@@ -10,6 +10,11 @@ pub(crate) fn sys_mlock2(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    let authority = current_mlock_authority();
+    if !can_do_mlock(authority) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
     let as_ref = match current_address_space() {
         Some(x) => x,
         None => {
@@ -18,20 +23,24 @@ pub(crate) fn sys_mlock2(ctx: &mut dyn TrapContext) {
         }
     };
     let result = if a.arg2 as u32 & MLOCK_ONFAULT != 0 {
-        as_ref.mlock_range_onfault(VirtAddr::new(a.arg0), a.arg1)
+        as_ref.mlock_range_onfault_limited(
+            VirtAddr::new(a.arg0),
+            a.arg1,
+            authority.limit_bytes,
+            authority.bypass_limit,
+        )
     } else {
-        as_ref.mlock_range(VirtAddr::new(a.arg0), a.arg1)
+        as_ref.mlock_range_limited(
+            VirtAddr::new(a.arg0),
+            a.arg1,
+            authority.limit_bytes,
+            authority.bypass_limit,
+        )
     };
     match result {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        // Same error surface as mlock(2): EINVAL out-of-range, EAGAIN when the
-        // lock can't be satisfied, else ENOMEM for the unmapped-hole case.
-        Err(narf_memory::AddressSpaceError::OutOfRange) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64))
-        }
-        Err(narf_memory::AddressSpaceError::NotImplemented) => {
-            ctx.set_return(SyscallReturn::ok((-11i64) as u64))
-        }
-        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+        Err(error) => ctx.set_return(SyscallReturn::ok(
+            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
+        )),
     }
 }

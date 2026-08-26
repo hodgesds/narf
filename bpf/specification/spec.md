@@ -67,6 +67,12 @@ The first three are dependency-free of the kernel and host-testable via
 that would be a cycle. The `bpf(2)` handler lives in `narf-userspace`, which
 depends on `narf-bpf`.
 
+`narf-bpf-bench` serial output uses grammar version 2. Each record publishes
+both its collected `n` and benchmark-declared `target_n`; an operator override
+may raise but never lower that target. Value chunks carry their starting sample
+index and terminate in a record/skip count marker consumed by `cargo xtask
+bpf-bench`.
+
 ### 3.2 The kfunc contract
 
 `narf_bpf_verifier::kfunc` — `KfuncDesc`, `ArgDesc`, `ValidityDomain`,
@@ -806,10 +812,10 @@ and the perf event layer, all of which are closed.
    Runner caveat: collected under KVM on an AMD Zen4 laptop whose §8.2
    noise-control preconditions (governor, boost, SMT, ASLR) are **not** met.
    `bpf-bench` refuses such a runner unless `--allow-unverified-runner` is
-   passed and marks every record it emits `noise_control: unverified`. These
-   are development measurements, not publishable perf numbers; the conclusion
-   survives because the effect is an order of magnitude below δ, not because
-   the environment was clean.
+   passed. That mode prints advisory diagnostics but emits no JSON performance
+   record. These are development measurements, not publishable perf numbers;
+   the conclusion survives because the effect is an order of magnitude below
+   δ, not because the environment was clean.
 8. **aarch64 `probe.rs`.** Porting the x86_64 recoverable-probe module would
    let `memory/src/tests.rs`'s four `probe::arm` sites stop being x86-only.
    Optional scope, but adjacent.
@@ -885,6 +891,21 @@ and the perf event layer, all of which are closed.
     cautionary example of defensive machinery guarding a case that could not
     arise (§9, the sizing fixpoint). The lever if this ever bites is an await
     point in the load path, which costs nothing when verification is fast.
+
+    **The worklist membership cost is fixed without adding a complexity
+    limit.** A generated dispatch CFG can leave thousands of distinct taken
+    arms pending while the LIFO verifier follows the fallthrough chain. The
+    worklist previously used `Vec::contains` before each enqueue, making that
+    valid shape quadratic even though every block itself converged once. The
+    verifier now retains the same LIFO order and state transitions but tracks
+    queued membership in a block-indexed bitmap. A permanent 2,048-arm / 6,147
+    instruction benchmark pins the shape. In an N=100 development comparison,
+    its median fell from 27,694,008 to 26,483,616 cycles: -4.37%, 95% bootstrap
+    CI [-4.48%, -4.29%], with Welch and Mann-Whitney both significant after
+    Benjamini-Hochberg correction. The ordinary `branchy194` case moved +0.28%,
+    inside its 3% delta. As with item 7, the laptop failed the §8.2 governor,
+    boost, SMT, ASLR, thermal-telemetry, and idle-host gates, so these are
+    explicitly advisory development measurements, not publishable numbers.
 
     **Amendment — the reasoning above did not cover every shape, and one of
     them was a genuine divergence.** The paragraph beginning "The existing

@@ -75,8 +75,10 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     };
     let new_leaf = &new_path[new_split + 1..];
     if flags & RENAME_NOREPLACE != 0 {
-        let exists = current_resolve_parent_absolute(&new_path, |_fs, parent, leaf| parent.lookup(leaf).is_some())
-            .unwrap_or(false);
+        let exists = current_resolve_parent_absolute(&new_path, |_fs, parent, leaf| {
+            parent.lookup(leaf).is_some()
+        })
+        .unwrap_or(false);
         if exists {
             ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
             return;
@@ -89,8 +91,8 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         return;
     }
     let outcome = current_resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
-            poll_blocking(parent.rename(old_leaf, new_leaf))
-        });
+        poll_blocking(parent.rename(old_leaf, new_leaf))
+    });
     // Report the filesystem's ACTUAL error. Collapsing everything to ENOENT
     // reads as "the source path is not there", which is a lie whenever the
     // source exists and the filesystem simply declined the operation — and

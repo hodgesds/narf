@@ -97,10 +97,10 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                     let _ = poll_blocking(parent.rmdir(&leaf));
                     let errno = match metadata_error {
                         Some(narf_filesystem::FsError::PermissionDenied) => -13, // EACCES
-                        Some(narf_filesystem::FsError::ReadOnly) => -30, // EROFS
-                        Some(narf_filesystem::FsError::NoSpace) => -28, // ENOSPC
-                        Some(narf_filesystem::FsError::QuotaExceeded) => -122, // EDQUOT
-                        _ => -5,                                       // EIO
+                        Some(narf_filesystem::FsError::ReadOnly) => -30,         // EROFS
+                        Some(narf_filesystem::FsError::NoSpace) => -28,          // ENOSPC
+                        Some(narf_filesystem::FsError::QuotaExceeded) => -122,   // EDQUOT
+                        _ => -5,                                                 // EIO
                     };
                     ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
                     return;

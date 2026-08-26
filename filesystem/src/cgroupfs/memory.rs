@@ -9,40 +9,28 @@
 //!
 //! # What is enforced vs accounting-only
 //!
-//! * **`memory.max` — ENFORCED with reclaim + OOM.** A positive charge
-//!   that would push any level over its `memory.max` first drives a
-//!   best-effort **direct reclaim** pass (`narf_memory::reclaim::
-//!   try_to_free`, the allocation-free frame-LRU + shrinker path) sized
-//!   to the breach, then re-checks. If a level is still over after
-//!   reclaim, the hook asks the OOM policy to kill a task
-//!   (`narf_memory::oom::request_oom_relief`) and re-checks once more.
-//!   Only if the breach still stands does the hook return `false`, so
+//! * **`memory.max` — ENFORCED without inline reclaim.** A positive charge
+//!   that would push any level over its `memory.max` publishes a capped,
+//!   coalesced background-reclaim request and returns `false`, so
 //!   `narf-memory`'s `alloc_frame*` / `alloc_pages_on` fail the
-//!   allocation (`FrameAllocError::Exhausted` ⇒ ENOMEM to the caller).
-//!   The breaching level's `memory.events` `max` counter is bumped, and
-//!   `oom` / `oom_kill` are bumped when the OOM path is taken.
-//! * **`memory.high` — ENFORCED as a reclaim throttle.** v2 `memory.high`
-//!   is a throttle/reclaim trigger, never a hard wall. A positive charge
-//!   that would push a level over `high` drives the same best-effort
-//!   direct-reclaim pass (`try_to_free`) sized to the over-`high` deficit
-//!   before committing, applying back-pressure. Crossing `high` still
-//!   bumps the `high` event counter and never denies the charge.
+//!   allocation with `FrameAllocError::Exhausted`. Fallible callers such as
+//!   BPF map creation preserve that as ENOMEM.
+//!   The breaching level's `memory.events` `max` counter is bumped. `oom` and
+//!   `oom_kill` remain unchanged because OOM selection is deliberately not run
+//!   from this arbitrary allocator/lock context.
+//! * **`memory.high` — deferred reclaim trigger.** v2 `memory.high` is a
+//!   throttle/reclaim trigger, never a hard wall. A positive charge that
+//!   would push a level over `high` publishes the same kind of background
+//!   request, commits the charge, and bumps the `high` event counter.
 //!
 //! ## Reclaim/OOM scope + limitations (first enforcement pass)
 //!
-//! Both the `high` reclaim throttle and the `max` reclaim step invoke
-//! **global** reclaim, not per-cgroup LRU: `try_to_free` reclaims the
-//! kernel-wide frame LRU + shrinkers, and it runs in the allocator charge
-//! path, so it can only drive the *allocation-free* reclaim arms — it
-//! must NOT call `reclaim_anon_pages` (that may allocate; it is kswapd's
-//! job). The `max`-breach OOM is **cgroup-scoped**: it collects the member
-//! pids of the charging task's cgroup subtree ([`super::oom_candidate_pids`])
-//! and calls `request_oom_relief_in`, so `OomKiller::select_victim_in` kills
-//! the highest-badness task INSIDE the offending hierarchy (an empty/unkillable
-//! subtree fails the charge as ENOMEM rather than reaching outside the cgroup).
-//! Follow-ups: (1) a per-cgroup reclaim LRU keyed on the cgroup's resident
-//! frames; (2) exact scoping when an ANCESTOR's limit breached (map the
-//! breaching MemoryState back to its cgroup) + `memory.oom.group` kill-all.
+//! Background work currently enters the global kswapd reclaim engines rather
+//! than a per-cgroup LRU. It is never OOM-authorized: a memcg breach must not
+//! select a machine-wide victim. Full deferred `memory.high` throttling and
+//! scoped `memory.max` reclaim/OOM require stable per-allocation cgroup
+//! ownership plus a cgroup-keyed worker; current uncharge attribution is only
+//! best-effort when a page is freed by a different task.
 //! * **`memory.current` / `memory.peak` — REAL.** Live charged-byte
 //!   totals, summed from actual frame allocations attributed to the
 //!   cgroup's tasks (no fabricated numbers).
@@ -117,6 +105,11 @@ static IN_CHARGE: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 static BYPASS_CHARGE: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
+/// Bound one memcg pressure publication to 16 MiB of base pages. Requests
+/// coalesce by maximum in `narf-memory`, so a burst cannot accumulate an
+/// unbounded kswapd debt.
+const BACKGROUND_RECLAIM_MAX_PAGES: usize = 4096;
+
 pub(super) struct ChargeBypassGuard {
     cpu: usize,
 }
@@ -150,102 +143,96 @@ fn charge_hook(pid: u64, delta_bytes: i64) -> bool {
     }
     let _guard = Guard(cpu);
 
-    // Collect the chain's `MemoryState`s once (clone the `Arc`s so we
-    // can iterate them twice without holding the chain lock across the
-    // closure body).
-    let mut states: Vec<Arc<dyn ControllerState>> = Vec::new();
-    super::with_chain_states(pid, "memory", |s| states.push(s.clone()));
-
     if delta_bytes < 0 {
         let amount = delta_bytes.unsigned_abs();
-        for s in &states {
+        // Final-owner frame return can run from allocator teardown, so this
+        // branch must not allocate or it recursively re-enters GlobalAlloc.
+        // Walk only an existing membership chain (no
+        // allocating root fallback), clone one already-owned Arc at a time,
+        // and perform the atomic uncharge inline. An exited/unplaced pid is a
+        // documented best-effort miss, not a reason to construct cgroup state.
+        super::with_existing_chain_states(pid, "memory", |s| {
             if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
                 m.uncharge(amount);
             }
-        }
+        });
         return true;
     }
 
+    if delta_bytes == 0 {
+        return true;
+    }
+
+    struct ChargeLevel {
+        state: Arc<dyn ControllerState>,
+        reserved_current: u64,
+    }
+
+    // Collect the hierarchy once, then reserve each level with a CAS. If an
+    // ancestor rejects the charge, roll back every descendant already
+    // reserved. This is the page_counter_try_charge shape: concurrent callers
+    // cannot both pass a detached load/check and overrun memory.max.
+    let mut states: Vec<ChargeLevel> = Vec::new();
+    super::with_chain_states(pid, "memory", |state| {
+        states.push(ChargeLevel {
+            state: state.clone(),
+            reserved_current: 0,
+        });
+    });
+
     let amount = delta_bytes as u64;
 
-    // High throttle: before committing, drive best-effort direct reclaim
-    // sized to the largest over-`memory.high` deficit on the chain. `high`
-    // never denies (it is a throttle, not a wall), so we reclaim and then
-    // fall through to commit regardless of the result.
+    for index in 0..states.len() {
+        let Some(m) = states[index].state.as_any().downcast_ref::<MemoryState>() else {
+            continue;
+        };
+        match m.try_reserve_charge(amount) {
+            Ok(now) => states[index].reserved_current = now,
+            Err(deficit) => {
+                for reserved in &states[..index] {
+                    if reserved.reserved_current == 0 {
+                        continue;
+                    }
+                    if let Some(previous) = reserved.state.as_any().downcast_ref::<MemoryState>() {
+                        previous.uncharge(amount);
+                    }
+                }
+                queue_background_reclaim(deficit);
+                m.note_max_event();
+                return false;
+            }
+        }
+    }
+
+    // All levels are committed now. Only a successful charge may generate
+    // memory.high pressure; publishing it before max validation would reclaim
+    // unrelated caches for a hypothetical charge that never landed.
     let mut high_deficit = 0u64;
-    for s in &states {
-        if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
-            high_deficit = high_deficit.max(m.over_high_by(amount));
+    for level in &states {
+        if let Some(m) = level.state.as_any().downcast_ref::<MemoryState>() {
+            high_deficit = high_deficit.max(m.finish_reserved_charge(level.reserved_current));
         }
     }
-    if high_deficit != 0 {
-        drive_direct_reclaim(high_deficit);
-    }
-
-    // Phase 1: pre-check every level against memory.max, driving reclaim
-    // (and then a scoped OOM kill) against any breach before denying.
-    for s in &states {
-        if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
-            if m.can_charge(amount) {
-                continue;
-            }
-            // Best-effort direct reclaim sized to the breach, then re-check.
-            drive_direct_reclaim(m.over_max_by(amount));
-            if m.can_charge(amount) {
-                continue;
-            }
-            // Still over: ask the OOM policy to kill a task WITHIN this cgroup's
-            // subtree — cgroup v2 kills inside the offending hierarchy, not
-            // machine-wide — then give the freed frames one more re-check. An
-            // empty/unkillable subtree yields `None`, so the charge is failed as
-            // ENOMEM rather than reaching outside the cgroup.
-            let candidates = super::oom_candidate_pids(pid);
-            let killed = narf_memory::oom::request_oom_relief_in(&candidates).is_some();
-            if killed {
-                m.note_oom_kill_event();
-            }
-            if m.can_charge(amount) {
-                continue;
-            }
-            // The breach still stands: record it and deny, so the allocator
-            // fails the allocation back to the caller as ENOMEM.
-            m.note_max_event();
-            return false;
-        }
-    }
-
-    // Phase 2: commit on every level (also notes `high` crossings).
-    for s in &states {
-        if let Some(m) = s.as_any().downcast_ref::<MemoryState>() {
-            m.commit_charge(amount);
-        }
-    }
+    queue_background_reclaim(high_deficit);
     true
 }
 
-/// Drive best-effort direct reclaim for a byte `deficit`, from the
-/// allocator charge path. Converts the byte deficit to a page target
-/// (round up) and calls `narf_memory::reclaim::try_to_free`, the
-/// **allocation-free** frame-LRU + shrinker reclaim path. It deliberately
-/// does NOT call `reclaim_anon_pages`: that arm may allocate and is
-/// reserved for kswapd (kthread) context, whereas this runs inside the
-/// re-entrancy-guarded charge hook where allocating could self-deadlock.
-/// Reclaim here is global, not per-cgroup (see the module-level scope
-/// note). Returns the number of pages freed.
-fn drive_direct_reclaim(deficit: u64) -> usize {
+/// Publish a capped page target to the local node's kswapd. This is bounded,
+/// allocation-free, and does not authorize the global OOM killer.
+fn queue_background_reclaim(deficit: u64) {
     if deficit == 0 {
-        return 0;
+        return;
     }
     let pages = deficit
         .div_ceil(narf_memory::PAGE_SIZE)
-        .min(usize::MAX as u64) as usize;
-    narf_memory::reclaim::try_to_free(pages)
+        .min(BACKGROUND_RECLAIM_MAX_PAGES as u64) as usize;
+    narf_memory::reclaim::request_reclaim(narf_memory::frame::local_node(), pages);
 }
 
 /// Test-only seam: drive the chain-walking [`charge_hook`] directly
 /// (the allocator normally invokes it via the installed fn-pointer).
 /// Lets the cgroupfs tests exercise the re-entrancy guard and the
-/// two-phase `memory.max` enforcement over a real cgroup chain without a
+/// hierarchical `memory.max` reservation over a real cgroup chain without a
 /// live frame allocation.
 #[doc(hidden)]
 pub fn charge_hook_for_test(pid: u64, delta_bytes: i64) -> bool {
@@ -434,58 +421,67 @@ impl MemoryState {
         allowed
     }
 
-    /// Would charging `amount` more bytes keep this level at or below
-    /// `memory.max`? `None` max ⇒ unlimited ⇒ always true.
-    fn can_charge(&self, amount: u64) -> bool {
-        match *self.max.lock() {
-            None => true,
-            Some(limit) => {
-                let cur = self.current.load(Ordering::Acquire);
-                cur.saturating_add(amount) <= limit
+    /// Atomically reserve `amount` against this level's current max. The limit
+    /// lock serializes a concurrent limit write with the CAS, while the CAS
+    /// serializes concurrent charges without holding a hierarchy-wide lock.
+    fn try_reserve_charge(&self, amount: u64) -> Result<u64, u64> {
+        self.try_reserve_charge_with(amount, || {})
+    }
+
+    fn try_reserve_charge_with(
+        &self,
+        amount: u64,
+        after_initial_load: impl FnOnce(),
+    ) -> Result<u64, u64> {
+        let limit = self.max.lock();
+        let mut current = self.current.load(Ordering::Acquire);
+        after_initial_load();
+        loop {
+            let Some(next) = current.checked_add(amount) else {
+                return Err(u64::MAX);
+            };
+            if let Some(max) = *limit {
+                if next > max {
+                    return Err(next - max);
+                }
+            }
+            match self.current.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(actual) => current = actual,
             }
         }
     }
 
-    /// Bytes by which charging `amount` more would exceed this level's
-    /// `memory.max`, or `0` if it stays at/under `max` (`None` ⇒
-    /// unlimited ⇒ `0`). Drives the reclaim target on the enforcement
-    /// path.
-    fn over_max_by(&self, amount: u64) -> u64 {
-        match *self.max.lock() {
-            None => 0,
-            Some(limit) => self
-                .current
-                .load(Ordering::Acquire)
-                .saturating_add(amount)
-                .saturating_sub(limit),
-        }
-    }
-
-    /// Bytes by which charging `amount` more would exceed this level's
-    /// `memory.high`, or `0` if it stays at/under `high` (`None` ⇒
-    /// unlimited ⇒ `0`). Drives the reclaim throttle target.
-    fn over_high_by(&self, amount: u64) -> u64 {
-        match *self.high.lock() {
-            None => 0,
-            Some(high) => self
-                .current
-                .load(Ordering::Acquire)
-                .saturating_add(amount)
-                .saturating_sub(high),
-        }
-    }
-
-    /// Commit a charge of `amount` bytes: bump `current`, advance
-    /// `peak`, and note a `memory.high` crossing if one occurs.
-    fn commit_charge(&self, amount: u64) {
-        let now = self.current.fetch_add(amount, Ordering::AcqRel) + amount;
+    /// Complete telemetry for an already-reserved hierarchy charge and return
+    /// its high-pressure deficit from the same limit snapshot used for the
+    /// event decision.
+    fn finish_reserved_charge(&self, now: u64) -> u64 {
         self.peak.fetch_max(now, Ordering::AcqRel);
         if let Some(high) = *self.high.lock() {
             if now > high {
                 // high is a throttle, not a wall: record only.
                 self.events_high.fetch_add(1, Ordering::Relaxed);
+                return now - high;
             }
         }
+        0
+    }
+
+    /// Deterministically place a competing current update after this caller's
+    /// initial load. The CAS must observe it and refuse a stale max decision.
+    #[doc(hidden)]
+    pub fn reservation_interleaving_for_test(&self, amount: u64) -> bool {
+        let result = self.try_reserve_charge_with(amount, || {
+            self.current.fetch_add(amount, Ordering::AcqRel);
+        });
+        let current = self.current.load(Ordering::Acquire);
+        self.uncharge(amount);
+        result.is_err() && current == amount
     }
 
     /// Uncharge `amount` bytes, saturating at 0 so a free that races a
@@ -505,39 +501,36 @@ impl MemoryState {
     }
 
     /// Record that a charge was ultimately rejected for exceeding
-    /// `memory.max` — i.e. reclaim (and any OOM kill) could not make room.
-    /// Bumps `max` (limit hit) and `oom` (the allocation is failed back to
-    /// the caller as an OOM). `oom_kill` is bumped separately, only when a
-    /// task was actually killed (see [`note_oom_kill_event`]).
+    /// `memory.max`. Only `max` advances: Linux's `oom` counter means OOM
+    /// policy was considered, which this arbitrary-context hook forbids.
     fn note_max_event(&self) {
         self.events_max.fetch_add(1, Ordering::Relaxed);
-        self.events_oom.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record that the `memory.max` enforcement path killed a task to try
-    /// to relieve the breach. Bumps `oom_kill`, matching v2 where the
-    /// counter tracks kills attributed to the cgroup's pressure.
-    fn note_oom_kill_event(&self) {
-        self.events_oom_kill.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Charge (`delta > 0`) or uncharge (`delta < 0`) this single level,
     /// enforcing `memory.max` on a positive delta. Returns `false` iff a
     /// positive delta is rejected for exceeding `max`. Exposed for tests
     /// and direct accounting; the allocator hook drives the chain-wide
-    /// two-phase path in `charge_hook`.
+    /// hierarchy-reservation path in `charge_hook`.
     pub fn charge(&self, delta: i64) -> bool {
         if delta < 0 {
             self.uncharge(delta.unsigned_abs());
             return true;
         }
-        let amount = delta as u64;
-        if !self.can_charge(amount) {
-            self.note_max_event();
-            return false;
+        if delta == 0 {
+            return true;
         }
-        self.commit_charge(amount);
-        true
+        let amount = delta as u64;
+        match self.try_reserve_charge(amount) {
+            Ok(now) => {
+                self.finish_reserved_charge(now);
+                true
+            }
+            Err(_) => {
+                self.note_max_event();
+                false
+            }
+        }
     }
 
     fn events_block(&self) -> String {

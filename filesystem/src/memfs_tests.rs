@@ -24,6 +24,7 @@
 //!   8. `smoke_memfs_truncate_grow_shrink`   — truncate grows (zero-fill) / shrinks; stat reflects
 //!   9. `smoke_memfs_distinct_inodes`        — distinct files, and dir vs parent, have distinct ino()
 //!  10. `smoke_memfs_registry_mount_roundtrip` — mount via registry, write through path, unmount → NotFound
+//!  11. `smoke_memfs_large_dir_enumerate_walks_all` — N-entry readdir returns every name once, sorted; lookup/remove all
 //!
 //! GPL-2.0-or-later — NARF is GPL-2.0-or-later as of 2026-05-20.
 
@@ -1094,3 +1095,76 @@ fn smoke_tmpfs_xattrs_and_reconfigure() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattrs_and_reconfigure);
+
+// ── Smoke: large-directory readdir walks every entry exactly once ─────
+//
+// stress-ng's chdir/dirdeep classes create thousands of entries in one
+// tmpfs directory, then read them all back and remove them. getdents64
+// drives readdir by snapshotting the tail at each cursor via
+// `enumerate_async(cursor, bounded_batch)` and serving entries positionally,
+// so this test reproduces that walk directly: it fills a directory with N
+// entries, then advances a cursor one entry at a time — requesting the
+// remaining tail on each step — and asserts every created name is
+// returned exactly once, in the BTreeMap's sorted order. It also confirms
+// lookup and removal of all N entries succeed, guarding the tmpfs
+// create/enumerate/remove path that mass mkdir/rmdir hammers.
+fn smoke_memfs_large_dir_enumerate_walks_all() -> TestResult {
+    const N: usize = 2048;
+    let fs = MemFs::new("memfs-bigdir");
+    let root = fs.root();
+
+    // Create N entries with names whose lexicographic order differs from
+    // creation order, so a correct sorted readdir can't accidentally pass
+    // by echoing insertion order.
+    for i in 0..N {
+        let name = alloc::format!("entry-{:05}", (i * 7919) % N);
+        if poll_once(root.create(&name)).map(|r| r.is_ok()) != Some(true) {
+            return TestResult::Fail("create in large dir failed");
+        }
+    }
+
+    // Positional walk mirroring the getdents64 handler: snapshot the tail
+    // at `cursor`, consume its head, advance the cursor by one.
+    let mut seen: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut cursor = 0usize;
+    loop {
+        let tail = match poll_once(root.enumerate_async(cursor, usize::MAX)) {
+            Some(Ok(v)) => v,
+            _ => return TestResult::Fail("enumerate_async tail snapshot failed"),
+        };
+        let head = match tail.into_iter().next() {
+            Some(e) => e,
+            None => break,
+        };
+        seen.push(head.0);
+        cursor += 1;
+    }
+
+    if seen.len() != N {
+        return TestResult::Fail("readdir did not return exactly N entries");
+    }
+    // BTreeMap iteration is sorted; the positional walk must be sorted too.
+    if seen.windows(2).any(|w| w[0] >= w[1]) {
+        return TestResult::Fail("readdir entries not strictly sorted / had a duplicate");
+    }
+
+    // Every created name is lookup-resolvable and removable.
+    for i in 0..N {
+        let name = alloc::format!("entry-{:05}", (i * 7919) % N);
+        if root.lookup(&name).is_none() {
+            return TestResult::Fail("large-dir entry not found by lookup");
+        }
+        if poll_once(root.unlink(&name)).map(|r| r.is_ok()) != Some(true) {
+            return TestResult::Fail("unlink of large-dir entry failed");
+        }
+    }
+    if !root.enumerate(0, 1).is_empty() {
+        return TestResult::Fail("directory not empty after removing all entries");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/memfs",
+    smoke_memfs_large_dir_enumerate_walks_all
+);

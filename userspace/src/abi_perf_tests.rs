@@ -469,16 +469,15 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             _ => return Err("perf_event_open(valid software event) failed to create fd"),
         };
 
-        // Read into too small buffer (< 8 bytes) -> expect -EINVAL (-22)
+        // Linux kernel/events/core.c::__perf_read returns -ENOSPC when count
+        // is smaller than event->read_size.
         let mut small_buf = [0u8; 4];
-        let read_res = call_raw(
+        if call(
             Syscall::Read.raw(),
             a2(fd as u64, small_buf.as_mut_ptr() as u64, 4),
-        );
-        if read_res.status != SyscallReturn::INVALID_OP {
-            return Err(
-                "read from perf fd with buffer < 8 bytes did not return SyscallReturn::INVALID_OP",
-            );
+        ) != Some(-28)
+        {
+            return Err("read from perf fd with buffer < 8 bytes did not return -ENOSPC");
         }
 
         // Read into valid 8-byte buffer -> expect success (returns 8)

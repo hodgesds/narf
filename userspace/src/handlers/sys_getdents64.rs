@@ -1,133 +1,174 @@
 #[allow(unused_imports)]
 use super::*;
 
-pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
+const EBADF: i64 = 9;
+const EIO: i64 = 5;
+const ENOMEM: i64 = 12;
+const EFAULT: i64 = 14;
+const ENOTDIR: i64 = 20;
+const EINVAL: i64 = 22;
+
+#[inline]
+fn fail(errno: i64) -> SyscallReturn {
+    SyscallReturn::ok((-errno) as u64)
+}
+
+#[inline]
+fn dirent_type(ftype: narf_filesystem::FileType) -> u8 {
+    match ftype {
+        narf_filesystem::FileType::File => 8,
+        narf_filesystem::FileType::Dir => 4,
+        narf_filesystem::FileType::Symlink => 10,
+        narf_filesystem::FileType::Special => 2,
+        narf_filesystem::FileType::Block => 6,
+        narf_filesystem::FileType::Socket => 12,
+        narf_filesystem::FileType::Fifo => 1,
+    }
+}
+
+fn enumerate_batch(
+    dir: &alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    cursor: usize,
+    batch_max: usize,
+) -> Result<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>, i64> {
+    match poll_blocking(dir.enumerate_async(cursor, batch_max)) {
+        Some(Ok(entries)) => Ok(entries),
+        Some(Err(narf_filesystem::FsError::Unsupported)) => {
+            let mut entries = alloc::vec::Vec::new();
+            entries.try_reserve(batch_max).map_err(|_| ENOMEM)?;
+            for entry in dir.iter().skip(cursor).take(batch_max) {
+                let mut name = alloc::string::String::new();
+                name.try_reserve_exact(entry.name.len())
+                    .map_err(|_| ENOMEM)?;
+                name.push_str(entry.name);
+                entries.push((name, entry.file_type));
+            }
+            Ok(entries)
+        }
+        Some(Err(error)) => Err(copy_fs_errno(error)),
+        None => Err(EIO),
+    }
+}
+
+/// Shared native implementation for x86_64 getdents and both architectures'
+/// getdents64. Linux resolves the fd before touching the output buffer, faults
+/// only when an entry is actually emitted, returns EINVAL when the first
+/// pending record cannot fit, and preserves partial progress after a later
+/// copy fault.
+pub(super) fn sys_getdents_common(ctx: &mut dyn TrapContext, legacy: bool) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
-    let out_ptr = args.arg1 as *mut u8;
-    let out_len = args.arg2 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-
-    if out_ptr.is_null() || out_len < 32 {
-        ctx.set_return(fail);
-        return;
-    }
+    let out_ptr = args.arg1;
+    // Linux declares count as unsigned int even on 64-bit targets.
+    let out_len = args.arg2 as u32 as usize;
     let task = current_task_id();
 
-    // EBADF: the fd isn't open at all (distinct from "open but not a dir").
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-    // Pull the DirOps + current cursor off the fd. `as_dir()` is `Some`
-    // only for a DirFdFile (an opened directory); the fd exists (checked
-    // above) so a `None` here means it's a non-directory → -ENOTDIR.
-    // The fd-table lock is released before we touch the FS
-    // (enumerate_async), per the no-reentrancy rule.
-    let dir_and_cursor = fd::with_table(task, |t| {
-        t.get(fd)
-            .and_then(|e| e.ops.as_dir().map(|d| (d, e.offset as usize)))
+    let entry = fd::with_table(task, |table| {
+        let entry = table.get(fd)?;
+        Some((entry.ops.clone(), table.offset(fd)?))
     })
     .flatten();
-    let (dir, mut cursor) = match dir_and_cursor {
-        Some(x) => x,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+    let Some((ops, offset)) = entry else {
+        ctx.set_return(fail(EBADF));
+        return;
+    };
+    let Some(dir) = ops.as_dir() else {
+        ctx.set_return(fail(ENOTDIR));
+        return;
+    };
+    let mut cursor = offset as usize;
+
+    // One look-ahead entry distinguishes EOF from a first record that cannot
+    // fit. The cap bounds kernel allocation for arbitrarily large user buffers
+    // while retaining O(N) traversal across normal directory scans.
+    const SNAPSHOT_ENTRY_CAP: usize = 4096;
+    const MINIMUM_RECORD: usize = 24;
+    let batch_max = (out_len / MINIMUM_RECORD)
+        .saturating_add(1)
+        .clamp(1, SNAPSHOT_ENTRY_CAP);
+    let snapshot = match enumerate_batch(&dir, cursor, batch_max) {
+        Ok(snapshot) => snapshot,
+        Err(errno) => {
+            ctx.set_return(fail(errno));
             return;
         }
     };
 
     let mut written = 0usize;
-    // iter()-only DirOps — the procfs trees (/proc root, /proc/<pid>,
-    // fd/, task/, ns/) — keep the Unsupported default for
-    // enumerate_async. Bridge them through the sync iterator, or ps/
-    // top/ls see an EMPTY /proc (opens worked, listing didn't: the
-    // alpine-probe "no process info in /proc" failure). Snapshot the
-    // remainder ONCE per getdents call: iter() rebuilds (and, for
-    // ProcRoot, Box::leaks names on) every invocation, so a per-entry
-    // re-iter would cost O(entries²) and multiply that leak by the
-    // directory size on every ps/top refresh.
-    let mut iter_snapshot: Option<
-        alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>,
-    > = None;
-    let mut snapshot_pos = 0usize;
-    loop {
-        let batch: Option<alloc::vec::Vec<(alloc::string::String, narf_filesystem::FileType)>> =
-            if let Some(snap) = iter_snapshot.as_ref() {
-                let e = snap.get(snapshot_pos).cloned();
-                snapshot_pos += 1;
-                Some(e.into_iter().collect())
-            } else {
-                match poll_blocking(dir.enumerate_async(cursor, 1)) {
-                    Some(Ok(v)) => Some(v),
-                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                        let snap: alloc::vec::Vec<_> = dir
-                            .iter()
-                            .skip(cursor)
-                            .map(|e| (alloc::string::String::from(e.name), e.file_type))
-                            .collect();
-                        let first = snap.first().cloned();
-                        iter_snapshot = Some(snap);
-                        snapshot_pos = 1;
-                        Some(first.into_iter().collect())
-                    }
-                    _ => None,
-                }
-            };
-        let mut entries = match batch {
-            Some(v) if !v.is_empty() => v,
-            _ => break,
-        };
-        let (name, ftype) = entries.pop().unwrap();
-        let name_bytes = name.as_bytes();
-        // 19-byte fixed header + name + NUL, padded up to 8 bytes.
-        let raw_len = 19 + name_bytes.len() + 1;
-        let reclen = (raw_len + 7) & !7;
-        if written + reclen > out_len {
-            // Record won't fit — stop here without advancing the
-            // cursor for this entry. Linux returns whatever fit.
+    let mut terminal_error = None;
+    let mut record = alloc::vec::Vec::new();
+    for (name, ftype) in snapshot {
+        let name = name.as_bytes();
+        // Linux verify_dirent_name(): an empty, slash-containing, or
+        // PATH_MAX-sized component indicates a corrupt filesystem record.
+        if name.is_empty() || name.len() >= 4096 || name.contains(&b'/') {
+            terminal_error = Some(EIO);
             break;
         }
-        let next_cursor = cursor + 1;
-        let dt = match ftype {
-            narf_filesystem::FileType::File => 8,     // DT_REG
-            narf_filesystem::FileType::Dir => 4,      // DT_DIR
-            narf_filesystem::FileType::Symlink => 10, // DT_LNK
-            narf_filesystem::FileType::Special => 2,  // DT_CHR
-            narf_filesystem::FileType::Block => 6,    // DT_BLK
-            narf_filesystem::FileType::Socket => 12,  // DT_SOCK
-            narf_filesystem::FileType::Fifo => 1,     // DT_FIFO
+        let fixed = if legacy { 18usize } else { 19usize };
+        let extra = if legacy { 2usize } else { 1usize };
+        let Some(raw_len) = fixed
+            .checked_add(name.len())
+            .and_then(|n| n.checked_add(extra))
+        else {
+            terminal_error = Some(EINVAL);
+            break;
         };
-        // Build the dirent record in kernel memory, then copy it into
-        // user space under the SMAP bracket.
-        let mut rec = alloc::vec![0u8; reclen];
-        rec[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_ino
-        rec[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes()); // d_off
-        rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes()); // d_reclen
-        rec[18] = dt; // d_type
-        rec[19..19 + name_bytes.len()].copy_from_slice(name_bytes); // d_name
-                                                                    // NUL terminator + zero-padding through end already zeroed by vec init.
-                                                                    // SAFETY: `out_ptr` is the user buffer base; `written < out_len` so the
-                                                                    // offset stays inside the user-supplied region. Forms a user vaddr only.
-                                                                    // SAFETY: Valid memory or trusted environment
-        let dest = unsafe { out_ptr.add(written) } as u64;
-        // SAFETY: `dest` is in-bounds of the user buffer (checked above); copy_to_user
-        // range-validates it and SMAP-brackets the write of the `reclen`-byte `rec`.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_to_user(dest, &rec) }.is_err() {
+        let Some(reclen) = raw_len.checked_add(7).map(|n| n & !7) else {
+            terminal_error = Some(EINVAL);
+            break;
+        };
+        if reclen > u16::MAX as usize {
+            terminal_error = Some(EINVAL);
+            break;
+        }
+        if reclen > out_len.saturating_sub(written) {
+            terminal_error = (written == 0).then_some(EINVAL);
+            break;
+        }
+
+        let next_cursor = cursor.saturating_add(1);
+        record.clear();
+        if record.try_reserve_exact(reclen).is_err() {
+            terminal_error = Some(ENOMEM);
+            break;
+        }
+        record.resize(reclen, 0);
+        record[..8].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
+        record[8..16].copy_from_slice(&(next_cursor as u64).to_ne_bytes());
+        record[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+        if legacy {
+            record[18..18 + name.len()].copy_from_slice(name);
+            record[reclen - 1] = dirent_type(ftype);
+        } else {
+            record[18] = dirent_type(ftype);
+            record[19..19 + name.len()].copy_from_slice(name);
+        }
+
+        let Some(dest) = out_ptr.checked_add(written as u64) else {
+            terminal_error = Some(EFAULT);
+            break;
+        };
+        // SAFETY: copy_to_user validates the complete destination record and
+        // performs the architecture's guarded user copy.
+        if unsafe { copy_to_user(dest, &record) }.is_err() {
+            terminal_error = Some(EFAULT);
             break;
         }
         written += reclen;
         cursor = next_cursor;
     }
 
-    // Persist the advanced cursor so the next getdents64 on this fd
-    // resumes where we stopped (mid-directory if the buffer filled).
-    fd::with_table(task, |t| {
-        if let Some(e) = t.get_mut(fd) {
-            e.offset = cursor as u64;
-        }
-    });
+    if written != 0 {
+        fd::with_table(task, |table| table.set_offset(fd, cursor as u64));
+        ctx.set_return(SyscallReturn::ok(written as u64));
+    } else if let Some(errno) = terminal_error {
+        ctx.set_return(fail(errno));
+    } else {
+        ctx.set_return(SyscallReturn::ok(0));
+    }
+}
 
-    ctx.set_return(SyscallReturn::ok(written as u64));
+pub(crate) fn sys_getdents64(ctx: &mut dyn TrapContext) {
+    sys_getdents_common(ctx, false);
 }

@@ -136,8 +136,17 @@ async fn kswapd_kthread(node: usize) {
         })
         .await;
 
+        // Consume explicit allocation-failure work once per wake. A request is
+        // serviced even if the node is above its low watermark; allocation
+        // failure can come from fragmentation or reclaimable slab/cache state
+        // that the aggregate free-page watermark does not expose.
+        let request = narf_memory::reclaim::take_reclaim_request(node);
+        let requested = request.target_pages;
+        let oom_requested = request.oom_authorized;
+        let mut explicit_remaining = requested;
+
         // Batch floor scales with the online CPU count (concurrent allocators);
-        // the actual target also tracks the free-memory deficit.
+        // the low-watermark target also tracks the free-memory deficit.
         let cpu_floor =
             (narf_scheduler::online_cpu_set().len() as usize).saturating_mul(KSWAPD_PAGES_PER_CPU);
 
@@ -146,8 +155,18 @@ async fn kswapd_kthread(node: usize) {
         // kills, so it is safe to run freely under the routine transient dips a
         // fork/vmalloc storm produces.
         let mut pass = 0;
-        while pass < MAX_PASSES && narf_memory::reclaim::under_low_watermark_node(node) {
-            let target = narf_memory::reclaim::reclaim_goal_node(node).max(cpu_floor);
+        let mut total_freed = 0usize;
+        while pass < MAX_PASSES
+            && (explicit_remaining > 0 || narf_memory::reclaim::under_low_watermark_node(node))
+        {
+            let under_low = narf_memory::reclaim::under_low_watermark_node(node);
+            let target = if under_low {
+                narf_memory::reclaim::reclaim_goal_node(node)
+                    .max(cpu_floor)
+                    .max(explicit_remaining)
+            } else {
+                explicit_remaining
+            };
 
             // Split the target between anonymous (swap) and file-cache reclaim
             // per `vm.swappiness`: higher swappiness pushes more onto anon.
@@ -183,18 +202,28 @@ async fn kswapd_kthread(node: usize) {
                 // No forward progress — nothing more to shed this wake.
                 break;
             }
+            total_freed = total_freed.saturating_add(freed);
+            explicit_remaining = explicit_remaining.saturating_sub(freed);
+            // Release fault waiters promptly after real progress rather than
+            // keeping them asleep until the complete high-watermark batch.
+            reclaim_wait::notify_reclaim_progress();
             pass += 1;
             narf_scheduler::yield_now().await;
         }
 
-        // OOM-kill ONLY on a genuine exhaustion signal: a KERNEL allocation
-        // actually failed (reserve empty), or user pressure under an overcommit
-        // policy that permits killing. NOT on a mere dip below `min` — those
-        // are routine under fork/vmalloc churn and the reserve + vmalloc carry
-        // them without a kill (killing a stress-ng worker there would fail the
-        // run under `--abort`). The victim's pages come back via `reap_all`.
-        if narf_memory::reclaim::take_oom_needed() {
-            if let Some(pid) = narf_memory::oom::request_oom_relief() {
+        // OOM-kill ONLY after a genuine exhaustion signal was paired with an
+        // explicit pass on this node and that pass reclaimed nothing. A pass
+        // that made progress consumes the signal but defers killing; a later
+        // failed allocation can request another bounded pass. Non-requested
+        // nodes cannot consume this node-scoped signal before the failing node
+        // has had its reclaim opportunity.
+        if oom_requested && total_freed == 0 {
+            // The OOM helper serializes policy across all node workers, then
+            // re-checks the same <=min predicate that refused the allocation.
+            // It reaps the selected victim before another node may select one.
+            if let Some(pid) = narf_memory::oom::request_oom_relief_and_reap_if(
+                narf_memory::reclaim::user_alloc_would_breach_reserve,
+            ) {
                 let _ = writeln!(
                     console::Writer,
                     "  oom: Killed process pid={pid} to relieve memory pressure"
@@ -202,6 +231,11 @@ async fn kswapd_kthread(node: usize) {
             }
         }
         narf_memory::oom::reap_all();
+
+        // Also publish completion after a zero-progress pass and after OOM
+        // reaping. A waiter retries once and then fails, so an unreclaimable
+        // workload cannot leave a task asleep forever.
+        reclaim_wait::notify_reclaim_progress();
 
         // Gentle background compaction on THIS node when it was under memory
         // pressure this wake (`pass > 0`): one bounded dual-scanner pass migrates
@@ -227,6 +261,7 @@ pub mod aarch64;
 mod canary;
 mod cross_crate_init;
 mod measure;
+mod reclaim_wait;
 mod secure_boot;
 /// SMP exercise for the JIT-text W^X seal. Lives here rather than in
 /// `memory/` because it needs to pin a task to a peer CPU and the scheduler
@@ -3565,6 +3600,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         }
     }
 
+    // Shared VMA lifetime accounting is required by both the production
+    // userspace path and kernel tests which exercise mmap directly. Install
+    // it in the common post-init path: putting this only in `run_async_demo`
+    // left kernel-test mappings unretained, so their canonical file-cache
+    // frame could be returned to the allocator while the VMA still named it.
+    narf_memory::install_shared_frame_hooks(
+        narf_userspace::retain_external_shared_frame,
+        narf_userspace::release_external_shared_frame,
+    );
+    narf_memory::install_address_space_drop_hook(narf_userspace::drop_mapped_file_address_space);
+
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]
@@ -4099,10 +4145,6 @@ fn boot_userspace_init() {
         narf_scheduler::address_space_of(id)
     });
     install_all_address_spaces_lookup(narf_scheduler::all_address_spaces);
-    narf_memory::install_shared_frame_hooks(
-        narf_userspace::retain_external_shared_frame,
-        narf_userspace::release_external_shared_frame,
-    );
     // Make `gettid` (and any handler that calls
     // `current_task_id`) report the scheduler's TaskId rather
     // than 0. Required for `sys_clone` to be observable from user

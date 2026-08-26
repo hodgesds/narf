@@ -1,6 +1,22 @@
 #[allow(unused_imports)]
 use super::*;
 
+fn finish_nonfixed_private_file_mapping(
+    as_ref: &AddressSpace,
+    receipt: narf_memory::MappingReceipt,
+) -> Result<narf_memory::MappingReceipt, narf_memory::AddressSpaceError> {
+    // SAFETY: the syscall owns a live address-space reference. A stale result
+    // means publication already linearized and a CLONE_VM peer subsequently
+    // replaced the VMA; Linux still returns the selected base in that race.
+    match unsafe { as_ref.materialize_mapping(receipt) } {
+        Ok(()) | Err(narf_memory::AddressSpaceError::StaleMapping) => Ok(receipt),
+        Err(error) => {
+            let _ = as_ref.rollback_mapping(receipt);
+            Err(error)
+        }
+    }
+}
+
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
@@ -13,9 +29,41 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let flags = args.arg3 as u32;
     let fd = args.arg4 as i64 as i32;
     let offset = args.arg5;
+    const MAP_FIXED: u32 = 0x10;
+    const MAP_ANONYMOUS: u32 = 0x20;
+    const MAP_SHARED: u32 = 0x01;
+    const MAP_LOCKED: u32 = 0x2000;
     const MAP_HUGETLB: u32 = 0x0004_0000;
     const MAP_HUGE_SHIFT: u32 = 26;
     const MAP_HUGE_MASK: u32 = 0x3f;
+    let anonymous = flags & MAP_ANONYMOUS != 0;
+
+    // Both x86_64 and AArch64 reject a non-page-aligned byte offset in the
+    // architecture syscall wrapper before fd lookup or any mmap work.
+    if offset & 0xFFF != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+
+    let as_ref = match current_address_space() {
+        Some(a) => a,
+        None => {
+            ctx.set_return(SyscallReturn::invalid_op());
+            return;
+        }
+    };
+    // ksys_mmap_pgoff resolves a non-anonymous fd before huge-flag and
+    // do_mmap length/address validation. Thus EBADF wins over a zero length or
+    // malformed MAP_FIXED address (but not over the arch offset check above).
+    if !anonymous
+        && (fd < 0
+            || fd::with_table(current_task_id(), |table| table.get(fd as u32).is_some())
+                != Some(true))
+    {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        return;
+    }
+
     let huge_size = if flags & MAP_HUGETLB != 0 {
         match (flags >> MAP_HUGE_SHIFT) & MAP_HUGE_MASK {
             0 | 21 => Some(narf_memory::hugepage::HugeSize::M2),
@@ -32,59 +80,82 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         narf_memory::hugepage::HugeSize::M2 => narf_memory::hugepage::HUGEPAGE_2M_BYTES,
         narf_memory::hugepage::HugeSize::G1 => narf_memory::hugepage::HUGEPAGE_1G_BYTES,
     });
+    // Linux do_mmap rejects an exact zero length before rounding and before
+    // get_unmapped_area validates MAP_FIXED. Never promote it to one page.
+    if args.arg1 == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
     let len = match args.arg1.checked_add(page_size - 1) {
-        Some(v) => (v & !(page_size - 1)).max(page_size),
+        Some(v) => v & !(page_size - 1),
         None => {
             ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
             return;
         }
     };
-    const MAP_FIXED: u32 = 0x10;
-    const MAP_ANONYMOUS: u32 = 0x20;
 
-    // Reject an impossible fixed hint before taking the scheduler's current-AS
-    // lock and cloning its Arc. stress-ng deliberately probes the complete
-    // power-of-two address space; most of those calls can never reach a NARF
-    // user page table, and making every miss enter shared scheduler state made
-    // the rejection path dominate the useful MAP_FIXED work.
+    // Semantic failures must precede MAP_FIXED replacement: an invalid new
+    // mapping never destroys the old one on Linux.
+    if huge_size.is_some() && flags & MAP_SHARED != 0 {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
+        return;
+    }
+    if huge_size.is_some() && flags & MAP_ANONYMOUS == 0 && fd >= 0 {
+        ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // ENODEV
+        return;
+    }
+
+    // __get_unmapped_area rejects fixed misalignment with EINVAL, range
+    // overflow with ENOMEM, then security_mmap_addr applies the low-address
+    // policy. NARF's USER_FIXED_FLOOR is that policy boundary.
     if flags & MAP_FIXED != 0 {
-        if hint == 0 || hint & (page_size - 1) != 0 {
-            ctx.set_return(SyscallReturn::invalid_op());
+        if hint & (page_size - 1) != 0 {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
             return;
         }
-        let fixed_ok = hint
+        let fixed_in_range = hint
             .checked_add(len)
-            .map(|end| hint >= AddressSpace::USER_FIXED_FLOOR && end <= AddressSpace::USER_HALF_END)
+            .map(|end| end <= AddressSpace::USER_HALF_END)
             .unwrap_or(false);
-        if !fixed_ok {
-            const ENOMEM: i64 = 12;
-            ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
+        if !fixed_in_range {
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            return;
+        }
+        if hint < AddressSpace::USER_FIXED_FLOOR {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
             return;
         }
     }
-    let as_ref = match current_address_space() {
-        Some(a) => a,
-        None => {
-            ctx.set_return(SyscallReturn::invalid_op());
-            return;
-        }
-    };
+    let mlock_authority = current_mlock_authority();
+    let explicit_lock = flags & MAP_LOCKED != 0;
+    if explicit_lock && !can_do_mlock(mlock_authority) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
 
     let pages = (len >> 12) as usize;
     let perms = perms_of_prot(prot);
+    #[cfg(feature = "linux-compat")]
+    let task = current_task_id();
+    #[cfg(feature = "linux-compat")]
+    let lpid = task_to_pid_raw(task).unwrap_or(task);
+    #[cfg(feature = "linux-compat")]
+    let as_key = shm_as_key(&as_ref);
+    #[cfg(feature = "linux-compat")]
+    if flags & MAP_FIXED != 0 {
+        shm_register_as_owner(as_key, lpid);
+    }
+    #[cfg(feature = "linux-compat")]
+    let shm_transaction =
+        (flags & MAP_FIXED != 0).then(|| shm_mapping_transaction(as_key));
+    #[cfg(feature = "linux-compat")]
+    let _shm_guard = shm_transaction
+        .as_ref()
+        .map(|transaction| transaction.lock());
 
-    // Base selection. MAP_FIXED uses `hint` and REPLACES any overlapping
-    // mappings (POSIX semantics) — the dynamic linker reserves a DSO range
-    // PROT_NONE then MAP_FIXED-maps each segment over it. Otherwise bump the
-    // per-AS mmap cursor.
+    // Base selection. Destructive MAP_FIXED replacement is deferred until the
+    // requested mapping's semantic, backing, and lock-limit checks pass.
     let base = if flags & MAP_FIXED != 0 {
-        // Punch out exactly [hint, hint+len), splitting (not destroying)
-        // any region it overlaps so the non-replaced pages survive — the
-        // dynamic linker overlays DSO segments onto its whole-file mapping
-        // this way, and the ELF-header page between them must stay mapped.
-        if as_ref.punch_fixed(VirtAddr::new(hint), len).is_ok() {
-            crate::mapped_file::punch_current(hint, len);
-        }
         hint
     } else {
         as_ref.reserve_mmap_va_aligned(len, page_size)
@@ -99,16 +170,21 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    const MAP_SHARED: u32 = 0x01;
+    macro_rules! record_fixed_replacement_owner_committed {
+        () => {
+            if flags & MAP_FIXED != 0 {
+                // `mapped_file::publish_current_mapping` updated the file
+                // owner table under the VMA transaction. Only the independent
+                // SysV attachment index remains to mirror here.
+                #[cfg(feature = "linux-compat")]
+                {
+                    shm_record_fixed_punch(as_key, hint, hint + len, lpid);
+                }
+            }
+        };
+    }
+
     if let Some(size) = huge_size {
-        if flags & MAP_SHARED != 0 {
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP: no shared huge refs.
-            return;
-        }
-        if flags & MAP_ANONYMOUS == 0 && fd >= 0 {
-            ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // ENODEV: no hugetlbfs.
-            return;
-        }
         let task = current_task_id();
         let stored = resolve_policy(task, base);
         let allowed = narf_scheduler::task_mems_allowed(task);
@@ -148,19 +224,41 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 core::ptr::write_bytes(frame.phys() as *mut u8, 0, frame.size_bytes() as usize);
             }
         }
-        // SAFETY: `as_ref` is the caller's live root; frames are owned and
-        // aligned for the selected hardware leaf size.
-        let mapped = unsafe {
-            as_ref.map_huge_region(HugeRegion {
-                base: VirtAddr::new(base),
+        let mapped = as_ref.with_vma_transaction(|| {
+            crate::mapped_file::publish_current_unowned_mapping(
+                base,
                 len,
-                perms,
-                size,
-                frames,
-            })
-        };
+                flags & MAP_FIXED != 0,
+                || {
+                    // SAFETY: the VMA transaction is held and the freshly
+                    // allocated aligned huge frames remain owned by this call.
+                    unsafe {
+                        as_ref.map_huge_region_locked_limited(
+                            HugeRegion {
+                                base: VirtAddr::new(base),
+                                len,
+                                perms,
+                                size,
+                                frames,
+                            },
+                            flags & MAP_FIXED != 0,
+                            explicit_lock,
+                            mlock_authority.limit_bytes,
+                            mlock_authority.bypass_limit,
+                        )
+                    }
+                },
+                |()| Ok(()),
+            )
+        });
         match mapped {
-            Ok(()) => ctx.set_return(SyscallReturn::ok(base)),
+            Ok(()) => {
+                record_fixed_replacement_owner_committed!();
+                ctx.set_return(SyscallReturn::ok(base));
+            }
+            Err(narf_memory::AddressSpaceError::LockLimit) => {
+                ctx.set_return(SyscallReturn::ok((-11i64) as u64))
+            }
             Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
         }
         return;
@@ -196,38 +294,75 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     .iter()
                     .map(|&p| narf_memory::PhysAddr::new(p))
                     .collect();
-                if as_ref
-                    .map_region(Region {
+                let region = Region {
                         base: VirtAddr::new(base),
                         len,
-                        perms: perms | RegionPerms::SHARED,
+                        perms: perms | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
                         phys,
+                    };
+                let mapped = as_ref.with_vma_transaction(|| {
+                    narf_memory::with_shared_mapping_transaction(|| {
+                        crate::mapped_file::publish_current_mapping(
+                            crate::mapped_file::MappingOwnerRegistration {
+                                base,
+                                len,
+                                file_offset: offset,
+                                ops: Arc::clone(&ops),
+                                lifetime: mmap_lifetime.clone(),
+                                writeback_phys: None,
+                                replace: flags & MAP_FIXED != 0,
+                            },
+                            || {
+                                // SAFETY: VMA -> shared transactions are held;
+                                // the file owner lock stays held until the VMA
+                                // has its external lifetime registered.
+                                unsafe {
+                                    if flags & MAP_FIXED != 0 {
+                                        as_ref.replace_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    } else {
+                                        as_ref.map_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    }
+                                }
+                            },
+                            |receipt| {
+                                // SAFETY: same live root and VMA transaction;
+                                // rollback is receipt-scoped if PTE install
+                                // fails.
+                                match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                                    Ok(()) => Ok(()),
+                                    Err(error) => {
+                                        // SAFETY: VMA -> shared transactions
+                                        // remain held by the enclosing scopes.
+                                        let _ = unsafe {
+                                            as_ref.rollback_mapping_locked(receipt)
+                                        };
+                                        Err(error)
+                                    }
+                                }
+                            },
+                        )
                     })
-                    .is_err()
-                {
-                    // VMA registration failed for device MAP_SHARED → ENOMEM.
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                });
+                if let Err(error) = mapped {
+                    let errno = if error == narf_memory::AddressSpaceError::LockLimit {
+                        11i64 // EAGAIN
+                    } else {
+                        12i64 // ENOMEM
+                    };
+                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
                     return;
                 }
-                // SAFETY: `as_ref` is the calling task's AddressSpace (valid
-                // root); the region was just registered via map_region, so
-                // materialize installs only its PTEs over borrowed frames.
-                if unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_err() {
-                    // Roll back so the failed region can't poison later
-                    // materialize() calls (SHARED → PTE-clear only, the
-                    // device keeps its frames).
-                    let _ = as_ref.unmap_region(VirtAddr::new(base));
-                    // PTE installation failed for device MAP_SHARED → ENOMEM.
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-                    return;
-                }
-                crate::mapped_file::register_current_with_lifetime(
-                    base,
-                    len,
-                    offset,
-                    ops,
-                    mmap_lifetime,
-                );
+                record_fixed_replacement_owner_committed!();
                 #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
@@ -251,23 +386,67 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // boot-order constraint of the kind §4.1 imposes on the BPF
                 // page-table slots.
                 narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
-                if as_ref
-                    .map_region(Region {
+                let region = Region {
                         base: VirtAddr::new(base),
                         len,
                         // SHARED: the frames belong to the file, so teardown
                         // clears PTEs and frees nothing. FILE_DEMAND: an
                         // unbacked slot means "ask the file", not "allocate an
                         // anonymous zero page".
-                        perms: perms | RegionPerms::SHARED | RegionPerms::FILE_DEMAND,
+                        perms: perms
+                            | RegionPerms::SHARED
+                            | RegionPerms::FILE_DEMAND
+                            | RegionPerms::LOCK_EXEMPT,
                         phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
+                    };
+                let mapped = as_ref.with_vma_transaction(|| {
+                    narf_memory::with_shared_mapping_transaction(|| {
+                        crate::mapped_file::publish_current_mapping(
+                            crate::mapped_file::MappingOwnerRegistration {
+                                base,
+                                len,
+                                file_offset: offset,
+                                ops: Arc::clone(&ops),
+                                lifetime: None,
+                                writeback_phys: None,
+                                replace: flags & MAP_FIXED != 0,
+                            },
+                            || {
+                                // SAFETY: VMA -> shared transactions are held
+                                // while the owner lock prevents a racing fault
+                                // from observing an ownerless FILE_DEMAND VMA.
+                                unsafe {
+                                    if flags & MAP_FIXED != 0 {
+                                        as_ref.replace_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    } else {
+                                        as_ref.map_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    }
+                                }
+                            },
+                            |_receipt| Ok(()),
+                        )
                     })
-                    .is_err()
-                {
-                    // VMA registration failed for demand-paged device → ENOMEM.
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                });
+                if let Err(error) = mapped {
+                    let errno = if error == narf_memory::AddressSpaceError::LockLimit {
+                        11i64
+                    } else {
+                        12i64
+                    };
+                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
                     return;
                 }
+                record_fixed_replacement_owner_committed!();
                 // No `materialize` call: every slot is unbacked, so it would
                 // install nothing. The PTEs arrive one demand fault at a time.
                 //
@@ -276,7 +455,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // through this table, and the frames the file hands out must
                 // not be returned to the allocator while this mapping can
                 // still reach them.
-                crate::mapped_file::register_current(base, len, offset, ops);
+                // Registration was committed atomically with VMA publication
+                // by `publish_current_mapping` above.
                 #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
@@ -297,89 +477,123 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // vanish from the parent's view (every counter reads back 0). Degrades to
     // the private-anonymous path below if the registry is unavailable or the
     // segment exceeds the per-handle cap (1 MiB); never a hard failure.
-    if flags & MAP_SHARED != 0 && (flags & MAP_ANONYMOUS != 0 || fd < 0) {
+    if flags & MAP_SHARED != 0 && anonymous {
         if let Some(v) = shmem_vtable() {
             let handle = (v.create)(current_task_id(), len);
             if handle != 0 {
-                let mapped = narf_memory::with_shared_mapping_transaction(|| {
-                    let mut frames_raw = alloc::vec::Vec::new();
-                    if !(v.frames)(handle, &mut frames_raw) || frames_raw.len() != pages {
-                        return Err(narf_memory::AddressSpaceError::Unmapped);
-                    }
-                    let phys = frames_raw
-                        .into_iter()
-                        .map(narf_memory::PhysAddr::new)
-                        .collect();
-                    // SAFETY: registry snapshot and alias insertion share one
-                    // transaction.
-                    unsafe {
-                        as_ref.map_shared_region_locked(Region {
+                let mapped = as_ref.with_vma_transaction(|| {
+                    narf_memory::with_shared_mapping_transaction(|| {
+                        let mut frames_raw = alloc::vec::Vec::new();
+                        if !(v.frames)(handle, &mut frames_raw) || frames_raw.len() != pages {
+                            return Err(narf_memory::AddressSpaceError::Unmapped);
+                        }
+                        let phys = frames_raw
+                            .into_iter()
+                            .map(narf_memory::PhysAddr::new)
+                            .collect();
+                        let region = Region {
                             base: VirtAddr::new(base),
                             len,
                             perms: perms | RegionPerms::SHARED,
                             phys,
-                        })
-                    }
-                });
-                if mapped.is_ok() {
-                    // SAFETY: `as_ref` is the calling task's AddressSpace
-                    // (valid root); the region was just registered, so
-                    // materialize installs only its PTEs over the registry
-                    // frames.
-                    if unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_ok() {
-                        // This handle is an implementation detail, not a name
-                        // userspace can ever attach again. Remove it as soon
-                        // as the VMA has retained every frame: the registry's
-                        // per-page refs keep the backing alive across fork and
-                        // until the last unmap, while retired mappings no
-                        // longer accumulate as public entries and turn every
-                        // later retain/release into an ever-longer linear
-                        // scan. This is the anonymous-mapping equivalent of
-                        // creating a shm object and immediately IPC_RMID'ing
-                        // it after the first attachment.
-                        if !(v.destroy)(handle) {
-                            let _ = as_ref.unmap_region(VirtAddr::new(base));
-                            // Segment teardown failed after mapping → ENOMEM.
-                            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-                            return;
-                        }
-                        #[cfg(feature = "linux-compat")]
-                        crate::perf_event::on_mmap(
-                            current_task_id(),
-                            -1,
+                        };
+                        crate::mapped_file::publish_current_unowned_mapping(
                             base,
                             len,
-                            0,
-                            prot,
-                            flags,
-                        );
-                        ctx.set_return(SyscallReturn::ok(base));
+                            flags & MAP_FIXED != 0,
+                            || {
+                                // SAFETY: VMA -> shared-owner transactions
+                                // cover the backing snapshot and alias
+                                // publication.
+                                unsafe {
+                                    if flags & MAP_FIXED != 0 {
+                                        as_ref.replace_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    } else {
+                                        as_ref.map_shared_region_locked_limited_receipt(
+                                            region,
+                                            explicit_lock,
+                                            mlock_authority.limit_bytes,
+                                            mlock_authority.bypass_limit,
+                                        )
+                                    }
+                                }
+                            },
+                            |receipt| {
+                                // SAFETY: root plus VMA/shared transactions
+                                // remain live through completion.
+                                match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                                    Ok(()) => Ok(()),
+                                    Err(error) => {
+                                        // SAFETY: both structural
+                                        // transactions remain held.
+                                        let _ = unsafe {
+                                            as_ref.rollback_mapping_locked(receipt)
+                                        };
+                                        Err(error)
+                                    }
+                                }
+                            },
+                        )
+                    })
+                });
+                if let Ok(receipt) = mapped {
+                    record_fixed_replacement_owner_committed!();
+                    // This handle is an implementation detail, not a name
+                    // userspace can ever attach again. Remove it as soon as
+                    // the VMA has retained every frame.
+                    if !(v.destroy)(handle) {
+                        let _ = as_ref.rollback_mapping(receipt);
+                        // Segment teardown failed after mapping → ENOMEM.
+                        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                         return;
                     }
-                    // Mapped but materialize failed (e.g. the fixed hint
-                    // hits a kernel huge page): ROLL BACK. Leaving the
-                    // region registered poisons the AS — every later
-                    // materialize() re-walks it, hits the same error, and
-                    // every subsequent mmap in the process fails. The
-                    // region is SHARED so unmap_region only clears PTEs
-                    // (frames stay registry-owned), then destroy reaps
-                    // the now-unreferenced segment.
-                    let _ = as_ref.unmap_region(VirtAddr::new(base));
-                    (v.destroy)(handle);
-                    // PTE installation failed for anon MAP_SHARED → ENOMEM.
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                    #[cfg(feature = "linux-compat")]
+                    crate::perf_event::on_mmap(
+                        current_task_id(),
+                        -1,
+                        base,
+                        len,
+                        0,
+                        prot,
+                        flags,
+                    );
+                    ctx.set_return(SyscallReturn::ok(base));
                     return;
                 }
-                // Not mapped (frames lookup / page-count mismatch / map_region
-                // failed) — no region references the frames, so reap the
-                // just-created segment now, then fall through to private anon.
+                let map_error = mapped.expect_err("mapped success returned above");
                 (v.destroy)(handle);
+                if map_error == narf_memory::AddressSpaceError::LockLimit {
+                    ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+                    return;
+                }
+                if flags & MAP_FIXED != 0 {
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                    return;
+                }
+                // Registry lookup/insertion failure for an ordinary anonymous
+                // shared mapping may still degrade to private anonymous.
             }
         }
         // Registry unavailable or create failed: degrade to private anonymous.
     }
 
-    let anonymous = flags & MAP_ANONYMOUS != 0 || fd < 0;
+    if as_ref
+        .check_locked_mapping_limit(
+            len,
+            explicit_lock,
+            mlock_authority.limit_bytes,
+            mlock_authority.bypass_limit,
+        )
+        .is_err()
+    {
+        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+        return;
+    }
     let shared_file_fallback = !anonymous && flags & MAP_SHARED != 0;
     let mut shared_file_ops = None;
     let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
@@ -480,17 +694,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         frames
     };
 
+    let mut shared_publication = None;
     if let Some(ops) = shared_file_ops.as_ref() {
-        phys_list = crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+        let (canonical, publication) =
+            crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+        phys_list = canonical;
+        shared_publication = Some(publication);
     }
-
-    // Only the shared-file rollback path needs a second owner-side list.
-    // Anonymous mmap previously cloned its potentially huge all-zero vector
-    // solely to keep `phys_list` available for an error arm that can never use
-    // it, adding another O(pages) copy before returning the lazy VMA.
-    let shared_rollback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
-    if as_ref
-        .map_region(Region {
+    let writeback_phys = shared_file_ops.as_ref().map(|_| phys_list.clone());
+    let region = Region {
             base: VirtAddr::new(base),
             len,
             // Generic MAP_SHARED file mappings borrow a frame from the
@@ -503,47 +715,128 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 perms
             },
             phys: phys_list,
+        };
+    let map_result = if let Some(ops) = shared_file_ops.as_ref() {
+        as_ref.with_vma_transaction(|| {
+            narf_memory::with_shared_mapping_transaction(|| {
+                crate::mapped_file::publish_current_mapping(
+                    crate::mapped_file::MappingOwnerRegistration {
+                        base,
+                        len,
+                        file_offset: offset,
+                        ops: Arc::clone(ops),
+                        lifetime: None,
+                        writeback_phys,
+                        replace: flags & MAP_FIXED != 0,
+                    },
+                    || {
+                        // SAFETY: VMA -> shared transactions are held and the
+                        // canonical page cache owns every nonzero frame.
+                        unsafe {
+                            if flags & MAP_FIXED != 0 {
+                                as_ref.replace_shared_region_locked_limited_receipt(
+                                    region,
+                                    explicit_lock,
+                                    mlock_authority.limit_bytes,
+                                    mlock_authority.bypass_limit,
+                                )
+                            } else {
+                                as_ref.map_shared_region_locked_limited_receipt(
+                                    region,
+                                    explicit_lock,
+                                    mlock_authority.limit_bytes,
+                                    mlock_authority.bypass_limit,
+                                )
+                            }
+                        }
+                    },
+                    |receipt| {
+                        // SAFETY: the root and VMA transaction remain live.
+                        match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                            Ok(()) => Ok(()),
+                            Err(error) => {
+                                // SAFETY: VMA -> shared transactions remain
+                                // held; rollback cannot target a replacement.
+                                let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
+                                Err(error)
+                            }
+                        }
+                    },
+                )
+            })
         })
-        .is_err()
-    {
-        if let Some(phys) = shared_rollback_phys.as_deref() {
-            crate::mapped_file::discard_unmapped_shared_file_pages(phys);
-        }
-        // Generic VMA registration failed → ENOMEM.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-        return;
-    }
-    // Anonymous private mappings are entirely lazy (`phys[i] == 0`), so there
-    // is nothing to install. Walking every slot here made mmap cost O(length)
-    // once to discover that fact, before the demand-fault path did the real
-    // per-page work; stress-ng's 64 MiB mmap churn paid a 16K-slot no-op walk
-    // on every iteration. File-backed mappings have resident frames and still
-    // materialize exactly this range.
-    let materialize_failed = if anonymous {
-        false
+    } else if flags & MAP_FIXED != 0 {
+        as_ref.with_vma_transaction(|| {
+            crate::mapped_file::publish_current_unowned_mapping(
+                base,
+                len,
+                true,
+                || {
+                    // SAFETY: the VMA transaction is held. This mapping is
+                    // private, so no shared transaction is required.
+                    unsafe {
+                        as_ref.replace_region_locked_limited_receipt(
+                            region,
+                            explicit_lock,
+                            mlock_authority.limit_bytes,
+                            mlock_authority.bypass_limit,
+                        )
+                    }
+                },
+                |receipt| {
+                    if anonymous {
+                        return Ok(());
+                    }
+                    // SAFETY: the root and VMA transaction remain live.
+                    match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                        Ok(()) => Ok(()),
+                        Err(error) => {
+                            // SAFETY: the VMA transaction remains held and the
+                            // receipt names a private mapping.
+                            let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
+                            Err(error)
+                        }
+                    }
+                },
+            )
+        })
     } else {
-        // SAFETY: `as_ref` is the calling task's live AddressSpace and the
-        // region was just registered via `map_region`.
-        unsafe { as_ref.materialize_range(VirtAddr::new(base), len) }.is_err()
+        let receipt = as_ref.map_region_limited_receipt(
+            region,
+            explicit_lock,
+            mlock_authority.limit_bytes,
+            mlock_authority.bypass_limit,
+        );
+        receipt.and_then(|receipt| {
+            if anonymous {
+                return Ok(receipt);
+            }
+            finish_nonfixed_private_file_mapping(&as_ref, receipt)
+        })
     };
-    if materialize_failed {
-        // Roll the region back — leaving it registered poisons every
-        // later materialize() in this AS (each re-walks the region,
-        // hits the same map error, and the whole mmap surface goes
-        // dark for the process). unmap_region frees any file-read
-        // frames via the region's own phys list.
-        let _ = as_ref.unmap_region(VirtAddr::new(base));
-        // File-path PTE installation failed, rolled back → ENOMEM.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+    if let Err(error) = map_result {
+        // Drop releases only this attempt's pending cache holds. A concurrent
+        // mapper selecting the same canonical page retains its own hold.
+        drop(shared_publication);
+        let errno = if error == narf_memory::AddressSpaceError::LockLimit {
+            11i64 // EAGAIN: a CLONE_VM peer consumed the limit after preflight.
+        } else {
+            12i64 // ENOMEM
+        };
+        ctx.set_return(SyscallReturn::ok((-errno) as u64));
         return;
     }
-
-    if let Some(ops) = shared_file_ops {
-        let phys = as_ref
-            .lookup(VirtAddr::new(base))
-            .map(|region| region.phys)
-            .unwrap_or_default();
-        crate::mapped_file::register_file_current(base, len, offset, ops, phys);
+    if let Some(publication) = shared_publication.take() {
+        // map_region retained every SHARED frame before returning. Convert
+        // this attempt's pending holds into those committed mapping refs.
+        publication.commit();
+    }
+    if shared_file_ops.is_some() {
+        record_fixed_replacement_owner_committed!();
+    } else if flags & MAP_FIXED != 0 {
+        // The unowned publication helper already retired overlapping mapped
+        // file owners under the VMA transaction.
+        record_fixed_replacement_owner_committed!();
     }
 
     #[cfg(feature = "linux-compat")]
@@ -656,6 +949,111 @@ mod tests {
             false
         }
     }
+
+    fn mmap_errno(args: SyscallArgs) -> Option<i64> {
+        let mut ctx = TestCtx { args, ret: None };
+        sys_mmap(&mut ctx);
+        ctx.ret
+            .filter(|ret| ret.status == SyscallReturn::OK)
+            .map(|ret| -(ret.value as i64))
+    }
+
+    fn smoke_mmap_linux_validation_errno_order() -> TestResult {
+        let aspace = Arc::new(AddressSpace::empty());
+        *USER_AS.lock() = Some(aspace);
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+
+        let unaligned_offset = mmap_errno(SyscallArgs {
+            arg1: 0,
+            arg3: 0x10, // MAP_FIXED, file-backed
+            arg4: u64::MAX,
+            arg5: 1,
+            ..SyscallArgs::default()
+        });
+        let bad_fd_precedes_zero_len = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0,
+            arg3: 0x10, // MAP_FIXED, file-backed
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let zero_len_precedes_fixed_alignment = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0,
+            arg3: 0x32, // MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let unaligned_fixed = mmap_errno(SyscallArgs {
+            arg0: AddressSpace::USER_FIXED_FLOOR + 1,
+            arg1: 0x1000,
+            arg3: 0x32,
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        let below_security_floor = mmap_errno(SyscallArgs {
+            arg0: 0,
+            arg1: 0x1000,
+            arg3: 0x32,
+            arg4: u64::MAX,
+            ..SyscallArgs::default()
+        });
+        *USER_AS.lock() = None;
+
+        if unaligned_offset != Some(22)
+            || bad_fd_precedes_zero_len != Some(9)
+            || zero_len_precedes_fixed_alignment != Some(22)
+            || unaligned_fixed != Some(22)
+            || below_security_floor != Some(1)
+        {
+            return TestResult::Fail("mmap validation errno/order diverged from Linux");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_mmap_linux_validation_errno_order);
+
+    fn smoke_nonfixed_file_mmap_stale_completion_is_success() -> TestResult {
+        const BASE: u64 = 0x0000_3f00_0000_0000;
+        let aspace = AddressSpace::empty();
+        let first = Region {
+            base: VirtAddr::new(BASE),
+            len: 4096,
+            perms: RegionPerms::READ,
+            phys: vec![PhysAddr::new(0)],
+        };
+        let receipt = match aspace.map_region_limited_receipt(first, false, u64::MAX, false) {
+            Ok(receipt) => receipt,
+            Err(_) => return TestResult::Fail("initial file VMA publication failed"),
+        };
+        let successor = Region {
+            base: VirtAddr::new(BASE),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: vec![PhysAddr::new(0)],
+        };
+        if aspace
+            .replace_region_limited_receipt(successor, false, u64::MAX, false)
+            .is_err()
+        {
+            return TestResult::Fail("racing replacement publication failed");
+        }
+        if finish_nonfixed_private_file_mapping(&aspace, receipt).is_err() {
+            return TestResult::Fail("stale completion turned successful mmap into ENOMEM");
+        }
+        if aspace
+            .lookup(VirtAddr::new(BASE))
+            .is_none_or(|region| !region.perms.contains(RegionPerms::WRITE))
+        {
+            return TestResult::Fail("stale completion touched the racing replacement");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_nonfixed_file_mmap_stale_completion_is_success
+    );
 
     /// The syscall must materialize only the VMA it just registered. A full
     /// address-space walk would revisit this deliberately conflicting VMA,
@@ -1000,14 +1398,10 @@ mod tests {
         CURRENT_TASK.store(ARENA_TASK, Ordering::Relaxed);
         crate::fd::__test_reset();
         crate::handlers::register_task_to_pid(ARENA_TASK, ARENA_PROCESS);
-        // Any owner left behind by an earlier run would answer this pid's
-        // demand faults from the wrong file.
-        crate::mapped_file::process_exit(ARENA_PROCESS, ARENA_PROCESS);
         Some(aspace)
     }
 
     fn arena_test_teardown() {
-        crate::mapped_file::process_exit(ARENA_PROCESS, ARENA_PROCESS);
         crate::fd::__test_reset();
         CURRENT_TASK.store(TASK, Ordering::Relaxed);
         *USER_AS.lock() = None;

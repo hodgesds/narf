@@ -77,24 +77,119 @@ the mapping syscall does not walk unrelated regions or allocate resident data
 pages. Anonymous `MAP_SHARED` mappings eagerly allocate registry-owned frames,
 retain them through the VMA and any fork aliases, and immediately remove their
 internal shmem name; the last alias unmap reclaims the backing without retaining
-one public registry entry per completed mapping until process exit. `mremap(2)`
-supports no-op resize, real tail shrink, in-place lazy grow,
-`MREMAP_MAYMOVE`, and disjoint `MREMAP_FIXED` replacement while preserving
-resident backing without copying it. The current operation requires one
-complete private base-page VMA. Shared/huge/sub-VMA moves and
-`MREMAP_DONTUNMAP` fail explicitly; retaining an ordinary private alias would
-not implement Linux's old-range fault/userfaultfd contract safely.
+one public registry entry per completed mapping until process exit.
+The native mmap entry validates a page-aligned byte offset before descriptor
+lookup, resolves non-anonymous descriptors before `do_mmap`-style validation,
+rejects an exact zero length with `EINVAL`, and distinguishes fixed-address
+misalignment (`EINVAL`), range exhaustion (`ENOMEM`), and the protected
+low-address floor (`EPERM`) in Linux order.
+
+File/device mapping publication holds the address-space transaction and that
+address space's owner bucket while it atomically retires overlapping owners
+and registers the new external owner. A `FILE_DEMAND` fault that observes
+newly-published VMA metadata blocks on the same per-address-space transaction
+until the file reference is visible; unrelated address spaces do not share
+that lock. Deferred PTE
+materialization and error rollback carry an opaque memory publication receipt;
+a concurrent identical-address replacement makes the receipt stale and cannot
+be materialized, removed, or registered by the losing syscall.
+
+`mremap(2)` supports no-op resize, real tail shrink, in-place lazy grow,
+`MREMAP_MAYMOVE`, disjoint `MREMAP_FIXED`, and `MREMAP_DONTUNMAP`. Private
+relocation transfers resident backing without copying it; DONTUNMAP leaves a
+lazy anonymous source range and transfers its lock contract to the
+destination. One-Region base-page shared mappings support ordinary shrink,
+in-place grow, MAYMOVE/FIXED relocation and equal-length DONTUNMAP, plus the
+historical `old_len == 0` duplication form. Ordinary relocation transfers kept
+backing and resident leaves, leaves a grown tail lazy, and releases a truncated
+tail only after source invalidation. DONTUNMAP and legacy duplication instead
+keep the backing owned by both VMAs; resident leaves move for DONTUNMAP and
+clone for duplication. File-demand slices and SysV attachment/nattch state are
+fallibly prepared and published atomically with every memory outcome,
+including fixed target retirement and a later source-tail shrink on failure.
+Huge, swapped, and cross-Region shared moves still fail explicitly.
+Parameter checks precede VMA lookup as on Linux. Every accepted lookup,
+resource-limit decision, resize, and move shares one address-space transaction,
+so a CLONE_VM peer cannot replace the source between validation and mutation.
+Growth checks locked bytes first (`EAGAIN`), then page-rounded `RLIMIT_AS` and
+private-writable non-stack `RLIMIT_DATA` (`ENOMEM`), including Linux's
+soft-DATA-zero/hard-limit compatibility rule. Fixed replacement conditionally
+takes the global shared-backing transaction only when the target overlaps
+borrowed backing; file/SysV owner rows are retired on success and on typed
+post-punch failure, and eager locked-tail population runs after all IRQ-safe
+transactions are released.
+
+Linux-compatible `brk(2)` likewise changes only the address-space break and
+its single anonymous heap VMA. Growth appends lazy zero-backed page slots and
+does not allocate, zero, or materialize resident frames in syscall context;
+first touch uses the ordinary user-reserve-aware demand-fault path. Shrink
+retires only the rounded tail. Validation, `RLIMIT_DATA`/`RLIMIT_AS` and
+inherited-memory-lock admission, VMA mutation, and break publication share one
+address-space transaction, so CLONE_VM peers cannot publish a stale break.
+Requests below the arena base, a metadata-allocation or overlap failure, and a
+failed tail teardown return the previous break as required by the Linux syscall
+ABI. `RLIMIT_DATA` includes the main executable's file-backed data span and is
+checked against the byte-precise request before page alignment; `RLIMIT_AS`
+charges page-rounded VMA growth but not NARF's synthetic stack-guard entry.
 
 `mlock(2)` and `munlock(2)` round byte intervals outward to pages, reject a
 non-empty range containing any unmapped page, and split VMAs so LOCKED applies
-exactly to the request; a zero length is a successful no-op. Plain `mlock`
-eagerly populates anonymous and file-demand
-pages. `mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;
+exactly to the visited request prefix; as on Linux, a later hole does not undo
+flags already applied to earlier VMAs. A zero length is a successful no-op.
+Plain `mlock` publishes LOCKED before eagerly populating anonymous and
+file-demand pages, and population failure does not roll that flag back.
+Malformed/wrapping range arithmetic returns `EINVAL`, an uncovered range
+returns `ENOMEM`, and eager-population failure returns `EAGAIN`.
+`mlock2(MLOCK_ONFAULT)` records LOCKED without populating lazy pages;
 their ordinary first fault supplies backing that reclaim must then retain.
 `munlock` clears the marker without discarding resident contents.
 `mlockall(MCL_CURRENT|MCL_ONFAULT)` applies the same lazy pinning to existing
-VMAs. `MCL_FUTURE` is accepted for compatibility but is not yet retained as a
-policy on subsequently created VMAs.
+VMAs. `MCL_FUTURE` is address-space state shared by CLONE_VM tasks: ordinary
+new mappings and `brk` growth inherit its eager or on-fault mode, while each
+subsequent `mlockall` replaces the prior future policy. A CURRENT-only call
+therefore clears an older future policy, FUTURE-only leaves current VMA lock
+bits unchanged, and `munlockall` clears both in one address-space transaction.
+Fork children start with neither current nor future memory locks. Eager
+population performed for CURRENT or inherited FUTURE locking is best-effort
+after the lock flags are published, matching Linux; stack guards and hardware
+huge mappings are lock-exempt.
+
+The family enforces the caller's process-shared `RLIMIT_MEMLOCK` against
+virtual locked bytes, including lazy ONFAULT pages. Invalid flags precede the
+authority check; a zero limit without authenticated lock authority returns
+`EPERM`, `mlock`/CURRENT-limit excess returns `ENOMEM`, and locked `mmap` or
+`mremap` admission returns `EAGAIN` before any fixed target is replaced.
+`MAP_LOCKED` selects eager mode. Locked `brk` growth that exceeds the limit
+returns the unchanged break. Rlimits are shared by CLONE_THREAD tasks, copied
+by process fork/clone, and retired only when the process is reaped. Device/PFN
+mappings, vDSO/vvar, kernel control rings, guards, and hardware huge mappings
+are lock-exempt; inaccessible PROT_NONE reservations are not populated.
+`setrlimit` validation and replacement are one process-table transaction.
+`prlimit64` copies a proposed limit before PID/permission validation, returns
+`ESRCH` for a nonexistent target, and requires the caller's real uid+gid to
+match all representable target real/effective/saved IDs unless the target is
+the exact caller. It retains the target task through the operation and
+atomically snapshots the old value with any successful update. Automatic
+stack expansion uses the faulting task's process-shared `RLIMIT_STACK`,
+`RLIMIT_AS`, and `RLIMIT_MEMLOCK`; limit failure leaves its guard and PTEs
+unchanged and reaches userspace through the Linux stack-fault `ENOMEM`/SIGSEGV
+path.
+
+Linux job-control state is process-shared. `setsid(2)` rejects an existing
+process-group leader with `EPERM` without mutation; otherwise SID, PGID, and
+controlling-terminal detachment publish under one fixed-order transaction and
+the returned SID is translated into the caller's visible PID space. PTY
+`TIOCSCTTY` accepts either endpoint, preserves Linux's same-session idempotent
+success ordering, requires a detached session leader, applies the fd read-mode
+check after ownership checks, and publishes raw session plus foreground group
+together. PTY control IDs remain stable internal task identities and are
+translated only by the querying `TIOCGPGRP`/`TIOCGSID` syscall. A slave query
+requires that slave to be the caller's controlling tty; a master query bypasses
+that ownership check. `TIOCSPGRP` on either endpoint requires the caller to
+control the slave and distinguishes `ENOTTY`, `EFAULT`, `EINVAL`, `ESRCH`, and
+`EPERM` in Linux order. NARF has no authenticated ambient `CAP_SYS_ADMIN`
+bridge, so tty stealing and the unreadable-fd privileged bypass fail closed
+with `EPERM`; emulated capset masks and uid zero never authorize them.
 
 `mprotect(2)` requires a page-aligned address, rounds a nonzero length
 upward, and validates complete coverage across base and hardware-huge VMAs
@@ -152,6 +247,24 @@ duplicate descriptor keeps the watch live after the original descriptor
 closes, and final close invalidates the watch without the epoll instance
 artificially retaining the file. `EPOLLERR` and `EPOLLHUP` are delivered
 regardless of the registered interest mask, matching Linux epoll semantics.
+`poll(2)` and `ppoll(2)` likewise report `POLLERR`, `POLLHUP`, and
+`POLLNVAL` without requiring those bits in the requested event mask.
+`select(2)` and `pselect6(2)` use Linux's distinct fd-set mapping: hangup and
+error make a requested read set ready, error makes a requested write set
+ready, and only priority/OOB data makes a requested exception set ready.
+Their return value counts ready result-set bits (so one descriptor ready in
+two sets contributes two), and an invalid selected descriptor returns `EBADF`.
+Bad fd-set, timeout, signal-mask, or pselect argpack pointers return `EFAULT`;
+negative descriptor counts, invalid timeout fields, and an invalid non-null
+signal-mask size return `EINVAL`. Descriptor counts are signed 32-bit values
+and positive counts are clamped to the process fdtable's current `max_fds`,
+not libc's `FD_SETSIZE`; only the native-word-rounded prefix of each set is
+accessed. Empty sets still perform an interruptible timeout wait. `pselect6`
+installs its validated temporary signal mask atomically for the whole wait and
+restores the prior mask on readiness, timeout, or post-handler `sigreturn`.
+Both raw syscalls retain nanosecond deadline precision and best-effort write
+the remaining timeout back without replacing the syscall's primary result if
+that write-back faults.
 An epoll wait accepts at most `maxevents` entries. Only entries actually
 returned to the caller advance edge-trigger tokens, acknowledge provider-local
 readiness, take an exclusive claim, or disarm `EPOLLONESHOT`; additional ready
@@ -165,6 +278,198 @@ Connected socket rings advance their token only on readiness transitions
 leave readiness unchanged do not synthesize edges. A drain followed by new
 data before the next `epoll_wait` remains a deliverable edge even though both
 sampled readiness masks contain `POLL_IN`.
+Blocking stream `send(2)` and `sendmsg(2)` park on the connected ring's durable
+writable readiness when no byte fits, then re-execute after space or closure is
+published. `O_NONBLOCK` and `MSG_DONTWAIT` return `EAGAIN` immediately.
+`sendmmsg(2)` returns an already-transmitted prefix without retrying it; when
+its first message would block it follows the same park-or-`EAGAIN` rule.
+Native `read(2)`, `write(2)`, `readv(2)`, and `writev(2)` resolve the
+descriptor and required access mode before user-range or iovec import,
+including zero-length operations. Scalar buffers and every imported iovec are
+validated before I/O, vector counts above 1024 return `EINVAL`, and effective
+length is capped at Linux `MAX_RW_COUNT`. Transfers use bounded kernel staging,
+preserve exact filesystem errors before progress, return an accepted prefix
+after progress, and distinguish blocking, `O_NONBLOCK`/`EAGAIN`, interrupting
+signals/`EINTR`, and broken-pipe `SIGPIPE`/`EPIPE`. A writev no larger than
+`PIPE_BUF` reaches a pipe as one write transaction across iovec boundaries.
+Anonymous-pipe and named-FIFO reads hold their queue prefix until the complete
+guarded scalar or vector user copy succeeds, so a protection change racing
+validation cannot consume unread bytes. NARF's byte queues do not retain Linux
+pipe-buffer/write boundaries, so the selected prefix is one logical buffer:
+an iovec fault after an earlier copied fragment still leaves that whole prefix
+queued, matching Linux's rule that the currently faulting pipe buffer is not
+consumed. Fanotify removes a selected event on a copy fault as Linux does, but
+reserves its object-fd numbers invisibly and publishes those fds only after the
+complete metadata copy succeeds; EFAULT therefore cannot leak an object fd.
+
+Each fd slot references a separate shared open-file-description object for
+file position and mutable status flags. `dup*`, `F_DUPFD`, fork inheritance,
+and `SCM_RIGHTS` alias that object, while `FD_CLOEXEC` remains per descriptor;
+independent opens create independent descriptions. Consequently `lseek`,
+sequential I/O, readiness-at-offset, `/proc/*/fdinfo`, and `F_GETFL/F_SETFL`
+observe changes made through any alias. Stdin is `O_RDONLY`, stdout/stderr are
+`O_WRONLY`, and sockets/socketpairs are `O_RDWR`; constructors do not rely on
+type-based access-mode exceptions. Sequential transfer syscalls pin these
+descriptions, lock distinct implicit positions in stable address order (or an
+alias once), snapshot positions only after locking, and commit directly to the
+pinned descriptions rather than a numeric fd that may have been closed and
+reused. Independent `O_APPEND` opens share an inode/FileOps append lock held
+across EOF selection and write, while their ordinary positions remain
+independent.
+
+The native send-family preserves Linux validation and errno ordering.
+`send(2)` validates a non-empty payload range before descriptor lookup;
+`sendmsg(2)` and `sendmmsg(2)` reject the kernel-only compat-control flag
+before distinguishing `EBADF` from `ENOTSOCK`, then import the complete native
+message header, address, iovec array, ancillary data, and payload without
+discarding user-copy failures. More than 1024 vectors returns `EMSGSIZE` and an
+unrepresentable ancillary length returns `ENOBUFS`. `sendmmsg` resolves its
+socket even when `vlen` is zero, caps `vlen` to 1024, returns the exact first
+message or `msg_len` write-back error when no message completed, and suppresses
+a later error only in favor of the number of already-completed messages.
+`sendfile(2)` imports and later writes back its optional 64-bit offset even
+when the transfer result is an error. It validates the readable input fd and
+explicit-offset seekability before resolving the writable output fd, rejects
+an append-mode output, clamps successful transfers to Linux `MAX_RW_COUNT`,
+and advances input and output positions only by bytes accepted by the sink.
+Exact filesystem, `EAGAIN`, broken-pipe/`SIGPIPE`, and user-copy errors are
+preserved; zero count still performs fd and mode validation. NARF stream
+inputs currently fail closed because their `FileOps` do not expose Linux's
+transactional `splice_read` source operation.
+`copy_file_range(2)` likewise serializes and commits implicit positions through
+the pinned descriptions. Explicit `loff_t` imports and write-backs use guarded
+user copies, so an unmapped or concurrently protected offset word returns
+`EFAULT` rather than silently supplying zero or reporting success.
+`splice(2)` returns zero for zero length before inspecting flags, descriptors,
+or offsets. Nonzero calls reject bits outside `SPLICE_F_ALL`, resolve input
+then output, reject a pipe-side offset with `ESPIPE` before user access, import
+`off_out` then `off_in`, and only then validate read/write modes and the
+one-pipe-required shape. Explicit non-pipe offsets are advanced only by the
+accepted prefix and are written back after a nonnegative result. Endpoint
+`O_NONBLOCK` implies `SPLICE_F_NONBLOCK`; empty/full live pipes park or return
+`EAGAIN`, while a closed sink raises `SIGPIPE` and returns `EPIPE`. Pipe moves
+are transactional: a short sink consumes only the accepted source prefix.
+Linux `vmsplice(2)` preserves the kernel entry-point's observable validation
+order: unknown flags are rejected before descriptor lookup; descriptor and
+access-mode errors precede iovec import; a valid descriptor's iovec copy and
+per-segment range errors precede the non-pipe and full-pipe checks. A NULL
+zero-segment iovec and any imported zero-total vector return zero before pipe
+identity or readiness is sampled. A valid nonblocking transfer into a full
+pipe returns `EAGAIN` only after those validations have succeeded. `O_PATH`
+remains part of the stored open-file status and represents neither readable nor
+writable mode, so `vmsplice` returns `EBADF` before importing its iovec. Both
+anonymous-pipe and named-FIFO read ends copy then commit each destination
+segment: a failed user copy cannot consume that segment's queued prefix, and a
+failure after earlier segments returns only the already-copied byte count.
+Native `getdents(2)` and `getdents64(2)` resolve the descriptor before touching
+the output range and distinguish `EBADF` from `ENOTDIR`. They snapshot a bounded
+directory batch per call, including the synchronous iterator fallback, so both
+wire formats retain linear full-directory traversal. Backend failures retain
+their Linux errno instead of becoming a false end-of-directory. A first record
+that cannot fit returns `EINVAL`; a first copy fault returns `EFAULT`; after any
+complete record, a later size, allocation, or copy failure returns the completed
+byte prefix and advances the directory cursor only through that prefix. The
+unsigned `count` argument is truncated to its native 32-bit ABI width.
+System V semaphore operations use Linux's default 500-operation `SEMOPM`
+boundary and validation order: `E2BIG`/zero-count validation precedes sembuf
+import, import faults are `EFAULT`, and `semtimedop(2)` imports its timeout
+first but validates its fields after the sembufs. Multi-operation changes are
+atomic. An imported `sem_num` outside the selected set returns `EFBIG` before
+the permission check. Only `SEM_UNDO` and `IPC_NOWAIT` affect `sem_flg`; Linux's
+other extension bits are accepted and ignored. A first `SEM_UNDO` flag,
+including on a zero operation, fallibly prepares the complete per-set
+adjustment array after set-id lookup but before member and permission checks;
+allocation failure therefore returns Linux's `ENOMEM` precedence. Blocking operations park
+interruptibly unless their blocking sembuf has `IPC_NOWAIT`; relative timed
+waits retain one absolute deadline across park/re-execution. Imported operation
+arrays and message payloads remain
+kernel-owned across that wait, so later user-memory mutation cannot alter an
+in-flight operation. Semaphore waiters are appended and evaluated in queue
+order after each relevant mutation, but an older operation that remains
+unsatisfied is skipped as on Linux. Eligible operations commit their semvals,
+`SEM_UNDO`, `sempid`, timestamp, and terminal result while the semaphore-state
+lock is still held; task wakeups occur after unlocking. Each task owns one
+replaceable durable waker, so repeated polls are deduplicated, a completion
+that precedes waker registration is observed on the registration recheck, and
+scheduler migration is transparent. Infinite waits have no polling deadline;
+timed waits return `EAGAIN`, signals return `EINTR`, and removal returns
+`EIDRM`, with the first terminal transition winning. `SEM_UNDO` adjustments are
+accumulated per process, atomically committed with the operation, shared by
+`CLONE_SYSVSEM`, cleared by `SETVAL`/`SETALL`, and reversed when the final
+sharing process exits. Exit applies every adjustment for one semaphore set
+before scanning its wait queue, so no operation observes a member-wise
+intermediate state.
+Semaphores retain Linux's per-member `sempid`: successful `semop` entries,
+including zero waits, `SETVAL`, every member of `SETALL`, and exit-time undo
+publish the responsible process, which `GETPID` translates into the querying
+task's PID namespace. `GETNCNT` and `GETZCNT` count retained operations by only
+the first blocking sembuf from their most recent atomic evaluation;
+interruption, timeout, successful retry, task exit, or set removal retires that
+waiter state. The counts are exact per-set integer state updated with queue
+linkage, so reads are O(1); they are not approximate per-CPU telemetry. System V
+message send imports the type and payload before queue lookup, reports copy
+faults as `EFAULT`, and reports payload or queue-record allocation failure as
+`ENOMEM` without partial publication. Queues enforce
+Linux's default 16-KiB byte and zero-length-message count limit; full blocking
+sends park, while `IPC_NOWAIT` returns `EAGAIN`. Receive supports Linux type
+selection, `IPC_NOWAIT`, `MSG_NOERROR`, `MSG_EXCEPT`, and `MSG_COPY`; an
+oversize receive without `MSG_NOERROR` returns `E2BIG` without dequeueing.
+Normal receives select and unlink the exact record in one locked queue
+transaction before copying the type and payload to userspace in Linux order;
+an ordinary `EFAULT` therefore consumes the selected message, while `MSG_COPY`
+retains it.
+Message queues and their sender/receiver wait records share one publication
+transaction: an operation is linked before its observed condition can change,
+and removal publishes `EIDRM` before the id disappears. Queue changes retain a
+recheck edge beside one replaceable task waker, so completion before waker
+registration, repeated polls, and scheduler migration are lossless without the
+generic 1-ms I/O polling deadline; wakers fire only after the state lock is
+released. Queue removal wakes staged semaphore, sender, and receiver waits with
+`EIDRM`.
+Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
+`IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;
+owner, creator, mode, supplementary-group, queue-limit, metadata timestamp,
+message count/byte count, and last-sender/receiver fields follow Linux.
+`msgctl(2)` also implements `IPC_INFO`, `MSG_INFO`, `MSG_STAT`, and
+`MSG_STAT_ANY`: information calls snapshot only the caller's IPC namespace and
+return its highest internal queue index, indexed-stat returns the full queue id,
+and `MSG_STAT_ANY` alone bypasses ordinary read-mode checks. Queue information
+uses Linux's native 32-byte `msginfo` layout and default MSGMNI/MSGMNB/MSGMAX
+limits. Creation admits at most 32,000 live queues per namespace and reports
+`ENOSPC` at that boundary. Last-sender and last-receiver identities are retained
+as outer process ids and translated into the querying task's PID namespace at
+copyout.
+Shared-memory, semaphore, and message identifiers and key lookups are scoped
+to the caller's current IPC namespace. Ordinary clone/fork inheritance shares
+the same namespace object and tables; `CLONE_NEWIPC` creates fresh empty tables
+with independent per-family id allocation, so equal numeric ids in different
+namespaces never alias. `CLONE_NEWIPC|CLONE_SYSVSEM` is rejected with `EINVAL`.
+The final task/ns-fd reference removes semaphore and message objects and wakes
+their waiters with `EIDRM`; shared-memory ids disappear at namespace teardown
+while already-attached VMAs retain their backing until final detach.
+System V shared-memory attachment follows Linux's native 64-bit ABI and
+validation order. `shmat(2)` validates signed ids and address shape first,
+rounds `SHM_RND` addresses to `SHMLBA`, requires a non-null address for
+`SHM_REMAP`, ignores otherwise unknown attach bits, and checks the requested
+read/write/execute permission before mapping. A fixed attach rejects overlap
+with `EINVAL` unless `SHM_REMAP` is present; replacement, registration, and
+materialization maintain exact rollback and backing-lifetime accounting.
+`SHM_RDONLY` and `SHM_EXEC` produce the corresponding shared VMA permissions.
+Attachments retain their original detach address across VMA splits and partial
+replacement. A single mm-level transaction serializes SysV VMA creation,
+fixed-range punching, attachment publication/removal, and `shm_nattch` changes
+across `CLONE_VM` siblings. `munmap(2)`, `MAP_FIXED`, `SHM_REMAP`, and an
+`MREMAP_FIXED` destination replacement update `shm_nattch`; a
+later `shmdt(2)` removes every surviving VMA fragment belonging to the selected
+logical attachment. Fork duplicates each inherited attachment and its count,
+whereas `CLONE_VM` processes share one mm-level attachment; exec and final
+process exit close the old address space's attachments. Segment backing belongs
+to the IPC object rather than its creator process. `IPC_RMID` removes the public id and key immediately but
+defers backing destruction until the final attachment closes. Native
+`shmctl(2)` imports the complete `shmid64_ds` before an `IPC_SET` lookup,
+resolves and permission-checks `IPC_STAT` before copyout, and reports owner,
+mode, size, creator/last-operation pids, attach count, and timestamps at their
+architecture ABI offsets.
 AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
 queues an accept-ready endpoint. Accepting the final pending endpoint followed
 by a new connection before the next epoll scan remains a deliverable
@@ -184,6 +489,14 @@ because another event joined an already-readable queue.
 Signalfd uses a per-task pending-set generation that advances only when the
 set changes from empty to nonempty, including the allocation-free IRQ raise
 path.
+Queued-signal syscalls import the complete native kernel `siginfo` prefix before
+publishing pending state. `rt_sigqueueinfo` and `rt_tgsigqueueinfo` require a
+readable non-null info pointer and preserve Linux's `EFAULT`-before-argument
+validation ordering; invalid targets and signals report `ESRCH` and `EINVAL`
+respectively without delivery. `pidfd_send_signal` rejects unsupported flags
+before fd resolution, validates non-null `si_signo`, checks that the pidfd still
+names a live target (including signal 0 probes), and never queues a payload or
+pending bit after a failed import or validation.
 Explicit stream shutdown publishes the same readiness notification as final
 descriptor close; a peer parked in an infinite poll/epoll wait wakes to
 `POLL_IN|POLL_HUP` and can consume EOF.
@@ -553,11 +866,13 @@ uniprocessor target matching the calling CPU.
 
 A successful file/device-backed `MAP_SHARED` mapping retains an
 `Arc<dyn FileOps>` independently of the descriptor table. Closing the fd does
-not invalidate mapped frames. The owner reference follows process
-fork/clone, mirrors `MAP_FIXED` region splitting, and is released by
-`munmap(2)` or process group-dead teardown. This registry lives in userspace
-compatibility code so address-space regions do not gain a filesystem
-dependency.
+not invalidate mapped frames. The owner reference is keyed by a stable
+address-space incarnation rather than PID: a real fork copies the bucket,
+`CLONE_VM` processes share it without duplication, and task migration is
+irrelevant. It mirrors `MAP_FIXED` region splitting and is released by
+`munmap(2)` or final address-space teardown after leaf invalidation. This
+registry lives in userspace compatibility code so address-space regions do not
+gain a filesystem dependency.
 
 When `FileOps::mmap_lifetime` returns a per-object owner, the same registry
 retains it beside the file reference and clones it across fork and VMA splits.

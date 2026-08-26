@@ -503,12 +503,6 @@ pub fn on_irq_with_user_state(
     }
     s.per_cpu_fired[cpu].fetch_add(1, Ordering::Release);
 
-    // Status-panel diag: bump the cross-vector total + record the
-    // most-recent vector so a bare-metal operator can see at a
-    // glance "are timer ticks landing? did IRQ1 ever fire?". Both
-    // updates are single-atomic ops; safe from IRQ context.
-    narf_memory::diag::bump_irq(vector);
-
     // Publish the dispatch marker for the lifetime of the chain
     // walk + waker drain. Any mutator (install_handler_named,
     // remove_handler, set_waker, etc.) called from inside a

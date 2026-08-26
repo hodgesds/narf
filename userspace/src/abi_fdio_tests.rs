@@ -13,12 +13,19 @@ use crate::abi_test_support::*;
 // 3 (0/1/2 are the pre-seeded stdio slots).
 
 /// Open `path` (a `&[u8]` ending in NUL) read/write; return the fd or
-/// an `Err` message. flags=0 — MemFs ignores the access mode.
+/// an `Err` message. Linux access modes are now enforced, so request O_RDWR.
 fn open_fd(path: &[u8]) -> Result<u32, &'static str> {
     let ptr = path.as_ptr() as u64;
-    match call_open(ptr, 0) {
+    match call_open(ptr, crate::fd::O_RDWR as u64) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open failed"),
+    }
+}
+
+fn open_fd_flags(path: &[u8], flags: u64) -> Result<u32, &'static str> {
+    match call_open(path.as_ptr() as u64, flags) {
+        Some(fd) if fd >= 0 => Ok(fd as u32),
+        _ => Err("open with flags failed"),
     }
 }
 
@@ -113,10 +120,47 @@ fn smoke_abi_fdio_writev_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_writev_pos);
 
+fn smoke_abi_fdio_append_independent_ofds_share_inode_lock() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let flags = (crate::fd::O_WRONLY | crate::fd::O_APPEND) as u64;
+        let left = open_fd_flags(b"/abi/f\0", flags)?;
+        let right = open_fd_flags(b"/abi/f\0", flags)?;
+        let task = crate::handlers::current_task_id();
+        let shared = crate::fd::with_table(task, |table| {
+            let left = table.description(left)?;
+            let right = table.description(right)?;
+            Some(core::ptr::eq(left.append_lock(), right.append_lock()))
+        })
+        .flatten()
+        .unwrap_or(false);
+        if !shared {
+            return Err("independent append OFDs did not share the inode append lock");
+        }
+        for (fd, byte) in [(left, [b'A']), (right, [b'B'])] {
+            if call(Syscall::Write.raw(), a2(fd as u64, byte.as_ptr() as u64, 1)) != Some(1) {
+                return Err("independent O_APPEND write failed");
+            }
+        }
+        let reader = open_fd_flags(b"/abi/f\0", crate::fd::O_RDONLY as u64)?;
+        let mut bytes = [0u8; 2];
+        match call(
+            Syscall::Read.raw(),
+            a2(reader as u64, bytes.as_mut_ptr() as u64, bytes.len() as u64),
+        ) {
+            Some(2) if &bytes == b"AB" => Ok(()),
+            _ => Err("independent O_APPEND writes overwrote one another"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_append_independent_ofds_share_inode_lock
+);
+
 fn smoke_abi_fdio_writev_neg() -> TestResult {
     with_setup(|| {
         // iovcnt > IOV_MAX (1024) → -EINVAL (Ok status, value -22).
-        match call(Syscall::Writev.raw(), a2(3, 0x1000, 2000)) {
+        match call(Syscall::Writev.raw(), a2(1, 0x1000, 2000)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("writev over IOV_MAX was not -EINVAL"),
         }
@@ -143,7 +187,7 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_readv_pos);
 fn smoke_abi_fdio_readv_neg() -> TestResult {
     with_setup(|| {
         // iovcnt > IOV_MAX → -EINVAL.
-        match call(Syscall::Readv.raw(), a2(3, 0x1000, 2000)) {
+        match call(Syscall::Readv.raw(), a2(0, 0x1000, 2000)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("readv over IOV_MAX was not -EINVAL"),
         }
@@ -354,12 +398,20 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_dup3_pos);
 fn smoke_abi_fdio_dup3_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let fd = open_fd(b"/abi/f\0")?;
-        // dup3 requires oldfd != newfd (unlike dup2) → InvalidOp when equal.
-        // LINUX-GAP: Linux dup3(fd, fd, 0) returns -EINVAL.
+        // dup3 requires oldfd != newfd (unlike dup2) → -EINVAL when equal.
         match call_raw(Syscall::Dup3.raw(), a2(fd as u64, fd as u64, 0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("dup3(fd, fd, 0) was not InvalidOp"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == -22 => {}
+            _ => return Err("dup3(fd, fd, 0) was not -EINVAL"),
         }
+        // Only O_CLOEXEC is accepted. The numerically-small FD_CLOEXEC slot
+        // bit and every unknown flag are rejected before oldfd lookup.
+        for flags in [1u64, 0x4000_0000] {
+            match call_raw(Syscall::Dup3.raw(), a2(8888, 52, flags)) {
+                r if r.status == SyscallReturn::OK && r.value as i64 == -22 => {}
+                _ => return Err("dup3 unknown flags did not precede bad-oldfd EBADF"),
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_dup3_neg);
@@ -1070,7 +1122,7 @@ fn smoke_abi_fdio_splice_shape() -> TestResult {
     with_memfs("/abi", "abi", &[("src", b"payload"), ("dst", b"")], || {
         const SPLICE_F_NONBLOCK: u64 = 0x2;
         let src = open_fd(b"/abi/src\0")?;
-        let dst = open_fd(b"/abi/dst\0")?;
+        let dst = open_fd_flags(b"/abi/dst\0", 1)?; // O_WRONLY
         let (rd, wr) = make_pipe()?;
         let mk = |a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64| SyscallArgs {
             arg0: a0,
@@ -1473,7 +1525,6 @@ kernel_test_in!(
 /// dup2(2) shares the open file description — the duplicate carries the
 /// description's status flags (O_NONBLOCK) and file offset
 /// (`fs/file.c::do_dup2`: both fds point at the same `struct file`).
-/// LINUX-GAP: NARF snapshots these at dup time rather than aliasing them.
 fn smoke_abi_fdio_dup2_carries_description_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
         const O_NONBLOCK: i64 = 0o4000;
@@ -1495,6 +1546,14 @@ fn smoke_abi_fdio_dup2_carries_description_pos() -> TestResult {
             Some(fl) if fl & O_NONBLOCK != 0 => {}
             _ => return Err("dup2 dropped O_NONBLOCK from the duplicate"),
         }
+        const F_SETFL: u64 = 4;
+        if call(Syscall::Fcntl.raw(), a2(20, F_SETFL, 0)) != Some(0) {
+            return Err("F_SETFL through duplicate failed");
+        }
+        match call(Syscall::Fcntl.raw(), a2(wr, F_GETFL, 0)) {
+            Some(fl) if fl & O_NONBLOCK == 0 => {}
+            _ => return Err("status flags were not shared with original fd"),
+        }
         // File offset: read 2 bytes, dup, and the duplicate continues at
         // offset 2 rather than rewinding to 0.
         let fd = open_fd(b"/abi/f\0")?;
@@ -1514,6 +1573,14 @@ fn smoke_abi_fdio_dup2_carries_description_pos() -> TestResult {
         }
         if &b2 != b"cd" {
             return Err("duplicate rewound to offset 0 instead of sharing it");
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(fd as u64, b2.as_mut_ptr() as u64, 2),
+        ) != Some(2)
+            || &b2 != b"ef"
+        {
+            return Err("duplicate advancement was not visible to original fd");
         }
         Ok(())
     })
@@ -1572,8 +1639,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_neg);
 fn smoke_abi_fdio_sendfile_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("src", b"hi"), ("dst", b"")], || {
         let in_fd = open_fd(b"/abi/src\0")?;
-        let out_fd = open_fd(b"/abi/dst\0")?;
-        // sendfile(out, in, NULL, 2) → 2 bytes copied.
+        let out_fd = open_fd_flags(b"/abi/dst\0", 1)?; // O_WRONLY
+                                                       // sendfile(out, in, NULL, 2) → 2 bytes copied.
         match call(
             Syscall::Sendfile.raw(),
             a3(out_fd as u64, in_fd as u64, 0, 2),
@@ -1587,16 +1654,181 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_sendfile_pos);
 
 fn smoke_abi_fdio_sendfile_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("dst", b"")], || {
-        let out_fd = open_fd(b"/abi/dst\0")?;
-        // bad in_fd → copy_fd_to_fd fails → -1 sentinel.
-        // LINUX-GAP: Linux sendfile(2) returns -EBADF.
+        let out_fd = open_fd_flags(b"/abi/dst\0", 1)?; // O_WRONLY
+                                                       // bad in_fd → -EBADF.
         match call(Syscall::Sendfile.raw(), a3(out_fd as u64, 7070, 0, 4)) {
-            Some(-1) => Ok(()),
-            _ => Err("sendfile with bad in_fd was not -1"),
+            Some(EBADF) => Ok(()),
+            _ => Err("sendfile with bad in_fd was not -EBADF"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_sendfile_neg);
+
+/// Pin `fs/read_write.c::{sendfile,do_sendfile}` validation ordering and
+/// exact errno values, including count==0 (which still validates both fds).
+fn smoke_abi_fdio_sendfile_exact_validation() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    const O_WRONLY: u64 = 1;
+    const O_APPEND: u64 = 0o2000;
+    with_memfs("/abi", "abi", &[("src", b"abcd"), ("dst", b"")], || {
+        if call(Syscall::Sendfile.raw(), a3(7001, 7002, BAD_PTR, 1)) != Some(EFAULT) {
+            return Err("sendfile did not import offset before fds");
+        }
+        let mut offset = 0u64;
+        let src = open_fd(b"/abi/src\0")?;
+        let dst = open_fd_flags(b"/abi/dst\0", O_WRONLY)?;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(dst as u64, 7002, (&mut offset as *mut u64) as u64, 1),
+        ) != Some(EBADF)
+        {
+            return Err("sendfile bad input fd was not EBADF");
+        }
+
+        let write_only_input = open_fd_flags(b"/abi/src\0", O_WRONLY)?;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(7001, write_only_input as u64, 0, 1),
+        ) != Some(EBADF)
+        {
+            return Err("sendfile did not validate input mode before output fd");
+        }
+        let (pipe_rd, _pipe_wr) = make_pipe()?;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(7001, pipe_rd as u64, (&mut offset as *mut u64) as u64, 1),
+        ) != Some(ESPIPE)
+        {
+            return Err("sendfile explicit pipe offset was not ESPIPE");
+        }
+
+        if call(Syscall::Sendfile.raw(), a3(7001, src as u64, 0, 1)) != Some(EBADF) {
+            return Err("sendfile bad output fd was not EBADF");
+        }
+        let read_only_output = open_fd_flags(b"/abi/dst\0", 0)?;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(read_only_output as u64, src as u64, 0, 1),
+        ) != Some(EBADF)
+        {
+            return Err("sendfile read-only output was not EBADF");
+        }
+        let append_output = open_fd_flags(b"/abi/dst\0", O_WRONLY | O_APPEND)?;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(append_output as u64, src as u64, 0, 1),
+        ) != Some(EINVAL)
+        {
+            return Err("sendfile O_APPEND output was not EINVAL");
+        }
+
+        let mut negative_offset = u64::MAX;
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(
+                dst as u64,
+                src as u64,
+                (&mut negative_offset as *mut u64) as u64,
+                1,
+            ),
+        ) != Some(EINVAL)
+            || negative_offset != u64::MAX
+        {
+            return Err("sendfile negative offset was not stable EINVAL");
+        }
+        if call(Syscall::Sendfile.raw(), a3(7001, src as u64, 0, 0)) != Some(EBADF) {
+            return Err("zero-count sendfile skipped fd validation");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sendfile",
+    smoke_abi_fdio_sendfile_exact_validation
+);
+
+/// A short pipe sink returns the accepted prefix and advances the input
+/// position by exactly that prefix, never by the staged read length.
+fn smoke_abi_fdio_sendfile_partial_pipe_preserves_tail() -> TestResult {
+    let payload = alloc::vec![0x6Du8; 8192];
+    with_memfs("/abi", "abi", &[("src", &payload)], || {
+        let src = open_fd(b"/abi/src\0")?;
+        let (rd, wr) = make_pipe()?;
+        let filler = alloc::vec![0xA6u8; 65536 - 32];
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, filler.as_ptr() as u64, filler.len() as u64),
+        ) != Some(filler.len() as i64)
+        {
+            return Err("failed to prepare partial sendfile sink");
+        }
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(wr as u64, src as u64, 0, payload.len() as u64),
+        ) != Some(32)
+        {
+            return Err("sendfile did not return the accepted pipe prefix");
+        }
+        let mut first = alloc::vec![0u8; 65536];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+            || first[filler.len()..] != payload[..32]
+        {
+            return Err("sendfile partial prefix was corrupted");
+        }
+        if call(
+            Syscall::Sendfile.raw(),
+            a3(wr as u64, src as u64, 0, payload.len() as u64),
+        ) != Some((payload.len() - 32) as i64)
+        {
+            return Err("sendfile skipped or lost the staged source tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sendfile",
+    smoke_abi_fdio_sendfile_partial_pipe_preserves_tail
+);
+
+fn smoke_abi_fdio_sendfile_pipe_errors() -> TestResult {
+    const O_NONBLOCK: u64 = 0o4000;
+    with_memfs("/abi", "abi", &[("src", b"x")], || {
+        let src = open_fd(b"/abi/src\0")?;
+        let mut fds = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(fds.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes(fds[..4].try_into().unwrap()) as u32;
+        let wr = i32::from_ne_bytes(fds[4..].try_into().unwrap()) as u32;
+        let chunk = [0x37u8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr as u64, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("failed to fill sendfile pipe");
+            }
+        }
+        if call(Syscall::Sendfile.raw(), a3(wr as u64, src as u64, 0, 1)) != Some(EAGAIN) {
+            return Err("sendfile to full O_NONBLOCK pipe was not EAGAIN");
+        }
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0)
+            || call(Syscall::Sendfile.raw(), a3(wr as u64, src as u64, 0, 1)) != Some(EPIPE)
+        {
+            return Err("sendfile to broken pipe was not EPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/sendfile", smoke_abi_fdio_sendfile_pipe_errors);
 
 // ── splice ─────────────────────────────────────────────────────────
 //
@@ -1660,6 +1892,523 @@ fn smoke_abi_fdio_splice_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_neg);
+
+/// Pin `fs/splice.c::{splice,__do_splice,do_splice}` ordering: zero length,
+/// flags, fd lookup, pipe-offset rejection, user offset import, then f_mode.
+fn smoke_abi_fdio_splice_exact_validation() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    const UNKNOWN_FLAG: u64 = 0x10;
+    const O_WRONLY: u64 = 1;
+    const O_APPEND: u64 = 0o2000;
+    let mk =
+        |fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64, flags: u64| SyscallArgs {
+            arg0: fd_in,
+            arg1: off_in,
+            arg2: fd_out,
+            arg3: off_out,
+            arg4: len,
+            arg5: flags,
+        };
+    with_memfs("/abi", "abi", &[("src", b"abcd"), ("dst", b"")], || {
+        // len==0 wins over unknown flags, bad fds, and invalid pointers.
+        if call(
+            Syscall::Splice.raw(),
+            mk(7001, BAD_PTR, 7002, BAD_PTR, 0, UNKNOWN_FLAG),
+        ) != Some(0)
+        {
+            return Err("zero-length splice validated later arguments");
+        }
+        if call(Syscall::Splice.raw(), mk(7001, 0, 7002, 0, 1, UNKNOWN_FLAG)) != Some(EINVAL) {
+            return Err("splice did not reject unknown flags before fds");
+        }
+
+        let src = open_fd(b"/abi/src\0")?;
+        let dst = open_fd_flags(b"/abi/dst\0", O_WRONLY)?;
+        let (rd, wr) = make_pipe()?;
+        if call(Syscall::Splice.raw(), mk(7001, 0, wr as u64, 0, 1, 0)) != Some(EBADF)
+            || call(Syscall::Splice.raw(), mk(src as u64, 0, 7002, 0, 1, 0)) != Some(EBADF)
+        {
+            return Err("splice fd lookup did not report EBADF");
+        }
+
+        // A pipe-side offset is ESPIPE without dereferencing the pointer.
+        if call(
+            Syscall::Splice.raw(),
+            mk(rd as u64, BAD_PTR, dst as u64, 0, 1, 0),
+        ) != Some(ESPIPE)
+        {
+            return Err("splice pipe offset did not precede uaccess");
+        }
+
+        // A non-pipe explicit offset is imported before f_mode validation.
+        let write_only_src = open_fd_flags(b"/abi/src\0", O_WRONLY)?;
+        if call(
+            Syscall::Splice.raw(),
+            mk(write_only_src as u64, BAD_PTR, wr as u64, 0, 1, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("splice f_mode check masked offset EFAULT");
+        }
+        let mut offset = 0u64;
+        if call(
+            Syscall::Splice.raw(),
+            mk(
+                write_only_src as u64,
+                (&mut offset as *mut u64) as u64,
+                wr as u64,
+                0,
+                1,
+                0,
+            ),
+        ) != Some(EBADF)
+        {
+            return Err("splice write-only input was not EBADF");
+        }
+        let read_only_dst = open_fd_flags(b"/abi/dst\0", 0)?;
+        if call(
+            Syscall::Splice.raw(),
+            mk(rd as u64, 0, read_only_dst as u64, 0, 1, 0),
+        ) != Some(EBADF)
+        {
+            return Err("splice read-only output was not EBADF");
+        }
+        let append_dst = open_fd_flags(b"/abi/dst\0", O_WRONLY | O_APPEND)?;
+        if call(
+            Syscall::Splice.raw(),
+            mk(rd as u64, 0, append_dst as u64, 0, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("splice O_APPEND output was not EINVAL");
+        }
+
+        // The two ends of one pipe name one pipe_inode_info: EINVAL.
+        if call(Syscall::Splice.raw(), mk(rd as u64, 0, wr as u64, 0, 1, 0)) != Some(EINVAL) {
+            return Err("splice to the same pipe was not EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/splice", smoke_abi_fdio_splice_exact_validation);
+
+/// O_NONBLOCK on either pipe endpoint implies SPLICE_F_NONBLOCK, and a pipe
+/// whose last reader closed reports EPIPE (plus SIGPIPE) rather than EINVAL.
+fn smoke_abi_fdio_splice_fd_nonblock_and_broken_pipe() -> TestResult {
+    const O_NONBLOCK: u64 = 0o4000;
+    with_memfs("/abi", "abi", &[("src", b"x")], || {
+        let src = open_fd(b"/abi/src\0")?;
+        let mut fds = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(fds.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes(fds[..4].try_into().unwrap()) as u32;
+        let wr = i32::from_ne_bytes(fds[4..].try_into().unwrap()) as u32;
+        let chunk = [0x55u8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr as u64, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("failed to fill nonblocking splice pipe");
+            }
+        }
+        if call(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src as u64,
+                arg2: wr as u64,
+                arg4: 1,
+                ..Default::default()
+            },
+        ) != Some(EAGAIN)
+        {
+            return Err("pipe O_NONBLOCK did not imply splice EAGAIN");
+        }
+
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("closing splice pipe reader failed");
+        }
+        if call(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src as u64,
+                arg2: wr as u64,
+                arg4: 1,
+                ..Default::default()
+            },
+        ) != Some(EPIPE)
+        {
+            return Err("splice to a broken pipe was not EPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/splice",
+    smoke_abi_fdio_splice_fd_nonblock_and_broken_pipe
+);
+
+/// splice(pipe → pipe) moves the queued bytes exactly once, reports the
+/// moved count, and leaves the source drained.
+fn smoke_abi_fdio_splice_pipe_to_pipe() -> TestResult {
+    with_setup(|| {
+        let (src_rd, src_wr) = make_pipe()?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        // Seed the source pipe with 5 bytes.
+        let payload = *b"hello";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(5)
+        {
+            return Err("seeding the source pipe failed");
+        }
+        // splice(src_rd, NULL, dst_wr, NULL, 5, 0) → 5 bytes moved.
+        match call_raw(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src_rd as u64,
+                arg1: 0,
+                arg2: dst_wr as u64,
+                arg3: 0,
+                arg4: 5,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == 5 => {}
+            _ => return Err("splice pipe→pipe did not move 5 bytes"),
+        }
+        // The bytes land in the destination pipe exactly once...
+        let mut b = [0u8; 8];
+        match call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, b.as_mut_ptr() as u64, 8),
+        ) {
+            Some(5) if &b[..5] == b"hello" => {}
+            _ => return Err("spliced bytes did not arrive in the destination pipe"),
+        }
+        // ...and the source is drained: a nonblocking read now EAGAINs (empty,
+        // writer still open) rather than re-delivering the moved bytes.
+        let _ = (src_rd, dst_wr);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_splice_pipe_to_pipe);
+
+/// A partially writable destination pipe must consume only the accepted
+/// source prefix. The old generic copy core drained/read 64 KiB first and then
+/// discarded `kbuf[written..]` after a short pipe write.
+fn smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail() -> TestResult {
+    let payload = alloc::vec![0x5Au8; 8192];
+    with_memfs("/abi", "abi", &[("src", &payload)], || {
+        let src = open_fd(b"/abi/src\0")?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        let filler = alloc::vec![0xA5u8; 65536 - 32];
+        if call(
+            Syscall::Write.raw(),
+            a2(dst_wr as u64, filler.as_ptr() as u64, filler.len() as u64),
+        ) != Some(filler.len() as i64)
+        {
+            return Err("failed to leave a 32-byte destination-pipe tail");
+        }
+        let splice = |len: usize| {
+            call(
+                Syscall::Splice.raw(),
+                SyscallArgs {
+                    arg0: src as u64,
+                    arg1: 0,
+                    arg2: dst_wr as u64,
+                    arg3: 0,
+                    arg4: len as u64,
+                    arg5: 0,
+                },
+            )
+        };
+        if splice(payload.len()) != Some(32) {
+            return Err("file splice did not report the accepted pipe prefix");
+        }
+        let mut first = alloc::vec![0u8; 65536];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+            || first[..filler.len()] != filler
+            || first[filler.len()..] != payload[..32]
+        {
+            return Err("first file splice corrupted the destination prefix");
+        }
+        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+            return Err("file splice skipped the tail after a short write");
+        }
+        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
+        ) != Some(tail.len() as i64)
+            || tail != payload[32..]
+        {
+            return Err("file splice lost or reordered its unwritten tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_file_to_partial_pipe_preserves_tail
+);
+
+/// Pipe-to-pipe splice needs an atomic source-consume/destination-append
+/// transaction: a 32-byte destination vacancy must leave the rest queued in
+/// the source for the next call.
+fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
+    with_setup(|| {
+        let (src_rd, src_wr) = make_pipe()?;
+        let (dst_rd, dst_wr) = make_pipe()?;
+        let payload = alloc::vec![0x3Cu8; 8192];
+        let filler = alloc::vec![0xC3u8; 65536 - 32];
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+            || call(
+                Syscall::Write.raw(),
+                a2(dst_wr as u64, filler.as_ptr() as u64, filler.len() as u64),
+            ) != Some(filler.len() as i64)
+        {
+            return Err("failed to seed partial pipe-to-pipe splice");
+        }
+        let splice = |len: usize| {
+            call(
+                Syscall::Splice.raw(),
+                SyscallArgs {
+                    arg0: src_rd as u64,
+                    arg1: 0,
+                    arg2: dst_wr as u64,
+                    arg3: 0,
+                    arg4: len as u64,
+                    arg5: 0,
+                },
+            )
+        };
+        if splice(payload.len()) != Some(32) {
+            return Err("pipe splice did not stop at destination capacity");
+        }
+        let mut first = alloc::vec![0u8; 65536];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+            || first[..filler.len()] != filler
+            || first[filler.len()..] != payload[..32]
+        {
+            return Err("partial pipe splice corrupted the destination");
+        }
+        if splice(payload.len()) != Some((payload.len() - 32) as i64) {
+            return Err("partial pipe splice did not retain the source tail");
+        }
+        let mut tail = alloc::vec![0u8; payload.len() - 32];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst_rd as u64, tail.as_mut_ptr() as u64, tail.len() as u64),
+        ) != Some(tail.len() as i64)
+            || tail != payload[32..]
+        {
+            return Err("partial pipe splice lost or reordered the source tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail
+);
+
+/// A non-pipe splice destination may use an explicit `off_out`. It advances
+/// that pointer without changing the destination fd's own cursor.
+fn smoke_abi_fdio_splice_honors_explicit_output_offset() -> TestResult {
+    with_memfs("/abi", "abi", &[("dst", b"abcdef")], || {
+        let dst = open_fd_flags(b"/abi/dst\0", 2)?; // O_RDWR
+        let (src_rd, src_wr) = make_pipe()?;
+        let payload = *b"XY";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(2)
+        {
+            return Err("failed to seed explicit-offset splice source");
+        }
+        let mut out_off = 2u64;
+        if call(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src_rd as u64,
+                arg1: 0,
+                arg2: dst as u64,
+                arg3: (&mut out_off as *mut u64) as u64,
+                arg4: 2,
+                arg5: 0,
+            },
+        ) != Some(2)
+            || out_off != 4
+        {
+            return Err("splice ignored or misadvanced explicit off_out");
+        }
+        let mut bytes = [0u8; 6];
+        if call(
+            Syscall::Read.raw(),
+            a2(dst as u64, bytes.as_mut_ptr() as u64, bytes.len() as u64),
+        ) != Some(6)
+            || &bytes != b"abXYef"
+        {
+            return Err("explicit off_out changed the fd cursor or wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_splice_honors_explicit_output_offset
+);
+
+/// vmsplice on a pipe READ end copies queued bytes OUT to user memory
+/// (`fs/splice.c` SPLICE_TO_USER). This direction used to hit
+/// `PipeRead::write`'s EBADF and abort stress-ng's vm-splice loop on the
+/// first iteration; it now drains the ring into the iov buffer.
+fn smoke_abi_fdio_vmsplice_from_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        // Queue 4 bytes into the pipe.
+        let src = *b"data";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, src.as_ptr() as u64, src.len() as u64),
+        ) != Some(4)
+        {
+            return Err("seeding the pipe failed");
+        }
+        // vmsplice(rd, iov→dst, 1, 0) drains up to 8 bytes into dst; the pipe
+        // only holds 4, so it returns 4 and fills dst[..4].
+        let mut dst = [0u8; 8];
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(dst.len() as u64).to_le_bytes());
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
+            Some(4) if &dst[..4] == b"data" => Ok(()),
+            _ => Err("vmsplice from a pipe read end did not drain 4 bytes"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_from_pipe);
+
+/// A failed pipe→user vmsplice must not consume the source bytes.  Linux's
+/// pipe-to-user actor advances the pipe only for bytes successfully copied;
+/// this pins the stronger all-or-nothing behavior of NARF's guarded copy.
+fn smoke_abi_fdio_vmsplice_efault_preserves_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        let src = *b"keep";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, src.as_ptr() as u64, src.len() as u64),
+        ) != Some(src.len() as i64)
+        {
+            return Err("seeding the pipe failed");
+        }
+
+        let mut bad_iov = [0u8; 16];
+        // Non-canonical on both supported architectures, so range validation
+        // fails before any user byte or pipe byte can be touched.
+        bad_iov[..8].copy_from_slice(&0x0001_0000_0000_0000u64.to_le_bytes());
+        bad_iov[8..].copy_from_slice(&(src.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, bad_iov.as_ptr() as u64, 1, 0),
+        ) != Some(-14)
+        {
+            return Err("vmsplice to an invalid destination did not return EFAULT");
+        }
+
+        let mut out = [0u8; 4];
+        match call(
+            Syscall::Read.raw(),
+            a2(rd as u64, out.as_mut_ptr() as u64, out.len() as u64),
+        ) {
+            Some(4) if out == src => Ok(()),
+            _ => Err("vmsplice EFAULT consumed or reordered pipe data"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_efault_preserves_pipe);
+
+/// The stress-ng vm-splice loop shape: vmsplice user memory INTO the pipe,
+/// splice it OUT to a sink, then vmsplice the pipe read end back to memory —
+/// all three make forward progress and the round-trip preserves the bytes.
+/// Before the fix the final read-end vmsplice returned EBADF, which broke
+/// the loop (0 bogo-ops).
+fn smoke_abi_fdio_vmsplice_roundtrip_progress() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        let (sink_rd, sink_wr) = make_pipe()?;
+        let payload = *b"vmsplice-roundtrip";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        // 1) gather user memory into the pipe write end.
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("vmsplice into the pipe did not gather the payload");
+        }
+        // 2) splice it out of the pipe read end into a sink pipe.
+        match call_raw(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: rd as u64,
+                arg1: 0,
+                arg2: sink_wr as u64,
+                arg3: 0,
+                arg4: payload.len() as u64,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == payload.len() as i64 => {}
+            _ => return Err("splice draining the pipe made no progress"),
+        }
+        // The source pipe is now empty, so a second vmsplice INTO it proceeds
+        // (would have EAGAIN'd against a stuck-full pipe).
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("second vmsplice into the drained pipe did not proceed");
+        }
+        // 3) vmsplice the read end back to memory and verify the bytes.
+        let mut back = [0u8; 32];
+        let mut iov_back = [0u8; 16];
+        iov_back[..8].copy_from_slice(&(back.as_mut_ptr() as u64).to_le_bytes());
+        iov_back[8..].copy_from_slice(&(back.len() as u64).to_le_bytes());
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, iov_back.as_ptr() as u64, 1, 0),
+        ) {
+            Some(n) if n == payload.len() as i64 && back[..payload.len()] == payload => {}
+            _ => return Err("read-end vmsplice did not recover the payload"),
+        }
+        let _ = (sink_rd,);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_roundtrip_progress);
 
 // ── copy_file_range ────────────────────────────────────────────────
 
@@ -1747,9 +2496,60 @@ fn smoke_abi_fdio_copy_file_range_neg() -> TestResult {
                 arg5: 1,
             },
         ) {
-            r if r.status == SyscallReturn::OK && r.value as i64 == -22 => Ok(()),
-            _ => Err("copy_file_range with non-zero flags was not -EINVAL"),
+            r if r.status == SyscallReturn::OK && r.value as i64 == -22 => {}
+            _ => return Err("copy_file_range with non-zero flags was not -EINVAL"),
         }
+        let in_fd = open_fd(b"/abi/src\0")?;
+        let out_fd = open_fd(b"/abi/dst\0")?;
+        let mut valid_offset = 0u64;
+        // Keep this below USER_VA_LIMIT so it passes access_ok and faults in
+        // the guarded copy itself. The former 0x1000 fixture is not reliably
+        // unmapped on x86 NARF because low physical memory may be mapped.
+        const UNMAPPED_USER: u64 = 0x0000_0080_0000_0000;
+        for (off_in, off_out) in [
+            (UNMAPPED_USER, &mut valid_offset as *mut u64 as u64),
+            (&mut valid_offset as *mut u64 as u64, UNMAPPED_USER),
+        ] {
+            match call_raw(
+                Syscall::CopyFileRange.raw(),
+                SyscallArgs {
+                    arg0: in_fd as u64,
+                    arg1: off_in,
+                    arg2: out_fd as u64,
+                    arg3: off_out,
+                    arg4: 1,
+                    arg5: 0,
+                },
+            ) {
+                r if r.status == SyscallReturn::OK && r.value as i64 == -14 => {}
+                _ => return Err("copy_file_range guarded offset fault was not EFAULT"),
+            }
+        }
+        for args in [
+            // fd_in, then fd_out precede offset/flags and even zero length.
+            SyscallArgs {
+                arg0: 9999,
+                arg1: 0x1000,
+                arg2: out_fd as u64,
+                arg3: 0,
+                arg4: 1,
+                arg5: 1,
+            },
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: 0,
+                arg2: 9999,
+                arg3: 0x1000,
+                arg4: 0,
+                arg5: 1,
+            },
+        ] {
+            match call_raw(Syscall::CopyFileRange.raw(), args) {
+                r if r.status == SyscallReturn::OK && r.value as i64 == -9 => {}
+                _ => return Err("copy_file_range fd validation did not precede offsets/flags/len"),
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_copy_file_range_neg);
@@ -1814,14 +2614,314 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_pos);
 
 fn smoke_abi_fdio_vmsplice_neg() -> TestResult {
     with_setup(|| {
+        let (_rd, wr) = make_pipe()?;
         // nr_segs > IOV_MAX (1024) → -EINVAL.
-        match call(Syscall::Vmsplice.raw(), a3(3, 0x1000, 2000, 0)) {
+        match call(Syscall::Vmsplice.raw(), a3(wr as u64, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("vmsplice over IOV_MAX was not -EINVAL"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_neg);
+
+/// Pin Linux's syscall-entry precedence (`fs/splice.c::vmsplice`): unknown
+/// flags are checked first; fd/f_mode precede import_iovec; pipe identity is
+/// checked only after a non-empty iovec has imported successfully.
+fn smoke_abi_fdio_vmsplice_errno_order() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    const UNKNOWN_FLAG: u64 = 0x10;
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        // Unknown flags win even when both fd and iovec are invalid.
+        if call(Syscall::Vmsplice.raw(), a3(4242, BAD_PTR, 1, UNKNOWN_FLAG)) != Some(EINVAL) {
+            return Err("vmsplice did not validate flags first");
+        }
+        // A missing fd wins over import_iovec errors and over IOV_MAX.
+        if call(Syscall::Vmsplice.raw(), a3(4242, BAD_PTR, 1, 0)) != Some(EBADF)
+            || call(Syscall::Vmsplice.raw(), a3(4242, BAD_PTR, 2000, 0)) != Some(EBADF)
+        {
+            return Err("vmsplice did not validate fd before the iovec");
+        }
+
+        let file_fd = open_fd(b"/abi/f\0")?;
+        // A readable regular file passes fd/f_mode, so import_iovec's EFAULT
+        // wins. With a valid non-empty iovec, get_pipe_info then yields EBADF.
+        if call(Syscall::Vmsplice.raw(), a3(file_fd as u64, BAD_PTR, 1, 0)) != Some(EFAULT) {
+            return Err("vmsplice checked pipe identity before import_iovec");
+        }
+        let payload = *b"x";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(file_fd as u64, iov.as_ptr() as u64, 1, 0),
+        ) != Some(EBADF)
+        {
+            return Err("vmsplice on a non-pipe fd was not EBADF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/vmsplice", smoke_abi_fdio_vmsplice_errno_order);
+
+/// Linux accepts a zero-segment NULL iovec after validating fd/f_mode, and an
+/// imported all-zero vector returns 0 before get_pipe_info checks pipe type.
+fn smoke_abi_fdio_vmsplice_zero_iovec() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let (_rd, wr) = make_pipe()?;
+        if call(Syscall::Vmsplice.raw(), a3(wr as u64, 0, 0, 0)) != Some(0) {
+            return Err("vmsplice rejected a NULL zero-segment iovec");
+        }
+
+        let file_fd = open_fd(b"/abi/f\0")?;
+        if call(Syscall::Vmsplice.raw(), a3(file_fd as u64, 0, 0, 0)) != Some(0) {
+            return Err("zero-segment vmsplice checked non-pipe identity");
+        }
+        let zero_iov = [0u8; 16];
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(file_fd as u64, zero_iov.as_ptr() as u64, 1, 0),
+        ) != Some(0)
+        {
+            return Err("all-zero vmsplice iovec did not return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/vmsplice", smoke_abi_fdio_vmsplice_zero_iovec);
+
+/// vmsplice into a pipe with no readers follows wait_for_space: SIGPIPE and
+/// EPIPE, never the generic EINVAL previously used for every FileOps error.
+fn smoke_abi_fdio_vmsplice_broken_pipe_errno() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("closing vmsplice pipe reader failed");
+        }
+        let payload = *b"x";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        match call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
+            Some(v) if v == EPIPE => Ok(()),
+            _ => Err("vmsplice with no pipe readers was not EPIPE"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/vmsplice",
+    smoke_abi_fdio_vmsplice_broken_pipe_errno
+);
+
+/// A real O_PATH open has neither FMODE_READ nor FMODE_WRITE and therefore
+/// fails before the iovec is imported. This also pins F_GETFL: open_impl must
+/// retain O_PATH instead of letting its low access-mode bits masquerade as
+/// O_RDONLY.
+fn smoke_abi_fdio_vmsplice_bad_mode_precedes_iovec() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    const O_PATH: u64 = 0o10000000;
+    const F_GETFL: u64 = 3;
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let file_fd = open_fd_flags(b"/abi/f\0", O_PATH)?;
+        match call(Syscall::Fcntl.raw(), a2(file_fd as u64, F_GETFL, 0)) {
+            Some(flags) if flags >= 0 && flags as u64 & O_PATH != 0 => {}
+            _ => return Err("F_GETFL did not retain O_PATH on the open description"),
+        }
+        match call(Syscall::Vmsplice.raw(), a3(file_fd as u64, BAD_PTR, 1, 0)) {
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("vmsplice did not reject O_PATH before importing the iovec"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/vmsplice",
+    smoke_abi_fdio_vmsplice_bad_mode_precedes_iovec
+);
+
+/// Named FIFOs use the same pipe-to-user observe/copy/commit rule as
+/// anonymous pipes. A fault after one completed iovec returns that prefix and
+/// leaves the faulting segment queued; a fault before any progress returns
+/// EFAULT and leaves the complete FIFO contents queued.
+fn smoke_abi_fdio_vmsplice_named_fifo_copy_transaction() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const S_IFIFO: u64 = 0o010000;
+    const O_WRONLY: u64 = 1;
+    const O_NONBLOCK: u64 = 0o4000;
+    const UNMAPPED_USER: u64 = 0x0000_0080_0000_0000;
+
+    with_memfs("/abi", "abi", &[], || {
+        let path = b"/abi/vmsplice.fifo\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("failed to create named-FIFO vmsplice fixture");
+        }
+        // A nonblocking reader may open before its writer. Once it is present,
+        // the nonblocking writer also opens without ENXIO.
+        let rd = open_fd_flags(path, O_NONBLOCK)?;
+        let wr = open_fd_flags(path, O_WRONLY | O_NONBLOCK)?;
+
+        let first = *b"abcdef";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, first.as_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+        {
+            return Err("failed to seed named FIFO");
+        }
+
+        let mut prefix = [0u8; 3];
+        let mut split_iov = [0u8; 32];
+        split_iov[..8].copy_from_slice(&(prefix.as_mut_ptr() as u64).to_le_bytes());
+        split_iov[8..16].copy_from_slice(&3u64.to_le_bytes());
+        split_iov[16..24].copy_from_slice(&UNMAPPED_USER.to_le_bytes());
+        split_iov[24..32].copy_from_slice(&3u64.to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, split_iov.as_ptr() as u64, 2, 0),
+        ) != Some(3)
+            || prefix != *b"abc"
+        {
+            return Err("named-FIFO vmsplice did not return its copied prefix");
+        }
+
+        let mut tail = [0u8; 3];
+        let mut tail_iov = [0u8; 16];
+        tail_iov[..8].copy_from_slice(&(tail.as_mut_ptr() as u64).to_le_bytes());
+        tail_iov[8..].copy_from_slice(&3u64.to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, tail_iov.as_ptr() as u64, 1, 0),
+        ) != Some(3)
+            || tail != *b"def"
+        {
+            return Err("faulting named-FIFO segment was consumed or reordered");
+        }
+
+        let second = *b"ghi";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, second.as_ptr() as u64, second.len() as u64),
+        ) != Some(second.len() as i64)
+        {
+            return Err("failed to reseed named FIFO");
+        }
+        let mut bad_iov = [0u8; 16];
+        bad_iov[..8].copy_from_slice(&UNMAPPED_USER.to_le_bytes());
+        bad_iov[8..].copy_from_slice(&3u64.to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, bad_iov.as_ptr() as u64, 1, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("zero-progress named-FIFO copy fault was not EFAULT");
+        }
+
+        let mut retry = [0u8; 3];
+        let mut retry_iov = [0u8; 16];
+        retry_iov[..8].copy_from_slice(&(retry.as_mut_ptr() as u64).to_le_bytes());
+        retry_iov[8..].copy_from_slice(&3u64.to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd as u64, retry_iov.as_ptr() as u64, 1, 0),
+        ) != Some(3)
+            || retry != second
+        {
+            return Err("zero-progress copy fault consumed named-FIFO bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/vmsplice",
+    smoke_abi_fdio_vmsplice_named_fifo_copy_transaction
+);
+
+/// A nonblocking `vmsplice(SPLICE_F_NONBLOCK)` into a full pipe returns
+/// -EAGAIN before gathering anything (`fs/splice.c::vmsplice_to_pipe` →
+/// wait_for_space, short-circuited by O_NONBLOCK). Without the full-pipe
+/// pre-check the write returned a 0-byte success, which stalls forward
+/// progress instead of signalling back-pressure.
+fn smoke_abi_fdio_vmsplice_full_pipe_eagain() -> TestResult {
+    const SPLICE_F_NONBLOCK: u64 = 0x2;
+    const O_NONBLOCK: u64 = 0o4000;
+    with_setup(|| {
+        let mut pipe_fds = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(pipe_fds.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes(pipe_fds[..4].try_into().unwrap()) as u32;
+        let wr = i32::from_ne_bytes(pipe_fds[4..].try_into().unwrap()) as u32;
+        // Fill the pipe to capacity (64 KiB) with 4 KiB chunks.
+        let chunk = [0x5Au8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr as u64, chunk.as_ptr() as u64, chunk.len() as u64),
+            ) != Some(chunk.len() as i64)
+            {
+                return Err("filling the pipe did not take a full 4 KiB chunk");
+            }
+        }
+        // A further nonblocking vmsplice must report back-pressure, not 0.
+        let payload = *b"ab";
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&(payload.as_ptr() as u64).to_le_bytes());
+        iov[8..].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, iov.as_ptr() as u64, 1, SPLICE_F_NONBLOCK),
+        ) != Some(EAGAIN)
+        {
+            return Err("vmsplice into a full pipe was not -EAGAIN");
+        }
+        // import_iovec validates each payload range before wait_for_space.
+        // Therefore an invalid payload pointer beats full-pipe EAGAIN.
+        let mut bad_iov = [0u8; 16];
+        bad_iov[..8].copy_from_slice(&0x0001_0000_0000_0000u64.to_le_bytes());
+        bad_iov[8..].copy_from_slice(&1u64.to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr as u64, bad_iov.as_ptr() as u64, 1, SPLICE_F_NONBLOCK),
+        ) != Some(EFAULT)
+        {
+            return Err("full-pipe EAGAIN masked vmsplice payload EFAULT");
+        }
+        // Drain the pipe so the fixture tears down cleanly, and confirm the
+        // refused vmsplice queued nothing (still exactly 64 KiB).
+        let mut sink = [0u8; 4096];
+        let mut drained = 0usize;
+        loop {
+            match call(
+                Syscall::Read.raw(),
+                a2(rd as u64, sink.as_mut_ptr() as u64, 4096),
+            ) {
+                Some(n) if n > 0 => drained += n as usize,
+                _ => break,
+            }
+            if drained >= 65536 {
+                break;
+            }
+        }
+        if drained != 65536 {
+            return Err("refused vmsplice altered the pipe contents");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/vmsplice",
+    smoke_abi_fdio_vmsplice_full_pipe_eagain
+);
 
 // ── F_SETLKW: EINTR + harness-degrade + exit-sweep release ──
 //

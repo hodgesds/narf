@@ -11,8 +11,17 @@ pub(crate) fn sys_eventfd(ctx: &mut dyn TrapContext) {
         t.open(crate::fd::FdEntry {
             ops: efd,
             offset: 0,
-            flags: 0,
-            status_flags: 0,
+            flags: if flags & crate::fd::O_CLOEXEC != 0 {
+                crate::fd::FD_CLOEXEC
+            } else {
+                0
+            },
+            status_flags: crate::fd::O_RDWR
+                | if flags & crate::fd::O_NONBLOCK != 0 {
+                    crate::fd::O_NONBLOCK
+                } else {
+                    0
+                },
         })
     }) {
         Some(n) => n,

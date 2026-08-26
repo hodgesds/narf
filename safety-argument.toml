@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "31f2268bffec442b347c24e5edc1e220634de3250af6506c7eb3c4b240b76a50"
+prompt_hash = "ebedd0c0a9b5c6bf58a25e7ede31105d76e0eb74249832cfd8d10a37a0efba29"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -76,6 +76,14 @@ ref = "security-model/specification/spec.md#L75"
 argument = "Externally owned shared pages carry one registry reference per address-space alias. Handle removal prevents new aliases but defers frame reuse until every mapped alias has torn down its leaf and completed cross-CPU TLB invalidation; mapping, unmapping, MAP_FIXED replacement, fork aliasing, and migration use one shared transaction order."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "mremap source validation, Linux resource-limit admission, target classification, PTE relocation, reverse-map movement, and VMA publication remain under one address-space transaction. Fixed target retirement conditionally serializes borrowed backing before file-owner state; a typed post-punch outcome forces external owner metadata to mirror every destructive memory outcome, and no resident frame is freed until source translations have been invalidated across CPUs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Ordinary SHARED base-page mremap holds the address-space transaction followed by the global shared-owner transaction from source validation through publication. It fallibly prepares proportional metadata and every required arena-backed VMA node before PTE mutation, moves rather than clones each resident leaf and reverse-map owner, transfers kept external backing exactly once across source splits, rolls a failed ordinary destination installation back to the authoritative source, and releases truncated backing only after cross-CPU source invalidation. Fixed moves reserve the later destination before target retirement; fixed shrink then follows Linux's target-punch, source-truncate, move order and its typed failure independently exposes both destructive steps so upper file/SysV ownership mirrors the exact committed topology. Paging-frame exhaustion propagates as allocation failure rather than a range error. Huge, swapped, and cross-Region sources fail closed until their distinct ownership machinery exists."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The memory-hotplug observer runs only after allocator donation/removal and topology-registry commit, with both locks released. It receives no physical-frame ownership and can only rebuild read-only sysfs topology; failed and busy transactions emit no notification. Offline ranges remain recorded solely as non-allocatable topology."
 
@@ -145,15 +153,15 @@ argument = "The frame edit changes only the diagnostic time budget attached to t
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
-argument = "The scheduler and frame edits add forward-progress accounting, idle-state reporting, and fatal-path stall diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
+argument = "The scheduler and frame edits remove per-slot pop/requeue and per-executor-round diagnostic atomic updates from the scheduler hot path while retaining bounded, cold-path queue, affinity, halted, and lock-state fatal diagnostics inside the existing TCB. They add no trusted subsystem and do not move the documented TCB boundary."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "Forward-progress counters and queue diagnostics neither bypass nor alter capability checks, domain tags, PKRS state, or domain transitions. The watchdog reads aggregate scheduling state and can only diagnose or panic after runnable work has made no progress."
+argument = "Removing observational hot-path counters does not change the wake flag, ready queues, task affinity, context/domain restore, capability checks, domain tags, PKRS state, or domain transitions. The retained watchdog snapshots are read-only and execute only after a suspected stall."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L62"
-argument = "The new scheduler observations are aggregate queue depths, a monotonic progress counter, and fatal-path task state. They remain within the existing documented per-CPU scheduling-state exception and do not expose task memory or capabilities to userspace."
+argument = "The retained scheduler observations expose only bounded queue depth, awake/home/affinity state, and CPU halted/lock state to the in-kernel fatal watchdog. They remain within the existing documented per-CPU scheduling-state exception and expose neither task memory nor capabilities to userspace."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -354,7 +362,7 @@ argument = "Overlapping MAP_FIXED and munmap punches use the ordered, non-overla
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "The base-page VMA representation changes from a sorted vector to a BTreeMap keyed by Region.base. Structural mutation is private to RegionTable: insert derives the key from the value, relocation and stack growth remove the old key before changing base, and range splits drain owned Region values before inserting disjoint fragments. Tree removal therefore transfers each Region.phys vector exactly once into the same leaf-teardown, COW/shared release, or surviving-fragment paths; it changes lookup and metadata movement complexity without changing frame ownership, page-table mutation, or invalidate-before-reuse ordering."
+argument = "The base-page VMA representation is an arena-backed AVL tree keyed by Region.base. Structural mutation is private to RegionTable: insert derives the key from the value, relocation and stack growth remove the old key before changing base, and range splits drain owned Region values before inserting disjoint fragments. Index links are integer arena slots, so fallible Vec reservation may move storage without invalidating tree edges; removed slots form an allocation-free free list. Tree removal transfers each Region.phys vector exactly once into the same leaf-teardown, COW/shared release, or surviving-fragment paths. Opaque mapping generations share the Region entry and cannot diverge through a second index allocation. These metadata changes preserve frame ownership, page-table mutation, and invalidate-before-reuse ordering."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
@@ -599,3 +607,123 @@ argument = "The scheduler change adds one opaque pointer field to the existing p
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Userspace publishes Arc::as_ptr(Task) only while the enclosing pinned UserTaskFuture retains that Arc through the full KernelTask lifetime. CURRENT_STACKFUL_TASK selects the pointer from the actually executing continuation across direct resume and migration, is cleared before switch-out/exit, and KernelTask reclamation remains RCU-deferred; acquire/release publication prevents a syscall from observing an uninitialized context, while cross-task lookups retain the refcounted registry path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Address-space materialization retains the authoritative region lock and exact backing vector while the existing architecture scatter installer holds the live root's mutation shard and derives each leaf's user, write/COW, and execute permissions from the same region metadata as the prior scalar path. Lazy zero backing remains absent. Because the scatter helper intentionally permits partial progress, every error is recovered through the idempotent scalar installer over the complete requested slice: an already-installed prefix and pre-existing leaves each acquire the same deduplicated reverse mapping, while a genuine structural or allocation error still fails construction before metadata or backing ownership is released. Successful batches add reverse mappings only after descriptor publication completes. Batching therefore changes lock and table-walk frequency, not mapped physical addresses, permissions, COW ownership, failure visibility, or stale-translation retirement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Calling the already-specified x86_64 and AArch64 scatter installers from address-space construction is an internal optimization inside the existing memory domain-manager TCB. It adds no capability, domain identifier, trusted subsystem, externally supplied pointer, mapping authority, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "x86_64 signal delivery now performs every user-stack write through the architecture's existing guarded user-copy primitive. The earlier writability probe remains only an optimization: a sibling sharing the address space may revoke or unmap the page afterward, but the final copy converts that race into ordinary delivery failure instead of allowing a supervisor page fault or kernel panic. No kernel-half address passes validate_user_range, no signal-frame pointer is dereferenced directly, and no capability, domain right, or mapping authority is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Stack growth retains the authoritative region lock while locating and replacing only the explicit STACK_GUARD region. The optimized ordered lookup is preserved, but the adjacent unmarked VMA is no longer merged or assigned fresh anonymous backing: this prevents an unmapped-and-replaced stack neighbor from importing SHARED, FILE_DEMAND, or COW ownership semantics. Fresh frames remain private, zeroed, and mapped only at the promoted guard span; executable permission is copied only as a leaf authority hint without modifying the adjacent region."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The targeted-wake scheduler fast path is removed because it could bypass the active policy and compare priority without scheduling class, selecting Batch work ahead of Realtime work. Dispatch again uses the established core/policy selection and eligibility validation path exclusively; removing the unused hooks grants no new policy observation, task handle, capability, domain state, or queue mutation authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Demand-fault publication now keeps the backing slot lazy until leaf installation succeeds. On failure the exact page ticket is retired while ownership stays with the fault path, which releases the unpublished anonymous or file-backed frame; a later fault may safely claim the page again. On success the leaf, Region backing slot, reverse-map owner, and ticket retirement are completed under the authoritative region lock before overlapping VMA teardown can free the frame. This closes the x86 post-unlock stale-rmap race, gives AArch64 the same reverse ownership, and preserves ticket-based protection against VMA removal/replacement ABA."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Every x86 shootdown invalidation now reaches an architecture helper with compiler_fence(SeqCst) immediately before and after the TLB instruction. Plain INVLPG requests route through the fenced memory primitive, INVPCID variants share one fenced raw wrapper, and CR3 fallback already uses fenced control-register helpers. The fences constrain compiler motion only; request ownership, target completion, invalidation scope, mapping authority, and hardware instruction semantics are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Production order-0 frame allocation and return no longer update global cache hit, miss, refill, or spill counters. The counters and their round-trip assertion remain compiled under the kernel-test feature, while allocator decisions continue to depend exclusively on the unchanged per-CPU cache contents, drain/hotplug bypass state, free-page accounting, and buddy locks. Removing observational atomic RMWs changes no frame identity, ownership transition, NUMA choice, reserve check, cache capacity, or reclamation visibility."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Demand-fault ownership remains address-space and page scoped under the existing authoritative region lock, but the common live claims now occupy a fixed inline table and use a checked per-address-space ticket counter instead of allocating a BTree node and incrementing a global atomic on every first touch. Exact tickets still deduplicate same-page faults and reject owners cancelled by VMA removal/replacement. A rare overflow map preserves progress beyond the inline capacity, so CPU migration, hotplug, nested faults, and future concurrency cannot create an ownerless retry. Ticket exhaustion fails closed without identifier reuse, and no physical-address sentinel or mapping permission changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Anonymous demand allocation reports reserve pressure only after cancelling its exact page-scoped claim and returning through every address-space and allocator lock. Frame then publishes only the current task's scheduler-owned waker into a fixed MAX_USER_TASKS-sized table; it stores no task pointer, address-space pointer, frame owner, capability, or domain state. A sequentially consistent generation handshake orders registration against kswapd completion, slots remain owner-held through resume to prevent ABA reuse, and task-owned wake routing remains valid across migration and CPU hotplug."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The page-fault backpressure path allocates no memory and performs only a bounded fixed-table scan before switching out. It clears the per-CPU mempolicy publication before parking, invokes no wake callback while holding a waiter lock, and retries demand allocation at most once. Missing stackful context, full waiter capacity, non-pressure errors, and a second zero-progress failure all fail closed without sleeping or spinning, so trap progress cannot depend on an unbounded reclaim loop."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "TLB-shootdown verification no longer clears live SMP residency, idle, deferred-flush, or topology publication while scheduler CPUs may be active. Production residency filtering and the idle-to-busy debt handshake retain their sequentially consistent publication order; state-parameterized helpers expose that exact mechanism to isolated test atomics without granting new mapping authority or changing invalidation scope. The remaining live integration checks use monotonic counter deltas and a reserved tracked bucket, so they cannot erase another CPU's obligation or create a missed invalidation window."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler waker no longer performs a diagnostic fetch_add on one global cache line for every wake. The task-owned awake Release store, owner-CPU Acquire load, remote reschedule decision, Arc lifetime rules, queue ownership, policy selection, and migration behavior are unchanged. Removing the framebuffer's observational read grants no scheduling, capability, domain, or task-memory authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "TLB-shootdown diagnostics no longer update shared global cache lines: the executing CPU updates only its own 64-byte-aligned counter record, and observational accessors aggregate all records on demand with wrapping semantics. Local invalidation, the mandatory StoreLoad fence, residency and idle-debt publication, target selection, IPI fanout, completion ordering, deferred full flushes, ASID/PCID scope, and backing-frame release order are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L89"
+argument = "Slab hit/miss telemetry moves from one shared atomic per size class into the already cache-line-isolated per-CPU magazines and is aggregated only by read-only statistics calls. Allocation and free still select the same current-CPU magazine with interrupts masked, mutate the same stack/top state, preserve the global in-use ownership count, and take the same central-list and buddy locks on misses. Counter placement therefore changes no object identity, allocation authority, domain assignment, zeroisation, canary check, reclaim eligibility, or cross-domain memory access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The x86 TLB-shootdown receiver updates INVPCID-path, ACK, and ever-received diagnostics only in its own 64-byte-aligned per-CPU record; totals are aggregated only by readers. Request-lane publication, pending-source acquisition, INVPCID/INVLPG selection, the mandatory architectural wrappers and fences, per-request completion bitmap, IPI targeting, incoming-request polling, and the unbounded correctness wait before frame reuse are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Guarded kernel uaccess publishes a cache-line-isolated marker only on the executing CPU while its single-depth recovery probe and interrupt mask are live and, on x86_64, while the SMAP AC window is open. A current-EL translation fault may still install immediately available backing, but reserve pressure uses an allocation-only path that neither registers a reclaim waiter nor switches tasks; it falls through to the already-armed architecture fixup and surfaces EFAULT before the marker, probe, and access window are disarmed in order. Lower-EL demand faults retain generation-ordered reclaim parking and one bounded retry, so the change prevents per-CPU recovery state from crossing task migration without changing mapping authority, frame ownership, or user-fault reclaim progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The guarded-uaccess marker, trap selection, no-wait demand helper, and executor assertion remain inside the existing architecture, frame, memory-manager, and scheduler-core TCB seams. They add no capability, domain identifier, policy authority, externally supplied pointer, or cross-domain data path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L89"
+argument = "Global heap failure no longer enters reclaim callbacks or retries the backend while its caller may hold an arbitrary TCB lock. It publishes only a bounded page count into the current NUMA node's atomic request slot and returns the same null failure sentinel required by GlobalAlloc; the scheduler-owned kswapd consumes that request outside the allocation context. Frame identity, buddy/slab ownership, NUMA selection, domain assignment, mapping permissions, cgroup accounting, and capability authority are unchanged. OOM remains task-context policy: authorization is packed with its coalesced reclaim target in one per-node atomic word, both are consumed by one kswapd swap, and killing is deferred until that background pass reports zero physical-page progress and the same reserve predicate still rejects allocation. A global selection gate spans the viability recheck, victim selection, and reaping, so node workers cannot concurrently kill duplicate or excess victims. An existing ordinary request or concurrent failure cannot mismatch authorization with another pass, and moving reclaim off-path cannot release or reassign a frame before its existing owner does so through the established reclaim callbacks."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L90"
+argument = "Scheduler watchdog telemetry remains executor-owned and read-only. The change replaces three shared relaxed counters with cache-line-isolated per-CPU relaxed counters and preserves the existing aggregate public snapshots modulo the same u64 wraparound behavior. It does not alter task identity, queue state, wake decisions, IPI ordering, affinity, migration, domain save/restore, capability checks, or any address-space access, and it grants no new cross-domain authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Eager mlock now publishes the existing LOCKED metadata before population, matching Linux failure ordering, while every page still uses the established page-scoped demand ticket, authoritative region lock, architecture leaf installer, reverse-map publication, and unpublished-frame rollback path. A typed LockFailed result changes only the syscall errno projection after complete range validation; it grants no mapping permission, frame ownership, capability, domain authority, or cross-address-space access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "MCL_FUTURE policy and current VMA lock modes are stored and replaced under the authoritative address-space region lock, so CLONE_VM insertion cannot escape an mlockall or munlockall transition. LOCK_ONFAULT is metadata-only and always paired with LOCKED; eager population drops the lock only through the existing ticketed demand-fault path and never re-publishes flags after munlockall. Fork clears both child lock bits before insertion while retaining the parent's bits and existing COW frame-refcount transaction. Stack guards remain unbacked and lock-exempt, promoted stack pages inherit only the adjacent stack's executable and lock metadata, and brk fragments carry an internal ownership bit so policy-driven splitting cannot annex an unrelated replacement VMA. No mapping permission, frame ownership, capability, domain right, or cross-address-space authority is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Virtual locked-byte accounting, future-policy selection, and final VMA flag publication share the authoritative region transaction; failed mlock and mlockall limit admission mutates no lock state. Fixed mmap and mremap perform a non-destructive limit preflight before removing the target, and brk rechecks while publishing its owned tail. LOCK_EXEMPT prevents device, vDSO, guard, and kernel-control mappings from entering anonymous/file demand population, while inaccessible reservations are skipped without page-wise fault attempts. Eager mremap growth populates only the new tail after ownership and translations are published. These checks constrain resource use and preserve existing mapping/frame ownership; they grant no new address-space, domain, capability, or physical-memory authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Automatic stack growth preflights RLIMIT_STACK, RLIMIT_AS, and inherited RLIMIT_MEMLOCK under the per-address-space VMA transaction, allocates and zeroes speculative frames only after releasing every address-space lock, then reacquires the transaction and revalidates the exact guard plan. Leaf installation rejects an existing PTE; any later mapping failure unmaps only leaves installed by that attempt and frees every speculative frame before returning, while metadata publication occurs only after the complete leaf range succeeds. Fixed relocation validates alignment, bounds, source overlap, exact source ownership, swap state, and memlock growth before target retirement. Eager locked-tail population for brk, grow, and relocation runs after the IRQ-safe VMA transaction is released. These changes preserve frame ownership and do not add mapping, capability, domain, or physical-memory authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Each base-page VMA publication receives an address-space-local monotonic generation which is removed and replaced on every structural split, relocation, or MAP_FIXED replacement. Deferred materialization and rollback hold the VMA transaction, revalidate the opaque generation plus exact range and sharedness, and return StaleMapping before touching a successor VMA. File/device mmap holds the external owner table across VMA publication and owner registration, so a FILE_DEMAND fault may block but cannot observe an ownerless live mapping; the IRQ-safe owner lock is released before page-table materialization. Shared-frame retention, translation invalidation before release, COW permissions, domain assignment, and capability authority are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Mapping receipts and external file-owner buckets are bound to one non-reused address-space incarnation, so identical local VMA generations in another mm cannot authorize materialization, rollback, fault routing, or owner retirement. Real fork explicitly clones owner references into the child's new incarnation while CLONE_VM shares the original bucket, independent of PID and CPU migration. Publication serializes only that address space; final AddressSpace teardown invalidates every leaf and releases shared backing before invoking the owner-drop hook with no VMA/shared transaction held. File destructors therefore cannot free mapped backing early or invert the mapping lock order, and no unrelated address space is globally blocked by page-table materialization or MAP_FIXED teardown."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The program break, its owned VMA tail, and Linux resource-limit admission are revalidated and published under the existing per-address-space VMA transaction, preventing CLONE_VM peers from using a stale break to unmap or annex another mapping. Lazy descriptor allocation occurs before retrying the transaction and carries no physical-frame authority. Below-base requests and failed tail retirement preserve both the prior break and mapping metadata. RLIMIT_DATA metadata is immutable after exec publication and copied only with the existing fork address-space clone. Excluding the synthetic unbacked stack guard from Linux VMA accounting changes no PTE, frame ownership, domain, capability, or access permission."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Base-page VMA growth and relocation reserve both proportional backing metadata and required arena-backed index slots fallibly before changing authoritative length, coordinates, or an occupied fixed target. A pre-publication allocation failure leaves the original source mapping, leaf translations, reverse-map owners, physical frames, and fixed target unchanged. Prepared index publication cannot allocate. Fixed shrink deliberately follows Linux's destructive target-retire, source-truncate, then move sequence only after this preflight, and its typed failure exposes both completed steps independently. Successful commits retain the existing VMA transaction, leaf-installation rollback, TLB invalidation, reverse-map transfer, and post-invalidation frame-release ordering."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Mixed hardware-huge and base-page mprotect holds the established huge-to-regular topology lock order from coverage and swap-state validation through metadata publication. Every required arena-backed base-page split node is reserved before any huge leaf is rewritten, so AllocationFailed cannot expose a partially protected range, and a page-in cannot publish stale permissions during the transaction. Successful huge-region splitting preserves all internal VMA flags while changing only POSIX protection bits. Existing page-table invalidation, frame ownership, reverse-map state, W^X admission, domain assignment, and capability authority are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Fork retains private base-page backing before child VMA publication and transfers ownership in region order. If a later fallible child index reservation fails, partial-child teardown balances only the published prefix while an allocation-free shard rollback removes only the unpublished suffix and restores implicit sole-owner counts without freeing a parent-owned frame. The parent may conservatively remain COW-marked, matching Linux partial-fork cleanup, but retains every mapping and backing owner. Releasing the global shared-owner transaction after regular child publication and before private huge-page allocation or copying changes no alias lifetime, page-table permission, reverse-map state, TLB ordering, domain assignment, capability authority, or cross-address-space access."

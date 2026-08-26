@@ -296,6 +296,46 @@ fn branchy(pairs: usize) -> Vec<Insn> {
     asm(&prog)
 }
 
+/// A chain of conditional dispatches whose taken arms are distinct exits.
+///
+/// The verifier's LIFO worklist visits each fallthrough first, leaving every
+/// taken arm pending until the chain ends. This is the broad-CFG complement to
+/// [`branchy`]: it models generated dispatch programs and exposes worklist
+/// membership algorithms that become quadratic in the number of live blocks.
+fn wide_fanout(branches: usize) -> Vec<Insn> {
+    let mut prog = Vec::with_capacity(3 * branches + 3);
+    prog.push(mov_imm(0, 0));
+    // R1 enters as the context pointer. Loading its first declared scalar
+    // field gives the dispatch chain an unknown value, so both edges of every
+    // comparison remain reachable to the abstract interpreter.
+    prog.push(Decoded::Load {
+        size: Size::Dw,
+        sign_extend: false,
+        dst: r(1),
+        src: r(1),
+        off: 0,
+    });
+    for i in 0..branches {
+        // Layout after the chain is one default exit followed by two
+        // instructions per taken arm. Relative offsets are from the next
+        // instruction: target=(3+branches+2*i), next=(3+i).
+        let off = branches + i;
+        prog.push(Decoded::JumpCond {
+            wide: true,
+            op: CondOp::Eq,
+            dst: r(1),
+            src: Source::Imm(i as i32),
+            off: i16::try_from(off).expect("benchmark fanout offset fits i16"),
+        });
+    }
+    prog.push(EXIT);
+    for i in 0..branches {
+        prog.push(mov_imm(0, i as i32));
+        prog.push(EXIT);
+    }
+    asm(&prog)
+}
+
 // ── cached state ────────────────────────────────────────────────────
 
 /// The programs, built once.
@@ -334,6 +374,10 @@ const VERIFY_SIZES: [usize; 3] = [16, 64, 256];
 /// for its size rather than its fork count so it is directly comparable with
 /// `straight256`.
 const BRANCHY_PAIRS: usize = 64;
+
+/// 2,048 branches produce 6,147 instruction slots and 2,048 simultaneously
+/// pending taken arms under the verifier's existing LIFO traversal.
+const FANOUT_BRANCHES: usize = 2_048;
 
 /// The four scalar words of the probe context tuple, as `prog.rs` declares
 /// them. Duplicated rather than shared because `prog.rs`'s copy is private and
@@ -374,6 +418,7 @@ fn cache() -> Option<&'static Cache> {
         load_images.push(straight_line(n));
     }
     load_images.push(branchy(BRANCHY_PAIRS));
+    load_images.push(wide_fanout(FANOUT_BRANCHES));
 
     // A `None` here means the verifier declined a shape this module built,
     // which is a bug in the shape rather than a result — the cases that need
@@ -720,6 +765,24 @@ macro_rules! load_case {
     };
 }
 
+macro_rules! load_case_iters {
+    ($name:literal, $iters:expr, $f:expr, $reason:literal) => {
+        Benchmark {
+            name: $name,
+            subsystem: "bpf",
+            unit: "cycles",
+            lower_is_better: true,
+            warmup: 3,
+            iters: $iters,
+            target_n: TARGET_N,
+            delta_pct: DELTA_PCT,
+            compare_with: None,
+            sample: $f,
+            skip_reason: $reason,
+        }
+    };
+}
+
 /// The fuel-granularity experiment, one group per instruction mix.
 ///
 /// Grouped per shape rather than flattened because the harness takes groups and
@@ -771,6 +834,12 @@ static LOAD_BENCHES: &[Benchmark] = &[
         "bpf.load.verify.branchy194",
         |i| sample_verify(3, i),
         "verifier declined the benchmark's own image"
+    ),
+    load_case_iters!(
+        "bpf.load.verify.fanout6147",
+        1,
+        |i| sample_verify(4, i),
+        "verifier declined the benchmark's own wide-fanout image"
     ),
     load_case!(
         "bpf.load.codegen.straight64",

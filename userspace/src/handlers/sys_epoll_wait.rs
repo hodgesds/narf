@@ -36,8 +36,11 @@ pub(crate) fn sys_epoll_wait(ctx: &mut dyn TrapContext) {
             };
             // Clone the FileOps out before polling so a nested-epoll fd can't
             // re-enter (and deadlock) the non-reentrant fd-table lock.
-            let file =
-                fd::with_table(task, |t| t.get(fd_u).map(|e| (e.ops.clone(), e.offset))).flatten();
+            let file = fd::with_table(task, |t| {
+                let entry = t.get(fd_u)?;
+                Some((entry.ops.clone(), t.offset(fd_u)?))
+            })
+            .flatten();
             let readiness = file
                 .map(|(o, offset)| o.poll_readiness_at(offset))
                 .unwrap_or(0);

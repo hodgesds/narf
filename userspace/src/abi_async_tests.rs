@@ -110,18 +110,18 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_neg);
 // ════════════════════════════════════════════════════════════════════
 // select(2) — sys_select(nfds, rfds, wfds, efds, timeval*)
 //
-// All-null fd sets + a null timeval (block-forever) with an empty
-// computed item list returns 0 immediately. nfds > FD_SETSIZE (1024)
-// is rejected up front.
+// An empty set with a zero timeout returns immediately. A null timeout is an
+// interruptible infinite wait and is covered by the stackful userspace tests.
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_select_pos() -> TestResult {
     with_setup(|| {
-        // select(0, NULL, NULL, NULL, NULL): no fds, block-forever, but the
-        // empty set returns 0 without ever sleeping.
-        match call(Syscall::Select.raw(), a3(0, 0, 0, 0)) {
+        let tv = [0i64, 0];
+        let mut args = a3(0, 0, 0, 0);
+        args.arg4 = tv.as_ptr() as u64;
+        match call(Syscall::Select.raw(), args) {
             Some(0) => Ok(()),
-            _ => Err("select(0,NULL,NULL,NULL,NULL) should return 0"),
+            _ => Err("select(0,NULL...,{0,0}) should return 0"),
         }
     })
 }
@@ -129,11 +129,10 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_select_pos);
 
 fn smoke_abi_async_select_neg() -> TestResult {
     with_setup(|| {
-        // select(2000, ..): nfds > FD_SETSIZE → rejected.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(Syscall::Select.raw(), a3(2000, 0, 0, 0)) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("select(nfds>FD_SETSIZE) must fail"),
+        // select(-1, ..): negative nfds → -EINVAL.
+        match call(Syscall::Select.raw(), a3(u64::from(u32::MAX), 0, 0, 0)) {
+            Some(EINVAL) => Ok(()),
+            _ => Err("select(nfds<0) must return EINVAL"),
         }
     })
 }
@@ -142,16 +141,17 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_select_neg);
 // ════════════════════════════════════════════════════════════════════
 // pselect6(2) — sys_pselect6(nfds, rfds, wfds, efds, timespec*, sigmask)
 //
-// Same shape as select with a timespec; null sets + null timespec → 0.
-// nfds > FD_SETSIZE rejected.
+// Same shape as select with a timespec. Negative nfds is EINVAL.
 // ════════════════════════════════════════════════════════════════════
 
 fn smoke_abi_async_pselect6_pos() -> TestResult {
     with_setup(|| {
-        // pselect6(0, NULL, NULL, NULL, NULL, NULL) → 0.
-        match call(Syscall::Pselect6.raw(), a3(0, 0, 0, 0)) {
+        let ts = [0i64, 0];
+        let mut args = a3(0, 0, 0, 0);
+        args.arg4 = ts.as_ptr() as u64;
+        match call(Syscall::Pselect6.raw(), args) {
             Some(0) => Ok(()),
-            _ => Err("pselect6(0,NULL..) should return 0"),
+            _ => Err("pselect6(0,NULL...,{0,0},NULL) should return 0"),
         }
     })
 }
@@ -159,11 +159,10 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_pselect6_pos);
 
 fn smoke_abi_async_pselect6_neg() -> TestResult {
     with_setup(|| {
-        // pselect6(2000, ..): nfds > FD_SETSIZE → rejected.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
-        match call(Syscall::Pselect6.raw(), a3(2000, 0, 0, 0)) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("pselect6(nfds>FD_SETSIZE) must fail"),
+        // pselect6(-1, ..): negative nfds → -EINVAL.
+        match call(Syscall::Pselect6.raw(), a3(u64::from(u32::MAX), 0, 0, 0)) {
+            Some(EINVAL) => Ok(()),
+            _ => Err("pselect6(nfds<0) must return EINVAL"),
         }
     })
 }
@@ -1265,3 +1264,52 @@ fn smoke_abi_async_fanotify_mark_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/async", smoke_abi_async_fanotify_mark_neg);
+
+fn smoke_abi_async_fanotify_read_efault_does_not_publish_fd() -> TestResult {
+    with_memfs("/fan", "fan", &[("f", b"x")], || {
+        let fanfd = match call(Syscall::FanotifyInit.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fanotify_init failed"),
+        };
+        let path = b"/fan/f\0";
+        let mark = SyscallArgs {
+            arg0: fanfd,
+            arg1: FAN_MARK_ADD,
+            arg2: 0x2, // FAN_MODIFY
+            arg3: 0,
+            arg4: path.as_ptr() as u64,
+            arg5: 0,
+        };
+        if call(Syscall::FanotifyMark.raw(), mark) != Some(0) {
+            return Err("fanotify_mark failed");
+        }
+        let filefd = match call_open(path.as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("fanotify target open failed"),
+        };
+        let byte = [b'y'];
+        if call(Syscall::Write.raw(), a2(filefd, byte.as_ptr() as u64, 1)) != Some(1) {
+            return Err("fanotify target write failed");
+        }
+
+        let task = crate::handlers::current_task_id();
+        let before = crate::fd::with_table(task, |table| table.open_fd_numbers().len())
+            .ok_or("missing fd table")?;
+        // 0x1000 passes the range-shape check but is unmapped, so the guarded
+        // copy faults only after fanotify has selected the queued event.
+        match call_raw(Syscall::Read.raw(), a2(fanfd, 0x1000, 24)) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == -14 => {}
+            _ => return Err("fanotify read to unmapped user buffer was not EFAULT"),
+        }
+        let after = crate::fd::with_table(task, |table| table.open_fd_numbers().len())
+            .ok_or("missing fd table after fanotify read")?;
+        if after != before {
+            return Err("fanotify EFAULT published/leaked an object fd");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_fanotify_read_efault_does_not_publish_fd
+);

@@ -91,6 +91,18 @@ pub trait FileOps {
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
+    fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
+        -> Option<Poll<u32>>;
+    fn disarm_readiness(&self, task_id: u64) -> bool;
+    fn tty_fg_pgrp(&self) -> Option<u64>;
+    fn tty_session(&self) -> Option<u64>;
+    fn set_tty_fg_pgrp(&self, pgrp: u64) -> bool;
+    fn tty_acquire_controlling(
+        &self,
+        arg: usize,
+        readable: bool,
+    ) -> Result<bool, FsError>;
 }
 
 pub enum FileType {
@@ -127,6 +139,17 @@ and `/dev/fuse` returns a fresh FUSE daemon connection. The stable `/dev/fuse`
 clone node is mode 0666 so unprivileged filesystem and desktop-portal daemons
 can open it, matching Linux distribution tmpfiles/udev policy.
 
+Named FIFO handles share durable data-readiness state and direction-specific
+peer-presence cells. `FifoHandle::arm_peer`/`disarm_peer` key waiters by task;
+the handle snapshots the counterpart edge before publishing its own open count,
+so a peer that opens and closes before the waiter runs still completes the
+blocking `open`. A read-only handle opened before any writer suppresses
+`POLLHUP` until its own writer-presence snapshot changes, matching Linux's
+per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the ordinary per-file
+readiness cell. `FifoHandle::vmsplice_to_user` holds the observed queue prefix
+through its copy callback and consumes it only after success, so a failed user
+copy neither discards nor reorders named-FIFO data.
+
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`
 values, and expose stable non-zero inode identities. The root accepts runtime
@@ -147,6 +170,14 @@ The Linux open path treats `/dev/tty` as the caller's controlling-terminal
 multiplexer: it selects the recorded console or PTY slave, preserves the 5:0
 path-node identity, and reports `ENXIO` for a detached session. `O_PATH`
 continues to open only the side-effect-free path node.
+PTY master and slave endpoints share one locked control record containing raw
+stable kernel session and foreground-process-group identities. The filesystem
+never translates those identities into a PID namespace: the querying syscall
+does so at delivery time. `tty_acquire_controlling` serializes the cross-crate
+process/PTY transaction and publishes session plus foreground group together;
+`tty_session`, `tty_fg_pgrp`, and `set_tty_fg_pgrp` expose the raw control
+record to the Linux-compat syscall policy. Non-PTY objects retain the default
+`None`/`false` behavior.
 
 With `linux-compat`, `MqueueFs::new(ipc_namespace_id)` exposes the same live
 queue objects used by `mq_open`/`mq_unlink`/send/receive/notify/getsetattr.
@@ -200,6 +231,20 @@ Pressure Stall Information is optional. The `cgroup-psi` feature exposes
 without it, no PSI cgroup ABI is present. The current PSI implementation
 reports Linux-shaped zero counters and does not yet implement pressure-trigger
 writes or poll notifications.
+
+The memory-controller allocator hook is nonblocking in every allocation
+context. Crossing `memory.high` commits the charge and publishes a capped,
+coalesced background-reclaim request. Breaching `memory.max` publishes the
+same non-OOM-authorized work and returns the allocator's exhaustion result.
+Fallible callers map that result to `ENOMEM`; syscall paths that collapse
+allocation exhaustion into another internal error must preserve it before
+performing their Linux errno mapping. The hook never invokes shrinkers, waits,
+or selects an OOM victim inline because its caller may hold an IRQ-safe lock
+that those paths need. Hierarchical current counters use atomic reservation
+with rollback, so concurrent charges cannot individually pass a stale max
+check and overrun the limit. Background reclaim is currently global rather
+than cgroup-keyed; deferred throttling and scoped memcg OOM require stable
+allocation-owner attribution and remain follow-up work.
 
 `/proc/numastat` exposes live per-node allocation events supplied by
 `memory/`: hit, miss, foreign, interleave-hit, local, and other counters.
@@ -613,6 +658,10 @@ without creating the snapshot.
 `FsError::QuotaExceeded` is the storage-independent hard-quota failure and maps
 to Linux `EDQUOT`. It remains distinct from `FsError::NoSpace`/`ENOSPC`, so a
 caller can distinguish policy exhaustion from exhausted backing storage.
+`FsError::OperationNotPermitted` represents an operation prohibited by object
+state and maps to Linux `EPERM`; it remains distinct from access-mode or
+credential denial (`PermissionDenied`/`EACCES`) and a read-only filesystem
+(`ReadOnly`/`EROFS`). Memfd seal violations use this variant.
 
 FUSE file handles register `POLL` once with a stable kernel handle and
 cache the daemon's `revents`. `FUSE_NOTIFY_POLL` invalidates that

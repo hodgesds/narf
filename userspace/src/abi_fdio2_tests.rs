@@ -14,10 +14,10 @@ use crate::abi_test_support::*;
 
 // ── Local helpers (mirrors abi_fdio_tests.rs; kept private to this file) ──
 
-/// Open `path` (a `&[u8]` ending in NUL) and return the fd. flags=0.
+/// Open `path` read/write and return the fd.
 fn open_fd2(path: &[u8]) -> Result<u32, &'static str> {
     let ptr = path.as_ptr() as u64;
-    match call_open(ptr, 0) {
+    match call_open(ptr, crate::fd::O_RDWR as u64) {
         Some(fd) if fd >= 0 => Ok(fd as u32),
         _ => Err("open failed"),
     }
@@ -221,13 +221,12 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio2_pwritev2_neg);
 // ── read / write — zero-length boundary + EFAULT branches ──────────
 //
 // The original file covers read/write success + bad-fd InvalidOp, but
-// not the `len == 0` early-return (returns 0 before any fd lookup) nor
-// the `validate_user_range` EFAULT arm.
+// not Linux's fd/mode-before-uaccess ordering, including count zero.
 
 fn smoke_abi_fdio2_read_zero_len() -> TestResult {
     with_setup(|| {
-        // len == 0 returns 0 before the fd is consulted — even a bad fd.
-        match call(Syscall::Read.raw(), a2(9999, 0, 0)) {
+        // A valid readable fd plus NULL/count=0 succeeds.
+        match call(Syscall::Read.raw(), a2(0, 0, 0)) {
             Some(0) => Ok(()),
             _ => Err("read zero-len did not return 0"),
         }
@@ -237,9 +236,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio2_read_zero_len);
 
 fn smoke_abi_fdio2_read_efault() -> TestResult {
     with_setup(|| {
-        // Non-null but non-canonical dst pointer → validate_user_range
-        // rejects it → -EFAULT (Ok status, value -14), before any fd use.
-        match call(Syscall::Read.raw(), a2(3, BAD_PTR, 4)) {
+        // After resolving valid readable stdin, a non-canonical destination
+        // fails access_ok with EFAULT.
+        match call(Syscall::Read.raw(), a2(0, BAD_PTR, 4)) {
             Some(v) if v == EFAULT => Ok(()),
             _ => Err("read with a bad dst pointer was not -EFAULT"),
         }
@@ -249,8 +248,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio2_read_efault);
 
 fn smoke_abi_fdio2_write_zero_len() -> TestResult {
     with_setup(|| {
-        // len == 0 returns 0 before the fd / buffer are touched.
-        match call(Syscall::Write.raw(), a2(9999, 0, 0)) {
+        // A valid writable fd plus NULL/count=0 succeeds.
+        match call(Syscall::Write.raw(), a2(1, 0, 0)) {
             Some(0) => Ok(()),
             _ => Err("write zero-len did not return 0"),
         }
@@ -260,14 +259,34 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio2_write_zero_len);
 
 fn smoke_abi_fdio2_write_efault() -> TestResult {
     with_setup(|| {
-        // copy_from_user_vec on a non-canonical src → -EFAULT.
-        match call(Syscall::Write.raw(), a2(3, BAD_PTR, 4)) {
+        // After resolving valid writable stdout, access_ok rejects the source.
+        match call(Syscall::Write.raw(), a2(1, BAD_PTR, 4)) {
             Some(v) if v == EFAULT => Ok(()),
             _ => Err("write with a bad src pointer was not -EFAULT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_write_efault);
+
+fn smoke_abi_fdio2_rw_validation_order() -> TestResult {
+    with_setup(|| {
+        // Linux resolves fd and FMODE before access_ok, even for count zero.
+        if call(Syscall::Read.raw(), a2(9999, BAD_PTR, 0)) != Some(EBADF) {
+            return Err("read count=0 did not validate fd first");
+        }
+        if call(Syscall::Write.raw(), a2(9999, BAD_PTR, 0)) != Some(EBADF) {
+            return Err("write count=0 did not validate fd first");
+        }
+        if call(Syscall::Read.raw(), a2(1, BAD_PTR, 4)) != Some(EBADF) {
+            return Err("read did not validate FMODE before pointer");
+        }
+        if call(Syscall::Write.raw(), a2(0, BAD_PTR, 4)) != Some(EBADF) {
+            return Err("write did not validate FMODE before pointer");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio2_rw_validation_order);
 
 // ── readv / writev / vmsplice — EFAULT on a bad iovec array ─────────
 //
@@ -279,7 +298,7 @@ fn smoke_abi_fdio2_readv_efault() -> TestResult {
     with_setup(|| {
         // iovcnt == 1 (≤ IOV_MAX) but the iovec array pointer is bad →
         // copy_from_user_vec → -EFAULT.
-        match call(Syscall::Readv.raw(), a2(3, BAD_PTR, 1)) {
+        match call(Syscall::Readv.raw(), a2(0, BAD_PTR, 1)) {
             Some(v) if v == EFAULT => Ok(()),
             _ => Err("readv with a bad iovec ptr was not -EFAULT"),
         }
@@ -288,17 +307,54 @@ fn smoke_abi_fdio2_readv_efault() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_readv_efault);
 
 fn smoke_abi_fdio2_writev_efault() -> TestResult {
-    with_setup(|| match call(Syscall::Writev.raw(), a2(3, BAD_PTR, 1)) {
+    with_setup(|| match call(Syscall::Writev.raw(), a2(1, BAD_PTR, 1)) {
         Some(v) if v == EFAULT => Ok(()),
         _ => Err("writev with a bad iovec ptr was not -EFAULT"),
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_writev_efault);
 
+fn smoke_abi_fdio2_readv_late_efault_preserves_pipe() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_pipe2()?;
+        let payload = *b"xy";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(2)
+        {
+            return Err("failed to seed pipe");
+        }
+        let mut first = [0u8; 1];
+        let mut iov = [0u8; 32];
+        iov[..8].copy_from_slice(&(first.as_mut_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        iov[16..24].copy_from_slice(&BAD_PTR.to_ne_bytes());
+        iov[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        if call(Syscall::Readv.raw(), a2(rd as u64, iov.as_ptr() as u64, 2)) != Some(EFAULT) {
+            return Err("late bad iovec did not return EFAULT");
+        }
+        let mut out = [0u8; 2];
+        match call(
+            Syscall::Read.raw(),
+            a2(rd as u64, out.as_mut_ptr() as u64, out.len() as u64),
+        ) {
+            Some(2) if &out == b"xy" => Ok(()),
+            _ => Err("readv EFAULT consumed or reordered pipe bytes"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio2_readv_late_efault_preserves_pipe
+);
+
 fn smoke_abi_fdio2_vmsplice_efault() -> TestResult {
     with_setup(|| {
-        // nr_segs == 1 (≤ IOV_MAX), bad iovec array → -EFAULT.
-        match call(Syscall::Vmsplice.raw(), a3(3, BAD_PTR, 1, 0)) {
+        let (_rd, wr) = make_pipe2()?;
+        // Linux resolves fd/f_mode before import_iovec, so use a valid pipe
+        // descriptor to isolate the unreadable iovec-array result.
+        match call(Syscall::Vmsplice.raw(), a3(wr as u64, BAD_PTR, 1, 0)) {
             Some(v) if v == EFAULT => Ok(()),
             _ => Err("vmsplice with a bad iovec ptr was not -EFAULT"),
         }

@@ -43,17 +43,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             let min_fd = arg as u32;
             let cloexec = cmd == F_DUPFD_CLOEXEC;
             let outcome = fd::with_table(task, |t| {
-                let entry = t.get(fd)?;
-                // F_DUPFD shares the open file description — offset travels
-                // with the duplicate too (LINUX-GAP: snapshotted, not
-                // aliased; see sys_dup).
-                let clone = crate::fd::FdEntry {
-                    ops: entry.ops.clone(),
-                    offset: entry.offset,
-                    flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-                    status_flags: entry.status_flags,
-                };
-                Some(t.open_at_least(clone, min_fd))
+                t.duplicate(fd, min_fd, if cloexec { crate::fd::FD_CLOEXEC } else { 0 })
             });
             match outcome {
                 Some(Some(new_fd)) => {
@@ -163,9 +153,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         // stamps owners in TaskId space, so translate TaskId
                         // -> outer -> caller's ns view rather than leaking a
                         // raw scheduler id to lslocks/sqlite.
-                        out.l_pid =
-                            report_pid_to(task, task_to_pid_raw(lock.pid as u64).unwrap_or(lock.pid as u64))
-                                as i32;
+                        out.l_pid = report_pid_to(
+                            task,
+                            task_to_pid_raw(lock.pid as u64).unwrap_or(lock.pid as u64),
+                        ) as i32;
                         if write_flock_to_user(arg, &out).is_err() {
                             ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
                         } else {
@@ -189,10 +180,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         out.l_len = b.len;
                         // Owner is a TaskId; report it in the caller's ns view
                         // (see the get_lock path above).
-                        out.l_pid = report_pid_to(
-                            task,
-                            task_to_pid_raw(b.owner).unwrap_or(b.owner),
-                        ) as i32;
+                        out.l_pid =
+                            report_pid_to(task, task_to_pid_raw(b.owner).unwrap_or(b.owner)) as i32;
                     }
                 }
                 if write_flock_to_user(arg, &out).is_err() {
@@ -345,18 +334,18 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let mq_nb: Option<bool> = None;
 
     let outcome = fd::with_table(task, |t| {
-        let entry = t.get_mut(fd)?;
+        let entry = t.get(fd)?;
         Some(match cmd {
             F_GETFD => SyscallReturn::ok(entry.flags as u64),
             F_SETFD => {
-                entry.flags = arg as u32;
+                t.get_mut(fd)?.flags = arg as u32;
                 SyscallReturn::ok(0)
             }
             // F_GETFL: report the per-fd status_flags. Socket
             // O_NONBLOCK overrides the bit if the SocketFile carries
             // its own nonblock toggle (kept in sync via F_SETFL).
             F_GETFL => {
-                let mut v = entry.status_flags as u64;
+                let mut v = t.status_flags(fd)? as u64;
                 if let Some(nb) = sock_nb {
                     if nb {
                         v |= crate::socket::O_NONBLOCK as u64;
@@ -381,7 +370,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 #[cfg(not(feature = "linux-compat"))]
                 let mask = 0o4000u32; // O_NONBLOCK only.
                 let new = (arg as u32) & mask;
-                entry.status_flags = (entry.status_flags & !mask) | new;
+                let old = t.status_flags(fd)?;
+                t.set_status_flags(fd, (old & !mask) | new)?;
                 SyscallReturn::ok(0)
             }
             // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report the pipe buffer

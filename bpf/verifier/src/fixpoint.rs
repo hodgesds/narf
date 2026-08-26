@@ -389,6 +389,12 @@ impl Analysis<'_, '_> {
         let mut in_state: Vec<Option<AbsState>> = vec![None; self.ir.blocks.len()];
         in_state[entry_block as usize] = Some(entry);
         let mut worklist = vec![entry_block];
+        // Membership is separate from the LIFO worklist so enqueue remains
+        // O(1) even for a wide CFG. Keep the vector (rather than changing to a
+        // queue or set) because pop order affects convergence work, while a
+        // block-indexed bit preserves the existing order exactly.
+        let mut queued = vec![false; self.ir.blocks.len()];
+        queued[entry_block as usize] = true;
 
         // Hard cap on worklist rounds.
         //
@@ -407,6 +413,7 @@ impl Analysis<'_, '_> {
         let budget = fixpoint_round_budget(self.ir.blocks.len());
 
         while let Some(b) = worklist.pop() {
+            queued[b as usize] = false;
             rounds += 1;
             if rounds > budget {
                 return Err(VerifyError::FixpointDiverged {
@@ -436,8 +443,9 @@ impl Analysis<'_, '_> {
                 };
                 if changed {
                     in_state[succ as usize] = Some(merged);
-                    if !worklist.contains(&succ) {
+                    if !queued[succ as usize] {
                         worklist.push(succ);
+                        queued[succ as usize] = true;
                     }
                 }
             }

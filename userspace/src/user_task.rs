@@ -100,6 +100,15 @@ pub struct UserTaskCtx {
     /// re-polls readiness immediately instead of waiting out its wheel
     /// deadline (~100 ms for redis's serverCron). Cleared on wake.
     pub net_io_wait: AtomicBool,
+    /// Set while a System V semaphore operation is queued. The park loop
+    /// installs its current task waker in the queue record and rechecks the
+    /// terminal status before sleeping, so migration and wake-before-register
+    /// races do not require a polling deadline.
+    pub sem_wait_pending: AtomicBool,
+    /// Set while a System V message send/receive is linked to its queue. The
+    /// park loop installs one durable waker in that record and rechecks the
+    /// queue-transition/terminal state under the message-state lock.
+    pub msg_wait_pending: AtomicBool,
     /// `narf_net::readiness::generation()` snapshot taken by
     /// `sys_epoll_wait`/`sys_poll` just before its final readiness
     /// check. After registering the I/O waker, the park path refreshes
@@ -453,6 +462,8 @@ impl UserTaskCtx {
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
+            sem_wait_pending: AtomicBool::new(false),
+            msg_wait_pending: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
             epoll_wait_fd: AtomicU64::new(0),
@@ -640,39 +651,136 @@ pub fn user_fpu_restore_current() {
     }
 }
 
-pub fn current_user_task() -> Option<*mut UserTaskCtx> {
-    // Own-stack model: a task RESUMES from a park via `kernel_switch`, NOT a
-    // re-poll, so `UserTaskFuture::poll`'s `install_current` does NOT re-run —
-    // the per-CPU `CURRENT` cell keeps pointing at whichever task was last
-    // FRESHLY polled, even after the executor switched to a different task. A
-    // syscall handler (e.g. `sys_futex`) reading `current_user_task()` while a
-    // RESUMED task runs would then operate on the WRONG task's `UserTaskCtx` —
-    // a redis worker's futex wrote its wait-state into netserve's ctx, wedging
-    // netserve's accept() into an infinite futex wait (net-smoke echo hang).
-    // The scheduler's CURRENT KernelTask publication is always correct and
-    // already follows direct resume plus migration. The polling future stores
-    // its Arc<Task> pointer in that task-local context once, so recover the ctx
-    // without bouncing the global TASKS B-tree lock on every syscall. Fall
-    // back to the legacy per-CPU cell for the longjmp model and kernel tests.
-    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if narf_scheduler::stackful::user_own_stack_enabled() {
-        let task = current_task_owner_ptr();
-        if !task.is_null() {
-            // SAFETY: the CURRENT KernelTask's pinned UserTaskFuture owns the
-            // Arc<Task> that published this pointer; it cannot be dropped
-            // while its syscall continuation is executing.
-            return Some(unsafe { &(*task).uctx as *const UserTaskCtx as *mut UserTaskCtx });
-        }
+/// Which pointer `current_user_task` should resolve the current `UserTaskCtx`
+/// from. Split out from the pointer dereferences so the own-stack-vs-legacy
+/// precedence is unit-testable without toggling the global own-stack latch or
+/// per-CPU scheduler state (both shared across the concurrent kernel-test run).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CurrentTaskSource {
+    /// No current user task on this CPU.
+    None,
+    /// Deref the scheduler-published owner `Task` (own-stack model).
+    OwnerContext,
+    /// Read the legacy per-CPU `CURRENT` cell (longjmp model / kernel tests).
+    LegacyCell,
+}
+
+/// Own-stack model: the scheduler-published owner context is the ONLY sound
+/// source. It is lifetime-coupled to the live `KernelTask` (its pinned
+/// `UserTaskFuture` owns the `Arc<Task>`) and follows direct kernel_switch
+/// resume + CPU migration. When no owner is published yet — e.g. a freshly
+/// polled task between `task_body_rust` arming CURRENT and its poll reaching
+/// `publish_current_task` — the answer is None: such a task has not opened a
+/// kernel span, so there is nothing to account against. The legacy per-CPU
+/// `CURRENT` cell must NOT be consulted here, because own-stack execution never
+/// runs its clear site (the longjmp poll tail), so the cell dangles at a prior
+/// exited task's freed `uctx` and a timer-preempt accounting hook would store
+/// through it. The legacy cell is authoritative only in the longjmp model,
+/// where the poll publishes it before entering user mode and clears it on the
+/// way back out.
+#[inline]
+fn current_user_task_source(
+    own_stack: bool,
+    owner_null: bool,
+    legacy_cell_null: bool,
+) -> CurrentTaskSource {
+    if own_stack {
+        return if owner_null {
+            CurrentTaskSource::None
+        } else {
+            CurrentTaskSource::OwnerContext
+        };
     }
-    // Longjmp model (and the fallback): the in-flight polling routine publishes
-    // its ctx in this CPU's `CURRENT` cell right before entering user mode and
-    // clears it on the way back out.
-    let p = current_slot().load(Ordering::Acquire);
-    if p.is_null() {
-        None
+    if legacy_cell_null {
+        CurrentTaskSource::None
     } else {
-        Some(p)
+        CurrentTaskSource::LegacyCell
     }
+}
+
+pub fn current_user_task() -> Option<*mut UserTaskCtx> {
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let (own_stack, owner) = {
+        let own_stack = narf_scheduler::stackful::user_own_stack_enabled();
+        // Only resolve the owner when the own-stack model is active; the legacy
+        // model never publishes it.
+        let owner = if own_stack {
+            current_task_owner_ptr()
+        } else {
+            core::ptr::null()
+        };
+        (own_stack, owner)
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let (own_stack, owner) = (false, core::ptr::null::<crate::task::Task>());
+
+    let legacy = current_slot().load(Ordering::Acquire);
+    match current_user_task_source(own_stack, owner.is_null(), legacy.is_null()) {
+        CurrentTaskSource::None => None,
+        CurrentTaskSource::OwnerContext => {
+            // SAFETY: the CURRENT KernelTask's pinned UserTaskFuture owns the
+            // Arc<Task> that published this pointer; it cannot be dropped while
+            // its syscall continuation is executing.
+            Some(unsafe { &(*owner).uctx as *const UserTaskCtx as *mut UserTaskCtx })
+        }
+        CurrentTaskSource::LegacyCell => Some(legacy),
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+mod current_user_task_source_tests {
+    use super::{current_user_task_source, CurrentTaskSource};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// C1 regression. In the own-stack model `current_user_task` must resolve
+    /// the current `UserTaskCtx` ONLY from the scheduler-published owner
+    /// context, never from the legacy per-CPU `CURRENT` cell. That cell is not
+    /// cleared on the own-stack park/exit path (its clear site is the longjmp
+    /// poll tail, which own-stack execution never reaches), so it dangles at a
+    /// prior exited task's freed `uctx`. A timer-preempt accounting hook that
+    /// fell back to it stored through freed memory — the KASAN store-to-poisoned
+    /// panic in `close_kernel_span`. The pre-fix code fell through to the cell
+    /// whenever no owner was published; this asserts the precedence stays split.
+    fn smoke_own_stack_never_reads_stale_legacy_cell() -> TestResult {
+        use CurrentTaskSource::{LegacyCell, None, OwnerContext};
+
+        // Own-stack, owner published → use the owner context.
+        if current_user_task_source(true, false, false) != OwnerContext {
+            return TestResult::Fail("own-stack with a published owner must use the owner context");
+        }
+        // Own-stack, NO owner published, legacy cell NON-null (a prior task's
+        // possibly-freed uctx) → None. This is the exact C1 window; the pre-fix
+        // code returned the stale cell here.
+        if current_user_task_source(true, true, false) != None {
+            return TestResult::Fail(
+                "own-stack without a published owner must be None, not the stale legacy cell",
+            );
+        }
+        // Own-stack, nothing anywhere → None.
+        if current_user_task_source(true, true, true) != None {
+            return TestResult::Fail("own-stack with no context must be None");
+        }
+        // Own-stack must resolve the owner even when the legacy cell is null.
+        if current_user_task_source(true, false, true) != OwnerContext {
+            return TestResult::Fail("own-stack must use the owner even with a null legacy cell");
+        }
+        // Longjmp model: fall back to the legacy per-CPU cell.
+        if current_user_task_source(false, true, false) != LegacyCell {
+            return TestResult::Fail("longjmp model must use the legacy cell");
+        }
+        if current_user_task_source(false, true, true) != None {
+            return TestResult::Fail("longjmp model with an empty cell must be None");
+        }
+        // Longjmp model ignores the owner pointer.
+        if current_user_task_source(false, false, false) != LegacyCell {
+            return TestResult::Fail("longjmp model must ignore the owner pointer");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/process",
+        smoke_own_stack_never_reads_stale_legacy_cell
+    );
 }
 
 // ── Per-task-own-stack syscall park ─────────────────────────────────
@@ -758,7 +866,7 @@ fn park_should_block(
         // return-to-user delivery path CONSUMES pending SIG_IGN/default-
         // Ignore bits (see `deliver_one_signal`), so breaking the park can't
         // busy-spin on a bit nobody clears.
-        let signal_pending = crate::handlers::is_signal_pending(task_id);
+        let signal_pending = crate::handlers::has_interrupting_signal(task_id);
         if now < deadline && !signal_pending {
             // rt_sigtimedwait park: register in SIGNAL_WAKERS FIRST (every
             // raise path calls `wake_signal`, which fires this entry), THEN
@@ -847,6 +955,34 @@ fn park_should_block(
                     crate::handlers::drop_signal_waker(task_id);
                     uc.sleep_deadline_ns.store(0, Ordering::Release);
                     return false;
+                }
+            }
+            if uc.sem_wait_pending.load(Ordering::Acquire) {
+                match crate::sysvipc::register_sem_wait_waker(task_id, waker.clone()) {
+                    crate::sysvipc::SemParkState::Pending => {}
+                    crate::sysvipc::SemParkState::Ready => {
+                        crate::handlers::drop_signal_waker(task_id);
+                        uc.sem_wait_pending.store(false, Ordering::Release);
+                        uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        return false;
+                    }
+                    crate::sysvipc::SemParkState::NotWaiting => {
+                        uc.sem_wait_pending.store(false, Ordering::Release);
+                    }
+                }
+            }
+            if uc.msg_wait_pending.load(Ordering::Acquire) {
+                match crate::sysvipc::register_msg_wait_waker(task_id, waker.clone()) {
+                    crate::sysvipc::MsgParkState::Pending => {}
+                    crate::sysvipc::MsgParkState::Ready => {
+                        crate::handlers::drop_signal_waker(task_id);
+                        uc.msg_wait_pending.store(false, Ordering::Release);
+                        uc.sleep_deadline_ns.store(0, Ordering::Release);
+                        return false;
+                    }
+                    crate::sysvipc::MsgParkState::NotWaiting => {
+                        uc.msg_wait_pending.store(false, Ordering::Release);
+                    }
                 }
             }
             // FUTEX_WAIT: register on the per-uaddr queue + lost-wake guard.
@@ -1947,6 +2083,54 @@ impl core::future::Future for UserTaskFuture {
                         return core::task::Poll::Pending;
                     }
                 }
+                if this.task.uctx.sem_wait_pending.load(Ordering::Acquire) {
+                    match crate::sysvipc::register_sem_wait_waker(
+                        crate::handlers::current_task_id(),
+                        cx.waker().clone(),
+                    ) {
+                        crate::sysvipc::SemParkState::Pending => {}
+                        crate::sysvipc::SemParkState::Ready => {
+                            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
+                            this.task
+                                .uctx
+                                .sem_wait_pending
+                                .store(false, Ordering::Release);
+                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            cx.waker().wake_by_ref();
+                            return core::task::Poll::Pending;
+                        }
+                        crate::sysvipc::SemParkState::NotWaiting => {
+                            this.task
+                                .uctx
+                                .sem_wait_pending
+                                .store(false, Ordering::Release);
+                        }
+                    }
+                }
+                if this.task.uctx.msg_wait_pending.load(Ordering::Acquire) {
+                    match crate::sysvipc::register_msg_wait_waker(
+                        crate::handlers::current_task_id(),
+                        cx.waker().clone(),
+                    ) {
+                        crate::sysvipc::MsgParkState::Pending => {}
+                        crate::sysvipc::MsgParkState::Ready => {
+                            crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
+                            this.task
+                                .uctx
+                                .msg_wait_pending
+                                .store(false, Ordering::Release);
+                            this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                            cx.waker().wake_by_ref();
+                            return core::task::Poll::Pending;
+                        }
+                        crate::sysvipc::MsgParkState::NotWaiting => {
+                            this.task
+                                .uctx
+                                .msg_wait_pending
+                                .store(false, Ordering::Release);
+                        }
+                    }
+                }
                 // FUTEX_WAIT: `sys_futex` published the futex word here.
                 // Register our waker on the per-uaddr wait queue so a
                 // `FUTEX_WAKE` on that word wakes us promptly (a real blocking
@@ -2058,6 +2242,14 @@ impl core::future::Future for UserTaskFuture {
             crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            this.task
+                .uctx
+                .sem_wait_pending
+                .store(false, Ordering::Release);
+            this.task
+                .uctx
+                .msg_wait_pending
+                .store(false, Ordering::Release);
             // Unqueue the futex waiter this park registered (see the own-stack
             // twin above): Linux's futex_unqueue removes it on timeout/signal
             // too, so a later FUTEX_WAKE(1) can't pop a ghost.
@@ -2714,7 +2906,7 @@ impl core::future::Future for UserTaskFuture {
             // rewound rt_sigtimedwait re-executes and consumes it.
             let tid = crate::handlers::current_task_id();
             let sw = this.task.uctx.sigwait_set.load(Ordering::Acquire);
-            let signal_pending = crate::handlers::is_signal_pending(tid)
+            let signal_pending = crate::handlers::has_interrupting_signal(tid)
                 || (sw != 0 && crate::handlers::sigwait_should_wake(tid, sw));
             if now < deadline && !signal_pending {
                 const PARK_CHUNK_NS: u64 = 1_000_000;

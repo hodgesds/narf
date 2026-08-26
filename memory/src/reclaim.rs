@@ -34,16 +34,15 @@
 //!      report `Freed` are dropped from tracking, the rest stay
 //!      tracked with their handler's outcome recorded.
 //!
-//! # Why Stage-1 is *only* the foreground path
+//! # Allocation context
 //!
-//! A background kthread that wakes up under low-watermark pressure is
-//! the eventual shape — but it needs the scheduler + sleep-pump
-//! integration that we won't have wired through cleanly until the
-//! kthread infrastructure stabilises. Until then the caller drives
-//! reclaim explicitly from the failing alloc site (e.g. in front of
-//! a buddy `Err(Exhausted)`). The same API surface that the
-//! foreground path uses is what the kthread will eventually call —
-//! no second redesign required when we install it.
+//! Global allocation may happen while an arbitrary subsystem lock is held, so
+//! it never invokes reclaim callbacks or sleeps. Allocation failures publish a
+//! bounded, per-node request through `request_reclaim`; the scheduler-owned
+//! kswapd task consumes it and drives the reclaim APIs below. Existing explicit
+//! callers remain outside `GlobalAlloc` and must independently uphold their
+//! lock and execution-context contract; migrating cgroup charging is separate
+//! follow-up work.
 //!
 //! # Why active/inactive instead of CLOCK or LRFU
 //!
@@ -93,7 +92,7 @@ extern crate alloc as alloc_crate;
 
 use alloc_crate::collections::VecDeque;
 use alloc_crate::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -348,29 +347,137 @@ pub fn user_alloc_would_breach_reserve() -> bool {
 
 static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// Set when the allocator could not satisfy a KERNEL allocation even after the
-/// reserve and the vmalloc fallback — i.e. genuine, unrecoverable exhaustion,
-/// not a transient dip below `min`. Only THIS arms the reclaimer's OOM killer;
-/// ordinary reserve-breach wakes just reclaim + reap. Keeping the OOM decision
-/// gated on real exhaustion is what stops the reclaimer from killing (and, with
-/// stress-ng `--abort`, failing) a workload that the reserve + vmalloc already
-/// carry without any kill.
-static OOM_NEEDED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// High bit packed into each request word when the matching failure authorizes
+/// OOM policy. Pages and authorization share one atomic linearization point so
+/// kswapd cannot pair one producer's flag with another producer's target.
+const RECLAIM_OOM_BIT: usize = 1usize << (usize::BITS - 1);
+const RECLAIM_PAGE_MASK: usize = RECLAIM_OOM_BIT - 1;
 
-/// Signal that a kernel allocation genuinely failed, and wake the reclaimer to
-/// OOM-kill. Called from the frame allocator's exhaustion path.
-pub fn signal_oom_needed() {
-    OOM_NEEDED.store(true, Ordering::Release);
-    // Genuine kernel exhaustion is global: wake EVERY node's kswapd so each
-    // reclaims its own node and the OOM/reap backlog is drained (every kthread
-    // checks the OOM signal after its reclaim pass regardless of its own
-    // watermark; the signal is single-consumer, so exactly one kill results).
-    wake_all_kswapd();
+/// Requested reclaim work for each NUMA node. Multiple producers coalesce to
+/// the largest outstanding page target and OR their OOM authorization; the
+/// node's sole kswapd consumes both fields in one swap.
+static RECLAIM_REQUESTS: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
+    [const { AtomicUsize::new(0) }; crate::frame::MAX_NUMA_NODES];
+
+/// One atomically consumed background-reclaim request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimRequest {
+    /// Largest coalesced base-page target.
+    pub target_pages: usize,
+    /// Whether at least one coalesced allocation failure authorized OOM policy.
+    pub oom_authorized: bool,
 }
 
-/// Consume the pending-OOM signal (the reclaimer checks this before killing).
-pub fn take_oom_needed() -> bool {
-    OOM_NEEDED.swap(false, Ordering::AcqRel)
+impl ReclaimRequest {
+    const NONE: Self = Self {
+        target_pages: 0,
+        oom_authorized: false,
+    };
+}
+
+fn publish_reclaim_request(node: usize, pages: usize, authorize_oom: bool) {
+    if pages == 0 {
+        return;
+    }
+    let Some(request) = RECLAIM_REQUESTS.get(node) else {
+        return;
+    };
+    let pages = pages.min(RECLAIM_PAGE_MASK);
+    let oom = if authorize_oom { RECLAIM_OOM_BIT } else { 0 };
+    let _ = request.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        let target = (current & RECLAIM_PAGE_MASK).max(pages);
+        Some((current & RECLAIM_OOM_BIT) | oom | target)
+    });
+    wake_kswapd(node);
+}
+
+/// Ask the background reclaimer for up to `pages` base pages on `node`.
+///
+/// Requests are allocation-free, non-blocking, and coalesced by maximum rather
+/// than addition so a burst of failures cannot manufacture an unbounded debt.
+/// A zero-sized or out-of-range request is ignored.
+pub fn request_reclaim(node: usize, pages: usize) {
+    publish_reclaim_request(node, pages, false);
+}
+
+/// Publish background work for a genuinely failed allocation and authorize OOM
+/// policy if its reclaim pass makes no progress. Target and authorization are
+/// one atomic update, including when an ordinary request is already pending.
+pub fn request_reclaim_with_oom(node: usize, pages: usize) {
+    publish_reclaim_request(node, pages, true);
+}
+
+/// Consume the coalesced target and its OOM authorization for `node` in one
+/// atomic operation. Only that node's kswapd should call this.
+pub fn take_reclaim_request(node: usize) -> ReclaimRequest {
+    let packed = RECLAIM_REQUESTS
+        .get(node)
+        .map_or(0, |request| request.swap(0, Ordering::AcqRel));
+    ReclaimRequest {
+        target_pages: packed & RECLAIM_PAGE_MASK,
+        oom_authorized: packed & RECLAIM_OOM_BIT != 0,
+    }
+}
+
+mod reclaim_request_tests {
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::{request_reclaim, request_reclaim_with_oom, take_reclaim_request, ReclaimRequest};
+
+    fn smoke_reclaim_requests_coalesce_and_consume() -> TestResult {
+        const NODE: usize = crate::frame::MAX_NUMA_NODES - 2;
+
+        let _ = take_reclaim_request(NODE);
+        request_reclaim(NODE, 2);
+        request_reclaim(NODE, 7);
+        request_reclaim(NODE, 3);
+        request_reclaim(NODE, 0);
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 7,
+                oom_authorized: false,
+            })
+        {
+            return TestResult::Fail("reclaim requests did not coalesce by maximum");
+        }
+        if take_reclaim_request(NODE) != ReclaimRequest::NONE {
+            return TestResult::Fail("reclaim request was not consumed exactly once");
+        }
+        request_reclaim(crate::frame::MAX_NUMA_NODES, 9);
+        if take_reclaim_request(crate::frame::MAX_NUMA_NODES) != ReclaimRequest::NONE {
+            return TestResult::Fail("out-of-range reclaim request was retained");
+        }
+
+        // Reproduce the state that made separate target/flag atomics racy: an
+        // ordinary request is already pending when an OOM-authorized producer
+        // publishes. One packed swap must return their coalesced target and
+        // authorization together; neither may leak into the next request.
+        request_reclaim(NODE, 2);
+        request_reclaim_with_oom(NODE, 4);
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 4,
+                oom_authorized: true,
+            })
+        {
+            return TestResult::Fail("OOM authorization was not paired with its request");
+        }
+        request_reclaim(NODE, 3);
+        if take_reclaim_request(NODE)
+            != (ReclaimRequest {
+                target_pages: 3,
+                oom_authorized: false,
+            })
+        {
+            return TestResult::Fail("OOM authorization leaked into the next request");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_requests_coalesce_and_consume
+    );
 }
 
 // ── Overcommit policy (vm.overcommit_memory analogue) ──────────────────
@@ -681,9 +788,10 @@ pub fn plan_watermark_reclaim(
 pub struct Shrinker {
     /// Stable identifier for diagnostics (`"page-cache"`, `"dentry"`, …).
     pub name: &'static str,
-    /// Number of reclaimable objects the cache currently holds.
+    /// Upper bound on the number of reclaimable base pages the cache holds.
     pub count: fn() -> usize,
-    /// Try to free up to `nr` objects; returns the number actually freed.
+    /// Try to free at most `nr_pages` base pages; returns the number actually
+    /// freed. A callback must never free or report more than its argument.
     pub scan: fn(usize) -> usize,
 }
 
@@ -719,8 +827,8 @@ pub fn register_shrinker(s: Shrinker) {
     }
 }
 
-/// Total reclaimable objects across all registered shrinkers.
-pub fn shrinkable_objects() -> usize {
+/// Total reclaimable base pages across all registered shrinkers.
+pub fn shrinkable_pages() -> usize {
     let snap = *SHRINKERS.lock();
     snap.iter()
         .flatten()
@@ -728,21 +836,35 @@ pub fn shrinkable_objects() -> usize {
         .fold(0usize, |a, c| a.saturating_add(c))
 }
 
-/// Drive all shrinkers to free about `target` objects, distributing the
+/// Compatibility alias for callers that predate the page-denominated
+/// shrinker contract.
+pub fn shrinkable_objects() -> usize {
+    shrinkable_pages()
+}
+
+/// Drive all shrinkers to free at most `target_pages` base pages, distributing the
 /// pressure in proportion to each shrinker's current size (Linux's
-/// proportional-pressure model). Returns the total number of objects
-/// actually freed (which may exceed or fall short of `target`).
+/// proportional-pressure model). Returns the total number of base pages
+/// actually freed, which can fall short of but never exceeds `target_pages`.
 ///
 /// Allocation-free: the registry array is copied out under the lock
 /// (it is `Copy`), then the lock is dropped before invoking any `scan`
 /// — a shrinker's `scan` may take its own locks, and must never run
 /// while the registry lock is held. This is why the whole path avoids
-/// `Vec`: `shrink_all` is callable from the allocation-failure path.
-pub fn shrink_all(target: usize) -> usize {
-    if target == 0 {
+/// `Vec`: `shrink_all` is callable while memory is scarce. The
+/// callback contract is strict: every `scan(n)` must itself cap physical
+/// release and its report at `n`; the defensive clamp below prevents a broken
+/// callback from corrupting the caller's accounting, but cannot undo excess
+/// physical release.
+pub fn shrink_all(target_pages: usize) -> usize {
+    if target_pages == 0 {
         return 0;
     }
     let snap = *SHRINKERS.lock();
+    shrink_snapshot(&snap, target_pages)
+}
+
+fn shrink_snapshot(snap: &[Option<Shrinker>; MAX_SHRINKERS], target_pages: usize) -> usize {
     let total: usize = snap
         .iter()
         .flatten()
@@ -753,7 +875,7 @@ pub fn shrink_all(target: usize) -> usize {
     }
     let mut freed = 0usize;
     for s in snap.iter().flatten() {
-        if freed >= target {
+        if freed >= target_pages {
             break;
         }
         let count = (s.count)();
@@ -761,18 +883,70 @@ pub fn shrink_all(target: usize) -> usize {
             continue;
         }
         // This shrinker's proportional share of the target, at least 1 so a
-        // small cache still contributes when it holds anything.
-        let share = ((target.saturating_mul(count)) / total).max(1);
-        freed = freed.saturating_add((s.scan)(share));
+        // small cache still contributes when it holds anything. Clamp it to
+        // the remaining global budget before entering subsystem code.
+        let remaining = target_pages - freed;
+        let share = (((target_pages as u128) * (count as u128) / (total as u128)) as usize)
+            .max(1)
+            .min(remaining);
+        let scanned = (s.scan)(share);
+        debug_assert!(scanned <= share, "shrinker exceeded its page budget");
+        freed += scanned.min(share);
     }
     freed
 }
 
-/// Test-only: drop all registered shrinkers so a test's mock never
-/// leaks into another test's `shrink_all`.
+/// Test-only: unregister one named shrinker without disturbing live
+/// production reclaimers.
+#[doc(hidden)]
+pub fn __unregister_shrinker_for_test(name: &str) -> bool {
+    let mut g = SHRINKERS.lock();
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(s) if s.name == name) {
+            *slot = None;
+            return true;
+        }
+    }
+    false
+}
+
+/// Test-only: register a scoped mock at the front of the scan order without
+/// removing or overwriting any production entry. This makes a one-page test
+/// target deterministic while preserving the live registry; callers must pair
+/// it with [`__unregister_shrinker_for_test`]. Returns `false` when all slots
+/// are live.
+#[doc(hidden)]
+pub fn __register_shrinker_first_for_test(s: Shrinker) -> bool {
+    let mut g = SHRINKERS.lock();
+    // Re-registration is still idempotent by name. Clearing the old position
+    // creates the empty slot used by the stable right shift below.
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(existing) if existing.name == s.name) {
+            *slot = None;
+            break;
+        }
+    }
+    let Some(empty) = g.iter().position(Option::is_none) else {
+        return false;
+    };
+    for index in (1..=empty).rev() {
+        g[index] = g[index - 1];
+    }
+    g[0] = Some(s);
+    true
+}
+
+/// Test-only compatibility cleanup. Remove only explicitly test-named
+/// shrinkers; never erase production entries such as the slab or page-cache
+/// shrinkers. New tests should prefer [`__unregister_shrinker_for_test`].
 #[doc(hidden)]
 pub fn __reset_shrinkers_for_test() {
-    *SHRINKERS.lock() = [None; MAX_SHRINKERS];
+    let mut g = SHRINKERS.lock();
+    for slot in g.iter_mut() {
+        if matches!(slot, Some(s) if s.name.ends_with("-test")) {
+            *slot = None;
+        }
+    }
 }
 
 /// Test-only: clear the per-page frame LRU (slots + both lists + stats) so a
@@ -791,12 +965,12 @@ pub fn __reset_lru_for_test() {
     state.sweep_count = 0;
 }
 
-/// Free up to `target` reclaimable pages for a caller under allocation
-/// pressure — the direct-reclaim entry point. Returns the number freed.
+/// Free up to `target` reclaimable pages for a policy-aware caller under
+/// pressure. Returns the number freed.
 ///
-/// ALLOCATION-FREE: this is called from `GlobalAlloc::alloc` when an
-/// allocation fails, where allocating is precisely what must not happen.
-/// Both arms it drives are allocation-free:
+/// ALLOCATION-FREE: kswapd and legacy explicit charge paths can enter while
+/// memory is scarce. `GlobalAlloc::alloc` never calls this function because it
+/// may run while a shrinker-owned lock is held. Both arms are allocation-free:
 ///   1. the per-page frame LRU (`reclaim_target_pages`) — reclaims the
 ///      oldest cold tracked frames first (proper aging), and
 ///   2. the shrinker path (`shrink_all`) for the remaining deficit —
@@ -1207,13 +1381,13 @@ mod range_planner_tests {
 }
 
 /// Shrinker-registry tests. Always compiled so they register + run under
-/// `cargo xtask test`. A mock shrinker backed by an atomic object count
-/// exercises registration, proportional `shrink_all`, and idempotent
-/// re-registration; the registry is reset before/after so the mock never
-/// leaks into another test.
+/// `cargo xtask test`. The proportional scan is exercised against a private
+/// snapshot so live production shrinkers are neither invoked nor removed.
 mod shrinker_tests {
     use super::{
-        __reset_shrinkers_for_test, register_shrinker, shrink_all, shrinkable_objects, Shrinker,
+        __register_shrinker_first_for_test, __reset_shrinkers_for_test,
+        __unregister_shrinker_for_test, register_shrinker, shrink_snapshot, Shrinker,
+        MAX_SHRINKERS,
     };
     use core::sync::atomic::{AtomicUsize, Ordering};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -1242,45 +1416,71 @@ mod shrinker_tests {
         freed
     }
 
-    fn smoke_reclaim_shrinker_proportional() -> TestResult {
-        __reset_shrinkers_for_test();
+    fn smoke_reclaim_shrinker_page_budget() -> TestResult {
         MOCK_AVAIL.store(100, Ordering::Relaxed);
-        register_shrinker(Shrinker {
-            name: "mock",
+        let mock = Shrinker {
+            name: "memory-mock-test",
             count: mock_count,
             scan: mock_scan,
-        });
-        let result = (|| {
-            if shrinkable_objects() != 100 {
-                return TestResult::Fail("registry should report the mock's 100 objects");
-            }
-            if shrink_all(30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
-                return TestResult::Fail("shrink_all(30) should free exactly 30");
-            }
-            // Re-register same name → replace, not duplicate.
-            register_shrinker(Shrinker {
-                name: "mock",
-                count: mock_count,
-                scan: mock_scan,
-            });
-            if shrinkable_objects() != 70 {
-                return TestResult::Fail("re-register by name must not duplicate the shrinker");
-            }
-            // Over-target request frees all that remains.
-            shrink_all(1000);
-            if MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
-                return TestResult::Fail("over-target shrink should drain the cache");
-            }
-            // Nothing left → shrink_all is a no-op.
-            if shrink_all(10) != 0 {
-                return TestResult::Fail("empty cache should free nothing");
-            }
-            TestResult::Pass
-        })();
-        __reset_shrinkers_for_test();
-        result
+        };
+        let mut snap = [None; MAX_SHRINKERS];
+        snap[0] = Some(mock);
+        if shrink_snapshot(&snap, 30) != 30 || MOCK_AVAIL.load(Ordering::Relaxed) != 70 {
+            return TestResult::Fail("30-page shrink budget was not enforced exactly");
+        }
+        // An over-large target may drain the cache, but the reported return is
+        // still the number of base pages actually released.
+        if shrink_snapshot(&snap, 1000) != 70 || MOCK_AVAIL.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("over-target page shrink did not report actual release");
+        }
+        if shrink_snapshot(&snap, 0) != 0 {
+            return TestResult::Fail("zero page budget should be a no-op");
+        }
+        TestResult::Pass
     }
-    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_proportional);
+    kernel_test_in!("memory/reclaim", smoke_reclaim_shrinker_page_budget);
+
+    fn production_count() -> usize {
+        1
+    }
+
+    fn production_scan(nr: usize) -> usize {
+        nr.min(1)
+    }
+
+    fn smoke_reclaim_test_cleanup_preserves_live_registry() -> TestResult {
+        const LIVE: &str = "memory-production-sentinel";
+        const TEST: &str = "memory-registry-test";
+        register_shrinker(Shrinker {
+            name: LIVE,
+            count: production_count,
+            scan: production_scan,
+        });
+        if !__register_shrinker_first_for_test(Shrinker {
+            name: TEST,
+            count: mock_count,
+            scan: mock_scan,
+        }) {
+            let _ = __unregister_shrinker_for_test(LIVE);
+            return TestResult::Fail("test registry had no free slot");
+        }
+        // Compatibility cleanup may remove test-owned names, but must leave
+        // every production name in place.
+        __reset_shrinkers_for_test();
+        let live_survived = __unregister_shrinker_for_test(LIVE);
+        let test_survived = __unregister_shrinker_for_test(TEST);
+        if !live_survived {
+            return TestResult::Fail("test cleanup erased a live production shrinker");
+        }
+        if test_survived {
+            return TestResult::Fail("test cleanup left its scoped mock registered");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "memory/reclaim",
+        smoke_reclaim_test_cleanup_preserves_live_registry
+    );
 }
 
 /// Frame-LRU ↔ `try_to_free` integration tests. Always compiled so they
@@ -1289,12 +1489,12 @@ mod shrinker_tests {
 /// as `__text_start` — so those host-only tests never execute anywhere;
 /// this module gives the direct-reclaim path real in-kernel coverage.)
 /// Exercises the allocation-free `reclaim_target_pages` batch path through
-/// the `try_to_free` entry point, including the multi-batch loop. Resets the
-/// LRU + shrinker registries before/after so pages never leak between tests.
+/// the `try_to_free` entry point, including the multi-batch loop. Resets only
+/// its private fake LRU pages; live shrinkers remain registered and untouched.
 mod frame_lru_tests {
     use super::{
-        __reset_lru_for_test, __reset_shrinkers_for_test, lru_stats, register_page, try_to_free,
-        PageEntry, PageFlags, PhysAddr, ReclaimFn, ReclaimOutcome, INITIAL_AGE,
+        __reset_lru_for_test, lru_stats, register_page, try_to_free, PageEntry, PageFlags,
+        PhysAddr, ReclaimFn, ReclaimOutcome, INITIAL_AGE,
     };
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -1313,7 +1513,6 @@ mod frame_lru_tests {
 
     fn smoke_try_to_free_drains_frame_lru() -> TestResult {
         __reset_lru_for_test();
-        __reset_shrinkers_for_test();
         // More pages than one BATCH (8) so try_to_free must loop the
         // allocation-free batch path across a batch boundary.
         for i in 0..10 {
@@ -1332,9 +1531,9 @@ mod frame_lru_tests {
             if lru_stats().total != 8 {
                 return TestResult::Fail("try_to_free left the wrong tracked count");
             }
-            // Ask for more than remain, spanning the 8-page batch boundary —
-            // caps at the 8 still tracked.
-            if try_to_free(100) != 8 {
+            // Ask for exactly the remaining pages, spanning the 8-page batch
+            // boundary without applying pressure to unrelated live shrinkers.
+            if try_to_free(8) != 8 {
                 return TestResult::Fail("try_to_free did not drain across batches");
             }
             if lru_stats().total != 0 {
@@ -1347,7 +1546,6 @@ mod frame_lru_tests {
             TestResult::Pass
         })();
         __reset_lru_for_test();
-        __reset_shrinkers_for_test();
         result
     }
     kernel_test_in!("memory/reclaim", smoke_try_to_free_drains_frame_lru);
@@ -1833,9 +2031,8 @@ pub fn reclaim_target_pages(n: usize) -> usize {
     // apply outcomes. Repeat until we hit `n` or run out.
     //
     // ALLOCATION-FREE: the batch lives in fixed-size stack arrays, never
-    // the heap. `reclaim_target_pages` runs on the direct-reclaim path
-    // (`try_to_free`), reached precisely when allocation is already
-    // failing, so it must not allocate. Batch size 8 balances lock-thrash
+    // the heap. `reclaim_target_pages` runs under memory pressure through
+    // `try_to_free`, so it must not allocate. Batch size 8 balances lock-thrash
     // against the rare case where the first reclaim would have freed the
     // rest; every field is `Copy`, so the scratch arrays need no drop glue.
     const BATCH: usize = 8;

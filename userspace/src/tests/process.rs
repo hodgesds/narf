@@ -281,9 +281,15 @@ fn smoke_userspace_clone_rejects_invalid_flag_dependencies() -> TestResult {
     install_global(t);
 
     const CLONE_VM: u64 = 0x100;
+    const CLONE_SYSVSEM: u64 = 0x4_0000;
     const CLONE_SIGHAND: u64 = 0x800;
     const CLONE_THREAD: u64 = 0x1_0000;
-    for flags in [CLONE_SIGHAND, CLONE_VM | CLONE_THREAD] {
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
+    for flags in [
+        CLONE_SIGHAND,
+        CLONE_VM | CLONE_THREAD,
+        CLONE_NEWIPC | CLONE_SYSVSEM,
+    ] {
         let mut ctx = StubCtx {
             args: SyscallArgs {
                 arg0: flags,
@@ -724,16 +730,16 @@ kernel_test_in!("userspace", smoke_userspace_fcntl_dupfd_cloexec);
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_brk_grows_heap() -> TestResult {
     // Brk: query → returns the per-task default base. Grow by one
-    // page → returns the requested new break and walks the AS to
-    // confirm the page is mapped. Walk the AS to verify the
-    // physical backing is reachable.
+    // page → returns and persists the requested new break while
+    // reserving one lazy heap slot. brk(2) must not allocate, charge,
+    // or map a resident frame; first touch owns demand population.
     use crate::{
         install_address_space_lookup, install_core_syscalls, install_global,
         install_task_id_lookup, kernel_syscall_entry, syscall::__test_clear_global, Syscall,
         SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
     };
     use core::sync::atomic::{AtomicU64, Ordering};
-    use narf_memory::{x86_64::paging, AddressSpace, VirtAddr};
+    use narf_memory::{x86_64::paging, AddressSpace, PhysAddr, VirtAddr};
 
     static USER_AS_BRK: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
         narf_lib::sync::IrqSafeSpinLock::new(None);
@@ -808,6 +814,7 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         __test_clear_global();
         return TestResult::Fail("Brk(0) returned zero base");
     }
+    let before_stats = addr_space.memory_stats();
 
     // Grow by one page.
     let target = initial + 0x1000;
@@ -833,17 +840,44 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         return TestResult::Fail("Brk(grow) returned wrong value");
     }
 
-    // The new page must be mapped in the AS — translate the page
-    // containing `initial` (which is page-aligned) to confirm it
-    // resolves to a real phys frame.
-    // SAFETY: `addr_space.root` is the live user root for this brk test, identity-
-    // reachable as `translate` requires; only walks its tables for the page-aligned
-    // `initial` break vaddr.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_none() {
+    // The heap reservation must exist as exactly one unbacked slot. A zero
+    // physical address is the AddressSpace contract for a demand-populated
+    // page; it contributes virtual bytes but no resident-page charge.
+    let region = match addr_space.lookup(VirtAddr::new(initial)) {
+        Some(region) => region,
+        None => {
+            *USER_AS_BRK.lock() = None;
+            __test_clear_global();
+            return TestResult::Fail("Brk(grow) did not reserve a heap region");
+        }
+    };
+    if region.base != VirtAddr::new(initial)
+        || region.len != 0x1000
+        || region.phys.as_slice() != [PhysAddr::new(0)]
+    {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        return TestResult::Fail("Brk-grown page not mapped in AS");
+        return TestResult::Fail("Brk(grow) did not add one lazy physical slot");
+    }
+    let after_stats = addr_space.memory_stats();
+    if after_stats.resident_pages != before_stats.resident_pages
+        || after_stats.mapped_bytes != before_stats.mapped_bytes + 0x1000
+    {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("Brk(grow) allocated or misaccounted heap residency");
+    }
+
+    // No user access occurs in this synthetic syscall test, so the lazy slot
+    // must still have no page-table leaf. Demand-fault coverage owns the first
+    // touch and subsequent population separately.
+    // SAFETY: `addr_space.root` is the fresh user root owned by this test and
+    // `translate` only walks it for the page-aligned heap address.
+    // SAFETY: Valid memory or trusted environment
+    if unsafe { paging::translate(addr_space.root, VirtAddr::new(initial)) }.is_some() {
+        *USER_AS_BRK.lock() = None;
+        __test_clear_global();
+        return TestResult::Fail("Brk(grow) eagerly installed a page-table leaf");
     }
 
     // Querying again returns the new break.

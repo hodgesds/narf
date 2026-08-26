@@ -40,8 +40,10 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
     // We need fd 0 to exist; force-create the table entry.
     let _dummy = fd::with_table(task, |_t| ());
 
-    // Dummy output buffer — we ask for 0 bytes.
-    let mut buf = [0u8; 4];
+    // Use a user-shaped address even though no bytes are copied. Linux
+    // performs access_ok(buf, count) before the zero-count fast path, and an
+    // aarch64 kernel-stack address remains invalid when count is zero.
+    const USER_BUF: u64 = 0x1000;
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -67,7 +69,7 @@ fn smoke_console_read_empty_buf_returns_zero() -> TestResult {
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: 0, // fd 0 = stdin
-            arg1: buf.as_mut_ptr() as u64,
+            arg1: USER_BUF,
             arg2: 0, // zero-length read
             ..SyscallArgs::default()
         },
@@ -1328,15 +1330,14 @@ kernel_test_in!("userspace", smoke_console_ioctl_kdsigaccept_ok);
 //
 // PtySlave::ioctl(TIOCSCTTY) calls back into the userspace crate via
 // the function-pointer hook installed in `boot_init`. This smoke
-// pokes the hook directly (`set_controlling_tty(idx)`) and reads
-// the per-task table via `ctty_for(task)`. setsid() detaches the ctty
-// (DETACHED marker), which `task_ctty` resolves to "no controlling tty".
+// drives the session transition, then pokes the hook directly and reads the
+// process table via `ctty_for(task)`.
 
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     use crate::handlers::{
-        __test_ctty_reset, __test_pgid_reset, __test_sid_reset, ctty_for, current_task_id,
-        set_controlling_tty, task_ctty,
+        __test_ctty_reset, __test_pgid_reset, __test_set_pgid, __test_sid_reset, ctty_for,
+        current_task_id, set_controlling_tty, set_controlling_tty_console, task_ctty,
     };
     use crate::{
         init_per_task_state, install_core_syscalls, install_global, kernel_syscall_entry,
@@ -1354,15 +1355,13 @@ fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
     init_per_task_state();
 
     let task = current_task_id();
+    // Model a fork child: it inherited a different process group and still
+    // has the boot console as its controlling tty. A process-group leader
+    // would receive EPERM from setsid on Linux.
+    __test_set_pgid(task, task.wrapping_add(1));
+    set_controlling_tty_console(task);
 
-    // The Wave-76 hook records the PTY index against the current task.
-    set_controlling_tty(7);
-    if ctty_for(task) != Some(7) {
-        __test_clear_global();
-        return TestResult::Fail("ctty_for did not see TIOCSCTTY hook write");
-    }
-
-    // setsid() must drop the controlling tty per POSIX.
+    // setsid() must create the session and drop the old controlling tty.
     struct FakeCtx {
         args: SyscallArgs,
         ret: Option<SyscallReturn>,
@@ -1391,12 +1390,23 @@ fn smoke_userspace_ctty_hook_roundtrip_and_setsid_clears() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
+    if ctx.ret != Some(SyscallReturn::ok(crate::handlers::pgid_to_user(task))) {
+        __test_clear_global();
+        return TestResult::Fail("setsid rejected a non-process-group leader");
+    }
 
     // setsid marks the slot DETACHED (a distinct state from the boot-console
     // default), which `task_ctty` resolves to "no controlling terminal".
     if task_ctty(task).is_some() {
         __test_clear_global();
         return TestResult::Fail("setsid did not clear controlling_tty");
+    }
+
+    // A detached session leader may now acquire an unowned PTY. The hook
+    // returns raw task-space session/group identities to the PTY.
+    if set_controlling_tty(7, 0, 0, true).is_err() || ctty_for(task) != Some(7) {
+        __test_clear_global();
+        return TestResult::Fail("TIOCSCTTY hook rejected a detached session leader");
     }
     __test_clear_global();
     TestResult::Pass
@@ -1416,7 +1426,7 @@ kernel_test_in!(
 #[cfg(feature = "linux-compat")]
 fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
     use crate::handlers::{
-        __test_ctty_reset, __test_pgid_reset, __test_sid_reset, current_task_id,
+        __test_ctty_reset, __test_pgid_reset, __test_set_pgid, __test_sid_reset, current_task_id,
         current_task_sid_user, detach_controlling_tty, set_controlling_tty_console, task_ctty,
     };
     use crate::{
@@ -1435,6 +1445,7 @@ fn smoke_userspace_console_ctty_acquire_release_and_sid() -> TestResult {
     init_per_task_state();
 
     let task = current_task_id();
+    __test_set_pgid(task, task.wrapping_add(1));
 
     struct FakeCtx {
         args: SyscallArgs,

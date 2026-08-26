@@ -354,6 +354,9 @@ struct InvpcidDescriptor {
 
 #[inline]
 unsafe fn invpcid_raw(typ: u64, desc: &InvpcidDescriptor) {
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    compiler_fence(Ordering::SeqCst);
     // SAFETY: caller-asserted CPL=0 + INVPCID supported (CPUID(7).EBX[10]).
     unsafe {
         core::arch::asm!(
@@ -363,6 +366,7 @@ unsafe fn invpcid_raw(typ: u64, desc: &InvpcidDescriptor) {
             options(nostack, preserves_flags),
         );
     }
+    compiler_fence(Ordering::SeqCst);
 }
 
 /// Type 0: invalidate the TLB entry for `addr` tagged with `pcid`.

@@ -6,35 +6,26 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
     let oldfd = args.arg0 as u32;
     let newfd = args.arg1 as u32;
     let flags = args.arg2 as u32;
+    // fs/file.c::ksys_dup3 accepts exactly O_CLOEXEC. FD_CLOEXEC is the
+    // per-slot bit used by fcntl, not a dup3 flag, despite sharing value 1.
+    if flags & !crate::fd::O_CLOEXEC != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
     // Linux dup3: differ from dup2 by failing on oldfd == newfd. The
     // call exists to atomically install FD_CLOEXEC, which only makes
     // sense when actually duplicating to a different slot.
     if oldfd == newfd {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
     let task = current_task_id();
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(oldfd)?;
-        // dup3(2) shares the open file description — offset + status flags
-        // travel with the duplicate (LINUX-GAP: snapshotted, not aliased;
-        // see sys_dup).
-        let clone = crate::fd::FdEntry {
-            ops: entry.ops.clone(),
-            offset: entry.offset,
-            // Set FD_CLOEXEC when the caller passes O_CLOEXEC (stock
-            // glibc/musl, bit 0x80000) OR the bare FD_CLOEXEC bit
-            // (narf-libc). Either way the slot bit is FD_CLOEXEC.
-            flags: if flags & (crate::fd::O_CLOEXEC | crate::fd::FD_CLOEXEC) != 0 {
-                crate::fd::FD_CLOEXEC
-            } else {
-                0
-            },
-            status_flags: entry.status_flags,
-        };
-        t.set(newfd, clone);
-        Some(())
-    });
+    let descriptor_flags = if flags & crate::fd::O_CLOEXEC != 0 {
+        crate::fd::FD_CLOEXEC
+    } else {
+        0
+    };
+    let outcome = fd::with_table(task, |t| t.duplicate_to(oldfd, newfd, descriptor_flags));
     match outcome {
         Some(Some(())) => {
             #[cfg(feature = "linux-compat")]

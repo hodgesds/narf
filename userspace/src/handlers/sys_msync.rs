@@ -30,11 +30,8 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
         return;
     }
-    let mapped = current_address_space().is_some_and(|as_ref| {
-        as_ref
-            .residency_range(VirtAddr::new(addr), a.arg1)
-            .is_ok()
-    });
+    let mapped = current_address_space()
+        .is_some_and(|as_ref| as_ref.residency_range(VirtAddr::new(addr), a.arg1).is_ok());
     if mapped {
         match crate::mapped_file::flush_current_range(addr, a.arg1) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),

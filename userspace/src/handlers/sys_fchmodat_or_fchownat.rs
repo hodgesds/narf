@@ -42,11 +42,21 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
             let path = resolve_cwd_path(current_task_id(), ".");
             if let Some(dir) = resolve_dir_absolute(&path) {
                 let (old_uid, old_gid) = dir.dir_owners();
-                let uid = if args.arg2 as u32 == u32::MAX { old_uid } else { args.arg2 as u32 };
-                let gid = if args.arg3 as u32 == u32::MAX { old_gid } else { args.arg3 as u32 };
+                let uid = if args.arg2 as u32 == u32::MAX {
+                    old_uid
+                } else {
+                    args.arg2 as u32
+                };
+                let gid = if args.arg3 as u32 == u32::MAX {
+                    old_gid
+                } else {
+                    args.arg3 as u32
+                };
                 match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
                     Some(Ok(())) => ctx.set_return(SyscallReturn::ok(0)),
-                    Some(Err(error)) => ctx.set_return(SyscallReturn::ok(chown_errno(error) as u64)),
+                    Some(Err(error)) => {
+                        ctx.set_return(SyscallReturn::ok(chown_errno(error) as u64))
+                    }
                     None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
                 }
             } else {
@@ -61,7 +71,10 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
                 arg4: 0,
                 arg5: 0,
             };
-            let mut proxy = ArgReshape { inner: ctx, args: proxy_args };
+            let mut proxy = ArgReshape {
+                inner: ctx,
+                args: proxy_args,
+            };
             sys_fchown(&mut proxy);
         } else {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64));
@@ -84,8 +97,16 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
 
     if let Some(file) = resolve_file_absolute_ext(&path, follow_final) {
         let (old_uid, old_gid) = file.owners();
-        let uid = if requested_uid == u32::MAX { old_uid } else { requested_uid };
-        let gid = if requested_gid == u32::MAX { old_gid } else { requested_gid };
+        let uid = if requested_uid == u32::MAX {
+            old_uid
+        } else {
+            requested_uid
+        };
+        let gid = if requested_gid == u32::MAX {
+            old_gid
+        } else {
+            requested_gid
+        };
         match poll_blocking(file.set_owners(uid, gid)) {
             Some(Ok(())) => {
                 #[cfg(feature = "linux-compat")]
@@ -100,8 +121,16 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
 
     if let Some(dir) = resolve_dir_absolute(&path) {
         let (old_uid, old_gid) = dir.dir_owners();
-        let uid = if requested_uid == u32::MAX { old_uid } else { requested_uid };
-        let gid = if requested_gid == u32::MAX { old_gid } else { requested_gid };
+        let uid = if requested_uid == u32::MAX {
+            old_uid
+        } else {
+            requested_uid
+        };
+        let gid = if requested_gid == u32::MAX {
+            old_gid
+        } else {
+            requested_gid
+        };
         match poll_blocking(dir.set_dir_owners_async(uid, gid)) {
             Some(Ok(())) => {
                 #[cfg(feature = "linux-compat")]

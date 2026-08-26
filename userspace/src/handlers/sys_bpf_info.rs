@@ -489,14 +489,14 @@ fn prog_info(
     put_u32(&mut out, PI_NR_MAP_IDS, nr_maps as u32);
     put_u64(&mut out, PI_MAP_IDS, map_ids_uptr);
     put_name(&mut out, PI_NAME, &prog.name);
-    put_u32(&mut out, PI_GPL_COMPATIBLE, u32::from(prog.gpl_compatible()));
+    put_u32(
+        &mut out,
+        PI_GPL_COMPATIBLE,
+        u32::from(prog.gpl_compatible()),
+    );
     put_u64(&mut out, PI_RUN_TIME_NS, prog.run_time_ns());
     put_u64(&mut out, PI_RUN_CNT, prog.stats_runs());
-    put_u64(
-        &mut out,
-        PI_RECURSION_MISSES,
-        prog.recursion_misses(),
-    );
+    put_u64(&mut out, PI_RECURSION_MISSES, prog.recursion_misses());
     // Everything else stays zero, and each is a deliberate absence:
     //
     // LINUX-GAP: `ifindex`, `netns_dev`, `netns_ino` — no offload, no netns
@@ -574,7 +574,11 @@ fn link_info(
             return -EINVAL;
         }
         put_u64(&mut out, LI_RAW_NAME, name_uptr);
-        put_u32(&mut out, LI_RAW_NAME_LEN, name.len().saturating_add(1) as u32);
+        put_u32(
+            &mut out,
+            LI_RAW_NAME_LEN,
+            name.len().saturating_add(1) as u32,
+        );
         put_u64(&mut out, LI_RAW_COOKIE, cookie);
         if name_uptr != 0 {
             let keep = name.len().min(capacity - 1);

@@ -496,13 +496,6 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
-    /// Diagnostic: times `run_until_empty` popped this slot, and times it
-    /// re-queued it because the awake flag was clear. A stranded slot is
-    /// ambiguous without these — "the CPU is running rounds" does not say
-    /// whether THIS slot is reached, and "awake=true" does not say whether
-    /// the swap that would clear it was ever executed.
-    pops: AtomicU64,
-    not_awake_requeues: AtomicU64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -632,19 +625,43 @@ fn arm_idle_backstop_ms(ms: u64) {
     arm_scheduler_deadline(deadline);
 }
 
-/// Reschedule the owner of a just-woken task: if it lives on a DIFFERENT
-/// CPU that is currently halted, IPI that CPU so it re-runs its round
-/// now. Same-CPU or running-CPU wakes need nothing (the run loop's
-/// pre-halt scan catches them). Dekker fence pairs with the idle side.
-/// Diagnostic counters for the cross-core wake path (read by the stall
-/// watchdog). `SENT` = resched IPIs actually fired (target was halted);
-/// `SKIP` = cross-core wakes where the target was NOT halted so no IPI was
-/// sent (relied on the target's pre-halt re-scan). A wedge with SENT≈0 ⇒
-/// wakes race the halt (Dekker miss); SENT≫0 but the AP stays halted ⇒ the
-/// IPI is sent but doesn't wake it (delivery/handler issue).
-static RESCHED_SENT: AtomicU64 = AtomicU64::new(0);
-static RESCHED_SKIP: AtomicU64 = AtomicU64::new(0);
-static FORWARD_PROGRESS: AtomicU64 = AtomicU64::new(0);
+/// Cache-line-isolated read-only telemetry written by the executing CPU.
+/// Watchdog and test readers aggregate all CPUs only when they need a snapshot,
+/// keeping remote-wake and bounded-completion paths off shared counter lines.
+#[repr(C, align(64))]
+struct SchedulerTelemetry {
+    resched_sent: AtomicU64,
+    resched_skip: AtomicU64,
+    forward_progress: AtomicU64,
+    _pad: [u8; 40],
+}
+
+impl SchedulerTelemetry {
+    const fn new() -> Self {
+        Self {
+            resched_sent: AtomicU64::new(0),
+            resched_skip: AtomicU64::new(0),
+            forward_progress: AtomicU64::new(0),
+            _pad: [0; 40],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<SchedulerTelemetry>() == 64);
+
+static SCHEDULER_TELEMETRY: [SchedulerTelemetry; narf_lib::percpu::MAX_CPUS] =
+    [const { SchedulerTelemetry::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+fn local_scheduler_telemetry() -> &'static SchedulerTelemetry {
+    &SCHEDULER_TELEMETRY[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+fn sum_scheduler_telemetry(select: fn(&SchedulerTelemetry) -> &AtomicU64) -> u64 {
+    SCHEDULER_TELEMETRY.iter().fold(0u64, |total, cpu| {
+        total.wrapping_add(select(cpu).load(Ordering::Relaxed))
+    })
+}
 
 /// Publish a completed unit of kernel work to fatal-path watchdogs.
 ///
@@ -653,19 +670,21 @@ static FORWARD_PROGRESS: AtomicU64 = AtomicU64::new(0);
 /// bounded completions so watchdogs distinguish that work from a true stall.
 #[inline]
 pub fn note_forward_progress() {
-    FORWARD_PROGRESS.fetch_add(1, Ordering::Relaxed);
+    local_scheduler_telemetry()
+        .forward_progress
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 /// Monotonic completed-work counter used by fatal-path watchdogs.
 pub fn forward_progress_count() -> u64 {
-    FORWARD_PROGRESS.load(Ordering::Relaxed)
+    sum_scheduler_telemetry(|cpu| &cpu.forward_progress)
 }
 
 /// `(resched_ipis_sent, cross_core_wakes_skipped_not_halted)`.
 pub fn dbg_resched_counts() -> (u64, u64) {
     (
-        RESCHED_SENT.load(Ordering::Relaxed),
-        RESCHED_SKIP.load(Ordering::Relaxed),
+        sum_scheduler_telemetry(|cpu| &cpu.resched_sent),
+        sum_scheduler_telemetry(|cpu| &cpu.resched_skip),
     )
 }
 
@@ -689,10 +708,14 @@ fn resched_remote(target_cpu: u32) {
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
     if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
-        RESCHED_SKIP.fetch_add(1, Ordering::Relaxed);
+        local_scheduler_telemetry()
+            .resched_skip
+            .fetch_add(1, Ordering::Relaxed);
         return;
     }
-    RESCHED_SENT.fetch_add(1, Ordering::Relaxed);
+    local_scheduler_telemetry()
+        .resched_sent
+        .fetch_add(1, Ordering::Relaxed);
     let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` was set by `set_resched_ipi_hook` from a `fn(u32)`.
@@ -1577,8 +1600,6 @@ where
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -1637,8 +1658,6 @@ where
     let slot = TaskSlot {
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake: Arc::new(WakeCell {
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(cpu as u32),
         }),
@@ -1859,8 +1878,6 @@ where
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
-            pops: AtomicU64::new(0),
-            not_awake_requeues: AtomicU64::new(0),
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
         }),
@@ -2347,12 +2364,6 @@ unsafe fn clone_raw(data: *const ()) -> RawWaker {
     RawWaker::new(Arc::into_raw(cloned) as *const (), &TASK_VTABLE)
 }
 
-/// Diagnostic: total `wake` + `wake_by_ref` invocations across all
-/// tasks. Lets a real-HW observer distinguish "wake_by_ref is never
-/// fired" (waker plumbing broken or waker isn't reaching this
-/// vtable) from "wake fires but the executor doesn't re-poll."
-pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
 // The cooperative executor idles a CPU exactly when no task is RUNNABLE,
 // matching Linux (`schedule()` picks the idle task iff `nr_running == 0`).
 // "Runnable" is encoded by a task's `awake` flag: a `wake` (self-wake
@@ -2368,7 +2379,6 @@ pub static WAKE_BY_REF_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic
 // directly.
 
 unsafe fn wake_raw(data: *const ()) {
-    WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
@@ -2380,7 +2390,6 @@ unsafe fn wake_raw(data: *const ()) {
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
-    WAKE_BY_REF_CALLS.fetch_add(1, Ordering::Relaxed);
     let ptr = data as *const WakeCell;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
@@ -2788,11 +2797,7 @@ pub fn run_until_empty() {
 
             // Skip if no waker has fired since the last poll. The slot
             // stays in the queue, waiting for an external signal.
-            slot.awake.pops.fetch_add(1, Ordering::Relaxed);
             if !slot.awake.flag.swap(false, Ordering::Acquire) {
-                slot.awake
-                    .not_awake_requeues
-                    .fetch_add(1, Ordering::Relaxed);
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
@@ -3114,13 +3119,6 @@ pub fn run_until_empty() {
         // still run on the all-parked branch below (every idle cycle, i.e.
         // once per request/response since the loop idles between them), plus
         // a ~1 ms forced fallback so a perpetual self-waker can't starve them.
-        // One tick per executor round on this CPU. A parked task whose wake
-        // landed but never ran is ambiguous without this: it distinguishes
-        // "this CPU is looping and skipping the slot" from "this CPU stopped
-        // iterating entirely", which are different bugs. Diagnostic only.
-        if cpu < narf_lib::percpu::MAX_CPUS {
-            EXEC_ROUNDS[cpu].fetch_add(1, Ordering::Relaxed);
-        }
         let runnable_now = narf_time::now_cycles();
         let any_runnable = {
             let q = READY[cpu].lock();
@@ -3520,29 +3518,11 @@ pub fn runnable_task_count() -> usize {
 ///   data-path/lock issue keeping it off the poll, OR a busy-loop bug.
 /// - `locked`               ⇒ a holder is stuck inside the queue lock.
 ///
-/// Executor rounds completed per CPU. See the increment site.
-static EXEC_ROUNDS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
-
-/// Rounds this CPU's executor loop has run.
-pub fn dbg_exec_rounds(cpu: usize) -> u64 {
-    if cpu >= narf_lib::percpu::MAX_CPUS {
-        return 0;
-    }
-    EXEC_ROUNDS[cpu].load(Ordering::Relaxed)
-}
-
 /// Scheduler-side state of the slot owning `task_id`, if it is queued:
-/// `(awake_flag, home_cpu, rounds_on_that_cpu, queue_len)`.
-///
-/// A parked task that has been woken but never re-polled leaves a specific
-/// fingerprint here. `awake == true` says the wake reached the slot, so
-/// the readiness and waker layers did their job; if the home CPU's round
-/// counter is ALSO advancing, the executor is iterating and skipping the
-/// slot; if it is flat, that CPU has stopped running rounds and every task
-/// homed on it is stranded regardless of its own state.
-#[allow(clippy::type_complexity)]
-pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, bool, u64, u64)> {
+/// `(awake_flag, home_cpu, queue_len, affinity_bits, queued_cpu, allowed)`.
+/// This is sampled only when the stall watchdog reports a stranded waiter;
+/// collecting it requires no counters on the normal scheduling path.
+pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, usize, u64, u32, bool)> {
     for (cpu, ready) in READY.iter().enumerate() {
         if cpu != 0 && !narf_lib::smp::is_online(cpu as u32) {
             continue;
@@ -3565,13 +3545,10 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
             return Some((
                 slot.awake.flag.load(Ordering::Acquire),
                 home,
-                dbg_exec_rounds(home as usize),
                 d.len(),
                 allowed.bits(),
                 cpu as u32,
                 allowed.contains(CpuId(cpu as u32)),
-                slot.awake.pops.load(Ordering::Relaxed),
-                slot.awake.not_awake_requeues.load(Ordering::Relaxed),
             ));
         }
     }
@@ -3579,26 +3556,19 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, u64, usize, u64, u32, 
 }
 
 /// Per-slot snapshot of `cpu`'s ready queue, newest-first, for the stall
-/// watchdog: `(tid, awake, home_cpu, affinity_bits, allowed_here, pops,
-/// not_awake_requeues)`.
+/// watchdog: `(tid, awake, home_cpu, affinity_bits, allowed_here)`.
 ///
 /// [`dbg_cpu_stall`] reports that a halted CPU has runnable work, but not
 /// WHICH work or why it is not running, and the stall dump's summary counts
-/// are compatible with two completely different bugs. An awake slot that
-/// never runs is either an affinity bounce — it is queued on a CPU its mask
-/// excludes, so `run_until_empty` re-queues it WITHOUT consuming the flag and
-/// it circulates forever (`allowed_here == false`, `not_awake_requeues`
-/// climbing) — or a slot the executor simply stopped visiting (`allowed_here
-/// == true`, `pops` flat). Those need opposite fixes, and only per-slot state
-/// separates them.
+/// are compatible with different bugs. `allowed_here == false` directly
+/// identifies an affinity bounce without maintaining per-slot counters.
 ///
 /// Capped at [`DBG_READY_SLOTS_MAX`]: this runs from a timer trap onto a
 /// synchronous serial console, where dumping an unbounded queue would itself
 /// become the stall. `try_lock`, for the same reason [`dbg_slot_state`] uses
 /// it — blocking on the queue lock held by the CPU under investigation would
 /// deadlock the reporter.
-#[allow(clippy::type_complexity)]
-pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool, u64, u64)> {
+pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool)> {
     let mut out = alloc::vec::Vec::new();
     if cpu >= narf_lib::percpu::MAX_CPUS {
         return out;
@@ -3615,8 +3585,6 @@ pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool
             slot.awake.cpu.load(Ordering::Relaxed),
             allowed.bits(),
             allowed.contains(CpuId(cpu as u32)),
-            slot.awake.pops.load(Ordering::Relaxed),
-            slot.awake.not_awake_requeues.load(Ordering::Relaxed),
         ));
     }
     out
@@ -4202,8 +4170,6 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
-        pops: AtomicU64::new(0),
-        not_awake_requeues: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

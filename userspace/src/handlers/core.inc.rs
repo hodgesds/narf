@@ -504,11 +504,7 @@ pub fn active_user_as() -> Option<Arc<AddressSpace>> {
 pub fn exit_landing() -> Option<(u64, u64)> {
     let rip = EXIT_LANDING_RIP.load(Ordering::Acquire);
     let rsp = EXIT_LANDING_RSP.load(Ordering::Acquire);
-    if rip == 0 {
-        None
-    } else {
-        Some((rip, rsp))
-    }
+    if rip == 0 { None } else { Some((rip, rsp)) }
 }
 
 // ── Exit-landing registration ──────────────────────────────────────
@@ -592,8 +588,8 @@ struct BootstrapHeader {
 
 use alloc::collections::BTreeMap;
 use narf_abi::{
-    completion_channel, submission_channel, Completion, CompletionDrain, CompletionQueue,
-    SharedRing, Submission, SubmissionDrain, SubmissionQueue,
+    Completion, CompletionDrain, CompletionQueue, SharedRing, Submission, SubmissionDrain,
+    SubmissionQueue, completion_channel, submission_channel,
 };
 use narf_memory::PhysAddr;
 
@@ -835,7 +831,7 @@ unsafe fn mint_shared_ring_pair(
         .map_region(Region {
             base: VirtAddr::new(sq_vaddr),
             len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![sq_phys],
         })
         .map_err(|_| ())?;
@@ -843,7 +839,7 @@ unsafe fn mint_shared_ring_pair(
         .map_region(Region {
             base: VirtAddr::new(cq_vaddr),
             len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCK_EXEMPT,
             phys: alloc::vec![cq_phys],
         })
         .map_err(|_| ())?;
@@ -946,15 +942,16 @@ fn open_impl(
             return;
         }
     }
-    // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR) plus the settable
-    // status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
+    // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR), O_PATH identity, and
+    // the settable status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
     // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
     // access mode via F_GETFL and rejects the stream with EINVAL if it
     // doesn't match the requested mode — systemd fdopens a `cgroup.procs`
     // it opened O_WRONLY, so a dropped access mode failed that check.
     // (O_NONBLOCK matters on its own for libinput's evdev nodes — see
     // `InputEventFile::nonblock_read_eagain`.)
-    let open_status_flags = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
+    let open_status_flags =
+        (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK | crate::fd::O_PATH);
     let task = current_task_id();
     // Linux open/openat reject an empty pathname with ENOENT. Do this before
     // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
@@ -996,7 +993,9 @@ fn open_impl(
     // open descriptors. Linux returns EMFILE from the fd-creating call.
     // RLIMIT_NOFILE is index 7; `.0` is the soft (current) limit.
     {
-        let nofile_cur = rlimits_of(task)[7].0;
+        let nofile_cur = read_rlimit(task, 7)
+            .map(|limit| limit.cur)
+            .unwrap_or_else(|| default_rlimits()[7].cur);
         if crate::fd::open_fds(task).len() as u64 >= nofile_cur {
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
@@ -1189,7 +1188,7 @@ fn open_impl(
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
                     flags: 0,
-                    status_flags: 0,
+                    status_flags: open_status_flags,
                 })
             });
             match new_fd {
@@ -1239,6 +1238,7 @@ fn open_impl(
                     let errno = match error {
                         narf_filesystem::FsError::NotFound => 2,          // ENOENT
                         narf_filesystem::FsError::PermissionDenied => 13, // EACCES
+                        narf_filesystem::FsError::OperationNotPermitted => 1, // EPERM
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
                         narf_filesystem::FsError::InvalidPath
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
@@ -1541,6 +1541,12 @@ fn open_fifo(
         }
     };
 
+    // Opening either direction changes the FIFO peer condition. Blocking
+    // openers use the normal deduplicated I/O-waker registry below; publish
+    // the transition only after the handle/open-count is visible. The shared
+    // readiness generation closes the notify-before-register race.
+    narf_net::readiness::notify(0);
+
     // Peer already present (or O_RDWR / O_NONBLOCK) → return the fd now.
     let peer_ready = rdwr
         || nonblock
@@ -1572,21 +1578,15 @@ fn open_fifo(
 /// the peer is present, else parks again on the ~1ms backstop.
 fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     let task = current_task_id();
-    // Read the handle's direction + peer counts through its shared buffer.
+    // The handle retains the counterpart edge observed before it published
+    // itself, so a peer open+close is not lost merely because its level is
+    // already clear when this task runs again.
     let ready = fd::with_table(task, |t| {
         t.get(fd).and_then(|e| {
-            let am = e.status_flags & crate::fd::O_ACCMODE;
-            e.ops.fifo_shared().map(|shared| {
-                // The pending open was, by construction, a single-direction
-                // blocking open: O_RDONLY waits for a writer, O_WRONLY for a
-                // reader. Its own handle is counted in exactly one of the peer
-                // totals, so "peer present" is "the OTHER side has >= 1".
-                if am == crate::fd::O_WRONLY {
-                    shared.reader_count() > 0
-                } else {
-                    shared.writer_count() > 0
-                }
-            })
+            e.ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+                .map(narf_filesystem::fifo::FifoHandle::peer_ready_or_seen)
         })
     })
     .flatten()
@@ -1607,34 +1607,48 @@ fn resume_fifo_open(ctx: &mut dyn TrapContext, fd: u32) {
     fifo_park_or_finish(ctx, fd);
 }
 
-/// Park the current task on the ~1ms timer wheel and RIP-rewind so the `open`
-/// syscall re-executes (and `resume_fifo_open` re-checks the peer). Falls back
-/// to returning the fd in a non-executor (kernel-test) context, where no
-/// scheduler can drive the re-check.
+/// Park the current task on the shared I/O-waker registry and RIP-rewind so
+/// the syscall re-executes (and `resume_fifo_open` re-checks the peer). The
+/// timer wheel remains only a ~1ms lost-wake backstop. Falls back to returning
+/// the fd in a non-executor (kernel-test) context.
 fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
-    if let (Some(uctx), Some(hook)) = (
-        crate::user_task::current_user_task(),
-        crate::user_task::yield_hook(),
-    ) {
-        let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        let resume_rip = ctx.rip().wrapping_sub(2);
-        ctx.set_rip(resume_rip);
-        // SAFETY: `uctx` is the live per-task ctx; we hold the only reference
-        // while setting the deadline + saving the RIP-rewound CPU state before
-        // the yield hook hands the task to the executor.
-        unsafe {
-            let uc = &*uctx;
-            uc.sleep_deadline_ns
-                .store(dl, core::sync::atomic::Ordering::Release);
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
+    let task = current_task_id();
+    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
+    if let Some(ops) = ops {
+        if let Some(handle) = ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+        {
+            if let Some(waker) = narf_scheduler::stackful::current_stackful_waker() {
+                match handle.arm_peer(task, &waker) {
+                    Poll::Ready(()) => {
+                        if let Some(uctx) = crate::user_task::current_user_task() {
+                            // SAFETY: live per-task ctx; single-threaded syscall.
+                            unsafe {
+                                (*uctx)
+                                    .fifo_open_pending_fd
+                                    .store(0, core::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        ctx.set_return(SyscallReturn::ok(fd as u64));
+                        return;
+                    }
+                    Poll::Pending => {
+                        let parked = park_reexecute_on_io(ctx);
+                        handle.disarm_peer(task);
+                        if parked {
+                            return;
+                        }
+                    }
+                }
+            } else if park_reexecute_on_io(ctx) {
                 return;
             }
-            hook(uctx);
+        } else if park_reexecute_on_io(ctx) {
+            return;
         }
-        // unreachable — hook() longjmps to the executor
+    } else if park_reexecute_on_io(ctx) {
+        return;
     }
     // No executor (kernel-test): can't park; hand back the fd so the round
     // trip still completes (the peer-rendezvous blocking is only exercised
@@ -1658,47 +1672,138 @@ fn fifo_park_or_finish(ctx: &mut dyn TrapContext, fd: u32) {
 
 // ── Read — arg0=fd, arg1=buf, arg2=len ─────────────────────────────
 
-/// Drain a fanotify group's queued events into `buf` as
-/// `struct fanotify_event_metadata` records, opening a fresh fd to each
-/// affected object in `task`'s fd table. Called from sys_read with NO
-/// fd-table lock held (the install below needs it).
+/// Drain fanotify events and copy their metadata transactionally with respect
+/// to object-fd publication. Linux removes the event even when copy_to_user
+/// faults, but reserves and installs the embedded fd only after all event data
+/// copied successfully; an EFAULT must not leak a reachable descriptor.
 #[cfg(feature = "linux-compat")]
-fn fanotify_read_into(task: u64, gid: u64, buf: &mut [u8]) -> usize {
-    let cap = buf.len() / crate::mqueue::FAN_EVENT_METADATA_LEN;
+fn fanotify_read_to_user(
+    task: u64,
+    gid: u64,
+    max: usize,
+    copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+) -> Result<usize, u64> {
+    let cap = max / crate::mqueue::FAN_EVENT_METADATA_LEN;
     if cap == 0 {
-        return 0;
+        return Ok(0);
     }
     let events = crate::mqueue::fanotify_drain(gid, cap);
-    let mut written = 0usize;
+    let mut resolved = alloc::vec::Vec::with_capacity(events.len());
+    let mut fd_count = 0usize;
     for (path, mask, pid) in events {
-        let fd = fanotify_open_object(task, &path);
-        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
-        buf[written..written + crate::mqueue::FAN_EVENT_METADATA_LEN].copy_from_slice(&meta);
-        written += crate::mqueue::FAN_EVENT_METADATA_LEN;
+        let ops = fanotify_resolve_object(&path);
+        fd_count += usize::from(ops.is_some());
+        resolved.push((ops, mask, pid));
     }
-    written
+    let reserved = fd::with_table(task, |table| table.reserve_fds(fd_count)).unwrap_or_default();
+    if reserved.len() != fd_count {
+        return Err(EFAULT);
+    }
+    let mut reserved_iter = reserved.iter().copied();
+    let mut installs = alloc::vec::Vec::with_capacity(fd_count);
+    let mut staging = alloc::vec::Vec::with_capacity(resolved.len() * crate::mqueue::FAN_EVENT_METADATA_LEN);
+    for (ops, mask, pid) in resolved {
+        let fd = match ops {
+            Some(ops) => {
+                let fd = reserved_iter.next().expect("one reservation per resolved fanotify object");
+                installs.push((fd, ops));
+                fd as i32
+            }
+            None => -1,
+        };
+        let meta = crate::mqueue::build_fan_metadata(mask, fd, pid);
+        staging.extend_from_slice(&meta);
+    }
+    if let Err(errno) = copy(&staging) {
+        let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
+        return Err(errno);
+    }
+    let installed = fd::with_table(task, |table| {
+        let entries = installs
+            .into_iter()
+            .map(|(fd, ops)| {
+                (
+                    fd,
+                    fd::FdEntry {
+                    ops,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: crate::fd::O_RDONLY,
+                    },
+                )
+            })
+            .collect();
+        table.install_reserved_batch(entries)
+    });
+    if installed != Some(true) {
+        let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
+        return Err(EFAULT);
+    }
+    Ok(staging.len())
 }
 
-/// Resolve `abs` and install a fresh read fd for it in `task`'s table;
-/// returns the fd number, or FAN_NOFD (-1) on failure.
+/// Require every page in a fanotify metadata destination to belong to the
+/// active user address space before entering the guarded copy. x86 keeps a
+/// supervisor-only low-memory identity map live while user CR3 is active;
+/// STAC disables SMAP, so a shape-valid low pointer with no user VMA could
+/// otherwise write that supervisor mapping without faulting. Linux's user
+/// page tables have no such alias and `copy_to_user` returns EFAULT.
+///
+/// This check runs from the copy closure, after fanotify selected/removed the
+/// event and reserved its embedded fd number, preserving Linux's event
+/// consumption ordering. Publication still happens only after the guarded
+/// copy succeeds.
 #[cfg(feature = "linux-compat")]
-fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
+    if len == 0 {
+        return Ok(());
+    }
+    validate_user_range(ptr, len)?;
+    if let Some(aspace) = current_address_space() {
+        let last = ptr + len as u64 - 1;
+        let mut page = ptr & !0xfff;
+        let last_page = last & !0xfff;
+        loop {
+            if !aspace.contains_address(VirtAddr::new(page)) {
+                return Err(EFAULT);
+            }
+            if page == last_page {
+                return Ok(());
+            }
+            page += 0x1000;
+        }
+    }
+
+    // ABI kernel tests have no active user AS and deliberately use kernel
+    // scratch buffers under an explicit scope. Preserve that test-only bridge,
+    // but never let a lower-half address fall through to x86's identity map.
+    #[cfg(feature = "kernel-test")]
+    if kernel_buf_scope::active() && !in_user_half(ptr) {
+        return Ok(());
+    }
+    Err(EFAULT)
+}
+
+#[cfg(feature = "linux-compat")]
+fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
     let root_rel = narf_filesystem::registry()
         .resolve_absolute(abs, |fs, rel| (fs.root(), alloc::string::String::from(rel)));
-    let (root, rel) = match root_rel {
-        Some(x) => x,
-        None => return -1,
-    };
-    let ops = match poll_blocking(narf_filesystem::resolve_async(root, &rel)) {
-        Some(Ok(o)) => o,
-        _ => return -1,
+    let (root, rel) = root_rel?;
+    poll_blocking(narf_filesystem::resolve_async(root, &rel))?.ok()
+}
+
+/// Resolve `abs` and install a fresh read fd for open_by_handle_at.
+#[cfg(feature = "linux-compat")]
+fn fanotify_open_object(task: u64, abs: &str) -> i32 {
+    let Some(ops) = fanotify_resolve_object(abs) else {
+        return -1;
     };
     match fd::with_table(task, |t| {
         t.open(fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            status_flags: crate::fd::O_RDONLY,
         })
     }) {
         Some(n) => n as i32,
@@ -3069,82 +3174,296 @@ fn perms_of_prot(prot: u32) -> RegionPerms {
 /// table's FileOps. When `in_off_ptr` is non-zero it is a user
 /// pread-style offset pointer (read from, updated, and the fd's own
 /// offset is left untouched); zero uses and advances the fd offset.
-/// Returns the bytes copied, or `None` on a bad fd / fault.
-fn copy_fd_to_fd(
-    task: u64,
-    in_fd: u32,
-    out_fd: u32,
-    in_off_ptr: u64,
-    count: usize,
-) -> Option<Result<usize, narf_filesystem::FsError>> {
-    let use_off_ptr = in_off_ptr != 0;
-    let mut in_off: u64 = if use_off_ptr {
-        // SAFETY: `in_off_ptr` is a user `off_t*` in-pointer; copy_from_user_vec
-        // range-validates the 8-byte read.
-        let b = unsafe { copy_from_user_vec(in_off_ptr, 8) }.ok()?;
-        u64::from_ne_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    } else {
-        0
+/// Returns the accepted byte count or the first filesystem error before any
+/// progress. Syscall-specific fd, offset-uaccess, and errno ordering stays in
+/// the sendfile/splice entry modules.
+enum CopyFdError {
+    Fs(narf_filesystem::FsError),
+}
+
+/// One fd-table snapshot held across a sendfile/splice transfer.  Linux's
+/// `fdget()` pins the open file while the syscall runs; cloning the FileOps
+/// Arc gives NARF the same lifetime even if a CLONE_FILES peer closes the
+/// numeric descriptor concurrently. The captured description similarly pins
+/// f_pos and receives every commit directly, so close+numeric-fd reuse cannot
+/// redirect an update to an unrelated file.
+struct CopyFdEndpoint {
+    ops: Arc<dyn narf_filesystem::FileOps>,
+    description: crate::fd::Description,
+    status_flags: u32,
+}
+
+impl CopyFdEndpoint {
+    fn readable(&self) -> bool {
+        self.status_flags & crate::fd::O_PATH == 0
+            && self.status_flags & crate::fd::O_ACCMODE != crate::fd::O_WRONLY
+    }
+
+    fn writable(&self) -> bool {
+        self.status_flags & crate::fd::O_PATH == 0
+            && self.status_flags & crate::fd::O_ACCMODE != crate::fd::O_RDONLY
+    }
+
+    fn nonblocking(&self) -> bool {
+        self.status_flags & crate::fd::O_NONBLOCK != 0
+    }
+
+    fn append(&self) -> bool {
+        self.status_flags & crate::fd::O_APPEND != 0
+    }
+
+    fn is_pipe(&self) -> bool {
+        self.ops.stat().mode.file_type == narf_filesystem::FileType::Fifo
+    }
+}
+
+fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
+    match error {
+        narf_filesystem::FsError::NotFound => 2,
+        narf_filesystem::FsError::PermissionDenied => 13,
+        narf_filesystem::FsError::OperationNotPermitted => 1,
+        narf_filesystem::FsError::Io(_) => 5,
+        narf_filesystem::FsError::InvalidPath
+        | narf_filesystem::FsError::InvalidData
+        | narf_filesystem::FsError::Unsupported => 22,
+        narf_filesystem::FsError::CrossDevice => 18,
+        narf_filesystem::FsError::Busy => 16,
+        narf_filesystem::FsError::ReadOnly => 30,
+        narf_filesystem::FsError::NoSpace => 28,
+        narf_filesystem::FsError::QuotaExceeded => 122,
+        narf_filesystem::FsError::BrokenPipe => 32,
+        narf_filesystem::FsError::BadFd => 9,
+        narf_filesystem::FsError::WouldBlock => EAGAIN_CODE as i64,
+    }
+}
+
+const LINUX_MAX_RW_COUNT: usize = 0x7fff_f000;
+const LINUX_IOV_MAX: usize = 1024;
+
+/// Linux `access_ok()` shape for read/write buffers, without NARF's generic
+/// 16-MiB single-copy allocation cap. Large I/O is staged in bounded chunks;
+/// range validation must still cover the caller's original count before fd
+/// state or a destructive stream is touched.
+fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
+    // access_ok(NULL, 0) succeeds, while a zero-length address outside the
+    // user half still fails. The generic helper deliberately rejects NULL for
+    // pointer-bearing structures, so preserve this syscall-specific rule.
+    if len == 0 && ptr == 0 {
+        return Ok(());
+    }
+    let Some(end) = ptr.checked_add(len as u64) else {
+        return Err(EFAULT);
     };
+    let last = if len == 0 { ptr } else { end - 1 };
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    {
+        if !in_user_half(ptr) || !in_user_half(last) {
+            #[cfg(feature = "kernel-test")]
+            if kernel_buf_scope::active()
+                && canonical(ptr)
+                && canonical(last)
+                && (ptr >> 63) == (last >> 63)
+            {
+                return Ok(());
+            }
+            return Err(EFAULT);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Copy, Clone)]
+struct ImportedRwIovec {
+    base: u64,
+    len: usize,
+}
+
+fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<ImportedRwIovec>, u64> {
+    if iovcnt == 0 {
+        return Ok(alloc::vec::Vec::new());
+    }
+    if iovcnt > LINUX_IOV_MAX {
+        return Err(22); // EINVAL
+    }
+    // SAFETY: 1024 native iovecs occupy 16 KiB, below MAX_USER_COPY.
+    let raw = unsafe { copy_from_user_vec(iov_ptr, iovcnt * 16) }?;
+    let mut out = alloc::vec::Vec::with_capacity(iovcnt);
+    let mut remaining = LINUX_MAX_RW_COUNT;
+    for slot in raw.chunks_exact(16) {
+        let base = u64::from_ne_bytes(slot[..8].try_into().unwrap());
+        let requested = u64::from_ne_bytes(slot[8..].try_into().unwrap()) as usize;
+        validate_rw_user_range(base, requested)?;
+        let len = core::cmp::min(requested, remaining);
+        remaining -= len;
+        out.push(ImportedRwIovec { base, len });
+    }
+    Ok(out)
+}
+
+fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
+    fd::with_table(task, |table| {
+        let entry = table.get(fd_num)?;
+        Some(CopyFdEndpoint {
+            ops: entry.ops.clone(),
+            description: table.description(fd_num)?,
+            status_flags: table.status_flags(fd_num)?,
+        })
+    })
+    .flatten()
+}
+
+fn copy_fd_to_fd(
+    input: &CopyFdEndpoint,
+    output: &CopyFdEndpoint,
+    explicit_in_off: Option<u64>,
+    explicit_out_off: Option<u64>,
+    count: usize,
+) -> Result<usize, CopyFdError> {
+    let use_off_ptr = explicit_in_off.is_some();
+    let use_out_off_ptr = explicit_out_off.is_some();
+    let same_description = Arc::ptr_eq(&input.description, &output.description);
+
+    // Linux locks each `struct file::f_pos` across the complete positioned
+    // transfer. Acquire distinct descriptions by stable address order so two
+    // opposite-direction copies cannot ABBA deadlock; aliases lock once.
+    let mut input_position_guard = None;
+    let mut output_position_guard = None;
+    if !use_off_ptr && !use_out_off_ptr && !same_description {
+        let input_key = Arc::as_ptr(&input.description) as usize;
+        let output_key = Arc::as_ptr(&output.description) as usize;
+        if input_key < output_key {
+            input_position_guard = poll_blocking(input.description.position_lock.lock());
+            if input_position_guard.is_some() {
+                output_position_guard = poll_blocking(output.description.position_lock.lock());
+            }
+        } else {
+            output_position_guard = poll_blocking(output.description.position_lock.lock());
+            if output_position_guard.is_some() {
+                input_position_guard = poll_blocking(input.description.position_lock.lock());
+            }
+        }
+        if input_position_guard.is_none() || output_position_guard.is_none() {
+            return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+        }
+    } else if (!use_off_ptr || !use_out_off_ptr) && same_description {
+        input_position_guard = poll_blocking(input.description.position_lock.lock());
+        if input_position_guard.is_none() {
+            return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+        }
+    } else {
+        if !use_off_ptr {
+            input_position_guard = poll_blocking(input.description.position_lock.lock());
+            if input_position_guard.is_none() {
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+            }
+        }
+        if !use_out_off_ptr {
+            output_position_guard = poll_blocking(output.description.position_lock.lock());
+            if output_position_guard.is_none() {
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
+            }
+        }
+    }
+
+    // Snapshot implicit positions only after their serialization lock is held.
+    // Explicit-offset sides neither read nor modify the shared cursor.
+    let mut in_off = explicit_in_off.unwrap_or_else(|| input.description.offset());
+    let mut out_off = explicit_out_off.unwrap_or_else(|| output.description.offset());
+    let input_ops = &input.ops;
+    let output_ops = &output.ops;
 
     let mut total = 0usize;
-    const CHUNK: usize = 4096;
+    // Transfer granularity for splice/sendfile/copy_file_range. Sized to a
+    // whole default pipe buffer (64 KiB) so a full-pipe splice completes in a
+    // single read+write pair — one heap Vec and two `fd::with_table` lock
+    // acquisitions — instead of 16 four-KiB round trips.
+    const CHUNK: usize = 65536;
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        let read_result: Result<alloc::vec::Vec<u8>, narf_filesystem::FsError> =
-            fd::with_table(task, |t| {
-                let entry = t.get_mut(in_fd)?;
-                let off = if use_off_ptr { in_off } else { entry.offset };
-                let mut kbuf = alloc::vec![0u8; want];
-                let n = match poll_blocking(entry.ops.read(off, &mut kbuf)) {
-                    Some(Ok(n)) => n,
-                    Some(Err(error)) => return Some(Err(error)),
-                    None => 0,
-                };
-                kbuf.truncate(n);
-                if !use_off_ptr {
-                    entry.offset = off.saturating_add(n as u64);
-                }
-                Some(Ok(kbuf))
-            })
-            .flatten()?;
-        let kbuf = match read_result {
-            Ok(kbuf) => kbuf,
-            // A short copy is reported normally; only an initial would-block
-            // must reach splice so it can park or return EAGAIN instead of
-            // mistaking the empty pipe for EOF.
-            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                return Some(Err(narf_filesystem::FsError::WouldBlock));
+        let step_out_off = out_off;
+        let moved = if let Some(pipe_in) = input_ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        {
+            if let Some(pipe_out) = output_ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
+            {
+                pipe_in.splice_to_pipe(pipe_out, want)
+            } else {
+                pipe_in.splice_to_sink(want, |bytes| {
+                    // The source queue is locked until the accepted prefix is
+                    // committed. Never park while its IRQ-safe lock is held.
+                    poll_once(output_ops.write(step_out_off, bytes))
+                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+                })
             }
+        } else {
+            let mut kbuf = alloc::vec![0u8; want];
+            let n = match poll_blocking(input_ops.read(in_off, &mut kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            {
+                Ok(n) => n,
+                Err(error) => {
+                    if total == 0 {
+                        return Err(CopyFdError::Fs(error));
+                    }
+                    break;
+                }
+            };
+            kbuf.truncate(n);
+            if n == 0 {
+                break;
+            }
+            match poll_blocking(output_ops.write(step_out_off, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+            {
+                Ok(written) if written <= n => Ok(written),
+                Ok(_) => Err(narf_filesystem::FsError::InvalidData),
+                Err(error) => Err(error),
+            }
+        };
+
+        let moved = match moved {
+            Ok(moved) => moved,
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                return Err(CopyFdError::Fs(narf_filesystem::FsError::WouldBlock));
+            }
+            Err(error) if total == 0 => return Err(CopyFdError::Fs(error)),
             Err(_) => break,
         };
-        if kbuf.is_empty() {
-            break; // EOF on in_fd
+
+        // Commit to the pinned descriptions, never by numeric fd. A concurrent
+        // close+reuse cannot redirect cursor updates to an unrelated file.
+        if !use_off_ptr || !use_out_off_ptr {
+            if same_description && !use_off_ptr && !use_out_off_ptr {
+                // Both local cursors started together and advanced by the same
+                // accepted prefix; one shared f_pos is advanced once.
+                input
+                    .description
+                    .set_offset(in_off.saturating_add(moved as u64));
+            } else {
+                if !use_off_ptr {
+                    input
+                        .description
+                        .set_offset(in_off.saturating_add(moved as u64));
+                }
+                if !use_out_off_ptr {
+                    output
+                        .description
+                        .set_offset(out_off.saturating_add(moved as u64));
+                }
+            }
         }
-        in_off = in_off.saturating_add(kbuf.len() as u64);
-        let w: usize = fd::with_table(task, |t| {
-            let entry = t.get_mut(out_fd)?;
-            let off = entry.offset;
-            let w = match poll_blocking(entry.ops.write(off, &kbuf)) {
-                Some(Ok(w)) => w,
-                _ => 0,
-            };
-            entry.offset = off.saturating_add(w as u64);
-            Some(w)
-        })
-        .flatten()?;
-        total += w;
-        if w < kbuf.len() {
-            break; // short write (e.g. pipe full) — stop here
+        total += moved;
+        in_off = in_off.saturating_add(moved as u64);
+        out_off = out_off.saturating_add(moved as u64);
+        if moved < want {
+            break;
         }
     }
 
-    if use_off_ptr {
-        // SAFETY: `in_off_ptr` is the user `off_t*` (non-zero); copy_to_user
-        // range-validates the 8-byte write-back of the advanced offset.
-        let _ = unsafe { copy_to_user(in_off_ptr, &in_off.to_ne_bytes()) };
-    }
-    Some(Ok(total))
+    Ok(total)
 }
 
 /// Per-task robust-futex list head (`set_robust_list` / `get_robust_list`).
@@ -3317,6 +3636,13 @@ const CAP_VERSION_3: u32 = 0x2008_0522;
 static CAP_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, [u64; 3]>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn cap_fork(parent: u64, child: u64) {
+    let mut g = CAP_TABLE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let inherited = m.get(&parent).copied().unwrap_or([0; 3]);
+    m.insert(child, inherited);
+}
 
 /// Data-element count for a capability version; None if unsupported.
 fn cap_ndata(version: u32) -> Option<usize> {
@@ -4138,11 +4464,7 @@ fn mpol_effective_nodemask(policy: StoredPolicy, allowed: u64) -> u64 {
     } else {
         policy.nodemask & allowed
     };
-    if effective == 0 {
-        allowed
-    } else {
-        effective
-    }
+    if effective == 0 { allowed } else { effective }
 }
 
 fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
@@ -5482,6 +5804,7 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_PARENT: u64 = 0x0000_8000;
     const CLONE_NEWNS: u64 = 0x0002_0000;
+    const CLONE_NEWIPC: u64 = 0x0800_0000;
     const CLONE_NEWUSER: u64 = 0x1000_0000;
     const CLONE_NEWPID: u64 = 0x2000_0000;
 
@@ -5523,6 +5846,9 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
         return Err(EINVAL);
     }
     if ca.flags & CLONE_FS != 0 && ca.flags & (CLONE_NEWNS | CLONE_NEWUSER) != 0 {
+        return Err(EINVAL);
+    }
+    if ca.flags & CLONE_NEWIPC != 0 && ca.flags & CLONE_SYSVSEM != 0 {
         return Err(EINVAL);
     }
     if ca.flags & CLONE_THREAD != 0 && ca.flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 {
@@ -5597,7 +5923,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     let share_fs = (flags & CLONE_FS) != 0;
     let _share_files = (flags & CLONE_FILES) != 0;
     let share_sighand = (flags & CLONE_SIGHAND) != 0;
-    let _share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
+    let share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
 
     // No-VM (fork-shaped) path: redirect to sys_fork's machinery.
     // The clone_args fields not consumed by fork are accepted-and-
@@ -5728,6 +6054,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     } else {
         crate::alloc_pid().raw()
     };
+    #[cfg(feature = "linux-compat")]
+    if !share_thread {
+        crate::sysvipc::clone_sem_undo(
+            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+            child_visible_pid,
+            share_sysvsem,
+        );
+    }
 
     // Parent-of bookkeeping MUST be published BEFORE the child is spawned (a
     // new *process*; threads are not waitpid-reapable). `spawn_user_process*`
@@ -5754,11 +6088,8 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // Publish inherited mapping owners before the child becomes runnable.
     // Otherwise an immediate child exit can race the late copy and leave an
     // owner reference keyed to a process that has already been reaped.
-    if !share_thread {
-        crate::mapped_file::fork_process(
-            task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
-            child_visible_pid,
-        );
+    if !share_vm {
+        crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
     }
 
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
@@ -5894,6 +6225,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             }
         }
     }
+
+    // Rlimits are process/TGID state (shared by CLONE_THREAD, copied by a real
+    // process clone); capabilities remain per-thread credentials and copy in
+    // both cases.
+    rlimit_fork(parent_pid, child_tid.raw());
+    cap_fork(parent_pid, child_tid.raw());
 
     // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
     // an fd opened by any thread is visible to all, and close/dup affect all
@@ -6134,6 +6471,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // This is the publication point for the child. Everything keyed by its
     // TaskId, including the copied fd table used by the immediate executor
     // fexecve, has been installed above.
+    #[cfg(feature = "linux-compat")]
+    if !share_thread {
+        shm_fork_process(&parent_as, &child_as, child_visible_pid, share_vm);
+    }
     pending_child.spawn();
     ctx.set_return(SyscallReturn::ok(ret_val));
 
@@ -6184,25 +6525,25 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             #[cfg(target_arch = "aarch64")]
             if !narf_scheduler::stackful::user_own_stack_enabled() {
                 if let Some(hook) = crate::user_task::yield_hook() {
-                // aarch64 uses the polling-future path: keep the parent's
-                // saved syscall return parked until vfork_child_release calls
-                // wake_signal and clears this infinite deadline.
-                // SAFETY: uctx is the live poller-owned context and hook
-                // longjmps back through its installed JmpBuf.
-                let uc = unsafe { &*uctx };
-                uc.sleep_deadline_ns
-                    .store(u64::MAX, core::sync::atomic::Ordering::Release);
-                if vfork_is_pending(child_visible_pid) {
-                    // SAFETY: `uc` and the legacy JmpBuf remain live for this
-                    // poll; the hook diverges back to that saved continuation.
-                    unsafe {
-                        ctx.save_user_state(uc.state.get() as *mut u8);
-                        *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
-                        hook(uctx);
+                    // aarch64 uses the polling-future path: keep the parent's
+                    // saved syscall return parked until vfork_child_release calls
+                    // wake_signal and clears this infinite deadline.
+                    // SAFETY: uctx is the live poller-owned context and hook
+                    // longjmps back through its installed JmpBuf.
+                    let uc = unsafe { &*uctx };
+                    uc.sleep_deadline_ns
+                        .store(u64::MAX, core::sync::atomic::Ordering::Release);
+                    if vfork_is_pending(child_visible_pid) {
+                        // SAFETY: `uc` and the legacy JmpBuf remain live for this
+                        // poll; the hook diverges back to that saved continuation.
+                        unsafe {
+                            ctx.save_user_state(uc.state.get() as *mut u8);
+                            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
+                            hook(uctx);
+                        }
                     }
-                }
-                uc.sleep_deadline_ns
-                    .store(0, core::sync::atomic::Ordering::Release);
+                    uc.sleep_deadline_ns
+                        .store(0, core::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -6590,8 +6931,9 @@ pub fn wait_init() {
     // the OCI teardown #UD).
     #[cfg(feature = "linux-compat")]
     crate::user_task::register_process_exit_observer(crate::perf_event::on_process_exit);
+    #[cfg(feature = "linux-compat")]
+    crate::user_task::register_process_exit_observer(shm_process_exit);
     crate::user_task::register_process_exit_observer(on_child_exit);
-    crate::user_task::register_process_exit_observer(crate::mapped_file::process_exit);
     crate::user_task::register_wait_child_check(wait_child_check_fn);
     crate::user_task::wait_child_waker_init();
     // Abnormal slot drops (budget kill / revoked cap) must run the same
@@ -6851,11 +7193,7 @@ pub(crate) fn finish_wait_child(status_ptr: u64, is_waitid: bool, reaped: i64, s
             let _ = unsafe { copy_to_user(status_ptr, &status.to_ne_bytes()) };
         }
     }
-    if is_waitid {
-        0
-    } else {
-        reaped_visible as u64
-    }
+    if is_waitid { 0 } else { reaped_visible as u64 }
 }
 
 /// Per-task-own-stack blocking wait4/waitid: reap-or-park loop that returns the
@@ -7027,9 +7365,14 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
         crate::user_task::yield_hook(),
     ) {
         let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-        // Rewind past the 2-byte `syscall`/`int 0x80` instruction so
-        // re-entry re-runs this syscall with its original args.
-        let resume_rip = ctx.rip().wrapping_sub(2);
+        // Rewind past the architecture's syscall instruction so re-entry
+        // re-runs this syscall with its original args (`syscall`/`int 0x80`
+        // are 2 bytes; AArch64 `svc` is one fixed-width 4-byte instruction).
+        #[cfg(target_arch = "x86_64")]
+        const SYSCALL_INSN_LEN: u64 = 2;
+        #[cfg(target_arch = "aarch64")]
+        const SYSCALL_INSN_LEN: u64 = 4;
+        let resume_rip = ctx.rip().wrapping_sub(SYSCALL_INSN_LEN);
         ctx.set_rip(resume_rip);
         // SAFETY: `uctx` is the live per-task UserTaskCtx from
         // current_user_task(); we hold the only reference while setting the
@@ -7056,6 +7399,49 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
         // unreachable — hook() longjmps to the executor
     }
     false
+}
+
+/// Park a blocking syscall on one descriptor's durable readiness cell, then
+/// re-execute the syscall from its original user arguments.  The readiness arm
+/// happens before the task becomes unrunnable, so a peer that frees space in
+/// that window cannot lose the wake.  Descriptors that have not migrated to a
+/// durable cell retain the existing generation-guarded I/O park.
+pub(crate) fn park_reexecute_on_fd(
+    ctx: &mut dyn TrapContext,
+    ops: &dyn narf_filesystem::FileOps,
+    interest: u32,
+) -> bool {
+    // CaptureCtx deliberately reports RIP 0 for a nested sendmsg used by
+    // sendmmsg.  The outer handler must decide whether re-execution is safe
+    // after accounting for any messages it already transmitted.
+    if ctx.rip() == 0 {
+        return false;
+    }
+    let task = current_task_id();
+    let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
+        // Legacy longjmp execution has no stackful waker, but it does have the
+        // generation-guarded park path. Preserve blocking semantics there;
+        // returning false would make a blocking stream send spuriously surface
+        // EAGAIN whenever own-stack mode is disabled.
+        return park_reexecute_on_io(ctx);
+    };
+    match ops.arm_readiness(task, interest, &waker) {
+        Some(Poll::Ready(_)) => {
+            ops.disarm_readiness(task);
+            #[cfg(target_arch = "x86_64")]
+            const SYSCALL_INSN_LEN: u64 = 2;
+            #[cfg(target_arch = "aarch64")]
+            const SYSCALL_INSN_LEN: u64 = 4;
+            ctx.set_rip(ctx.rip().wrapping_sub(SYSCALL_INSN_LEN));
+            true
+        }
+        Some(Poll::Pending) => {
+            let parked = park_reexecute_on_io(ctx);
+            ops.disarm_readiness(task);
+            parked
+        }
+        None => park_reexecute_on_io(ctx),
+    }
 }
 
 /// Encode a `siginfo_t` (128 bytes, x86_64/aarch64 layout) describing a
@@ -7211,6 +7597,10 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     crate::pid_ns::clear_ns(tid);
                 }
                 crate::task::release_task(tid);
+                if let Some(state) = RLIMIT_TABLE.lock().as_mut() {
+                    state.rows.remove(&tid);
+                    state.reaped.insert(tid, ());
+                }
                 // Reap-time pid↔tid unbinding. PIDs are recycled
                 // (lowest-free), so a surviving PID_TO_TASK row would
                 // point the pid's NEXT owner-lookup at this dead tid —
@@ -7316,9 +7706,6 @@ fn release_task_tables(tid: u64) {
     }
     #[cfg(feature = "linux-compat")]
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = RLIMIT_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = PRCTL_TABLE.lock().as_mut() {
@@ -8209,12 +8596,40 @@ fn read_sid(target: u64) -> u64 {
         .unwrap_or(target) // default: sid == pid
 }
 
+/// Linux `session_of_pgrp`: resolve an internal process-group id to the
+/// session of one live member. The current task is checked explicitly because
+/// syscall-unit fixtures need not populate the scheduler task registry.
+fn session_of_pgrp(pgrp: u64) -> Option<u64> {
+    let current = process_state_key(current_task_id());
+    if current != 0 && read_pgid(current) == pgrp {
+        return Some(read_sid(current));
+    }
+
+    let members: alloc::vec::Vec<u64> = PGID_TABLE
+        .lock()
+        .as_ref()
+        .map(|m| {
+            m.iter()
+                .filter_map(|(&task, &group)| (group == pgrp).then_some(task))
+                .collect()
+        })
+        .unwrap_or_default();
+    members
+        .into_iter()
+        .find(|&task| crate::task::task_get(task).is_some())
+        .map(read_sid)
+        .or_else(|| {
+            (crate::task::task_get(pgrp).is_some() && read_pgid(pgrp) == pgrp)
+                .then(|| read_sid(pgrp))
+        })
+}
+
 /// The session id of the current task, in the visible-pid space userspace
 /// sees. Backs the `TIOCGSID` console ioctl (`tcgetsid(3)`), which getty
 /// and login use to confirm they own the tty's session after `TIOCSCTTY`.
 #[cfg(feature = "linux-compat")]
 pub fn current_task_sid_user() -> u64 {
-    pgid_to_user(read_sid(current_task_id()))
+    pgid_to_user(read_sid(process_state_key(current_task_id())))
 }
 
 /// The current task's process-group id in the visible-pid space — exactly
@@ -8224,7 +8639,7 @@ pub fn current_task_sid_user() -> u64 {
 /// `pgid_to_user`.
 #[cfg(feature = "linux-compat")]
 pub fn current_task_pgid_user() -> u64 {
-    pgid_to_user(read_pgid(current_task_id()))
+    pgid_to_user(read_pgid(process_state_key(current_task_id())))
 }
 
 /// Child inherits the parent's process-group id (POSIX fork semantics).
@@ -8280,6 +8695,7 @@ pub const CTTY_DETACHED: u32 = 0xFFFF_FFFF;
 /// has no controlling terminal.
 #[cfg(feature = "linux-compat")]
 pub fn task_ctty(task: u64) -> Option<u32> {
+    let task = process_state_key(task);
     match CTTY_TABLE
         .lock()
         .as_ref()
@@ -8295,6 +8711,7 @@ pub fn task_ctty(task: u64) -> Option<u32> {
 /// `TIOCSCTTY` path (mirrors `set_controlling_tty` for PTY slaves).
 #[cfg(feature = "linux-compat")]
 pub fn set_controlling_tty_console(task: u64) {
+    let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
         m.insert(task, CTTY_CONSOLE);
     }
@@ -8307,6 +8724,7 @@ pub fn set_controlling_tty_console(task: u64) {
 /// explicit `TIOCSCTTY` re-acquires one.
 #[cfg(feature = "linux-compat")]
 pub fn detach_controlling_tty(task: u64) {
+    let task = process_state_key(task);
     if let Some(m) = CTTY_TABLE.lock().as_mut() {
         m.insert(task, CTTY_DETACHED);
     }
@@ -8317,6 +8735,8 @@ pub fn detach_controlling_tty(task: u64) {
 /// default for both parent and child.
 #[cfg(feature = "linux-compat")]
 pub fn ctty_fork(parent: u64, child: u64) {
+    let parent = process_state_key(parent);
+    let child = process_state_key(child);
     let raw = CTTY_TABLE
         .lock()
         .as_ref()
@@ -8343,36 +8763,69 @@ pub fn __test_ctty_reset() {
 /// `None` if the task has no controlling tty.
 #[cfg(feature = "linux-compat")]
 pub fn ctty_for(task: u64) -> Option<u32> {
+    let task = process_state_key(task);
     CTTY_TABLE
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
 }
 
-/// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can
-/// record the caller's controlling tty without depending on this crate.
+/// Hook installed by `bare_main` so `PtySlave::ioctl(TIOCSCTTY)` can validate
+/// and record the caller's controlling tty without depending on this crate.
 ///
-/// Returns the caller's `(session id, process group id)` so the PTY can
-/// complete Linux's `__proc_set_tty`: acquiring a controlling terminal
-/// installs the tty's session AND its foreground process group. The pgrp
-/// half is what makes `tcgetpgrp()` answer truthfully, without which a
-/// job-control shell stops itself on SIGTTIN and never prints a prompt.
+/// `tty_sid` is the tty's current owning session in internal task-id space and
+/// `arg` is the Linux TIOCSCTTY argument. Linux permits acquisition only by a
+/// session leader without a controlling tty. Repeating the operation for the
+/// leader of the tty's existing session succeeds. Stealing another session's
+/// tty requires `arg == 1` and trusted `CAP_SYS_ADMIN`; NARF currently exposes
+/// no ambient trusted POSIX capability, so that branch is denied with EPERM.
+///
+/// The returned session and process-group IDs remain in task-id space. The
+/// querying syscall translates them into its caller's PID namespace, matching
+/// Linux's `pid_vnr()` at query time rather than acquisition time.
 #[cfg(feature = "linux-compat")]
-pub fn set_controlling_tty(pty_index: u32) -> (u64, u64) {
-    let task = current_task_id();
-    {
-        let mut g = CTTY_TABLE.lock();
-        if let Some(m) = g.as_mut() {
+pub fn set_controlling_tty(
+    pty_index: u32,
+    tty_sid: u64,
+    arg: usize,
+    readable: bool,
+) -> Result<(u64, u64), narf_filesystem::FsError> {
+    let task = process_state_key(current_task_id());
+    let sid = read_sid(task);
+    let pgid = read_pgid(task);
+    let session_leader = sid == task;
+
+    // Linux checks this idempotent case before rejecting a leader that
+    // already has a controlling terminal.
+    if session_leader && tty_sid == sid {
+        if let Some(m) = CTTY_TABLE.lock().as_mut() {
             m.insert(task, pty_index);
         }
+        return Ok((sid, pgid));
     }
-    // BOTH values must be in the VISIBLE-pid space, because userspace
-    // compares what tcgetpgrp() reports against its own getpgrp() — which is
-    // `pgid_to_user(read_pgid(..))`. Returning the raw task-space pgid here
-    // would reintroduce, on PTYs, exactly the divergence documented above
-    // `pgid_to_user`: a foreground leader read as "background", SIGTTIN, and
-    // a shell stopped at its first read.
-    (current_task_sid_user(), current_task_pgid_user())
+
+    if !session_leader || task_ctty(task).is_some() {
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    if tty_sid != 0 {
+        // `arg == 1` is necessary but not sufficient: Linux also requires
+        // CAP_SYS_ADMIN. The emulated capget/capset masks are explicitly not
+        // trusted authority, so no NARF caller can currently steal a tty.
+        let _ = arg;
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    // Linux performs this after the session/ownership checks. There is no
+    // authenticated CAP_SYS_ADMIN bridge to bypass FMODE_READ in NARF.
+    if !readable {
+        return Err(narf_filesystem::FsError::OperationNotPermitted);
+    }
+
+    if let Some(m) = CTTY_TABLE.lock().as_mut() {
+        m.insert(task, pty_index);
+    }
+    Ok((sid, pgid))
 }
 
 /// `TIOCSCTTY`-on-console hook (installed in `boot_init`): record the boot
@@ -8719,7 +9172,7 @@ fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32)
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-// ── Per-task rlimit table ──────────────────────────────────────────
+// ── Per-process rlimit table ───────────────────────────────────────
 //
 // POSIX getrlimit / setrlimit query and update per-resource soft
 // (`rlim_cur`) and hard (`rlim_max`) limits, stored per task. Most limits
@@ -8772,43 +9225,210 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 1024,
         max: 4096,
     };
+    // Linux INIT_RLIMITS uses MLOCK_LIMIT (8 MiB) for both soft and hard
+    // RLIMIT_MEMLOCK. Keeping infinity here made all new admission paths
+    // vacuous until a process explicitly lowered its own limit.
+    t[8] = RLimitPair {
+        cur: 8 * 1024 * 1024,
+        max: 8 * 1024 * 1024,
+    };
     t
 }
 
-static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>>,
-> = narf_lib::sync::IrqSafeSpinLock::new(None);
+struct RlimitState {
+    /// Rows are keyed by the monotonic thread-group leader TaskId. ProcessIds
+    /// are recycled and therefore cannot safely own lifetime-bearing state.
+    rows: BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>,
+    /// Reaped leader IDs are tombstoned so a prlimit holder that retained an
+    /// Arc<Task> across concurrent reap cannot recreate a dead process row.
+    reaped: BTreeMap<u64, ()>,
+}
+
+impl RlimitState {
+    fn new() -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            reaped: BTreeMap::new(),
+        }
+    }
+}
+
+static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<RlimitState>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
 
 pub fn rlimit_init() {
-    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
+    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
 }
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
-    *RLIMIT_TABLE.lock() = Some(BTreeMap::new());
+    *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+}
+
+/// Resolve any thread in a group to the leader's never-reused TaskId.
+fn process_state_key(task: u64) -> u64 {
+    task_to_pid_raw(task)
+        .and_then(pid_to_task_raw)
+        .unwrap_or(task)
 }
 
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     if resource >= RLIMIT_COUNT {
         return None;
     }
+    let key = process_state_key(task);
     let g = RLIMIT_TABLE.lock();
-    let m = g.as_ref()?;
-    let row = m.get(&task).copied().unwrap_or_else(default_rlimits);
+    let state = g.as_ref()?;
+    if state.reaped.contains_key(&key) {
+        return None;
+    }
+    let row = state
+        .rows
+        .get(&key)
+        .copied()
+        .unwrap_or_else(default_rlimits);
     Some(row[resource])
 }
 
-fn write_rlimit(task: u64, resource: usize, val: RLimitPair) -> bool {
+const RLIMIT_DATA: usize = 2;
+const RLIMIT_STACK: usize = 3;
+const RLIMIT_MEMLOCK: usize = 8;
+const RLIMIT_AS: usize = 9;
+
+#[derive(Copy, Clone)]
+struct MlockAuthority {
+    limit_bytes: u64,
+    bypass_limit: bool,
+}
+
+fn current_mlock_authority() -> MlockAuthority {
+    let task = current_task_id();
+    let limit_bytes = read_rlimit(task, RLIMIT_MEMLOCK)
+        .map(|limit| limit.cur)
+        .unwrap_or(0);
+    // CAP_TABLE is currently an ABI round-trip store, not trusted capability
+    // authority: capset may synthesize bits. Do not turn those emulated bits
+    // into a memory-limit bypass. Once capability-core supplies authenticated
+    // credentials this becomes its effective CAP_IPC_LOCK query.
+    MlockAuthority {
+        limit_bytes,
+        bypass_limit: false,
+    }
+}
+
+/// Current task's process-shared Linux limits for automatic stack growth in
+/// the architecture trap handlers.
+pub fn current_stack_growth_limits() -> narf_memory::StackGrowthLimits {
+    let task = current_task_id();
+    let authority = current_mlock_authority();
+    let defaults = default_rlimits();
+    narf_memory::StackGrowthLimits {
+        stack_bytes: read_rlimit(task, RLIMIT_STACK)
+            .unwrap_or(defaults[RLIMIT_STACK])
+            .cur,
+        memlock_bytes: authority.limit_bytes,
+        address_space_bytes: read_rlimit(task, RLIMIT_AS)
+            .unwrap_or(defaults[RLIMIT_AS])
+            .cur,
+        bypass_memlock: authority.bypass_limit,
+    }
+}
+
+fn can_do_mlock(authority: MlockAuthority) -> bool {
+    authority.limit_bytes != 0 || authority.bypass_limit
+}
+
+/// Atomically snapshot and optionally replace one process-shared rlimit.
+/// Validation against the previous hard limit occurs under the same table
+/// lock as publication, matching Linux's group-leader task lock and preventing
+/// two CLONE_THREAD callers from raising a hard limit through stale snapshots.
+fn update_rlimit_atomic(
+    task: u64,
+    resource: usize,
+    new_value: Option<RLimitPair>,
+) -> Result<RLimitPair, i64> {
     if resource >= RLIMIT_COUNT {
-        return false;
+        return Err(22); // EINVAL
+    }
+    let key = process_state_key(task);
+    let mut g = RLIMIT_TABLE.lock();
+    let state = g.as_mut().ok_or(22i64)?;
+    if state.reaped.contains_key(&key) {
+        return Err(3); // ESRCH
+    }
+    let row = state.rows.entry(key).or_insert_with(default_rlimits);
+    let prior = row[resource];
+    if let Some(value) = new_value {
+        if value.cur > value.max {
+            return Err(22); // EINVAL
+        }
+        if value.max > prior.max {
+            // No authenticated CAP_SYS_RESOURCE authority exists yet.
+            return Err(1); // EPERM
+        }
+        row[resource] = value;
+    }
+    Ok(prior)
+}
+
+/// Resolve Linux prlimit's pid argument to a live task. A non-container build
+/// must still reject unregistered numeric IDs rather than manufacturing a
+/// default rlimit row for a phantom process.
+struct PrlimitTarget {
+    tid: u64,
+    /// Mirrors Linux's get_task_struct reference for cross-task operations.
+    /// The exact current task cannot disappear during its own syscall, and
+    /// some kernel-test shims intentionally have no registered Task object.
+    _owner: Option<alloc::sync::Arc<crate::task::Task>>,
+}
+
+fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
+    if pid == 0 {
+        return Some(PrlimitTarget {
+            tid: caller,
+            _owner: crate::task::task_get(caller),
+        });
+    }
+    let outer = accept_pid_from(caller, pid)?;
+    let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
+    Some(PrlimitTarget {
+        tid: task,
+        _owner: Some(crate::task::task_get(task)?),
+    })
+}
+
+/// Linux permits cross-task prlimit when the caller's real uid/gid matches all
+/// of the target's real/effective/saved IDs. NARF reports saved as effective,
+/// so these are the complete representable checks. Only the exact current task
+/// bypasses them; same-thread-group membership alone does not. A future
+/// authenticated CAP_SYS_RESOURCE query can provide the namespace bypass.
+fn prlimit_permission(caller: u64, target: u64) -> bool {
+    if caller == target {
+        return true;
+    }
+    let caller_ids = read_uidgid(caller);
+    let target_ids = read_uidgid(target);
+    caller_ids.uid == target_ids.uid
+        && caller_ids.uid == target_ids.euid
+        && caller_ids.gid == target_ids.gid
+        && caller_ids.gid == target_ids.egid
+}
+
+fn rlimit_fork(parent: u64, child: u64) {
+    let parent_key = process_state_key(parent);
+    let child_key = process_state_key(child);
+    if parent_key == child_key {
+        return;
     }
     let mut g = RLIMIT_TABLE.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
-    };
-    let row = m.entry(task).or_insert_with(default_rlimits);
-    row[resource] = val;
-    true
+    let state = g.get_or_insert_with(RlimitState::new);
+    let inherited = state
+        .rows
+        .get(&parent_key)
+        .copied()
+        .unwrap_or_else(default_rlimits);
+    state.reaped.remove(&child_key);
+    state.rows.insert(child_key, inherited);
 }
 
 // ── prctl — per-task settings switchboard ──────────────────────────
@@ -9144,14 +9764,7 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
 
 #[cfg(feature = "container")]
 fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
-    if let Some(ns) = crate::namespaces::current_ipc_ns(task) {
-        return ns;
-    }
-    // Lazy-install a per-task IPC NS so the get-by-key family has a
-    // stable id space even for tasks that never unshared. Matches the
-    // shape Linux uses (every task is always in some IPC NS).
-    crate::namespaces::unshare_ipc(task);
-    crate::namespaces::current_ipc_ns(task).expect("unshare_ipc just installed an entry")
+    crate::namespaces::current_ipc_namespace(task)
 }
 
 // ── System V shared memory (linux-compat) ────────────────────────────
@@ -9168,6 +9781,11 @@ struct ShmSegment {
     handle: u64,
     key: u32,
     len: u64,
+    uid: u32,
+    gid: u32,
+    cuid: u32,
+    cgid: u32,
+    mode: u32,
     /// Creator's OUTER ProcessId (shmid_ds.shm_cpid), set at shmget.
     cpid: u64,
     /// OUTER ProcessId of the last shmat (shmid_ds.shm_lpid); 0 until the
@@ -9175,13 +9793,192 @@ struct ShmSegment {
     /// IPC_STAT. shmdt unmaps by address (no shmid in hand) so it is not
     /// tracked as a last-op here.
     lpid: u64,
+    atime: i64,
+    dtime: i64,
+    ctime: i64,
+    nattch: u64,
+    /// `IPC_RMID` removes the id/key immediately but retains the backing and
+    /// metadata until the last live (or in-progress) attachment is gone.
+    removed: bool,
 }
 
 #[cfg(feature = "linux-compat")]
+#[derive(Clone)]
+struct ShmAttachment {
+    ipc_ns: u64,
+    shmid: u64,
+    /// Original address passed to `shmdt`. `SHM_REMAP` may punch this mapping
+    /// into fragments, which remain one logical attachment.
+    base: u64,
+    fragments: alloc::vec::Vec<(u64, u64)>,
+    /// A destination record prepared before a shared `MREMAP_DONTUNMAP`
+    /// transaction mutates page tables. The per-address-space SysV mapping
+    /// transaction keeps this record private until commit; fixed-target punch
+    /// accounting must preserve it while retiring the previous destination.
+    pending_mremap: Option<u64>,
+}
+
+#[cfg(feature = "linux-compat")]
+type ShmAttachmentKey = (u64, u64); // (address-space incarnation, detach base)
+
+/// Sorted attachment index with fallible preparation for insertion.
+///
+/// BTreeMap has no stable fallible entry API: inserting a post-mremap
+/// destination could therefore invoke the kernel allocation-error handler
+/// after page tables had already changed. This compact index retains O(log n)
+/// exact lookup through binary search while allowing callers to reserve both
+/// the outer key slot and inner attachment slot before mutation. Insertion and
+/// removal shift O(n) records, which is acceptable for low-frequency SysV
+/// topology changes and does not affect normal `shmdt` lookup complexity.
+#[cfg(feature = "linux-compat")]
+#[derive(Default)]
+struct ShmAttachmentRegistry {
+    entries: alloc::vec::Vec<(ShmAttachmentKey, alloc::vec::Vec<ShmAttachment>)>,
+}
+
+#[cfg(feature = "linux-compat")]
+impl ShmAttachmentRegistry {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn search(&self, key: ShmAttachmentKey) -> Result<usize, usize> {
+        self.entries
+            .binary_search_by_key(&key, |(entry_key, _)| *entry_key)
+    }
+
+    fn get(&self, key: &ShmAttachmentKey) -> Option<&alloc::vec::Vec<ShmAttachment>> {
+        self.search(*key)
+            .ok()
+            .map(|index| &self.entries[index].1)
+    }
+
+    fn get_mut(
+        &mut self,
+        key: &ShmAttachmentKey,
+    ) -> Option<&mut alloc::vec::Vec<ShmAttachment>> {
+        self.search(*key)
+            .ok()
+            .map(|index| &mut self.entries[index].1)
+    }
+
+    fn contains_key(&self, key: &ShmAttachmentKey) -> bool {
+        self.search(*key).is_ok()
+    }
+
+    fn as_bounds(&self, as_key: u64) -> core::ops::Range<usize> {
+        let start = self
+            .entries
+            .partition_point(|((entry_as, _), _)| *entry_as < as_key);
+        let end = self
+            .entries
+            .partition_point(|((entry_as, _), _)| *entry_as <= as_key);
+        start..end
+    }
+
+    fn as_slice(
+        &self,
+        as_key: u64,
+    ) -> &[(ShmAttachmentKey, alloc::vec::Vec<ShmAttachment>)] {
+        let bounds = self.as_bounds(as_key);
+        &self.entries[bounds]
+    }
+
+    fn as_slice_mut(
+        &mut self,
+        as_key: u64,
+    ) -> &mut [(ShmAttachmentKey, alloc::vec::Vec<ShmAttachment>)] {
+        let bounds = self.as_bounds(as_key);
+        &mut self.entries[bounds]
+    }
+
+    /// Ensure a key exists and its value Vec can accept `additional` records.
+    /// Both allocations complete before the empty key is published.
+    fn try_reserve_key(
+        &mut self,
+        key: ShmAttachmentKey,
+        additional: usize,
+    ) -> Result<(), ()> {
+        match self.search(key) {
+            Ok(index) => self.entries[index]
+                .1
+                .try_reserve_exact(additional)
+                .map_err(|_| ()),
+            Err(index) => {
+                let mut values = alloc::vec::Vec::new();
+                values.try_reserve_exact(additional).map_err(|_| ())?;
+                self.entries.try_reserve_exact(1).map_err(|_| ())?;
+                self.entries.insert(index, (key, values));
+                Ok(())
+            }
+        }
+    }
+
+    /// Push after [`Self::try_reserve_key`], without allocation.
+    fn push_reserved(&mut self, key: ShmAttachmentKey, attachment: ShmAttachment) {
+        let index = self
+            .search(key)
+            .expect("reserved SysV attachment key disappeared");
+        debug_assert!(self.entries[index].1.len() < self.entries[index].1.capacity());
+        self.entries[index].1.push(attachment);
+    }
+
+    fn try_push(
+        &mut self,
+        key: ShmAttachmentKey,
+        attachment: ShmAttachment,
+    ) -> Result<(), ShmAttachment> {
+        if self.try_reserve_key(key, 1).is_err() {
+            return Err(attachment);
+        }
+        self.push_reserved(key, attachment);
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &ShmAttachmentKey) -> Option<alloc::vec::Vec<ShmAttachment>> {
+        self.search(*key)
+            .ok()
+            .map(|index| self.entries.remove(index).1)
+    }
+
+    fn retain(
+        &mut self,
+        mut keep: impl FnMut(&ShmAttachmentKey, &mut alloc::vec::Vec<ShmAttachment>) -> bool,
+    ) {
+        self.entries
+            .retain_mut(|(key, entries)| keep(key, entries));
+    }
+}
+#[cfg(feature = "linux-compat")]
+type ShmAddressSpaceOwners =
+    alloc::collections::BTreeMap<u64, alloc::collections::BTreeSet<u64>>;
+#[cfg(feature = "linux-compat")]
+type ShmObjectKey = (u64, u64); // (IPC namespace id, namespace-local shmid)
+
+#[cfg(feature = "linux-compat")]
 static SHM_SEGMENTS: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, ShmSegment>>,
+    Option<alloc::collections::BTreeMap<ShmObjectKey, ShmSegment>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 #[cfg(feature = "linux-compat")]
+static SHM_ATTACHMENTS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmAttachmentRegistry>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+static SHM_AS_OWNERS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmAddressSpaceOwners>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+type ShmMappingTransactions = alloc::collections::BTreeMap<
+    u64,
+    alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>>,
+>;
+#[cfg(feature = "linux-compat")]
+static SHM_MAPPING_TRANSACTIONS: narf_lib::sync::IrqSafeSpinLock<
+    Option<ShmMappingTransactions>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+#[cfg(feature = "linux-compat")]
+static SHM_NEXT_MREMAP_PREPARATION: AtomicU64 = AtomicU64::new(1);
+#[cfg(all(feature = "linux-compat", not(feature = "container")))]
 static SHM_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(feature = "linux-compat")]
@@ -9191,9 +9988,1223 @@ const IPC_EXCL: u64 = 0o2000;
 #[cfg(feature = "linux-compat")]
 const IPC_RMID: u64 = 0;
 #[cfg(feature = "linux-compat")]
-const IPC_64: u64 = 0x100;
+const IPC_SET: u64 = 1;
+#[cfg(feature = "linux-compat")]
+const IPC_STAT: u64 = 2;
 #[cfg(feature = "linux-compat")]
 const SHM_RDONLY: u64 = 0o10000;
+#[cfg(feature = "linux-compat")]
+const SHM_RND: u64 = 0o20000;
+#[cfg(feature = "linux-compat")]
+const SHM_REMAP: u64 = 0o40000;
+#[cfg(feature = "linux-compat")]
+const SHM_EXEC: u64 = 0o100000;
+#[cfg(feature = "linux-compat")]
+const SHMLBA: u64 = 4096;
+
+#[cfg(feature = "linux-compat")]
+fn shm_now_seconds() -> i64 {
+    narf_scheduler::narf_time::now_wall().secs
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_as_key(as_ref: &Arc<AddressSpace>) -> u64 {
+    shm_as_key_ref(as_ref)
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_as_key_ref(as_ref: &AddressSpace) -> u64 {
+    let root = as_ref.root.as_u64();
+    if root != 0 {
+        root
+    } else {
+        as_ref as *const AddressSpace as usize as u64
+    }
+}
+
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+fn current_shm_ipc_ns() -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
+    crate::namespaces::current_ipc_namespace(current_task_id())
+}
+
+#[cfg(all(feature = "linux-compat", not(feature = "container")))]
+fn current_shm_ipc_ns_id() -> u64 {
+    0
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_register_as_owner(as_key: u64, pid: u64) {
+    SHM_AS_OWNERS
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(as_key)
+        .or_default()
+        .insert(pid);
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_mapping_transaction(
+    as_key: u64,
+) -> alloc::sync::Arc<narf_lib::sync::IrqSafeSpinLock<()>> {
+    SHM_MAPPING_TRANSACTIONS
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(as_key)
+        .or_insert_with(|| alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(())))
+        .clone()
+}
+
+/// Mirror Linux `shm_open` across fork. A separate address space gets one
+/// additional logical attachment for every inherited mapping; `CLONE_VM`
+/// merely adds another process owner of the same mm and does not change
+/// `shm_nattch`.
+#[cfg(feature = "linux-compat")]
+fn shm_fork_process(
+    parent_as: &Arc<AddressSpace>,
+    child_as: &Arc<AddressSpace>,
+    child_pid: u64,
+    share_vm: bool,
+) {
+    let parent_key = shm_as_key(parent_as);
+    let child_key = shm_as_key(child_as);
+    let parent_tracked = SHM_AS_OWNERS
+        .lock()
+        .as_ref()
+        .is_some_and(|owners| owners.contains_key(&parent_key));
+    if !parent_tracked {
+        return;
+    }
+    let mapping_transaction = shm_mapping_transaction(parent_key);
+    let _mapping_guard = mapping_transaction.lock();
+    shm_register_as_owner(child_key, child_pid);
+    if share_vm {
+        return;
+    }
+
+    let inherited = {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        let inherited: alloc::vec::Vec<_> = map
+            .as_slice(parent_key)
+            .iter()
+            .flat_map(|((_, base), entries)| {
+                entries
+                    .iter()
+                    .cloned()
+                    .map(|entry| (*base, entry))
+                    .collect::<alloc::vec::Vec<_>>()
+            })
+            .collect();
+        for (base, entry) in &inherited {
+            if map
+                .try_push((child_key, *base), entry.clone())
+                .is_err()
+            {
+                panic!("could not reserve inherited SysV attachment registry entry");
+            }
+        }
+        inherited
+    };
+    let mut segments = SHM_SEGMENTS.lock();
+    let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+    for (_, attachment) in inherited {
+        if let Some(seg) = map.get_mut(&(attachment.ipc_ns, attachment.shmid)) {
+            seg.nattch = seg.nattch.saturating_add(1);
+        }
+    }
+}
+
+/// Process-exit half of Linux `exit_shm`: only the final process sharing an
+/// address space closes its inherited logical attachments.
+#[cfg(feature = "linux-compat")]
+pub(crate) fn shm_process_exit(pid: u64, _tid: u64) {
+    let closing_keys = {
+        let mut owners = SHM_AS_OWNERS.lock();
+        let map = owners.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let mut closing = alloc::vec::Vec::new();
+        let keys: alloc::vec::Vec<_> = map.keys().copied().collect();
+        for key in keys {
+            let remove = map.get_mut(&key).is_some_and(|pids| {
+                pids.remove(&pid);
+                pids.is_empty()
+            });
+            if remove {
+                map.remove(&key);
+                closing.push(key);
+            }
+        }
+        closing
+    };
+    if closing_keys.is_empty() {
+        return;
+    }
+    // `closing_keys` follows BTreeMap key order, giving multi-mm teardown a
+    // stable lock order even for synthetic tests that associate one pid with
+    // more than one address space.
+    let mapping_transactions: alloc::vec::Vec<_> = closing_keys
+        .iter()
+        .map(|key| shm_mapping_transaction(*key))
+        .collect();
+    let mapping_guards: alloc::vec::Vec<_> = mapping_transactions
+        .iter()
+        .map(|transaction| transaction.lock())
+        .collect();
+    let detached = {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        let keys: alloc::vec::Vec<_> = map
+            .entries
+            .iter()
+            .map(|(key, _)| *key)
+            .filter(|(as_key, _)| closing_keys.contains(as_key))
+            .collect();
+        keys.into_iter()
+            .flat_map(|key| map.remove(&key).unwrap_or_default())
+            .map(|attachment| (attachment.ipc_ns, attachment.shmid))
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    let now = shm_now_seconds();
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        for object in detached {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.nattch = seg.nattch.saturating_sub(1);
+            seg.lpid = pid;
+            seg.dtime = now;
+            if seg.removed && seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+    drop(mapping_guards);
+    let mut transactions = SHM_MAPPING_TRANSACTIONS.lock();
+    if let Some(map) = transactions.as_mut() {
+        for key in closing_keys {
+            map.remove(&key);
+        }
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_ipc_allowed(seg: &ShmSegment, request: u32) -> bool {
+    // Linux ipcperms collapses owner/group/other request bits into one rwx
+    // mask before comparing it with the caller-selected permission class.
+    let request = ((request >> 6) | (request >> 3) | request) & 0o7;
+    let cred = current_ucred();
+    if cred.uid == 0 {
+        return true;
+    }
+    let groups = current_groups();
+    let granted = if cred.uid == seg.uid || cred.uid == seg.cuid {
+        (seg.mode >> 6) & 0o7
+    } else if cred.gid == seg.gid
+        || cred.gid == seg.cgid
+        || groups.contains(&seg.gid)
+        || groups.contains(&seg.cgid)
+    {
+        (seg.mode >> 3) & 0o7
+    } else {
+        seg.mode & 0o7
+    };
+    granted & request == request
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_ipc_owner(seg: &ShmSegment) -> bool {
+    let uid = current_ucred().uid;
+    uid == 0 || uid == seg.uid || uid == seg.cuid
+}
+
+/// Drop an in-progress attach reservation. If `IPC_RMID` raced the mapping,
+/// the final reservation owns destruction of the now-unreachable backing.
+#[cfg(feature = "linux-compat")]
+fn shm_cancel_attach(object: ShmObjectKey) {
+    let destroy = {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let Some(seg) = map.get_mut(&object) else {
+            return;
+        };
+        seg.nattch = seg.nattch.saturating_sub(1);
+        if seg.removed && seg.nattch == 0 {
+            map.remove(&object).map(|seg| seg.handle)
+        } else {
+            None
+        }
+    };
+    if let (Some(handle), Some(vtable)) = (destroy, shmem_vtable()) {
+        if handle != 0 {
+            (vtable.destroy)(handle);
+        }
+    }
+}
+
+/// A registry-side failure while preparing a shared `mremap` alias.
+#[cfg(feature = "linux-compat")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShmMremapPrepareError {
+    InvalidRange,
+    PartialSysvSource,
+    AmbiguousSysvSource,
+    SegmentMissing,
+    PreparationConflict,
+    AllocationFailed,
+    TokenExhausted,
+}
+
+/// Registry transaction prepared before a shared `MREMAP_DONTUNMAP` page-table
+/// operation. A SysV source installs one hidden destination attachment up
+/// front, so commit performs no attachment allocation after memory has changed.
+/// Non-SysV shared sources still carry fixed-target punch accounting.
+///
+/// The caller must keep `shm_mapping_transaction(as_key)` locked from prepare
+/// through commit/abort. Dropping this value rolls back only the hidden SysV
+/// destination; use [`Self::abort`] when memory already punched a fixed target.
+#[cfg(feature = "linux-compat")]
+#[must_use = "dropping the preparation rolls back its pending SysV alias"]
+pub(crate) struct PreparedShmMremapAlias {
+    as_key: u64,
+    new_base: u64,
+    len: u64,
+    lpid: u64,
+    pending: Option<(u64, ShmObjectKey)>,
+    /// Capacity is reserved before memory mutation for every removed segment
+    /// handle that a fixed target punch can make destroyable.
+    destroy_after_punch: alloc::vec::Vec<u64>,
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_attachment_covers(attachment: &ShmAttachment, lo: u64, hi: u64) -> bool {
+    let mut cursor = lo;
+    for &(base, len) in &attachment.fragments {
+        let end = base.saturating_add(len);
+        if end <= cursor {
+            continue;
+        }
+        if base > cursor {
+            return false;
+        }
+        cursor = core::cmp::min(end, hi);
+        if cursor == hi {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_attachment_intersects(attachment: &ShmAttachment, lo: u64, hi: u64) -> bool {
+    attachment.fragments.iter().any(|&(base, len)| {
+        let end = base.saturating_add(len);
+        base < hi && lo < end
+    })
+}
+
+/// Reserve every Vec growth needed to clip the fixed target in place. The
+/// address-space mapping transaction makes these capacities stable until the
+/// prepared operation commits or aborts.
+#[cfg(feature = "linux-compat")]
+fn shm_prepare_punch_capacity(
+    as_key: u64,
+    ranges: &[(u64, u64)],
+) -> Result<alloc::vec::Vec<u64>, ShmMremapPrepareError> {
+    let mut attachments = SHM_ATTACHMENTS.lock();
+    let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+    let mut detach_bound = 0usize;
+    for ((key, _), entries) in map.as_slice_mut(as_key) {
+        if *key != as_key {
+            continue;
+        }
+        for attachment in entries {
+            if attachment.pending_mremap.is_some() {
+                continue;
+            }
+            let intersects = ranges
+                .iter()
+                .any(|&(lo, hi)| shm_attachment_intersects(attachment, lo, hi));
+            if !intersects {
+                continue;
+            }
+            detach_bound = detach_bound.saturating_add(1);
+            let splits = ranges
+                .iter()
+                .map(|&(lo, hi)| {
+                    attachment
+                        .fragments
+                        .iter()
+                        .filter(|&&(base, len)| {
+                            let end = base.saturating_add(len);
+                            base < lo && end > hi
+                        })
+                        .count()
+                })
+                .fold(0usize, usize::saturating_add);
+            attachment
+                .fragments
+                .try_reserve_exact(splits)
+                .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
+        }
+    }
+    let mut destroy = alloc::vec::Vec::new();
+    destroy
+        .try_reserve_exact(detach_bound)
+        .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
+    Ok(destroy)
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_prepare_fixed_punch_capacity(
+    as_key: u64,
+    lo: u64,
+    hi: u64,
+) -> Result<alloc::vec::Vec<u64>, ShmMremapPrepareError> {
+    shm_prepare_punch_capacity(as_key, &[(lo, hi)])
+}
+
+#[cfg(feature = "linux-compat")]
+fn shm_clip_attachment_prepared(attachment: &mut ShmAttachment, lo: u64, hi: u64) {
+    let mut index = 0usize;
+    while index < attachment.fragments.len() {
+        let (base, len) = attachment.fragments[index];
+        let end = base.saturating_add(len);
+        if end <= lo || base >= hi {
+            index += 1;
+        } else if base < lo && end > hi {
+            // Capacity for this one additional suffix was reserved by
+            // shm_prepare_fixed_punch_capacity before memory mutation.
+            attachment.fragments[index] = (base, lo - base);
+            attachment.fragments.insert(index + 1, (hi, end - hi));
+            index += 2;
+        } else if base < lo {
+            attachment.fragments[index] = (base, lo - base);
+            index += 1;
+        } else if end > hi {
+            attachment.fragments[index] = (hi, end - hi);
+            index += 1;
+        } else {
+            attachment.fragments.remove(index);
+        }
+    }
+}
+
+/// Prepare the SysV attachment half of a shared `MREMAP_DONTUNMAP` operation.
+/// `Ok` with no pending object means the source is shared but not SysV-backed;
+/// the returned plan must still finish fixed-target punch accounting.
+///
+/// # Safety
+/// The caller must hold the per-address-space lock returned by
+/// [`shm_mapping_transaction`] for `as_key` until the returned plan is consumed
+/// or dropped. `old_base..old_base+len` and `new_base..new_base+len` must name
+/// the already-validated source and prospective destination of the same memory
+/// transaction.
+#[cfg(feature = "linux-compat")]
+pub(crate) unsafe fn shm_prepare_mremap_shared_alias_locked(
+    as_key: u64,
+    old_base: u64,
+    len: u64,
+    new_base: u64,
+    lpid: u64,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    // SAFETY: forwards the caller's transaction/range contract.
+    unsafe {
+        shm_prepare_mremap_shared_destination_locked(
+            as_key, old_base, len, new_base, len, lpid, false,
+        )
+    }
+}
+
+/// Prepare the owner transfer for an ordinary nonzero shared move. The hidden
+/// destination is published only on success; failure methods can commit the
+/// fixed-target punch and Linux's separately observable source-tail shrink.
+#[cfg(feature = "linux-compat")]
+pub(crate) unsafe fn shm_prepare_mremap_shared_relocation_locked(
+    as_key: u64,
+    old_base: u64,
+    old_len: u64,
+    new_base: u64,
+    new_len: u64,
+    lpid: u64,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    // SAFETY: forwards the caller's transaction/range contract.
+    unsafe {
+        shm_prepare_mremap_shared_destination_locked(
+            as_key, old_base, old_len, new_base, new_len, lpid, true,
+        )
+    }
+}
+
+/// Prepare a source-tail ownership punch for an in-place shared shrink.
+///
+/// # Safety
+/// The caller holds `shm_mapping_transaction(as_key)` through plan commit/drop.
+#[cfg(feature = "linux-compat")]
+pub(crate) unsafe fn shm_prepare_mremap_punch_locked(
+    as_key: u64,
+    base: u64,
+    len: u64,
+    lpid: u64,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    let hi = base
+        .checked_add(len)
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    if len == 0 || base & 0xfff != 0 {
+        return Err(ShmMremapPrepareError::InvalidRange);
+    }
+    Ok(PreparedShmMremapAlias {
+        as_key,
+        new_base: base,
+        len,
+        lpid,
+        pending: None,
+        destroy_after_punch: shm_prepare_fixed_punch_capacity(as_key, base, hi)?,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(feature = "linux-compat")]
+unsafe fn shm_prepare_mremap_shared_destination_locked(
+    as_key: u64,
+    old_base: u64,
+    old_len: u64,
+    new_base: u64,
+    new_len: u64,
+    lpid: u64,
+    relocation: bool,
+) -> Result<PreparedShmMremapAlias, ShmMremapPrepareError> {
+    if old_len == 0 || new_len == 0 || old_base & 0xFFF != 0 || new_base & 0xFFF != 0 {
+        return Err(ShmMremapPrepareError::InvalidRange);
+    }
+    let old_hi = old_base
+        .checked_add(old_len)
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    let new_hi = new_base
+        .checked_add(new_len)
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    if old_base < new_hi && new_base < old_hi {
+        return Err(ShmMremapPrepareError::InvalidRange);
+    }
+    let source_tail = old_base
+        .checked_add(core::cmp::min(old_len, new_len))
+        .ok_or(ShmMremapPrepareError::InvalidRange)?;
+    let relocation_ranges = [
+        (new_base, new_hi),
+        (old_base, old_hi),
+        (source_tail, old_hi),
+    ];
+    let destroy_after_punch = if relocation {
+        shm_prepare_punch_capacity(as_key, &relocation_ranges)?
+    } else {
+        shm_prepare_fixed_punch_capacity(as_key, new_base, new_hi)?
+    };
+
+    let source = {
+        let attachments = SHM_ATTACHMENTS.lock();
+        let mut source = None;
+        let mut saw_partial = false;
+        if let Some(map) = attachments.as_ref() {
+            for ((key, _), entries) in map.as_slice(as_key) {
+                if *key != as_key {
+                    continue;
+                }
+                for attachment in entries {
+                    if attachment.pending_mremap.is_some()
+                        || !shm_attachment_intersects(attachment, old_base, old_hi)
+                    {
+                        continue;
+                    }
+                    if !shm_attachment_covers(attachment, old_base, old_hi) {
+                        saw_partial = true;
+                        continue;
+                    }
+                    let object = (attachment.ipc_ns, attachment.shmid);
+                    if source.replace(object).is_some() {
+                        return Err(ShmMremapPrepareError::AmbiguousSysvSource);
+                    }
+                }
+            }
+        }
+        if source.is_none() && saw_partial {
+            return Err(ShmMremapPrepareError::PartialSysvSource);
+        }
+        source
+    };
+
+    let Some(object) = source else {
+        return Ok(PreparedShmMremapAlias {
+            as_key,
+            new_base,
+            len: new_len,
+            lpid,
+            pending: None,
+            destroy_after_punch,
+        });
+    };
+    if !SHM_SEGMENTS
+        .lock()
+        .as_ref()
+        .is_some_and(|segments| segments.contains_key(&object))
+    {
+        return Err(ShmMremapPrepareError::SegmentMissing);
+    }
+
+    let token = SHM_NEXT_MREMAP_PREPARATION
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            next.checked_add(1)
+        })
+        .map_err(|_| ShmMremapPrepareError::TokenExhausted)?;
+    let mut fragments = alloc::vec::Vec::new();
+    fragments
+        .try_reserve_exact(1)
+        .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
+    fragments.push((new_base, new_len));
+
+    {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        map.try_reserve_key((as_key, new_base), 1)
+            .map_err(|_| ShmMremapPrepareError::AllocationFailed)?;
+        let entries = map
+            .get(&(as_key, new_base))
+            .expect("reserved SysV mremap destination key disappeared");
+        if entries
+            .iter()
+            .any(|attachment| attachment.pending_mremap.is_some())
+        {
+            return Err(ShmMremapPrepareError::PreparationConflict);
+        }
+        map.push_reserved((as_key, new_base), ShmAttachment {
+            ipc_ns: object.0,
+            shmid: object.1,
+            base: new_base,
+            fragments,
+            pending_mremap: Some(token),
+        });
+    }
+    Ok(PreparedShmMremapAlias {
+        as_key,
+        new_base,
+        len: new_len,
+        lpid,
+        pending: Some((token, object)),
+        destroy_after_punch,
+    })
+}
+
+#[cfg(feature = "linux-compat")]
+impl PreparedShmMremapAlias {
+    fn remove_pending(&mut self) {
+        let Some((token, _)) = self.pending.take() else {
+            return;
+        };
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        let key = (self.as_key, self.new_base);
+        let remove_key = if let Some(entries) = map.get_mut(&key) {
+            if let Some(index) = entries
+                .iter()
+                .position(|attachment| attachment.pending_mremap == Some(token))
+            {
+                entries.remove(index);
+            }
+            entries.is_empty()
+        } else {
+            false
+        };
+        if remove_key {
+            map.remove(&key);
+        }
+    }
+
+    /// Apply the target outcome using only capacities reserved at prepare time.
+    /// Unlike the legacy generic punch helper, this performs no Vec growth or
+    /// BTree insertion after memory has destructively replaced the target.
+    fn apply_prepared_punch(&mut self, lo: u64, hi: u64) {
+        let now = shm_now_seconds();
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        let mut segments = SHM_SEGMENTS.lock();
+        let segment_map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        map.retain(|(as_key, _), entries| {
+            if *as_key != self.as_key {
+                return true;
+            }
+            entries.retain_mut(|attachment| {
+                if attachment.pending_mremap.is_some()
+                    || !shm_attachment_intersects(attachment, lo, hi)
+                {
+                    return true;
+                }
+                shm_clip_attachment_prepared(attachment, lo, hi);
+                if !attachment.fragments.is_empty() {
+                    return true;
+                }
+                let object = (attachment.ipc_ns, attachment.shmid);
+                let Some(segment) = segment_map.get_mut(&object) else {
+                    return false;
+                };
+                segment.nattch = segment.nattch.saturating_sub(1);
+                segment.lpid = self.lpid;
+                segment.dtime = now;
+                if segment.removed && segment.nattch == 0 {
+                    if let Some(segment) = segment_map.remove(&object) {
+                        // Capacity was reserved for every possibly detached
+                        // attachment, an upper bound on destroyed segments.
+                        self.destroy_after_punch.push(segment.handle);
+                    }
+                }
+                false
+            });
+            !entries.is_empty()
+        });
+        drop(segments);
+        drop(attachments);
+        if let Some(vtable) = shmem_vtable() {
+            for handle in self.destroy_after_punch.drain(..) {
+                if handle != 0 {
+                    (vtable.destroy)(handle);
+                }
+            }
+        }
+    }
+
+    /// Publish a successful alias and mirror any fixed destination retirement.
+    /// The pending destination becomes one independent logical attachment, so
+    /// Linux `shm_open` accounting increments `nattch` and updates atime/lpid.
+    pub(crate) fn commit(mut self, target_punched: bool) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        self.commit_pending();
+    }
+
+    fn commit_pending(&mut self) {
+        let Some((token, object)) = self.pending else {
+            return;
+        };
+        let now = shm_now_seconds();
+        {
+            let mut attachments = SHM_ATTACHMENTS.lock();
+            let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+            let attachment = map
+                .get_mut(&(self.as_key, self.new_base))
+                .and_then(|entries| {
+                    entries
+                        .iter_mut()
+                        .find(|attachment| attachment.pending_mremap == Some(token))
+                })
+                .expect("prepared SysV mremap alias disappeared under its transaction");
+            let mut segments = SHM_SEGMENTS.lock();
+            let segment = segments
+                .as_mut()
+                .and_then(|segments| segments.get_mut(&object))
+                .expect("live SysV mremap source lost its backing segment");
+            segment.nattch = segment.nattch.saturating_add(1);
+            segment.lpid = self.lpid;
+            segment.atime = now;
+            attachment.pending_mremap = None;
+        }
+        self.pending = None;
+    }
+
+    /// Commit an ordinary move: fixed-target retirement, complete source
+    /// transfer, then publication of the prepared destination attachment.
+    pub(crate) fn commit_relocation(
+        mut self,
+        old_base: u64,
+        old_len: u64,
+        target_punched: bool,
+    ) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        self.commit_pending();
+        self.apply_prepared_punch(old_base, old_base + old_len);
+    }
+
+    /// Roll back the prepared alias and, when memory already performed a fixed
+    /// target punch, retire exactly those displaced destination attachments.
+    pub(crate) fn abort(mut self, target_punched: bool) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        self.remove_pending();
+    }
+
+    /// Apply the destructive prefix of a failed ordinary fixed move. Linux can
+    /// expose target retirement alone or target retirement plus source-tail
+    /// truncation before a later move error.
+    pub(crate) fn abort_relocation(
+        mut self,
+        old_base: u64,
+        old_len: u64,
+        new_len: u64,
+        target_punched: bool,
+        source_shrunk: bool,
+    ) {
+        if target_punched {
+            self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+        }
+        if source_shrunk && old_len > new_len {
+            self.apply_prepared_punch(old_base + new_len, old_base + old_len);
+        }
+        self.remove_pending();
+    }
+
+    pub(crate) fn commit_punch(mut self) {
+        self.apply_prepared_punch(self.new_base, self.new_base + self.len);
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+impl Drop for PreparedShmMremapAlias {
+    fn drop(&mut self) {
+        self.remove_pending();
+    }
+}
+
+/// Account for mappings displaced by `SHM_REMAP`. Fully covered logical
+/// attachments detach; partially covered ones retain the surviving fragments
+/// so a later `shmdt(original_base)` still finds and removes them.
+#[cfg(feature = "linux-compat")]
+fn shm_record_fixed_punch(as_key: u64, lo: u64, hi: u64, lpid: u64) {
+    let mut detached_ids = alloc::vec::Vec::new();
+    {
+        let mut attachments = SHM_ATTACHMENTS.lock();
+        let map = attachments.get_or_insert_with(ShmAttachmentRegistry::new);
+        for (_, entries) in map.as_slice_mut(as_key) {
+            let mut surviving = alloc::vec::Vec::new();
+            for mut attachment in core::mem::take(entries) {
+                // A prepared mremap alias occupies its destination slot before
+                // memory changes so commit cannot allocate. It is not part of
+                // the old fixed target and must survive that target's punch.
+                if attachment.pending_mremap.is_some() {
+                    surviving.push(attachment);
+                    continue;
+                }
+                let mut kept = alloc::vec::Vec::new();
+                for &(base, len) in &attachment.fragments {
+                    let end = base.saturating_add(len);
+                    if end <= lo || base >= hi {
+                        kept.push((base, len));
+                        continue;
+                    }
+                    if base < lo {
+                        kept.push((base, lo - base));
+                    }
+                    if end > hi {
+                        kept.push((hi, end - hi));
+                    }
+                }
+                attachment.fragments = kept;
+                if attachment.fragments.is_empty() {
+                    detached_ids.push((attachment.ipc_ns, attachment.shmid));
+                } else {
+                    surviving.push(attachment);
+                }
+            }
+            *entries = surviving;
+        }
+        map.retain(|_, entries| !entries.is_empty());
+    }
+    if detached_ids.is_empty() {
+        return;
+    }
+    let now = shm_now_seconds();
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        for object in detached_ids {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.nattch = seg.nattch.saturating_sub(1);
+            seg.lpid = lpid;
+            seg.dtime = now;
+            if seg.removed && seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "linux-compat")]
+mod shm_mremap_registry_tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    const AS_KEY: u64 = u64::MAX - 0x1000;
+    const SOURCE: u64 = 0x6200_0000;
+    const TARGET: u64 = 0x6300_0000;
+    const SOURCE_OBJECT: ShmObjectKey = (u64::MAX - 0x2000, u64::MAX - 0x3000);
+    const TARGET_OBJECT: ShmObjectKey = (u64::MAX - 0x2000, u64::MAX - 0x3001);
+
+    fn insert_segment(object: ShmObjectKey, nattch: u64) {
+        SHM_SEGMENTS
+            .lock()
+            .get_or_insert_with(alloc::collections::BTreeMap::new)
+            .insert(
+                object,
+                ShmSegment {
+                    handle: 0,
+                    key: 0,
+                    len: 0x2000,
+                    uid: 0,
+                    gid: 0,
+                    cuid: 0,
+                    cgid: 0,
+                    mode: 0o600,
+                    cpid: 1,
+                    lpid: 0,
+                    atime: 0,
+                    dtime: 0,
+                    ctime: 0,
+                    nattch,
+                    removed: false,
+                },
+            );
+    }
+
+    fn insert_attachment(
+        object: ShmObjectKey,
+        base: u64,
+        fragments: alloc::vec::Vec<(u64, u64)>,
+    ) {
+        let attachment = ShmAttachment {
+                ipc_ns: object.0,
+                shmid: object.1,
+                base,
+                fragments,
+                pending_mremap: None,
+            };
+        if SHM_ATTACHMENTS
+            .lock()
+            .get_or_insert_with(ShmAttachmentRegistry::new)
+            .try_push((AS_KEY, base), attachment)
+            .is_err()
+        {
+            panic!("test could not reserve synthetic SysV attachment");
+        }
+    }
+
+    fn cleanup() {
+        if let Some(map) = SHM_ATTACHMENTS.lock().as_mut() {
+            map.retain(|(as_key, _), _| *as_key != AS_KEY);
+        }
+        if let Some(map) = SHM_SEGMENTS.lock().as_mut() {
+            map.remove(&SOURCE_OBJECT);
+            map.remove(&TARGET_OBJECT);
+        }
+        if let Some(map) = SHM_MAPPING_TRANSACTIONS.lock().as_mut() {
+            map.remove(&AS_KEY);
+        }
+    }
+
+    fn smoke_shm_mremap_alias_commit_accounts_one_attachment() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_attachment(
+            SOURCE_OBJECT,
+            SOURCE,
+            alloc::vec![(SOURCE, 0x1000), (SOURCE + 0x1000, 0x1000)],
+        );
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        let result = (|| {
+            // SAFETY: this test holds the synthetic AS mapping transaction
+            // across preparation and commit.
+            let prepared = unsafe {
+                shm_prepare_mremap_shared_alias_locked(AS_KEY, SOURCE, 0x2000, TARGET, 77)
+            }
+            .map_err(|_| "prepare rejected a contiguous fragmented source")?;
+            let pending = SHM_ATTACHMENTS
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(&(AS_KEY, TARGET)))
+                .is_some_and(|entries| {
+                    entries.len() == 1 && entries[0].pending_mremap.is_some()
+                });
+            let before = SHM_SEGMENTS
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(&SOURCE_OBJECT))
+                .map(|segment| segment.nattch);
+            if !pending || before != Some(1) {
+                return Err("prepare published or counted its hidden alias early");
+            }
+            prepared.commit(false);
+            let committed = SHM_ATTACHMENTS
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(&(AS_KEY, TARGET)))
+                .is_some_and(|entries| {
+                    entries.len() == 1
+                        && entries[0].base == TARGET
+                        && entries[0].fragments == alloc::vec![(TARGET, 0x2000)]
+                        && entries[0].pending_mremap.is_none()
+                });
+            let accounted = SHM_SEGMENTS
+                .lock()
+                .as_ref()
+                .and_then(|map| map.get(&SOURCE_OBJECT))
+                .is_some_and(|segment| segment.nattch == 2 && segment.lpid == 77);
+            if !committed || !accounted {
+                return Err("commit did not publish and account one destination attachment");
+            }
+            Ok(())
+        })();
+        drop(guard);
+        cleanup();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_alias_commit_accounts_one_attachment
+    );
+
+    fn smoke_shm_mremap_alias_abort_preserves_pending_during_fixed_punch() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_segment(TARGET_OBJECT, 1);
+        insert_attachment(SOURCE_OBJECT, SOURCE, alloc::vec![(SOURCE, 0x1000)]);
+        insert_attachment(TARGET_OBJECT, TARGET, alloc::vec![(TARGET, 0x1000)]);
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        let result = (|| {
+            // SAFETY: the synthetic AS mapping transaction remains held.
+            let prepared = unsafe {
+                shm_prepare_mremap_shared_alias_locked(AS_KEY, SOURCE, 0x1000, TARGET, 88)
+            }
+            .map_err(|_| "prepare failed")?;
+            prepared.abort(true);
+            if SHM_ATTACHMENTS
+                .lock()
+                .as_ref()
+                .is_some_and(|map| map.contains_key(&(AS_KEY, TARGET)))
+            {
+                return Err("fixed failure left a target or pending attachment");
+            }
+            let segments = SHM_SEGMENTS.lock();
+            let map = segments.as_ref().ok_or("segment table disappeared")?;
+            if map.get(&SOURCE_OBJECT).map(|segment| segment.nattch) != Some(1) {
+                return Err("rollback changed the source attachment count");
+            }
+            if !map
+                .get(&TARGET_OBJECT)
+                .is_some_and(|segment| segment.nattch == 0 && segment.lpid == 88)
+            {
+                return Err("fixed failure did not account the displaced target");
+            }
+            Ok(())
+        })();
+        drop(guard);
+        cleanup();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_alias_abort_preserves_pending_during_fixed_punch
+    );
+
+    fn smoke_shm_mremap_relocation_mirrors_fixed_progress() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_segment(TARGET_OBJECT, 1);
+        insert_attachment(SOURCE_OBJECT, SOURCE, alloc::vec![(SOURCE, 0x2000)]);
+        insert_attachment(TARGET_OBJECT, TARGET, alloc::vec![(TARGET, 0x1000)]);
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        let result = (|| {
+            // SAFETY: the synthetic AS mapping transaction remains held.
+            let prepared = unsafe {
+                shm_prepare_mremap_shared_relocation_locked(
+                    AS_KEY, SOURCE, 0x2000, TARGET, 0x1000, 101,
+                )
+            }
+            .map_err(|_| "relocation prepare failed")?;
+            prepared.abort_relocation(SOURCE, 0x2000, 0x1000, true, true);
+            let attachments = SHM_ATTACHMENTS.lock();
+            let map = attachments
+                .as_ref()
+                .ok_or("attachment table disappeared")?;
+            if map.contains_key(&(AS_KEY, TARGET))
+                || map
+                    .get(&(AS_KEY, SOURCE))
+                    .is_none_or(|entries| {
+                        entries.len() != 1
+                            || entries[0].fragments != alloc::vec![(SOURCE, 0x1000)]
+                    })
+            {
+                return Err("failed fixed move did not mirror target+source shrink");
+            }
+            drop(attachments);
+            let segments = SHM_SEGMENTS.lock();
+            let map = segments.as_ref().ok_or("segment table disappeared")?;
+            if map.get(&SOURCE_OBJECT).map(|segment| segment.nattch) != Some(1)
+                || !map
+                    .get(&TARGET_OBJECT)
+                    .is_some_and(|segment| segment.nattch == 0 && segment.lpid == 101)
+            {
+                return Err("failed fixed move changed SysV attachment counts incorrectly");
+            }
+            Ok(())
+        })();
+        drop(guard);
+        cleanup();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_relocation_mirrors_fixed_progress
+    );
+
+    fn smoke_shm_mremap_alias_fixed_commit_replaces_target_then_opens_source() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_segment(TARGET_OBJECT, 1);
+        insert_attachment(SOURCE_OBJECT, SOURCE, alloc::vec![(SOURCE, 0x1000)]);
+        insert_attachment(TARGET_OBJECT, TARGET, alloc::vec![(TARGET, 0x1000)]);
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        let result = (|| {
+            // SAFETY: the synthetic AS mapping transaction remains held.
+            let prepared = unsafe {
+                shm_prepare_mremap_shared_alias_locked(AS_KEY, SOURCE, 0x1000, TARGET, 99)
+            }
+            .map_err(|_| "prepare failed")?;
+            prepared.commit(true);
+            let entries = SHM_ATTACHMENTS.lock();
+            let target = entries
+                .as_ref()
+                .and_then(|map| map.get(&(AS_KEY, TARGET)))
+                .ok_or("committed destination disappeared")?;
+            if target.len() != 1
+                || (target[0].ipc_ns, target[0].shmid) != SOURCE_OBJECT
+                || target[0].pending_mremap.is_some()
+            {
+                return Err("fixed commit punched the prepared alias or retained its target");
+            }
+            drop(entries);
+            let segments = SHM_SEGMENTS.lock();
+            let map = segments.as_ref().ok_or("segment table disappeared")?;
+            if !map
+                .get(&SOURCE_OBJECT)
+                .is_some_and(|segment| segment.nattch == 2 && segment.lpid == 99)
+                || !map
+                    .get(&TARGET_OBJECT)
+                    .is_some_and(|segment| segment.nattch == 0 && segment.lpid == 99)
+            {
+                return Err("fixed commit produced incorrect source/target nattch accounting");
+            }
+            Ok(())
+        })();
+        drop(guard);
+        cleanup();
+        match result {
+            Ok(()) => TestResult::Pass,
+            Err(message) => TestResult::Fail(message),
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_alias_fixed_commit_replaces_target_then_opens_source
+    );
+
+    fn smoke_shm_mremap_alias_rejects_partial_sysv_source() -> TestResult {
+        cleanup();
+        insert_segment(SOURCE_OBJECT, 1);
+        insert_attachment(SOURCE_OBJECT, SOURCE, alloc::vec![(SOURCE, 0x1000)]);
+        let transaction = shm_mapping_transaction(AS_KEY);
+        let guard = transaction.lock();
+        // SAFETY: the synthetic AS mapping transaction remains held.
+        let result = unsafe {
+            shm_prepare_mremap_shared_alias_locked(AS_KEY, SOURCE, 0x2000, TARGET, 111)
+        };
+        let passed = matches!(result, Err(ShmMremapPrepareError::PartialSysvSource))
+            && !SHM_ATTACHMENTS
+                .lock()
+                .as_ref()
+                .is_some_and(|map| map.contains_key(&(AS_KEY, TARGET)));
+        drop(guard);
+        cleanup();
+        if passed {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("partial SysV source prepared a destination alias")
+        }
+    }
+    kernel_test_in!(
+        "userspace/sysv_registry",
+        smoke_shm_mremap_alias_rejects_partial_sysv_source
+    );
+}
+
+/// Final `ipc_namespace` teardown removes every public id immediately. SHM
+/// mappings survive exactly as Linux VMAs do; their namespace-qualified
+/// attachment records retain the backing until final detach/process exit.
+#[cfg(all(feature = "linux-compat", feature = "container"))]
+pub(crate) fn shm_ipc_namespace_drop(ipc_ns: u64) {
+    let mut destroy = alloc::vec::Vec::new();
+    {
+        let mut segments = SHM_SEGMENTS.lock();
+        let map = segments.get_or_insert_with(alloc::collections::BTreeMap::new);
+        let objects: alloc::vec::Vec<_> = map
+            .keys()
+            .filter(|(namespace, _)| *namespace == ipc_ns)
+            .copied()
+            .collect();
+        for object in objects {
+            let Some(seg) = map.get_mut(&object) else {
+                continue;
+            };
+            seg.removed = true;
+            seg.key = 0;
+            if seg.nattch == 0 {
+                if let Some(seg) = map.remove(&object) {
+                    destroy.push(seg.handle);
+                }
+            }
+        }
+    }
+    if let Some(vtable) = shmem_vtable() {
+        for handle in destroy {
+            if handle != 0 {
+                (vtable.destroy)(handle);
+            }
+        }
+    }
+}
 
 // ── Yield / Sleep — Ok ─────────────────────────────────────────────
 

@@ -528,30 +528,6 @@ fn root() -> Arc<Cgroup> {
     root
 }
 
-/// Collect the member pids of `pid`'s cgroup and its entire subtree — the
-/// candidate set for a cgroup-scoped OOM when that subtree breaches
-/// `memory.max`. A v2 process is in exactly one cgroup, and the charging pid is
-/// always a member of its own subtree, so scoping the OOM here keeps every
-/// victim inside the offending hierarchy (rather than killing machine-wide).
-///
-/// Runs inside the charge hook's per-CPU re-entrancy guard, so its own `Vec`
-/// growth is treated as cgroup metadata (not recursively charged). NOTE: when
-/// an ANCESTOR's `memory.max` is what breached, the ideal victim set is that
-/// ancestor's (wider) subtree; scoping to the charging pid's own subtree is a
-/// sound subset (documented follow-up: map the breaching MemoryState back to
-/// its cgroup for exact scoping).
-#[cfg(feature = "cgroup-memory")]
-pub(super) fn oom_candidate_pids(pid: u64) -> Vec<u64> {
-    let start = TASK_CGROUP.lock().get(&pid).cloned().unwrap_or_else(root);
-    let mut out: Vec<u64> = Vec::new();
-    let mut stack: Vec<Arc<Cgroup>> = alloc::vec![start];
-    while let Some(cg) = stack.pop() {
-        out.extend(cg.members.lock().iter().copied());
-        stack.extend(cg.children.lock().values().cloned());
-    }
-    out
-}
-
 /// Resolve the cgroup a pid currently belongs to (root if unplaced).
 fn cgroup_of(pid: u64) -> Arc<Cgroup> {
     // Keep the guard's lifetime explicit: `root()` may reconcile controller
@@ -590,6 +566,26 @@ pub fn with_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
     mut f: F,
 ) {
     let mut cur = Some(cgroup_of(pid));
+    while let Some(c) = cur {
+        let state = c.ctrl_state.lock().get(name).cloned();
+        if let Some(s) = state {
+            f(&s);
+        }
+        cur = c.parent.clone();
+    }
+}
+
+/// Allocation-free variant for final-owner accounting paths. Unlike
+/// [`with_chain_states`], an unplaced/exited pid is ignored instead of falling
+/// back through `root()`, whose controller reconciliation may allocate. Map
+/// lookups, `Arc` clones, parent traversal, and state downcasts do not allocate;
+/// callers must keep `f` allocation-free as well.
+pub(super) fn with_existing_chain_states<F: FnMut(&Arc<dyn ControllerState>)>(
+    pid: u64,
+    name: &'static str,
+    mut f: F,
+) {
+    let mut cur = { TASK_CGROUP.lock().get(&pid).cloned() };
     while let Some(c) = cur {
         let state = c.ctrl_state.lock().get(name).cloned();
         if let Some(s) = state {

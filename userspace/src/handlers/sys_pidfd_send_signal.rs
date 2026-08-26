@@ -19,7 +19,10 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let pidfd = a.arg0 as u32;
     let signum = a.arg1 as u32;
-    if signum > 64 {
+    let flags = a.arg3 as u32;
+    // NARF does not yet implement Linux's signal-scope override flags. Reject
+    // every nonzero value before touching the fd or user siginfo.
+    if flags != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
@@ -35,64 +38,60 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // sig 0 is an existence/permission probe — don't queue anything.
-    if signum == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
     // SIGNAL_PENDING is keyed by TaskId; translate pid → tid.
     let mut target = pid;
     if let Some(tid) = pid_to_task_raw(target) {
         target = tid;
     }
-    // [PROBE] Name the SENDER of a termination signal to a user-957 /
-    // systemd-manager task. pidfd_send_signal is the path modern systemd uses to
-    // signal its services, and it sets SIGNAL_PENDING DIRECTLY (bypassing
-    // raise_signal_pending, where the twin probe lives), so a user@957 SIGTERM
-    // was invisible until this hook. cgevt_trace-gated, termination signals only.
-    #[cfg(feature = "cgroup")]
-    if narf_filesystem::cgroupfs::cgevt_trace_enabled() && matches!(signum, 6 | 15) {
-        let tgt_comm = proc_comm_of_task(target).unwrap_or_default();
-        let tgt_cg = narf_filesystem::cgroupfs::cgroup_path_of(pid);
-        if tgt_comm == "systemd"
-            || tgt_comm.starts_with("(sd")
-            || tgt_comm.starts_with("(systemd")
-            || tgt_cg.contains("user-957")
-        {
-            let sender_pid = task_to_pid_raw(task).unwrap_or(task);
-            let sender_comm = proc_comm_of_task(task).unwrap_or_default();
-            use core::fmt::Write as _;
-            let _ = writeln!(
-                narf_console::Writer,
-                "SIGSEND(pidfd) sig={} -> pid={} comm={} cg={} FROM pid={} comm={}",
-                signum,
-                pid,
-                tgt_comm,
-                tgt_cg,
-                sender_pid,
-                sender_comm
-            );
+    let imported = if a.arg2 == 0 {
+        None
+    } else {
+        let info = match import_queued_siginfo(a.arg2) {
+            Ok(info) => info,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+        };
+        if info.signo != signum {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            return;
         }
+        if siginfo_requires_self_target(info) && target != task {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            return;
+        }
+        Some(info)
+    };
+    // A pidfd keeps its numeric identity after exit; signal delivery must still
+    // resolve a live task. This also precedes signal-number validation in Linux.
+    if !signal_target_exists(target) {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+        return;
     }
-    signal_stopcont_interaction(target, signum);
-    if a.arg2 == 0 {
+    if signum > 64 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    // sig 0 is an existence/permission probe — don't queue anything.
+    if signum == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if let Some(info) = imported {
+        if enqueue_imported_siginfo(target, signum, info).is_none() {
+            // The payload is stashed before the pending bit becomes visible.
+            // A full queue is EAGAIN with nothing delivered.
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+            return;
+        }
+    } else {
         // NULL info is a kill(2)-shaped send: Linux's prepare_kill_siginfo
         // fills SI_USER with the sender's pid in the receiver's namespace
         // (do_pidfd_send_signal). Record it so the receiver's signalfd names
         // the sender, matching kill/tkill/tgkill.
         queue_sender_siginfo(target, signum);
-    } else if !capture_queued_siginfo(target, signum, a.arg2) {
-        // Non-NULL info: the caller's own siginfo (systemd's pidref_sigqueue
-        // sends SI_QUEUE). Stashed BEFORE the pending bit is visible so a
-        // consumer that observes the bit never races ahead of its siginfo. A
-        // full queue is -EAGAIN with nothing delivered (rt_sigqueueinfo shape).
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN
-        return;
     }
-    if signal_bits_update(&SIGNAL_PENDING, target, |slot| *slot |= sig_bit(signum)).is_none() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
-        return;
-    }
-    wake_signal(target);
+    raise_signal_pending(target, signum);
     ctx.set_return(SyscallReturn::ok(0));
 }

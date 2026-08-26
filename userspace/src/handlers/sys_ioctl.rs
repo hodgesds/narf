@@ -10,9 +10,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // Clone the Arc out of the fd table so we drop the table lock
     // before invoking the FileOps::ioctl body (which may take
     // device-internal locks of its own).
-    let ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()));
-    let ops = match ops {
-        Some(Some(o)) => o,
+    let entry = fd::with_table(task, |t| {
+        t.get(fd)
+            .map(|e| (e.ops.clone(), t.status_flags(fd).unwrap_or(e.status_flags)))
+    });
+    let (ops, status_flags) = match entry {
+        Some(Some(entry)) => entry,
         _ => {
             ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
             return;
@@ -46,15 +49,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 return;
             }
             let quota = if flags & BTRFS_SUBVOL_QGROUP_INHERIT != 0 {
-                let inherit_size = match usize::try_from(u64::from_ne_bytes(
-                    input[24..32].try_into().unwrap(),
-                )) {
-                    Ok(n) if (72..=4096).contains(&n) => n,
-                    _ => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let inherit_size =
+                    match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
+                        Ok(n) if (72..=4096).contains(&n) => n,
+                        _ => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 let inherit_ptr = u64::from_ne_bytes(input[32..40].try_into().unwrap());
                 let mut payload = alloc::vec![0u8; inherit_size];
                 // SAFETY: the UAPI size is page-bounded and copy_from_user
@@ -64,15 +66,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 let inherit_flags = u64::from_ne_bytes(payload[0..8].try_into().unwrap());
-                let count = match usize::try_from(u64::from_ne_bytes(
-                    payload[8..16].try_into().unwrap(),
-                )) {
-                    Ok(count) => count,
-                    Err(_) => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let count =
+                    match usize::try_from(u64::from_ne_bytes(payload[8..16].try_into().unwrap())) {
+                        Ok(count) => count,
+                        Err(_) => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 if inherit_flags & !1 != 0
                     || u64::from_ne_bytes(payload[16..24].try_into().unwrap()) != 0
                     || u64::from_ne_bytes(payload[24..32].try_into().unwrap()) != 0
@@ -119,8 +120,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         };
         let source = fd::with_table(task, |t| {
-            t.get(source_fd as u32)
-                .and_then(|entry| entry.ops.as_dir())
+            t.get(source_fd as u32).and_then(|entry| entry.ops.as_dir())
         })
         .flatten();
         let Some(source) = source else {
@@ -132,9 +132,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         };
         let result = match quota {
-            Some(quota) => poll_blocking(destination.snapshot_with_quota_async(
-                source, name, readonly, quota,
-            )),
+            Some(quota) => {
+                poll_blocking(destination.snapshot_with_quota_async(source, name, readonly, quota))
+            }
             None => poll_blocking(destination.snapshot_async(source, name, readonly)),
         };
         let rc = match result {
@@ -179,7 +179,8 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 return false;
             };
             entry.ops = cloned;
-            entry.offset = 0;
+            let _ = entry;
+            t.set_offset(fd, 0);
             true
         })
         .unwrap_or(false);
@@ -242,6 +243,108 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         return;
     }
+    // PTY job-control ioctls need caller process state, fd access mode, PID
+    // namespace translation, and Linux errno ordering. Keep that policy here;
+    // the filesystem object owns only the shared raw tty control state.
+    #[cfg(feature = "linux-compat")]
+    {
+        use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP};
+
+        let master_index = ops.as_pty_master_index();
+        let slave_index = ops
+            .tty_id()
+            .filter(|&id| id != crate::handlers::CTTY_CONSOLE);
+        if let Some(pty_index) = master_index.or(slave_index) {
+            match cmd {
+                TIOCSCTTY => {
+                    // O_PATH has no tty file_operations on Linux.
+                    if status_flags & crate::fd::O_PATH != 0 {
+                        ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                        return;
+                    }
+                    let readable = status_flags & crate::fd::O_ACCMODE != crate::fd::O_WRONLY;
+                    let result = ops.tty_acquire_controlling(arg, readable);
+                    let rc = match result {
+                        Ok(true) => 0,
+                        Ok(false) | Err(narf_filesystem::FsError::Unsupported) => {
+                            -(ENOTTY as i64)
+                        }
+                        Err(narf_filesystem::FsError::OperationNotPermitted) => -1, // EPERM
+                        Err(_) => -(EINVAL_CODE as i64),
+                    };
+                    ctx.set_return(SyscallReturn::ok(rc as u64));
+                    return;
+                }
+                TIOCGPGRP | TIOCGSID => {
+                    // Linux lets a PTY master query its slave control state,
+                    // but a slave fd must be the caller's controlling tty.
+                    if master_index.is_none() && task_ctty(task) != Some(pty_index) {
+                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                        return;
+                    }
+                    let raw = if cmd == TIOCGPGRP {
+                        ops.tty_fg_pgrp().unwrap_or(0)
+                    } else {
+                        match ops.tty_session() {
+                            Some(0) | None => {
+                                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                                return;
+                            }
+                            Some(sid) => sid,
+                        }
+                    };
+                    let visible = pgid_to_user(raw) as i32;
+                    // SAFETY: copy_to_user validates the complete pid_t output
+                    // after all ownership/session checks, matching Linux.
+                    if unsafe { copy_to_user(arg as u64, &visible.to_ne_bytes()) }.is_err() {
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    } else {
+                        ctx.set_return(SyscallReturn::ok(0));
+                    }
+                    return;
+                }
+                TIOCSPGRP => {
+                    let caller_sid = read_sid(process_state_key(task));
+                    if task_ctty(task) != Some(pty_index)
+                        || ops.tty_session() != Some(caller_sid)
+                    {
+                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                        return;
+                    }
+                    let mut raw_input = [0u8; core::mem::size_of::<i32>()];
+                    // SAFETY: copy_from_user validates the complete pid_t
+                    // after tty ownership, preserving Linux's errno order.
+                    if unsafe { copy_from_user(&mut raw_input, arg as u64) }.is_err() {
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        return;
+                    }
+                    let visible = i32::from_ne_bytes(raw_input);
+                    if visible < 0 {
+                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        return;
+                    }
+                    let pgrp = pgid_from_user(visible as u64);
+                    let Some(group_sid) = (pgrp != 0).then(|| session_of_pgrp(pgrp)).flatten()
+                    else {
+                        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                        return;
+                    };
+                    if group_sid != caller_sid {
+                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        return;
+                    }
+                    if !ops.set_tty_fg_pgrp(pgrp) {
+                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                    } else {
+                        ctx.set_return(SyscallReturn::ok(0));
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+
     // Wave-76 special-case: TIOCGPTPEER allocates a fresh slave fd in
     // the caller's table. The fd-allocation side lives here (not in the
     // filesystem crate), so we hijack the dispatch before delegating.
@@ -503,15 +606,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     & BTRFS_SUBVOL_QGROUP_INHERIT
                     != 0
             {
-                let inherit_size = match usize::try_from(u64::from_ne_bytes(
-                    input[24..32].try_into().unwrap(),
-                )) {
-                    Ok(n) if (72..=4096).contains(&n) => n,
-                    _ => {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
-                        return;
-                    }
-                };
+                let inherit_size =
+                    match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
+                        Ok(n) if (72..=4096).contains(&n) => n,
+                        _ => {
+                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            return;
+                        }
+                    };
                 let inherit_ptr = u64::from_ne_bytes(input[32..40].try_into().unwrap());
                 let old_len = input.len();
                 input.resize(old_len + inherit_size, 0);
@@ -567,6 +669,9 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         Err(narf_filesystem::FsError::PermissionDenied) => {
             // EACCES = 13
             ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+        }
+        Err(narf_filesystem::FsError::OperationNotPermitted) => {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         }
         Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));

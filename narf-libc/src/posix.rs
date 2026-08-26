@@ -17,6 +17,8 @@
 
 #![allow(non_camel_case_types)]
 
+use crate::errno::set_errno;
+
 pub type c_char = i8;
 pub type c_int = i32;
 pub type c_void = core::ffi::c_void;
@@ -75,18 +77,34 @@ pub(crate) unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     core::str::from_utf8(bytes).unwrap_or("")
 }
 
-/// `open(path, flags, mode)` — routes to the absolute-path opener
-/// in the kernel; `O_CREAT` is honoured (the kernel asks the parent
-/// directory to `create()` the leaf when missing). Other flags are
-/// accepted and ignored. `mode` is reserved for permission bits and
-/// currently unused by the kernel. Returns the fd on success or -1.
+/// `open(path, flags, mode)` — issue Linux `openat(AT_FDCWD, ...)`.
+/// The kernel's Linux-compat syscall table owns the architecture's `open`
+/// number, so using the legacy NARF `(ptr, len, mount, mount_len, flags)`
+/// shape here would misread `len` as the access mode. Return `-1` and preserve
+/// the kernel's exact errno through the libc TLS slot.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, _mode: mode_t) -> c_int {
-    // SAFETY: caller contract — `path` is a NUL-terminated C string.
-    let s = unsafe { cstr_to_str(path) };
-    match narf_user_runtime::open_flags(s, "", flags as u64) {
-        Some(fd) => fd as c_int,
-        None => -1,
+pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: mode_t) -> c_int {
+    if path.is_null() {
+        set_errno(14); // EFAULT
+        return -1;
+    }
+    // SAFETY: caller contract keeps the NUL-terminated pathname live for the
+    // syscall. `openat` uses the Linux ABI on both supported architectures.
+    let raw = unsafe {
+        narf_user_runtime::syscall4_raw(
+            narf_user_runtime::SYS_OPENAT,
+            (-100i64) as u64, // AT_FDCWD
+            path as u64,
+            flags as i64 as u64,
+            mode as u64,
+        )
+    };
+    let signed = raw as i64;
+    if signed < 0 {
+        set_errno((-signed) as i32);
+        -1
+    } else {
+        signed as c_int
     }
 }
 

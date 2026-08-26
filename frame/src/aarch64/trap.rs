@@ -176,108 +176,153 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
     }
 
     if ec == EC_DATA_ABORT_LOWER_EL {
-        // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
-        //   bit  6  (WnR)  : 0 = read, 1 = write
-        //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011
-        //                    indicate a permission fault (level
-        //                    encoded in the low 2 bits); 0b0001
-        //                    indicates a translation fault (no
-        //                    PTE present at the named level).
-        let iss = esr & 0x01FF_FFFF;
-        const ISS_WNR: u64 = 1 << 6;
-        const DFSC_MASK: u64 = 0x3F;
-        const DFSC_PERMISSION_FAULT_TOP: u64 = 0b00_1100;
-        const DFSC_TRANSLATION_FAULT_TOP: u64 = 0b00_0100;
-        let is_write = (iss & ISS_WNR) != 0;
-        let dfsc = iss & DFSC_MASK;
-        let is_perm_fault = (dfsc & 0b11_1100) == DFSC_PERMISSION_FAULT_TOP;
-        let is_translation_fault = (dfsc & 0b11_1100) == DFSC_TRANSLATION_FAULT_TOP;
         // SAFETY: FAR_EL1 read at EL1 is always defined.
         let far = unsafe { sysreg::read_far_el1() };
-        // Stack auto-extension + demand paging on translation
-        // fault (no PTE installed). mmap's deferred-back path
-        // surfaces here; if the vaddr lands in a STACK_GUARD
-        // region the trap routes into try_grow_stack instead.
-        if is_translation_fault {
-            if narf_userspace::handlers::handle_numa_hint_fault(far) {
-                return;
-            }
-            if let Some(as_arc) = narf_userspace::active_user_as() {
-                let v = narf_memory::VirtAddr::new(far);
-                // Publish the faulting task's NUMA mempolicy for `far`
-                // so demand-paging steers the fresh frame
-                // (set_mempolicy/mbind enforcement). Cleared right after.
-                narf_userspace::publish_mempolicy_for_fault(far);
-                // SAFETY: low-RAM phys-as-virt window is live;
-                // AS is the active user AS by construction.
-                // SAFETY: Valid memory or trusted environment
-                let r = unsafe { as_arc.demand_alloc_page(v) };
-                narf_userspace::clear_mempolicy_for_fault();
-                if r.is_ok() {
-                    return;
-                }
-                // SAFETY: same.
-                if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
-                    return;
-                }
-            }
-        }
-        if is_write && is_perm_fault {
-            if let Some(as_arc) = narf_userspace::active_user_as() {
-                let v = narf_memory::VirtAddr::new(far);
-                // SAFETY: low-RAM identity map is live, frame
-                // allocator + COW refcount table initialised at
-                // boot; AS is the active user AS by construction
-                // (the trap arrived from EL0).
-                // SAFETY: Valid memory or trusted environment
-                let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
-                if split_ok {
-                    // SAFETY: same identity-map argument; the
-                    // region was just touched by the split.
-                    // SAFETY: Valid memory or trusted environment
-                    let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
-                    if remap_ok {
-                        return;
-                    }
-                }
-            }
+        // Demand paging / stack grow / COW split for the EL0 fault. On
+        // success we `eret` back to the faulting user instruction.
+        if try_heal_user_data_abort(esr, far, true) {
+            return;
         }
         // Fall through to fatal if the abort wasn't a recoverable
         // user-mode COW write / demand-paging miss — genuine bugs
         // surface on the existing diagnostic path.
     }
 
-    // BPF extable — aarch64's first kernel fault-recovery surface.
-    //
-    // Runs after the EL0 data-abort arm above (demand paging, stack grow, COW)
-    // and immediately before the fatal path, mirroring the x86_64 ordering
-    // rule: a legitimate recovery must never be stolen, and an unrecovered
-    // fault must still reach the diagnostic printer untouched.
-    //
-    // `EC = 0b100101` is by definition a kernel-mode abort, so there is no CS
-    // equivalent to gate on here.
     if ec == EC_DATA_ABORT_CURRENT_EL {
         // `frame.elr` is the address of the faulting instruction — `vec.S`
         // saved it from ELR_EL1, and `RESTORE_ALL_GPRS` reloads ELR_EL1 from
         // this same slot on the way out, so rewriting the field is what
         // redirects the `eret`.
+
+        // SAFETY: FAR_EL1 read at EL1 is always defined.
+        let far = unsafe { sysreg::read_far_el1() };
+
+        // HEAL FIRST. A guarded kernel↔user copy (`uaccess::copy_user_guarded`)
+        // runs at EL1, so a fault while it touches a *legitimate but not-yet-
+        // backed* user page (fresh mmap, stack-guard, COW-shared) surfaces
+        // here as a current-EL abort. It must be demand-paged / stack-grown /
+        // COW-split and resumed exactly like the EL0 case — never stolen by
+        // the copy fixup below. Gated to the user half so a genuine kernel-
+        // pointer bug can't be COW/demand-heal-attempted. This mirrors the
+        // x86_64 #PF handler servicing a CPL=0 fault on a user vaddr.
+        let may_wait_for_reclaim = !narf_arch::aarch64::uaccess::guarded_copy_armed();
+        if in_user_half(far) && try_heal_user_data_abort(esr, far, may_wait_for_reclaim) {
+            return;
+        }
+
+        // BPF extable — a JIT-compiled probe load may fault by design; the
+        // recovery is Linux's `ex_handler_bpf` (`bpf_jit_comp.c:1479`): zero
+        // the destination register, resume at the fixup address. Runs after
+        // the healing arm above so a demand-paged buffer isn't silently
+        // zeroed.
         if let Some(rec) = narf_memory::bpf_extable::try_recover(frame.elr) {
-            // Same fixup shape as x86_64 and as Linux's `ex_handler_bpf`
-            // (`bpf_jit_comp.c:1479`): zero the destination register by
-            // mutating the saved GPR, resume at the fixup address. One label
-            // per program, no per-fault-site stub.
+            // One label per program, no per-fault-site stub.
             if !rec.zero_reg.is_none() {
                 zero_trap_frame_gpr(frame, rec.zero_reg.0);
             }
             frame.elr = rec.resume_pc;
             return;
         }
-        // No entry — fatal, by design (invariant §4.3). A missing entry is a
-        // JIT bug, and resuming anyway would turn it into a corrupt register.
+
+        // Recoverable-probe fixup (`uaccess::copy_user_guarded`). LAST, after
+        // every legitimate healing surface: `consume` is a single-shot armed
+        // latch, so an unhealable fault the copy is guarding against (a
+        // validated-but-unmapped user pointer, or a racing munmap) redirects
+        // ELR to the copy's recovery label and returns -EFAULT to the caller
+        // instead of taking the fatal path. `consume` returns 0 when no probe
+        // is armed, so ordinary kernel bugs still fall through to the printer.
+        let recovery = narf_arch::aarch64::probe::consume(esr);
+        if recovery != 0 {
+            frame.elr = recovery;
+            return;
+        }
+        // No entry / no armed probe — fatal, by design. A missing BPF entry is
+        // a JIT bug, and resuming anyway would turn it into a corrupt register.
     }
 
     // Non-recoverable synchronous exception — fatal.
     rust_aarch64_sync(frame);
+}
+
+/// Whether `a` is a canonical user-half (lower) address on aarch64.
+///
+/// User translations use `TTBR0_EL1` (top bits clear); the kernel half
+/// uses `TTBR1_EL1` (top bits set). The 48-bit user ceiling matches
+/// `validate_user_range`'s `in_user_half` in the userspace crate.
+#[inline]
+fn in_user_half(a: u64) -> bool {
+    a < 0x0000_8000_0000_0000
+}
+
+/// Attempt to heal a data abort whose faulting address is `far`, using the
+/// active user address space: demand-page a fresh translation-fault page,
+/// grow the stack into a `STACK_GUARD` region, or COW-split a write
+/// permission fault. Returns `true` iff the fault was fully recovered and
+/// the faulting instruction can be re-executed via `eret`.
+///
+/// Shared by the EL0 (lower-EL) abort path and the EL1 (current-EL) guarded
+/// user-copy path so both apply the identical heal-first policy.
+fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> bool {
+    // ISS field for a Data Abort (Arm ARM DDI0487 D5.4):
+    //   bit  6  (WnR)  : 0 = read, 1 = write
+    //   bits [5:0] DFSC: fault status code. Top 4 bits 0b0011 indicate a
+    //                    permission fault (level in the low 2 bits); 0b0001
+    //                    indicates a translation fault (no PTE at that level).
+    let iss = esr & 0x01FF_FFFF;
+    const ISS_WNR: u64 = 1 << 6;
+    const DFSC_MASK: u64 = 0x3F;
+    const DFSC_PERMISSION_FAULT_TOP: u64 = 0b00_1100;
+    const DFSC_TRANSLATION_FAULT_TOP: u64 = 0b00_0100;
+    let is_write = (iss & ISS_WNR) != 0;
+    let dfsc = iss & DFSC_MASK;
+    let is_perm_fault = (dfsc & 0b11_1100) == DFSC_PERMISSION_FAULT_TOP;
+    let is_translation_fault = (dfsc & 0b11_1100) == DFSC_TRANSLATION_FAULT_TOP;
+
+    // Stack auto-extension + demand paging on translation fault (no PTE
+    // installed). mmap's deferred-back path surfaces here; if the vaddr
+    // lands in a STACK_GUARD region the trap routes into try_grow_stack.
+    if is_translation_fault {
+        if narf_userspace::handlers::handle_numa_hint_fault(far) {
+            return true;
+        }
+        if let Some(as_arc) = narf_userspace::active_user_as() {
+            let v = narf_memory::VirtAddr::new(far);
+            // A guarded EL1 uaccess owns a per-CPU recovery slot. It may heal
+            // with an immediate allocation, but reserve pressure must reach
+            // probe fixup/EFAULT rather than context-switching with that slot
+            // armed. Lower-EL faults retain the reclaim wait path.
+            let r = if may_wait_for_reclaim {
+                crate::bare::reclaim_wait::demand_page(&as_arc, v)
+            } else {
+                crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
+            };
+            if r.is_ok() {
+                return true;
+            }
+            let limits = narf_userspace::handlers::current_stack_growth_limits();
+            // SAFETY: same.
+            if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
+                return true;
+            }
+        }
+    }
+    if is_write && is_perm_fault {
+        if let Some(as_arc) = narf_userspace::active_user_as() {
+            let v = narf_memory::VirtAddr::new(far);
+            // SAFETY: low-RAM identity map is live, frame allocator + COW
+            // refcount table initialised at boot; AS is the active user AS.
+            let split_ok = unsafe { as_arc.cow_split_on_write(v) }.is_ok();
+            if split_ok {
+                // SAFETY: same identity-map argument; the region was just
+                // touched by the split.
+                let remap_ok = unsafe { as_arc.remap_page(v) }.is_ok();
+                if remap_ok {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Zero one saved general-purpose register in a live trap frame.

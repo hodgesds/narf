@@ -1687,6 +1687,12 @@ pub unsafe fn syscall3_raw(num: u64, a0: u64, a1: u64, a2: u64) -> u64 {
     unsafe { syscall3(num, a0, a1, a2) }
 }
 
+#[inline]
+pub unsafe fn syscall4_raw(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
+    // SAFETY: thin syscall wrapper — args follow the kernel syscall ABI; pointer/length validity is this fn's documented caller contract.
+    unsafe { syscall4(num, a0, a1, a2, a3) }
+}
+
 // SYS_SOCKET, SYS_BIND, SYS_LISTEN, SYS_ACCEPT, SYS_CONNECT,
 // SYS_SOCKET_SEND, SYS_SOCKET_RECV, SYS_SHUTDOWN, SYS_GETSOCKOPT,
 // SYS_SETSOCKOPT, SYS_POLL, SYS_EPOLL_*, SYS_EVENTFD, SYS_TIMERFD_*,

@@ -57,11 +57,11 @@ fn register_process(task: u64, outer_pid: u64) {
     crate::handlers::register_pid_task_mapping(outer_pid, task);
 }
 
-/// The 32-byte siginfo prefix `capture_queued_siginfo` reads, filled the way
+/// The fixed siginfo prefix imported by the signal handlers, filled the way
 /// systemd's `pidref_sigqueue` fills it: SI_QUEUE, si_pid = manager's own
 /// getpid(), payload value.
-fn sigqueue_info(si_pid: u32) -> [u8; 32] {
-    let mut si = [0u8; 32];
+fn sigqueue_info(si_pid: u32) -> [u8; 48] {
+    let mut si = [0u8; 48];
     si[0..4].copy_from_slice(&SIGUSR1.to_le_bytes());
     si[8..12].copy_from_slice(&SI_QUEUE.to_le_bytes());
     si[16..20].copy_from_slice(&si_pid.to_le_bytes());

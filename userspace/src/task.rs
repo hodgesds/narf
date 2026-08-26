@@ -85,6 +85,12 @@ pub struct Task {
     /// `struct file` being polled and stays live — that is what keeps an
     /// offset-gated reader like `/dev/kmsg` re-evaluating correctly.
     pub poll_files: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<PollFileSlot>>,
+    /// Entry-time select/pselect arguments retained across RIP-rewind park
+    /// re-executions. Linux copies fd sets, timeout, and pselect's mask once;
+    /// retaining the staged kernel form prevents a sibling from changing the
+    /// in-flight wait by mutating those user buffers while this task sleeps.
+    pub(crate) select_park:
+        narf_lib::sync::IrqSafeSpinLock<Option<crate::select::SelectParkSnapshot>>,
 }
 
 /// One entry of [`Task::poll_files`]: the resolved file and the offset it
@@ -105,6 +111,7 @@ impl Task {
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
+            select_park: narf_lib::sync::IrqSafeSpinLock::new(None),
         });
         TASKS.lock().insert(tid, t.clone());
         // /proc/[pid]/stat starttime source — every task (spawn, fork,
@@ -679,7 +686,8 @@ pub fn dbg_stranded_poll_waiters() -> alloc::vec::Vec<StrandedPollWaiter> {
             //     on it, so a task still parked on one is stranded.
             let always = crate::poll::POLL_ERR | crate::poll::POLL_HUP | crate::poll::POLL_NVAL;
             let ready = crate::fd::with_table(t.tid, |tbl| {
-                tbl.get(fd as u32).map(|e| (e.ops.clone(), e.offset))
+                let entry = tbl.get(fd as u32)?;
+                Some((entry.ops.clone(), tbl.offset(fd as u32)?))
             })
             .flatten()
             .map(|(ops, offset)| ops.poll_readiness_at(offset))

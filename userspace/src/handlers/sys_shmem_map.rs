@@ -31,18 +31,22 @@ pub(crate) fn sys_shmem_map(ctx: &mut dyn TrapContext) {
         }
     };
     let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
-    let mapped = narf_memory::with_shared_mapping_transaction(|| {
-        let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-        if !(v.frames)(handle, &mut frames_raw) {
-            return Err(narf_memory::AddressSpaceError::Unmapped);
-        }
-        let phys_list = frames_raw
-            .into_iter()
-            .map(narf_memory::PhysAddr::new)
-            .collect();
-        // SAFETY: the transaction covers both registry snapshot and insertion.
-        unsafe {
-            as_ref.map_shared_region_locked(Region {
+    let authority = current_mlock_authority();
+    let mapped = as_ref.with_vma_transaction(|| {
+        narf_memory::with_shared_mapping_transaction(|| {
+            let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            if !(v.frames)(handle, &mut frames_raw) {
+                return Err(narf_memory::AddressSpaceError::Unmapped);
+            }
+            let phys_list = frames_raw
+                .into_iter()
+                .map(narf_memory::PhysAddr::new)
+                .collect();
+            // SAFETY: VMA -> shared-owner transactions cover both registry
+            // snapshot and insertion.
+            unsafe {
+                as_ref.map_shared_region_locked_limited(
+                    Region {
                 base: VirtAddr::new(base),
                 len,
                 // SHARED is load-bearing, not advisory: `phys_list` is the
@@ -59,8 +63,13 @@ pub(crate) fn sys_shmem_map(ctx: &mut dyn TrapContext) {
                 // twin already sets SHARED for the identical frames.
                 perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
                 phys: phys_list,
-            })
-        }
+                    },
+                    false,
+                    authority.limit_bytes,
+                    authority.bypass_limit,
+                )
+            }
+        })
     });
     if mapped.is_err() {
         ctx.set_return(SyscallReturn::invalid_op());

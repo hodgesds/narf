@@ -21,6 +21,10 @@ const O_NONBLOCK: i64 = 0o4000;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
+const ENOTSOCK_ERR: i64 = -88;
+const EMSGSIZE_ERR: i64 = -90;
+const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
+const BAD_USER_PTR: u64 = 1 << 47;
 
 // A clearly-invalid fd that no freshly-created table will ever hand out.
 const BAD_FD: u64 = 4096;
@@ -562,14 +566,44 @@ fn smoke_abi_socket_send_neg() -> TestResult {
             a3(BAD_FD, payload.as_ptr() as u64, payload.len() as u64, 0),
         )
         .ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
-        if r != -1 {
-            return Err("send() on a bad fd did not return -1");
+        if r != EBADF {
+            return Err("send() on a bad fd did not return EBADF");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_neg);
+
+fn smoke_abi_socket_send_errno_order() -> TestResult {
+    with_setup(|| {
+        // sendto imports its payload iterator before fd lookup.
+        if call(Syscall::SocketSend.raw(), a3(BAD_FD, BAD_USER_PTR, 1, 0)) != Some(EFAULT) {
+            return Err("send invalid payload did not precede EBADF");
+        }
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        let payload = b"x";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(non_socket, payload.as_ptr() as u64, 1, 0),
+        ) != Some(ENOTSOCK_ERR)
+        {
+            return Err("send on a non-socket fd did not return ENOTSOCK");
+        }
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(non_socket, BAD_USER_PTR, 1, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("send invalid payload did not precede ENOTSOCK");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_errno_order);
 
 // ───────────────────────────── SocketRecv ─────────────────────────────
 
@@ -1986,16 +2020,72 @@ fn smoke_abi_socket_sendmsg_neg() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
         let n = Syscall::SocketSendMsg.raw();
-        // msg_ptr == 0 → handler rejects with the -1 sentinel.
+        // A valid socket plus an unreadable msghdr is EFAULT.
         let r = call(n, a2(fd, 0, 0)).ok_or("status not Ok")?;
-        // LINUX-GAP: Linux returns -EFAULT (-14); NARF returns -1.
-        if r != -1 {
-            return Err("sendmsg() with NULL msghdr did not return -1");
+        if r != EFAULT {
+            return Err("sendmsg() with NULL msghdr did not return EFAULT");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmsg_neg);
+
+fn smoke_abi_socket_sendmsg_exact_validation() -> TestResult {
+    with_setup(|| {
+        // MSG_CMSG_COMPAT is rejected before fd lookup; fd/type errors precede
+        // importing the msghdr itself.
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(BAD_FD, BAD_USER_PTR, MSG_CMSG_COMPAT),
+        ) != Some(EINVAL)
+        {
+            return Err("sendmsg compat flag did not precede EBADF");
+        }
+        if call(Syscall::SocketSendMsg.raw(), a2(BAD_FD, BAD_USER_PTR, 0)) != Some(EBADF) {
+            return Err("sendmsg bad fd did not precede msghdr EFAULT");
+        }
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(non_socket, BAD_USER_PTR, 0),
+        ) != Some(ENOTSOCK_ERR)
+        {
+            return Err("sendmsg non-socket fd did not precede msghdr EFAULT");
+        }
+
+        let (tx, _rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let mut msg = [0u8; 56];
+        msg[16..24].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0)) != Some(EFAULT) {
+            return Err("sendmsg did not report an unreadable iovec array");
+        }
+        msg[16..24].copy_from_slice(&0u64.to_ne_bytes());
+        msg[24..32].copy_from_slice(&1025u64.to_ne_bytes());
+        if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0)) != Some(EMSGSIZE_ERR)
+        {
+            return Err("sendmsg iovlen > UIO_MAXIOV did not return EMSGSIZE");
+        }
+
+        let mut iov = [0u8; 16];
+        iov[..8].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+        iov[8..].copy_from_slice(&1u64.to_ne_bytes());
+        msg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        msg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        if call(Syscall::SocketSendMsg.raw(), a2(tx, msg.as_ptr() as u64, 0)) != Some(EFAULT) {
+            return Err("sendmsg ignored an unreadable iovec payload");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmsg_exact_validation
+);
 
 // ───────────────────────────── SocketRecvMsg ──────────────────────────
 
@@ -3993,6 +4083,125 @@ fn smoke_abi_socket_sendmsg_full_ring_reports_eagain() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_sendmsg_full_ring_reports_eagain
+);
+
+/// A non-blocking `sendmmsg()` whose first message cannot make progress must
+/// return EAGAIN, not a successful zero-message count.  The nested sendmsg
+/// handler cannot itself rewind the outer syscall; sendmmsg owns that decision.
+fn smoke_abi_socket_sendmmsg_full_ring_reports_eagain() -> TestResult {
+    with_setup(|| {
+        let (fd0, _fd1) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        fill_stream_ring_until_eagain(fd0)?;
+
+        let payload = b"x";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut mmsg = [0u8; 64];
+        mmsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        mmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+
+        let r = call(
+            Syscall::Sendmmsg.raw(),
+            a3(fd0, mmsg.as_mut_ptr() as u64, 1, 0),
+        )
+        .ok_or("full-ring sendmmsg status")?;
+        if r != EAGAIN {
+            return Err("sendmmsg on a full non-blocking ring did not report EAGAIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmmsg_full_ring_reports_eagain
+);
+
+fn smoke_abi_socket_sendmmsg_exact_errors() -> TestResult {
+    with_setup(|| {
+        // Native-only flag validation and descriptor resolution occur even for
+        // a zero-length batch, before the mmsghdr pointer is considered.
+        if call(
+            Syscall::Sendmmsg.raw(),
+            a3(BAD_FD, BAD_USER_PTR, 0, MSG_CMSG_COMPAT),
+        ) != Some(EINVAL)
+        {
+            return Err("sendmmsg compat flag did not precede fd lookup");
+        }
+        if call(Syscall::Sendmmsg.raw(), a3(BAD_FD, BAD_USER_PTR, 0, 0)) != Some(EBADF) {
+            return Err("sendmmsg vlen=0 on a bad fd did not return EBADF");
+        }
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        if call(Syscall::Sendmmsg.raw(), a3(non_socket, BAD_USER_PTR, 0, 0)) != Some(ENOTSOCK_ERR) {
+            return Err("sendmmsg vlen=0 on a pipe did not return ENOTSOCK");
+        }
+
+        let (tx, _rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        if call(Syscall::Sendmmsg.raw(), a3(tx, BAD_USER_PTR, 0, 0)) != Some(0) {
+            return Err("sendmmsg valid fd/vlen=0 touched the message vector");
+        }
+        if call(Syscall::Sendmmsg.raw(), a3(tx, BAD_USER_PTR, 1, 0)) != Some(EFAULT) {
+            return Err("sendmmsg discarded its first-message EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sendmmsg_exact_errors);
+
+fn smoke_abi_socket_sendmmsg_partial_prefix() -> TestResult {
+    with_setup(|| {
+        let (tx, rx) = make_pair(SOCK_STREAM | SOCK_NONBLOCK)?;
+        let first = b"first";
+        let mut iov = [0u8; 32];
+        iov[0..8].copy_from_slice(&(first.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(first.len() as u64).to_ne_bytes());
+        iov[16..24].copy_from_slice(&BAD_USER_PTR.to_ne_bytes());
+        iov[24..32].copy_from_slice(&1u64.to_ne_bytes());
+
+        let mut batch = [0u8; 128];
+        batch[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        batch[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        batch[64 + 16..64 + 24].copy_from_slice(&(iov.as_ptr() as u64 + 16).to_ne_bytes());
+        batch[64 + 24..64 + 32].copy_from_slice(&1u64.to_ne_bytes());
+
+        if call(
+            Syscall::Sendmmsg.raw(),
+            a3(tx, batch.as_mut_ptr() as u64, 2, 0),
+        ) != Some(1)
+        {
+            return Err("sendmmsg did not return its transmitted prefix");
+        }
+        let first_len = u32::from_ne_bytes(batch[56..60].try_into().unwrap());
+        if first_len as usize != first.len() {
+            return Err("sendmmsg did not write the first message length");
+        }
+        if batch[64 + 56..64 + 60] != [0u8; 4] {
+            return Err("sendmmsg wrote msg_len for the failing message");
+        }
+        let mut received = [0u8; 16];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(
+                rx,
+                received.as_mut_ptr() as u64,
+                received.len() as u64,
+                MSG_DONTWAIT,
+            ),
+        ) != Some(first.len() as i64)
+            || &received[..first.len()] != first
+        {
+            return Err("sendmmsg partial batch did not publish exactly its prefix");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_sendmmsg_partial_prefix
 );
 
 /// An fd-passing `sendmsg()` (SCM_RIGHTS) on a FULL ring must report EAGAIN and

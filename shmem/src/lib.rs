@@ -92,7 +92,10 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
     if len == 0 {
         return Err(ShmemError::BadLen);
     }
-    let len_pg = (len + PAGE - 1) & !(PAGE - 1);
+    let len_pg = len
+        .checked_add(PAGE - 1)
+        .map(|value| value & !(PAGE - 1))
+        .ok_or(ShmemError::BadLen)?;
     let pages = (len_pg / PAGE) as usize;
     if pages > MAX_PAGES_PER_HANDLE {
         return Err(ShmemError::BadLen);

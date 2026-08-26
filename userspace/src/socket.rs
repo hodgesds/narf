@@ -975,6 +975,7 @@ enum SocketState {
 pub(crate) struct ScmRightsFile {
     pub(crate) ops: Arc<dyn FileOps>,
     pub(crate) status_flags: u32,
+    pub(crate) description: Option<crate::fd::Description>,
 }
 
 /// One enqueued UDP-style datagram. Owns the payload bytes (UDP
@@ -2139,6 +2140,8 @@ impl FileOps for SocketFile {
             let r = self.do_send(buf, 0, None);
             match r {
                 Ok(n) => Ok(n),
+                Err(SockError::WouldBlock) => Err(FsError::WouldBlock),
+                Err(SockError::Pipe) => Err(FsError::BrokenPipe),
                 Err(_) => Err(FsError::Unsupported),
             }
         })
@@ -6097,6 +6100,7 @@ fn smoke_unix_dgram_scm_rights_delivers_per_datagram() -> TestResult {
     let passed_right = ScmRightsFile {
         ops: passed.clone(),
         status_flags: 0,
+        description: None,
     };
     match sender.unix_dgram_sendmsg(b"FDSTORE=1", 0, Some(addr), alloc::vec![passed_right]) {
         Ok(n) if n == b"FDSTORE=1".len() => {}
@@ -6758,6 +6762,7 @@ fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
     let passed_right = ScmRightsFile {
         ops: passed.clone(),
         status_flags: 0,
+        description: None,
     };
 
     if ring.write(b"plain") != 5
@@ -6798,10 +6803,12 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
     let first_right = ScmRightsFile {
         ops: first.clone(),
         status_flags: 0,
+        description: None,
     };
     let second_right = ScmRightsFile {
         ops: second.clone(),
         status_flags: 0,
+        description: None,
     };
 
     if ring.write_stream_with_fds(b"a", alloc::vec![first_right]) != 1

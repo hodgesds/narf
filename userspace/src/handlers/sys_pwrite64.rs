@@ -41,12 +41,9 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
         return;
     }
     let outcome = fd::with_table(task, |t| {
-        let entry = t
-            .get(fd)
-            .ok_or(narf_filesystem::FsError::ReadOnly)?;
+        let entry = t.get(fd).ok_or(narf_filesystem::FsError::ReadOnly)?;
         let ops = entry.ops.clone();
-        poll_blocking(ops.write(offset, &kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
+        poll_blocking(ops.write(offset, &kbuf)).unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
     });
     match outcome {
         Some(Ok(n)) => ctx.set_return(SyscallReturn::ok(n as u64)),

@@ -897,7 +897,8 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
         return TestResult::Fail("setrlimit did not stick");
     }
 
-    // Out-of-range resource → -1.
+    // Linux validates the resource number before touching the output pointer
+    // and reports the precise errno, EINVAL.
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: 99,
@@ -909,7 +910,7 @@ fn smoke_userspace_rlimit_round_trip() -> TestResult {
     kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
     let bad_resource_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-22i64) as u64,
     );
     if !bad_resource_rejected {
         return TestResult::Fail("getrlimit(99) was not rejected");

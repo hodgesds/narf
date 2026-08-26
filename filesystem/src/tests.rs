@@ -898,6 +898,78 @@ fn smoke_filesystem_fifo_peer_counts() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_filesystem_fifo_peer_counts);
 
+/// Blocking open remembers a counterpart that opened and closed before the
+/// waiter ran. A level-only peer count loses this edge and can strand forever.
+fn smoke_filesystem_fifo_transient_peer_is_durable() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::FileOps;
+
+    let node = FifoNode::new(0x4001, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4001, 0o666, 0, 0, true, false);
+    if reader.peer_ready_or_seen() {
+        return TestResult::Fail("reader observed a writer before one opened");
+    }
+    {
+        let _writer =
+            crate::fifo::FifoHandle::open(shared.clone(), 0x4001, 0o666, 0, 0, false, true);
+    }
+    if !reader.peer_ready_or_seen() {
+        return TestResult::Fail("transient writer edge was lost after close");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_fifo_transient_peer_is_durable
+);
+
+/// Linux records the writer generation in each read-only FIFO description.
+/// A nonblocking reader opened before any writer must not report POLLHUP to
+/// poll until a writer has actually connected and gone away.  stress-ng's
+/// FIFO readers depend on this: an eager initial HUP makes all readers exit
+/// before the parent gets to open the write end.
+fn smoke_filesystem_fifo_initial_hup_is_suppressed() -> TestResult {
+    use crate::fifo::FifoNode;
+    use crate::{FileOps, POLL_HUP, POLL_IN};
+    use core::task::{Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(core::ptr::null(), &VT)
+    }
+    fn noop(_: *const ()) {}
+    static VT: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+
+    let node = FifoNode::new(0x4002, 0o666);
+    let shared = node.fifo_shared().expect("shared");
+    let reader = crate::fifo::FifoHandle::open(shared.clone(), 0x4002, 0o666, 0, 0, true, false);
+
+    if reader.poll_readiness() & POLL_HUP != 0 {
+        return TestResult::Fail("fresh read-only FIFO exposed HUP before any writer");
+    }
+    // SAFETY: the no-op vtable does not dereference its null data pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VT)) };
+    if !matches!(
+        reader.arm_readiness(0x4002, POLL_IN | POLL_HUP, &waker),
+        Some(Poll::Pending)
+    ) {
+        return TestResult::Fail("fresh FIFO readiness arm did not wait for a writer");
+    }
+
+    {
+        let _writer = crate::fifo::FifoHandle::open(shared, 0x4002, 0o666, 0, 0, false, true);
+    }
+    reader.disarm_readiness(0x4002);
+    if reader.poll_readiness() & POLL_HUP == 0 {
+        return TestResult::Fail("FIFO omitted HUP after an observed writer closed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem",
+    smoke_filesystem_fifo_initial_hup_is_suppressed
+);
+
 /// Every in-memory directory must carry a unique, stable, nonzero inode so
 /// it is distinguishable from its parent. systemd's `rm_rf` refuses to
 /// descend when a directory and its parent share `(st_dev, st_ino)` (its

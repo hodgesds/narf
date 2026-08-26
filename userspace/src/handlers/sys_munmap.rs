@@ -52,6 +52,18 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    #[cfg(feature = "linux-compat")]
+    let task = current_task_id();
+    #[cfg(feature = "linux-compat")]
+    let lpid = task_to_pid_raw(task).unwrap_or(task);
+    #[cfg(feature = "linux-compat")]
+    let as_key = shm_as_key(&as_ref);
+    #[cfg(feature = "linux-compat")]
+    shm_register_as_owner(as_key, lpid);
+    #[cfg(feature = "linux-compat")]
+    let shm_transaction = shm_mapping_transaction(as_key);
+    #[cfg(feature = "linux-compat")]
+    let _shm_guard = shm_transaction.lock();
     match munmap_core(&as_ref, args.arg0, args.arg1) {
         Ok(len) => {
             // Ordered after the unmap, and that order is load-bearing: this
@@ -61,6 +73,10 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             // freed frames through live PTEs.  The range form mirrors the VMA
             // split so surviving prefix/suffix owners retain their reference.
             crate::mapped_file::punch_current(args.arg0, len);
+            #[cfg(feature = "linux-compat")]
+            {
+                shm_record_fixed_punch(as_key, args.arg0, args.arg0 + len, lpid);
+            }
             ctx.set_return(SyscallReturn::ok(0));
         }
         Err(()) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // EINVAL
@@ -102,8 +118,12 @@ mod tests {
         }
         let middle_base = BASE + PREFIX_PAGES * 4096;
         let suffix_base = middle_base + MIDDLE_PAGES * 4096;
-        if munmap_core(&aspace, suffix_base, (PAGES - PREFIX_PAGES - MIDDLE_PAGES) * 4096)
-            .is_err()
+        if munmap_core(
+            &aspace,
+            suffix_base,
+            (PAGES - PREFIX_PAGES - MIDDLE_PAGES) * 4096,
+        )
+        .is_err()
         {
             return TestResult::Fail("suffix munmap failed");
         }
@@ -118,20 +138,15 @@ mod tests {
 
         // This is the operation that immediately follows the two trims in
         // glibc.  It must find the surviving PROT_NONE middle and split it.
-        if mprotect_core(
-            &aspace,
-            VirtAddr::new(middle_base),
-            0x21_000,
-            0b011,
-        )
-        .is_err()
-        {
+        if mprotect_core(&aspace, VirtAddr::new(middle_base), 0x21_000, 0b011).is_err() {
             return TestResult::Fail("mprotect could not enable the retained arena header");
         }
         let enabled = aspace.lookup(VirtAddr::new(middle_base));
         if !enabled.is_some_and(|region| {
             region.len == 0x21_000
-                && region.perms.contains(RegionPerms::READ | RegionPerms::WRITE)
+                && region
+                    .perms
+                    .contains(RegionPerms::READ | RegionPerms::WRITE)
         }) {
             return TestResult::Fail("arena header permissions were not applied");
         }
@@ -149,4 +164,31 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_munmap_preserves_glibc_arena_middle);
+
+    #[cfg(feature = "linux-compat")]
+    fn smoke_sysv_mapping_transaction_is_shared_per_mm() -> TestResult {
+        let first = Arc::new(AddressSpace::empty());
+        let second = Arc::new(AddressSpace::empty());
+        let first_key = shm_as_key(&first);
+        let second_key = shm_as_key(&second);
+        let first_a = shm_mapping_transaction(first_key);
+        let first_b = shm_mapping_transaction(first_key);
+        let other = shm_mapping_transaction(second_key);
+        let correct = Arc::ptr_eq(&first_a, &first_b) && !Arc::ptr_eq(&first_a, &other);
+        if let Some(transactions) = SHM_MAPPING_TRANSACTIONS.lock().as_mut() {
+            transactions.remove(&first_key);
+            transactions.remove(&second_key);
+        }
+        if !correct {
+            return TestResult::Fail(
+                "CLONE_VM siblings did not share one per-mm SysV mapping transaction",
+            );
+        }
+        TestResult::Pass
+    }
+    #[cfg(feature = "linux-compat")]
+    kernel_test_in!(
+        "userspace",
+        smoke_sysv_mapping_transaction_is_shared_per_mm
+    );
 }

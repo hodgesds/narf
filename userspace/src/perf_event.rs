@@ -50,6 +50,10 @@ pub fn dbg_active_perf_events() -> usize {
 static NEXT_PERF_EVENT_ID: AtomicU64 = AtomicU64::new(1);
 static PERF_EVENT_REGISTRY: IrqSafeSpinLock<Vec<Weak<PerfEventFile>>> =
     IrqSafeSpinLock::new(Vec::new());
+/// Serializes the ACTIVE_PERF_EVENTS 0↔1 transition with the low-level fast
+/// gate. Registry users take the registry lock first; Drop takes only this
+/// lock, avoiding re-entrancy when a registry-held temporary Arc is last.
+static PERF_EVENT_GATE_LOCK: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 static PERF_LAST_SELECTED_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(u64::MAX) }; narf_lib::percpu::MAX_CPUS];
 static PERF_LAST_MULTIPLEX_NS: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
@@ -68,6 +72,24 @@ const SAMPLE_CPU_SLOTS: usize = narf_lib::percpu::MAX_CPUS;
 const PENDING_SAMPLE_DEPTH: usize = 64;
 const PENDING_LOSS_BUCKETS: usize = 16;
 const PENDING_TRACE_DEPTH: usize = 64;
+
+fn publish_perf_event(registry: &mut Vec<Weak<PerfEventFile>>, file: &Arc<PerfEventFile>) {
+    let _gate = PERF_EVENT_GATE_LOCK.lock();
+    file.registered.store(true, Ordering::Release);
+    registry.push(Arc::downgrade(file));
+    if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Release) == 0 {
+        narf_lib::perf::set_enabled(true);
+    }
+}
+
+fn unpublish_perf_event(file: &PerfEventFile) {
+    let _gate = PERF_EVENT_GATE_LOCK.lock();
+    if file.registered.swap(false, Ordering::AcqRel)
+        && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::AcqRel) == 1
+    {
+        narf_lib::perf::set_enabled(false);
+    }
+}
 const PENDING_TRACE_BYTES: usize = 256;
 static PENDING_SAMPLES: [[PendingSample; PENDING_SAMPLE_DEPTH]; SAMPLE_CPU_SLOTS] =
     [const { [const { PendingSample::new() }; PENDING_SAMPLE_DEPTH] }; SAMPLE_CPU_SLOTS];
@@ -2170,6 +2192,11 @@ pub(crate) fn bpf_task_fd_query(fd: u32) -> Option<(u32, u32)> {
 /// Events are owned by the monitoring process but keyed by the target task,
 /// matching the way the upstream perf CLI opens events for its stopped child.
 pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], program_path: &str) {
+    // No event can request enable-on-exec or sideband records. Avoid resolving
+    // every image mapping through VFS on the ordinary exec path.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let comm = crate::handlers::proc_comm_of(task);
     let resolved: Vec<(&crate::process::LoadedMapping, &str, u64)> = mappings
@@ -2202,10 +2229,7 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
         };
         if event.tracks_task(task) && event.attr.flags & PERF_ATTR_FLAG_REMOVE_ON_EXEC != 0 {
             event.disable();
-            event.registered.store(false, Ordering::Release);
-            if ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1 {
-                narf_lib::perf::set_enabled(false);
-            }
+            unpublish_perf_event(&event);
             return false;
         }
         if event.tracks_task(task)
@@ -2240,6 +2264,9 @@ pub(crate) fn on_exec(task: u64, mappings: &[crate::process::LoadedMapping], pro
 }
 
 pub(crate) fn on_comm(task: u64, comm: &str) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
@@ -2255,6 +2282,12 @@ pub(crate) fn on_comm(task: u64, comm: &str) {
 
 /// Publish a mapping only after its PTE materialization has committed.
 pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot: u32, flags: u32) {
+    // This hook is called after every successful mmap. With no live perf event,
+    // skip before allocating the anonymous filename, consulting the fd table,
+    // or taking the global registry lock.
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     const MAP_SHARED: u32 = 0x01;
     const MAP_PRIVATE: u32 = 0x02;
     let pid = crate::handlers::task_to_pid_raw(task).unwrap_or(task);
@@ -2303,6 +2336,9 @@ pub(crate) fn on_mmap(task: u64, fd: i32, addr: u64, len: u64, pgoff: u64, prot:
 }
 
 pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
@@ -2330,6 +2366,9 @@ pub(crate) fn on_fork(parent_pid: u64, child_pid: u64, parent_tid: u64, child_ti
 
 /// Stop task-targeted events when the target process becomes group-dead.
 pub(crate) fn on_process_exit(pid: u64, tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let parent_pid = crate::handlers::parent_of_get(pid).unwrap_or(0);
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
@@ -2355,6 +2394,9 @@ pub(crate) fn on_process_exit(pid: u64, tid: u64) {
 }
 
 pub(crate) fn on_thread_exit(_pid: u64, tid: u64) {
+    if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
+        return;
+    }
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| {
         let Some(event) = weak.upgrade() else {
@@ -3315,11 +3357,7 @@ impl Drop for PerfEventFile {
                 let _ = unsafe { counter.release() };
             }
         }
-        if self.registered.load(Ordering::Acquire)
-            && ACTIVE_PERF_EVENTS.fetch_sub(1, Ordering::Relaxed) == 1
-        {
-            narf_lib::perf::set_enabled(false);
-        }
+        unpublish_perf_event(self);
     }
 }
 
@@ -3335,8 +3373,27 @@ impl FileOps for PerfEventFile {
             let format = self.attr.read_format;
             let mut cursor = 0;
 
-            if format & PERF_FORMAT_GROUP != 0 {
-                let members = self.member_files();
+            // Linux caches this as event->read_size and rejects a short
+            // userspace buffer with ENOSPC before copying any words
+            // (kernel/events/core.c::__perf_read). Work out the complete
+            // record size up front so group reads are transactional too.
+            let members = (format & PERF_FORMAT_GROUP != 0).then(|| self.member_files());
+            let timed_words = usize::from(format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0)
+                + usize::from(format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0);
+            let per_event_words = 1
+                + usize::from(format & PERF_FORMAT_ID != 0)
+                + usize::from(format & PERF_FORMAT_LOST != 0);
+            let required_words = match &members {
+                Some(group_members) => {
+                    1 + timed_words + (1 + group_members.len()) * per_event_words
+                }
+                None => timed_words + per_event_words,
+            };
+            if buf.len() < required_words.saturating_mul(core::mem::size_of::<u64>()) {
+                return Err(FsError::NoSpace);
+            }
+
+            if let Some(members) = members {
                 Self::push_word(buf, &mut cursor, 1 + members.len() as u64)?;
                 if format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
                     Self::push_word(buf, &mut cursor, time_enabled)?;
@@ -4173,7 +4230,6 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
     let cloexec = (flags & 8) != 0; // PERF_FLAG_FD_CLOEXEC
     let install_flags = if cloexec { fd::FD_CLOEXEC } else { 0 };
 
-    let mut opened_file = None;
     let fd_num_opt = fd::with_table(task, |t| {
         // A group member is scheduled only through its leader even when its
         // own disabled bit is clear (the upstream CLI relies on this).
@@ -4234,10 +4290,12 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
             #[cfg(target_arch = "aarch64")]
             pmu_event,
         });
-        if initially_enabled {
-            file.enable();
-        }
         let ops: Arc<dyn FileOps> = file.clone();
+        let mut registry = PERF_EVENT_REGISTRY.lock();
+        // Publish registry membership and the fast-path gate as one serialized
+        // transition. A sideband hook either sees zero events, or blocks on the
+        // registry until this event is fully enabled and group-linked.
+        publish_perf_event(&mut registry, &file);
         if let Some(leader) = &group_leader {
             if let Some(event) = leader
                 .as_any()
@@ -4246,26 +4304,19 @@ pub fn sys_perf_event_open(ctx: &mut dyn TrapContext) {
                 event.add_group_member(&ops);
             }
         }
-        let result = t.open(FdEntry {
+        if initially_enabled {
+            file.enable();
+        }
+        drop(registry);
+        t.open(FdEntry {
             ops,
             offset: 0,
             flags: install_flags,
             status_flags: 0,
-        });
-        opened_file = Some(file);
-        result
+        })
     });
 
     if let Some(fd_num) = fd_num_opt {
-        // Mark registration before publishing the global enabled bit. The fd table
-        // owns another Arc, so this file remains alive after `opened_file` drops.
-        if let Some(file) = opened_file {
-            file.registered.store(true, Ordering::Release);
-            PERF_EVENT_REGISTRY.lock().push(Arc::downgrade(&file));
-        }
-        if ACTIVE_PERF_EVENTS.fetch_add(1, Ordering::Relaxed) == 0 {
-            narf_lib::perf::set_enabled(true);
-        }
         ctx.set_return(SyscallReturn::ok(fd_num as u64));
     } else {
         // No fd table exists for the current task, so the closure never took

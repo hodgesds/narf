@@ -47,15 +47,50 @@ fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
         // page (both mean "writable now"); `try_grow_stack` promotes a guard
         // page. Anything else means the page is unbacked and not growable.
         let backed = matches!(
-            unsafe { as_arc.demand_alloc_page(v) },
+            crate::bare::reclaim_wait::demand_page(&as_arc, v),
             Ok(()) | Err(AddressSpaceError::AlignmentMismatch)
-        ) || unsafe { as_arc.try_grow_stack(v) }.is_ok();
+        ) || {
+            let limits = narf_userspace::handlers::current_stack_growth_limits();
+            // SAFETY: same active-AS/identity-map contract as below.
+            unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok()
+        };
         if !backed {
+            return false;
+        }
+        // Presence is not writability. `AlignmentMismatch` above only proves
+        // the page is mapped — it may be read-only (an `mprotect(PROT_READ)`
+        // region, or a deliberately-bad `sigaltstack`). A CPL=0 frame write to
+        // such a page faults un-recoverably and panics the kernel. Confirm the
+        // page is (or can be made, via COW) writable; refuse otherwise so the
+        // caller applies the signal's default action instead.
+        // SAFETY: same identity-map / active-AS contract as the calls above.
+        if !unsafe { as_arc.user_page_writable_or_resolve(v) } {
             return false;
         }
         p = p.wrapping_add(0x1000);
     }
     true
+}
+
+/// Copy a kernel object into the active user address space under the x86
+/// recoverable-uaccess probe. The preflight above is intentionally not relied
+/// on as a synchronization primitive: a CLONE_VM sibling may `mprotect` or
+/// `munmap` the target after that check. The guarded copy turns the resulting
+/// supervisor #PF into `false` so signal delivery can force the default action
+/// instead of panicking the kernel.
+#[cfg(target_arch = "x86_64")]
+unsafe fn signal_copy_to_user<T>(dst: u64, src: &T) -> bool {
+    // SAFETY: `src` is a live kernel object for exactly size_of::<T>() bytes.
+    // `dst` is the user address being probed; copy_user_guarded is specifically
+    // allowed to receive an arbitrary/faulting user-side pointer.
+    unsafe {
+        narf_arch::x86_64::smap::copy_user_guarded(
+            dst as *mut u8,
+            (src as *const T).cast::<u8>(),
+            core::mem::size_of::<T>(),
+        )
+        .is_ok()
+    }
 }
 
 /// Scheduler-stall watchdog. Detects a *global forward-progress stall*
@@ -404,15 +439,13 @@ mod stall_wd {
                     "STALL-WD poll-stranded tid={tid} pid={pid} fd={fd} revents={revents:#x} park_checks={checks} scans={scans} deadline={deadline:#x} netio={netio} waitchild={waitchild} stopped={stopped}"
                 );
                 // Scheduler-side half of the verdict. `awake` says whether
-                // the wake actually reached the slot; `rounds` says whether
-                // the CPU that owns it is still iterating. Sampled twice a
-                // second apart so a flat round counter is visible as flat
-                // rather than inferred from one reading.
+                // the wake reached the slot; queue ownership and affinity
+                // distinguish a misplaced slot without hot-path counters.
                 match narf_scheduler::dbg_slot_state(tid) {
-                    Some((awake, home, rounds, qlen, aff, qcpu, allowed, pops, requeues)) => {
+                    Some((awake, home, qlen, aff, qcpu, allowed)) => {
                         let _ = writeln!(
                             TrapWriter,
-                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} rounds={rounds} qlen={qlen} aff={aff:#x} queued_on={qcpu} cpu_allowed={allowed} pops={pops} notawake_requeues={requeues}"
+                            "STALL-WD   slot tid={tid} awake={awake} home_cpu={home} qlen={qlen} aff={aff:#x} queued_on={qcpu} cpu_allowed={allowed}"
                         );
                     }
                     None => {
@@ -554,17 +587,13 @@ mod stall_wd {
             );
             // The counts above say a halted CPU has runnable work; only the
             // per-slot state says which slot and why it is not running. An
-            // awake slot with `allowed=false` is circulating on a queue whose
-            // CPU its affinity mask excludes (watch `requeues`); an awake slot
-            // with `allowed=true` and flat `pops` is one the executor stopped
-            // visiting. Bounded by `DBG_READY_SLOTS_MAX` — this is a trap onto
-            // a synchronous console.
-            for (tid, awake_flag, home, aff, allowed, pops, requeues) in
-                narf_scheduler::dbg_ready_slots(cpu)
-            {
+            // awake slot with `allowed=false` is on a queue whose CPU its
+            // affinity mask excludes. Bounded by `DBG_READY_SLOTS_MAX` — this
+            // is a trap onto a synchronous console.
+            for (tid, awake_flag, home, aff, allowed) in narf_scheduler::dbg_ready_slots(cpu) {
                 let _ = writeln!(
                     TrapWriter,
-                    "STALL-WD   ready cpu={cpu} tid={tid} awake={awake_flag} home_cpu={home} aff={aff:#x} allowed={allowed} pops={pops} notawake_requeues={requeues}"
+                    "STALL-WD   ready cpu={cpu} tid={tid} awake={awake_flag} home_cpu={home} aff={aff:#x} allowed={allowed}"
                 );
             }
         }
@@ -1341,15 +1370,17 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             }
             if let Some(as_arc) = narf_userspace::active_user_as() {
                 let v = narf_memory::VirtAddr::new(cr2);
-                // Publish the faulting task's NUMA mempolicy for `cr2`
-                // so the demand-paging allocator steers the fresh frame
-                // (set_mempolicy/mbind enforcement). Cleared right after.
-                narf_userspace::publish_mempolicy_for_fault(cr2);
-                // SAFETY: identity map live, AS belongs to the
-                // task whose CR3 is currently active.
-                // SAFETY: Valid memory or trusted environment
-                let r = unsafe { as_arc.demand_alloc_page(v) };
-                narf_userspace::clear_mempolicy_for_fault();
+                // A guarded kernel uaccess owns a per-CPU recovery slot (and
+                // has SMAP's AC window open). It may heal by allocating now,
+                // but must not park for reclaim: switching here would expose
+                // that recovery to another task and migration would strand it
+                // on this CPU. Reserve pressure therefore falls through to the
+                // probe fixup, which gives the syscall ordinary EFAULT.
+                let r = if narf_arch::x86_64::smap::guarded_copy_armed() {
+                    crate::bare::reclaim_wait::demand_page_no_wait(&as_arc, v)
+                } else {
+                    crate::bare::reclaim_wait::demand_page(&as_arc, v)
+                };
                 if r.is_ok() {
                     return;
                 }
@@ -1374,8 +1405,9 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // region, so a non-stack user vaddr still falls through
                 // to the SEGV/panic surface.
                 if from_user || cr2_in_user_half {
+                    let limits = narf_userspace::handlers::current_stack_growth_limits();
                     // SAFETY: same identity-map argument.
-                    if unsafe { as_arc.try_grow_stack(v) }.is_ok() {
+                    if unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok() {
                         return;
                     }
                 }
@@ -1993,29 +2025,21 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_sigmask: 0,
             };
 
-            // SAFETY: `new_rsp` is the 16-byte-aligned user stack pointer
-            // derived from the task's own RSP/altstack minus `frame_size`,
-            // and `siginfo_vaddr`/`uctx_vaddr` are the layout offsets within
-            // that same `frame_size` reservation, so all writes stay inside
-            // the user stack we just allocated. `with_user_access` opens the
-            // SMAP window so these CPL=0 writes to user PTEs don't fault; the
-            // `write_unaligned`/`write_bytes` tolerate the unaligned siginfo
-            // fields.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_arch::x86_64::smap::with_user_access(|| {
-                    core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
-                    let info_p = siginfo_vaddr as *mut u8;
-                    core::ptr::write_bytes(info_p, 0, 128);
-                    (info_p as *mut i32).write_unaligned(params.signum as i32);
-                    (info_p.add(4) as *mut i32).write_unaligned(0);
-                    (info_p.add(8) as *mut i32).write_unaligned(params.si_code);
-                    (info_p.add(16) as *mut u64).write_unaligned(params.si_addr);
-                    // _sifields._rt.si_sigval (sigqueue payload). Unused by
-                    // non-queued signals, so writing 0 there is harmless.
-                    (info_p.add(24) as *mut u64).write_unaligned(params.si_value);
-                    core::ptr::write_volatile(uctx_vaddr as *mut UContext, uctx);
-                });
+            let mut info = [0u8; 128];
+            info[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
+            info[8..12].copy_from_slice(&params.si_code.to_ne_bytes());
+            info[16..24].copy_from_slice(&params.si_addr.to_ne_bytes());
+            // _sifields._rt.si_sigval (sigqueue payload). Unused by
+            // non-queued signals, so writing 0 there is harmless.
+            info[24..32].copy_from_slice(&params.si_value.to_ne_bytes());
+            // SAFETY: each source is a live kernel object; destinations are
+            // within the preflighted frame. The guarded copy catches a racing
+            // permission/unmap fault and leaves the trap frame unredirected.
+            if unsafe { !signal_copy_to_user(new_rsp, &fallback_return) }
+                || unsafe { !signal_copy_to_user(siginfo_vaddr, &info) }
+                || unsafe { !signal_copy_to_user(uctx_vaddr, &uctx) }
+            {
+                return false;
             }
 
             self.frame.rsp = new_rsp;
@@ -2030,15 +2054,11 @@ impl<'a> TrapContext for X86TrapContext<'a> {
             // of orig_rsp so the trapped code resumes cleanly without
             // calling sigreturn.
             //
-            // SAFETY: user stack is mapped under the active CR3 and
-            // we hold the trap frame for the calling task. SMAP
-            // bracket required for supervisor-mode write to USER pages.
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                narf_arch::x86_64::smap::with_user_access(|| {
-                    core::ptr::write_volatile(new_rsp as *mut u64, saved_rip);
-                    core::ptr::write_volatile((new_rsp + 8) as *mut u64, params.signum as u64);
-                });
+            let minimal = [saved_rip, params.signum as u64];
+            // SAFETY: kernel source is live; guarded user destination catches
+            // a concurrent VMA permission/removal race.
+            if unsafe { !signal_copy_to_user(new_rsp, &minimal) } {
+                return false;
             }
             self.frame.rsp = new_rsp;
             self.frame.rdi = params.signum as u64;
@@ -2077,12 +2097,14 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 _pad: [0; 3],
             };
 
-            // SAFETY: see SA_SIGINFO branch.
-            unsafe {
-                narf_arch::x86_64::smap::with_user_access(|| {
-                    core::ptr::write_volatile(new_rsp as *mut u64, fallback_return);
-                    core::ptr::write_volatile(ctx_vaddr as *mut SigContext, ctx);
-                });
+            // SAFETY: see SA_SIGINFO branch. Guard both copies so a sibling's
+            // racing VMA mutation cannot turn signal delivery into a kernel
+            // fault. A partial frame is harmless because the caller applies
+            // the signal's default action on `false`.
+            if unsafe { !signal_copy_to_user(new_rsp, &fallback_return) }
+                || unsafe { !signal_copy_to_user(ctx_vaddr, &ctx) }
+            {
+                return false;
             }
 
             self.frame.rsp = new_rsp;
@@ -2579,6 +2601,37 @@ fn smoke_x86_64_deliver_signal_refuses_unbacked_user_stack() -> TestResult {
 kernel_test_in!(
     "frame/x86_64",
     smoke_x86_64_deliver_signal_refuses_unbacked_user_stack
+);
+
+/// The signal-frame write itself must be fault guarded. A writable preflight
+/// cannot pin a CLONE_VM mapping, so a sibling may unmap the page before the
+/// supervisor copy. Model the post-preflight state with an active but empty AS:
+/// the copy must return false through the recoverable #PF probe, not panic.
+fn smoke_x86_64_signal_copy_survives_racing_unmap() -> TestResult {
+    use alloc::sync::Arc;
+    use narf_memory::AddressSpace;
+
+    fn empty_as_lookup() -> Option<Arc<AddressSpace>> {
+        Some(Arc::new(AddressSpace::empty()))
+    }
+
+    let saved = narf_userspace::address_space_lookup();
+    narf_userspace::install_address_space_lookup(empty_as_lookup);
+    let word = 0x5152_5354_5556_5758u64;
+    // SAFETY: the kernel source is live. The unmapped user destination is
+    // deliberate and is exactly what the guarded helper is required to catch.
+    let caught = unsafe { !signal_copy_to_user(0x0000_7000_0000_0000, &word) };
+    narf_userspace::restore_address_space_lookup(saved);
+
+    if caught {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("signal copy accepted an unmapped raced-away destination")
+    }
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_signal_copy_survives_racing_unmap
 );
 
 /// SA_RESTART cleared: even on a restartable syscall, the saved

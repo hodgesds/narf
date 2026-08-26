@@ -147,6 +147,42 @@ fn lookup_task_shim() -> u64 {
     LOOKUP_TASK.load(Ordering::Relaxed)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn set_memlock_rlimit(cur: u64, max: u64) -> Result<(), &'static str> {
+    let limit = [cur, max];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 8, // RLIMIT_MEMLOCK
+            arg1: limit.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Setrlimit.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => Ok(()),
+        _ => Err("setrlimit(RLIMIT_MEMLOCK) failed"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn get_memlock_rlimit() -> Result<(u64, u64), &'static str> {
+    let mut limit = [0u64, 0u64];
+    let mut ctx = StubCtx {
+        args: SyscallArgs {
+            arg0: 8, // RLIMIT_MEMLOCK
+            arg1: limit.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Getrlimit.raw(), &mut ctx);
+    match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == 0 => Ok((limit[0], limit[1])),
+        _ => Err("getrlimit(RLIMIT_MEMLOCK) failed"),
+    }
+}
+
 fn teardown_process_state() {
     crate::handlers::__test_sigaction_reset();
     crate::handlers::__test_signal_reset();
@@ -1586,17 +1622,30 @@ fn smoke_process_pgid_setsid_roundtrip() -> TestResult {
         }
     }
 
-    // setsid() — sets both pgid and sid to TASK
+    // A process-group leader may not create a session. Linux returns EPERM
+    // and leaves the group unchanged.
     let mut ctx = StubCtx {
         args: SyscallArgs::default(),
         ret: None,
     };
     kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
     match ctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64 => {}
+        _ => {
+            teardown_process_state();
+            return TestResult::Fail("setsid() did not EPERM a process-group leader");
+        }
+    }
+
+    // Model a fork child in its parent's group, then create a new session.
+    crate::handlers::__test_set_pgid(TASK, TASK + 1);
+    ctx.ret = None;
+    kernel_syscall_entry(Syscall::Setsid.raw(), &mut ctx);
+    match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value == TASK => {}
         _ => {
             teardown_process_state();
-            return TestResult::Fail("setsid() should return the task's own id");
+            return TestResult::Fail("setsid() rejected a non-process-group leader");
         }
     }
 
@@ -5511,3 +5560,164 @@ fn smoke_process_clone_thread_shares_pid() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_clone_thread_shares_pid);
+
+/// Resource limits belong to the thread group. A CLONE_THREAD child must see
+/// the caller's live RLIMIT_MEMLOCK row, and a change made by the child must be
+/// immediately visible to the creator.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_clone_thread_shares_rlimit() -> TestResult {
+    const PARENT: u64 = 0xF0_68;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    crate::handlers::__test_rlimit_reset();
+
+    // SAFETY: process smokes run after paging has installed the kernel root.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => Arc::new(address_space),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        set_memlock_rlimit(0x3000, 0x3000)?;
+
+        #[repr(C)]
+        #[derive(Default)]
+        struct ThreadCloneArgs {
+            flags: u64,
+            pidfd: u64,
+            child_tid: u64,
+            parent_tid: u64,
+            exit_signal: u64,
+            stack: u64,
+            stack_size: u64,
+            tls: u64,
+        }
+        let clone_args = ThreadCloneArgs {
+            flags: CLONE_VM | CLONE_SIGHAND | CLONE_THREAD,
+            stack: 0x7fff_ffd0_0000,
+            stack_size: 0x1_0000,
+            ..Default::default()
+        };
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: &clone_args as *const ThreadCloneArgs as u64,
+                arg1: core::mem::size_of::<ThreadCloneArgs>() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+        let child_tid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("clone3(CLONE_THREAD) did not return a thread tid"),
+        };
+
+        LOOKUP_TASK.store(child_tid, Ordering::Relaxed);
+        if get_memlock_rlimit()? != (0x3000, 0x3000) {
+            return Err("CLONE_THREAD child did not inherit the shared rlimit row");
+        }
+        set_memlock_rlimit(0x1000, 0x1000)?;
+
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        if get_memlock_rlimit()? != (0x1000, 0x1000) {
+            return Err("thread rlimit update was not visible to its creator");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    crate::handlers::__test_rlimit_reset();
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_process_clone_thread_shares_rlimit
+);
+
+/// fork takes a snapshot of resource limits. The child initially sees the
+/// parent's values, but subsequent changes remain private to each process.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_fork_copies_rlimit() -> TestResult {
+    const PARENT: u64 = 0xF0_69;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    crate::handlers::__test_rlimit_reset();
+
+    // SAFETY: process smokes run after paging has installed the kernel root.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => Arc::new(address_space),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    let verdict = (|| {
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        set_memlock_rlimit(0x3000, 0x3000)?;
+
+        let mut ctx = StubCtx {
+            args: SyscallArgs::default(),
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Fork.raw(), &mut ctx);
+        let child_pid = match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
+            _ => return Err("fork did not return a child pid"),
+        };
+        let child_task = crate::handlers::pid_to_task_raw(child_pid)
+            .ok_or("fork registered no PID-to-task mapping")?;
+
+        LOOKUP_TASK.store(child_task, Ordering::Relaxed);
+        if get_memlock_rlimit()? != (0x3000, 0x3000) {
+            return Err("fork child did not inherit the parent's rlimit snapshot");
+        }
+        set_memlock_rlimit(0x1000, 0x1000)?;
+
+        LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+        if get_memlock_rlimit()? != (0x3000, 0x3000) {
+            return Err("fork child rlimit update leaked into the parent");
+        }
+        Ok(())
+    })();
+
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+    crate::handlers::__test_rlimit_reset();
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(message) => TestResult::Fail(message),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace/process", smoke_process_fork_copies_rlimit);

@@ -28,6 +28,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
@@ -125,6 +126,14 @@ pub struct PipeWrite {
     shared: Arc<PipeShared>,
 }
 
+/// Result classes needed by the read-end `vmsplice(2)` transaction.  The
+/// user-copy errno is kept intact so the syscall layer can distinguish an
+/// invalid range (`EINVAL`) from an inaccessible one (`EFAULT`).
+pub(crate) enum VmspliceDrainError {
+    WouldBlock,
+    User(u64),
+}
+
 impl core::fmt::Debug for PipeRead {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PipeRead").finish_non_exhaustive()
@@ -156,6 +165,184 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
         }),
         Arc::new(PipeWrite { shared }),
     )
+}
+
+impl PipeRead {
+    /// Move a pipe prefix into a non-pipe sink and consume only the prefix the
+    /// sink accepted. The source queue stays locked across one non-blocking
+    /// sink poll, making the observation+commit indivisible with respect to
+    /// other readers. The caller must not park or await while that poll runs.
+    /// Pipe to pipe uses [`Self::splice_to_pipe`] instead so two queue locks are
+    /// always acquired in address order.
+    pub(crate) fn splice_to_sink(
+        &self,
+        max: usize,
+        write: impl FnOnce(&[u8]) -> Result<usize, narf_filesystem::FsError>,
+    ) -> Result<usize, narf_filesystem::FsError> {
+        // Reserve before disabling IRQs in the queue lock. `max` is capped by
+        // the syscall copy core's 64-KiB chunk size.
+        let mut staging = Vec::with_capacity(core::cmp::min(max, PIPE_BUF_BYTES));
+        let mut q = self.shared.queue.lock();
+        let avail = q.len();
+        if avail == 0 {
+            return if self.shared.writer_closed.load(Ordering::Acquire) {
+                Ok(0)
+            } else {
+                Err(narf_filesystem::FsError::WouldBlock)
+            };
+        }
+        let n = core::cmp::min(max, avail);
+        staging.extend(q.iter().copied().take(n));
+        let written = write(&staging)?;
+        if written > n {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        q.drain(..written);
+        let became_writable = avail == PIPE_BUF_BYTES && written != 0;
+        drop(q);
+
+        if became_writable {
+            self.shared.writable_token.fetch_add(1, Ordering::Release);
+        }
+        if written != 0 {
+            self.shared.sync_readiness();
+            narf_net::readiness::notify(0);
+        }
+        Ok(written)
+    }
+
+    /// Move bytes directly between two pipe queues. Locking both queues in
+    /// stable address order prevents opposing concurrent splices from
+    /// deadlocking, while consuming exactly the number appended prevents a
+    /// partially full destination from dropping the source tail.
+    pub(crate) fn splice_to_pipe(
+        &self,
+        dst: &PipeWrite,
+        max: usize,
+    ) -> Result<usize, narf_filesystem::FsError> {
+        if Arc::ptr_eq(&self.shared, &dst.shared) {
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        if dst.shared.reader_closed.load(Ordering::Acquire) {
+            return Err(narf_filesystem::FsError::BrokenPipe);
+        }
+
+        let src_addr = Arc::as_ptr(&self.shared) as usize;
+        let dst_addr = Arc::as_ptr(&dst.shared) as usize;
+        let (moved, src_was_full, dst_was_empty) = if src_addr < dst_addr {
+            let mut src = self.shared.queue.lock();
+            let mut dstq = dst.shared.queue.lock();
+            move_pipe_prefix(
+                &mut src,
+                &mut dstq,
+                max,
+                self.shared.writer_closed.load(Ordering::Acquire),
+            )?
+        } else {
+            let mut dstq = dst.shared.queue.lock();
+            let mut src = self.shared.queue.lock();
+            move_pipe_prefix(
+                &mut src,
+                &mut dstq,
+                max,
+                self.shared.writer_closed.load(Ordering::Acquire),
+            )?
+        };
+
+        if src_was_full && moved != 0 {
+            self.shared.writable_token.fetch_add(1, Ordering::Release);
+        }
+        if dst_was_empty && moved != 0 {
+            dst.shared.readable_token.fetch_add(1, Ordering::Release);
+        }
+        if moved != 0 {
+            self.shared.sync_readiness();
+            dst.shared.sync_readiness();
+            narf_net::readiness::notify(0);
+        }
+        Ok(moved)
+    }
+
+    /// Copy the current pipe prefix to `dst`, consuming it only after the
+    /// guarded user copy succeeds.  Keeping the queue lock across the copy is
+    /// deliberate: another reader must not consume or reorder the prefix
+    /// between observation and commit.  A failed copy leaves every byte in
+    /// the pipe, matching Linux's pipe-to-user splice actor.
+    pub(crate) fn vmsplice_to_user(
+        &self,
+        dst: u64,
+        max: usize,
+    ) -> Result<usize, VmspliceDrainError> {
+        crate::handlers::validate_user_range(dst, max).map_err(VmspliceDrainError::User)?;
+        self.read_to_user(max, |bytes| {
+            // SAFETY: validate_user_range accepted the complete destination;
+            // guarded copy catches a racing unmap/protection change.
+            unsafe { crate::handlers::copy_to_user(dst, bytes) }
+        })
+    }
+
+    /// Transactional pipe read used by read/readv/vmsplice: copy a stable
+    /// prefix through `copy`, and consume it only after the complete guarded
+    /// user-copy succeeds. The byte queue does not preserve Linux pipe_buffer
+    /// boundaries, so this selected prefix is one logical buffer: a fault in a
+    /// later iovec retains even an earlier copied fragment rather than wrongly
+    /// consuming part of the currently faulting buffer.
+    pub(crate) fn read_to_user(
+        &self,
+        max: usize,
+        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
+        // Allocate before disabling IRQs on the queue lock.  A pipe can never
+        // supply more than its fixed capacity, even if the iovec is larger.
+        let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, PIPE_BUF_BYTES));
+        let mut q = self.shared.queue.lock();
+        let avail = q.len();
+        if avail == 0 {
+            return if self.shared.writer_closed.load(Ordering::Acquire) {
+                Ok(0)
+            } else {
+                Err(VmspliceDrainError::WouldBlock)
+            };
+        }
+        let n = core::cmp::min(max, avail);
+        staging.extend(q.iter().copied().take(n));
+
+        copy(&staging).map_err(VmspliceDrainError::User)?;
+        q.drain(..n);
+        let became_writable = avail == PIPE_BUF_BYTES;
+        drop(q);
+
+        if became_writable {
+            self.shared.writable_token.fetch_add(1, Ordering::Release);
+        }
+        self.shared.sync_readiness();
+        narf_net::readiness::notify(0);
+        Ok(n)
+    }
+}
+
+fn move_pipe_prefix(
+    src: &mut VecDeque<u8>,
+    dst: &mut VecDeque<u8>,
+    max: usize,
+    writer_closed: bool,
+) -> Result<(usize, bool, bool), narf_filesystem::FsError> {
+    if src.is_empty() {
+        return if writer_closed {
+            Ok((0, false, dst.is_empty()))
+        } else {
+            Err(narf_filesystem::FsError::WouldBlock)
+        };
+    }
+    let room = PIPE_BUF_BYTES.saturating_sub(dst.len());
+    if room == 0 {
+        return Err(narf_filesystem::FsError::WouldBlock);
+    }
+    let src_was_full = src.len() == PIPE_BUF_BYTES;
+    let dst_was_empty = dst.is_empty();
+    let n = core::cmp::min(max, core::cmp::min(src.len(), room));
+    dst.extend(src.drain(..n));
+    Ok((n, src_was_full, dst_was_empty))
 }
 
 impl Drop for PipeRead {
@@ -212,9 +399,12 @@ impl FileOps for PipeRead {
                 };
             }
             let n = core::cmp::min(buf.len(), avail);
-            for slot in buf.iter_mut().take(n) {
-                // VecDeque::pop_front cannot fail: avail > 0 above.
-                *slot = q.pop_front().unwrap();
+            // Bulk drain: `VecDeque::drain` copies the front `n` bytes in as
+            // few `memcpy`s as the ring's two contiguous slices allow, instead
+            // of `n` individual `pop_front`s — the byte-at-a-time loop dominated
+            // large pipe/splice transfers.
+            for (slot, byte) in buf.iter_mut().zip(q.drain(..n)) {
+                *slot = byte;
             }
             let became_writable = avail == PIPE_BUF_BYTES && n != 0;
             drop(q);
@@ -223,8 +413,13 @@ impl FileOps for PipeRead {
             }
             if n != 0 {
                 // Draining can clear POLL_IN (queue now empty) and set POLL_OUT
-                // (room freed); republish so a writer parked on this pipe wakes.
+                // (room freed); republish so a writer parked on this pipe's
+                // readiness cell wakes, and bump the global notify generation so
+                // a writer parked via `park_reexecute_on_io` (armed on that
+                // generation, not the cell) re-runs instead of sleeping out its
+                // deadline.
                 self.shared.sync_readiness();
+                narf_net::readiness::notify(0);
             }
             Ok(n)
         })
@@ -328,6 +523,10 @@ impl FileOps for PipeRead {
     fn pipe_capacity(&self) -> Option<usize> {
         Some(PIPE_BUF_BYTES)
     }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
 }
 
 impl FileOps for PipeWrite {
@@ -357,9 +556,10 @@ impl FileOps for PipeWrite {
                 return Ok(0);
             }
             let n = core::cmp::min(buf.len(), room);
-            for &b in buf.iter().take(n) {
-                q.push_back(b);
-            }
+            // Bulk enqueue: `extend` appends the whole prefix in one pass
+            // (amortised memcpy into the ring), replacing `n` individual
+            // `push_back`s that dominated large pipe/vmsplice writes.
+            q.extend(buf[..n].iter().copied());
             drop(q);
             if n != 0 {
                 if was_empty {

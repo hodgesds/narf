@@ -252,15 +252,17 @@ fn smoke_abi_signal_rt_sigpending_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigpending_neg);
 
 // ── RtSigqueueinfo ──────────────────────────────────────────────────
-// sys_rt_sigqueueinfo(pid, sig, info): sig>=32 → invalid_op(); else
-// captures siginfo (skipped when info=0) + raises pending → ok(0).
-
 fn smoke_abi_signal_rt_sigqueueinfo_pos() -> TestResult {
     with_setup(|| {
-        // info=0 → siginfo capture skipped; valid sig → ok(0).
-        let r = call(Syscall::RtSigqueueinfo.raw(), a2(FAKE_TASK, 10, 0));
+        // Unlike pidfd_send_signal, Linux's rt wrapper overwrites imported
+        // si_signo with the syscall argument rather than rejecting a mismatch.
+        let si = sigqueue_siginfo(11, -1, FAKE_TASK as u32, 7);
+        let r = call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(FAKE_TASK, 10, si.as_ptr() as u64),
+        );
         if r != Some(0) {
-            return Err("rt_sigqueueinfo(self, SIGUSR1, NULL) should return 0");
+            return Err("rt_sigqueueinfo(self, SIGUSR1, &info) should return 0");
         }
         Ok(())
     })
@@ -269,11 +271,36 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigqueueinfo_pos);
 
 fn smoke_abi_signal_rt_sigqueueinfo_neg() -> TestResult {
     with_setup(|| {
-        // sig >= 32 → invalid_op() (None).
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
-        let r = call(Syscall::RtSigqueueinfo.raw(), a2(FAKE_TASK, 65, 0));
-        if r.is_some() {
-            return Err("rt_sigqueueinfo(self, 64, ..) should be a non-Ok status");
+        let si = sigqueue_siginfo(65, -1, FAKE_TASK as u32, 0);
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(FAKE_TASK, 65, si.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_sigqueueinfo(self, 65, &info) should return -EINVAL");
+        }
+        if call(Syscall::RtSigqueueinfo.raw(), a2(FAKE_TASK, 10, 0)) != Some(EFAULT) {
+            return Err("rt_sigqueueinfo with NULL info should return -EFAULT");
+        }
+        // Linux imports uinfo first: EFAULT wins over both an invalid signal
+        // and a nonexistent target, and the failed import delivers nothing.
+        let before = crate::handlers::signal_pending_of(FAKE_TASK);
+        if call(Syscall::RtSigqueueinfo.raw(), a2(0xDEAD_BEEF, 65, u64::MAX)) != Some(EFAULT) {
+            return Err("rt_sigqueueinfo must return -EFAULT before EINVAL/ESRCH");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) != before {
+            return Err("failed rt_sigqueueinfo copy delivered a signal");
+        }
+        if crate::handlers::take_sigqueue_info(FAKE_TASK, 10).is_some() {
+            return Err("failed rt_sigqueueinfo copy left a queued payload");
+        }
+        let missing = sigqueue_siginfo(10, -1, FAKE_TASK as u32, 0);
+        if call(
+            Syscall::RtSigqueueinfo.raw(),
+            a2(0xDEAD_BEEF, 10, missing.as_ptr() as u64),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_sigqueueinfo of a missing target should return -ESRCH");
         }
         Ok(())
     })
@@ -281,18 +308,15 @@ fn smoke_abi_signal_rt_sigqueueinfo_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigqueueinfo_neg);
 
 // ── RtTgsigqueueinfo ────────────────────────────────────────────────
-// sys_rt_tgsigqueueinfo(tgid, tid, sig, info): sig>=32 → invalid_op();
-// else captures siginfo (skipped when info=0) + raises pending → ok(0).
-
 fn smoke_abi_signal_rt_tgsigqueueinfo_pos() -> TestResult {
     with_setup(|| {
-        // info=0; valid sig at arg2 → ok(0).
+        let si = sigqueue_siginfo(10, -1, FAKE_TASK as u32, 7);
         let r = call(
             Syscall::RtTgsigqueueinfo.raw(),
-            a3(FAKE_TASK, FAKE_TASK, 10, 0),
+            a3(FAKE_TASK, FAKE_TASK, 10, si.as_ptr() as u64),
         );
         if r != Some(0) {
-            return Err("rt_tgsigqueueinfo(self, self, SIGUSR1, NULL) should return 0");
+            return Err("rt_tgsigqueueinfo(self, self, SIGUSR1, &info) should return 0");
         }
         Ok(())
     })
@@ -301,14 +325,51 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_tgsigqueueinfo_pos);
 
 fn smoke_abi_signal_rt_tgsigqueueinfo_neg() -> TestResult {
     with_setup(|| {
-        // sig (arg2) >= 32 → invalid_op() (None).
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
-        let r = call(
+        // The mandatory copy precedes tgid/tid validation.
+        if call(Syscall::RtTgsigqueueinfo.raw(), a3(0, 0, 99, u64::MAX)) != Some(EFAULT) {
+            return Err("rt_tgsigqueueinfo must return -EFAULT before argument errors");
+        }
+        if call(
             Syscall::RtTgsigqueueinfo.raw(),
-            a3(FAKE_TASK, FAKE_TASK, 99, 0),
-        );
-        if r.is_some() {
-            return Err("rt_tgsigqueueinfo(.., 99, ..) should be a non-Ok status");
+            a3(FAKE_TASK, FAKE_TASK, 10, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("rt_tgsigqueueinfo with NULL info should return -EFAULT");
+        }
+        let si = sigqueue_siginfo(99, -1, FAKE_TASK as u32, 0);
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(0, FAKE_TASK, 99, si.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo with tgid 0 should return -EINVAL");
+        }
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(FAKE_TASK, FAKE_TASK, 99, si.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("rt_tgsigqueueinfo with signal 99 should return -EINVAL");
+        }
+        let missing = sigqueue_siginfo(10, -1, FAKE_TASK as u32, 0);
+        // Keep the absent PID within signed pid_t range; 0xDEAD_BEEF is
+        // negative after Linux's u64-to-pid_t syscall argument conversion
+        // and must therefore fail earlier with EINVAL.
+        const MISSING_POSITIVE_PID: u64 = 0x3EAD_BEEF;
+        if call(
+            Syscall::RtTgsigqueueinfo.raw(),
+            a3(
+                MISSING_POSITIVE_PID,
+                MISSING_POSITIVE_PID,
+                10,
+                missing.as_ptr() as u64,
+            ),
+        ) != Some(ESRCH)
+        {
+            return Err("rt_tgsigqueueinfo of a missing target should return -ESRCH");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) != 0 {
+            return Err("failed rt_tgsigqueueinfo validation delivered a signal");
         }
         Ok(())
     })
@@ -567,8 +628,8 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_neg);
 
 /// x86_64 `siginfo_t` prefix in the layout userspace fills for sigqueue:
 /// si_signo@0, si_errno@4, si_code@8, si_pid@16, si_uid@20, si_value@24.
-fn sigqueue_siginfo(signum: u32, si_code: i32, si_pid: u32, si_value: u64) -> [u8; 32] {
-    let mut si = [0u8; 32];
+fn sigqueue_siginfo(signum: u32, si_code: i32, si_pid: u32, si_value: u64) -> [u8; 48] {
+    let mut si = [0u8; 48];
     si[0..4].copy_from_slice(&signum.to_le_bytes());
     si[8..12].copy_from_slice(&si_code.to_le_bytes());
     si[16..20].copy_from_slice(&si_pid.to_le_bytes());
@@ -694,6 +755,40 @@ fn smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_signal_pidfd_send_signal_null_info_has_no_payload
+);
+
+fn smoke_abi_signal_pidfd_send_signal_validation_order() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        const SI_QUEUE: i32 = -1;
+        let pidfd = pidfd_for_self()?;
+        let before = crate::handlers::signal_pending_of(FAKE_TASK);
+
+        // With a resolved pidfd, copy/mismatch checks precede signal delivery,
+        // including for the null signal probe.
+        if call(Syscall::PidfdSendSignal.raw(), a3(pidfd, 0, u64::MAX, 0)) != Some(EFAULT) {
+            return Err("pidfd_send_signal(sig 0, bad info) should return -EFAULT");
+        }
+        let mismatch = sigqueue_siginfo(SIGUSR1 + 1, SI_QUEUE, FAKE_TASK as u32, 0);
+        if call(
+            Syscall::PidfdSendSignal.raw(),
+            a3(pidfd, SIGUSR1 as u64, mismatch.as_ptr() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("pidfd_send_signal with mismatched si_signo should return -EINVAL");
+        }
+        if crate::handlers::signal_pending_of(FAKE_TASK) != before {
+            return Err("failed pidfd_send_signal import/validation delivered a signal");
+        }
+        if crate::handlers::take_sigqueue_info(FAKE_TASK, SIGUSR1).is_some() {
+            return Err("failed pidfd_send_signal import/validation left a queued payload");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pidfd_send_signal_validation_order
 );
 
 // ── Sigprocmask ─────────────────────────────────────────────────────

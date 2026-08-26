@@ -34,8 +34,8 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // unlinked — dbus/wayland unlink a stale socket before re-binding).
     let was_socket = crate::socket::unbind_path(path);
     let outcome = current_resolve_parent_absolute(path, |_fs, parent, leaf| {
-            poll_blocking(parent.unlink(leaf))
-        });
+        poll_blocking(parent.unlink(leaf))
+    });
     match outcome {
         Some(Some(Ok(()))) => {
             #[cfg(feature = "linux-compat")]

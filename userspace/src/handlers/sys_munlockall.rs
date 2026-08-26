@@ -1,7 +1,8 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `munlockall()` — clear the LOCKED flag on every region.
+/// `munlockall()` — clear every current lock and the MCL_FUTURE policy in one
+/// address-space transaction.
 pub(crate) fn sys_munlockall(ctx: &mut dyn TrapContext) {
     let as_ref = match current_address_space() {
         Some(a) => a,
@@ -10,8 +11,10 @@ pub(crate) fn sys_munlockall(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    for r in as_ref.regions_snapshot() {
-        let _ = as_ref.munlock_range(r.base, r.len);
+    match as_ref.munlock_all() {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
+        Err(error) => ctx.set_return(SyscallReturn::ok(
+            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
+        )),
     }
-    ctx.set_return(SyscallReturn::ok(0));
 }

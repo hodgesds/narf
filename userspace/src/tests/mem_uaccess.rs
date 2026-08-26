@@ -167,7 +167,7 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
             ops: Arc::new(SentinelFile),
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            status_flags: fd::O_WRONLY,
         })
     })
     .expect("with_table");
@@ -202,6 +202,7 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
 
     // "User" buffer is a kernel-heap allocation filled with 0xAA.
     let user_buf = alloc::vec![0xAAu8; 32];
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: fd_n as u64,
@@ -227,77 +228,20 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_smap_sys_write_kbuf_roundtrip);
 
-/// Smoke 2: `sys_write` with `len > 16 MiB` returns EINVAL (-22).
+/// Smoke 2: the generic single-copy helper rejects `len > 16 MiB` with
+/// EINVAL. Native read/write deliberately do not use this whole-request cap:
+/// they validate Linux's range shape and stage large transfers in chunks.
 #[cfg(target_arch = "x86_64")]
-fn smoke_smap_sys_write_oversized_einval() -> TestResult {
-    use crate::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-        TrapContext,
-    };
+fn smoke_smap_uaccess_oversized_einval() -> TestResult {
+    use crate::handlers::validate_user_range;
 
-    static FAKE_TASK_OV: u64 = 0xF002;
-    fn task_ov() -> u64 {
-        FAKE_TASK_OV
-    }
-
-    fd::__test_reset();
-    install_task_id_lookup(task_ov);
-
-    __test_clear_global();
-    let mut t = SyscallTable::new();
-    install_core_syscalls(&mut t);
-    install_global(t);
-
-    struct FakeCtx {
-        args: SyscallArgs,
-        ret: Option<SyscallReturn>,
-    }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.ret = Some(r);
-        }
-        fn user_rsp(&self) -> u64 {
-            0
-        }
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-        fn redirect_to_kernel(&mut self, _: u64, _: u64) -> bool {
-            false
-        }
-    }
-
-    // 17 MiB > 16 MiB cap — should return EINVAL = -22.
-    // ptr value doesn't matter (len check fires first); use a stable address.
-    let dummy_buf = [0u8; 1];
-    let dummy_ptr = dummy_buf.as_ptr() as u64;
-    let mut ctx = FakeCtx {
-        args: SyscallArgs {
-            arg0: 1, // fd (doesn't matter)
-            arg1: dummy_ptr,
-            arg2: (17 * 1024 * 1024) as u64,
-            ..SyscallArgs::default()
-        },
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
-
-    fd::__test_reset();
-    __test_clear_global();
-
-    let expected = SyscallReturn::ok((-22i64) as u64);
-    if ctx.ret != Some(expected) {
-        return TestResult::Fail("sys_write with len>16MiB did not return EINVAL");
+    if validate_user_range(0x1000, 17 * 1024 * 1024) != Err(22) {
+        return TestResult::Fail("generic uaccess len>16MiB did not return EINVAL");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_smap_sys_write_oversized_einval);
+kernel_test_in!("userspace", smoke_smap_uaccess_oversized_einval);
 
 /// Smoke 3: `sys_write` with null pointer returns EFAULT (-14).
 #[cfg(target_arch = "x86_64")]

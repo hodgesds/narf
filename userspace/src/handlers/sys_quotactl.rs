@@ -113,8 +113,9 @@ fn quota_kind(type_: u32) -> Option<QuotaKind> {
 
 /// Resolve the `special` argument (a path on / device of the target mount) to
 /// its filesystem instance, re-rooting through the caller's namespace.
-fn fs_for_special(special_ptr: u64) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, i64>
-{
+fn fs_for_special(
+    special_ptr: u64,
+) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, i64> {
     let raw = copy_user_cstr(special_ptr, 4096).ok_or(EFAULT)?;
     let path = resolve_cwd_path(current_task_id(), &raw);
     current_fs_arc_at(&path).ok_or(ENOENT)
@@ -174,7 +175,8 @@ fn quotactl_dispatch(subcmd: u32, type_: u32, special: u64, id: u32, addr: u64) 
                 return EFAULT;
             }
             let blk = decode_dqblk(&buf);
-            fs.quota_set(kind, id, &blk).map_or_else(quota_errno, |()| 0)
+            fs.quota_set(kind, id, &blk)
+                .map_or_else(quota_errno, |()| 0)
         }
         Q_GETINFO => match fs.quota_get_info(kind) {
             Ok(info) => write_user_bytes(addr, &encode_dqinfo(&info)),
@@ -187,7 +189,8 @@ fn quotactl_dispatch(subcmd: u32, type_: u32, special: u64, id: u32, addr: u64) 
                 return EFAULT;
             }
             let info = decode_dqinfo(&buf);
-            fs.quota_set_info(kind, &info).map_or_else(quota_errno, |()| 0)
+            fs.quota_set_info(kind, &info)
+                .map_or_else(quota_errno, |()| 0)
         }
         _ => EINVAL, // unknown subcommand
     }

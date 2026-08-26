@@ -146,16 +146,12 @@ fn link_caps() -> LinkCaps {
     static SLOT: IrqSafeSpinLock<Option<LinkCaps>> = IrqSafeSpinLock::new(None);
     let mut g = SLOT.lock();
     if g.is_none() {
-        let attach: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<
-            BpfAttach,
-            Grant,
-        >::bootstrap(
-        )));
-        let probe_install: &'static _ = alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<
-            ProbeHandlerInstall,
-            Grant,
-        >::bootstrap(
-        )));
+        let attach: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(Cap::<BpfAttach, Grant>::bootstrap()));
+        let probe_install: &'static _ =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                Cap::<ProbeHandlerInstall, Grant>::bootstrap(),
+            ));
         *g = Some(LinkCaps {
             attach,
             probe_install,
@@ -487,8 +483,7 @@ fn raw_tracepoint_name(uptr: u64) -> Result<String, i64> {
         let src = uptr.checked_add(i).ok_or(-EFAULT)?;
         // SAFETY: one caller-provided byte; `copy_from_user` validates the
         // address and SMAP-brackets the access.
-        unsafe { copy_from_user(core::slice::from_mut(&mut byte), src) }
-            .map_err(|_| -EFAULT)?;
+        unsafe { copy_from_user(core::slice::from_mut(&mut byte), src) }.map_err(|_| -EFAULT)?;
         if byte == 0 {
             return String::from_utf8(bytes).map_err(|_| -ENOENT);
         }
@@ -702,7 +697,8 @@ pub(crate) fn bpf_prog_query(attr_uptr: u64, size: usize) -> i64 {
     // `attach_flags` (out) and `count` (out) go back into the caller's `attr`.
     // SAFETY: each write is one field, range-checked inside `copy_to_user`,
     // which brackets SMAP and turns a fault into `Err(EFAULT)`.
-    if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_ATTACH_FLAGS as u64, &0u32.to_le_bytes()) } {
+    if let Err(e) = unsafe { copy_to_user(attr_uptr + Q_ATTACH_FLAGS as u64, &0u32.to_le_bytes()) }
+    {
         return -(e as i64);
     }
     // SAFETY: as above — one field, range-checked inside `copy_to_user`.

@@ -224,9 +224,9 @@ struct Collected {
 
 /// Run every registered benchmark and write the record stream to `out`.
 ///
-/// `n_override` replaces each benchmark's `target_n` when non-zero, so a
-/// cmdline can trade run time for tightness without a rebuild. It is clamped
-/// up to 30:
+/// `n_override` may raise each benchmark's `target_n` when non-zero, so a
+/// cmdline can tighten a run without a rebuild. It can never lower the
+/// declaration and is clamped up to 30:
 /// §8.3's floor is not a suggestion, and a harness that will happily emit
 /// `n=5` invites exactly the report the protocol exists to prevent.
 pub fn run(out: &mut impl Write, n_override: u32) {
@@ -315,7 +315,7 @@ fn effective_n(b: &Benchmark, n_override: u32) -> u32 {
     if n_override == 0 {
         b.target_n.max(30)
     } else {
-        n_override.max(30)
+        n_override.max(b.target_n).max(30)
     }
 }
 
@@ -327,7 +327,7 @@ fn emit_env(out: &mut impl Write, cases: usize) {
     // run 10-20% fast on a non-integer-GHz TSC.
     let _ = writeln!(
         out,
-        "narf.bench.env: version=1 arch={} cases={} cpus={} cycles_per_ns={} \
+        "narf.bench.env: version=2 arch={} cases={} cpus={} cycles_per_ns={} \
          tsc_mult={} tsc_shift={} irq_masked=1 tick_reliable={}",
         if cfg!(target_arch = "x86_64") {
             "x86_64"
@@ -347,13 +347,14 @@ fn emit_record(out: &mut impl Write, c: &Collected) {
     let b = c.bench;
     let _ = writeln!(
         out,
-        "narf.bench.rec: name={} subsystem={} unit={} lower_is_better={} n={} \
+        "narf.bench.rec: name={} subsystem={} unit={} lower_is_better={} n={} target_n={} \
          iters={} warmup={} work={} work_varied={} delta_pct={} pair={}",
         b.name,
         b.subsystem,
         b.unit,
         u8::from(b.lower_is_better),
         c.samples.len(),
+        b.target_n,
         b.iters,
         b.warmup,
         c.work,

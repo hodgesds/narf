@@ -20,50 +20,61 @@ use super::*;
 /// forks fresh workers to the `children_max=18` ceiling.
 pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let sig = a.arg2 as u32;
-    if sig > 64 {
-        ctx.set_return(SyscallReturn::invalid_op());
+    let info = match import_queued_siginfo(a.arg3) {
+        Ok(info) => info,
+        Err(_) => {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+    };
+    let user_tgid = a.arg0 as i32;
+    let user_tid = a.arg1 as i32;
+    // Linux rejects both zero and negative identifiers after importing uinfo.
+    if user_tgid <= 0 || user_tid <= 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
-    #[allow(unused_mut)]
-    let (mut tgid, mut tid) = (a.arg0, a.arg1);
-    #[cfg(feature = "container")]
+    if siginfo_requires_self_target(info)
+        && user_tid != linux_tid_for_task(current_task_id()) as i32
     {
-        let caller = current_task_id();
-        // A tgid of 0 is the "don't check" wildcard below — leave it alone.
-        if tgid != 0 {
-            match crate::pid_ns::resolve_inner_pid(caller, tgid) {
-                Some(outer) => tgid = outer,
-                None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-                    return;
-                }
-            }
-        }
-        match crate::pid_ns::resolve_inner_pid(caller, tid) {
-            Some(outer) => tid = outer,
-            None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64));
-                return;
-            }
-        }
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
     }
-    let target = pid_to_task_raw(tid).unwrap_or(tid);
+    let sig = a.arg2 as u32;
+    let caller = current_task_id();
+    let Some(tgid) = accept_pid_from(caller, user_tgid as u64) else {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        return;
+    };
+    let Some(target) = signal_tid_from_user(caller, user_tid as u64) else {
+        ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        return;
+    };
     // ESRCH for a vanished target + tgid consistency (see sys_tgkill).
-    if !signal_target_exists(target)
-        || (tgid != 0 && task_to_pid_raw(target).unwrap_or(target) != tgid)
-    {
+    if !signal_target_exists(target) || task_to_pid_raw(target).unwrap_or(target) != tgid {
         ctx.set_return(SyscallReturn::ok((-3i64) as u64));
         return;
     }
-    if !capture_queued_siginfo(target, sig, a.arg3) {
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
+    if sig > 64 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    if sig == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    let depth = match enqueue_imported_siginfo(target, sig, info) {
+        Some(d) => d,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
+            return;
+        }
+    };
     raise_signal_pending(target, sig);
-    // Back-pressure — see sys_rt_sigqueueinfo.
+    // Back-pressure — see sys_rt_sigqueueinfo. `depth` comes from the enqueue,
+    // so there is no second sigqueue-bucket lock/scan on this send path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    if sigqueue_depth(target) > SIGQUEUE_BACKPRESSURE_DEPTH {
+    if depth > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();
     }
     ctx.set_return(SyscallReturn::ok(0));

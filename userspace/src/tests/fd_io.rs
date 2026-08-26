@@ -483,7 +483,10 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
             ops: Arc::new(CountingFile),
             offset: 0,
             flags: 0,
-            status_flags: 0,
+            // The smoke exercises both read(2) and write(2) through one open
+            // file description, so model an O_RDWR open rather than relying
+            // on the old type-based access-mode exception.
+            status_flags: crate::fd::O_RDWR,
         })
     })
     .expect("with_table");
@@ -537,7 +540,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         return TestResult::Fail("Read didn't return 16");
     }
     // Offset should now be 16.
-    let got_offset = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    let got_offset = fd::with_table(7, |t| t.offset(fd_n)).flatten();
     if got_offset != Some(16) {
         return TestResult::Fail("Read didn't advance fd offset");
     }
@@ -567,7 +570,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
         return TestResult::Fail("FileOps::write didn't observe payload bytes");
     }
     // Offset should be 16 + 8 = 24.
-    let got_offset2 = fd::with_table(7, |t| t.get(fd_n).map(|e| e.offset)).flatten();
+    let got_offset2 = fd::with_table(7, |t| t.offset(fd_n)).flatten();
     if got_offset2 != Some(24) {
         return TestResult::Fail("Write didn't advance fd offset");
     }
@@ -848,8 +851,8 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
         Some(r) if r.status == SyscallReturn::OK && r.value & want == want => {}
         _ => return TestResult::Fail("F_GETFL did not round-trip O_NONBLOCK|O_APPEND"),
     }
-    // Verify the FdEntry actually carries the bits.
-    let observed = fd::with_table(task, |x| x.get(fd_n).map(|e| e.status_flags))
+    // Verify the shared open-file description carries the bits.
+    let observed = fd::with_table(task, |x| x.status_flags(fd_n))
         .flatten()
         .unwrap_or(0);
     if (observed as u64) & want != want {
@@ -1095,20 +1098,32 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
         return TestResult::Fail("two task tables should be live");
     }
 
-    // Mutating offset via get_mut.
-    fd::with_table(task_a, |t| {
-        if let Some(e) = t.get_mut(3) {
-            e.offset += 100;
-        }
-    });
-    let off_a = fd::with_table(task_a, |t| t.get(3).map(|e| e.offset)).flatten();
+    // Mutating the open-file-description offset.
+    fd::with_table(task_a, |t| t.set_offset(3, 100));
+    let off_a = fd::with_table(task_a, |t| t.offset(3)).flatten();
     if off_a != Some(100) {
         return TestResult::Fail("offset update did not stick");
     }
-    let off_b = fd::with_table(task_b, |t| t.get(3).map(|e| e.offset)).flatten();
+    let off_b = fd::with_table(task_b, |t| t.offset(3)).flatten();
     if off_b != Some(0) {
         return TestResult::Fail("task B's offset should be independent");
     }
+
+    // fork copies descriptor slots but aliases each open-file description.
+    let child = 0xCC;
+    if fd::fork(task_a, child) < 4 {
+        return TestResult::Fail("fork did not inherit the parent fd table");
+    }
+    fd::with_table(child, |t| {
+        t.set_offset(3, 125);
+        t.set_status_flags(3, crate::fd::O_NONBLOCK);
+    });
+    let parent_state =
+        fd::with_table(task_a, |t| Some((t.offset(3)?, t.status_flags(3)?))).flatten();
+    if parent_state != Some((125, crate::fd::O_NONBLOCK)) {
+        return TestResult::Fail("fork did not share offset/status description state");
+    }
+    fd::detach(child);
 
     // Close fd 3 in A, then re-open should reuse slot 3.
     let closed = fd::with_table(task_a, |t| t.close(3));
@@ -1927,7 +1942,7 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         MemFs::with_seeds("cfr-test", &[("src", b"abcdefghij"), ("dst", b"")]),
     );
 
-    fn open(path: &str) -> Option<u32> {
+    fn open(path: &str, flags: u64) -> Option<u32> {
         struct FakeCtx {
             args: SyscallArgs,
             ret: Option<SyscallReturn>,
@@ -1959,14 +1974,14 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
             #[cfg(target_arch = "x86_64")]
             args: SyscallArgs {
                 arg0: cpath.as_ptr() as u64,
-                arg1: 0, // flags
+                arg1: flags,
                 ..SyscallArgs::default()
             },
             #[cfg(target_arch = "aarch64")]
             args: SyscallArgs {
                 arg0: 0xffffffffffffff9c, // AT_FDCWD
                 arg1: cpath.as_ptr() as u64,
-                arg2: 0, // flags
+                arg2: flags,
                 ..SyscallArgs::default()
             },
             ret: None,
@@ -1981,11 +1996,13 @@ fn smoke_userspace_copy_file_range_round_trip() -> TestResult {
         }
     }
 
-    let fd_in = match open("/cfr/src") {
+    let fd_in = match open("/cfr/src", crate::fd::O_RDONLY as u64) {
         Some(f) => f,
         None => return TestResult::Fail("open src failed"),
     };
-    let fd_out = match open("/cfr/dst") {
+    // O_RDWR keeps the output writable for copy_file_range and readable for
+    // the positional verification below. Linux's f_mode checks require both.
+    let fd_out = match open("/cfr/dst", crate::fd::O_RDWR as u64) {
         Some(f) => f,
         None => return TestResult::Fail("open dst failed"),
     };
@@ -2550,7 +2567,8 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
         None => return TestResult::Fail("fcntl F_GET_SEALS no return (post)"),
     };
 
-    // Write after sealing — must fail.
+    // Write after sealing — Linux returns EPERM (not EROFS and not the
+    // transport-level InvalidOp sentinel).
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: fd as u64,
@@ -2561,9 +2579,9 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut ctx);
-    let w2_rejected = matches!(
+    let w2_eperm = matches!(
         ctx.ret,
-        Some(r) if r.value == (-1i64) as u64 || r.status != SyscallReturn::OK
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64
     );
 
     crate::fd::__test_reset();
@@ -2578,8 +2596,8 @@ fn smoke_userspace_memfd_seal_write_rejects_write() -> TestResult {
     if post_seals & F_SEAL_WRITE == 0 {
         return TestResult::Fail("F_SEAL_WRITE not visible after add");
     }
-    if !w2_rejected {
-        return TestResult::Fail("post-seal write was not rejected");
+    if !w2_eperm {
+        return TestResult::Fail("post-seal write did not return EPERM");
     }
     TestResult::Pass
 }
@@ -3447,18 +3465,24 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
         }
     };
 
-    let install = |ops: Arc<dyn narf_filesystem::FileOps>| {
+    let install = |ops: Arc<dyn narf_filesystem::FileOps>, status_flags| {
         fd::with_table(task, |tab| {
             tab.open(FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
-                status_flags: 0,
+                status_flags,
             })
         })
     };
     let slave: Arc<dyn narf_filesystem::FileOps> = slave;
-    let (mfd, sfd) = match (install(master.clone()), install(slave.clone())) {
+    // posix_openpt/open(/dev/pts/N) are O_RDWR in the terminal-emulator path;
+    // the integration smoke exercises both directions and must not construct
+    // read-only descriptions then expect slave writes to succeed.
+    let (mfd, sfd) = match (
+        install(master.clone(), crate::fd::O_RDWR),
+        install(slave.clone(), crate::fd::O_RDWR),
+    ) {
         (Some(m), Some(s)) => (m, s),
         _ => {
             narf_filesystem::devfs_pty::ptmx_close(idx);
@@ -3558,17 +3582,38 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
     use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPTLCK};
     use narf_filesystem::FileOps;
 
+    fn ctty_task() -> u64 {
+        0x7c77
+    }
+    fn cleanup_ctty_fixture() {
+        crate::handlers::__test_reset_task_id_lookup();
+        crate::handlers::__test_ctty_reset();
+        crate::handlers::__test_pgid_reset();
+        crate::handlers::__test_sid_reset();
+    }
+
+    // Production boot installs both callbacks and process state. This direct
+    // FileOps smoke must model a detached session leader explicitly.
+    crate::install_task_id_lookup(ctty_task);
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    crate::handlers::detach_controlling_tty(ctty_task());
+    narf_filesystem::devfs_pty::set_controlling_tty_hook(crate::handlers::set_controlling_tty);
+
     let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
     let master = narf_filesystem::devfs_pty::PtyMaster::new(pty);
     let mut unlock: i32 = 0;
     if FileOps::ioctl(&master, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
         narf_filesystem::devfs_pty::ptmx_close(idx);
+        cleanup_ctty_fixture();
         return TestResult::Fail("TIOCSPTLCK(0) (unlockpt) failed on a fresh master");
     }
     let slave = match narf_filesystem::devfs_pty::pts_open_peer(idx) {
         Some(Ok(s)) => s,
         _ => {
             narf_filesystem::devfs_pty::ptmx_close(idx);
+            cleanup_ctty_fixture();
             return TestResult::Fail("pts_open_peer refused the freshly opened master");
         }
     };
@@ -3618,6 +3663,7 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
 
     drop(slave);
     narf_filesystem::devfs_pty::ptmx_close(idx);
+    cleanup_ctty_fixture();
     match fail {
         Some(m) => TestResult::Fail(m),
         None => TestResult::Pass,
@@ -3627,6 +3673,197 @@ fn smoke_userspace_pty_tiocsctty_installs_foreground_pgrp() -> TestResult {
 kernel_test_in!(
     "userspace",
     smoke_userspace_pty_tiocsctty_installs_foreground_pgrp
+);
+
+/// PTY job-control ioctls are syscall policy, not merely FileOps plumbing.
+/// Pin Linux's ownership, fd-mode, endpoint and errno ordering through the
+/// real ioctl dispatch path.
+#[cfg(feature = "linux-compat")]
+fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{fd, syscall::__test_clear_global, FdEntry};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK};
+    use narf_filesystem::FileOps;
+
+    const OWNER: u64 = 0x7d01;
+    const OTHER: u64 = 0x7d02;
+    const ENOTTY_ERR: i64 = 25;
+    const EINVAL_ERR: i64 = 22;
+    static ACTIVE: AtomicU64 = AtomicU64::new(OWNER);
+    fn current() -> u64 {
+        ACTIVE.load(Ordering::Acquire)
+    }
+
+    struct Ctx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for Ctx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, value: SyscallReturn) {
+            self.ret = Some(value);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _rip: u64, _rsp: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    let call = |fd: u32, cmd: u32, arg: u64| {
+        let mut ctx = Ctx {
+            args: SyscallArgs {
+                arg0: fd as u64,
+                arg1: cmd as u64,
+                arg2: arg,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Ioctl.raw(), &mut ctx);
+        ctx.ret.map(|ret| ret.value).unwrap_or(u64::MAX)
+    };
+
+    fd::__test_reset();
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    crate::install_task_id_lookup(current);
+    narf_filesystem::devfs_pty::set_controlling_tty_hook(crate::handlers::set_controlling_tty);
+    __test_clear_global();
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    let (idx, pty) = narf_filesystem::devfs_pty::ptmx_open();
+    let master_obj = narf_filesystem::devfs_pty::PtyMaster::new(pty);
+    let mut unlock = 0i32;
+    if FileOps::ioctl(&master_obj, TIOCSPTLCK, &mut unlock as *mut i32 as usize) != Ok(0) {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("could not unlock PTY fixture");
+    }
+    let Some(Ok(slave_obj)) = narf_filesystem::devfs_pty::pts_open_peer(idx) else {
+        narf_filesystem::devfs_pty::ptmx_close(idx);
+        return TestResult::Fail("could not open PTY slave fixture");
+    };
+    let master: Arc<dyn FileOps> = Arc::new(master_obj);
+    let slave: Arc<dyn FileOps> = slave_obj;
+
+    let install = |task, ops: Arc<dyn FileOps>, status_flags| {
+        fd::with_table(task, |table| {
+            table.open(FdEntry {
+                ops,
+                offset: 0,
+                flags: 0,
+                status_flags,
+            })
+        })
+    };
+    let Some(owner_ro) = install(OWNER, slave.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install owner PTY fd");
+    };
+    let Some(owner_wo) = install(OWNER, slave.clone(), crate::fd::O_WRONLY) else {
+        return TestResult::Fail("could not install write-only PTY fd");
+    };
+    let Some(owner_master) = install(OWNER, master.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install owner PTY master");
+    };
+    let Some(other_slave) = install(OTHER, slave.clone(), crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install foreign PTY slave");
+    };
+    let Some(other_master) = install(OTHER, master, crate::fd::O_RDWR) else {
+        return TestResult::Fail("could not install foreign PTY master");
+    };
+
+    crate::handlers::detach_controlling_tty(OWNER);
+    let mut fail = None;
+    if call(owner_wo, TIOCSCTTY, 0) != (-1i64) as u64 {
+        fail = Some("write-only TIOCSCTTY did not return EPERM");
+    } else if call(owner_ro, TIOCSCTTY, 0) != 0 {
+        fail = Some("detached session leader could not acquire PTY");
+    } else if call(owner_wo, TIOCSCTTY, 0) != 0 {
+        fail = Some("idempotent TIOCSCTTY checked fd mode before same-session success");
+    }
+
+    let mut pgrp = -1i32;
+    if fail.is_none()
+        && (call(owner_ro, TIOCGPGRP, &mut pgrp as *mut i32 as u64) != 0 || pgrp as u64 != OWNER)
+    {
+        fail = Some("TIOCGPGRP did not return the owner's visible process group");
+    }
+    let mut sid = -1i32;
+    if fail.is_none()
+        && (call(owner_ro, TIOCGSID, &mut sid as *mut i32 as u64) != 0 || sid as u64 != OWNER)
+    {
+        fail = Some("TIOCGSID did not return the owner's visible session");
+    }
+
+    ACTIVE.store(OTHER, Ordering::Release);
+    if fail.is_none() && call(other_slave, TIOCGPGRP, 0) != (-ENOTTY_ERR) as u64 {
+        fail = Some("foreign slave TIOCGPGRP did not return ENOTTY before pointer access");
+    }
+    let mut master_pgrp = -1i32;
+    if fail.is_none()
+        && (call(other_master, TIOCGPGRP, &mut master_pgrp as *mut i32 as u64) != 0
+            || master_pgrp as u64 != OWNER)
+    {
+        fail = Some("PTY master did not bypass GET ownership or translate pgrp");
+    }
+    crate::handlers::detach_controlling_tty(OTHER);
+    if fail.is_none() && call(other_slave, TIOCSCTTY, 1) != (-1i64) as u64 {
+        fail = Some("unprivileged TIOCSCTTY steal did not return EPERM");
+    }
+    let mut other_group = OTHER as i32;
+    if fail.is_none()
+        && call(other_master, TIOCSPGRP, &mut other_group as *mut i32 as u64)
+            != (-ENOTTY_ERR) as u64
+    {
+        fail = Some("foreign master TIOCSPGRP did not return ENOTTY");
+    }
+
+    ACTIVE.store(OWNER, Ordering::Release);
+    let mut negative = -1i32;
+    if fail.is_none()
+        && call(owner_master, TIOCSPGRP, &mut negative as *mut i32 as u64) != (-EINVAL_ERR) as u64
+    {
+        fail = Some("negative TIOCSPGRP id did not return EINVAL");
+    }
+    let mut missing = 0x6fff_i32;
+    if fail.is_none()
+        && call(owner_master, TIOCSPGRP, &mut missing as *mut i32 as u64) != (-3i64) as u64
+    {
+        fail = Some("unknown TIOCSPGRP id did not return ESRCH");
+    }
+    let mut owner_group = OWNER as i32;
+    if fail.is_none() && call(owner_master, TIOCSPGRP, &mut owner_group as *mut i32 as u64) != 0 {
+        fail = Some("owner could not set its PTY foreground group");
+    }
+
+    narf_filesystem::devfs_pty::ptmx_close(idx);
+    fd::__test_reset();
+    crate::handlers::__test_reset_task_id_lookup();
+    crate::handlers::__test_ctty_reset();
+    crate::handlers::__test_pgid_reset();
+    crate::handlers::__test_sid_reset();
+    __test_clear_global();
+    match fail {
+        Some(message) => TestResult::Fail(message),
+        None => TestResult::Pass,
+    }
+}
+#[cfg(feature = "linux-compat")]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_pty_job_control_ioctl_errno_matrix
 );
 
 /// An O_NONBLOCK `read(2)` on an eventfd whose counter is 0 must return
@@ -3691,7 +3928,8 @@ fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
             ops,
             offset: 0,
             flags: 0,
-            status_flags: crate::fd::O_NONBLOCK,
+            // Linux eventfd_file_create installs O_RDWR | user flags.
+            status_flags: crate::fd::O_RDWR | crate::fd::O_NONBLOCK,
         })
     }) else {
         __test_clear_global();

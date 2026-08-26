@@ -207,9 +207,8 @@ fn with_bpf_parent<R>(path: &str, f: impl FnOnce(&BpfDir, &str) -> R) -> Result<
     // namespaces are applied by `resolve_cwd_path`'s chroot re-rooting, and the
     // unlink that drops a pin goes through this same table — a pin created
     // against one view and dropped against another would leak.
-    let outcome = narf_filesystem::registry().resolve_parent_absolute(path, |_fs, dir, leaf| {
-        as_bpf_dir(&*dir).map(|d| f(d, leaf))
-    });
+    let outcome = narf_filesystem::registry()
+        .resolve_parent_absolute(path, |_fs, dir, leaf| as_bpf_dir(&*dir).map(|d| f(d, leaf)));
     match outcome {
         Some(Some(r)) => Ok(r),
         Some(None) => Err(-EPERM),
@@ -276,11 +275,7 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
-    let path = match common_path(
-        &attr,
-        size,
-        BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_PATH_FD,
-    ) {
+    let path = match common_path(&attr, size, BPF_F_RDONLY | BPF_F_WRONLY | BPF_F_PATH_FD) {
         Ok(p) => p,
         Err(e) => return e,
     };
@@ -308,10 +303,7 @@ pub(crate) fn bpf_obj_get(attr_uptr: u64, size: usize) -> i64 {
     // A pin holds the object, not the access mode of the fd that created it.
     // Reopening a map therefore gets a fresh `MapFile` with this call's mode.
     // Linux ignores these mode flags for programs and refuses them for links.
-    if let Some(map_file) = obj
-        .as_any()
-        .and_then(|any| any.downcast_ref::<MapFile>())
-    {
+    if let Some(map_file) = obj.as_any().and_then(|any| any.downcast_ref::<MapFile>()) {
         return super::install_map_fd(map_file.map(), access);
     }
     if obj

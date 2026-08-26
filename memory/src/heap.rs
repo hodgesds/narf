@@ -39,7 +39,9 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::heap_backend::{self, current_backend, install_default_if_unset, SLAB_BACKEND};
+use crate::heap_backend::{
+    self, current_backend, install_default_if_unset, HeapBackend, SLAB_BACKEND,
+};
 
 /// Bootstrap arena size. Has to cover every allocation up to the
 /// point `promote_to_slab()` is called. Pre-promotion includes
@@ -273,16 +275,48 @@ pub(crate) fn bump_alloc(layout: Layout) -> *mut u8 {
 // produced them. Concurrent calls are serialised through the backend's
 // own atomics (the bump path is a lock-free CAS loop), so the impl is
 // sound under the multi-threaded use the global allocator sees.
-/// Minimum pages `GlobalAlloc::alloc` asks direct reclaim to free when an
-/// allocation fails: shed ~2 MiB of clean cache so a small allocation's
-/// retry has ample headroom (a large allocation asks for its own size,
-/// rounded up, if bigger).
-const RECLAIM_ON_ALLOC_FAIL_PAGES: usize = 512;
+/// Maximum background-reclaim target published by one failed
+/// `GlobalAlloc::alloc`. Coalescing happens per node, so repeated failures do
+/// not accumulate unbounded work.
+const BACKGROUND_RECLAIM_MAX_PAGES: usize = 8;
+
+#[inline]
+const fn background_reclaim_target(size: usize) -> usize {
+    let pages = size.saturating_add(4095) / 4096;
+    if pages == 0 {
+        1
+    } else if pages > BACKGROUND_RECLAIM_MAX_PAGES {
+        BACKGROUND_RECLAIM_MAX_PAGES
+    } else {
+        pages
+    }
+}
+
+/// Attempt one backend allocation, publishing background reclaim on failure.
+///
+/// This helper deliberately neither retries nor invokes a shrinker: a global
+/// allocation may occur while its caller holds any kernel lock, including a
+/// lock that a shrinker needs. Returning null preserves `GlobalAlloc`'s failure
+/// contract and lets an allocation-aware outer path decide whether it can park
+/// and retry safely.
+unsafe fn alloc_once_or_request(
+    backend: &'static dyn HeapBackend,
+    layout: Layout,
+    node: usize,
+) -> *mut u8 {
+    // SAFETY: the caller forwards the `GlobalAlloc::alloc` layout contract.
+    let ptr = unsafe { backend.alloc(layout) };
+    if ptr.is_null() {
+        crate::reclaim::request_reclaim(node, background_reclaim_target(layout.size()));
+    }
+    ptr
+}
 
 // SAFETY: the backend dispatched to (`current_backend`) upholds the
 // `GlobalAlloc` contract; alloc/dealloc forward the caller's layout
-// unchanged, and the direct-reclaim retry only sheds clean cache pages
-// (never allocates), so it cannot violate the contract or re-enter.
+// unchanged. Failure only publishes an allocation-free background-reclaim
+// request and returns null; it never sleeps, runs callbacks, or retries while
+// the caller may hold arbitrary locks.
 unsafe impl GlobalAlloc for BumpAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         // First-allocation lazy default: if no backend is installed
@@ -298,34 +332,9 @@ unsafe impl GlobalAlloc for BumpAllocator {
             // skips initialization.
             None => return core::ptr::null_mut(),
         };
-        // SAFETY: caller upholds `GlobalAlloc::alloc` contract,
-        // which is the same contract `HeapBackend::alloc`
-        // forwards.
-        // SAFETY: Valid memory or trusted environment
-        let ptr = unsafe { backend.alloc(layout) };
-        if !ptr.is_null() {
-            return ptr;
-        }
-        // Direct reclaim: the allocation failed, so shed reclaimable cached
-        // memory and retry ONCE before giving up (a null return routes to the
-        // alloc-error handler / panic). This turns transient memory pressure
-        // into backpressure instead of an instant OOM kill.
-        //
-        // Safe against re-entry: the failed `backend.alloc` above already
-        // released its locks, and `reclaim::try_to_free` is allocation-free
-        // (it only sheds clean cache pages, whose drops call `dealloc`, never
-        // `alloc`), so it cannot recurse into this path. The retry is a plain
-        // `backend.alloc` (unhooked), so failure returns null directly with no
-        // second reclaim attempt.
-        let want_pages = layout
-            .size()
-            .div_ceil(4096)
-            .max(RECLAIM_ON_ALLOC_FAIL_PAGES);
-        if crate::reclaim::try_to_free(want_pages) == 0 {
-            return core::ptr::null_mut();
-        }
-        // SAFETY: same contract as the first attempt.
-        unsafe { backend.alloc(layout) }
+        // SAFETY: caller upholds `GlobalAlloc::alloc`'s layout contract, which
+        // is the same contract `HeapBackend::alloc` forwards.
+        unsafe { alloc_once_or_request(backend, layout, crate::frame::current_cpu_node()) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -381,3 +390,109 @@ pub fn spill_stats() -> (usize, usize) {
 /// Backwards-compat alias. The constant is now BOOTSTRAP_CAPACITY,
 /// but external diagnostics may still reference HEAP_CAPACITY.
 pub const HEAP_CAPACITY: usize = BOOTSTRAP_CAPACITY;
+
+#[cfg(test)]
+mod tests {
+    use super::{background_reclaim_target, BACKGROUND_RECLAIM_MAX_PAGES};
+
+    #[test]
+    fn background_reclaim_target_is_nonzero_and_strictly_bounded() {
+        assert_eq!(background_reclaim_target(0), 1);
+        assert_eq!(background_reclaim_target(1), 1);
+        assert_eq!(background_reclaim_target(4096), 1);
+        assert_eq!(background_reclaim_target(4097), 2);
+        assert_eq!(
+            background_reclaim_target(usize::MAX),
+            BACKGROUND_RECLAIM_MAX_PAGES
+        );
+    }
+}
+
+/// In-kernel regression coverage for the global-allocation failure path. The
+/// test backend always fails; the scoped shrinker proves failure publishes work
+/// without invoking reclaim inline, and the call count proves there is no
+/// hidden backend retry.
+mod allocation_failure_tests {
+    use core::alloc::Layout;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    use super::alloc_once_or_request;
+    use crate::heap_backend::HeapBackend;
+    use crate::reclaim::{
+        __register_shrinker_first_for_test, __unregister_shrinker_for_test, take_reclaim_request,
+        Shrinker,
+    };
+
+    const NODE: usize = crate::frame::MAX_NUMA_NODES - 1;
+    const SHRINKER_NAME: &str = "heap-no-inline-reclaim-test";
+    static BACKEND_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SHRINKER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    struct FailingBackend;
+
+    impl HeapBackend for FailingBackend {
+        fn name(&self) -> &'static str {
+            "failing-test"
+        }
+
+        unsafe fn alloc(&self, _layout: Layout) -> *mut u8 {
+            BACKEND_CALLS.fetch_add(1, Ordering::Relaxed);
+            core::ptr::null_mut()
+        }
+
+        unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+    }
+
+    static FAILING_BACKEND: FailingBackend = FailingBackend;
+
+    fn shrinker_count() -> usize {
+        1
+    }
+
+    fn shrinker_scan(_pages: usize) -> usize {
+        SHRINKER_CALLS.fetch_add(1, Ordering::Relaxed);
+        0
+    }
+
+    fn smoke_global_alloc_failure_has_no_inline_reclaim_or_retry() -> TestResult {
+        let _ = take_reclaim_request(NODE);
+        BACKEND_CALLS.store(0, Ordering::Relaxed);
+        SHRINKER_CALLS.store(0, Ordering::Relaxed);
+        if !__register_shrinker_first_for_test(Shrinker {
+            name: SHRINKER_NAME,
+            count: shrinker_count,
+            scan: shrinker_scan,
+        }) {
+            return TestResult::Fail("test shrinker registry was full");
+        }
+
+        let layout = Layout::from_size_align(4097, 8).expect("valid test layout");
+        // SAFETY: `layout` is valid and the mock backend always returns null.
+        let ptr = unsafe { alloc_once_or_request(&FAILING_BACKEND, layout, NODE) };
+        let backend_calls = BACKEND_CALLS.load(Ordering::Relaxed);
+        let shrinker_calls = SHRINKER_CALLS.load(Ordering::Relaxed);
+        let request = take_reclaim_request(NODE);
+        let _ = __unregister_shrinker_for_test(SHRINKER_NAME);
+
+        if !ptr.is_null() {
+            return TestResult::Fail("failing backend unexpectedly allocated");
+        }
+        if backend_calls != 1 {
+            return TestResult::Fail("global allocator retried its backend");
+        }
+        if shrinker_calls != 0 {
+            return TestResult::Fail("global allocator invoked a shrinker inline");
+        }
+        if request.target_pages != 2 || request.oom_authorized {
+            return TestResult::Fail("global allocator published the wrong reclaim target");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "memory/heap",
+        smoke_global_alloc_failure_has_no_inline_reclaim_or_retry
+    );
+}

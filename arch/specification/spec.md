@@ -97,6 +97,13 @@ pub unsafe extern "C" fn aarch64::kernel_ctx::kernel_switch(
     incoming: *const aarch64::kernel_ctx::KernelContext,
 );
 
+/// True only while the executing CPU owns a guarded kernel-user copy probe.
+/// Trap handlers use this to forbid reclaim parking until fixup/disarm.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::smap::guarded_copy_armed() -> bool;
+#[cfg(target_arch = "aarch64")]
+pub fn aarch64::uaccess::guarded_copy_armed() -> bool;
+
 /// AArch64 EL0 FP/SIMD image: Q0-Q31 followed by FPCR and FPSR.
 #[cfg(target_arch = "aarch64")]
 pub struct aarch64::UserFpState { /* 528 bytes, 16-byte aligned */ }

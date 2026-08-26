@@ -67,6 +67,11 @@ pub unsafe fn set_current_user_context(context: *mut ());
 pub fn current_user_context() -> *mut ();
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
+pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool);
+pub fn dbg_slot_state(task: u64)
+    -> Option<(bool, u32, usize, u64, u32, bool)>;
+pub fn dbg_ready_slots(cpu: usize)
+    -> Vec<(u64, bool, u32, u64, bool)>;
 ```
 
 Executor internals are per-CPU queues plus global stealing. The specified
@@ -114,8 +119,15 @@ enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
+Forward-progress and remote-reschedule telemetry is cache-line-isolated per CPU
+on update and aggregated across CPUs only for watchdog or test snapshots.
 Ordinary background task polls deliberately do not advance it: scheduler churn
 must not hide a foreground task that has stopped making useful progress.
+The three `dbg_*` functions are bounded, read-only fatal-watchdog snapshots.
+They use nonblocking queue acquisition and report current queue ownership,
+awake state, affinity, and CPU idle/lock state. They deliberately maintain no
+per-poll, per-pop, per-requeue, or global per-wake counters on the normal
+scheduling path.
 
 #### 3.1.1 Pluggable scheduling policy
 

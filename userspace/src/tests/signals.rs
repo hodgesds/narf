@@ -607,6 +607,68 @@ kernel_test_in!(
     smoke_userspace_sigqueue_is_sharded_fifo_and_isolated
 );
 
+// RT signals queue every instance (FIFO, each with its own payload) while a
+// standard signal coalesces to the latest payload. The depth returned by
+// `store_sigqueue_info_depth` — the value the sender-side back-pressure check
+// reads instead of a second bucket scan — must equal the total queued payloads
+// across every signum, and coalescing a standard signal must NOT inflate it.
+#[cfg(not(feature = "user-mode-e2e"))]
+fn smoke_userspace_sigqueue_depth_rt_queue_vs_std_coalesce() -> TestResult {
+    use crate::handlers::{__test_signal_reset, store_sigqueue_info_depth, take_sigqueue_info};
+
+    const TASK: u64 = 0x5300;
+    const SIGRT: u32 = 40; // RT: queues
+    const SIGSTD: u32 = 10; // < SIGRT_QUEUE_MIN (32): coalesces
+
+    __test_signal_reset();
+
+    // Three RT instances → depth grows 1, 2, 3; each keeps its own payload.
+    let d1 = store_sigqueue_info_depth(TASK, SIGRT, -1, 0x11, 1);
+    let d2 = store_sigqueue_info_depth(TASK, SIGRT, -1, 0x22, 2);
+    let d3 = store_sigqueue_info_depth(TASK, SIGRT, -1, 0x33, 3);
+    if d1 != Some(1) || d2 != Some(2) || d3 != Some(3) {
+        __test_signal_reset();
+        return TestResult::Fail("RT enqueue depth did not grow 1/2/3");
+    }
+
+    // A standard signal enqueued twice coalesces: the second replaces the
+    // first, so the total depth rises by exactly one (RT 3 + STD 1 = 4) and
+    // stays there — it must NOT double-count the coalesced slot.
+    let s1 = store_sigqueue_info_depth(TASK, SIGSTD, 0, 0xAA, 9);
+    let s2 = store_sigqueue_info_depth(TASK, SIGSTD, 0, 0xBB, 9);
+    if s1 != Some(4) || s2 != Some(4) {
+        __test_signal_reset();
+        return TestResult::Fail("standard signal coalesce inflated the queue depth");
+    }
+
+    // RT payloads drain in submission order (FIFO), each intact.
+    let r1 = take_sigqueue_info(TASK, SIGRT);
+    let r2 = take_sigqueue_info(TASK, SIGRT);
+    let r3 = take_sigqueue_info(TASK, SIGRT);
+    let r4 = take_sigqueue_info(TASK, SIGRT);
+    // The standard signal yields exactly one instance: the latest payload.
+    let std_taken = take_sigqueue_info(TASK, SIGSTD);
+    let std_more = take_sigqueue_info(TASK, SIGSTD);
+    __test_signal_reset();
+
+    if r1 != Some((-1, 0x11, 1))
+        || r2 != Some((-1, 0x22, 2))
+        || r3 != Some((-1, 0x33, 3))
+        || r4.is_some()
+    {
+        return TestResult::Fail("RT signals lost FIFO order, payload, or queued too many");
+    }
+    if std_taken != Some((0, 0xBB, 9)) || std_more.is_some() {
+        return TestResult::Fail("standard signal did not coalesce to the latest payload");
+    }
+    TestResult::Pass
+}
+#[cfg(not(feature = "user-mode-e2e"))]
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_sigqueue_depth_rt_queue_vs_std_coalesce
+);
+
 // Trap-return signal hooks are immutable after boot and therefore live in
 // atomic function-pointer slots. Exercise both pointer reconstructions so an
 // architecture where a function pointer cannot round-trip through usize fails

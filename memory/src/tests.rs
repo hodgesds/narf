@@ -5,6 +5,103 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+/// A syscall that published mapping A must not materialize or roll back an
+/// identical-looking mapping B installed by a racing `MAP_FIXED` peer.
+fn smoke_mapping_receipts_reject_replaced_vma() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = VirtAddr::new(0x0000_0100_4000_0000);
+    let first = match aspace.map_region_limited_receipt(
+        Region {
+            base,
+            len: 4096,
+            perms: RegionPerms::READ,
+            phys: vec![PhysAddr::new(0)],
+        },
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => return TestResult::Fail("initial receipt publication failed"),
+    };
+    let second = match aspace.replace_region_limited_receipt(
+        Region {
+            base,
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: vec![PhysAddr::new(0)],
+        },
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(receipt) => receipt,
+        Err(_) => return TestResult::Fail("replacement receipt publication failed"),
+    };
+
+    // SAFETY: stale-receipt validation returns before consulting the empty
+    // test address space's deliberately absent hardware root.
+    if unsafe { aspace.materialize_mapping(first) } != Err(AddressSpaceError::StaleMapping) {
+        return TestResult::Fail("stale receipt materialized a replacement VMA");
+    }
+    if aspace.rollback_mapping(first) != Err(AddressSpaceError::StaleMapping) {
+        return TestResult::Fail("stale receipt rolled back a replacement VMA");
+    }
+    let Some(region) = aspace.lookup(base) else {
+        return TestResult::Fail("replacement VMA disappeared");
+    };
+    if !region.perms.contains(RegionPerms::WRITE) || second.base() != base || second.len() != 4096 {
+        return TestResult::Fail("replacement VMA or receipt changed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_mapping_receipts_reject_replaced_vma);
+
+/// A receipt is an address-space capability, not merely a `(base, len,
+/// generation)` tuple. Independent address spaces begin their local mapping
+/// generations at the same value, so the AS incarnation must also match.
+fn smoke_mapping_receipts_reject_another_address_space() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let first = AddressSpace::empty();
+    let second = AddressSpace::empty();
+    let base = VirtAddr::new(0x0000_0100_5000_0000);
+    let region = || Region {
+        base,
+        len: 4096,
+        perms: RegionPerms::READ,
+        phys: vec![PhysAddr::new(0)],
+    };
+    let receipt = match first.map_region_limited_receipt(region(), false, u64::MAX, false) {
+        Ok(receipt) => receipt,
+        Err(_) => return TestResult::Fail("first AS receipt publication failed"),
+    };
+    if second
+        .map_region_limited_receipt(region(), false, u64::MAX, false)
+        .is_err()
+    {
+        return TestResult::Fail("second AS receipt publication failed");
+    }
+    if first.identity() == second.identity() {
+        return TestResult::Fail("independent address spaces reused an identity");
+    }
+    if second.rollback_mapping(receipt) != Err(AddressSpaceError::StaleMapping) {
+        return TestResult::Fail("foreign receipt rolled back an identical VMA");
+    }
+    if second.lookup(base).is_none() {
+        return TestResult::Fail("foreign receipt removed the second AS mapping");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_mapping_receipts_reject_another_address_space
+);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_probe_catches_page_fault() -> TestResult {
     // Arm the recoverable-fault probe, write to an unmapped virtual
@@ -1759,7 +1856,6 @@ kernel_test_in!(
 
 fn smoke_tlb_shootdown_local_only() -> TestResult {
     use crate::tlb_shootdown;
-    tlb_shootdown::__reset_for_test();
     let before = tlb_shootdown::shootdown_count();
     tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::full());
     tlb_shootdown::shootdown(tlb_shootdown::ShootdownRequest::for_tag(7));
@@ -3546,17 +3642,29 @@ fn smoke_memory_relocate_region_moves_live_leaves() -> TestResult {
     // SAFETY: the grown tail is expected to have no leaf.
     let new_tail = unsafe { translate(aspace.root, VirtAddr::new(NEW + 8192)) };
     let region = aspace.lookup(VirtAddr::new(NEW));
+    let mut first_old_rmap = false;
+    let mut first_new_rmap = false;
+    crate::rmap::for_each_owner(first, |owner| {
+        if owner.root == aspace.root && owner.va == VirtAddr::new(OLD) {
+            first_old_rmap = true;
+        }
+        if owner.root == aspace.root && owner.va == VirtAddr::new(NEW) {
+            first_new_rmap = true;
+        }
+    });
     if old_first.is_some()
         || new_first != Some(first)
         || new_second != Some(second)
         || new_tail.is_some()
+        || first_old_rmap
+        || !first_new_rmap
         || !region.is_some_and(|region| {
             region.base == VirtAddr::new(NEW)
                 && region.len == 12288
                 && region.phys == alloc::vec![first, second, crate::PhysAddr::new(0)]
         })
     {
-        return TestResult::Fail("relocation did not move leaves/backing atomically");
+        return TestResult::Fail("relocation did not move leaves/backing/rmap atomically");
     }
     TestResult::Pass
 }
@@ -3813,6 +3921,128 @@ fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
     verdict
 }
 kernel_test_in!("memory", smoke_memory_cow_refcount_batch_retains_each_owner);
+
+/// A failed fork owns only the child VMAs it actually published. If a later
+/// child index insertion runs out of metadata, speculative COW retains for the
+/// unpublished suffix must be undone while the partial child's Drop balances
+/// the published prefix. Existing siblings must keep their exact ownership.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
+    use crate::address_space::__test_fail_fork_child_region_reserve_after;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+
+    cow::__test_clear();
+    // SAFETY: paging is live in the kernel-test harness and this test owns the
+    // fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("fork rollback parent root unavailable"),
+    };
+    let first = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("fork rollback first frame unavailable"),
+    };
+    let second = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            frame::free_frame(first);
+            return TestResult::Skip("fork rollback second frame unavailable");
+        }
+    };
+    let first_phys = first.start_address();
+    let second_phys = second.start_address();
+    let first_base = VirtAddr::new(0x0000_0080_3a00_0000);
+    let second_base = VirtAddr::new(0x0000_0080_3a00_2000);
+    if parent
+        .map_region(Region {
+            base: first_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![first_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(first);
+        frame::free_frame(second);
+        return TestResult::Fail("fork rollback first VMA setup failed");
+    }
+    if parent
+        .map_region(Region {
+            base: second_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![second_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(second);
+        return TestResult::Fail("fork rollback second VMA setup failed");
+    }
+
+    __test_fail_fork_child_region_reserve_after(2);
+    // SAFETY: the inactive parent is exclusively owned; the injected failure
+    // occurs during child metadata publication before scheduler visibility.
+    let first_failure = unsafe { parent.clone_for_fork() };
+    if !matches!(first_failure, Err(AddressSpaceError::AllocationFailed)) {
+        return TestResult::Fail("fork index failure did not surface AllocationFailed");
+    }
+    let parent_intact = parent.lookup(first_base).is_some_and(|region| {
+        region.phys == alloc::vec![first_phys]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    }) && parent.lookup(second_base).is_some_and(|region| {
+        region.phys == alloc::vec![second_phys]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !parent_intact || cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("failed fork leaked a child COW owner or changed the parent");
+    }
+
+    // Establish one real sibling, then repeat the same partial failure. Both
+    // backing counts must return exactly to the two live owners; this catches
+    // both a leaked suffix and an accidental rollback of the published prefix.
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let sibling = match unsafe { parent.clone_for_fork() } {
+        Ok(sibling) => sibling,
+        Err(_) => return TestResult::Fail("fork rollback sibling setup failed"),
+    };
+    if cow::count(first_phys) != 2 || cow::count(second_phys) != 2 {
+        return TestResult::Fail("successful sibling did not own both COW frames");
+    }
+    __test_fail_fork_child_region_reserve_after(2);
+    // SAFETY: same injected, unpublished-child contract as the first failure.
+    let second_failure = unsafe { parent.clone_for_fork() };
+    if !matches!(second_failure, Err(AddressSpaceError::AllocationFailed))
+        || cow::count(first_phys) != 2
+        || cow::count(second_phys) != 2
+    {
+        return TestResult::Fail("failed fork changed pre-existing sibling ownership");
+    }
+
+    drop(sibling);
+    if cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("sibling teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(first_phys) == 0 && cow::count(second_phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left failed-fork COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_failed_fork_rolls_back_unpublished_cow_refs
+);
 
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
@@ -5392,8 +5622,7 @@ kernel_test_in!(
 );
 
 fn smoke_tlb_shootdown_counter_monotonic() -> TestResult {
-    use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest, __reset_for_test};
-    __reset_for_test();
+    use crate::tlb_shootdown::{shootdown, shootdown_count, ShootdownRequest};
     let base = shootdown_count();
     shootdown(ShootdownRequest::full());
     shootdown(ShootdownRequest::for_tag(1));
@@ -6937,10 +7166,10 @@ fn smoke_memory_try_grow_stack_collision_rejected() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_try_grow_stack_collision_rejected);
 
-/// Sequential grows: starting from a single guard, three grows
-/// produce three R+W stack pages and a guard sitting at the
-/// new bottom. Catches a regression where the new guard install
-/// races against the promotion bookkeeping.
+/// Sequential grows: starting from a single guard, three indexed lookups
+/// create three backed R+W fragments with a guard at the new bottom.  Keeping
+/// fragments avoids annexing an unmarked adjacent VMA; RegionSet makes guard
+/// discovery O(log VMA) despite the fragments.
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_try_grow_stack_sequential() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
@@ -6969,14 +7198,14 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         cur -= 0x1000;
     }
     let snap = a.regions_snapshot();
-    let rw_count = snap
+    let rw_regions: alloc::vec::Vec<_> = snap
         .iter()
         .filter(|r| {
             !r.perms.contains(RegionPerms::STACK_GUARD)
                 && r.perms.contains(RegionPerms::READ)
                 && r.perms.contains(RegionPerms::WRITE)
         })
-        .count();
+        .collect();
     let guard_count = snap
         .iter()
         .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
@@ -6987,8 +7216,16 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
         .map(|r| r.base.as_u64())
         .min();
     core::mem::forget(a);
-    if rw_count != 3 {
-        return TestResult::Fail("expected 3 promoted stack pages");
+    if rw_regions.len() != 3 {
+        return TestResult::Fail("sequential grows did not produce three fragments");
+    }
+    for expected in [guard0 - 2 * 0x1000, guard0 - 0x1000, guard0] {
+        let Some(fragment) = rw_regions.iter().find(|r| r.base.as_u64() == expected) else {
+            return TestResult::Fail("sequential stack fragment has the wrong base");
+        };
+        if fragment.len != 0x1000 || fragment.phys.len() != 1 || fragment.phys[0].raw() == 0 {
+            return TestResult::Fail("sequential stack fragment is not singly backed");
+        }
     }
     if guard_count != 1 {
         return TestResult::Fail("expected exactly one trailing guard");
@@ -7000,6 +7237,321 @@ fn smoke_memory_try_grow_stack_sequential() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_try_grow_stack_sequential);
+
+/// Realistic layout: a backed executable stack VMA sits directly above the
+/// guard. Many one-page growths preserve EXEC on separate anonymous fragments
+/// without changing the original VMA, and a guard tracks the new bottom.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_try_grow_stack_preserves_exec_without_annexing() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // One backed, EXECUTABLE stack page, with a guard directly below.
+    let stack_base = 0x0000_0080_0600_0000u64;
+    let stack_frame = match crate::frame::alloc_user_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("no frame for stack page");
+        }
+    };
+    a.map_region(Region {
+        base: VirtAddr::new(stack_base),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::EXEC,
+        phys: alloc::vec![stack_frame],
+    })
+    .expect("map_region stack");
+    let guard0 = stack_base - 0x1000;
+    a.map_region(Region {
+        base: VirtAddr::new(guard0),
+        len: 0x1000,
+        perms: RegionPerms::STACK_GUARD,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .expect("map_region guard");
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    if unsafe { a.materialize() }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("materialize failed");
+    }
+
+    // Grow the stack down 16 pages, one fault at a time.
+    const GROWS: u64 = 16;
+    let mut cur = guard0;
+    for _ in 0..GROWS {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
+        if unsafe { a.try_grow_stack(VirtAddr::new(cur + 0x40)) }.is_err() {
+            core::mem::forget(a);
+            return TestResult::Fail("in-place stack grow failed mid-loop");
+        }
+        cur -= 0x1000;
+    }
+
+    let snap = a.regions_snapshot();
+    // Every grown page must be present in the tables and writable.
+    let mut all_present_writable = true;
+    let mut p = guard0;
+    for _ in 0..GROWS {
+        // SAFETY: the operation upholds its documented invariant (see surrounding context).
+        if unsafe { translate_arch(a.root, VirtAddr::new(p)) }.is_none() {
+            all_present_writable = false;
+        }
+        p -= 0x1000;
+    }
+    let stack_regions: alloc::vec::Vec<_> = snap
+        .iter()
+        .filter(|r| {
+            !r.perms.contains(RegionPerms::STACK_GUARD) && r.perms.contains(RegionPerms::WRITE)
+        })
+        .collect();
+    let guard_count = snap
+        .iter()
+        .filter(|r| r.perms.contains(RegionPerms::STACK_GUARD))
+        .count();
+    // The original VMA must remain intact rather than being annexed by the
+    // grow path.  Each promoted guard is its own one-page anonymous fragment;
+    // the ordered RegionSet still finds the next guard in O(log VMA), and the
+    // executable-stack permission propagates across every fragment.
+    let stack_ok = stack_regions.len() as u64 == GROWS + 1
+        && stack_regions.iter().all(|s| {
+            s.len == 0x1000
+                && s.perms.contains(RegionPerms::EXEC)
+                && s.phys.len() == 1
+                && s.phys[0].raw() != 0
+        })
+        && stack_regions.iter().any(|s| s.base.as_u64() == stack_base);
+    // Read back one grown page: try_grow_stack zeroes each frame.
+    let lowest = stack_base - GROWS * 0x1000;
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let zeroed = unsafe { translate_arch(a.root, VirtAddr::new(lowest)) }
+        .map(|pa| {
+            // SAFETY: identity-mapped low physical memory.
+            let byte = unsafe { core::ptr::read_volatile(pa.raw() as *const u8) };
+            byte == 0
+        })
+        .unwrap_or(false);
+    core::mem::forget(a);
+
+    if !all_present_writable {
+        return TestResult::Fail("a grown stack page was not present");
+    }
+    if !stack_ok {
+        return TestResult::Fail("stack growth annexed a VMA or lost EXEC permissions");
+    }
+    if guard_count != 1 {
+        return TestResult::Fail("expected exactly one trailing guard");
+    }
+    if !zeroed {
+        return TestResult::Fail("grown stack page was not zeroed");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_try_grow_stack_preserves_exec_without_annexing
+);
+
+/// Linux stack expansion is admitted against RLIMIT_STACK and RLIMIT_AS
+/// before allocating or publishing a leaf. A rejection must leave the guard
+/// VMA and page tables unchanged.
+fn smoke_memory_stack_growth_limits_preserve_guard() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, StackGrowthLimits, VirtAddr,
+    };
+
+    for (offset, limits) in [
+        (
+            0u64,
+            StackGrowthLimits {
+                stack_bytes: 0,
+                memlock_bytes: u64::MAX,
+                address_space_bytes: u64::MAX,
+                bypass_memlock: true,
+            },
+        ),
+        (
+            0x20_0000u64,
+            StackGrowthLimits {
+                stack_bytes: u64::MAX,
+                memlock_bytes: u64::MAX,
+                // The existing guard already consumes this page; promotion
+                // plus the replacement guard grows total VM by one page.
+                address_space_bytes: 0x1000,
+                bypass_memlock: true,
+            },
+        ),
+    ] {
+        // SAFETY: the frame allocator and kernel page-table aliases are live
+        // in the kernel-test environment.
+        let address_space = match unsafe { AddressSpace::new_for_user() } {
+            Ok(address_space) => address_space,
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let guard = 0x0000_0080_0700_0000u64 + offset;
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(guard),
+                len: 0x1000,
+                perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .expect("map stack guard");
+
+        // SAFETY: the AS root is live and the guard contains no backing.
+        let result =
+            unsafe { address_space.try_grow_stack_limited(VirtAddr::new(guard + 8), limits) };
+        let unchanged = address_space.regions_snapshot().iter().any(|region| {
+            region.base.as_u64() == guard
+                && region.len == 0x1000
+                && region.perms.contains(RegionPerms::STACK_GUARD)
+        });
+        // SAFETY: the address-space root remains live until the test forgets
+        // it below.
+        let pte_absent =
+            unsafe { translate_arch(address_space.root, VirtAddr::new(guard)).is_none() };
+        core::mem::forget(address_space);
+        if result != Err(AddressSpaceError::StackLimit) || !unchanged || !pte_absent {
+            return TestResult::Fail("stack-limit rejection changed VMA or PTE state");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_stack_growth_limits_preserve_guard);
+
+/// A locked stack inherits VM_LOCKED into each grown page. Admission failure
+/// is RLIMIT_MEMLOCK-specific and likewise occurs before allocation.
+fn smoke_memory_locked_stack_growth_honours_memlock_limit() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, StackGrowthLimits, VirtAddr,
+    };
+
+    // SAFETY: kernel-test paging/allocator setup satisfies new_for_user.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard = 0x0000_0080_0740_0000u64;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(guard),
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("map stack guard");
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(guard + 0x1000),
+            len: 0x1000,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::STACK_SEGMENT
+                | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("map locked stack");
+
+    let limits = StackGrowthLimits {
+        stack_bytes: u64::MAX,
+        // Existing stack consumes all available locked-byte budget.
+        memlock_bytes: 0x1000,
+        address_space_bytes: u64::MAX,
+        bypass_memlock: false,
+    };
+    // SAFETY: root and allocator satisfy try_grow_stack_limited's contract.
+    let result = unsafe { address_space.try_grow_stack_limited(VirtAddr::new(guard), limits) };
+    let still_guard = address_space.regions_snapshot().iter().any(|region| {
+        region.base.as_u64() == guard && region.perms.contains(RegionPerms::STACK_GUARD)
+    });
+    core::mem::forget(address_space);
+    if result == Err(AddressSpaceError::LockLimit) && still_guard {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("locked stack growth ignored memlock admission")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_locked_stack_growth_honours_memlock_limit
+);
+
+/// An unexpected pre-existing leaf is an internal collision, not permission
+/// to associate a newly allocated frame with someone else's PTE. The failed
+/// transaction must preserve both the rogue leaf and the guard metadata.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it() -> TestResult {
+    use crate::x86_64::paging::{map_4kb, unmap_4kb, PtFlags};
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: kernel-test paging/allocator setup satisfies new_for_user.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard = 0x0000_0080_0780_0000u64;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(guard),
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("map stack guard");
+    let rogue_frame = match crate::frame::alloc_user_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            core::mem::forget(address_space);
+            return TestResult::Skip("no rogue frame");
+        }
+    };
+    let rogue_phys = rogue_frame.start_address();
+    // SAFETY: the test owns the aligned frame and empty user leaf.
+    if unsafe {
+        map_4kb(
+            address_space.root,
+            VirtAddr::new(guard),
+            rogue_phys,
+            PtFlags::USER | PtFlags::WRITABLE | PtFlags::NO_EXEC,
+        )
+    }
+    .is_err()
+    {
+        crate::frame::free_frame(rogue_frame);
+        core::mem::forget(address_space);
+        return TestResult::Fail("could not install rogue stack leaf");
+    }
+
+    // SAFETY: the AS is live; the intentional PTE/VMA mismatch exercises the
+    // transaction's collision rollback.
+    let result = unsafe { address_space.try_grow_stack(VirtAddr::new(guard)) };
+    // SAFETY: root remains live and the leaf should still name rogue_phys.
+    let preserved =
+        unsafe { translate_arch(address_space.root, VirtAddr::new(guard)) } == Some(rogue_phys);
+    let still_guard = address_space.regions_snapshot().iter().any(|region| {
+        region.base.as_u64() == guard && region.perms.contains(RegionPerms::STACK_GUARD)
+    });
+    // SAFETY: remove the leaf explicitly before returning its backing frame.
+    let _ = unsafe { unmap_4kb(address_space.root, VirtAddr::new(guard)) };
+    crate::frame::free_frame(rogue_frame);
+    core::mem::forget(address_space);
+
+    if result == Err(AddressSpaceError::NotImplemented) && preserved && still_guard {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("stack collision replaced/unmapped an existing leaf")
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it
+);
 
 /// STACK_GUARD bit lives outside the POSIX prot mask so an
 /// `mprotect`-style query on the region's perms doesn't observe
@@ -9086,6 +9638,130 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
 #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
 kernel_test_in!("memory", smoke_memory_madvise_dontneed_releases_pages);
 
+/// MADV_DONTNEED over a MULTI-PAGE range with an interior unfaulted hole must
+/// release every resident private frame and zero its per-page slot, while
+/// leaving the hole's already-zero slot untouched. This exercises the batched
+/// per-region range unmap (one root lock + one upper-level walk for the whole
+/// intersection) rather than the single-page helper, so a regression in the
+/// range teardown that dropped or double-counted a page would surface here.
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // Three real resident frames with an unfaulted hole (phys 0) at index 1.
+    let mut frames = alloc::vec::Vec::new();
+    for _ in 0..3 {
+        match crate::alloc_frame() {
+            Ok(f) => frames.push(f.start_address()),
+            Err(_) => {
+                core::mem::forget(a);
+                return TestResult::Skip("frame drained");
+            }
+        }
+    }
+    let v = VirtAddr::new(0x0000_0080_0005_0000);
+    if a.map_region(Region {
+        base: v,
+        len: 0x4000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![frames[0], PhysAddr::new(0), frames[1], frames[2]],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: the operation upholds its documented invariant (see surrounding context).
+    let _ = unsafe { a.materialize() };
+
+    if a.madvise_dontneed(v, 0x4000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("madvise_dontneed over the range returned err");
+    }
+
+    let ok = {
+        let g = a.regions_snapshot();
+        g.iter()
+            .find(|r| r.base.as_u64() == v.as_u64())
+            .map(|r| r.phys.len() == 4 && r.phys.iter().all(|p| p.raw() == 0))
+            .unwrap_or(false)
+    };
+    core::mem::forget(a);
+    if ok {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("range madvise left a resident slot or resized the region")
+    }
+}
+#[cfg(all(
+    feature = "linux-compat",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_madvise_dontneed_range_frees_all_and_keeps_hole
+);
+
+/// A supervisor-mode write (signal-frame placement) must be refused on a
+/// present-but-read-only user page rather than faulting the kernel. This is the
+/// guard behind deliver_signal's pre-flight: a stress-ng `bad-altstack` points
+/// `sigaltstack` at a `PROT_READ` page, and without the writability gate the
+/// CPL=0 frame write took an unrecoverable #PF and panicked the whole kernel
+/// instead of terminating just the offending task (Linux `force_sigsegv`).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_user_page_writable_gates_readonly() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let ro = VirtAddr::new(0x0000_0080_0090_0000);
+    let rw = VirtAddr::new(0x0000_0080_0091_0000);
+    if a.map_region(Region {
+        base: ro,
+        len: 0x1000,
+        perms: RegionPerms::READ,
+        phys: alloc::vec![PhysAddr::new(0x3000_0000)],
+    })
+    .is_err()
+        || a.map_region(Region {
+            base: rw,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0x3000_1000)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+
+    // Read-only page (a PROT_READ sigaltstack) must be refused.
+    // SAFETY: identity map is live in the kernel-test environment; the method
+    // only reads region metadata for a non-COW mapping.
+    if unsafe { a.user_page_writable_or_resolve(ro) } {
+        return TestResult::Fail("read-only page accepted for a supervisor write");
+    }
+    // Writable page is accepted.
+    // SAFETY: as above.
+    if !unsafe { a.user_page_writable_or_resolve(rw) } {
+        return TestResult::Fail("writable page refused");
+    }
+    // Unmapped hole is refused.
+    // SAFETY: as above.
+    if unsafe { a.user_page_writable_or_resolve(VirtAddr::new(0x0000_0080_00a0_0000)) } {
+        return TestResult::Fail("unmapped page accepted");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_user_page_writable_gates_readonly);
+
 /// MADV_DONTNEED reports an unmapped hole without releasing either mapped
 /// island, and rounds a one-byte request over its containing page.
 #[cfg(all(
@@ -9681,11 +10357,164 @@ fn smoke_materialize_range_installs_only_intersection() -> TestResult {
         if unsafe { translated(&a, va) } != Some(*frame) {
             return TestResult::Fail("full materialize disagreed with range backing");
         }
+        // The full batch encounters the already-mapped middle page after
+        // installing its first-page prefix. Recovery must record that prefix
+        // as well as the pre-existing and remaining leaves, without duplicate
+        // owners on this test-owned backing.
+        if crate::rmap::owner_count(*frame) != 1 {
+            return TestResult::Fail("partial batch recovery left inconsistent rmap owners");
+        }
     }
     TestResult::Pass
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_materialize_range_installs_only_intersection);
+
+/// System V `shmat` maps a segment's registry-owned frames into the caller's
+/// address space and installs the PTEs for ONLY that segment's VA window via
+/// `materialize_range` (not a whole-address-space `materialize`, which the
+/// shm-sysv shmget/shmat/shmdt loop otherwise re-paid per attach). This
+/// mirrors that attach shape at the address-space layer and pins its three
+/// load-bearing invariants:
+///   * shared visibility — a second attach (a second AS here) aliases the
+///     SAME physical frame, so a write through one attach is visible through
+///     the other (`shmat` maps, never copies);
+///   * range-scoped PTE install — `materialize_range` installs exactly the
+///     segment window and nothing else;
+///   * shared-frame lifetime — a SHARED region borrows registry-owned frames,
+///     so dropping one attaching AS unmaps its PTEs but must NOT free the
+///     frame while another AS still maps it (the cross-AS double-free hazard).
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shmat_shared_attach_range_materialize() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::x86_64::paging::translate(a.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(a: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: the caller passes a live test-owned user root.
+        unsafe { crate::aarch64::paging::translate(a.root, va) }
+    }
+
+    // Two independent user address spaces stand in for two processes attaching
+    // the same segment. SAFETY: test-owned roots; neither is ever activated.
+    // SAFETY: test-owned user root; it is never activated.
+    let as_a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AS a alloc failed"),
+    };
+    // SAFETY: test-owned user root; it is never activated.
+    let as_b = match unsafe { AddressSpace::new_for_user() } {
+        Ok(b) => b,
+        Err(_) => return TestResult::Skip("AS b alloc failed"),
+    };
+
+    // One page of registry-owned backing stands in for the shmem segment's
+    // frame list. A single frame keeps the shared-alias reasoning exact.
+    let seg = match crate::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    const SEG_LEN: u64 = 4096;
+    // Above the low-4-GiB identity window so the leaf doesn't collide with the
+    // kernel's shared huge PML4[0] identity mapping.
+    let base_a = VirtAddr::new(0x0000_4090_0000_0000);
+    let base_b = VirtAddr::new(0x0000_4098_0000_0000);
+
+    // Attach shape: SHARED marks the frames as borrowed so neither unmap nor
+    // AS-drop frees them; the transaction serializes the alias install exactly
+    // as `sys_shmat` does. A single frame maps into both roots — no copy.
+    let attach = |as_ref: &AddressSpace, base: VirtAddr| {
+        as_ref.with_vma_transaction(|| {
+            crate::with_shared_mapping_transaction(|| {
+                // SAFETY: VMA + registry transactions cover alias insertion;
+                // the live root's range install touches only this window.
+                unsafe {
+                    as_ref.map_shared_region_locked(Region {
+                        base,
+                        len: SEG_LEN,
+                        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                        phys: alloc::vec![seg],
+                    })?;
+                    as_ref.materialize_range(base, SEG_LEN)
+                }
+            })
+        })
+    };
+    if attach(&as_a, base_a).is_err() {
+        return TestResult::Fail("first attach (map_shared + materialize_range) failed");
+    }
+    if attach(&as_b, base_b).is_err() {
+        return TestResult::Fail("second attach (map_shared + materialize_range) failed");
+    }
+
+    // Range-scoped install: exactly the segment window is present, and both
+    // attaches resolve to the SAME physical frame (shared visibility, not a
+    // copy).
+    // SAFETY: both roots are live test-owned user roots.
+    if unsafe { translated(&as_a, base_a) } != Some(seg) {
+        return TestResult::Fail("attach A did not install the segment PTE");
+    }
+    // SAFETY: as above.
+    if unsafe { translated(&as_b, base_b) } != Some(seg) {
+        return TestResult::Fail("attach B did not alias the SAME frame (visibility broken)");
+    }
+    // materialize_range must not spill outside the one-page window.
+    // SAFETY: as above.
+    if unsafe { translated(&as_a, VirtAddr::new(base_a.as_u64() + SEG_LEN)) }.is_some() {
+        return TestResult::Fail("materialize_range installed a page past the segment");
+    }
+
+    // Write through the shared frame and read it back through B's mapping:
+    // both attaches see the same bytes. The frame is identity-mapped, so its
+    // phys doubles as a kernel VA here.
+    const SENTINEL: u64 = 0x5347_5F53_484D_4154;
+    // SAFETY: `seg` is a live, identity-mapped, freshly allocated frame.
+    unsafe { core::ptr::write_volatile(seg.raw() as *mut u64, SENTINEL) };
+    // SAFETY: B translated to `seg`; reading through that phys observes the
+    // write, proving cross-attach shared visibility.
+    let seen = unsafe { core::ptr::read_volatile(seg.raw() as *const u64) };
+    if seen != SENTINEL {
+        return TestResult::Fail("shared write not visible through the second attach");
+    }
+
+    // Detach one attach (drop A). A SHARED region unmaps its PTEs but must NOT
+    // free the borrowed frame while B still maps it — the marginal-buddy
+    // cross-AS double-free hazard.
+    drop(as_a);
+    // B still resolves the frame and still reads the sentinel: A's teardown
+    // neither unmapped B nor freed the shared frame.
+    // SAFETY: B owns a live user root; `seg` stays identity-mapped.
+    if unsafe { translated(&as_b, base_b) } != Some(seg) {
+        return TestResult::Fail("detaching A tore down B's still-live attach");
+    }
+    // SAFETY: as above.
+    if unsafe { core::ptr::read_volatile(seg.raw() as *const u64) } != SENTINEL {
+        return TestResult::Fail("shared frame was clobbered by A's detach");
+    }
+    // The clinching double-free check: had A's drop freed the still-mapped
+    // frame, the allocator's free list would now hand it back. It must not.
+    let probe = crate::alloc_frame().ok();
+    if let Some(f) = probe.as_ref() {
+        if f.start_address() == seg {
+            return TestResult::Fail("detach freed a frame still attached elsewhere (double-free)");
+        }
+    }
+
+    // Cleanup: drop B (releases its borrow, still no free of `seg`), return the
+    // probe frame, then free the segment frame we own outright.
+    drop(as_b);
+    if let Some(f) = probe {
+        crate::frame::free_frame(f);
+    }
+    crate::frame::free_frame(crate::frame::PhysFrame::new(seg));
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shmat_shared_attach_range_materialize);
 
 /// A bad, unrelated VMA must not poison incremental materialisation of a
 /// valid mmap range. A test-owned huge leaf gives a deterministic structural
@@ -10395,11 +11224,11 @@ fn smoke_memory_mlock_spans_multiple_regions() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_mlock_spans_multiple_regions);
 
-/// A mapped-unmapped-mapped range is not partially lockable.  Validate the
-/// complete range before allocating or setting flags so failure leaves both
-/// mapped islands untouched.
+/// Linux applies mlock flags VMA-by-VMA, so a later hole returns ENOMEM after
+/// the mapped prefix has already changed. The island after the hole is not
+/// reached.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn smoke_memory_mlock_hole_is_atomic() -> TestResult {
+fn smoke_memory_mlock_hole_preserves_linux_prefix_effect() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
     // SAFETY: fresh user AS used only by this test.
@@ -10426,20 +11255,91 @@ fn smoke_memory_mlock_hole_is_atomic() -> TestResult {
         core::mem::forget(a);
         return TestResult::Fail("mlock across a hole succeeded");
     }
-    let untouched = a
-        .regions_snapshot()
+    let snapshot = a.regions_snapshot();
+    let first_locked = snapshot
         .iter()
-        .filter(|r| r.base.as_u64() == base || r.base.as_u64() == base + 0x2000)
-        .all(|r| !r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
+        .find(|r| r.base.as_u64() == base)
+        .is_some_and(|r| r.perms.contains(RegionPerms::LOCKED));
+    let later_untouched = snapshot
+        .iter()
+        .find(|r| r.base.as_u64() == base + 0x2000)
+        .is_some_and(|r| !r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
     core::mem::forget(a);
-    if untouched {
+    if first_locked && later_untouched {
         TestResult::Pass
     } else {
-        TestResult::Fail("failed mlock partially changed mapped pages")
+        TestResult::Fail("mlock hole did not preserve Linux prefix-side effect")
     }
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-kernel_test_in!("memory", smoke_memory_mlock_hole_is_atomic);
+kernel_test_in!(
+    "memory",
+    smoke_memory_mlock_hole_preserves_linux_prefix_effect
+);
+
+/// Linux marks a covered PROT_NONE VMA locked but does not attempt to fault
+/// inaccessible pages during the eager population pass. The operation
+/// succeeds and the backing stays lazy until permissions later allow access.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_mlock_prot_none_locks_without_population() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh user AS used only by this test.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_2A00_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x1000,
+        perms: RegionPerms::default(),
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("map_region failed");
+    }
+    if a.mlock_range(VirtAddr::new(base), 0x1000).is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("covered PROT_NONE mlock failed");
+    }
+    let locked_lazy = a
+        .regions_snapshot()
+        .iter()
+        .find(|r| r.base.as_u64() == base)
+        .is_some_and(|r| r.perms.contains(RegionPerms::LOCKED) && r.phys[0].raw() == 0);
+    core::mem::forget(a);
+    if locked_lazy {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("PROT_NONE mlock populated backing or lost LOCKED")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_mlock_prot_none_locks_without_population
+);
+
+/// Only arithmetic wrap is EINVAL. A non-wrapping range beyond the user VMA
+/// window is simply uncovered and therefore ENOMEM at the syscall boundary.
+fn smoke_memory_mlock_range_error_classes_match_linux() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, VirtAddr};
+
+    let a = AddressSpace::empty();
+    if a.mlock_range(VirtAddr::new(u64::MAX - 0x100), 0x200) != Err(AddressSpaceError::OutOfRange) {
+        return TestResult::Fail("wrapping mlock range did not classify as invalid");
+    }
+    if a.mlock_range(VirtAddr::new(AddressSpace::USER_HALF_END - 0x800), 0x1000)
+        != Err(AddressSpaceError::Unmapped)
+    {
+        return TestResult::Fail("uncovered high mlock range did not classify as ENOMEM");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_mlock_range_error_classes_match_linux);
 
 /// Negative pair: a range intersecting nothing is `Unmapped`, for both
 /// verbs. `munlock` had no negative test at all, so a change making it
@@ -10535,6 +11435,2228 @@ fn smoke_memory_mlock_survives_mprotect() -> TestResult {
 }
 #[cfg(all(target_arch = "x86_64", feature = "linux-compat"))]
 kernel_test_in!("memory", smoke_memory_mlock_survives_mprotect);
+
+/// A mixed huge/base-page mprotect must reserve every base-page split node
+/// before changing a huge leaf.  Otherwise ENOMEM can leave only the huge
+/// prefix protected.  The successful retry also keeps internal VMA flags in
+/// the huge middle, just as the ordinary 4 KiB path does.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "linux-compat",
+    feature = "kernel-test"
+))]
+fn smoke_memory_mprotect_mixed_huge_index_oom_is_preflight() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, reserve_from_regions, HugeSize, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{
+        AddressSpace, AddressSpaceError, HugeRegion, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    const SYNTH_BASE: u64 = 0x40_0000_0000;
+    const USER_VA: u64 = 0x0000_5000_6000_0000;
+    let source = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    // SAFETY: the synthetic frame is mapped for metadata/translation checks
+    // only and is returned to the test reservation before this test exits.
+    let excludes = unsafe { reserve_from_regions(&[source], &[], 1, 0) };
+    if excludes.len() != 1 {
+        return TestResult::Fail("mixed mprotect hugepage reservation failed");
+    }
+    // SAFETY: topology lookup does not dereference the synthetic frame.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("mixed mprotect hugepage allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            let _ = alloc_hugepage_2m_on(node);
+            return TestResult::Fail("mixed mprotect address-space creation failed");
+        }
+    };
+    let huge_base = VirtAddr::new(USER_VA);
+    // SAFETY: the fresh root, aligned VA, and owned aligned frame satisfy the
+    // huge mapping contract.
+    if unsafe {
+        address_space.map_huge_region(HugeRegion {
+            base: huge_base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+            size: HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect huge mapping failed");
+    }
+    let regular_base = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    if address_space
+        .map_region(Region {
+            base: regular_base,
+            len: 0x3000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0); 3],
+        })
+        .is_err()
+    {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect regular mapping failed");
+    }
+
+    let writable_before = address_space.memory_stats().writable_nonexec_bytes;
+    address_space.__test_fail_next_region_index_reserve();
+    let failed =
+        address_space.mprotect_range(huge_base, HUGEPAGE_2M_BYTES + 0x2000, RegionPerms::READ);
+    let failure_atomic = failed == Err(AddressSpaceError::AllocationFailed)
+        && address_space.memory_stats().writable_nonexec_bytes == writable_before
+        && address_space.lookup(regular_base).is_some_and(|region| {
+            region.len == 0x3000 && region.perms.contains(RegionPerms::WRITE)
+        })
+        && address_space
+            .__test_huge_region_perms(huge_base)
+            .is_some_and(|perms| perms.contains(RegionPerms::WRITE));
+    if !failure_atomic {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("mixed mprotect ENOMEM partially changed permissions");
+    }
+
+    let retry =
+        address_space.mprotect_range(huge_base, HUGEPAGE_2M_BYTES + 0x2000, RegionPerms::READ);
+    let huge_preserved = address_space
+        .__test_huge_region_perms(huge_base)
+        .is_some_and(|perms| {
+            perms.contains(RegionPerms::LOCKED) && !perms.contains(RegionPerms::WRITE)
+        });
+    let regular_split = address_space
+        .lookup(regular_base)
+        .is_some_and(|region| region.len == 0x2000 && !region.perms.contains(RegionPerms::WRITE))
+        && address_space
+            .lookup(VirtAddr::new(regular_base.as_u64() + 0x2000))
+            .is_some_and(|region| {
+                region.len == 0x1000 && region.perms.contains(RegionPerms::WRITE)
+            });
+    let unmapped = address_space.unmap_huge_region(huge_base).is_ok();
+    let _ = alloc_hugepage_2m_on(node);
+    if retry.is_ok() && huge_preserved && regular_split && unmapped {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mixed mprotect retry lost flags or split metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "linux-compat",
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_mprotect_mixed_huge_index_oom_is_preflight
+);
+
+/// Linux replaces `mm->def_flags` on every mlockall call rather than stacking
+/// successive MCL_FUTURE modes.  In particular, MCL_CURRENT without
+/// MCL_FUTURE clears a previously-installed future policy.
+fn smoke_memory_future_lock_policy_replaces_and_current_clears() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy};
+
+    let a = AddressSpace::empty();
+    if a.update_mlockall(None, FutureLockPolicy::Eager).is_err()
+        || a.future_lock_policy() != FutureLockPolicy::Eager
+    {
+        return TestResult::Fail("MCL_FUTURE did not install eager policy");
+    }
+    if a.update_mlockall(None, FutureLockPolicy::OnFault).is_err()
+        || a.future_lock_policy() != FutureLockPolicy::OnFault
+    {
+        return TestResult::Fail("future on-fault policy did not replace eager policy");
+    }
+    if a.update_mlockall(Some(FutureLockPolicy::Eager), FutureLockPolicy::None)
+        .is_err()
+    {
+        return TestResult::Fail("MCL_CURRENT policy update failed");
+    }
+    if a.future_lock_policy() == FutureLockPolicy::None {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MCL_CURRENT without MCL_FUTURE left stale future policy")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_future_lock_policy_replaces_and_current_clears
+);
+
+/// New ordinary mappings inherit the address-space default.  Eager future
+/// locking must populate a lazy page, while MCL_ONFAULT must preserve its lazy
+/// slot and record the distinct on-fault mode in addition to LOCKED.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_future_lock_policy_applies_to_new_mappings() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging is live in the kernel-test harness; this test exclusively
+    // owns the fresh root and keeps it alive through both mapping operations.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // Keep the VA in PML4[1]'s deliberately-empty 512..513 GiB user slot.
+    // Addresses at/above 0x80_4000_0000 overlap the inherited high-MMIO map.
+    let eager_base = VirtAddr::new(0x0000_0080_3400_0000);
+    if a.update_mlockall(None, FutureLockPolicy::Eager).is_err()
+        || a.map_region(Region {
+            base: eager_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("eager future-lock mapping failed");
+    }
+    let eager = a.lookup(eager_base).map(|region| {
+        (
+            region.perms.contains(RegionPerms::LOCKED),
+            region.perms.contains(RegionPerms::LOCK_ONFAULT),
+            region.phys[0].raw() != 0,
+        )
+    });
+    if !matches!(eager, Some((true, false, true))) {
+        if a.root.raw() == 0 {
+            core::mem::forget(a);
+            return TestResult::Fail("new_for_user returned root zero, so eager helper skipped");
+        }
+        if !matches!(eager, Some((true, false, false))) {
+            core::mem::forget(a);
+            return TestResult::Fail("eager future policy did not publish the expected lock mode");
+        }
+        // Diagnostic control: exercise the same primitive the best-effort eager
+        // helper calls.  The test still fails when this works; the distinction
+        // tells us whether enumeration skipped the page or demand allocation
+        // itself was unavailable without adding hot-path instrumentation.
+        // SAFETY: fresh test-owned live root and initialized frame allocator.
+        let direct = unsafe { a.demand_alloc_page(eager_base) };
+        let direct_backed = a
+            .lookup(eager_base)
+            .is_some_and(|region| region.phys[0].raw() != 0);
+        core::mem::forget(a);
+        return match (direct, direct_backed) {
+            (Ok(()), true) => {
+                TestResult::Fail("direct demand worked but eager helper skipped the page")
+            }
+            (Ok(()), false) => {
+                TestResult::Fail("direct demand returned success without publishing backing")
+            }
+            (Err(_), _) => TestResult::Fail("direct demand failed after eager helper failure"),
+        };
+    }
+
+    let onfault_base = VirtAddr::new(0x0000_0080_3400_1000);
+    if a.update_mlockall(None, FutureLockPolicy::OnFault).is_err()
+        || a.map_region(Region {
+            base: onfault_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("on-fault future-lock mapping failed");
+    }
+    let onfault = a.lookup(onfault_base).is_some_and(|region| {
+        region.perms.contains(RegionPerms::LOCKED)
+            && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0].raw() == 0
+    });
+    core::mem::forget(a);
+    if onfault {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("on-fault future mapping was populated or lost its lock mode")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_future_lock_policy_applies_to_new_mappings
+);
+
+/// munlockall clears both current VMA lock modes and the policy inherited by
+/// later mappings.  Resident contents remain backed.  Use an explicitly
+/// resident setup page so this test is independent of eager-population coverage
+/// above: one broken behavior should produce one focused failure.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_munlock_all_clears_current_and_future_locking() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned user root; paging and the frame allocator are
+    // initialized by the kernel-test harness.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let resident = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let locked_base = VirtAddr::new(0x0000_0080_3500_0000);
+    if a.update_mlockall(None, FutureLockPolicy::OnFault).is_err()
+        || a.map_region(Region {
+            base: locked_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![resident],
+        })
+        .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("munlockall setup failed");
+    }
+    if a.munlock_all().is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("munlockall failed");
+    }
+    let current_cleared = a.lookup(locked_base).is_some_and(|region| {
+        !region.perms.contains(RegionPerms::LOCKED)
+            && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0] == resident
+    });
+    let later_base = VirtAddr::new(0x0000_0080_3500_1000);
+    let later_unlocked = a.future_lock_policy() == FutureLockPolicy::None
+        && a.map_region(Region {
+            base: later_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_ok()
+        && a.lookup(later_base).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED)
+                && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+                && region.phys[0].raw() == 0
+        });
+    core::mem::forget(a);
+    if current_cleared && later_unlocked {
+        TestResult::Pass
+    } else if !current_cleared {
+        TestResult::Fail("munlockall changed backing or left current VMA locked")
+    } else {
+        TestResult::Fail("munlockall left a future-lock policy")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_munlock_all_clears_current_and_future_locking
+);
+
+/// POSIX memory locks do not cross fork.  Linux clears VM_LOCKED_MASK from
+/// every duplicated VMA and excludes those bits from the child's def_flags;
+/// the parent must remain unchanged.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_fork_clears_current_and_future_locking() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned root; clone_for_fork's allocator/MMU
+    // preconditions are supplied by the kernel-test harness.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = VirtAddr::new(0x0000_0080_3600_0000);
+    if parent
+        .update_mlockall(None, FutureLockPolicy::OnFault)
+        .is_err()
+        || parent
+            .map_region(Region {
+                base,
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        core::mem::forget(parent);
+        return TestResult::Fail("fork lock-policy setup failed");
+    }
+    // SAFETY: parent is inactive and exclusively owned here; neither address
+    // space becomes scheduler-visible during the test.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => {
+            core::mem::forget(parent);
+            return TestResult::Fail("clone_for_fork failed");
+        }
+    };
+    let parent_kept = parent.future_lock_policy() == FutureLockPolicy::OnFault
+        && parent.lookup(base).is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED)
+                && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+        });
+    let child_cleared = child.future_lock_policy() == FutureLockPolicy::None
+        && child.lookup(base).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED)
+                && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+        });
+    core::mem::forget(child);
+    core::mem::forget(parent);
+    if parent_kept && child_cleared {
+        TestResult::Pass
+    } else if !parent_kept {
+        TestResult::Fail("fork cleared the parent's lock state")
+    } else {
+        TestResult::Fail("fork child inherited current or future memory locking")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_fork_clears_current_and_future_locking
+);
+
+/// RLIMIT_MEMLOCK accounts virtual bytes, but a repeated/overlapping mlock
+/// must subtract pages that are already locked.  Expanding one page to two at
+/// a two-page limit therefore succeeds; a third distinct page is rejected and
+/// remains unchanged.
+fn smoke_memory_mlock_limit_subtracts_locked_overlap() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let base = 0x0000_4080_2400_0000u64;
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x3000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); 3],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("lock-limit setup mapping failed");
+    }
+    if a.mlock_range_onfault_limited(VirtAddr::new(base), 0x1000, 0x2000, false)
+        .is_err()
+        || a.mlock_range_onfault_limited(VirtAddr::new(base), 0x2000, 0x2000, false)
+            .is_err()
+    {
+        return TestResult::Fail("overlapping locked bytes were counted twice");
+    }
+    // Exercise the eager mlock limit API for the rejection arm as well; it
+    // must fail admission before trying to populate the metadata-only AS.
+    if a.mlock_range_limited(VirtAddr::new(base + 0x2000), 0x1000, 0x2000, false)
+        != Err(AddressSpaceError::LockLimit)
+    {
+        return TestResult::Fail("distinct page beyond lock limit was admitted");
+    }
+
+    let regions = a.regions_snapshot();
+    let lock_mode = |va: u64| {
+        regions
+            .iter()
+            .find(|region| region.base.as_u64() <= va && va < region.base.as_u64() + region.len)
+            .map(|region| {
+                (
+                    region.perms.contains(RegionPerms::LOCKED),
+                    region.perms.contains(RegionPerms::LOCK_ONFAULT),
+                )
+            })
+    };
+    if lock_mode(base) == Some((true, true))
+        && lock_mode(base + 0x1000) == Some((true, true))
+        && lock_mode(base + 0x2000) == Some((false, false))
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("lock-limit failure mutated the rejected page")
+    }
+}
+kernel_test_in!("memory", smoke_memory_mlock_limit_subtracts_locked_overlap);
+
+/// A failed MCL_CURRENT limit preflight is transactional: it must not replace
+/// the prior MCL_FUTURE default or partially rewrite current VMA lock modes.
+fn smoke_memory_mlockall_limit_failure_preserves_state() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    let a = AddressSpace::empty();
+    let plain = VirtAddr::new(0x0000_4080_2500_0000);
+    let inherited = VirtAddr::new(0x0000_4080_2500_1000);
+    if a.map_region(Region {
+        base: plain,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+        || a.update_mlockall(None, FutureLockPolicy::OnFault).is_err()
+        || a.map_region(Region {
+            base: inherited,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mlockall transaction setup failed");
+    }
+    if a.update_mlockall_limited(
+        Some(FutureLockPolicy::Eager),
+        FutureLockPolicy::Eager,
+        0x1000,
+        false,
+    ) != Err(AddressSpaceError::LockLimit)
+    {
+        return TestResult::Fail("mlockall over the lock limit did not fail");
+    }
+
+    let plain_unchanged = a.lookup(plain).is_some_and(|region| {
+        !region.perms.contains(RegionPerms::LOCKED)
+            && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0].raw() == 0
+    });
+    let inherited_unchanged = a.lookup(inherited).is_some_and(|region| {
+        region.perms.contains(RegionPerms::LOCKED)
+            && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0].raw() == 0
+    });
+    if a.future_lock_policy() == FutureLockPolicy::OnFault && plain_unchanged && inherited_unchanged
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("failed mlockall changed prior current/future lock state")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_mlockall_limit_failure_preserves_state
+);
+
+/// NARF's explicit stack-guard region models Linux's unmapped guard gap. It
+/// must not consume RLIMIT_MEMLOCK admission for MCL_CURRENT.
+fn smoke_memory_mlockall_limit_excludes_stack_guard() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let plain = VirtAddr::new(0x0000_4080_2580_0000);
+    let guard = VirtAddr::new(0x0000_4080_2580_1000);
+    if a.map_region(Region {
+        base: plain,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+        || a.map_region(Region {
+            base: guard,
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("guard accounting setup failed");
+    }
+    if a.update_mlockall_limited(
+        Some(FutureLockPolicy::OnFault),
+        FutureLockPolicy::None,
+        0x1000,
+        false,
+    )
+    .is_err()
+    {
+        return TestResult::Fail("synthetic guard consumed RLIMIT_MEMLOCK");
+    }
+    let plain_locked = a.lookup(plain).is_some_and(|region| {
+        region.perms.contains(RegionPerms::LOCKED)
+            && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+    });
+    let guard_unlocked = a.lookup(guard).is_some_and(|region| {
+        !region.perms.contains(RegionPerms::LOCKED)
+            && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+    });
+    if plain_locked && guard_unlocked {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("MCL_CURRENT changed the synthetic guard")
+    }
+}
+kernel_test_in!("memory", smoke_memory_mlockall_limit_excludes_stack_guard);
+
+/// A PROT_NONE special VMA is neither eligible for inherited future locking
+/// nor for MCL_CURRENT.  Its lazy slot must remain untouched by both eager
+/// population opportunities.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_lock_exempt_prot_none_ignores_mlockall() -> TestResult {
+    use crate::{AddressSpace, FutureLockPolicy, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned user root; paging is live in the test harness.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = VirtAddr::new(0x0000_4080_2600_0000);
+    if a.update_mlockall(None, FutureLockPolicy::Eager).is_err()
+        || a.map_region(Region {
+            base,
+            len: 0x1000,
+            perms: RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || a.update_mlockall(Some(FutureLockPolicy::Eager), FutureLockPolicy::Eager)
+            .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("lock-exempt setup or mlockall failed");
+    }
+    let exempt = a.lookup(base).is_some_and(|region| {
+        region.perms.prot_only().0 == 0
+            && region.perms.contains(RegionPerms::LOCK_EXEMPT)
+            && !region.perms.contains(RegionPerms::LOCKED)
+            && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0].raw() == 0
+    });
+    core::mem::forget(a);
+    if exempt {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("mlockall locked or populated a PROT_NONE lock-exempt VMA")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_lock_exempt_prot_none_ignores_mlockall
+);
+
+/// Growing an eagerly locked VMA must populate the appended pages immediately;
+/// leaving a zero slot would violate the original eager-lock contract.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_eager_locked_grow_populates_tail() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned user root and initialized frame allocator.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let resident = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let base = VirtAddr::new(0x0000_4080_2700_0000);
+    if a.map_region(Region {
+        base,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+        phys: alloc::vec![resident],
+    })
+    .is_err()
+        || a.grow_region(base, 0x2000).is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("eager locked grow failed");
+    }
+    let populated = a.lookup(base).is_some_and(|region| {
+        region.len == 0x2000
+            && region.perms.contains(RegionPerms::LOCKED)
+            && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+            && region.phys[0] == resident
+            && region.phys[1].raw() != 0
+            && region.phys[1] != resident
+    });
+    core::mem::forget(a);
+    if populated {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("eager locked grow left its appended page lazy")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_eager_locked_grow_populates_tail);
+
+/// A user-half-valid but allocator-impossible mremap grow must report a typed
+/// allocation failure instead of entering the kernel allocator's abort path.
+/// The failed reservation is made before `Region::len` or its backing vector
+/// changes, so the original mapping remains authoritative.
+fn smoke_memory_grow_metadata_allocation_is_fallible() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let base = VirtAddr::new(AddressSpace::MMAP_CURSOR_BASE);
+    if address_space
+        .map_region(Region {
+            base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("metadata-allocation setup failed");
+    }
+    let impossible_len = AddressSpace::USER_HALF_END - base.as_u64();
+    if address_space.grow_region(base, impossible_len) != Err(AddressSpaceError::AllocationFailed) {
+        return TestResult::Fail("impossible metadata grow did not fail cleanly");
+    }
+    if address_space
+        .lookup(base)
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![PhysAddr::new(0)])
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("failed metadata reservation changed the source VMA")
+    }
+}
+kernel_test_in!("memory", smoke_memory_grow_metadata_allocation_is_fallible);
+
+/// mremap growth follows Linux's MEMLOCK -> AS -> DATA admission order and
+/// implements the RLIMIT_DATA soft-zero/hard-limit compatibility exception.
+fn smoke_memory_mremap_growth_limit_order_and_data_compat() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms, VirtAddr,
+    };
+
+    let locked = AddressSpace::empty();
+    let locked_base = VirtAddr::new(0x0000_4080_2500_0000);
+    if locked
+        .map_region(Region {
+            base: locked_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("mremap limit-order setup failed");
+    }
+    let both_exceeded = locked.grow_region_limited(
+        locked_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: 0x1000,
+            address_space_bytes: 0x1000,
+            data_bytes: u64::MAX,
+            data_max_bytes: u64::MAX,
+            bypass_memlock: false,
+        },
+    );
+    let as_exceeded = locked.grow_region_limited(
+        locked_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: 0x1000,
+            data_bytes: u64::MAX,
+            data_max_bytes: u64::MAX,
+            bypass_memlock: true,
+        },
+    );
+    if both_exceeded != Err(AddressSpaceError::LockLimit)
+        || as_exceeded != Err(AddressSpaceError::MappingLimit)
+        || locked
+            .lookup(locked_base)
+            .is_none_or(|region| region.len != 0x1000)
+    {
+        return TestResult::Fail("mremap growth limit ordering or rollback was wrong");
+    }
+
+    let soft_zero = AddressSpace::empty();
+    let soft_zero_base = VirtAddr::new(0x0000_4080_2510_0000);
+    if soft_zero
+        .map_region(Region {
+            base: soft_zero_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("RLIMIT_DATA compatibility setup failed");
+    }
+    let compat = soft_zero.grow_region_limited(
+        soft_zero_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: u64::MAX,
+            data_bytes: 0,
+            data_max_bytes: 0x2000,
+            bypass_memlock: true,
+        },
+    );
+
+    let hard = AddressSpace::empty();
+    let hard_base = VirtAddr::new(0x0000_4080_2520_0000);
+    if hard
+        .map_region(Region {
+            base: hard_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("RLIMIT_DATA hard-limit setup failed");
+    }
+    let beyond_hard = hard.grow_region_limited(
+        hard_base,
+        0x2000,
+        MremapLimits {
+            memlock_bytes: u64::MAX,
+            address_space_bytes: u64::MAX,
+            data_bytes: 0,
+            data_max_bytes: 0x1000,
+            bypass_memlock: true,
+        },
+    );
+    if compat.is_ok()
+        && soft_zero
+            .lookup(soft_zero_base)
+            .is_some_and(|region| region.len == 0x2000)
+        && beyond_hard == Err(AddressSpaceError::MappingLimit)
+        && hard
+            .lookup(hard_base)
+            .is_some_and(|region| region.len == 0x1000)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("RLIMIT_DATA soft-zero compatibility did not match Linux")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_mremap_growth_limit_order_and_data_compat
+);
+
+/// Shared mremap aliases may select an interval inside one Region. Historical
+/// old_len==0 duplication performs MEMLOCK before AS admission and leaves the
+/// source lock state alone; DONTUNMAP skips MEMLOCK, charges the complete new
+/// VMA, and clears the lock bits only after the alias commits.
+fn smoke_memory_shared_mremap_interval_and_limit_modes() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms,
+        SharedMremapMode, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2600_0000);
+    let duplicate = VirtAddr::new(0x0000_4080_2610_0000);
+    let dontunmap = VirtAddr::new(0x0000_4080_2620_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x3000,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::SHARED
+                | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0); 3],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("shared mremap interval setup failed");
+    }
+
+    // The source already accounts for three locked pages, so a fourth page
+    // fails Duplicate's pre-mutation MEMLOCK admission even though AS is open.
+    // SAFETY: AddressSpace::empty has no live root; the test exercises only
+    // serialized metadata publication.
+    let memlock_failure = unsafe {
+        address_space.alias_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            duplicate,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x3000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if memlock_failure != Err(AddressSpaceError::LockLimit)
+        || address_space.lookup(duplicate).is_some()
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("Duplicate did not fail atomically at MEMLOCK");
+    }
+
+    // SAFETY: same metadata-only address-space contract as above.
+    let duplicate_result = unsafe {
+        address_space.alias_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            duplicate,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x4000,
+                address_space_bytes: 0x4000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if duplicate_result.is_err()
+        || address_space.lookup(duplicate).is_none_or(|region| {
+            region.len != 0x1000 || !region.perms.contains(RegionPerms::LOCKED)
+        })
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("Duplicate did not preserve interval/lock metadata");
+    }
+
+    // Four pages are now mapped. DONTUNMAP bypasses a deliberately impossible
+    // MEMLOCK limit but must fail AS admission before changing either VMA.
+    // SAFETY: same metadata-only address-space contract as above.
+    let as_failure = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            dontunmap,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x4000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if as_failure != Err(AddressSpaceError::MappingLimit)
+        || address_space.lookup(dontunmap).is_some()
+        || address_space
+            .lookup(source)
+            .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+    {
+        return TestResult::Fail("DONTUNMAP AS failure changed source metadata");
+    }
+
+    // SAFETY: same metadata-only address-space contract as above.
+    let dontunmap_result = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            dontunmap,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x5000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if dontunmap_result.is_ok()
+        && address_space.lookup(source).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED)
+                && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+        })
+        && address_space.lookup(dontunmap).is_some_and(|region| {
+            region.len == 0x1000 && region.perms.contains(RegionPerms::LOCKED)
+        })
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("DONTUNMAP did not transfer the shared lock contract")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_mremap_interval_and_limit_modes
+);
+
+/// Linux permits ordinary demand-paged file VMAs in DONTUNMAP despite their
+/// lock-accounting exemption, rejects PFN/device-like DONTUNMAP sources, and
+/// still permits the legacy old_len==0 shared duplication of such sources.
+fn smoke_memory_shared_mremap_lock_exempt_eligibility() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, MremapLimits, PhysAddr, Region, RegionPerms,
+        SharedMremapMode, VirtAddr,
+    };
+
+    let file_as = AddressSpace::empty();
+    let file_source = VirtAddr::new(0x0000_4080_2630_0000);
+    let file_alias = VirtAddr::new(0x0000_4080_2640_0000);
+    if file_as
+        .map_region(Region {
+            base: file_source,
+            len: 0x1000,
+            perms: RegionPerms::READ
+                | RegionPerms::SHARED
+                | RegionPerms::FILE_DEMAND
+                | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("file DONTUNMAP eligibility setup failed");
+    }
+    // SAFETY: metadata-only address space; wrapper supplies both transactions.
+    let file_result = unsafe {
+        file_as.alias_shared_region_limited(
+            file_source,
+            0x1000,
+            file_alias,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if file_result.is_err() || file_as.lookup(file_alias).is_none() {
+        return TestResult::Fail("demand-paged file DONTUNMAP was rejected");
+    }
+
+    let device_as = AddressSpace::empty();
+    let device_source = VirtAddr::new(0x0000_4080_2650_0000);
+    let duplicate_alias = VirtAddr::new(0x0000_4080_2660_0000);
+    let dontunmap_alias = VirtAddr::new(0x0000_4080_2670_0000);
+    if device_as
+        .map_region(Region {
+            base: device_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("device shared-duplication eligibility setup failed");
+    }
+    // SAFETY: same metadata-only transaction contract as above.
+    let duplicate_result = unsafe {
+        device_as.alias_shared_region_limited(
+            device_source,
+            0x1000,
+            duplicate_alias,
+            SharedMremapMode::Duplicate,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: same metadata-only transaction contract as above.
+    let dontunmap_result = unsafe {
+        device_as.alias_shared_region_limited(
+            device_source,
+            0x1000,
+            dontunmap_alias,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if duplicate_result.is_ok()
+        && dontunmap_result == Err(AddressSpaceError::NotImplemented)
+        && device_as.lookup(duplicate_alias).is_some()
+        && device_as.lookup(dontunmap_alias).is_none()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("LOCK_EXEMPT mode-specific eligibility diverged")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_mremap_lock_exempt_eligibility);
+
+/// Duplicate preflight preserves a fixed target, while DONTUNMAP deliberately
+/// performs full AS admission after target retirement and reports that state.
+fn smoke_memory_shared_mremap_fixed_punch_order() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, SharedMremapMode, VirtAddr,
+    };
+
+    let duplicate_as = AddressSpace::empty();
+    let duplicate_source = VirtAddr::new(0x0000_4080_2700_0000);
+    let duplicate_target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    if duplicate_as
+        .map_region(Region {
+            base: duplicate_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || duplicate_as
+            .map_region(Region {
+                base: duplicate_target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("fixed Duplicate setup failed");
+    }
+    // SAFETY: AddressSpace::empty has no live root; both wrappers serialize
+    // their metadata-only fixed transactions internally.
+    let duplicate_failure = unsafe {
+        duplicate_as.alias_shared_region_fixed_limited(
+            duplicate_source,
+            0x1000,
+            duplicate_target,
+            SharedMremapMode::Duplicate,
+            MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if duplicate_failure
+        != Err(FixedRelocationError {
+            error: AddressSpaceError::LockLimit,
+            target_punched: false,
+            source_shrunk: false,
+        })
+        || duplicate_as.lookup(duplicate_target).is_none()
+    {
+        return TestResult::Fail("Duplicate limit failure retired its fixed target");
+    }
+
+    let dontunmap_as = AddressSpace::empty();
+    let dontunmap_source = VirtAddr::new(0x0000_4080_2710_0000);
+    let dontunmap_target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    if dontunmap_as
+        .map_region(Region {
+            base: dontunmap_source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || dontunmap_as
+            .map_region(Region {
+                base: dontunmap_target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("fixed DONTUNMAP setup failed");
+    }
+    // SAFETY: same metadata-only fixed transaction contract as above.
+    let dontunmap_failure = unsafe {
+        dontunmap_as.alias_shared_region_fixed_limited(
+            dontunmap_source,
+            0x1000,
+            dontunmap_target,
+            SharedMremapMode::DontUnmap,
+            MremapLimits {
+                memlock_bytes: 0,
+                address_space_bytes: 0x1000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::MappingLimit,
+        target_punched: true,
+        source_shrunk: false,
+    });
+    if dontunmap_failure == expected
+        && dontunmap_as.lookup(dontunmap_target).is_none()
+        && dontunmap_as
+            .lookup(dontunmap_source)
+            .is_some_and(|region| region.perms.contains(RegionPerms::LOCKED))
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("DONTUNMAP did not expose its post-punch limit failure")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_mremap_fixed_punch_order);
+
+/// Shared DONTUNMAP moves source residency/rmap authority to the destination,
+/// keeps both backing descriptions, and lets the retained source fault the
+/// same shared frame back in.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
+    use crate::{
+        AddressSpace, MremapLimits, PhysAddr, PhysFrame, Region, RegionPerms, SharedMremapMode,
+        VirtAddr,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: the fresh user root is owned exclusively by this test and is
+    // never activated as a task address space.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared alias root allocation failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared alias backing allocation failed"),
+    };
+    let source = VirtAddr::new(0x0000_4094_0000_0000);
+    let destination = VirtAddr::new(0x0000_4095_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both required structural transactions are held; the root
+            // and allocated backing remain live for publication/materialization.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x1000,
+                    perms: RegionPerms::READ
+                        | RegionPerms::WRITE
+                        | RegionPerms::SHARED
+                        | RegionPerms::LOCKED,
+                    phys: alloc::vec![frame],
+                })?;
+                address_space.materialize_range(source, 0x1000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared alias source materialization failed");
+    }
+
+    #[cfg(feature = "kernel-test")]
+    {
+        crate::address_space::__test_fail_next_shared_alias_after_install();
+        // SAFETY: same live test-root and wrapper-supplied transactions as the
+        // successful publication below. The injected error fires only after
+        // the destination PTE has been installed.
+        let injected = unsafe {
+            address_space.alias_shared_region_limited(
+                source,
+                0x1000,
+                destination,
+                SharedMremapMode::DontUnmap,
+                MremapLimits::UNLIMITED,
+            )
+        };
+        // SAFETY: the rollback has completed while the test root remains live.
+        let rolled_back_destination = unsafe { translated(&address_space, destination) };
+        if injected != Err(crate::AddressSpaceError::AllocationFailed)
+            || rolled_back_destination.is_some()
+            || crate::rmap::owner_count(frame) != 1
+            || address_space.lookup(destination).is_some()
+            || address_space
+                .lookup(source)
+                .is_none_or(|region| !region.perms.contains(RegionPerms::LOCKED))
+        {
+            return TestResult::Fail("shared alias post-install rollback leaked state");
+        }
+    }
+
+    // SAFETY: the test-owned user root and backing remain live; the convenience
+    // wrapper supplies VMA then shared-owner serialization.
+    let aliased = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            destination,
+            SharedMremapMode::DontUnmap,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: both read-only walks target this test's still-live user root.
+    let source_translation = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof as the source walk.
+    let destination_translation = unsafe { translated(&address_space, destination) };
+    let moved = aliased.is_ok()
+        && source_translation.is_none()
+        && destination_translation == Some(frame)
+        && crate::rmap::owner_count(frame) == 1
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![0])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1])
+        && address_space.lookup(source).is_some_and(|region| {
+            !region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+        })
+        && address_space.lookup(destination).is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED) && region.phys == alloc::vec![frame]
+        });
+    if !moved {
+        return TestResult::Fail("shared DONTUNMAP did not move residency/rmap authority");
+    }
+
+    // SAFETY: the retained source VMA still owns shared backing in this live
+    // test root. The backed-fault repair path must reinstall its leaf and rmap.
+    let refaulted = unsafe { address_space.demand_alloc_page(source) };
+    // SAFETY: both walks target the still-live test root after refault repair.
+    let source_after_refault = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof for the unchanged destination.
+    let destination_after_refault = unsafe { translated(&address_space, destination) };
+    let correct = refaulted.is_ok()
+        && source_after_refault == Some(frame)
+        && destination_after_refault == Some(frame)
+        && crate::rmap::owner_count(frame) == 2
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![1])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(frame));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared DONTUNMAP source did not refault its backing")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_mremap_installs_destination_rmap
+);
+
+/// Legacy old_len==0 shared duplication clones resident leaves instead of
+/// moving them, unlike DONTUNMAP.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
+    use crate::{
+        AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, SharedMremapMode, VirtAddr,
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: fresh test-owned root is never activated by a task.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared Duplicate root allocation failed"),
+    };
+    let frame = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared Duplicate backing allocation failed"),
+    };
+    let source = VirtAddr::new(0x0000_4096_0000_0000);
+    let destination = VirtAddr::new(0x0000_4097_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both structural transactions and live-root ownership are
+            // held through mapping and materialization.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x1000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                    phys: alloc::vec![frame],
+                })?;
+                address_space.materialize_range(source, 0x1000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared Duplicate source materialization failed");
+    }
+    // SAFETY: wrapper supplies both transactions; root/backing remain live.
+    let duplicated = unsafe {
+        address_space.alias_shared_region_limited(
+            source,
+            0x1000,
+            destination,
+            SharedMremapMode::Duplicate,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: both translations read this test's live root.
+    let source_translation = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof as the source translation.
+    let destination_translation = unsafe { translated(&address_space, destination) };
+    let correct = duplicated.is_ok()
+        && source_translation == Some(frame)
+        && destination_translation == Some(frame)
+        && crate::rmap::owner_count(frame) == 2
+        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![1])
+        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(frame));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared Duplicate moved rather than cloned residency")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shared_duplicate_clones_residency);
+
+/// Ordinary nonzero-length shared mremap may select an interval inside one
+/// VMA, preserve both outside fragments, transfer only the kept backing, and
+/// lazily extend a locked destination after admitting the growth delta.
+fn smoke_memory_shared_relocation_splits_and_grows() -> TestResult {
+    use crate::{AddressSpace, MremapLimits, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2c00_0000);
+    let destination = VirtAddr::new(0x0000_4080_2d00_0000);
+    let backing = alloc::vec![
+        PhysAddr::new(0x1100_0000),
+        PhysAddr::new(0x1100_1000),
+        PhysAddr::new(0x1100_2000),
+        PhysAddr::new(0x1100_3000),
+    ];
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x4000,
+            perms: RegionPerms::READ
+                | RegionPerms::WRITE
+                | RegionPerms::SHARED
+                | RegionPerms::LOCKED,
+            phys: backing.clone(),
+        })
+        .is_err()
+    {
+        return TestResult::Fail("shared relocation split setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no live root; the wrapper supplies both
+    // structural transactions for this metadata-only move.
+    let moved = unsafe {
+        address_space.relocate_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x2000,
+            destination,
+            0x3000,
+            MremapLimits {
+                memlock_bytes: 0x5000,
+                address_space_bytes: 0x5000,
+                data_bytes: 0,
+                data_max_bytes: 0,
+                bypass_memlock: false,
+            },
+        )
+    };
+    let head = address_space
+        .lookup(source)
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[0]]);
+    let removed = address_space
+        .lookup(VirtAddr::new(source.as_u64() + 0x1000))
+        .is_none();
+    let tail = address_space
+        .lookup(VirtAddr::new(source.as_u64() + 0x3000))
+        .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![backing[3]]);
+    let destination_correct = address_space.lookup(destination).is_some_and(|region| {
+        region.len == 0x3000
+            && region.perms.contains(RegionPerms::LOCKED)
+            && region.phys == alloc::vec![backing[1], backing[2], PhysAddr::new(0)]
+    });
+    if moved.is_ok() && head && removed && tail && destination_correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared relocation did not preserve split/backing metadata")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_relocation_splits_and_grows);
+
+/// Region-index allocation is part of relocation preflight. Ordinary moves
+/// leave the source authoritative, and fixed moves fail before retiring an
+/// occupied target, when arena capacity cannot be prepared.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_shared_relocation_index_oom_is_preflight() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_409d_0000_0000);
+    let destination = VirtAddr::new(0x0000_409e_0000_0000);
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR + 0x80_0000);
+    let source_phys = alloc::vec![PhysAddr::new(0), PhysAddr::new(0), PhysAddr::new(0),];
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x3000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            phys: source_phys.clone(),
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("region-index OOM setup failed");
+    }
+
+    address_space.__test_fail_next_region_index_reserve();
+    // SAFETY: AddressSpace::empty is metadata-only and this wrapper supplies
+    // both structural transactions.
+    let ordinary = unsafe {
+        address_space.relocate_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x1000,
+            destination,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if ordinary != Err(AddressSpaceError::AllocationFailed)
+        || address_space.lookup(destination).is_some()
+        || !address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+    {
+        return TestResult::Fail("ordinary shared index OOM mutated VMA state");
+    }
+
+    address_space.__test_fail_next_region_index_reserve();
+    // SAFETY: same metadata-only proof. The occupied target must remain live
+    // because its punch also prepares capacity for the later destination.
+    let fixed = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x3000,
+            target,
+            0x3000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: false,
+        source_shrunk: false,
+    });
+    if fixed == expected
+        && address_space.lookup(target).is_some()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x3000 && region.phys == source_phys)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fixed shared index OOM retired source or target")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_relocation_index_oom_is_preflight
+);
+
+/// A resident ordinary shared move transfers PTE/rmap authority instead of
+/// cloning it. A truncated page loses its rmap only after the source leaves
+/// are retired, while a failed post-install attempt rolls back to the source.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_shared_relocation_moves_residency() -> TestResult {
+    use crate::{AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, VirtAddr};
+
+    // This test asserts exact global reverse-map owner counts. Isolate those
+    // counts from deliberately retained mappings in earlier memory smokes.
+    crate::rmap::__reset_for_test();
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned root.
+        unsafe { crate::x86_64::paging::translate(address_space.root, va) }
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
+        // SAFETY: caller supplies this test's live, exclusively-owned root.
+        unsafe { crate::aarch64::paging::translate(address_space.root, va) }
+    }
+
+    // SAFETY: fresh test root is exclusively owned and never activated.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("shared relocation root allocation failed"),
+    };
+    let first = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("shared relocation first frame unavailable"),
+    };
+    let second = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            crate::free_frame(PhysFrame::new(first));
+            return TestResult::Skip("shared relocation second frame unavailable");
+        }
+    };
+    let source = VirtAddr::new(0x0000_4098_0000_0000);
+    #[cfg(feature = "kernel-test")]
+    let rollback_destination = VirtAddr::new(0x0000_4099_0000_0000);
+    let destination = VirtAddr::new(0x0000_409a_0000_0000);
+    let mapped = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: both structural transactions, the live root, and backing
+            // frames remain owned by this test.
+            unsafe {
+                address_space.map_shared_region_locked(Region {
+                    base: source,
+                    len: 0x2000,
+                    perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+                    phys: alloc::vec![first, second],
+                })?;
+                address_space.materialize_range(source, 0x2000)
+            }
+        })
+    });
+    if mapped.is_err() {
+        return TestResult::Fail("shared relocation materialization failed");
+    }
+
+    #[cfg(feature = "kernel-test")]
+    {
+        crate::address_space::__test_fail_next_shared_relocation_after_install();
+        // SAFETY: wrapper supplies both transactions; injected failure occurs
+        // before any source/rmap/backing commit.
+        let injected = unsafe {
+            address_space.relocate_shared_region_limited(
+                source,
+                0x2000,
+                rollback_destination,
+                0x1000,
+                MremapLimits::UNLIMITED,
+            )
+        };
+        // SAFETY: all translations inspect this test's still-live root.
+        let source_first = unsafe { translated(&address_space, source) };
+        // SAFETY: same live-root proof.
+        let source_second =
+            unsafe { translated(&address_space, VirtAddr::new(source.as_u64() + 0x1000)) };
+        // SAFETY: same live-root proof after rollback.
+        let rolled_back = unsafe { translated(&address_space, rollback_destination) };
+        if injected != Err(crate::AddressSpaceError::AllocationFailed) {
+            return TestResult::Fail("shared relocation injection returned the wrong error");
+        }
+        if source_first != Some(first) || source_second != Some(second) {
+            return TestResult::Fail("shared relocation rollback changed source translations");
+        }
+        if rolled_back.is_some() {
+            return TestResult::Fail("shared relocation rollback left a destination translation");
+        }
+        if crate::rmap::owner_count(first) != 1 || crate::rmap::owner_count(second) != 1 {
+            return TestResult::Fail("shared relocation rollback changed reverse-map ownership");
+        }
+        if address_space.lookup(rollback_destination).is_some() {
+            return TestResult::Fail("shared relocation rollback left destination metadata");
+        }
+    }
+
+    // SAFETY: wrapper supplies both transactions; root/backing remain live.
+    let moved = unsafe {
+        address_space.relocate_shared_region_limited(
+            source,
+            0x2000,
+            destination,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    // SAFETY: all translations inspect the test-owned live root.
+    let old_first = unsafe { translated(&address_space, source) };
+    // SAFETY: same live-root proof.
+    let old_second = unsafe { translated(&address_space, VirtAddr::new(source.as_u64() + 0x1000)) };
+    // SAFETY: same live-root proof.
+    let new_first = unsafe { translated(&address_space, destination) };
+    let correct = moved.is_ok()
+        && old_first.is_none()
+        && old_second.is_none()
+        && new_first == Some(first)
+        && crate::rmap::owner_count(first) == 1
+        && crate::rmap::contains_owner(first, address_space.root, destination)
+        && crate::rmap::owner_count(second) == 0
+        && address_space.lookup(source).is_none()
+        && address_space
+            .lookup(destination)
+            .is_some_and(|region| region.len == 0x1000 && region.phys == alloc::vec![first]);
+    drop(address_space);
+    crate::free_frame(PhysFrame::new(first));
+    crate::free_frame(PhysFrame::new(second));
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("ordinary shared relocation cloned or lost residency")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("memory", smoke_memory_shared_relocation_moves_residency);
+
+/// Ordinary shared fixed moves admit locked growth before target retirement
+/// and expose every later failure as destructive, matching Linux's ownership
+/// handoff boundary.
+fn smoke_memory_shared_relocation_fixed_order() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::SHARED | RegionPerms::LOCKED,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("shared fixed relocation setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no live root; wrappers serialize these
+    // metadata-only fixed transactions.
+    let early = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    if early
+        != Err(FixedRelocationError {
+            error: AddressSpaceError::LockLimit,
+            target_punched: false,
+            source_shrunk: false,
+        })
+        || address_space.lookup(target).is_none()
+    {
+        return TestResult::Fail("shared fixed preflight retired its target");
+    }
+
+    let impossible_len = source.as_u64() - target.as_u64();
+    // SAFETY: same metadata-only fixed transaction. Proportional preparation
+    // fails only after the one-page target has been punched.
+    let late = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            impossible_len,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if late
+        == Err(FixedRelocationError {
+            error: AddressSpaceError::AllocationFailed,
+            target_punched: true,
+            source_shrunk: false,
+        })
+        && address_space.lookup(target).is_none()
+        && address_space.lookup(source).is_some()
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared fixed relocation hid its destructive failure")
+    }
+}
+kernel_test_in!("memory", smoke_memory_shared_relocation_fixed_order);
+
+/// Linux fixed-shrink ordering retires the destination, truncates the source,
+/// then attempts the move. A late move failure must expose both destructive
+/// steps so external file/SysV owners can publish the identical state.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_shared_fixed_shrink_reports_source_state() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(0x0000_409b_0000_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x2000,
+            perms: RegionPerms::READ | RegionPerms::SHARED,
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("shared fixed-shrink setup failed");
+    }
+
+    crate::address_space::__test_fail_next_fixed_relocation_after_shrink();
+    // SAFETY: AddressSpace::empty is metadata-only and the wrapper supplies
+    // the VMA then shared-owner transactions around the complete operation.
+    let result = unsafe {
+        address_space.relocate_shared_region_fixed_limited(
+            source,
+            0x2000,
+            target,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+        source_shrunk: true,
+    });
+    if result == expected
+        && address_space.lookup(target).is_none()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x1000 && region.phys.len() == 1)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared fixed-shrink failure state diverged from Linux")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_shared_fixed_shrink_reports_source_state
+);
+
+/// Private fixed shrinking has the same Linux progress boundary as SHARED:
+/// destination retirement and source truncation remain committed if the later
+/// move fails.
+#[cfg(feature = "kernel-test")]
+fn smoke_memory_private_fixed_shrink_reports_source_state() -> TestResult {
+    use crate::{
+        AddressSpace, AddressSpaceError, FixedRelocationError, MremapLimits, PhysAddr, Region,
+        RegionPerms, VirtAddr,
+    };
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(0x0000_409c_0000_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x2000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x1000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("private fixed-shrink setup failed");
+    }
+
+    crate::address_space::__test_fail_next_fixed_relocation_after_shrink();
+    // SAFETY: AddressSpace::empty is metadata-only and the wrapper supplies
+    // the required VMA transaction.
+    let result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x2000,
+            target,
+            0x1000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let expected = Err(FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+        source_shrunk: true,
+    });
+    if result == expected
+        && address_space.lookup(target).is_none()
+        && address_space
+            .lookup(source)
+            .is_some_and(|region| region.len == 0x1000 && region.phys.len() == 1)
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("private fixed-shrink failure state diverged from Linux")
+    }
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_private_fixed_shrink_reports_source_state
+);
+
+/// Page-table frame exhaustion is an allocation failure (`ENOMEM` at Linux
+/// syscall boundaries), not a malformed address or an occupied destination.
+fn smoke_memory_paging_install_error_classification() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError};
+
+    #[cfg(target_arch = "x86_64")]
+    let correct = {
+        use crate::x86_64::paging::MapError;
+        AddressSpace::paging_install_error(MapError::FrameExhausted)
+            == AddressSpaceError::AllocationFailed
+            && AddressSpace::paging_install_error(MapError::NonCanonical)
+                == AddressSpaceError::OutOfRange
+            && AddressSpace::paging_install_error(MapError::AlreadyMapped)
+                == AddressSpaceError::Overlap
+            && AddressSpace::paging_install_error(MapError::EncounteredHugePage)
+                == AddressSpaceError::Overlap
+    };
+    #[cfg(target_arch = "aarch64")]
+    let correct = {
+        use crate::aarch64::paging::MapError;
+        AddressSpace::paging_install_error(MapError::NoFrame) == AddressSpaceError::AllocationFailed
+            && AddressSpace::paging_install_error(MapError::NonCanonical)
+                == AddressSpaceError::OutOfRange
+            && AddressSpace::paging_install_error(MapError::AlreadyMapped)
+                == AddressSpaceError::Overlap
+            && AddressSpace::paging_install_error(MapError::EncounteredBlock)
+                == AddressSpaceError::Overlap
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let correct = true;
+
+    if correct {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("paging install errors collapsed allocation into range/state")
+    }
+}
+kernel_test_in!("memory", smoke_memory_paging_install_error_classification);
+
+/// A relocating grow preserves the source lock mode and eagerly populates only
+/// the new destination tail.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_memory_eager_locked_relocate_growth_populates_tail() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: fresh test-owned user root and initialized frame allocator.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let resident = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            core::mem::forget(a);
+            return TestResult::Skip("frame drained");
+        }
+    };
+    let old = VirtAddr::new(0x0000_4080_2800_0000);
+    let new = VirtAddr::new(0x0000_4080_2900_0000);
+    if a.map_region(Region {
+        base: old,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+        phys: alloc::vec![resident],
+    })
+    .is_err()
+    {
+        core::mem::forget(a);
+        return TestResult::Fail("eager relocate setup failed");
+    }
+    // SAFETY: disjoint aligned user ranges in this exclusively-owned live AS.
+    if unsafe { a.relocate_region(old, 0x1000, new, 0x2000) }.is_err() {
+        core::mem::forget(a);
+        return TestResult::Fail("eager locked relocate growth failed");
+    }
+    let populated = a.lookup(old).is_none()
+        && a.lookup(new).is_some_and(|region| {
+            region.len == 0x2000
+                && region.perms.contains(RegionPerms::LOCKED)
+                && !region.perms.contains(RegionPerms::LOCK_ONFAULT)
+                && region.phys[0] == resident
+                && region.phys[1].raw() != 0
+                && region.phys[1] != resident
+        });
+    core::mem::forget(a);
+    if populated {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("relocating eager grow left its new tail lazy")
+    }
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_eager_locked_relocate_growth_populates_tail
+);
+
+/// Fixed relocation performs every non-destructive request/limit check before
+/// punching the destination. Linux leaves the target intact for these early
+/// failures.
+fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2a00_0000);
+    let target = VirtAddr::new(0x0000_4080_2b00_0000);
+    let source_phys = PhysAddr::new(0x0200_0000);
+    let target_phys = PhysAddr::new(0x0300_0000);
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+            phys: alloc::vec![source_phys],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: target,
+                len: 0x2000,
+                perms: RegionPerms::READ,
+                phys: alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("fixed-relocate preflight setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no live page-table root, so this test
+    // exercises metadata transactions only.
+    let limit_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: 0x1000,
+                address_space_bytes: u64::MAX,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: false,
+            },
+        )
+    };
+    // SAFETY: as above; the out-of-range target must be rejected before any
+    // page-table operation.
+    let invalid_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000),
+            0x2000,
+            crate::MremapLimits::UNLIMITED,
+        )
+    };
+    // AS and DATA admission are also pre-punch checks. The existing source
+    // plus target account for three pages; a one-page growth must fail against
+    // the three-page AS ceiling without retiring either target page.
+    // SAFETY: AddressSpace::empty has no live root; this is metadata-only.
+    let as_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: u64::MAX,
+                address_space_bytes: 0x3000,
+                data_bytes: u64::MAX,
+                data_max_bytes: u64::MAX,
+                bypass_memlock: true,
+            },
+        )
+    };
+    // SAFETY: same metadata-only transaction as the AS-limit check above.
+    let data_result = unsafe {
+        address_space.relocate_region_fixed_limited(
+            source,
+            0x1000,
+            target,
+            0x2000,
+            crate::MremapLimits {
+                memlock_bytes: u64::MAX,
+                address_space_bytes: u64::MAX,
+                data_bytes: 0x1000,
+                data_max_bytes: 0x1000,
+                bypass_memlock: true,
+            },
+        )
+    };
+    let target_preserved = address_space.lookup(target).is_some_and(|region| {
+        region.len == 0x2000
+            && region.perms.prot_only() == RegionPerms::READ
+            && region.phys == alloc::vec![target_phys, PhysAddr::new(target_phys.raw() + 0x1000)]
+    });
+    let source_preserved = address_space.lookup(source).is_some_and(|region| {
+        region.len == 0x1000
+            && region.perms.contains(RegionPerms::LOCKED)
+            && region.phys == alloc::vec![source_phys]
+    });
+    let early = |error| {
+        Err(crate::FixedRelocationError {
+            error,
+            target_punched: false,
+            source_shrunk: false,
+        })
+    };
+    if limit_result == early(AddressSpaceError::LockLimit)
+        && invalid_result == early(AddressSpaceError::OutOfRange)
+        && as_result == early(AddressSpaceError::MappingLimit)
+        && data_result == early(AddressSpaceError::MappingLimit)
+        && source_preserved
+        && target_preserved
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("failed fixed-relocate preflight changed source or target")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_fixed_relocate_preflight_preserves_target
+);
+
+/// Once MAP_FIXED has retired its target, a later fallible relocation failure
+/// must report that destructive state so filesystem/SysV owner tables mirror
+/// memory instead of retaining stale backing references.
+fn smoke_memory_fixed_relocate_reports_post_punch_failure() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let target = VirtAddr::new(AddressSpace::USER_FIXED_FLOOR);
+    let source = VirtAddr::new(AddressSpace::USER_HALF_END - 0x1000);
+    if address_space
+        .map_region(Region {
+            base: target,
+            len: 0x1000,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: source,
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("post-punch failure setup failed");
+    }
+    let impossible_len = source.as_u64() - target.as_u64();
+    let outcome = address_space.with_vma_transaction(|| {
+        crate::with_shared_mapping_transaction(|| {
+            // SAFETY: metadata-only AddressSpace::empty has no live root and
+            // both required structural transactions are held.
+            unsafe {
+                address_space.relocate_region_fixed_locked_limited(
+                    source,
+                    0x1000,
+                    target,
+                    impossible_len,
+                    crate::MremapLimits::UNLIMITED,
+                    false,
+                )
+            }
+        })
+    });
+    let expected = Err(crate::FixedRelocationError {
+        error: AddressSpaceError::AllocationFailed,
+        target_punched: true,
+        source_shrunk: false,
+    });
+    let source_preserved = address_space
+        .lookup(source)
+        .is_some_and(|region| region.len == 0x1000);
+    if outcome == expected && source_preserved && address_space.lookup(target).is_none() {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("fixed relocation did not report its destructive failure state")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_fixed_relocate_reports_post_punch_failure
+);
+
+/// A mapping at the conventional brk base is not implicitly heap-owned.  A
+/// later append must require BRK_HEAP on the root instead of annexing the
+/// foreign VMA and exposing it to brk shrink/free.
+fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    let a = AddressSpace::empty();
+    let base = VirtAddr::new(0x0000_0000_7000_0000);
+    if a.map_region(Region {
+        base,
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0)],
+    })
+    .is_err()
+    {
+        return TestResult::Fail("foreign brk-root setup failed");
+    }
+    if a.brk_extend_region(base, base.as_u64() + 0x1000, alloc::vec![PhysAddr::new(0)])
+        != Err(AddressSpaceError::Overlap)
+    {
+        return TestResult::Fail("brk annexed a root without BRK_HEAP provenance");
+    }
+    let unchanged = a.lookup(base).is_some_and(|region| {
+        region.len == 0x1000
+            && !region.perms.contains(RegionPerms::BRK_HEAP)
+            && region.phys == alloc::vec![PhysAddr::new(0)]
+    }) && a.lookup(VirtAddr::new(base.as_u64() + 0x1000)).is_none();
+    if unchanged {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("rejected brk growth mutated the foreign root")
+    }
+}
+kernel_test_in!("memory", smoke_memory_brk_growth_rejects_foreign_root);
 
 // ── W^X: the kernel's non-text mappings have no executable alias ────────
 //

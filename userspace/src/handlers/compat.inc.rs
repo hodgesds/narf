@@ -1,4 +1,3 @@
-
 // ── Per-task cwd state ────────────────────────────────────────────
 //
 // Storage shape mirrors the other per-task tables in this file:
@@ -149,15 +148,184 @@ pub(crate) fn resolve_cwd_path(task: u64, path: &str) -> alloc::string::String {
     }
 }
 
+/// The number of symlink expansions (`SYMLOOP_MAX`) a single
+/// `resolve_vfs_symlink_path` call will perform before giving up with
+/// `ELOOP`. Matches Linux (the 2.6-era de-facto ceiling) and the
+/// filesystem-local resolver's own `SYMLOOP_MAX` in `resolve_async_ext`.
+const SYMLOOP_MAX: usize = 40;
+
+/// True when every component of `path` is served by a SINGLE covering mount,
+/// so a per-component walk against that mount's `fs.root()` faithfully
+/// reproduces VFS resolution. Returns `false` (→ take the slow per-prefix
+/// path) when a proper prefix of `path` enters a deeper mount, or when
+/// `path` is an ancestor of a mount point (a component that has no real
+/// node in the covering filesystem, only a synthetic dir). Both cases mean
+/// a component "crosses a mount", which the single-fs fast walk cannot see.
+fn fast_walk_stays_in_one_mount(path: &str) -> bool {
+    // Longest mount prefix covering the full path — the mount the fast walk
+    // would descend within. `current_mount_list` is namespace-aware.
+    let mounts = current_mount_list();
+    let cover_len = mounts
+        .iter()
+        .filter(|m| {
+            path == m.as_str()
+                || m.as_str() == "/"
+                || (path.starts_with(m.as_str()) && path.as_bytes().get(m.len()) == Some(&b'/'))
+        })
+        .map(|m| m.len())
+        .max();
+    let Some(cover_len) = cover_len else {
+        // No mount covers the path (not even "/"): nothing for the fast
+        // walk to descend. Defer to the slow path.
+        return false;
+    };
+    for m in &mounts {
+        // A deeper mount whose path lies strictly inside `path` (at a
+        // component boundary) means a proper prefix crosses into it: e.g.
+        // resolving `/a/b/c` while `/a/b` is its own mount. Bail so the
+        // per-prefix slow walk re-selects the covering mount per component.
+        if m.len() > cover_len
+            && path.starts_with(m.as_str())
+            && (path.len() == m.len() || path.as_bytes().get(m.len()) == Some(&b'/'))
+        {
+            return false;
+        }
+    }
+    // A path that is a proper ancestor of a mount point has no real node in
+    // the covering fs (only a synthetic S_IFDIR); the fast walk would miss
+    // it. Defer to the slow path, which the callers already reconcile with
+    // the mount-ancestor stat/mkdir synthesis.
+    if path_is_mount_ancestor(path) {
+        return false;
+    }
+    true
+}
+
+/// Fast path for [`resolve_vfs_symlink_path`]: a single O(depth) forward walk
+/// that carries the parent-directory handle and looks each component up
+/// WITHOUT following symlinks. Returns `Some(path)` only when it has PROVEN
+/// the whole path resolves through real directories with no symlink to
+/// expand (so the input needs no rewriting); returns `None` to signal the
+/// caller to fall back to the slow per-prefix loop — either because a symlink
+/// was found (it must be expanded there) or because a lookup could not
+/// prove the component is a plain directory.
+///
+/// This replaces the old O(depth²) behaviour where the caller rebuilt and
+/// re-resolved `/c0/…/ci` from the mount root for every component `i`.
+fn resolve_vfs_symlink_path_fast(
+    expanded: &str,
+    follow_final: bool,
+) -> Option<alloc::string::String> {
+    // Only sound while the whole path lives in one mount (see the helper):
+    // the walk descends within a single `fs.root()` and cannot cross a
+    // mount boundary the way the slow per-prefix resolver does.
+    if !fast_walk_stays_in_one_mount(expanded) {
+        return None;
+    }
+
+    // Clone the covering mount's root `Arc` AND the path RELATIVE to that
+    // mount OUT of the mount-table lock before any (block-)I/O: the lookups
+    // below drive `poll_blocking`, which busy-spins on the backing device
+    // IRQ. Holding the IrqSafeSpinLock across that deadlocks the box (see
+    // `resolve_absolute`). `rel` has the mount prefix stripped, so the walk
+    // starts at `fs.root()` and steps through the in-mount components only.
+    let (root, rel) = current_resolve_absolute(expanded, |fs, rel| {
+        (fs.root(), alloc::string::String::from(rel))
+    })?;
+
+    let components: alloc::vec::Vec<&str> = rel
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect();
+    if components.is_empty() {
+        // The path IS the mount root. A file-rooted mount's root could in
+        // principle be a symlink (`fs.root_file()`), so defer to the slow
+        // path, which inspects the root node exactly as before rather than
+        // assuming the mount root is a plain directory.
+        return None;
+    }
+
+    let mut current_dir = root;
+    for (index, component) in components.iter().enumerate() {
+        let is_final = index + 1 == components.len();
+
+        // NOFOLLOW single-component lookup: `lookup_async` returns the raw
+        // node so a symlink is SEEN, not followed. `resolve_async_nofollow`
+        // only spares the FINAL component of a multi-component path, so a
+        // one-component lookup is exactly the nofollow primitive we need.
+        let node = poll_blocking(current_dir.lookup_async(component)).and_then(|r| r.ok());
+
+        let Some(node) = node else {
+            // Not a file-shaped node. It may be a dir-only child (e.g.
+            // `/dev/pts`): descend if we can. If neither, the component is
+            // absent or non-traversable — no symlink to expand here, and
+            // any downstream error matches the slow path returning the
+            // path unchanged.
+            if is_final {
+                return Some(alloc::string::String::from(expanded));
+            }
+            match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+                Some(next) => {
+                    current_dir = next;
+                    continue;
+                }
+                None => return Some(alloc::string::String::from(expanded)),
+            }
+        };
+
+        let kind = node.stat().mode.file_type;
+        if kind == narf_filesystem::FileType::Symlink {
+            if is_final && !follow_final {
+                // NOFOLLOW final symlink: the link itself is the answer;
+                // nothing to expand. Mirrors the slow loop's
+                // `is_final && !follow_final` skip.
+                return Some(alloc::string::String::from(expanded));
+            }
+            // A symlink that must be expanded (any intermediate symlink, or
+            // a final one under FOLLOW). The fast path cannot rewrite the
+            // path itself — hand off to the slow per-prefix loop.
+            return None;
+        }
+
+        if is_final {
+            // Final real file/dir, no symlink anywhere on the path.
+            return Some(alloc::string::String::from(expanded));
+        }
+
+        // Intermediate component: it must be a real directory to keep
+        // walking. If it is not (a plain file, or a dir with no `DirOps`
+        // shape), stop — there is no symlink here and the path needs no
+        // rewrite; downstream open/stat produces the same error the slow
+        // path would.
+        if kind != narf_filesystem::FileType::Dir {
+            return Some(alloc::string::String::from(expanded));
+        }
+        match poll_blocking(current_dir.lookup_dir_async(component)).and_then(|r| r.ok()) {
+            Some(next) => current_dir = next,
+            None => return Some(alloc::string::String::from(expanded)),
+        }
+    }
+    Some(alloc::string::String::from(expanded))
+}
+
 /// Expand symlinks component-by-component through the current task's mount
 /// table. This supplies the VFS boundary that a filesystem-local resolver
 /// cannot cross after an absolute symlink target.
+///
+/// A symlink-free path in a single mount takes the O(depth) fast walk
+/// ([`resolve_vfs_symlink_path_fast`]); anything with a symlink to expand,
+/// or that crosses a mount boundary, falls through to the O(depth²) slow
+/// per-prefix loop below (which re-selects the covering mount per component
+/// and performs the splice / re-root / ELOOP handling).
 pub(crate) fn resolve_vfs_symlink_path(
     path: &str,
     follow_final: bool,
 ) -> Option<alloc::string::String> {
     let mut expanded = normalize_abs(path);
-    const SYMLOOP_MAX: usize = 40;
+
+    if let Some(resolved) = resolve_vfs_symlink_path_fast(&expanded, follow_final) {
+        return Some(resolved);
+    }
 
     for _ in 0..SYMLOOP_MAX {
         let components: alloc::vec::Vec<&str> = expanded
@@ -165,6 +333,8 @@ pub(crate) fn resolve_vfs_symlink_path(
             .filter(|component| !component.is_empty())
             .collect();
         let mut prefix = alloc::string::String::new();
+        // SLOW PATH marker: reached only when the fast walk found a symlink
+        // to expand or a mount boundary it could not cross.
         let mut followed = false;
 
         for (index, component) in components.iter().enumerate() {
@@ -493,11 +663,7 @@ impl narf_filesystem::FileOps for DirFdFile {
     fn owners(&self) -> (u32, u32) {
         self.dir.dir_owners()
     }
-    fn set_owners<'a>(
-        &'a self,
-        uid: u32,
-        gid: u32,
-    ) -> narf_filesystem::FsFuture<'a, ()> {
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> narf_filesystem::FsFuture<'a, ()> {
         self.dir.set_dir_owners_async(uid, gid)
     }
     fn set_perms<'a>(&'a self, perms: u16) -> narf_filesystem::FsFuture<'a, ()> {
@@ -542,19 +708,11 @@ struct CurrentTtyFile {
 
 #[cfg(feature = "linux-compat")]
 impl narf_filesystem::FileOps for CurrentTtyFile {
-    fn read<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a mut [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.read(offset, buf)
     }
 
-    fn write<'a>(
-        &'a self,
-        offset: u64,
-        buf: &'a [u8],
-    ) -> narf_filesystem::FsFuture<'a, usize> {
+    fn write<'a>(&'a self, offset: u64, buf: &'a [u8]) -> narf_filesystem::FsFuture<'a, usize> {
         self.inner.write(offset, buf)
     }
 
@@ -1137,9 +1295,9 @@ fn do_execve_resolved(
         }
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
-                // SAFETY: canonical user vaddr from the new image's TLS staging.
-                unsafe { narf_scheduler::set_user_fs_base(fb) };
-                narf_scheduler::stackful::set_current_user_fs_base(fb);
+            // SAFETY: canonical user vaddr from the new image's TLS staging.
+            unsafe { narf_scheduler::set_user_fs_base(fb) };
+            narf_scheduler::stackful::set_current_user_fs_base(fb);
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -1158,6 +1316,8 @@ fn do_execve_resolved(
         // (if Step 5 displaced one) is dead to this task. Release both local
         // refs now — after activate(), so teardown of a last-ref pre-exec AS
         // never races the CR3 it used to back.
+        #[cfg(feature = "linux-compat")]
+        shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(new_as);
         drop(prev_slot_as);
         let top = narf_scheduler::stackful::current_stackful_stack_top();
@@ -1219,6 +1379,8 @@ fn do_execve_resolved(
         // every heap-owning local by hand first. (`req` was consumed into
         // `pending_exec`; the ExecRequest itself is freed by the poll that
         // applies it.)
+        #[cfg(feature = "linux-compat")]
+        shm_process_exit(task_to_pid_raw(task).unwrap_or(task), task);
         drop(argv_refs);
         drop(envp_refs);
         drop(new_proc);
@@ -1739,9 +1901,21 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
         narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
             .map_err(|_remaining| EFAULT)?;
     }
-    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
-    // volatile read of each in-range user byte is the access path.
-    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: dst is a live kernel slice; src is range-validated; the
+    // guarded copy catches any unrecoverable EL1 data abort (a validated-
+    // but-unmapped user page, or a racing munmap) as Err instead of a
+    // kernel panic — Linux's arm64 uaccess extable-fixup -EFAULT semantics.
+    // A legitimately-healable fault (demand page / stack grow / COW) heals
+    // in the data-abort handler first and the copy resumes transparently.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
+            .map_err(|_remaining| EFAULT)?;
+    }
+    // SAFETY: any other target — plain volatile read of each in-range user
+    // byte (no fault-fixup surface implemented there).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in dst.iter_mut().enumerate() {
@@ -1793,9 +1967,18 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
         narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
             .map_err(|_remaining| EFAULT)?;
     }
-    // SAFETY: range-validated above; no SMAP on non-x86_64, so a plain
-    // volatile write of each in-range user byte is the access path.
-    #[cfg(not(target_arch = "x86_64"))]
+    // SAFETY: src is a live kernel slice; dst is range-validated; the
+    // guarded copy catches any unrecoverable EL1 data abort as Err — see
+    // copy_from_user. Healable faults heal first and the copy resumes.
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
+            .map_err(|_remaining| EFAULT)?;
+    }
+    // SAFETY: any other target — plain volatile write of each in-range user
+    // byte (no fault-fixup surface implemented there).
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     // SAFETY: Valid memory or trusted environment
     unsafe {
         for (i, b) in src.iter().enumerate() {
@@ -2110,7 +2293,12 @@ fn current_path_is_mount_root(path: &str) -> bool {
     };
     current_mount_namespace()
         .map(|ns| ns.list().iter().any(|mount| mount == path))
-        .unwrap_or_else(|| narf_filesystem::registry().list().iter().any(|mount| mount == path))
+        .unwrap_or_else(|| {
+            narf_filesystem::registry()
+                .list()
+                .iter()
+                .any(|mount| mount == path)
+        })
 }
 
 pub(crate) fn current_mount_arc(
@@ -2757,12 +2945,7 @@ fn task_account_cpu() -> usize {
     narf_lib::percpu::current_cpu() % TASK_ACCOUNT_CPUS
 }
 
-fn task_account_add_on_cpu(
-    ledgers: &TaskCpuLedgers,
-    cpu: usize,
-    task: u64,
-    delta_ns: u64,
-) {
+fn task_account_add_on_cpu(ledgers: &TaskCpuLedgers, cpu: usize, task: u64, delta_ns: u64) {
     let mut values = ledgers[cpu % TASK_ACCOUNT_CPUS].values.lock();
     let entry = values.entry(task).or_insert(0);
     *entry = entry.saturating_add(delta_ns);
@@ -2864,7 +3047,9 @@ pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
 /// sites and the syscall-dispatch exit — so what accumulates is on-CPU time
 /// only, never the sleep in between.
 pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
-    let start = uc.kern_span_start_ns.swap(0, core::sync::atomic::Ordering::AcqRel);
+    let start = uc
+        .kern_span_start_ns
+        .swap(0, core::sync::atomic::Ordering::AcqRel);
     if start == 0 {
         return;
     }
@@ -2921,7 +3106,11 @@ pub fn __test_open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64
 /// switches a timer-preempted CPL0 continuation off-CPU. Returns true only
 /// when a matching resume must re-open the span.
 fn pause_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) -> bool {
-    if uc.kern_span_start_ns.load(core::sync::atomic::Ordering::Acquire) == 0 {
+    if uc
+        .kern_span_start_ns
+        .load(core::sync::atomic::Ordering::Acquire)
+        == 0
+    {
         return false;
     }
     close_kernel_span(uc, task);
@@ -3240,33 +3429,44 @@ pub(crate) fn store_sigqueue_info(
     si_value: u64,
     si_pid: u32,
 ) -> bool {
+    store_sigqueue_info_depth(task, signum, si_code, si_value, si_pid).is_some()
+}
+
+/// Like [`store_sigqueue_info`], but returns the target's TOTAL queued-payload
+/// depth AFTER the insert (`None` when the per-task cap was already hit, i.e.
+/// the caller must surface -EAGAIN). The depth is computed from the same
+/// `range().sum()` the cap check already walks, so the sender-side
+/// back-pressure decision (see `sys_rt_sigqueueinfo`) reads it here instead of
+/// re-taking the bucket lock and re-scanning in a separate `sigqueue_depth`
+/// call — one lock round-trip per send instead of two.
+pub(crate) fn store_sigqueue_info_depth(
+    task: u64,
+    signum: u32,
+    si_code: i32,
+    si_value: u64,
+    si_pid: u32,
+) -> Option<usize> {
     let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
-    if signum >= SIGRT_QUEUE_MIN {
-        // Cap check across ALL of the target's queues (the per-process
-        // pending budget, like Linux's ucounts sigpending charge).
-        let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
-        if queued >= SIGQUEUE_MAX_PER_TASK {
-            return false;
-        }
+    // Total queued across ALL of the target's signums (the per-process pending
+    // budget, like Linux's ucounts sigpending charge). For RT signals this is
+    // the cap gate; for every send it is the depth returned for back-pressure.
+    let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
+    if signum >= SIGRT_QUEUE_MIN && queued >= SIGQUEUE_MAX_PER_TASK {
+        return None;
     }
     let q = m.entry((task, signum)).or_default();
     if signum < SIGRT_QUEUE_MIN {
+        // Standard signals coalesce: replace the slot with the latest payload.
+        // If the slot already held an instance, that entry was part of
+        // `queued`, so the depth is unchanged; a brand-new slot adds one.
+        let existed = !q.is_empty();
         q.clear();
+        q.push_back((si_code, si_value, si_pid));
+        return Some(if existed { queued } else { queued + 1 });
     }
     q.push_back((si_code, si_value, si_pid));
-    true
-}
-
-/// Total queued rt_sigqueueinfo payloads pending for `task` across every
-/// signum — the sender-side back-pressure probe (see `sys_rt_sigqueueinfo`).
-/// Only consulted on supported own-stack reschedule paths.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub(crate) fn sigqueue_depth(task: u64) -> usize {
-    let g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
-    g.as_ref()
-        .map(|m| m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum())
-        .unwrap_or(0)
+    Some(queued + 1)
 }
 
 /// Threshold above which a signal sender is asked to yield at syscall exit:
@@ -3374,8 +3574,7 @@ pub(crate) fn has_interrupting_signal(task_id: u64) -> bool {
     false
 }
 
-static SIGNAL_MASK: SignalBitsTable =
-    [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+static SIGNAL_MASK: SignalBitsTable = [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 
 /// fork/clone inheritance of the signal mask (Linux `copy_process`
 /// copies `blocked` unconditionally, for threads and forks alike).
@@ -3509,6 +3708,35 @@ fn take_suspend_saved_mask(task: u64) -> Option<u64> {
     g.as_mut().and_then(|m| m.remove(&task))
 }
 
+/// Install a syscall-scoped temporary signal mask while preserving the mask
+/// from the syscall's first entry across RIP-rewind park/re-executions.
+///
+/// pselect6/ppoll/epoll_pwait share Linux's TIF_RESTORE_SIGMASK model with
+/// rt_sigsuspend: normal completion restores the saved mask directly, while
+/// an interrupting signal delivery consumes the saved value and arranges for
+/// sigreturn to restore it after the handler.
+pub(crate) fn install_temporary_signal_mask(task: u64, mask: u64) {
+    let already_installed = SUSPEND_SAVED_MASK
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&task));
+    if already_installed {
+        let _ = set_signal_mask_for_task(task, mask);
+        return;
+    }
+    let prior = set_signal_mask_for_task(task, mask);
+    set_suspend_saved_mask(task, prior);
+}
+
+/// Restore a syscall-scoped temporary signal mask on a non-signal return.
+/// If signal delivery already consumed the saved value, sigreturn owns the
+/// restoration and this is intentionally a no-op.
+pub(crate) fn restore_temporary_signal_mask(task: u64) {
+    if let Some(prior) = take_suspend_saved_mask(task) {
+        let _ = set_signal_mask_for_task(task, prior);
+    }
+}
+
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
@@ -3517,6 +3745,13 @@ pub fn signal_init() {
     signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
     *SIG_ALTSTACK.lock() = Some(BTreeMap::new());
+    // Pending bits and queued siginfo payloads are one logical signal state.
+    // Reinitialising only the bitmaps leaves an unreachable payload behind;
+    // the next signal of the same number can then consume stale si_code/value
+    // even though the failed/current send never published anything. This is
+    // also what made ABI transactionality tests misattribute a payload queued
+    // by an earlier fixture to a later EFAULT/EINVAL call.
+    sigqueue_clear();
 }
 
 /// Reset the registries — test hook. Drops every per-task entry.
@@ -3845,7 +4080,7 @@ pub fn proc_oom_score_of(pid: u64) -> i32 {
         // Address spaces are keyed by TaskId; resolve the outer ProcessId first.
         let task = narf_scheduler::address_space_of(narf_scheduler::TaskId(proc_pid_to_tid(pid)));
         task.map(|as_arc| as_arc.mapped_bytes().saturating_add(4095) / 4096)
-        .unwrap_or(0)
+            .unwrap_or(0)
     };
     let total = stats.total.max(1);
     let base = (rss_pages as i64 * 1000 / total as i64) as i32;
@@ -4182,13 +4417,14 @@ pub fn proc_task_info(
 /// Return the full rlimit table for `pid` as `[(cur, max); 16]`.
 /// Indices follow RLIMIT_* numbering (0=CPU, 3=STACK, 7=NOFILE, …).
 pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
-    // RLIMIT_TABLE is keyed by TaskId (prlimit's self form stores under
-    // current_task_id()); resolve the outer ProcessId → TaskId.
-    let tid = proc_pid_to_tid(pid);
+    // Rows are keyed by the monotonic group-leader TaskId; /proc hands this
+    // accessor an outer ProcessId, so resolve it before entering the table.
+    let key = pid_to_task_raw(pid).unwrap_or(pid);
     let row = {
         let g = RLIMIT_TABLE.lock();
         g.as_ref()
-            .and_then(|m| m.get(&tid).copied())
+            .filter(|state| !state.reaped.contains_key(&key))
+            .and_then(|state| state.rows.get(&key).copied())
             .unwrap_or_else(default_rlimits)
     };
     let mut out = [(0u64, 0u64); 16];
@@ -4307,7 +4543,7 @@ pub fn fd_path_of(pid: u64, n: u32) -> Option<narf_filesystem::procfs::ProcFdSna
     let tid = proc_pid_to_tid(pid);
     let (pos, flags, ino) = crate::fd::with_table(tid, |table| {
         let entry = table.get(n)?;
-        Some((entry.offset, entry.status_flags, entry.ops.ino()))
+        Some((table.offset(n)?, table.status_flags(n)?, entry.ops.ino()))
     })
     .flatten()?;
     // Preferred: the real backing path recorded at open() time (the same
@@ -4580,11 +4816,10 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
         return false;
     }
     if let Some(was_empty) = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
-            let was_empty = *slot == 0;
-            *slot |= sig_bit(signum);
-            was_empty
-        })
-    {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(signum);
+        was_empty
+    }) {
         if was_empty
             && signal_bits_update_existing(&SIGNAL_READABLE_GEN, task, |generation| {
                 *generation = generation.wrapping_add(1);
@@ -4873,28 +5108,51 @@ fn linux_tid_for_task(task: u64) -> u64 {
     }
 }
 
-/// Copy `si_code` (offset 8), `si_pid` (offset 16) and `si_value` (the
-/// sigval union, offset 24) out of a user `siginfo_t` and stash them for
-/// delivery / sigtimedwait / signalfd. Returns `false` only when the
-/// target's queue is full (RLIMIT_SIGPENDING shape → sender returns
-/// -EAGAIN); a NULL/unreadable info queues nothing but "succeeds" (the
-/// bare signal still delivers, like a payload-less kill).
-fn capture_queued_siginfo(target: u64, sig: u32, info_ptr: u64) -> bool {
-    if info_ptr == 0 {
-        return true;
-    }
-    // SAFETY: info_ptr is non-zero; copy_from_user_vec range-validates the
-    // 32-byte read covering si_signo..si_value.
-    if let Ok(b) = unsafe { copy_from_user_vec(info_ptr, 32) } {
-        let si_code = i32::from_le_bytes(b[8..12].try_into().unwrap());
+/// Linux's in-kernel siginfo representation is 48 bytes on both architectures
+/// NARF supports. `copy_siginfo_from_user()` imports this whole fixed prefix,
+/// even though queued-signal delivery currently consumes only the fields below.
+const KERNEL_SIGINFO_SIZE: usize = 48;
+
+#[derive(Copy, Clone)]
+struct ImportedSiginfo {
+    signo: u32,
+    code: i32,
+    pid: u32,
+    value: u64,
+}
+
+/// Import a user `siginfo_t` without changing signal state.
+///
+/// Keeping copy and enqueue separate is load-bearing: Linux performs the user
+/// copy before most argument/target validation, and a failed copy must return
+/// `EFAULT` without making a pending bit or payload visible. The rt_sigqueueinfo
+/// wrappers overwrite `si_signo` with their syscall argument after this copy;
+/// pidfd_send_signal instead compares the imported value with that argument.
+fn import_queued_siginfo(info_ptr: u64) -> Result<ImportedSiginfo, u64> {
+    let mut b = [0u8; KERNEL_SIGINFO_SIZE];
+    // SAFETY: copy_from_user validates the complete fixed-size user range and
+    // SMAP/fault-brackets the read. NULL and unreadable pointers become EFAULT.
+    unsafe { copy_from_user(&mut b, info_ptr) }?;
+    Ok(ImportedSiginfo {
+        signo: u32::from_ne_bytes(b[0..4].try_into().unwrap()),
+        code: i32::from_ne_bytes(b[8..12].try_into().unwrap()),
         // si_pid (offset 16 in the rt union) — musl/glibc `sigqueue` fill
-        // getpid() here, and consumers reply to it (stress-ng --sigrt's
-        // child does `sigqueue(info.si_pid, ...)`).
-        let si_pid = u32::from_le_bytes(b[16..20].try_into().unwrap());
-        let si_value = u64::from_le_bytes(b[24..32].try_into().unwrap());
-        return store_sigqueue_info(target, sig, si_code, si_value, si_pid);
-    }
-    true
+        // getpid() here, and consumers reply to it.
+        pid: u32::from_ne_bytes(b[16..20].try_into().unwrap()),
+        value: u64::from_ne_bytes(b[24..32].try_into().unwrap()),
+    })
+}
+
+/// Store an already-imported payload. `None` is the queued-signal budget's
+/// `EAGAIN`; user-copy failures cannot reach this function.
+fn enqueue_imported_siginfo(target: u64, sig: u32, info: ImportedSiginfo) -> Option<usize> {
+    store_sigqueue_info_depth(target, sig, info.code, info.value, info.pid)
+}
+
+#[inline]
+fn siginfo_requires_self_target(info: ImportedSiginfo) -> bool {
+    const SI_TKILL: i32 = -6;
+    info.code >= 0 || info.code == SI_TKILL
 }
 
 // ── futex — minimal scaffold ────────────────────────────────────────
@@ -4992,9 +5250,9 @@ fn futex_timeout_deadline(
     if remaining <= 0 {
         Ok(Some(monotonic_now))
     } else {
-        Ok(Some(
-            monotonic_now.saturating_add(u64::try_from(remaining).unwrap_or(u64::MAX)),
-        ))
+        Ok(Some(monotonic_now.saturating_add(
+            u64::try_from(remaining).unwrap_or(u64::MAX),
+        )))
     }
 }
 
@@ -5836,8 +6094,22 @@ fn is_restartable_syscall(raw: u32) -> bool {
             | crate::syscall::Syscall::RtSigtimedwait
             | crate::syscall::Syscall::RtSigsuspend
             | crate::syscall::Syscall::Poll
+            | crate::syscall::Syscall::Ppoll
+            | crate::syscall::Syscall::Select
+            | crate::syscall::Syscall::Pselect6
             | crate::syscall::Syscall::EpollWait
+            | crate::syscall::Syscall::EpollPwait
+            | crate::syscall::Syscall::EpollPwait2
+            | crate::syscall::Syscall::Semop
+            | crate::syscall::Syscall::Semtimedop
+            | crate::syscall::Syscall::Msgsnd
+            | crate::syscall::Syscall::Msgrcv
     )
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_is_restartable_syscall(raw: u32) -> bool {
+    is_restartable_syscall(raw)
 }
 
 /// Build the `SigDeliveryParams` for `(task, action, signum,
@@ -6643,6 +6915,19 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
         })
 }
 
+/// Resolve a socket descriptor without collapsing Linux's two descriptor
+/// errors.  `current_socket()` predates exact errno reporting and returns
+/// `None` for both an absent slot and a live non-socket file; send-family
+/// syscalls must distinguish those as `EBADF` and `ENOTSOCK` respectively.
+fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::SocketFile>, i64> {
+    let task = current_task_id();
+    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+        .flatten()
+        .ok_or(9i64)?; // EBADF
+    let raw = alloc::sync::Arc::as_ptr(&entry.ops) as *const ();
+    socket_arc_lookup(raw).ok_or(88) // ENOTSOCK
+}
+
 /// Install the kernel-held admin authority returned by a successful stack
 /// attach onto one of the calling task's route-netlink sockets.
 ///
@@ -6787,24 +7072,19 @@ fn copy_user_addr(ptr: u64, len: u64) -> Option<crate::socket::SockAddr> {
 /// transferred systemd activation socket cannot accidentally become blocking;
 /// retain the slot bit as a compatibility fallback for older construction
 /// paths that populated only `FdEntry::status_flags`.
-fn socket_listener_nonblock(
-    task: u64,
-    fd: u32,
-    socket: &crate::socket::SocketFile,
-) -> bool {
+fn socket_listener_nonblock(task: u64, fd: u32, socket: &crate::socket::SocketFile) -> bool {
     socket.is_nonblock()
         || fd::with_table(task, |table| {
             table
-                .get(fd)
-                .is_some_and(|entry| entry.status_flags & crate::fd::O_NONBLOCK != 0)
+                .status_flags(fd)
+                .is_some_and(|flags| flags & crate::fd::O_NONBLOCK != 0)
         })
         .unwrap_or(false)
 }
 
 pub(crate) fn __test_socket_listener_nonblock(fd: u32) -> bool {
     let task = current_task_id();
-    current_socket(fd)
-        .is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
+    current_socket(fd).is_some_and(|socket| socket_listener_nonblock(task, fd, socket.as_ref()))
 }
 
 fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
@@ -6835,7 +7115,12 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
             } else {
                 0
             };
-            let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
+            let status_flags = crate::fd::O_RDWR
+                | if nonblock {
+                    crate::fd::O_NONBLOCK
+                } else {
+                    0
+                };
             socket_arc_register(&socket);
             let task = current_task_id();
             // Pairs with UNIXENQ (socket.rs Connect): stamps when the
@@ -6984,13 +7269,14 @@ fn parse_scm_rights_fds(
                     return Err(9); // EBADF
                 }
                 let Some(passed) = fd::with_table(task, |t| {
-                    t.get(fd as u32).map(|entry| crate::socket::ScmRightsFile {
-                        ops: entry.ops.clone(),
-                        status_flags: entry.status_flags,
+                    let (ops, description, status_flags) = t.export_description(fd as u32)?;
+                    Some(crate::socket::ScmRightsFile {
+                        ops,
+                        status_flags,
+                        description: Some(description),
                     })
                 })
-                .flatten()
-                else {
+                .flatten() else {
                     return Err(9); // EBADF: send no payload or partial rights
                 };
                 out.push(passed);
@@ -7080,13 +7366,14 @@ fn install_recv_ancillary(
     let task = current_task_id();
     let mut new_fds: alloc::vec::Vec<i32> = alloc::vec::Vec::new();
     for passed in fds.into_iter().take(rights_to_install) {
-        let entry = fd::FdEntry {
-            ops: passed.ops,
-            offset: 0,
-            flags: if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
-            status_flags: passed.status_flags,
-        };
-        if let Some(newfd) = fd::with_table(task, |t| t.open(entry)) {
+        if let Some(newfd) = fd::with_table(task, |t| {
+            t.open_transferred(
+                passed.ops,
+                passed.description,
+                passed.status_flags,
+                if cloexec { crate::fd::FD_CLOEXEC } else { 0 },
+            )
+        }) {
             new_fds.push(newfd as i32);
         } else {
             truncated = true;
@@ -7156,17 +7443,6 @@ fn read_user_u64(ptr: u64) -> u64 {
     // SAFETY: same contract as read_user_u32.
     let _ = unsafe { copy_from_user(&mut b, ptr) };
     u64::from_ne_bytes(b)
-}
-
-/// Write a u64 to a user address (helper for `copy_file_range`'s
-/// `loff_t *off_in` / `*off_out` write-back, etc.)
-#[inline]
-fn write_user_u64(ptr: u64, val: u64) {
-    let b = val.to_ne_bytes();
-    // SAFETY: caller range-validated `ptr` for 8 bytes; copy_to_user
-    // re-checks and SMAP-brackets the write.
-    // SAFETY: Valid memory or trusted environment
-    let _ = unsafe { copy_to_user(ptr, &b) };
 }
 
 /// Write a u32 to a user address (helper for getsockopt length field, etc.)
@@ -7457,9 +7733,7 @@ pub fn abi_file_op_bridge(
     if kind == narf_abi::FileOpKind::Munmap {
         let status = current_address_space()
             .ok_or(())
-            .and_then(|as_ref| {
-                handler_sys_munmap::munmap_native_v1(&as_ref, args.a0)
-            })
+            .and_then(|as_ref| handler_sys_munmap::munmap_native_v1(&as_ref, args.a0))
             .map(|()| 0)
             .unwrap_or(1);
         return narf_abi::FileOpReturn { status, value: 0 };
@@ -8348,16 +8622,8 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "memfd_create",
         RawFnHandler(sys_memfd_create),
     );
-    table.install_raw(
-        Syscall::Fchmod,
-        "fchmod",
-        RawFnHandler(sys_fchmod),
-    );
-    table.install_raw(
-        Syscall::Fchown,
-        "fchown",
-        RawFnHandler(sys_fchown),
-    );
+    table.install_raw(Syscall::Fchmod, "fchmod", RawFnHandler(sys_fchmod));
+    table.install_raw(Syscall::Fchown, "fchown", RawFnHandler(sys_fchown));
     table.install_raw(Syscall::Fchmodat, "fchmodat", RawFnHandler(sys_fchmodat));
     table.install_raw(
         Syscall::Fchownat,
@@ -8393,11 +8659,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Access, "access", RawFnHandler(sys_access));
     table.install_raw(Syscall::Chmod, "chmod", RawFnHandler(sys_chmod));
-    table.install_raw(
-        Syscall::Chown,
-        "chown",
-        RawFnHandler(sys_chown),
-    );
+    table.install_raw(Syscall::Chown, "chown", RawFnHandler(sys_chown));
 
     // Tier-2 cwd state + nanosleep wired into the table. Sleep
     // already replaced the noop_ok stub above.
@@ -8543,11 +8805,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     // Batch 14: filesystem misc (legacy x86_64-only entries).
     table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
-    table.install_raw(
-        Syscall::Lchown,
-        "lchown",
-        RawFnHandler(sys_lchown),
-    );
+    table.install_raw(Syscall::Lchown, "lchown", RawFnHandler(sys_lchown));
     table.install_raw(Syscall::Utime, "utime", RawFnHandler(sys_utime));
     table.install_raw(Syscall::Utimes, "utimes", RawFnHandler(sys_utimes));
     table.install_raw(Syscall::Futimesat, "futimesat", RawFnHandler(sys_futimesat));
@@ -9280,12 +9538,12 @@ mod handler_sys_at2_reshape;
 mod handler_sys_bootstrap;
 #[path = "sys_bpf.rs"]
 mod handler_sys_bpf;
+#[path = "sys_bpf_attach.rs"]
+mod handler_sys_bpf_attach;
 #[path = "sys_bpf_btf.rs"]
 mod handler_sys_bpf_btf;
 #[path = "sys_bpf_info.rs"]
 mod handler_sys_bpf_info;
-#[path = "sys_bpf_attach.rs"]
-mod handler_sys_bpf_attach;
 #[path = "sys_bpf_pin.rs"]
 mod handler_sys_bpf_pin;
 #[path = "sys_brk.rs"]
@@ -9604,6 +9862,8 @@ mod handler_sys_pwrite64;
 mod handler_sys_pwritev;
 #[path = "sys_pwritev2.rs"]
 mod handler_sys_pwritev2;
+#[path = "sys_quotactl.rs"]
+mod handler_sys_quotactl;
 #[path = "sys_read.rs"]
 mod handler_sys_read;
 #[path = "sys_readahead.rs"]
@@ -9792,8 +10052,6 @@ mod handler_sys_splice;
 mod handler_sys_stat;
 #[path = "sys_stat_linux.rs"]
 mod handler_sys_stat_linux;
-#[path = "sys_quotactl.rs"]
-mod handler_sys_quotactl;
 #[path = "sys_statfs.rs"]
 mod handler_sys_statfs;
 #[path = "sys_statx.rs"]
@@ -9871,10 +10129,10 @@ mod handler_sys_yield;
 pub(crate) use handler_sys_arch_prctl::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf::*;
+pub(crate) use handler_sys_bpf_attach::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_bpf_btf::*;
 pub(crate) use handler_sys_bpf_info::*;
-pub(crate) use handler_sys_bpf_attach::*;
 pub(crate) use handler_sys_bpf_pin::*;
 #[allow(unused_imports)]
 pub use handler_sys_chdir_for_test::*;
@@ -10076,6 +10334,7 @@ pub(crate) use {
     handler_sys_pwrite64::sys_pwrite64,
     handler_sys_pwritev::sys_pwritev,
     handler_sys_pwritev2::sys_pwritev2,
+    handler_sys_quotactl::sys_quotactl,
     handler_sys_read::sys_read,
     handler_sys_readahead::sys_readahead,
     handler_sys_readlink::sys_readlink,
@@ -10162,7 +10421,6 @@ pub(crate) use {
     handler_sys_socketpair::sys_socketpair,
     handler_sys_splice::sys_splice,
     handler_sys_stat::{stat_absolute, sys_stat},
-    handler_sys_quotactl::sys_quotactl,
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,

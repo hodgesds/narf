@@ -1,6 +1,34 @@
 //! Linux syscall ABI conformance — mem group.
 #![cfg(feature = "linux-compat")]
+use alloc::sync::Arc;
+
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::{AddressSpace, RegionPerms};
+
 use crate::abi_test_support::*;
+
+static MEM_TEST_AS: IrqSafeSpinLock<Option<Arc<AddressSpace>>> = IrqSafeSpinLock::new(None);
+
+fn lookup_mem_test_as() -> Option<Arc<AddressSpace>> {
+    MEM_TEST_AS.lock().clone()
+}
+
+fn with_mem_test_as(
+    body: impl FnOnce(&Arc<AddressSpace>) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    // SAFETY: kernel tests run after paging is enabled, and MEM_TEST_AS owns
+    // the page-table root for the complete syscall sequence.
+    let as_ref = match unsafe { AddressSpace::new_for_user() } {
+        Ok(as_ref) => Arc::new(as_ref),
+        Err(_) => return Err("failed to create memory-test address space"),
+    };
+    *MEM_TEST_AS.lock() = Some(Arc::clone(&as_ref));
+    crate::handlers::install_address_space_lookup(lookup_mem_test_as);
+    let result = body(&as_ref);
+    crate::handlers::restore_address_space_lookup(None);
+    *MEM_TEST_AS.lock() = None;
+    result
+}
 
 // ════════════════════════════════════════════════════════════════════
 // Harness note on address-space–backed mem syscalls.
@@ -142,6 +170,112 @@ fn smoke_abi_mem_mmap_no_as_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mmap_no_as_neg);
 
+fn smoke_abi_mem_map_locked_linux_errno_ordering() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            // RLIMIT_MEMLOCK == 0 makes mlock unavailable to an unprivileged
+            // caller. Linux resolves a non-anonymous mapping's file descriptor
+            // before do_mmap checks MAP_LOCKED authority, so an invalid fd wins.
+            let zero_limit = [0u64, 0u64];
+            if call(Syscall::Setrlimit.raw(), a1(8, zero_limit.as_ptr() as u64)) != Some(0) {
+                return Err("failed to set zero RLIMIT_MEMLOCK");
+            }
+            let invalid_file = SyscallArgs {
+                arg0: 0,
+                arg1: 0x1000,
+                arg2: 3,
+                arg3: 0x02 | 0x2000, // MAP_PRIVATE | MAP_LOCKED
+                arg4: 999,
+                arg5: 0,
+            };
+            if call(Syscall::Mmap.raw(), invalid_file) != Some(EBADF) {
+                return Err("invalid file-backed MAP_LOCKED must return EBADF before EPERM");
+            }
+
+            // With no fd lookup in the way, the same unprivileged caller gets
+            // EPERM for an otherwise valid anonymous MAP_LOCKED request.
+            let anonymous = SyscallArgs {
+                arg3: 0x02 | 0x20 | 0x2000, // MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED
+                arg4: (-1i64) as u64,
+                ..invalid_file
+            };
+            if call(Syscall::Mmap.raw(), anonymous) != Some(EPERM) {
+                return Err("anonymous MAP_LOCKED without authority must return EPERM");
+            }
+            if !as_ref.regions_snapshot().is_empty() {
+                return Err("rejected MAP_LOCKED requests unexpectedly changed the address space");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_map_locked_linux_errno_ordering);
+
+fn smoke_abi_mem_future_locked_map_fixed_limit_preserves_old_mapping() -> TestResult {
+    with_setup(|| {
+        with_mem_test_as(|as_ref| {
+            const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x0200_0000;
+            const MAP_PRIVATE: u64 = 0x02;
+            const MAP_FIXED: u64 = 0x10;
+            const MAP_ANONYMOUS: u64 = 0x20;
+
+            let one_page_limit = [0x1000u64, 0x1000u64];
+            if call(
+                Syscall::Setrlimit.raw(),
+                a1(8, one_page_limit.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("failed to set one-page RLIMIT_MEMLOCK");
+            }
+
+            let original = SyscallArgs {
+                arg0: BASE,
+                arg1: 0x1000,
+                arg2: 3,
+                arg3: MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS,
+                arg4: (-1i64) as u64,
+                arg5: 0,
+            };
+            if call(Syscall::Mmap.raw(), original) != Some(BASE as i64) {
+                return Err("failed to establish original MAP_FIXED mapping");
+            }
+
+            // MCL_FUTURE | MCL_ONFAULT: future VMAs count against the limit,
+            // while the already-present mapping remains unlocked.
+            if call(Syscall::Mlockall.raw(), a0(2 | 4)) != Some(0) {
+                return Err("failed to install future on-fault lock policy");
+            }
+
+            let oversized_replacement = SyscallArgs {
+                arg1: 0x2000,
+                ..original
+            };
+            if call(Syscall::Mmap.raw(), oversized_replacement) != Some(EAGAIN) {
+                return Err("future-locked MAP_FIXED over the limit must return EAGAIN");
+            }
+
+            let regions = as_ref.regions_snapshot();
+            if regions.len() != 1 {
+                return Err("failed MAP_FIXED changed the region count");
+            }
+            let old = &regions[0];
+            if old.base.as_u64() != BASE || old.len != 0x1000 {
+                return Err("failed MAP_FIXED did not preserve the old mapping extent");
+            }
+            if old.perms.contains(RegionPerms::LOCKED)
+                || old.perms.contains(RegionPerms::LOCK_ONFAULT)
+            {
+                return Err("MCL_FUTURE retroactively changed the old mapping");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_future_locked_map_fixed_limit_preserves_old_mapping
+);
+
 // ── Munmap (11) ──────────────────────────────────────────────────────
 
 fn smoke_abi_mem_munmap_no_as_neg() -> TestResult {
@@ -200,6 +334,26 @@ fn smoke_abi_mem_mlock_no_as_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mlock_no_as_neg);
+
+fn smoke_abi_mem_mlock_permission_precedes_range_validation() -> TestResult {
+    with_setup(|| {
+        let zero_limit = [0u64, 0u64];
+        if call(Syscall::Setrlimit.raw(), a1(8, zero_limit.as_ptr() as u64)) != Some(0) {
+            return Err("failed to set zero RLIMIT_MEMLOCK");
+        }
+        // This range overflows the address space and would otherwise be
+        // EINVAL. Linux checks mlock privilege first, so zero allowance wins.
+        match call(Syscall::MLock.raw(), a1(u64::MAX - 0x7ff, 0x1000)) {
+            Some(v) if v == EPERM => Ok(()),
+            Some(_) => Err("mlock permission failure must precede invalid-range errno"),
+            None => Err("mlock permission failure must be Ok(-EPERM)"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mlock_permission_precedes_range_validation
+);
 
 // ── MUnlock (150) ────────────────────────────────────────────────────
 

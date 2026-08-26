@@ -1926,6 +1926,16 @@ pub fn current_slice_elapsed_ns() -> u64 {
 /// own kernel stack, with a stackful task current on this CPU.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn yield_current_stackful() {
+    #[cfg(target_arch = "x86_64")]
+    debug_assert!(
+        !narf_arch::x86_64::smap::guarded_copy_armed(),
+        "context switch attempted inside guarded x86 user copy"
+    );
+    #[cfg(target_arch = "aarch64")]
+    debug_assert!(
+        !narf_arch::aarch64::uaccess::guarded_copy_armed(),
+        "context switch attempted inside guarded aarch64 user copy"
+    );
     let cpu = this_cpu();
     let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if p.is_null() {

@@ -11,14 +11,25 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     // result → -EINVAL (was a blanket InvalidOp).
     let ebadf = SyscallReturn::ok((-9i64) as u64);
     let einval = SyscallReturn::ok((-22i64) as u64);
-    let resolved = fd::with_table(task, |t| t.get(fd).map(|e| (e.ops.clone(), e.offset)));
-    let (ops, current) = match resolved {
+    let resolved = fd::with_table(task, |t| {
+        let entry = t.get(fd)?;
+        Some((entry.ops.clone(), t.description(fd)?))
+    });
+    let (ops, description) = match resolved {
         Some(Some(v)) => v,
         _ => {
             ctx.set_return(ebadf);
             return;
         }
     };
+    let _position_guard = match poll_blocking(description.position_lock.lock()) {
+        Some(guard) => guard,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+            return;
+        }
+    };
+    let current = description.offset();
     // Pipes, FIFOs and sockets are not seekable: `fs/pipe.c`'s
     // `pipefifo_fops` and net/socket.c's `socket_file_ops` define no
     // .llseek, so `fs/read_write.c::vfs_llseek` fails with -ESPIPE
@@ -38,7 +49,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
     if offset >= 0 && (whence == SEEK_DATA || whence == SEEK_HOLE) {
         match poll_blocking(ops.seek(offset as u64, whence as u32)) {
             Some(Ok(new_off)) => {
-                let _ = fd::with_table(task, |t| t.get_mut(fd).map(|entry| entry.offset = new_off));
+                description.set_offset(new_off);
                 ctx.set_return(SyscallReturn::ok(new_off));
                 return;
             }
@@ -66,9 +77,7 @@ pub(crate) fn sys_lseek(ctx: &mut dyn TrapContext) {
                 return;
             }
         };
-        let _ = fd::with_table(task, |t| {
-            t.get_mut(fd).map(|entry| entry.offset = new_off as u64)
-        });
+        description.set_offset(new_off as u64);
         SyscallReturn::ok(new_off as u64)
     };
     ctx.set_return(outcome);

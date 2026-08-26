@@ -19,8 +19,8 @@
 //!   `DriverFuture<'a>` uses.
 //! - `Stat`: size / blocks / mode / mtime in monotonic cycles
 //!   (`narf_time::Instant::as_cycles`).
-//! - `FsError`: `NotFound`, `PermissionDenied`, `Io(BlockError)`,
-//!   `InvalidPath`, `Busy`, `ReadOnly`, `Unsupported`. `From<CapError>`
+//! - `FsError`: `NotFound`, `PermissionDenied`, `OperationNotPermitted`,
+//!   `Io(BlockError)`, `InvalidPath`, `Busy`, `ReadOnly`, `Unsupported`. `From<CapError>`
 //!   collapses revocation onto `PermissionDenied` so the cap-gated
 //!   mount path surfaces a meaningful FS error.
 //! - `resolve(root, path)`: walks an ASCII path segment-by-segment.
@@ -423,6 +423,10 @@ impl Mode {
 pub enum FsError {
     NotFound,
     PermissionDenied,
+    /// The operation is forbidden by object state rather than filesystem
+    /// access permissions. Maps to Linux `EPERM`; memfd seals use this so a
+    /// sealed write is not confused with a read-only filesystem (`EROFS`).
+    OperationNotPermitted,
     Io(BlockError),
     InvalidPath,
     /// Operation would cross a filesystem/overlay boundary. Maps to EXDEV.
@@ -988,6 +992,27 @@ pub trait FileOps: Send + Sync {
     /// SIGTTIN / SIGTTOU. Default: not a tty.
     fn tty_fg_pgrp(&self) -> Option<u64> {
         None
+    }
+
+    /// If this fd is a tty, return the owning session id in the kernel's
+    /// stable task-id space (zero when unowned). The Linux-compat syscall
+    /// layer translates it into the querying caller's PID namespace.
+    fn tty_session(&self) -> Option<u64> {
+        None
+    }
+
+    /// Replace this tty's foreground process group using a stable task-space
+    /// id. Returns false for non-tty objects. Session/ownership validation is
+    /// performed by the Linux-compat syscall layer before this mutation.
+    fn set_tty_fg_pgrp(&self, _pgrp: u64) -> bool {
+        false
+    }
+
+    /// Apply Linux `TIOCSCTTY` policy to this PTY endpoint and install the
+    /// controlling-terminal state. `readable` is the open-file description's
+    /// FMODE_READ equivalent. `Ok(false)` means this object is not a PTY.
+    fn tty_acquire_controlling(&self, _arg: usize, _readable: bool) -> Result<bool, FsError> {
+        Ok(false)
     }
 
     /// True when this tty has `TOSTOP` set (background writes raise

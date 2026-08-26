@@ -187,6 +187,41 @@ pub fn watermark_low() -> u64;
 pub fn watermark_high() -> u64;
 pub fn reclaim_goal_pages() -> usize;
 
+/// Cache reclaim is denominated exclusively in 4 KiB base pages. `count`
+/// returns an upper bound; `scan(n)` may free fewer pages but must neither free
+/// nor report more than `n`.
+pub struct Shrinker {
+    pub name: &'static str,
+    pub count: fn() -> usize,
+    pub scan: fn(usize) -> usize,
+}
+pub fn register_shrinker(shrinker: Shrinker);
+pub fn shrinkable_pages() -> usize;
+/// Compatibility alias with the same base-page unit.
+pub fn shrinkable_objects() -> usize;
+/// Allocation-free; returns a value in `0..=target_pages`.
+pub fn shrink_all(target_pages: usize) -> usize;
+/// Frame LRU first, then shrinkers for the remaining page deficit.
+pub fn try_to_free(target_pages: usize) -> usize;
+/// Install/wake the per-node background reclaimer without a scheduler
+/// dependency in this crate.
+pub fn set_kswapd_wake_hook(hook: fn(node: usize));
+pub fn wake_kswapd(node: usize);
+/// Publish bounded allocation-failure work. Concurrent requests for one node
+/// coalesce to their maximum target rather than accumulating without bound.
+pub fn request_reclaim(node: usize, target_pages: usize);
+/// Order OOM authorization before the matching reclaim request and wake.
+pub fn request_reclaim_with_oom(node: usize, target_pages: usize);
+pub struct ReclaimRequest {
+    pub target_pages: usize,
+    pub oom_authorized: bool,
+}
+/// Atomically consume one node's coalesced target and OOM authorization.
+pub fn take_reclaim_request(node: usize) -> ReclaimRequest;
+/// Serialize global victim selection, re-check viability, and reap before
+/// another node may select a victim.
+pub fn request_oom_relief_and_reap_if(still_needed: fn() -> bool) -> Option<u64>;
+
 /// Fixed-point proportional-set-size units (one private resident page).
 pub const PSS_UNITS_PER_PAGE: u64;
 pub struct ReclaimRangeCandidate {
@@ -278,13 +313,44 @@ impl RegionPerms {
     pub const WRITE: RegionPerms;
     pub const EXEC: RegionPerms;
     pub const LOCKED: RegionPerms;
+    /// Lazy memory locking; always accompanied by LOCKED.
+    pub const LOCK_ONFAULT: RegionPerms;
+    /// Linux VM_SPECIAL analogue; never memory-lock eligible.
+    pub const LOCK_EXEMPT: RegionPerms;
+    /// Provenance for growable user-stack fragments.
+    pub const STACK_SEGMENT: RegionPerms;
     pub const COW: RegionPerms;
+}
+
+pub enum FutureLockPolicy { None, Eager, OnFault }
+
+pub enum BrkUpdateResult {
+    Complete(u64),
+    NeedPages(usize),
+}
+
+pub struct StackGrowthLimits {
+    pub memlock_bytes: u64,
+    pub stack_bytes: u64,
+    pub address_space_bytes: u64,
+    pub bypass_memlock: bool,
 }
 
 impl AddressSpace {
     /// Allocate an architecture user root. On aarch64 this also reserves one
     /// lifetime-scoped process ASID when the hardware pool has capacity.
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// Stable, never-reused identity of this address-space incarnation.
+    /// Const-created empty address spaces allocate it lazily on first use.
+    pub fn identity(&self) -> u64;
+    /// Publish/query the main executable's immutable Linux RLIMIT_DATA charge.
+    pub fn set_program_data_bytes(&self, bytes: u64);
+    pub fn program_data_bytes(&self) -> u64;
+    /// Serialize raw-break validation, Linux resource-limit admission, heap
+    /// VMA mutation, and break publication against every CLONE_VM peer.
+    /// `NeedPages` requests allocation-free lazy descriptors outside the
+    /// IRQ-safe transaction and guarantees no state was changed.
+    pub fn update_brk_limited(/* ... */) -> BrkUpdateResult;
     /// Install this address space's architecture root for the current CPU.
     pub fn activate(&self) -> Result<(), AddressSpaceError>;
     /// One ownership-integrated same-root page-out submission.
@@ -300,12 +366,36 @@ impl AddressSpace {
     ) -> SwapBatchReport;
     /// Materialize every recorded base-page region; used for exec/fork build.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
+    /// Back one anonymous/file-demand page. Anonymous reserve refusal returns
+    /// `AddressSpaceError::ReclaimPressure` only after its page ticket and all
+    /// address-space/allocator locks have been released; `Unmapped` and
+    /// `OutOfRange` retain their non-reclaim meanings.
+    pub unsafe fn demand_alloc_page(
+        &self,
+        vaddr: VirtAddr,
+    ) -> Result<(), AddressSpaceError>;
     /// Materialize only current regions intersecting a page-aligned user range.
     /// The region lock is held through the page-table walk.
     pub unsafe fn materialize_range(
         &self,
         base: VirtAddr,
         len: u64,
+    ) -> Result<(), AddressSpaceError>;
+    /// Materialize/rollback only if the receipt's address-space incarnation
+    /// and opaque publication generation still name the exact VMA.
+    /// Replacement, splitting, relocation, and use against another address
+    /// space return `StaleMapping` without touching the successor.
+    pub unsafe fn materialize_mapping(
+        &self, receipt: MappingReceipt,
+    ) -> Result<(), AddressSpaceError>;
+    pub fn rollback_mapping(
+        &self, receipt: MappingReceipt,
+    ) -> Result<(), AddressSpaceError>;
+    /// Atomically changes a completely-covered rounded range across ordinary
+    /// and hardware-huge VMAs. Base-page split capacity and swap state are
+    /// preflighted before any huge leaf changes; internal VMA flags survive.
+    pub fn mprotect_range(
+        &self, base: VirtAddr, len: u64, new_perms: RegionPerms,
     ) -> Result<(), AddressSpaceError>;
     /// Install real architecture huge/block leaves and take frame ownership.
     pub unsafe fn map_huge_region(
@@ -342,7 +432,10 @@ impl AddressSpace {
         new_base: VirtAddr,
         new_len: u64,
     ) -> Result<(), AddressSpaceError>;
-    /// Eagerly populate and pin exactly the rounded mapped range.
+    /// Publish LOCKED on the mapped prefix, then eagerly populate it. A later
+    /// coverage hole returns `Unmapped` without rolling back the earlier VMA
+    /// flags; malformed arithmetic returns `OutOfRange`; backing allocation or
+    /// installation failure returns `LockFailed` and also retains LOCKED.
     pub fn mlock_range(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
     /// Pin exactly the rounded mapped range without populating lazy pages.
@@ -351,6 +444,130 @@ impl AddressSpace {
     /// Unpin exactly the rounded mapped range without discarding backing.
     pub fn munlock_range(&self, base: VirtAddr, len: u64)
         -> Result<(), AddressSpaceError>;
+    /// Address-space default inherited by newly-created ordinary VMAs.
+    pub fn future_lock_policy(&self) -> FutureLockPolicy;
+    /// Atomically replace the future policy and optionally the current mode.
+    pub fn update_mlockall(
+        &self,
+        current: Option<FutureLockPolicy>,
+        future: FutureLockPolicy,
+    ) -> Result<(), AddressSpaceError>;
+    /// Same transition with atomic RLIMIT_MEMLOCK admission.
+    pub fn update_mlockall_limited(
+        &self,
+        current: Option<FutureLockPolicy>,
+        future: FutureLockPolicy,
+        limit_bytes: u64,
+        bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Clear current and future memory locking atomically.
+    pub fn munlock_all(&self) -> Result<(), AddressSpaceError>;
+    /// Publish an ordinary VMA with atomic future-lock/rlimit admission.
+    pub fn map_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Receipt-returning variants bind deferred completion to the exact VMA
+    /// publication rather than only its reusable base/length coordinates.
+    pub fn map_region_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    /// MAP_FIXED counterpart: admission precedes target retirement.
+    pub fn replace_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Run a VMA/external-owner transaction in VMA -> owner lock order.
+    pub fn with_vma_transaction<R>(&self, op: impl FnOnce() -> R) -> R;
+    /// Allocation-free exact-VMA classification while that transaction is
+    /// held; returns only Copy permissions, never proportional backing.
+    pub unsafe fn exact_region_perms_locked(/* ... */)
+        -> Option<RegionPerms>;
+    /// Allocation-free classification of a sub-VMA interval (or containing
+    /// VMA for len==0) while the same transaction is held.
+    pub unsafe fn region_perms_covering_locked(/* ... */)
+        -> Option<RegionPerms>;
+    /// Read, but do not consume, the default mmap candidate while the VMA
+    /// transaction is held. Successful publication advances the cursor.
+    pub unsafe fn mmap_cursor_candidate_locked(/* ... */)
+        -> Result<VirtAddr, AddressSpaceError>;
+    /// Shared insertion/replacement variants require VMA then shared-owner
+    /// transactions to remain held across the external backing snapshot.
+    pub unsafe fn map_shared_region_locked_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn replace_shared_region_locked_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    /// Transaction-held receipt variants let an external owner be registered
+    /// before the VMA transaction is released. FILE_DEMAND faults may observe
+    /// the VMA during this interval, but block on that owner transaction until
+    /// registration completes.
+    pub unsafe fn map_region_locked_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    pub unsafe fn replace_region_locked_limited_receipt(/* ... */)
+        -> Result<MappingReceipt, AddressSpaceError>;
+    /// Locked VMA resize/move admits growth against an explicit MremapLimits
+    /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional
+    /// backing-vector metadata and arena-backed VMA index nodes are fallibly
+    /// reserved before publication; exhaustion returns `AllocationFailed`
+    /// without changing the source.
+    /// Eager population occurs only after the IRQ-safe transaction is released.
+    pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
+    pub unsafe fn grow_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    pub unsafe fn relocate_region_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    /// Private relocation currently requires one exact Region; Linux's
+    /// cross-VMA move-only extension remains unsupported. Fixed relocation
+    /// reports target_punched and source_shrunk independently after a later
+    /// failure, so external file/SysV ownership mirrors Linux's target-retire,
+    /// source-truncate, move ordering exactly for the supported shape.
+    pub unsafe fn relocate_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn relocate_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
+    /// Ordinary nonzero-length SHARED base-page relocation transfers backing
+    /// and resident PTE/rmap authority instead of creating a second alias.
+    /// One source Region may be split around the selected interval; growth is
+    /// admitted on the delta and appends lazy backing, while shrink releases
+    /// only the truncated backing after source invalidation. Swap, huge, and
+    /// cross-Region sources remain explicit NotImplemented outcomes.
+    pub unsafe fn relocate_shared_region_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn relocate_shared_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    /// Fixed shared relocation performs source/limit preflight before target
+    /// retirement. A shrink then truncates the source before attempting its
+    /// move, matching Linux; FixedRelocationError separately reports
+    /// target_punched and source_shrunk so external ownership can mirror both.
+    pub unsafe fn relocate_shared_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn relocate_shared_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
+    /// Create a second base-page VMA over an interval wholly contained in one
+    /// SHARED Region. Duplicate performs MEMLOCK then AS/DATA admission before
+    /// a fixed punch; DontUnmap skips MEMLOCK, admits AS/DATA after a fixed
+    /// punch, clears LOCKED|LOCK_ONFAULT on the source Region, and moves each
+    /// resident source leaf/rmap owner to the destination so the retained
+    /// source refaults its shared backing. Duplicate instead clones resident
+    /// leaves/rmap owners. Both preserve source backing and commit one external
+    /// destination retain per non-zero backing slot atomically.
+    pub enum SharedMremapMode { Duplicate, DontUnmap }
+    pub unsafe fn alias_shared_region_limited(/* ... */)
+        -> Result<(), AddressSpaceError>;
+    pub unsafe fn alias_shared_region_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, AddressSpaceError>;
+    pub unsafe fn alias_shared_region_hint_locked_limited(/* ... */)
+        -> Result<(VirtAddr, Option<(u64, u64)>), AddressSpaceError>;
+    pub unsafe fn alias_shared_region_fixed_limited(/* ... */)
+        -> Result<(), FixedRelocationError>;
+    pub unsafe fn alias_shared_region_fixed_locked_limited(/* ... */)
+        -> Result<Option<(u64, u64)>, FixedRelocationError>;
+    /// Fault-time stack growth checks all task-specific memory limits and is
+    /// failure-atomic across speculative frame and PTE installation.
+    pub unsafe fn try_grow_stack_limited(
+        &self, fault: VirtAddr, limits: StackGrowthLimits,
+    ) -> Result<(), AddressSpaceError>;
 }
 
 /// Install the external shared-page owner's per-alias lifetime hooks.
@@ -358,6 +575,9 @@ impl AddressSpace {
 /// replacement, and address-space teardown release only after the
 /// corresponding translations have been invalidated.
 pub fn install_shared_frame_hooks(retain: fn(u64), release: fn(u64));
+/// Retire upper-layer VMA ownership after the final address-space reference
+/// has invalidated all leaves and released their backing.
+pub fn install_address_space_drop_hook(drop: fn(address_space_id: u64));
 
 impl AddressSpace {
     /// Remove an exact base-page region.
@@ -365,6 +585,10 @@ impl AddressSpace {
         -> Result<Region, AddressSpaceError>;
     /// Remove a base-page range while preserving non-overlapping fragments.
     pub fn punch_fixed(&self, base: VirtAddr, len: u64)
+        -> Result<(), AddressSpaceError>;
+    /// Transaction-held syscall form for a SHARED range. The caller supplies
+    /// the VMA -> shared-owner lock-order proof explicitly.
+    pub unsafe fn punch_fixed_locked_for_syscall_with_shared(/* ... */)
         -> Result<(), AddressSpaceError>;
 }
 
@@ -435,6 +659,10 @@ pub fn tlb_shootdown::set_active_as(cpu: u32, tag: u16);
 pub fn tlb_shootdown::clear_active_as(cpu: u32, tag: u16);
 pub fn tlb_shootdown::mark_idle(cpu: u32);
 pub fn tlb_shootdown::mark_busy(cpu: u32);
+/// Per-CPU observability. The invalidation path updates only the executing
+/// CPU's cache-line-isolated record; accessors aggregate across CPUs on demand.
+pub fn tlb_shootdown::{shootdown_count, local_only_count,
+    ipi_fanout_count, broadcast_budget, filtered_targets, lazy_flush_count}();
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
@@ -519,6 +747,12 @@ impl<T> SlabCache<T> {
 pub fn kalloc(size: usize, align: usize, domain: DomainId) -> Option<NonNull<u8>>;
 pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 
+/// Allocation and per-CPU-magazine telemetry snapshots. Hit/miss totals are
+/// aggregated modulo 2^64 at read time; allocation/free fast paths update only
+/// the executing CPU's cache-line-isolated magazine counters.
+pub fn slab::stats() -> SlabStats;
+pub fn slab::magazine_stats() -> MagazineStats;
+
 // Task-context domain state. Its architecture representation is private so
 // scheduler policies cannot manufacture or directly switch rights state.
 pub struct DomainSavedState {
@@ -602,8 +836,14 @@ x86_64 is rejected at runtime.
   while the parent region transaction is held. The batch groups frames by
   refcount shard, locks each touched shard once, and increments once per input
   occurrence; unbacked zero sentinels and externally owned SHARED mappings are
-  excluded. Multi-page materialization and parent permission rewriting snapshot
-  COW counts by shard while holding the relevant address-space region lock. A
+  excluded. Child VMA publication transfers those retains in prefix order. If
+  a later child index reservation fails, partial-child teardown releases the
+  published prefix and an allocation-free rollback removes only the unpublished
+  suffix, including restoration of the implicit sole-owner representation.
+  The shared-owner transaction is released after regular child publication and
+  before private huge-page allocation or copying. Multi-page materialization
+  and parent permission rewriting snapshot COW counts by shard while holding
+  the relevant address-space region lock. A
   concurrent last-owner decrement may conservatively leave a leaf read-only;
   a sole-owner frame cannot become newly shared without that same region
   transaction, so the snapshot cannot incorrectly grant WRITE to shared
@@ -616,16 +856,38 @@ x86_64 is rejected at runtime.
   scrub. It then groups without allocation into bounded NUMA-cache/buddy
   transactions that retain the cache lock until displaced cached frames are
   visible in the zone; alternative allocators use the scalar default.
-- Base-page relocation installs the disjoint destination before removing the
-  source, publishes backing ownership exactly once, invalidates source
-  translations before freeing a truncated tail, and leaves the source intact
-  when destination installation fails.
-- Base-page regions live in an ordered tree keyed by virtual base. The key and
-  `Region.base` remain equal after every insertion, removal, split, stack
-  growth, and relocation. Because regions never overlap, admission, point
-  lookup, random insertion, and empty MAP_FIXED punches are O(log VMA) and
-  inspect only the predecessor/successor or intersecting tree range; backing
-  ownership and TLB ordering are unchanged by this metadata index invariant.
+- Non-fixed base-page relocation installs the disjoint destination before
+  removing the source, publishes backing ownership exactly once, invalidates
+  source translations before freeing a truncated tail, and leaves it intact
+  when destination installation fails. Ordinary SHARED relocation applies the
+  same ordering while holding the VMA then global shared-owner transactions:
+  it moves (never clones) resident leaf/rmap authority, transfers kept external
+  backing without a retain/release pair, and releases only truncated backing
+  after the source broadcast. Every proportional vector and required VMA-index
+  arena slot is fallibly prepared before PTE mutation. Provisional Region
+  nodes are then published allocation-free; rollback removes those nodes and
+  destination leaves while the original source remains authoritative. Private
+  moves require one exact Region; ordinary SHARED moves may
+  select an interval contained in one Region. Cross-Region/cross-VMA moves are
+  explicit unsupported outcomes. For any fixed shrinking move, Linux ordering
+  is intentionally destructive: target retirement precedes source-tail
+  truncation, which precedes the move.
+  A later failure reports both committed steps so external ownership can make
+  the same transition. Architecture page-table frame exhaustion is distinct
+  from malformed ranges and occupied/huge leaves and propagates as
+  `AllocationFailed` (`ENOMEM` at the syscall boundary).
+- Base-page regions live in an arena-backed AVL tree keyed by virtual base.
+  Tree links are stable arena indices, removed slots form a non-allocating
+  intrusive free list, and `try_reserve_nodes(n)` makes the following `n`
+  distinct-key publications allocation-free. The key and `Region.base` remain
+  equal after every insertion, removal, split, stack growth, and relocation.
+  Because regions never overlap, admission, point lookup, random insertion,
+  and empty MAP_FIXED punches are O(log VMA) and inspect only the
+  predecessor/successor or intersecting tree range; ordered iteration remains
+  O(VMA). Mapping publication generations live in the same tree entry, so VMA
+  and generation publication cannot diverge through a second allocation.
+  Backing ownership and TLB ordering are unchanged by this metadata index
+  invariant.
   The periodic NUMA sampler seeks to the VMA containing or succeeding its
   page-aligned cursor and stops at the first eligible resident slot, rather
   than rescanning all preceding VMAs/pages under the IRQ-safe region lock.
@@ -638,6 +900,15 @@ x86_64 is rejected at runtime.
   replacement can appear. A cancelled anonymous allocation remains owned by
   the fault path and returns to the frame allocator; a cancelled file alias is
   released through its backing-owner hook.
+- An anonymous demand fault refused by the protected user reserve reports
+  `ReclaimPressure` only after cancelling its exact page ticket and releasing
+  the region and allocator locks. The frame fault path may then register the
+  current stackful task in a fixed allocation-free waiter table, park, and
+  retry once after kswapd progress or completion. A generation handshake
+  orders waiter publication against completion, while absent stackful context,
+  full waiter capacity, and a second zero-progress failure all fail without
+  sleeping again. File refusal, missing VMAs, and ordinary placement/range
+  exhaustion never enter this wait path.
 - COW write faults use the same page-scoped exclusion principle. The ticket
   owner takes a temporary source-frame reference before releasing the region
   lock, allocates and copies outside that lock, and republishes only if the
@@ -661,6 +932,36 @@ x86_64 is rejected at runtime.
   return in bounded 64-frame batches; x86_64 still requires a live ownership-
   registry entry at every reclaimed level, so copied kernel tables remain
   outside the detached set and can never enter a batch.
+- Reclaim progress is denominated only in physical 4 KiB base pages. Every
+  shrinker scan receives a strict page budget and may report no more than that
+  budget; object counts never advance watermark or allocation-retry progress.
+  The slab converts free blocks to page estimates per size class, visits the
+  4 KiB class first while dividing pressure fairly across the remaining
+  classes, and reclaims only a frame whose complete block set is present on the
+  central list. It detaches those blocks and updates class ownership under the
+  class lock, then releases that lock before buddy return, cgroup uncharge, or
+  any callback that can re-enter the allocator. The negative cgroup uncharge
+  path reached during final-owner return is itself allocation-free. Test
+  cleanup unregisters only its named/test-marked shrinkers and cannot erase a
+  live slab, page-cache, or other production registration.
+- `GlobalAlloc` invokes its selected backend exactly once. On failure it
+  publishes a bounded per-node reclaim request, wakes kswapd, and returns null;
+  it never invokes a shrinker, sleeps, or retries while its caller may hold an
+  arbitrary kernel lock. Concurrent requests coalesce to the largest target.
+  Kernel and user-backing frame allocations proactively wake local kswapd below
+  the low watermark, and an explicit allocation-failure request is serviced
+  even when aggregate free pages remain above that watermark. OOM policy runs
+  only in schedulable kswapd context: a pending kill is considered only after
+  an explicit requested pass makes no progress and the same reserve predicate
+  still rejects an allocation; progress or a concurrent recovery defers killing
+  until a later failed allocation requests another pass. Global victim selection
+  is serialized across node workers and the chosen victim is reaped before a
+  competing worker may select another. OOM authorization is
+  packed into the same per-node atomic word as its matching reclaim target and
+  consumed with one swap, so neither an existing ordinary request nor a failure
+  arriving during a pass can mismatch the two fields. A `brk` extension
+  reserves virtual address space only; physical user frames are allocated
+  lazily by the demand-fault path and inherit the same watermark policy.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
@@ -859,8 +1160,9 @@ breakdown. Modules in tree:
 - `context.rs` — `is_sleepable()`, `irqs_enabled()`,
   `AllocContext` enum, debug assert at slab-alloc entry.
 
-Stage 2 / 4 still owe: domain tagging through `SlabOpts`,
-shrinker subsystem, per-domain accounting.
+Stage 2 / 4 still owe: domain tagging through `SlabOpts` and per-domain
+accounting. The allocation-free, page-denominated shrinker subsystem is in
+tree, including bounded slab-page return and per-node kswapd wake integration.
 
 ## 8. Resolved decisions
 
