@@ -92,8 +92,12 @@ const SEM_UNDO: i16 = 0o10000;
 /// operation nor accidentally acquire behavior in later bit tests.
 const SEM_BEHAVIOR_FLAGS: i16 = IPC_NOWAIT | SEM_UNDO;
 const SEMVMX: i32 = 32767;
-const MAX_SEMS_PER_SET: usize = 1024;
-const SEM_BITMAP_WORDS: usize = MAX_SEMS_PER_SET.div_ceil(64);
+const SEMMNI: usize = 32_000;
+const SEMMSL: usize = 32_000;
+const SEMMNS: usize = SEMMNI * SEMMSL;
+const SEMOPM: usize = 500;
+const SEMUME: i32 = SEMOPM as i32;
+const SEMUSZ: i32 = 20;
 
 // ipc control cmds (low bits; libc ORs IPC_64 = 0x100 which we mask off).
 const IPC_RMID: u64 = 0;
@@ -109,6 +113,9 @@ const GETNCNT: u64 = 14;
 const GETZCNT: u64 = 15;
 const SETVAL: u64 = 16;
 const SETALL: u64 = 17;
+const SEM_STAT: u64 = 18;
+const SEM_INFO: u64 = 19;
+const SEM_STAT_ANY: u64 = 20;
 
 // msgctl cmds.
 const MSG_STAT: u64 = 11;
@@ -133,6 +140,7 @@ const SEM_CTIME_OFFSET: usize = 56;
 const SEM_NSEMS_OFFSET: usize = 64;
 const MSQID64_SIZE: usize = 120;
 const MSGINFO_SIZE: usize = 32;
+const SEMINFO_SIZE: usize = 40;
 
 fn put_u32(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
@@ -233,6 +241,8 @@ struct SemState {
 
 static SEMS: IrqSafeSpinLock<Option<SemState>> = IrqSafeSpinLock::new(None);
 static FAIL_NEXT_SEM_UNDO_RESERVE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "kernel-test")]
+static TEST_SEMMNI: AtomicUsize = AtomicUsize::new(0);
 #[derive(Default)]
 struct SemUndoSharing {
     owner_of: BTreeMap<u64, u64>,
@@ -243,7 +253,18 @@ static SEM_UNDO_OBSERVER_INSTALLED: AtomicBool = AtomicBool::new(false);
 
 /// Linux's default SEMOPM limit.  This sizes the fixed import buffer as well
 /// as defining the observable E2BIG boundary.
-const MAX_SOPS: usize = 500;
+const MAX_SOPS: usize = SEMOPM;
+
+fn semmni() -> usize {
+    #[cfg(feature = "kernel-test")]
+    {
+        let override_limit = TEST_SEMMNI.load(Ordering::Acquire);
+        if override_limit != 0 {
+            return override_limit;
+        }
+    }
+    SEMMNI
+}
 
 fn with_sem_state<R>(f: impl FnOnce(&mut SemState) -> R) -> R {
     let mut g = SEMS.lock();
@@ -287,6 +308,21 @@ fn ensure_sem_undo_set(state: &mut SemState, object: IpcObjectKey, owner: u64) -
 #[doc(hidden)]
 pub(crate) fn __test_fail_next_sem_undo_reserve() {
     FAIL_NEXT_SEM_UNDO_RESERVE.store(true, Ordering::Release);
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_set_semmni(limit: usize) {
+    TEST_SEMMNI.store(limit, Ordering::Release);
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_sem_set_count() -> usize {
+    let ipc_ns = current_ipc_namespace_id();
+    with_sems(|sets| {
+        sets.keys()
+            .filter(|(namespace, _)| *namespace == ipc_ns)
+            .count()
+    })
 }
 
 fn now_seconds() -> i64 {
@@ -334,6 +370,34 @@ fn ipc_allowed(
 
 fn ipc_owner(caller_uid: u32, uid: u32, cuid: u32) -> bool {
     caller_uid == 0 || caller_uid == uid || caller_uid == cuid
+}
+
+type SemStatSnapshot = (u32, u32, u32, u32, u32, u32, i64, i64, usize);
+
+fn sem_stat_snapshot(set: &SemSet) -> SemStatSnapshot {
+    (
+        set.key,
+        set.uid,
+        set.gid,
+        set.cuid,
+        set.cgid,
+        set.mode,
+        set.otime,
+        set.ctime,
+        set.sems.len(),
+    )
+}
+
+fn encode_sem_stat(snapshot: SemStatSnapshot) -> Vec<u8> {
+    let (key, uid, gid, cuid, cgid, mode, otime, ctime, nsems) = snapshot;
+    let (uid, gid) = ipc_ids_to_user(uid, gid);
+    let (cuid, cgid) = ipc_ids_to_user(cuid, cgid);
+    let mut out = alloc::vec![0u8; SEMID64_SIZE];
+    encode_perm(&mut out, key, uid, gid, cuid, cgid, mode);
+    put_i64(&mut out, SEM_OTIME_OFFSET, otime);
+    put_i64(&mut out, SEM_CTIME_OFFSET, ctime);
+    put_u64(&mut out, SEM_NSEMS_OFFSET, nsems as u64);
+    out
 }
 
 fn ipc_ids_to_user(uid: u32, gid: u32) -> (u32, u32) {
@@ -789,12 +853,6 @@ fn perform_sem_ops(
     pid: u64,
     undo_owner: Option<u64>,
 ) -> Result<(), SemOpFailure> {
-    // Index transaction scratch by semaphore number rather than operation.
-    // The largest legal set uses 4 KiB of deltas plus a 128-byte bitmap; the
-    // previous Option<(usize, i32)>[SEMOPM] plus key array exceeded a 32-KiB
-    // task stack for the legal nsops=500 boundary.
-    let mut undo_deltas = [0i32; MAX_SEMS_PER_SET];
-    let mut undo_touched = [0u64; SEM_BITMAP_WORDS];
     let mut applied = 0usize;
     let mut fail = None;
     for i in 0..nsops {
@@ -817,14 +875,12 @@ fn perform_sem_ops(
             let owner = undo_owner.expect("SEM_UNDO owner");
             let index = sem_undo_index(undos, (owner, ipc_ns, semid, num))
                 .expect("SEM_UNDO key preallocated");
-            let prior = undos[index].1 + undo_deltas[num];
-            let next_undo = prior - i32::from(op);
+            let next_undo = undos[index].1 - i32::from(op);
             if !((-SEMVMX - 1)..=SEMVMX).contains(&next_undo) {
                 fail = Some((ERANGE, true, None));
                 break;
             }
-            undo_deltas[num] -= i32::from(op);
-            undo_touched[num / 64] |= 1u64 << (num % 64);
+            undos[index].1 = next_undo;
         }
         if op != 0 {
             set.sems[num] = next;
@@ -833,22 +889,18 @@ fn perform_sem_ops(
     }
     if let Some(failure) = fail {
         for i in (0..applied).rev() {
-            let (num, op, _) = parse_sem_op(sops, i);
+            let (num, op, flg) = parse_sem_op(sops, i);
             if op != 0 {
                 set.sems[num] -= i32::from(op);
+                if flg & SEM_UNDO != 0 {
+                    let owner = undo_owner.expect("SEM_UNDO owner");
+                    let index = sem_undo_index(undos, (owner, ipc_ns, semid, num))
+                        .expect("SEM_UNDO key preallocated");
+                    undos[index].1 += i32::from(op);
+                }
             }
         }
         return Err(failure);
-    }
-    if let Some(owner) = undo_owner {
-        for semnum in 0..set.sems.len() {
-            if undo_touched[semnum / 64] & (1u64 << (semnum % 64)) == 0 {
-                continue;
-            }
-            let key = (owner, ipc_ns, semid, semnum);
-            let index = sem_undo_index(undos, key).expect("SEM_UNDO key preallocated");
-            undos[index].1 += undo_deltas[semnum];
-        }
     }
     for i in 0..nsops {
         let (num, _, _) = parse_sem_op(sops, i);
@@ -1213,7 +1265,12 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
     ensure_sem_undo_observer();
     let a = *ctx.args();
     let key = a.arg0 as u32;
-    let nsems = a.arg1 as usize;
+    let nsems_raw = a.arg1 as i32;
+    if nsems_raw < 0 || nsems_raw as usize > SEMMSL {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let nsems = nsems_raw as usize;
     let flg = a.arg2;
     let ipc_ns = current_ipc_namespace_id();
     let (_, uid, gid, groups) = current_identity();
@@ -1247,8 +1304,17 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 return Err(ENOENT);
             }
         }
-        if nsems == 0 || nsems > MAX_SEMS_PER_SET {
+        if nsems == 0 {
             return Err(EINVAL);
+        }
+        let (set_count, used_sems) = m
+            .iter()
+            .filter(|((namespace, _), _)| *namespace == ipc_ns)
+            .fold((0usize, 0usize), |(count, used), (_, set)| {
+                (count.saturating_add(1), used.saturating_add(set.sems.len()))
+            });
+        if used_sems.saturating_add(nsems) > SEMMNS || set_count >= semmni() {
+            return Err(ENOSPC);
         }
         let mut sems = Vec::new();
         let mut pids = Vec::new();
@@ -1624,6 +1690,46 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
     let arg = a.arg3;
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
+        IPC_INFO | SEM_INFO => {
+            let (set_count, used_sems, max_index) = with_sems(|sets| {
+                sets.iter()
+                    .filter(|((namespace, _), _)| *namespace == ipc_ns)
+                    .fold(
+                        (0usize, 0usize, 0u64),
+                        |(count, used, max_id), ((_, id), set)| {
+                            (
+                                count.saturating_add(1),
+                                used.saturating_add(set.sems.len()),
+                                core::cmp::max(max_id, *id),
+                            )
+                        },
+                    )
+            });
+            let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+            let mut out = [0u8; SEMINFO_SIZE];
+            put_i32(&mut out, 0, SEMMNS as i32); // semmap (legacy)
+            put_i32(&mut out, 4, semmni() as i32);
+            put_i32(&mut out, 8, SEMMNS as i32);
+            put_i32(&mut out, 12, SEMMNS as i32); // semmnu (legacy)
+            put_i32(&mut out, 16, SEMMSL as i32);
+            put_i32(&mut out, 20, SEMOPM as i32);
+            put_i32(&mut out, 24, SEMUME);
+            if cmd == SEM_INFO {
+                put_i32(&mut out, 28, clamp_i32(set_count));
+                put_i32(&mut out, 36, clamp_i32(used_sems));
+            } else {
+                put_i32(&mut out, 28, SEMUSZ);
+                put_i32(&mut out, 36, SEMVMX);
+            }
+            put_i32(&mut out, 32, SEMVMX);
+            // SAFETY: Linux takes the namespace snapshot before validating
+            // the output range; copy_to_user performs that final validation.
+            if unsafe { crate::handlers::copy_to_user(arg, &out) }.is_err() {
+                ctx.set_return(err(EFAULT));
+            } else {
+                ctx.set_return(SyscallReturn::ok(max_index));
+            }
+        }
         IPC_RMID => {
             let removed = with_sem_state(|state| {
                 let set = state.sets.get(&object).ok_or(EINVAL)?;
@@ -1649,54 +1755,40 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 Err(e) => ctx.set_return(err(e)),
             }
         }
-        IPC_STAT => {
+        IPC_STAT | SEM_STAT | SEM_STAT_ANY => {
             let snapshot = with_sems(|m| {
                 let set = m.get(&object).ok_or(EINVAL)?;
-                if !ipc_allowed(
-                    caller_uid,
-                    caller_gid,
-                    &caller_groups,
-                    set.uid,
-                    set.gid,
-                    set.cuid,
-                    set.cgid,
-                    set.mode,
-                    0o4,
-                ) {
+                if cmd != SEM_STAT_ANY
+                    && !ipc_allowed(
+                        caller_uid,
+                        caller_gid,
+                        &caller_groups,
+                        set.uid,
+                        set.gid,
+                        set.cuid,
+                        set.cgid,
+                        set.mode,
+                        0o4,
+                    )
+                {
                     return Err(EACCES);
                 }
-                Ok((
-                    set.key,
-                    set.uid,
-                    set.gid,
-                    set.cuid,
-                    set.cgid,
-                    set.mode,
-                    set.otime,
-                    set.ctime,
-                    set.sems.len(),
-                ))
+                Ok(sem_stat_snapshot(set))
             });
-            let (key, uid, gid, cuid, cgid, mode, otime, ctime, nsems) = match snapshot {
+            let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(e) => {
                     ctx.set_return(err(e));
                     return;
                 }
             };
-            let (uid, gid) = ipc_ids_to_user(uid, gid);
-            let (cuid, cgid) = ipc_ids_to_user(cuid, cgid);
-            let mut out = alloc::vec![0u8; SEMID64_SIZE];
-            encode_perm(&mut out, key, uid, gid, cuid, cgid, mode);
-            put_i64(&mut out, SEM_OTIME_OFFSET, otime);
-            put_i64(&mut out, SEM_CTIME_OFFSET, ctime);
-            put_u64(&mut out, SEM_NSEMS_OFFSET, nsems as u64);
+            let out = encode_sem_stat(snapshot);
             // SAFETY: copy_to_user validates the complete architecture-specific
             // semid64_ds output range after the object snapshot is taken.
             if unsafe { crate::handlers::copy_to_user(arg, &out) }.is_err() {
                 ctx.set_return(err(EFAULT));
             } else {
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT { 0 } else { semid }));
             }
         }
         IPC_SET => {

@@ -43,6 +43,9 @@ const GETPID: u64 = 11;
 const GETVAL: u64 = 12;
 const GETNCNT: u64 = 14;
 const GETZCNT: u64 = 15;
+const SEM_STAT: u64 = 18;
+const SEM_INFO: u64 = 19;
+const SEM_STAT_ANY: u64 = 20;
 const MSG_STAT: u64 = 11;
 const MSG_INFO: u64 = 12;
 const MSG_STAT_ANY: u64 = 13;
@@ -1270,6 +1273,149 @@ fn smoke_abi_ipc_semctl_stat_set_layout() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_semctl_stat_set_layout);
+
+fn smoke_abi_ipc_semctl_info_and_indexed_stat() -> TestResult {
+    with_setup(|| {
+        #[cfg(target_arch = "x86_64")]
+        const STAT_SIZE: usize = 104;
+        #[cfg(target_arch = "aarch64")]
+        const STAT_SIZE: usize = 88;
+
+        let id = make_semset(2)?;
+        let read_i32 = |bytes: &[u8], offset: usize| {
+            i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let mut info = [0u8; 40];
+        let ipc_info = call_raw(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_INFO, info.as_mut_ptr() as u64),
+        );
+        if ipc_info.value < id
+            || read_i32(&info, 0) != 1_024_000_000
+            || read_i32(&info, 4) != 32_000
+            || read_i32(&info, 8) != 1_024_000_000
+            || read_i32(&info, 12) != 1_024_000_000
+            || read_i32(&info, 16) != 32_000
+            || read_i32(&info, 20) != 500
+            || read_i32(&info, 24) != 500
+            || read_i32(&info, 28) != 20
+            || read_i32(&info, 32) != 32_767
+            || read_i32(&info, 36) != 32_767
+        {
+            return Err("semctl IPC_INFO did not expose Linux semaphore limits");
+        }
+
+        info.fill(0);
+        let sem_info = call_raw(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_INFO, info.as_mut_ptr() as u64),
+        );
+        if sem_info.value < id || read_i32(&info, 28) < 1 || read_i32(&info, 36) < 2 {
+            return Err("semctl SEM_INFO did not aggregate live sets and semaphores");
+        }
+
+        let mut stat = [0u8; STAT_SIZE];
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(id as i64)
+        {
+            return Err("semctl SEM_STAT did not return the indexed set's full id");
+        }
+        if call(Syscall::Semctl.raw(), a3(987_654, 0, SEM_STAT, BAD_PTR)) != Some(EINVAL) {
+            return Err("semctl SEM_STAT must resolve its index before copyout");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, SEM_STAT, BAD_PTR)) != Some(EFAULT) {
+            return Err("semctl SEM_STAT bad output must return EFAULT after lookup");
+        }
+        if call(
+            Syscall::Semctl.raw(),
+            a3(u64::from(u32::MAX), 0, IPC_INFO, BAD_PTR),
+        ) != Some(EINVAL)
+        {
+            return Err("negative semctl id must precede IPC_INFO copyout");
+        }
+
+        let task = crate::handlers::current_task_id();
+        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(EACCES)
+        {
+            return Err("SEM_STAT must enforce read permission");
+        }
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, SEM_STAT_ANY, stat.as_mut_ptr() as u64),
+        ) != Some(id as i64)
+        {
+            return Err("SEM_STAT_ANY must bypass ordinary read permission");
+        }
+        crate::handlers::__test_set_fsids(task, 0, 0);
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("semctl info test cleanup failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semctl_info_and_indexed_stat
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_ipc_semget_limits_and_undo_rollback() -> TestResult {
+    struct ResetLimit;
+    impl Drop for ResetLimit {
+        fn drop(&mut self) {
+            crate::sysvipc::__test_set_semmni(0);
+        }
+    }
+
+    with_setup(|| {
+        if call(Syscall::Semget.raw(), a2(0x55aa, 32_001, 0)) != Some(EINVAL) {
+            return Err("semget above Linux SEMMSL must return EINVAL before lookup");
+        }
+        let baseline = crate::sysvipc::__test_sem_set_count();
+        crate::sysvipc::__test_set_semmni(baseline.saturating_add(1));
+        let _reset = ResetLimit;
+        let id = make_semset(1)?;
+        if call(Syscall::Semget.raw(), a2(0, 1, IPC_CREAT)) != Some(ENOSPC) {
+            return Err("semget at SEMMNI must return ENOSPC");
+        }
+        crate::sysvipc::__test_set_semmni(0);
+
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("setup: SETVAL before SEM_UNDO rollback failed");
+        }
+        let mut sops = [0u8; 12];
+        sops[2..4].copy_from_slice(&1i16.to_le_bytes());
+        sops[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        sops[8..10].copy_from_slice(&(-3i16).to_le_bytes());
+        sops[10..12].copy_from_slice(&(SEM_UNDO | IPC_NOWAIT as i16).to_le_bytes());
+        if call(Syscall::Semop.raw(), a2(id, sops.as_ptr() as u64, 2)) != Some(EAGAIN) {
+            return Err("unsatisfied SEM_UNDO transaction must fail atomically");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("failed SEM_UNDO transaction changed the semaphore value");
+        }
+        let pid = u64::from(crate::handlers::current_ucred().pid);
+        crate::sysvipc::sem_undo_process_exit(pid, crate::handlers::current_task_id());
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(1) {
+            return Err("failed SEM_UNDO transaction leaked an exit adjustment");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("semget limit test cleanup failed");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_semget_limits_and_undo_rollback
+);
 
 fn smoke_abi_ipc_sem_undo_and_rmid_wake() -> TestResult {
     with_setup(|| {

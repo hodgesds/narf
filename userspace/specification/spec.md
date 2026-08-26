@@ -430,6 +430,13 @@ Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
 `IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;
 owner, creator, mode, supplementary-group, queue-limit, metadata timestamp,
 message count/byte count, and last-sender/receiver fields follow Linux.
+`semctl(2)` also implements `IPC_INFO`, `SEM_INFO`, `SEM_STAT`, and
+`SEM_STAT_ANY`: information calls report Linux's default SEMMNI/SEMMSL/SEMMNS,
+SEMOPM, SEMVMX, and undo limits together with namespace-local live usage;
+indexed-stat returns the full semaphore-set id, and `SEM_STAT_ANY` alone
+bypasses ordinary read-mode checks. Semaphore creation accepts 32,000 members
+per set, admits at most 32,000 live sets and 1,024,000,000 members per
+namespace, and reports `ENOSPC` at the resource boundaries.
 `msgctl(2)` also implements `IPC_INFO`, `MSG_INFO`, `MSG_STAT`, and
 `MSG_STAT_ANY`: information calls snapshot only the caller's IPC namespace and
 return its highest internal queue index, indexed-stat returns the full queue id,
