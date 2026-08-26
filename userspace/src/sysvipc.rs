@@ -259,10 +259,13 @@ struct SemSet {
     mode: u32,
     otime: i64,
     ctime: i64,
-    /// Tasks are appended once and considered in insertion order.  As on
-    /// Linux, an older operation that is still unsatisfiable does not block a
-    /// younger satisfiable operation.
-    pending: VecDeque<u64>,
+    /// Intrusive FIFO of blocked tasks, linked through `SemWait`.  Linux puts
+    /// each `sem_queue` directly on a per-array/per-semaphore list so timeout
+    /// and signal cancellation can unlink without searching the whole queue.
+    /// As on Linux, an older unsatisfiable operation does not block a younger
+    /// satisfiable operation.
+    pending_head: Option<u64>,
+    pending_tail: Option<u64>,
     ncnt: Vec<usize>,
     zcnt: Vec<usize>,
     /// SEM_UNDO adjustments are owned by the semaphore array in Linux.  Keep
@@ -294,6 +297,9 @@ struct SemWait {
     undo_owner: Option<u64>,
     /// `None` while linked; otherwise the positive errno (zero is success).
     result: Option<i64>,
+    /// Intrusive membership in the owning semaphore set's pending FIFO.
+    pending_prev: Option<u64>,
+    pending_next: Option<u64>,
     /// Replaced on every scheduler poll and taken exactly once on completion.
     waker: Option<Waker>,
     /// Intrusive membership in the global ready-to-wake queue. Task ids are
@@ -379,6 +385,59 @@ fn with_sem_set<R>(
 
 fn sem_wait_index(waits: &[SemWait], task: u64) -> Result<usize, usize> {
     waits.binary_search_by_key(&task, |wait| wait.task)
+}
+
+fn sem_pending_is_linked(set: &SemSet, wait: &SemWait) -> bool {
+    wait.pending_prev.is_some()
+        || wait.pending_next.is_some()
+        || set.pending_head == Some(wait.task)
+}
+
+fn queue_sem_pending(set: &mut SemSet, state: &mut SemState, index: usize) {
+    assert!(
+        !sem_pending_is_linked(set, &state.waits[index]),
+        "SysV semaphore wait queued twice"
+    );
+    let task = state.waits[index].task;
+    let previous = set.pending_tail;
+    if let Some(previous) = previous {
+        let previous_index = sem_wait_index(&state.waits, previous)
+            .expect("SysV semaphore pending predecessor disappeared");
+        state.waits[previous_index].pending_next = Some(task);
+    } else {
+        set.pending_head = Some(task);
+    }
+    state.waits[index].pending_prev = previous;
+    state.waits[index].pending_next = None;
+    set.pending_tail = Some(task);
+}
+
+fn unlink_sem_pending(set: &mut SemSet, state: &mut SemState, index: usize) -> bool {
+    if !sem_pending_is_linked(set, &state.waits[index]) {
+        return false;
+    }
+    let task = state.waits[index].task;
+    let previous = state.waits[index].pending_prev;
+    let next = state.waits[index].pending_next;
+    if let Some(previous) = previous {
+        let previous_index = sem_wait_index(&state.waits, previous)
+            .expect("SysV semaphore pending predecessor disappeared");
+        state.waits[previous_index].pending_next = next;
+    } else {
+        assert_eq!(set.pending_head, Some(task));
+        set.pending_head = next;
+    }
+    if let Some(next) = next {
+        let next_index = sem_wait_index(&state.waits, next)
+            .expect("SysV semaphore pending successor disappeared");
+        state.waits[next_index].pending_prev = previous;
+    } else {
+        assert_eq!(set.pending_tail, Some(task));
+        set.pending_tail = previous;
+    }
+    state.waits[index].pending_prev = None;
+    state.waits[index].pending_next = None;
+    true
 }
 
 fn sem_wake_is_queued(state: &SemState, index: usize) -> bool {
@@ -1440,6 +1499,8 @@ pub(crate) fn __test_begin_removed_wait(kind: u8, id: u64) {
                         pid: task,
                         undo_owner: None,
                         result: None,
+                        pending_prev: None,
+                        pending_next: None,
                         waker: None,
                         wake_prev: None,
                         wake_next: None,
@@ -1474,6 +1535,8 @@ pub(crate) fn __test_stage_sem_wait(id: u64, sops: &[u8]) {
                     pid: task,
                     undo_owner: None,
                     result: None,
+                    pending_prev: None,
+                    pending_next: None,
                     waker: None,
                     wake_prev: None,
                     wake_next: None,
@@ -1602,7 +1665,7 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
             }
             false
         });
-        if changed && !set.pending.is_empty() {
+        if changed && set.pending_head.is_some() {
             with_sem_state(|state| scan_sem_waiters(&mut set, state, object));
         }
     }
@@ -1755,7 +1818,7 @@ fn perform_semop_locked(
         return Err((EACCES, true, None));
     }
     let result = perform_sem_ops(set, object.0, object.1, sops, nsops, pid, undo_owner);
-    if result.is_ok() && !set.pending.is_empty() {
+    if result.is_ok() && set.pending_head.is_some() {
         with_sem_state(|state| scan_sem_waiters(set, state, object));
     }
     result
@@ -1800,19 +1863,22 @@ fn drain_sem_wakes() {
 /// The queue is scanned in insertion order, but an unsatisfied entry is
 /// skipped, matching Linux rather than imposing head-of-line blocking.
 fn scan_sem_waiters(set: &mut SemSet, state: &mut SemState, object: IpcObjectKey) {
-    let mut pending = core::mem::take(&mut set.pending);
     loop {
-        let pass_len = pending.len();
+        let pass_tail = set.pending_tail;
         let mut altered = false;
-        for _ in 0..pass_len {
-            let Some(task) = pending.pop_front() else {
+        loop {
+            let Some(task) = set.pending_head else {
                 break;
             };
-            let Ok(wait_index) = sem_wait_index(&state.waits, task) else {
-                continue;
-            };
+            let wait_index = sem_wait_index(&state.waits, task)
+                .expect("SysV semaphore pending waiter disappeared");
+            let last_in_pass = pass_tail == Some(task);
+            assert!(unlink_sem_pending(set, state, wait_index));
             let wait = &state.waits[wait_index];
             if wait.result.is_some() {
+                if last_in_pass {
+                    break;
+                }
                 continue;
             }
             let nsops = wait.nsops;
@@ -1854,7 +1920,9 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemState, object: IpcObjectKey
                             state.waits[index].blocking = blocker;
                         }
                     }
-                    pending.push_back(task);
+                    let index = sem_wait_index(&state.waits, task)
+                        .expect("SysV semaphore pending waiter disappeared during retry");
+                    queue_sem_pending(set, state, index);
                 }
                 Err((errno, _, _)) => {
                     if let Some(blocker) = old_blocker {
@@ -1866,12 +1934,14 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemState, object: IpcObjectKey
                     }
                 }
             }
+            if last_in_pass {
+                break;
+            }
         }
         if !altered {
             break;
         }
     }
-    set.pending = pending;
 }
 
 fn unlink_sem_wait(task: u64) -> Option<SemWait> {
@@ -1890,14 +1960,12 @@ fn unlink_sem_wait(task: u64) -> Option<SemWait> {
     let mut set = set_ref.lock();
     let wait = with_sem_state(|state| {
         let index = sem_wait_index(&state.waits, task).ok()?;
+        unlink_sem_pending(&mut set, state, index);
         unlink_sem_wake(state, index);
         Some(state.waits.remove(index))
     })?;
     if wait.result.is_some() {
         return Some(wait);
-    }
-    if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
-        set.pending.remove(pos);
     }
     if let Some(blocker) = wait.blocking {
         adjust_wait_count(&mut set, blocker, false);
@@ -1932,22 +2000,16 @@ fn finish_pending_sem_wait(task: u64, errno: i64) -> i64 {
         let Ok(index) = sem_wait_index(&state.waits, task) else {
             return (errno, None);
         };
-        let mut wait = state.waits.remove(index);
-        if let Some(result) = wait.result {
-            let index = sem_wait_index(&state.waits, task).unwrap_or_else(|index| index);
-            state.waits.insert(index, wait);
+        if let Some(result) = state.waits[index].result {
             return (result, None);
         }
-        if let Some(pos) = set.pending.iter().position(|queued| *queued == task) {
-            set.pending.remove(pos);
-        }
-        if let Some(blocker) = wait.blocking {
+        unlink_sem_pending(&mut set, state, index);
+        if let Some(blocker) = state.waits[index].blocking {
             adjust_wait_count(&mut set, blocker, false);
         }
+        let wait = &mut state.waits[index];
         wait.result = Some(errno);
         let waker = wait.waker.take();
-        let index = sem_wait_index(&state.waits, task).unwrap_or_else(|index| index);
-        state.waits.insert(index, wait);
         (errno, waker)
     });
     if let Some(waker) = waker {
@@ -2234,7 +2296,8 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 mode: (flg as u32) & IPC_PERM_MASK,
                 otime: 0,
                 ctime: now_seconds(),
-                pending: VecDeque::new(),
+                pending_head: None,
+                pending_tail: None,
                 ncnt,
                 zcnt,
                 undos: Vec::new(),
@@ -2482,16 +2545,12 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                             Ok(()) => Ok(Some(())),
                             Err((errno, true, _)) => Err(errno),
                             Err((EAGAIN, false, retry_blocking)) => {
-                                if set.pending.try_reserve(1).is_err() {
-                                    return Err(ENOMEM);
-                                }
                                 let blocker = retry_blocking.or(blocking);
                                 with_sem_state(|state| {
                                     state.waits.try_reserve(1).map_err(|_| ENOMEM)?;
                                     if let Some(blocker) = blocker {
                                         adjust_wait_count(&mut set, blocker, true);
                                     }
-                                    set.pending.push_back(task);
                                     let wait_index = sem_wait_index(&state.waits, task)
                                         .unwrap_or_else(|index| index);
                                     state.waits.insert(
@@ -2508,11 +2567,14 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                                             pid,
                                             undo_owner,
                                             result: None,
+                                            pending_prev: None,
+                                            pending_next: None,
                                             waker: None,
                                             wake_prev: None,
                                             wake_next: None,
                                         },
                                     );
+                                    queue_sem_pending(&mut set, state, wait_index);
                                     Ok::<(), i64>(())
                                 })?;
                                 Ok(None)
@@ -2520,7 +2582,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                             Err((errno, _, _)) => Err(errno),
                         }
                     })();
-                    if matches!(retry_result, Ok(Some(()))) && !set.pending.is_empty() {
+                    if matches!(retry_result, Ok(Some(()))) && set.pending_head.is_some() {
                         with_sem_state(|state| scan_sem_waiters(&mut set, state, object));
                     }
                     retry_result
@@ -2674,19 +2736,23 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                                 state.usage.remove(&ipc_ns);
                             }
                             for index in 0..state.waits.len() {
-                                let should_complete = {
+                                let matches_set = {
                                     let wait = &state.waits[index];
-                                    wait.ipc_ns == ipc_ns
-                                        && wait.id == semid
-                                        && wait.result.is_none()
+                                    wait.ipc_ns == ipc_ns && wait.id == semid
                                 };
-                                if should_complete {
+                                if !matches_set {
+                                    continue;
+                                }
+                                state.waits[index].pending_prev = None;
+                                state.waits[index].pending_next = None;
+                                if state.waits[index].result.is_none() {
                                     state.waits[index].result = Some(EIDRM);
                                     queue_sem_wake(state, index);
                                 }
                             }
                             set.removed = true;
-                            set.pending.clear();
+                            set.pending_head = None;
+                            set.pending_tail = None;
                             set.ncnt.fill(0);
                             set.zcnt.fill(0);
                             set.undos.clear();
@@ -2839,7 +2905,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                         *adjustment = 0;
                     }
                 }
-                if !set.pending.is_empty() {
+                if set.pending_head.is_some() {
                     with_sem_state(|state| scan_sem_waiters(set, state, object));
                 }
                 Ok(())
@@ -2963,7 +3029,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                             *adjustment = 0;
                         }
                     }
-                    if !set.pending.is_empty() {
+                    if set.pending_head.is_some() {
                         with_sem_state(|state| scan_sem_waiters(&mut set, state, object));
                     }
                     Ok(())
@@ -4001,18 +4067,24 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
                 state.sets.remove(&object);
             }
             for index in 0..state.waits.len() {
-                let should_complete = {
+                let matches_set = {
                     let wait = &state.waits[index];
-                    wait.ipc_ns == ipc_ns && wait.id == object.1 && wait.result.is_none()
+                    wait.ipc_ns == ipc_ns && wait.id == object.1
                 };
-                if should_complete {
+                if !matches_set {
+                    continue;
+                }
+                state.waits[index].pending_prev = None;
+                state.waits[index].pending_next = None;
+                if state.waits[index].result.is_none() {
                     state.waits[index].result = Some(EIDRM);
                     queue_sem_wake(state, index);
                 }
             }
         });
         set.removed = true;
-        set.pending.clear();
+        set.pending_head = None;
+        set.pending_tail = None;
         set.ncnt.fill(0);
         set.zcnt.fill(0);
         set.undos.clear();

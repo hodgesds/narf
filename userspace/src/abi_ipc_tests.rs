@@ -1172,6 +1172,110 @@ kernel_test_in!(
     smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order
 );
 
+/// Linux unlinks an interrupted `sem_queue` directly from its intrusive list.
+/// Removing a middle waiter must leave both FIFO neighbours linked and must
+/// not change their handoff order.
+fn smoke_abi_ipc_sem_middle_cancel_preserves_pending_fifo() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    struct OrderedWake {
+        marker: u64,
+        order: Arc<AtomicU64>,
+    }
+
+    impl OrderedWake {
+        fn record(&self) {
+            self.order
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some(old * 10 + self.marker)
+                })
+                .expect("infallible wake-order update");
+        }
+    }
+
+    impl Wake for OrderedWake {
+        fn wake(self: Arc<Self>) {
+            self.record();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.record();
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        // Deliberately avoid task-id order so the global waiter index cannot
+        // accidentally satisfy this FIFO assertion.
+        const FIRST: u64 = FAKE_TASK + 35;
+        const MIDDLE: u64 = FAKE_TASK + 33;
+        const LAST: u64 = FAKE_TASK + 34;
+        for task in [FIRST, MIDDLE, LAST] {
+            set_task(task);
+            if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD
+            {
+                set_task(FAKE_TASK);
+                return Err("semaphore waiter did not enter the pending FIFO");
+            }
+        }
+
+        let order = Arc::new(AtomicU64::new(0));
+        for (task, marker) in [(FIRST, 1), (LAST, 3)] {
+            let waker = core::task::Waker::from(Arc::new(OrderedWake {
+                marker,
+                order: Arc::clone(&order),
+            }));
+            if crate::sysvipc::register_sem_wait_waker(task, waker)
+                != crate::sysvipc::SemParkState::Pending
+            {
+                set_task(FAKE_TASK);
+                return Err("pending FIFO waiter rejected durable waker registration");
+            }
+        }
+
+        set_task(MIDDLE);
+        crate::handlers::raise_signal_pending(MIDDLE, 10);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(EINTR) {
+            crate::handlers::clear_signal_pending(MIDDLE, 10);
+            set_task(FAKE_TASK);
+            return Err("middle semaphore waiter did not cancel with EINTR");
+        }
+        crate::handlers::clear_signal_pending(MIDDLE, 10);
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(2) {
+            return Err("middle cancellation corrupted the pending wait count");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 2)) != Some(0) {
+            return Err("SETVAL failed to complete pending FIFO neighbours");
+        }
+        if order.load(Ordering::Relaxed) != 13 {
+            return Err("middle cancellation changed neighbour handoff order");
+        }
+        for task in [FIRST, LAST] {
+            set_task(task);
+            if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+                set_task(FAKE_TASK);
+                return Err("pending FIFO neighbour did not consume cached success");
+            }
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(0)
+        {
+            return Err("pending FIFO retained stale state after completion");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_middle_cancel_preserves_pending_fifo
+);
+
 fn smoke_abi_ipc_sem_queue_timeout_and_undo_handoff() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
