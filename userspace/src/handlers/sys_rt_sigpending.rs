@@ -5,14 +5,20 @@ use super::*;
 /// Write the (pending & mask) set to `*set_out` so the caller sees
 /// which signals were delivered while blocked.
 ///
-/// arg0 = set out ptr (writable u64 — sigset_t is 8 bytes on
-/// glibc x86_64 / aarch64).  arg1 = sigsetsize (must be 8).
+/// arg0 = set out ptr (writable — sigset_t is 8 bytes on
+/// glibc x86_64 / aarch64).  arg1 = sigsetsize.
+///
+/// Error order follows `SYSCALL_DEFINE2(rt_sigpending)` (kernel/signal.c,
+/// Linux 7.0):
+///   - `sigsetsize > sizeof(sigset_t)` → -EINVAL (a SMALLER size is legal —
+///     the kernel copies only that many low bytes of the set),
+///   - `copy_to_user` failure (a faulting or NULL `set_out`) → -EFAULT.
 pub(crate) fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let set_out = args.arg0;
-    let sigsetsize = args.arg1;
-    if sigsetsize != 8 || set_out == 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    let sigsetsize = args.arg1 as usize;
+    if sigsetsize > 8 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let task = current_task_id();
@@ -20,12 +26,11 @@ pub(crate) fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     let mask = signal_mask_of(task);
     // NARF's pending layout == userspace sigset_t (both bit N-1), so the
     // set copies out verbatim — through the SMAP bracket (a raw
-    // write_unaligned to the user pointer #PF's under SMAP).
-    let user_bits = pending & mask;
-    // SAFETY: set_out != 0 checked above; copy_to_user range-validates and
-    // SMAP-brackets the 8-byte write.
-    if unsafe { copy_to_user(set_out, &user_bits.to_ne_bytes()) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    // write_unaligned to the user pointer #PF's under SMAP). Copy exactly
+    // `sigsetsize` low bytes, as Linux does (NULL/faulting → -EFAULT).
+    let user_bits = (pending & mask).to_ne_bytes();
+    if unsafe { copy_to_user(set_out, &user_bits[..sigsetsize]) }.is_err() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
