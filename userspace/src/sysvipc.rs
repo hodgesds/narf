@@ -1944,6 +1944,44 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemState, object: IpcObjectKey
     }
 }
 
+fn complete_sem_set_waits(
+    set: &mut SemSet,
+    state: &mut SemState,
+    object: IpcObjectKey,
+    errno: i64,
+) {
+    let mut current = set.pending_head;
+    while let Some(task) = current {
+        let index = sem_wait_index(&state.waits, task)
+            .expect("SysV semaphore pending waiter disappeared during removal");
+        let wait = &state.waits[index];
+        assert_eq!((wait.ipc_ns, wait.id), object);
+        current = wait.pending_next;
+        state.waits[index].pending_prev = None;
+        state.waits[index].pending_next = None;
+        if state.waits[index].result.is_none() {
+            state.waits[index].result = Some(errno);
+            queue_sem_wake(state, index);
+        }
+    }
+    set.pending_head = None;
+    set.pending_tail = None;
+
+    // Synthetic ABI race fixtures can stage an unlinked wait record. Real
+    // blocked operations are always members of the per-set FIFO above.
+    #[cfg(feature = "kernel-test")]
+    for index in 0..state.waits.len() {
+        let wait = &state.waits[index];
+        if wait.set.is_none()
+            && (wait.ipc_ns, wait.id) == object
+            && state.waits[index].result.is_none()
+        {
+            state.waits[index].result = Some(errno);
+            queue_sem_wake(state, index);
+        }
+    }
+}
+
 fn unlink_sem_wait(task: u64) -> Option<SemWait> {
     let set_ref = with_sem_state(|state| {
         sem_wait_index(&state.waits, task)
@@ -2735,24 +2773,8 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                             if remove_usage {
                                 state.usage.remove(&ipc_ns);
                             }
-                            for index in 0..state.waits.len() {
-                                let matches_set = {
-                                    let wait = &state.waits[index];
-                                    wait.ipc_ns == ipc_ns && wait.id == semid
-                                };
-                                if !matches_set {
-                                    continue;
-                                }
-                                state.waits[index].pending_prev = None;
-                                state.waits[index].pending_next = None;
-                                if state.waits[index].result.is_none() {
-                                    state.waits[index].result = Some(EIDRM);
-                                    queue_sem_wake(state, index);
-                                }
-                            }
+                            complete_sem_set_waits(&mut set, state, object, EIDRM);
                             set.removed = true;
-                            set.pending_head = None;
-                            set.pending_tail = None;
                             set.ncnt.fill(0);
                             set.zcnt.fill(0);
                             set.undos.clear();
@@ -4066,25 +4088,9 @@ pub(crate) fn ipc_namespace_drop(ipc_ns: u64) {
             {
                 state.sets.remove(&object);
             }
-            for index in 0..state.waits.len() {
-                let matches_set = {
-                    let wait = &state.waits[index];
-                    wait.ipc_ns == ipc_ns && wait.id == object.1
-                };
-                if !matches_set {
-                    continue;
-                }
-                state.waits[index].pending_prev = None;
-                state.waits[index].pending_next = None;
-                if state.waits[index].result.is_none() {
-                    state.waits[index].result = Some(EIDRM);
-                    queue_sem_wake(state, index);
-                }
-            }
+            complete_sem_set_waits(&mut set, state, object, EIDRM);
         });
         set.removed = true;
-        set.pending_head = None;
-        set.pending_tail = None;
         set.ncnt.fill(0);
         set.zcnt.fill(0);
         set.undos.clear();

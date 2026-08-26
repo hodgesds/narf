@@ -1768,6 +1768,70 @@ kernel_test_in!(
     smoke_abi_ipc_sem_undo_and_rmid_wake
 );
 
+fn smoke_abi_ipc_sem_rmid_only_retires_target_set_waiters() -> TestResult {
+    with_setup(|| {
+        let removed_id = make_semset(1)?;
+        let live_id = make_semset(1)?;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        const REMOVED_WAITER: u64 = FAKE_TASK + 36;
+        set_task(REMOVED_WAITER);
+        if call_raw(
+            Syscall::Semop.raw(),
+            a2(removed_id, decrement.as_ptr() as u64, 1),
+        )
+        .value
+            != 0xDEAD
+        {
+            set_task(FAKE_TASK);
+            return Err("removed-set waiter did not block");
+        }
+
+        const LIVE_WAITER: u64 = FAKE_TASK + 37;
+        set_task(LIVE_WAITER);
+        if call_raw(
+            Syscall::Semop.raw(),
+            a2(live_id, decrement.as_ptr() as u64, 1),
+        )
+        .value
+            != 0xDEAD
+        {
+            set_task(FAKE_TASK);
+            return Err("live-set waiter did not block");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(removed_id, 0, IPC_RMID, 0)) != Some(0) {
+            return Err("IPC_RMID failed for target semaphore set");
+        }
+        set_task(REMOVED_WAITER);
+        if call(Syscall::Semop.raw(), a2(removed_id, BAD_PTR, 1)) != Some(EIDRM) {
+            set_task(FAKE_TASK);
+            return Err("target-set waiter did not consume EIDRM");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(live_id, 0, GETNCNT, 0)) != Some(1) {
+            return Err("IPC_RMID disturbed another set's pending waiter");
+        }
+        if call(Syscall::Semctl.raw(), a3(live_id, 0, SETVAL, 1)) != Some(0) {
+            return Err("SETVAL failed on unaffected semaphore set");
+        }
+        set_task(LIVE_WAITER);
+        if call(Syscall::Semop.raw(), a2(live_id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("unaffected set waiter did not consume cached success");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_rmid_only_retires_target_set_waiters
+);
+
 fn smoke_abi_ipc_retained_semop_and_shared_undo() -> TestResult {
     with_setup(|| {
         let id = make_semset(1)?;
