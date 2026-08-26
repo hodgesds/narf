@@ -33,21 +33,99 @@ const CLOCK_BOOTTIME: u64 = 7;
 const SIGEV_SIGNAL: i32 = 0;
 const SIGEV_NONE: i32 = 1;
 const SIGEV_THREAD: i32 = 2;
+/// A modifier bit, not a value: `SIGEV_SIGNAL | SIGEV_THREAD_ID` means
+/// "queue the signal to the thread named in `sigev_notify_thread_id`".
+/// glibc's `SIGEV_THREAD` implementation rewrites the user's sigevent to
+/// exactly that before issuing `timer_create`, so rejecting it breaks
+/// every `SIGEV_THREAD` timer in a glibc program.
+const SIGEV_THREAD_ID: i32 = 4;
 
 // ── `timer_settime` flags ────────────────────────────────────────────
 const TIMER_ABSTIME: u64 = 1;
 
 const SIGALRM: u32 = 14;
+/// `good_sigevent()` bounds `sigev_signo` by `SIGRTMAX`, which is 64 on
+/// every Linux ABI NARF targets.
+const SIGRTMAX: i32 = 64;
+
+// ── errnos, returned the way every other Linux-compat handler does ───
+//
+// These used to be a bare `-1`. A `-1` return is not a sentinel once it
+// crosses into libc: the syscall stub sees a value in [-4095, -1] and
+// reports `-ret` as `errno`, so `-1` arrives as errno 1 = EPERM. Every
+// failure in this file — a stale timer id, a faulting `itimerspec`, an
+// unknown clock, an out-of-range `which` — therefore looked to a caller
+// like a permission denial, which is the one diagnosis none of them
+// admit: none of these syscalls has a privileged variant, so there is
+// nothing for the caller to acquire and no reason for `strace` output
+// to say "Operation not permitted". The errnos below are what Linux
+// actually returns, and they are separable answers: EINVAL means "fix
+// the argument", EFAULT means "fix the pointer", EOPNOTSUPP means "this
+// kernel does not implement it, use your fallback".
+const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
+const EOPNOTSUPP: i64 = 95;
+
+/// Linux hands errors back as a negated errno in the return register.
+fn err(e: i64) -> SyscallReturn {
+    SyscallReturn::ok((-e) as u64)
+}
+
+// ── `clockid_t` as the 32-bit `int` the ABI actually delivers ────────
+//
+// `kernel/time/posix-timers.c::posix_clocks[]`. Kept separate from the
+// `u64` constants above (which `clock_nanosleep`'s accept-list still
+// matches on) because `timer_create` has to classify the *whole* table:
+// a clockid Linux knows but cannot arm a timer on is EOPNOTSUPP, while
+// one it does not know at all is EINVAL, and the two are not
+// interchangeable to a caller probing for clock support.
+const CLOCKID_REALTIME: i32 = 0;
+const CLOCKID_MONOTONIC: i32 = 1;
+const CLOCKID_PROCESS_CPUTIME_ID: i32 = 2;
+const CLOCKID_THREAD_CPUTIME_ID: i32 = 3;
+const CLOCKID_MONOTONIC_RAW: i32 = 4;
+const CLOCKID_REALTIME_COARSE: i32 = 5;
+const CLOCKID_MONOTONIC_COARSE: i32 = 6;
+const CLOCKID_BOOTTIME: i32 = 7;
+const CLOCKID_REALTIME_ALARM: i32 = 8;
+const CLOCKID_BOOTTIME_ALARM: i32 = 9;
+const CLOCKID_TAI: i32 = 11;
+
+/// Largest timerid `lock_timer()` will look up — see [`timer_id_arg`].
+const TIMER_ID_MAX: u32 = i32::MAX as u32;
+
+/// `kernel/time/posix-timers.c::lock_timer`:
+///
+/// ```text
+///     /*
+///      * timer_t could be any type >= int and we want to make sure any
+///      * @timer_id outside positive int range fails lookup.
+///      */
+///     if ((unsigned long long)timer_id > INT_MAX)
+///             return NULL;
+/// ```
+///
+/// `timer_t` is `int`, so only the low 32 bits of the register reach the
+/// kernel and an id with bit 31 set is a *negative* int — it can never
+/// name a live timer. Returning `None` here (→ EINVAL at every call
+/// site) keeps NARF from ever resolving `0xFFFF_FFFF` to a real entry
+/// once the id allocator has wrapped, which Linux structurally cannot do
+/// because `posix_timer_add()` only ever hands out 0..INT_MAX.
+fn timer_id_arg(raw: u64) -> Option<u32> {
+    let id = raw as u32;
+    (id <= TIMER_ID_MAX).then_some(id)
+}
 
 /// One armed POSIX timer.
 #[derive(Debug, Clone, Copy)]
 struct PosixTimer {
     /// Owning task.
     task: u64,
-    /// One of CLOCK_REALTIME / CLOCK_MONOTONIC(_RAW) / CLOCK_BOOTTIME.
-    /// Realtime currently shares the monotonic source — no NTP yet.
+    /// One of CLOCK_REALTIME / CLOCK_MONOTONIC / CLOCK_BOOTTIME, as the
+    /// 32-bit `clockid_t` the ABI delivers. Realtime currently shares the
+    /// monotonic source — no NTP yet.
     #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
-    clockid: u64,
+    clockid: i32,
     /// Signum to raise on expiry (SIGEV_SIGNAL); 0 = SIGEV_NONE.
     signum: u32,
     /// Absolute monotonic-ns deadline for the next fire; 0 = disarmed.
@@ -173,66 +251,207 @@ fn ns_to_timespec(ns: u64) -> (i64, i64) {
 //
 // 16 bytes is enough to decide SIGEV_SIGNAL vs SIGEV_NONE/THREAD and
 // pick the signum.
-fn parse_sigevent(buf: &[u8; 16]) -> (i32, u32) {
+fn parse_sigevent(buf: &[u8; 16]) -> (i32, i32) {
     let signo = i32::from_le_bytes(buf[8..12].try_into().unwrap());
     let notify = i32::from_le_bytes(buf[12..16].try_into().unwrap());
-    (notify, signo as u32)
+    (notify, signo)
 }
 
-/// timer_create(clockid, sigevent, timerid_out)
+/// Classify a `clockid_t` the way `clockid_to_kclock()` +
+/// `do_timer_create()` do:
+///
+/// ```text
+///     if (!kc)                return -EINVAL;
+///     if (!kc->timer_create)  return -EOPNOTSUPP;
+/// ```
+///
+/// `posix_clocks[]` has a hole at index 10 and ends at `CLOCK_TAI` (11),
+/// so anything outside 0..=11 — and index 10 itself — is EINVAL.
+/// `CLOCK_MONOTONIC_RAW` and the two `_COARSE` clocks *are* in the table
+/// but carry no `.timer_create`, which is EOPNOTSUPP, not EINVAL, and
+/// not success: NARF used to accept `CLOCK_MONOTONIC_RAW` and hand back
+/// a timer Linux would have refused to create.
+fn timer_create_clock_ok(clockid: i32) -> Result<(), i64> {
+    match clockid {
+        // Backed by the monotonic source; these actually arm.
+        CLOCKID_REALTIME | CLOCKID_MONOTONIC | CLOCKID_BOOTTIME => Ok(()),
+        // In `posix_clocks[]`, no `.timer_create` — exactly Linux's
+        // EOPNOTSUPP arm.
+        CLOCKID_MONOTONIC_RAW | CLOCKID_REALTIME_COARSE | CLOCKID_MONOTONIC_COARSE => {
+            Err(EOPNOTSUPP)
+        }
+        // LINUX-GAP: Linux *can* create timers on these (CPU-time clocks
+        // via posix-cpu-timers.c, the alarm clocks via alarmtimer.c, TAI
+        // via clock_tai). NARF has no CPU-time accounting, no RTC wakeup
+        // source and no TAI offset, so there is nothing to arm. They are
+        // reported as EOPNOTSUPP — "this clock exists, this operation is
+        // unavailable" — which is the answer a feature probe is written
+        // to handle, rather than EINVAL (which claims the clockid itself
+        // is malformed) or the old EPERM.
+        CLOCKID_PROCESS_CPUTIME_ID
+        | CLOCKID_THREAD_CPUTIME_ID
+        | CLOCKID_REALTIME_ALARM
+        | CLOCKID_BOOTTIME_ALARM
+        | CLOCKID_TAI => Err(EOPNOTSUPP),
+        // Not in `posix_clocks[]` at all (index 10 is a hole, >= 12 is
+        // past the end). Negative ids are the pid-encoded CPU-clock and
+        // `CLOCKFD` dynamic-clock forms, which NARF cannot resolve —
+        // `posix_cpu_timer_create()` answers EINVAL for every one it
+        // cannot map to a task, so EINVAL is the right shape here too.
+        _ => Err(EINVAL),
+    }
+}
+
+/// `timer_create(clockid, sigevent, timerid_out)`.
+///
+/// `kernel/time/posix-timers.c::sys_timer_create` +
+/// `do_timer_create()`:
+///
+/// ```text
+///     SYSCALL_DEFINE3(timer_create, const clockid_t, which_clock, ...)
+///     {
+///             if (timer_event_spec) {
+///                     if (copy_from_user(&event, timer_event_spec, sizeof (event)))
+///                             return -EFAULT;
+///                     return do_timer_create(which_clock, &event, created_timer_id);
+///             }
+///             return do_timer_create(which_clock, NULL, created_timer_id);
+///     }
+///
+///     static int do_timer_create(...)
+///     {
+///             const struct k_clock *kc = clockid_to_kclock(which_clock);
+///             if (!kc)                        return -EINVAL;
+///             if (!kc->timer_create)          return -EOPNOTSUPP;
+///             ...
+///             if (!new_timer->it_pid) { error = -EINVAL; goto out; }  /* good_sigevent() */
+///             ...
+///             if (copy_to_user(created_timer_id, &new_timer_id, sizeof(new_timer_id))) {
+///                     error = -EFAULT;
+///                     goto out;
+///             }
+///     }
+/// ```
+///
+/// The ORDER is load-bearing and is not the obvious one: the sigevent
+/// copy happens in the syscall wrapper, *before* `do_timer_create` has
+/// looked at the clockid at all. So `timer_create(999, faulting_evp,
+/// out)` is EFAULT on Linux, not EINVAL — this handler copies first for
+/// the same reason. Conversely `created_timer_id` is not touched until
+/// the very end, so a NULL/faulting output pointer loses to both the
+/// clock check and the sigevent check.
+///
+/// Why the errnos matter to a caller: a program that wants a
+/// CLOCK_BOOTTIME timer and is willing to settle for CLOCK_MONOTONIC has
+/// to distinguish "this kernel does not do timers on that clock"
+/// (EOPNOTSUPP — retry on another clock) from "you passed nonsense"
+/// (EINVAL — the clockid is wrong, retrying with a different one is
+/// pointless) from "your sigevent is unmapped" (EFAULT — a bug in the
+/// caller). All three used to be EPERM, which says none of those things
+/// and implies a privilege the caller could go acquire; `timer_create`
+/// has no privileged form, so that answer is a dead end.
 pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let clockid = args.arg0;
+    // `clockid_t` is `int`: only the low 32 bits of the register reach
+    // the kernel, so 0x1_0000_0000 is CLOCK_REALTIME, not a bad clock.
+    let clockid = args.arg0 as u32 as i32;
     let evp = args.arg1;
     let out_ptr = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
 
-    match clockid {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {}
-        _ => {
-            ctx.set_return(fail);
-            return;
-        }
-    }
-    if out_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-
-    // Default: SIGEV_SIGNAL + SIGALRM (Linux default when evp == NULL).
-    let (notify, signum) = if evp == 0 {
-        (SIGEV_SIGNAL, SIGALRM)
+    // Step 1 — the sigevent copy, ahead of every other check (above).
+    //
+    // LINUX-GAP: Linux copies `sizeof(sigevent_t)` = 64 bytes here and
+    // faults on any of them; NARF reads the 16 that carry sigev_value /
+    // sigev_signo / sigev_notify, so a pointer that is valid for 16
+    // bytes and faulting for 64 is EFAULT there and accepted here.
+    let parsed = if evp == 0 {
+        None
     } else {
         let mut kbuf = [0u8; 16];
         // SAFETY: handler runs in the calling task's address space;
         // `copy_from_user` validates the user pointer + SMAP brackets.
         // SAFETY: Valid memory or trusted environment
         if unsafe { crate::handlers::copy_from_user(&mut kbuf, evp) }.is_err() {
-            ctx.set_return(fail);
+            ctx.set_return(err(EFAULT));
             return;
         }
-        parse_sigevent(&kbuf)
+        Some(parse_sigevent(&kbuf))
     };
-    let effective_signum = match notify {
-        SIGEV_SIGNAL => {
-            if signum == 0 || signum >= 32 {
-                ctx.set_return(fail);
-                return;
+
+    // Step 2 — the clockid: EINVAL (unknown) vs EOPNOTSUPP (known, no
+    // timers on it).
+    if let Err(e) = timer_create_clock_ok(clockid) {
+        ctx.set_return(err(e));
+        return;
+    }
+
+    // Step 3 — `good_sigevent()`. Default when evp == NULL is
+    // SIGEV_SIGNAL + SIGALRM, which the kernel builds without validating.
+    let effective_signum = match parsed {
+        None => SIGALRM,
+        Some((notify, signo)) => {
+            // `good_sigevent()`'s switch, arm for arm. Note it switches
+            // on the RAW `sigev_notify`: `SIGEV_SIGNAL | SIGEV_THREAD_ID`
+            // (4) is a listed case that falls through into SIGEV_SIGNAL,
+            // but `SIGEV_THREAD | SIGEV_THREAD_ID` (6) and
+            // `SIGEV_NONE | SIGEV_THREAD_ID` (5) are NOT — they land in
+            // `default:` and are EINVAL. Masking the bit off instead of
+            // enumerating would silently accept those two.
+            //
+            // The signo bound is `signo <= 0 || signo > SIGRTMAX`. The RT
+            // half of that range matters in practice: glibc implements
+            // SIGEV_THREAD by rewriting the sigevent to
+            // `SIGEV_SIGNAL | SIGEV_THREAD_ID` with signo = SIGRTMIN
+            // (34), so the `signum >= 32` cap this handler used to apply
+            // rejected every glibc SIGEV_THREAD timer. NARF's
+            // `raise_signal_pending` already accepts 1..=64, so widening
+            // to Linux's bound costs nothing and unblocks that path.
+            //
+            // LINUX-GAP: for the THREAD_ID forms Linux additionally
+            // requires `sigev_notify_thread_id` to name a live thread in
+            // the caller's thread group (EINVAL otherwise) and queues the
+            // signal to that thread. The field sits at offset 16, past
+            // the 16 bytes NARF reads, and NARF's pending mask is
+            // per-task — so the tid is neither validated nor honoured and
+            // the signal goes to the calling task.
+            const SIGEV_SIGNAL_THREAD_ID: i32 = SIGEV_SIGNAL | SIGEV_THREAD_ID;
+            match notify {
+                SIGEV_SIGNAL | SIGEV_SIGNAL_THREAD_ID => {
+                    if signo <= 0 || signo > SIGRTMAX {
+                        ctx.set_return(err(EINVAL));
+                        return;
+                    }
+                    signo as u32
+                }
+                // `case SIGEV_THREAD:` validates its signo the same way
+                // (it falls through from the SIGEV_SIGNAL case), but NARF
+                // has no notify thread to spawn, so an accepted
+                // SIGEV_THREAD timer degrades to SIGEV_NONE: it arms and
+                // counts overruns, it just delivers nothing.
+                SIGEV_THREAD => {
+                    if signo <= 0 || signo > SIGRTMAX {
+                        ctx.set_return(err(EINVAL));
+                        return;
+                    }
+                    0
+                }
+                SIGEV_NONE => 0,
+                _ => {
+                    ctx.set_return(err(EINVAL));
+                    return;
+                }
             }
-            signum
-        }
-        SIGEV_NONE | SIGEV_THREAD => 0, // SIGEV_THREAD: no real thread support, treat as NONE.
-        _ => {
-            ctx.set_return(fail);
-            return;
         }
     };
 
     let task = current_task_id();
     let id = with_table(|m| {
         let t = m.entry(task).or_default();
+        // Stay inside 0..INT_MAX: `lock_timer()` refuses to look up
+        // anything above it, so an id with bit 31 set would be
+        // unaddressable the moment it was handed out.
         t.next_id = t.next_id.wrapping_add(1);
-        if t.next_id == 0 {
+        if t.next_id == 0 || t.next_id > TIMER_ID_MAX {
             t.next_id = 1;
         }
         let id = t.next_id;
@@ -249,38 +468,93 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
         );
         id
     });
-    // Write the timerid (kernel_timer_t is a `void*`-sized opaque on
-    // Linux; we emit a u32 zero-extended to 8 B to keep wire-size
-    // sane on both 32/64-bit consumers).
-    let id_bytes = (id as u64).to_le_bytes();
+    // Step 4 — publish the id. Linux writes `sizeof(new_timer_id)` where
+    // `new_timer_id` is an `int`: FOUR bytes, not eight. musl and glibc
+    // both pass `&(int)` here (`kernel_timer_t` is `int`) and widen the
+    // result themselves, so the 8-byte write this used to do scribbled
+    // four bytes past the caller's object — a stack smash in libc, not
+    // just an ABI nit.
+    let id_bytes = (id as i32).to_le_bytes();
     // SAFETY: `out_ptr` is a user address; `copy_to_user` range-validates it
-    // and brackets the 8-byte write in the SMAP window. We run in the calling
+    // and brackets the 4-byte write in the SMAP window. We run in the calling
     // task's address space from the syscall path (not IRQ context).
     // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_to_user(out_ptr, &id_bytes) }.is_err() {
-        // Best-effort cleanup.
+        // Linux takes the `goto out` cleanup path here too — the timer is
+        // unhashed and freed, so the failed id is not left live.
         with_table(|m| {
             if let Some(t) = m.get_mut(&task) {
                 t.by_id.remove(&id);
             }
         });
-        ctx.set_return(fail);
+        ctx.set_return(err(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// timer_settime(timerid, flags, new, old)
+/// `timer_settime(timerid, flags, new, old)`.
+///
+/// `kernel/time/posix-timers.c::sys_timer_settime` +
+/// `do_timer_settime`:
+///
+/// ```text
+///     SYSCALL_DEFINE4(timer_settime, timer_t, timer_id, int, flags, ...)
+///     {
+///             if (!new_setting)
+///                     return -EINVAL;
+///             if (get_itimerspec64(&new_spec, new_setting))
+///                     return -EFAULT;
+///             error = do_timer_settime(timer_id, flags, &new_spec, rtn);
+///             if (!error && old_setting) {
+///                     if (put_itimerspec64(&old_spec, old_setting))
+///                             error = -EFAULT;
+///             }
+///             return error;
+///     }
+///
+///     static int do_timer_settime(...)
+///     {
+///             if (!timespec64_valid(&new_spec64->it_interval) ||
+///                 !timespec64_valid(&new_spec64->it_value))
+///                     return -EINVAL;
+///             ...
+///             scoped_timer_get_or_fail(timer_id)      /* -EINVAL on miss */
+///     }
+/// ```
+///
+/// Three orderings this pins down:
+///
+///  * A NULL `new_setting` is **EINVAL, not EFAULT** — Linux rejects the
+///    argument before it ever tries to read it. That distinction is the
+///    difference between "you forgot the argument" and "your buffer is
+///    unmapped"; conflating them sends a caller looking at its memory map.
+///  * The `new` copy runs before the timer lookup, so a faulting `new`
+///    with a stale `timerid` is EFAULT, not EINVAL.
+///  * A faulting `old` is reported as **EFAULT after the timer has
+///    already been re-armed**. This handler used to swallow that error
+///    (`let _ = copy_to_user`), which is the worst of both worlds: the
+///    caller is told the call succeeded and then reads a stale
+///    `itimerspec` out of its own buffer. Losing the old value while
+///    still arming is exactly what Linux does; hiding it is not.
+///
+/// A missing timerid is EINVAL — the single errno Linux uses for "no
+/// such timer". As EPERM it was indistinguishable from a sandbox denial,
+/// so a caller that legitimately raced a `timer_delete` could not tell
+/// a stale handle from a policy failure and had no reason to re-create
+/// the timer.
 pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let id = args.arg0 as u32;
-    let flags = args.arg1;
+    // `timer_t` is `int` and `flags` is `int`: 32 bits each, whatever the
+    // caller left in the upper half of the register.
+    let id_arg = args.arg0;
+    let flags = args.arg1 as u32 as i32;
     let new_ptr = args.arg2;
     let old_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
 
+    // `if (!new_setting) return -EINVAL;` — before any dereference.
     if new_ptr == 0 {
-        ctx.set_return(fail);
+        ctx.set_return(err(EINVAL));
         return;
     }
     let mut buf = [0u8; 32];
@@ -289,25 +563,38 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     // SMAP window. Runs in the calling task's address space, not IRQ context.
     // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(err(EFAULT));
         return;
     }
     let (int_s, int_n) = read_timespec(buf[0..16].try_into().unwrap());
     let (val_s, val_n) = read_timespec(buf[16..32].try_into().unwrap());
+    // `timespec64_valid`: tv_sec >= 0 and tv_nsec in [0, NSEC_PER_SEC).
     let (interval_ns, value_ns) = match (timespec_to_ns(int_s, int_n), timespec_to_ns(val_s, val_n))
     {
         (Some(i), Some(v)) => (i, v),
         _ => {
-            ctx.set_return(fail);
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    };
+    // `scoped_timer_get_or_fail` → `lock_timer` → EINVAL on a miss.
+    let id = match timer_id_arg(id_arg) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EINVAL));
             return;
         }
     };
 
     let task = current_task_id();
     let now = narf_scheduler::narf_time::monotonic_ns();
+    // Linux does not validate `flags`: `common_timer_set` only ever tests
+    // `flags & TIMER_ABSTIME`, every other bit is accepted and ignored.
+    // Matching that (rather than rejecting unknown bits) is deliberate —
+    // a caller passing a bit from a newer ABI must not start failing.
     let next_fire = if value_ns == 0 {
         0 // disarm
-    } else if flags & TIMER_ABSTIME != 0 {
+    } else if flags & (TIMER_ABSTIME as i32) != 0 {
         value_ns
     } else {
         now.saturating_add(value_ns)
@@ -326,7 +613,7 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
     let (prev_next, prev_interval) = match prev {
         Some(p) => p,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(err(EINVAL));
             return;
         }
     };
@@ -341,23 +628,51 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         // SAFETY: `old_ptr` is checked non-zero above and is a user address;
         // `copy_to_user` range-validates it and brackets the 32-byte write in
         // the SMAP window. Runs in the calling task's address space, not IRQ
-        // context. Best-effort: a failed copy is ignored per POSIX old-value.
+        // context.
         // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { crate::handlers::copy_to_user(old_ptr, &out) };
+        if unsafe { crate::handlers::copy_to_user(old_ptr, &out) }.is_err() {
+            // `put_itimerspec64` failing turns the whole call into EFAULT
+            // even though the timer is now armed — the arm is NOT undone.
+            ctx.set_return(err(EFAULT));
+            return;
+        }
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// timer_gettime(timerid, cur)
+/// `timer_gettime(timerid, cur)`.
+///
+/// `kernel/time/posix-timers.c::sys_timer_gettime`:
+///
+/// ```text
+///     int ret = do_timer_gettime(timer_id, &cur_setting);
+///     if (!ret) {
+///             if (put_itimerspec64(&cur_setting, setting))
+///                     ret = -EFAULT;
+///     }
+///     return ret;
+/// ```
+///
+/// with `do_timer_gettime` = `scoped_timer_get_or_fail(timer_id)`, i.e.
+/// `-EINVAL` when the lookup misses.
+///
+/// ORDER: the lookup runs FIRST and the copy-out only on success, so
+/// `timer_gettime(stale_id, NULL)` is EINVAL, not EFAULT. This handler
+/// used to check the output pointer first and would have answered the
+/// other way round once both were errno-ified; a caller diagnosing a
+/// stale handle would have been pointed at its buffer instead.
 pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let id = args.arg0 as u32;
     let out_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if out_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
+    // `timer_t` is `int`; ids above INT_MAX never resolve (see
+    // `timer_id_arg`), which is the same EINVAL as an unknown id.
+    let id = match timer_id_arg(args.arg0) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    };
     let task = current_task_id();
     let now = narf_scheduler::narf_time::monotonic_ns();
     let snap = with_table(|m| {
@@ -368,7 +683,7 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
     let (next, interval) = match snap {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(err(EINVAL));
             return;
         }
     };
@@ -382,27 +697,54 @@ pub fn sys_timer_gettime(ctx: &mut dyn TrapContext) {
     let (vs, vn) = ns_to_timespec(remaining);
     write_timespec((&mut out[0..16]).try_into().unwrap(), is, in_);
     write_timespec((&mut out[16..32]).try_into().unwrap(), vs, vn);
-    // SAFETY: `out_ptr` is checked non-zero above and is a user address;
-    // `copy_to_user` range-validates it and brackets the 32-byte write in the
-    // SMAP window. Runs in the calling task's address space, not IRQ context.
+    // SAFETY: `out_ptr` is a user address; `copy_to_user` range-validates it
+    // (NULL included → EFAULT) and brackets the 32-byte write in the SMAP
+    // window. Runs in the calling task's address space, not IRQ context.
     // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_to_user(out_ptr, &out) }.is_err() {
-        ctx.set_return(fail);
+        // `put_itimerspec64(...)` → `-EFAULT`.
+        ctx.set_return(err(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// timer_delete(timerid)
+/// `timer_delete(timerid)`.
+///
+/// `kernel/time/posix-timers.c::sys_timer_delete`:
+///
+/// ```text
+///     SYSCALL_DEFINE1(timer_delete, timer_t, timer_id)
+///     {
+///             scoped_timer_get_or_fail(timer_id) {    /* -EINVAL on miss */
+///                     timer = scoped_timer;
+///                     posix_timer_delete(timer);
+///             }
+///             posix_timer_unhash_and_free(timer);
+///             return 0;
+///     }
+/// ```
+///
+/// The only failure is the lookup, and it is EINVAL. This is the arm
+/// where EPERM hurt most: double-free-style bugs and races against a
+/// sibling thread's `timer_delete` are the normal way to reach it, and
+/// "Operation not permitted" gives a caller no way to tell "already
+/// gone, fine" from "the sandbox took my timers away".
 pub fn sys_timer_delete(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let id = args.arg0 as u32;
+    let id = match timer_id_arg(args.arg0) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    };
     let task = current_task_id();
     let removed = with_table(|m| m.get_mut(&task).and_then(|t| t.by_id.remove(&id)).is_some());
     if removed {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        ctx.set_return(err(EINVAL));
     }
 }
 
@@ -598,35 +940,94 @@ fn write_itimerval(out: &mut [u8; 32], slot: Itimer, now: u64) {
     write_timeval((&mut out[16..32]).try_into().unwrap(), vs, vu);
 }
 
-/// setitimer(which, new, old)
+/// `setitimer(which, new, old)`.
+///
+/// `kernel/time/itimer.c::sys_setitimer` + `get_itimerval` +
+/// `do_setitimer`:
+///
+/// ```text
+///     if (value) {
+///             error = get_itimerval(&set_buffer, value);   /* -EFAULT then -EINVAL */
+///             if (error)
+///                     return error;
+///     } else {
+///             memset(&set_buffer, 0, sizeof(set_buffer));
+///             printk_once(KERN_WARNING "%s calls setitimer() with new_value NULL pointer."
+///                         " Misfeature support will be removed\n", current->comm);
+///     }
+///
+///     error = do_setitimer(which, &set_buffer, ovalue ? &get_buffer : NULL);
+///     if (error || !ovalue)
+///             return error;
+///     if (put_itimerval(ovalue, &get_buffer))
+///             return -EFAULT;
+/// ```
+///
+/// with `get_itimerval` = `copy_from_user` (EFAULT) then
+/// `timeval_valid` (EINVAL), and `do_setitimer`'s `switch (which)`
+/// ending in `default: return -EINVAL;`.
+///
+/// Three divergences this fixes beyond the errno numbers themselves:
+///
+///  * **A NULL `value` is accepted**, not rejected. Linux treats it as a
+///    zeroed `itimerval`, i.e. "disarm", and only grumbles into dmesg.
+///    NARF refused it, so `setitimer(ITIMER_REAL, NULL, &old)` — the
+///    documented way to read-and-clear in one call — failed where Linux
+///    succeeds. Rejecting a value Linux accepts is the silent kind of
+///    divergence: the caller's timer stays armed.
+///  * **`which` is validated last.** `setitimer(99, faulting, NULL)` is
+///    EFAULT on Linux because the value is parsed first; this handler
+///    tested `which` first and would have answered EINVAL.
+///  * **A faulting `ovalue` is EFAULT**, reported after the new timer is
+///    already installed. The old code dropped that error on the floor and
+///    returned 0, leaving the caller reading uninitialised memory as its
+///    previous itimerval.
+///
+/// The errno itself matters because `which` and the buffer are the only
+/// two things a caller can get wrong here: EINVAL says "that itimer slot
+/// does not exist" (retry with ITIMER_REAL), EFAULT says "your struct is
+/// not mapped". EPERM said neither, and setitimer has no permission
+/// dimension at all — there is no privileged variant to escalate to.
 pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let which = args.arg0;
+    // `which` is `int`: 32 bits. A caller with garbage in the top half of
+    // the register still names ITIMER_REAL, as it does on Linux.
+    let which = args.arg0 as u32 as i32;
     let new_ptr = args.arg1;
     let old_ptr = args.arg2;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if which > ITIMER_PROF || new_ptr == 0 {
-        ctx.set_return(fail);
-        return;
-    }
-    let mut buf = [0u8; 32];
-    // SAFETY: `new_ptr` is checked non-zero above and is a user address;
-    // `copy_from_user` range-validates it and brackets the 32-byte read in the
-    // SMAP window. Runs in the calling task's address space, not IRQ context.
-    if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
-        ctx.set_return(fail);
-        return;
-    }
-    let (int_s, int_us) = read_timeval(buf[0..16].try_into().unwrap());
-    let (val_s, val_us) = read_timeval(buf[16..32].try_into().unwrap());
-    let (interval_ns, value_ns) = match (timeval_to_ns(int_s, int_us), timeval_to_ns(val_s, val_us))
-    {
-        (Some(i), Some(v)) => (i, v),
-        _ => {
-            ctx.set_return(fail);
+
+    // Step 1 — the new value, ahead of the `which` check (see above).
+    // NULL is the accepted "disarm" misfeature, not an error.
+    let (interval_ns, value_ns) = if new_ptr == 0 {
+        (0, 0)
+    } else {
+        let mut buf = [0u8; 32];
+        // SAFETY: `new_ptr` is checked non-zero above and is a user address;
+        // `copy_from_user` range-validates it and brackets the 32-byte read in
+        // the SMAP window. Runs in the calling task's address space, not IRQ
+        // context.
+        if unsafe { crate::handlers::copy_from_user(&mut buf, new_ptr) }.is_err() {
+            ctx.set_return(err(EFAULT));
             return;
         }
+        let (int_s, int_us) = read_timeval(buf[0..16].try_into().unwrap());
+        let (val_s, val_us) = read_timeval(buf[16..32].try_into().unwrap());
+        // `timeval_valid`: tv_sec >= 0 and tv_usec in [0, USEC_PER_SEC).
+        match (timeval_to_ns(int_s, int_us), timeval_to_ns(val_s, val_us)) {
+            (Some(i), Some(v)) => (i, v),
+            _ => {
+                ctx.set_return(err(EINVAL));
+                return;
+            }
+        }
     };
+
+    // Step 2 — `do_setitimer`'s `switch (which) { ... default: -EINVAL }`.
+    if !(0..=ITIMER_PROF as i32).contains(&which) {
+        ctx.set_return(err(EINVAL));
+        return;
+    }
+    let which = which as usize;
 
     let task = current_task_id();
     let now = narf_scheduler::narf_time::monotonic_ns();
@@ -644,8 +1045,8 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
     crate::handlers::ensure_signal_pending_slot(task);
     let prev = with_itimers(|m| {
         let slots = m.entry(task).or_default();
-        let prev = slots[which as usize];
-        slots[which as usize] = Itimer {
+        let prev = slots[which];
+        slots[which] = Itimer {
             next_fire_ns: next_fire,
             interval_ns,
         };
@@ -658,43 +1059,105 @@ pub fn sys_setitimer(ctx: &mut dyn TrapContext) {
         // SAFETY: `old_ptr` is checked non-zero above and is a user address;
         // `copy_to_user` range-validates it and brackets the 32-byte write in
         // the SMAP window. Runs in the calling task's address space, not IRQ
-        // context. Best-effort: a failed copy is ignored per the old-value API.
-        let _ = unsafe { crate::handlers::copy_to_user(old_ptr, &out) };
+        // context.
+        if unsafe { crate::handlers::copy_to_user(old_ptr, &out) }.is_err() {
+            // `if (put_itimerval(ovalue, &get_buffer)) return -EFAULT;` —
+            // the new timer stays installed; only the report is lost.
+            ctx.set_return(err(EFAULT));
+            return;
+        }
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// getitimer(which, cur)
+/// `getitimer(which, cur)`.
+///
+/// `kernel/time/itimer.c::sys_getitimer`:
+///
+/// ```text
+///     int error = do_getitimer(which, &get_buffer);
+///     if (!error && put_itimerval(value, &get_buffer))
+///             error = -EFAULT;
+///     return error;
+/// ```
+///
+/// `do_getitimer`'s `switch (which)` ends in `default: return(-EINVAL);`,
+/// and it runs BEFORE the copy-out — so `getitimer(99, NULL)` is EINVAL,
+/// not EFAULT. The two checks used to share one `if` here, which made the
+/// winner an accident of how the condition was written; splitting them
+/// fixes the order at the same time as the errnos.
+///
+/// For the caller: EINVAL means the slot number is wrong (ITIMER_VIRTUAL
+/// and ITIMER_PROF exist, so it is worth distinguishing), EFAULT means
+/// the `struct itimerval` is not writable. EPERM meant neither, and
+/// getitimer is unprivileged — there is no permission to acquire.
 pub fn sys_getitimer(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let which = args.arg0;
+    // `which` is `int`; only the low 32 bits reach the kernel.
+    let which = args.arg0 as u32 as i32;
     let out_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if which > ITIMER_PROF || out_ptr == 0 {
-        ctx.set_return(fail);
+    if !(0..=ITIMER_PROF as i32).contains(&which) {
+        ctx.set_return(err(EINVAL));
         return;
     }
+    let which = which as usize;
     let task = current_task_id();
     let now = narf_scheduler::narf_time::monotonic_ns();
-    let slot = with_itimers(|m| m.get(&task).map(|s| s[which as usize]).unwrap_or_default());
+    let slot = with_itimers(|m| m.get(&task).map(|s| s[which]).unwrap_or_default());
     let mut out = [0u8; 32];
     write_itimerval(&mut out, slot, now);
-    // SAFETY: `out_ptr` is checked non-zero above and is a user address;
-    // `copy_to_user` range-validates it and brackets the 32-byte write in the
-    // SMAP window. Runs in the calling task's address space, not IRQ context.
+    // SAFETY: `out_ptr` is a user address; `copy_to_user` range-validates it
+    // (NULL included → EFAULT) and brackets the 32-byte write in the SMAP
+    // window. Runs in the calling task's address space, not IRQ context.
     if unsafe { crate::handlers::copy_to_user(out_ptr, &out) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(err(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
 }
 
-/// alarm(seconds) — convenience wrapper over ITIMER_REAL with no
-/// interval. Returns the previous alarm's remaining whole seconds
-/// (rounded up), or 0 if none was armed.
+/// `alarm(seconds)` — convenience wrapper over ITIMER_REAL with no
+/// interval. Returns the previous alarm's remaining seconds, 0 if none
+/// was armed. There is no error path: `SYSCALL_DEFINE1(alarm, unsigned
+/// int, seconds)` returns an `unsigned int` and `do_setitimer` cannot
+/// fail for a hardcoded `ITIMER_REAL` + a valid timespec.
+///
+/// `kernel/time/itimer.c::alarm_setitimer`:
+///
+/// ```text
+///     static unsigned int alarm_setitimer(unsigned int seconds)
+///     {
+///             it_new.it_value.tv_sec = seconds;
+///             ...
+///             do_setitimer(ITIMER_REAL, &it_new, &it_old);
+///
+///             /*
+///              * We can't return 0 if we have an alarm pending ...  And we'd
+///              * better return too much than too little anyway
+///              */
+///             if ((!it_old.it_value.tv_sec && it_old.it_value.tv_nsec) ||
+///                   it_old.it_value.tv_nsec >= (NSEC_PER_SEC / 2))
+///                     it_old.it_value.tv_sec++;
+///
+///             return it_old.it_value.tv_sec;
+///     }
+/// ```
+///
+/// Two fixes, neither of them an errno:
+///
+///  * `seconds` is `unsigned int` — **32 bits**. Reading the full
+///    register meant `alarm(1 << 32)` armed a ~136-year timer where
+///    Linux truncates to 0 and *cancels* the alarm. A watchdog that
+///    passes a computed 64-bit value would silently never fire.
+///  * The rounding is round-to-nearest with a floor of 1 for any nonzero
+///    sub-second remainder, not the unconditional round-up this used to
+///    do: for 1.2 s remaining Linux answers 1, NARF answered 2. Callers
+///    that re-arm with the returned value (the standard
+///    save/restore-the-alarm idiom) drifted a second later on every hop.
 pub fn sys_alarm(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let secs = args.arg0;
+    // `unsigned int seconds` — truncate, do not read the whole register.
+    let secs = args.arg0 as u32 as u64;
     let task = current_task_id();
     let now = narf_scheduler::narf_time::monotonic_ns();
     let next_fire = if secs == 0 {
@@ -720,13 +1183,21 @@ pub fn sys_alarm(ctx: &mut dyn TrapContext) {
     let prev_remaining = if prev.next_fire_ns == 0 {
         0
     } else {
-        // Round up to whole seconds, like Linux.
-        prev.next_fire_ns
-            .saturating_sub(now)
-            .saturating_add(999_999_999)
-            / 1_000_000_000
+        // `alarm_setitimer`'s bump, verbatim: add a second only when the
+        // whole remainder is sub-second-but-nonzero (so a pending alarm
+        // never reports 0 and looks unarmed), or when the sub-second part
+        // is at least half a second.
+        let rem = prev.next_fire_ns.saturating_sub(now);
+        let sec = rem / 1_000_000_000;
+        let nsec = rem % 1_000_000_000;
+        if (sec == 0 && nsec != 0) || nsec >= 500_000_000 {
+            sec.saturating_add(1)
+        } else {
+            sec
+        }
     };
-    ctx.set_return(SyscallReturn::ok(prev_remaining));
+    // The return type is `unsigned int`; Linux truncates the same way.
+    ctx.set_return(SyscallReturn::ok(prev_remaining as u32 as u64));
 }
 
 /// Sleep-pump half for ITIMER_REAL — collect SIGALRM deliveries for

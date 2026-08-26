@@ -42,6 +42,81 @@ fn parse_overlay_lowerdirs(value: &str) -> Option<alloc::vec::Vec<alloc::string:
     Some(layers)
 }
 
+/// Map an `FsError` raised while ATTACHING a built filesystem (or a bind) at
+/// the target onto the errno `fs/namespace.c::do_add_mount` / `graft_tree`
+/// would report. Notably not EFAULT: an attach failure has nothing to do with
+/// the caller's pointers, and reporting "Bad address" for it sends a mount
+/// helper hunting for a buffer bug that does not exist (this is exactly how
+/// xdg-document-portal's "fuse: mount failed: Bad address" arose).
+fn mount_attach_errno(e: narf_filesystem::FsError) -> SyscallReturn {
+    use narf_filesystem::FsError;
+    let code: i64 = match e {
+        FsError::NotFound => -2,              // -ENOENT — nothing to attach
+        FsError::Busy => -16,                 // -EBUSY  — target in use
+        FsError::PermissionDenied => -1,      // -EPERM  — revoked authority
+        FsError::OperationNotPermitted => -1, // -EPERM
+        FsError::NoSpace => -28,              // -ENOSPC
+        FsError::Unsupported => -95,          // -EOPNOTSUPP
+        _ => -22,                             // -EINVAL
+    };
+    SyscallReturn::ok(code as u64)
+}
+
+// `include/uapi/linux/mount.h`. Neither bit is in the shared `MS_*` block
+// because nothing else in NARF acts on them.
+//
+// MS_MGC_VAL is the pre-2.4 "mount magic": callers used to OR it into the
+// flag word and the kernel strips it before ANY flag is interpreted. That
+// strip is not cosmetic — MS_MGC_VAL (0xC0ED0000) contains bit 31, which is
+// MS_NOUSER, so a legacy caller that still passes the magic would otherwise
+// be rejected with EINVAL by the very next check.
+const MS_MGC_MSK: u64 = 0xffff_0000;
+const MS_MGC_VAL: u64 = 0xC0ED_0000;
+const MS_NOUSER: u64 = 1 << 31;
+
+/// `fs/namespace.c::path_mount`, reached from `do_mount` /
+/// `SYSCALL_DEFINE5(mount)`, in the order the kernel applies it:
+///
+/// ```text
+///   SYSCALL_DEFINE5(mount): copy_mount_string(type);      /* -EFAULT */
+///                           copy_mount_string(dev_name);  /* -EFAULT */
+///                           copy_mount_options(data);     /* -EFAULT */
+///   do_mount():   user_path_at(AT_FDCWD, dir_name, LOOKUP_FOLLOW, &path);
+///                                        /* -EFAULT/-ENOENT/-ENOTDIR/-EACCES */
+///   path_mount(): if ((flags & MS_MGC_MSK) == MS_MGC_VAL) flags &= ~MS_MGC_MSK;
+///                 if (flags & MS_NOUSER)  return -EINVAL;
+///                 if (!may_mount())       return -EPERM;
+///                 ... dispatch: remount / bind / change_type / move / new
+/// ```
+///
+/// Getting the errno right matters more for mount(2) than for almost any
+/// other syscall, precisely BECAUSE EPERM is one of its legitimate answers:
+/// a bare `-1` is indistinguishable from "you lack CAP_SYS_ADMIN". A
+/// container runtime branches hard on that — EPERM means "re-exec in a user
+/// namespace / give up on this mount", while ENODEV means "load the module
+/// or pick another fstype", EBUSY means "retry after the previous tenant
+/// leaves", ENOENT means "mkdir the target first" and EINVAL means "the
+/// option string is wrong". Collapsing all five into EPERM makes every one
+/// of them look like a privilege problem.
+///
+/// LINUX-GAPs still open in this handler, all noted where they occur:
+///   * `may_mount()`'s -EPERM (CAP_SYS_ADMIN in the mount namespace's user
+///     namespace) is never checked — NARF has no per-task capability set to
+///     consult here.
+///   * The target is never required to exist: Linux's `user_path_at` gives
+///     -ENOENT for a missing target and -ENOTDIR for a non-directory one
+///     BEFORE any of the flag handling, and NARF's flat mount table happily
+///     registers a mount at a path that has no node. `do_add_mount`'s -EBUSY
+///     for a target that already carries this same mount is likewise absent.
+///   * -ENOTBLK (a block-device fstype whose `source` names a non-block file)
+///     and -EACCES (an unsearchable target directory) have no NARF analogue:
+///     the block layer here is a flat name→device registry with no file
+///     identity, and there is no directory permission walk on the mount path.
+///   * MS_RDONLY / MS_NOSUID / MS_NODEV / MS_NOEXEC / MS_REC / MS_RELATIME
+///     are accepted and then IGNORED (see the swallow below) — a silent
+///     divergence rather than a wrong errno, and the more dangerous kind:
+///     a sandbox that mounts `MS_NOSUID|MS_NODEV` gets a success reply and
+///     no enforcement.
 pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // errno replies (negated-long convention). Every failure carries a
@@ -51,8 +126,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
     let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
     let efault = SyscallReturn::ok((-14i64) as u64); // EFAULT — bad user pointer
-                                                     // A copy-in failure means an unreadable user pointer → EFAULT.
-    let fail = efault;
 
     // Linux `mount(2)`: (const char *source, const char *target,
     // const char *filesystemtype, unsigned long mountflags, const void *data).
@@ -63,21 +136,45 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // call was mis-parsed (arg1 read as a length, etc.) and returned EPERM.
     // That silently broke every real mount: elogind's per-user tmpfs at
     // /run/user/0 failed → CreateSession failed → no logind session for kwin.
-    let source = copy_user_cstr(args.arg0, 4096).unwrap_or_default();
-    let target_raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    // fstype may be NULL for MS_REMOUNT / MS_BIND / MS_MOVE.
+    //
+    // `SYSCALL_DEFINE5(mount)` stages the three copyable strings BEFORE it
+    // looks at the target, and `copy_mount_string` is `strndup_user`: a NULL
+    // pointer yields NULL (no error), a faulting one yields -EFAULT. Folding
+    // a fault into an empty string — which is what `unwrap_or_default()` did
+    // for `source` and `fstype` — turned "your fstype pointer is garbage"
+    // into "unknown filesystem type" (ENODEV) and a faulting `source` into a
+    // silent block-device-less mount attempt.
+    //
+    // The copy ORDER is Linux's: type, then dev_name, then data, then the
+    // target path. All four faults are EFAULT, so the order is only visible
+    // through which string a handler stops on — but keeping it means a later
+    // length/name check added to one of them lands where Linux puts it.
+    //
+    // fstype may be NULL for MS_REMOUNT / MS_BIND / MS_MOVE. The cap is
+    // `copy_mount_string`'s PAGE_SIZE.
     let fstype = if args.arg2 == 0 {
         alloc::string::String::new()
     } else {
-        copy_user_cstr(args.arg2, 256).unwrap_or_default()
+        match copy_user_cstr(args.arg2, 4096) {
+            Some(s) => s,
+            None => {
+                ctx.set_return(efault);
+                return;
+            }
+        }
     };
-    let flags = args.arg3;
+    // A NULL source is legal (MS_REMOUNT / propagation changes pass one).
+    let source = if args.arg0 == 0 {
+        alloc::string::String::new()
+    } else {
+        match copy_user_cstr(args.arg0, 4096) {
+            Some(s) => s,
+            None => {
+                ctx.set_return(efault);
+                return;
+            }
+        }
+    };
     // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=64M").
     let data = if args.arg4 == 0 {
         alloc::string::String::new()
@@ -90,6 +187,26 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             }
         }
     };
+    let target_raw = match copy_user_cstr(args.arg1, 4096) {
+        Some(s) => s,
+        None => {
+            ctx.set_return(efault);
+            return;
+        }
+    };
+    // `path_mount` runs after `do_mount` has resolved the target: it discards
+    // the legacy mount magic before any flag is read, then rejects MS_NOUSER —
+    // the in-kernel-only bit that marks a mount userspace may not request.
+    let flags = args.arg3;
+    let flags = if flags & MS_MGC_MSK == MS_MGC_VAL {
+        flags & !MS_MGC_MSK
+    } else {
+        flags
+    };
+    if flags & MS_NOUSER != 0 {
+        ctx.set_return(einval);
+        return;
+    }
 
     // Propagation-only change (MS_SLAVE/MS_SHARED/MS_PRIVATE/MS_UNBINDABLE,
     // optionally |MS_REC): change the propagation type of the mount at
@@ -144,8 +261,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         } else {
             resolve_vfs_symlink_path(source_resolved.as_str(), true).unwrap_or(source_resolved)
         };
-    // Silence-the-warning swallow for option bits we accept but
-    // don't yet act on; they're documented above.
+    // LINUX-GAP (accepted-then-ignored, NOT an errno bug): `path_mount`
+    // translates each of these into an `MNT_*` bit that the VFS then enforces
+    // per mount. NARF has nowhere to store them until `FsInstance` grows a
+    // per-mount option vector, so they are validated (they are real flags, so
+    // no EINVAL) and dropped. The dangerous members are MS_RDONLY, MS_NOSUID
+    // and MS_NODEV: a caller that mounts with them gets 0 and no enforcement.
     let _ =
         flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
 
@@ -276,6 +397,14 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         // (226/EXIT_NAMESPACE). current_bind_mount handles a file source by
         // registering a FileMount, so a self-bind of a file is a real mount
         // whose lookups still resolve to the same file.
+        // LINUX-GAP (swallowed failure, NOT an errno bug): a failing bind
+        // reports 0 below. `fs/namespace.c::do_loopback` returns -ENOENT for
+        // a source that does not resolve and -EINVAL for one that may not be
+        // bound. Turning this into an errno is a behaviour change, not an
+        // errno fix — several live paths (systemd's self-binds over procfs
+        // control files, and the bind that pivot_root stages put_old with)
+        // currently depend on the success reply — so it is left recorded
+        // rather than changed under an audit that cannot run the boot.
         return match current_bind_mount(&auth, source_resolved.as_str(), target.as_str()) {
             Ok(_h) => {
                 for (relative, fs) in descendants {
@@ -447,7 +576,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         };
         return match current_mount_arc(&auth, target.as_str(), fs) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
+            Err(e) => ctx.set_return(mount_attach_errno(e)),
         };
     }
 
@@ -529,7 +658,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
         return match current_mount_arc(&auth, target.as_str(), fs_dyn) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(fail),
+            Err(e) => ctx.set_return(mount_attach_errno(e)),
         };
     }
 
@@ -541,9 +670,12 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         return match builder(source_resolved.as_str(), data.as_str()) {
             Ok(fs) => match current_mount_arc(&auth, target.as_str(), fs) {
                 Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
-                Err(_) => ctx.set_return(fail),
+                Err(e) => ctx.set_return(mount_attach_errno(e)),
             },
-            Err(_) => ctx.set_return(fail),
+            // The out-of-tree constructor rejected the source/options it was
+            // handed — Linux's `fill_super` failure, which surfaces as the
+            // filesystem's own errno, never EFAULT.
+            Err(e) => ctx.set_return(mount_attach_errno(e)),
         };
     }
 

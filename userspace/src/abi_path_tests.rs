@@ -595,11 +595,18 @@ kernel_test_in!("syscall_abi", smoke_abi_path_getcwd_pos);
 
 fn smoke_abi_path_getcwd_neg() -> TestResult {
     with_setup(|| {
-        // LINUX ABI: a NULL destination pointer faults → -EFAULT (previously
-        // folded to a non-Ok InvalidOp status).
+        // `fs/d_path.c::SYSCALL_DEFINE2(getcwd)` sizes the answer BEFORE it
+        // touches the destination:
+        //
+        //     else if (unlikely(len > size)) error = -ERANGE;
+        //     else if (copy_to_user(buf, b.buf, len)) error = -EFAULT;
+        //
+        // so with size 0 the length check always wins and the NULL is never
+        // dereferenced. -EFAULT only becomes reachable once the buffer is
+        // nominally big enough, which the pathx suite covers.
         match call(Syscall::Getcwd.raw(), a1(0, 0)) {
-            Some(v) if v == EFAULT => Ok(()),
-            _ => Err("getcwd(NULL, 0) must return -EFAULT"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("getcwd(NULL, 0) must return -ERANGE (size is checked first)"),
         }
     })
 }

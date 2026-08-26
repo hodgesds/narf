@@ -1,5 +1,28 @@
 //! Ptrace syscall implementation.
 //! Linux-compatible ptrace(2) interface.
+//!
+//! ## Errno model
+//!
+//! `kernel/ptrace.c::SYSCALL_DEFINE4(ptrace, ...)` decides which error
+//! wins when several apply, and the order is not the obvious one:
+//!
+//! 1. `find_get_task_by_vpid(pid)` — no such pid in the CALLER's pid
+//!    namespace is **ESRCH**.
+//! 2. `ptrace_check_attach()` — "not traced by me" / "not stopped" is
+//!    **ESRCH**, not EPERM. It runs for every request except TRACEME,
+//!    ATTACH and SEIZE, and it runs *before* `arch_ptrace()`, so a
+//!    stranger's pid reports ESRCH even when the request code is
+//!    garbage and the pointers fault.
+//! 3. Only then the per-request checks, where ptrace's own dialect is
+//!    **EIO**, not EINVAL: an unrecognised request code, an unaligned
+//!    or out-of-range PEEKUSER/POKEUSER offset, a tracee word that
+//!    cannot be read or written, an invalid resume/detach signal.
+//!    EFAULT is reserved for a fault on the *tracer's own* buffer —
+//!    the `data` word, the iovec, the `user_regs_struct`.
+//!
+//! EPERM survives in exactly three places, all in `ptrace_attach` /
+//! `ptrace_traceme`: attaching to a process that already has a tracer,
+//! TRACEME when already traced, and attaching to yourself.
 
 use crate::handlers::{
     clear_pending_signal_bits, copy_from_user, copy_to_user, current_task_id, push_stopcont_report,
@@ -40,6 +63,48 @@ pub const NT_PRSTATUS: u64 = 1;
 /// syscall-stop so the tracer can distinguish it from an ordinary
 /// SIGTRAP.
 pub const PTRACE_O_TRACESYSGOOD: u64 = 1;
+
+/// The set of PTRACE_SETOPTIONS bits Linux will accept, from
+/// `include/uapi/linux/ptrace.h`:
+///
+/// ```text
+/// #define PTRACE_O_MASK		(\
+///	0x000000ff | PTRACE_O_EXITKILL | PTRACE_O_SUSPEND_SECCOMP)
+/// ```
+///
+/// with PTRACE_O_EXITKILL = 1<<20 and PTRACE_O_SUSPEND_SECCOMP = 1<<21.
+/// `kernel/ptrace.c::check_ptrace_options` rejects anything outside it
+/// with EINVAL; see PTRACE_SETOPTIONS below for why silently storing
+/// unknown bits is worse than rejecting them.
+pub const PTRACE_O_MASK: u64 = 0x0000_00ff | (1 << 20) | (1 << 21);
+
+/// `kernel/ptrace.c::ptrace_check_attach`:
+///
+/// ```text
+/// static int ptrace_check_attach(struct task_struct *child, bool ignore_state)
+/// {
+///	int ret = -ESRCH;
+///	...
+///	if (child->ptrace && child->parent == current) {
+///		if (ignore_state || ptrace_freeze_traced(child))
+///			ret = 0;
+///	}
+///	...
+///	return ret;
+/// }
+/// ```
+///
+/// "you are not this process's tracer" is **ESRCH**, not EPERM — and
+/// `SYSCALL_DEFINE4(ptrace)` calls this before `arch_ptrace()`, so it
+/// outranks a bad request code (EIO) and a faulting pointer (EFAULT).
+///
+/// The distinction is load-bearing. A tracer races the tracee's exit on
+/// every single request: strace and gdb read ESRCH as "the tracee died
+/// or left its ptrace-stop", go reap it with waitpid, and carry on. They
+/// report EPERM to the user as a fatal "Operation not permitted" and
+/// abandon the session. Answering EPERM for a tracee that merely exited
+/// turns a routine race into a hard failure.
+const ESRCH_NOT_TRACER: u64 = (-3i64) as u64;
 
 /// Per-tracee syscall-stop phase. A PTRACE_SYSCALL resume arms the
 /// tracee to stop at the *next* syscall boundary; the boundary toggles
@@ -669,7 +734,10 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             };
             let mut g = PTRACE_STATE.lock();
             if let Some(r) = g.as_mut() {
-                // One tracer per process (Linux: EPERM if already traced).
+                // `kernel/ptrace.c::ptrace_traceme` opens with
+                // `int ret = -EPERM;` and only `if (!current->ptrace)`
+                // clears it — one tracer per process. A genuine EPERM,
+                // not the -1 sentinel.
                 if r.tracers.contains_key(&caller_pid) {
                     ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
                     return;
@@ -681,21 +749,39 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             }
         }
         PTRACE_ATTACH => {
-            if pid == caller_pid {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                return;
-            }
+            // `SYSCALL_DEFINE4(ptrace)` resolves the pid FIRST
+            // (`find_get_task_by_vpid` → -ESRCH) and only then calls
+            // `ptrace_attach`, so a pid that does not exist outranks every
+            // attach-time check below.
             let tid = pid_to_tid(pid);
             let has_task = crate::user_task::with_user_task_ctx(tid, |_| ()).is_some();
             if !has_task {
                 ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
                 return;
             }
+            // `kernel/ptrace.c::ptrace_attach`:
+            //
+            //     if (unlikely(task->flags & PF_KTHREAD))
+            //             return -EPERM;
+            //     if (same_thread_group(task, current))
+            //             return -EPERM;
+            //
+            // Attaching to yourself is EPERM, not EINVAL. EINVAL tells a
+            // caller "the request you built is malformed" — a library
+            // probing whether it may self-trace (gdb, sanitizers, crash
+            // handlers that fork a helper) treats that as a bug in its own
+            // argument marshalling, while EPERM correctly says the target
+            // is off limits and the probe should fall back.
+            if pid == caller_pid {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
-                    // A process can have only ONE tracer (Linux: EPERM to
-                    // attach to an already-traced tracee).
+                    // `ptrace_attach`: `if (task->ptrace) return -EPERM;`
+                    // — a process can have only ONE tracer. A genuine
+                    // EPERM, not the -1 sentinel.
                     if r.tracers.contains_key(&pid) {
                         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
                         return;
@@ -713,7 +799,30 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let mut g = PTRACE_STATE.lock();
             if let Some(r) = g.as_mut() {
                 if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                    // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                    ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
+                    return;
+                }
+                // `kernel/ptrace.c::ptrace_detach`:
+                //
+                //     static int ptrace_detach(struct task_struct *child,
+                //                              unsigned int data)
+                //     {
+                //             if (!valid_signal(data))
+                //                     return -EIO;
+                //
+                // `data` names the signal to deliver as the tracee
+                // resumes. Note the parameter WIDTH: `unsigned int`, so
+                // only the low 32 bits are examined — 0x1_0000_0000
+                // detaches with signal 0 instead of failing.
+                // valid_signal() is `sig <= _NSIG` (64).
+                //
+                // A tracer that passes a bad signal must learn its detach
+                // did NOT happen; returning 0 would leave it believing the
+                // tracee was released while it is still stopped and still
+                // attached, and its next waitpid would hang.
+                if (data as u32) as u64 > 64 {
+                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
                     return;
                 }
                 r.tracers.remove(&pid);
@@ -733,7 +842,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
@@ -752,6 +862,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 Some(p) => {
                     // SAFETY: p is a valid physical address mapped in the kernel's virtual space.
                     let val = unsafe { *p.kernel_ptr::<u64>() };
+                    // The write-back target is the TRACER's own pointer, so
+                    // this one really is EFAULT: `generic_ptrace_peekdata`
+                    // ends with `return put_user(tmp, ...)`.
                     // SAFETY: data is a user pointer, checked by copy_to_user.
                     if data != 0 && unsafe { copy_to_user(data, &val.to_ne_bytes()) }.is_err() {
                         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
@@ -760,7 +873,21 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok(val));
                 }
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    // `kernel/ptrace.c::generic_ptrace_peekdata`:
+                    //
+                    //     copied = ptrace_access_vm(tsk, addr, &tmp,
+                    //                               sizeof(tmp), FOLL_FORCE);
+                    //     if (copied != sizeof(tmp))
+                    //             return -EIO;
+                    //
+                    // An address that is not mapped in the TRACEE is EIO,
+                    // not EFAULT — EFAULT would accuse the tracer of
+                    // passing a bad pointer of its own. gdb walks a
+                    // tracee's stack by peeking word after word until it
+                    // falls off the end of the mapping, and its unwinder
+                    // keys on EIO to mean "that address isn't there";
+                    // EFAULT reads as an internal error instead.
+                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
                 }
             }
         }
@@ -769,7 +896,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
@@ -793,7 +921,16 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok(0));
                 }
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                    // `kernel/ptrace.c::generic_ptrace_pokedata`:
+                    //
+                    //     return (copied == sizeof(data)) ? 0 : -EIO;
+                    //
+                    // Poking an address the tracee has not mapped is EIO.
+                    // A breakpoint-setter that gets EFAULT here blames its
+                    // own `data` argument; EIO correctly says the tracee
+                    // address is unwritable, which is how gdb decides a
+                    // software breakpoint cannot be planted there.
+                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
                 }
             }
         }
@@ -802,7 +939,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
@@ -826,7 +964,8 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
@@ -848,7 +987,24 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
+                        return;
+                    }
+                    // `kernel/ptrace.c::ptrace_resume`:
+                    //
+                    //     if (!valid_signal(data))
+                    //             return -EIO;
+                    //
+                    // `valid_signal()` is `sig <= _NSIG` (64). This runs
+                    // before the tracee is woken, so a bad signal number
+                    // leaves the tracee stopped — the tracer must learn
+                    // that from the errno. Returning 0 while quietly
+                    // dropping the signal (what this arm did for anything
+                    // >= 32) tells a tracer its SIGCONT/SIGTERM injection
+                    // succeeded when nothing was delivered.
+                    if data > 64 {
+                        ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
                         return;
                     }
                     r.stopped.remove(&pid);
@@ -897,7 +1053,35 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
+                        return;
+                    }
+                    // `kernel/ptrace.c::check_ptrace_options`, reached via
+                    // `ptrace_setoptions`:
+                    //
+                    //     if (data & ~(unsigned long)PTRACE_O_MASK)
+                    //             return -EINVAL;
+                    //
+                    // Storing a bit OUTSIDE PTRACE_O_MASK and answering 0
+                    // is the silent kind of divergence: PTRACE_SETOPTIONS
+                    // is how a tracer feature-probes: it sets the bit it
+                    // wants and reads the errno. Told "accepted" for a
+                    // PTRACE_O_* this kernel has never heard of, it stops
+                    // arranging a fallback and then waits forever for a
+                    // stop that will never be reported. EINVAL — the same
+                    // answer a real kernel too old for that option gives —
+                    // keeps the probe honest.
+                    //
+                    // LINUX-GAP: of the bits INSIDE the mask, NARF only
+                    // acts on PTRACE_O_TRACESYSGOOD. The rest (EXITKILL,
+                    // TRACEFORK, TRACEEXIT, …) are stored and ignored;
+                    // Linux stores them too, but it also generates the
+                    // PTRACE_EVENT_* stops they ask for, and NARF does
+                    // not. Rejecting them would be the larger divergence
+                    // — Linux accepts them — so they stay accepted here.
+                    if data & !PTRACE_O_MASK != 0 {
+                        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
                         return;
                     }
                     r.options.insert(pid, data);
@@ -911,20 +1095,43 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
             }
-            if addr != NT_PRSTATUS {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                return;
-            }
+            // `kernel/ptrace.c::ptrace_request`, case PTRACE_GETREGSET:
+            //
+            //     if (!access_ok(uiov, sizeof(*uiov)))
+            //             return -EFAULT;
+            //     if (__get_user(kiov.iov_base, &uiov->iov_base) ||
+            //         __get_user(kiov.iov_len, &uiov->iov_len))
+            //             return -EFAULT;
+            //     ret = ptrace_regset(child, request, addr, &kiov);
+            //
+            // ORDER: the iovec is read BEFORE `ptrace_regset` looks at the
+            // regset id, so a faulting iovec beats an unknown regset. A
+            // tool that feature-probes regsets (CRIU asks for NT_X86_XSTATE
+            // and friends) must be able to tell "this kernel has no such
+            // regset" (EINVAL) from "I handed you a bad iovec" (EFAULT);
+            // checking the id first reports EINVAL for both and makes it
+            // silently skip a regset it should have retried.
+            //
             // Read the caller's iovec (two u64s: iov_base, iov_len).
             let mut iov = [0u64; 2];
             // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                return;
+            }
+            // WIDTH: `ptrace_regset(struct task_struct *task, int req,
+            // unsigned int type, struct iovec *kiov)` takes the regset id
+            // as `unsigned int`, so only the low 32 bits of `addr` select
+            // it — NT_PRSTATUS with junk in the high half still resolves.
+            // `ptrace_regset` returns EINVAL when `find_regset` misses.
+            if addr as u32 as u64 != NT_PRSTATUS {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
                 return;
             }
             let regs = match get_tracee_regs(pid) {
@@ -954,21 +1161,34 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
             }
-            if addr != NT_PRSTATUS {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
-                return;
-            }
+            // Same order as PTRACE_GETREGSET above: `ptrace_request`
+            // faults on the iovec first, `ptrace_regset` validates the
+            // regset id second.
             let mut iov = [0u64; 2];
             // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
                 ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
                 return;
             }
+            // WIDTH: the regset id is `unsigned int` in `ptrace_regset`.
+            if addr as u32 as u64 != NT_PRSTATUS {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            // `ptrace_regset`: `if (!regset || (kiov->iov_len %
+            // regset->size) != 0) return -EINVAL;`
+            //
+            // LINUX-GAP: Linux only requires the length to be a multiple of
+            // the register size (8) and then clamps it, so a partial
+            // SETREGSET writes the leading registers; NARF has no partial
+            // path and requires the whole struct. The errno for a rejected
+            // length is EINVAL either way.
             let full = core::mem::size_of::<user_regs_struct>();
             if (iov[1] as usize) < full {
                 ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
@@ -992,10 +1212,39 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
+            }
+            // `arch/x86/kernel/ptrace.c::arch_ptrace`, case PTRACE_PEEKUSR:
+            //
+            //     ret = -EIO;
+            //     if ((addr & (sizeof(data) - 1)) ||
+            //         addr >= sizeof(struct user))
+            //             break;
+            //
+            // A misaligned or out-of-range USER-area offset is EIO, not
+            // EFAULT: `addr` is an offset into a kernel-side struct, not a
+            // pointer, so there is no fault to report. libthread_db and
+            // gdb probe this offset space to discover which registers a
+            // kernel exposes, and they read EIO as "no such register"
+            // while EFAULT looks like a broken tracer buffer.
+            //
+            // ORDER: this guard sits at the top of arch_ptrace's case, so
+            // the offset is rejected before the tracee's saved registers
+            // are even fetched.
+            //
+            // LINUX-GAP: Linux bounds this by `sizeof(struct user)` (which
+            // also covers u_debugreg and the a.out header fields) and
+            // returns 0 for in-range offsets past user_regs_struct; NARF
+            // only models user_regs_struct, so those offsets are EIO here.
+            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
+            let idx = (addr as usize) / 8;
+            if addr % 8 != 0 || idx >= nregs {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                return;
             }
             let regs = match get_tracee_regs(pid) {
                 Some(r) => r,
@@ -1004,12 +1253,6 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
-            let idx = (addr as usize) / 8;
-            if addr % 8 != 0 || idx >= nregs {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-                return;
-            }
             // SAFETY: idx is in bounds of the [u64; nregs]-shaped regs struct.
             let val = unsafe { *(&regs as *const user_regs_struct as *const u64).add(idx) };
             // PEEKUSER returns the word as the syscall value; glibc/musl also
@@ -1026,10 +1269,23 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 let g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_ref() {
                     if r.tracers.get(&pid).copied() != Some(caller_pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        // ESRCH, not EPERM: see `ESRCH_NOT_TRACER`.
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
                         return;
                     }
                 }
+            }
+            // `arch/x86/kernel/ptrace.c::arch_ptrace`, case PTRACE_POKEUSR,
+            // uses the identical `ret = -EIO;` guard as PEEKUSR above:
+            //
+            //     if ((addr & (sizeof(data) - 1)) ||
+            //         addr >= sizeof(struct user))
+            //             break;
+            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
+            let idx = (addr as usize) / 8;
+            if addr % 8 != 0 || idx >= nregs {
+                ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                return;
             }
             let mut regs = match get_tracee_regs(pid) {
                 Some(r) => r,
@@ -1038,12 +1294,6 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     return;
                 }
             };
-            let nregs = core::mem::size_of::<user_regs_struct>() / 8;
-            let idx = (addr as usize) / 8;
-            if addr % 8 != 0 || idx >= nregs {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-                return;
-            }
             // SAFETY: idx is in bounds of the [u64; nregs]-shaped regs struct.
             unsafe { *(&mut regs as *mut user_regs_struct as *mut u64).add(idx) = data };
             if set_tracee_regs(pid, regs) {
@@ -1053,6 +1303,26 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             }
         }
         PTRACE_KILL => {
+            // `SYSCALL_DEFINE4(ptrace)` still runs
+            //
+            //     ret = ptrace_check_attach(child, request == PTRACE_KILL ||
+            //                               request == PTRACE_INTERRUPT);
+            //
+            // for PTRACE_KILL — `ignore_state` only waives the "must be in
+            // TASK_TRACED" half; `child->ptrace && child->parent ==
+            // current` is still required, and failing it is ESRCH. Without
+            // this check any process could SIGKILL any pid through
+            // ptrace(2), and a tracer whose tracee has already exited would
+            // be told the kill "worked".
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
+                        return;
+                    }
+                }
+            }
             let tid = pid_to_tid(pid);
             // Clear the ptrace-stop so the parked tracee actually RESUMES (as
             // PTRACE_CONT does) and then terminates on the pending SIGKILL it
@@ -1073,7 +1343,29 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         _ => {
-            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
+            // ORDER: `ptrace_check_attach` has already run by the time an
+            // unknown request reaches `ptrace_request`, so "not my tracee"
+            // (ESRCH) outranks "no such request" (EIO).
+            {
+                let g = PTRACE_STATE.lock();
+                if let Some(r) = g.as_ref() {
+                    if r.tracers.get(&pid).copied() != Some(caller_pid) {
+                        ctx.set_return(SyscallReturn::ok(ESRCH_NOT_TRACER));
+                        return;
+                    }
+                }
+            }
+            // `kernel/ptrace.c::ptrace_request` opens with `int ret =
+            // -EIO;` and its `default:` label only `break`s, so an
+            // unrecognised request code returns EIO.
+            //
+            // ENOSYS (what this arm returned) is a different claim: glibc
+            // renders it "Function not implemented", so a tracer probing
+            // for an optional request — PTRACE_GETSIGINFO, PTRACE_SEIZE,
+            // PTRACE_GET_SYSCALL_INFO — concludes that ptrace(2) itself is
+            // missing and disables tracing wholesale, instead of falling
+            // back to the requests this kernel does implement.
+            ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
         }
     }
 }

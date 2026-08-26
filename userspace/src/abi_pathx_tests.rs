@@ -198,11 +198,23 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chroot_pos);
 
 fn smoke_abi_pathx_chroot_neg() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
-        // A relative path is rejected outright (must start with '/').
+        // A relative path is NOT rejected for being relative — Linux's
+        // chroot() looks its argument up with AT_FDCWD, so "relative" joins
+        // the cwd. What it must NOT do is report the bare -1 sentinel, which
+        // reaches a container runtime as EPERM ("you are not privileged")
+        // when the real problem is the path.
+        //
+        // LINUX-GAP: the handler's existence test is "some mount covers this
+        // prefix", not "this name exists". With a root filesystem mounted —
+        // which is every booted configuration — every path is covered, so a
+        // missing name under it still installs as a root instead of -ENOENT.
+        // Tightening that changes which chroots SUCCEED, not just their
+        // errno, so this pins the reachable half: never EPERM.
         let path = b"relative\0";
         match call(Syscall::Chroot.raw(), a0(path.as_ptr() as u64)) {
-            Some(0) => Err("chroot(relative) must fail"),
-            _ => Ok(()),
+            Some(ENOENT) | Some(0) => Ok(()),
+            Some(EPERM) => Err("chroot(relative) returned EPERM — the bare -1 sentinel"),
+            _ => Err("chroot of a relative path returned an unexpected errno"),
         }
     })
 }
@@ -2268,8 +2280,13 @@ kernel_test_in!(
 // ── listdir (NARF-native path_ptr, path_len, cursor, out, out_len) ──
 //
 // Path-based readdir: serialises the cursor-th entry as
-// [name_len:u32][file_type:u32][name…]. Returns bytes_written (>0),
-// 0 at end-of-directory, -1 on bad input. LINUX-GAP: NARF-only call.
+// [name_len:u32][file_type:u32][name…]. Returns bytes_written (>0) or 0 at
+// end-of-directory. There is no Linux syscall of this name, but it is
+// getdents64(2) keyed on a path instead of an fd, so its failures carry
+// `fs/readdir.c`'s errnos and check ORDER: the directory is resolved
+// (-ENOENT / -ENOTDIR) before the output buffer is looked at, and
+// `filldir64` rejects a record that cannot fit with -EINVAL before it opens
+// the user-access window (-EFAULT).
 
 fn smoke_abi_pathx_listdir_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("a", b"x"), ("b", b"y")], || {
@@ -2295,26 +2312,108 @@ fn smoke_abi_pathx_listdir_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_pos);
 
 fn smoke_abi_pathx_listdir_neg() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
     with_memfs("/p2", "p2", &[("a", b"x")], || {
         let path = b"/p2";
-        // out_ptr == NULL → -1 sentinel.
-        match call(
-            Syscall::Listdir.raw(),
-            SyscallArgs {
-                arg0: path.as_ptr() as u64,
-                arg1: path.len() as u64,
-                arg2: 0,
-                arg3: 0,
-                arg4: 128,
-                arg5: 0,
-            },
-        ) {
-            Some(-1) => Ok(()),
-            _ => Err("listdir(null out buf) was not the -1 sentinel"),
+        let listdir = |arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64| {
+            call(
+                Syscall::Listdir.raw(),
+                SyscallArgs {
+                    arg0,
+                    arg1,
+                    arg2,
+                    arg3,
+                    arg4,
+                    arg5: 0,
+                },
+            )
+        };
+        let p = path.as_ptr() as u64;
+        let n = path.len() as u64;
+        // A record that cannot fit is -EINVAL (`filldir64`: reclen > count),
+        // and it is decided BEFORE the user-access window opens — so the
+        // undersized buffer wins over the unusable pointer. "Grow the buffer
+        // and re-issue the same cursor" is a recoverable answer; the old
+        // -1/EPERM was not.
+        if listdir(p, n, 0, 0, 4) != Some(EINVAL) {
+            return Err("listdir with a buffer too small for one record must be -EINVAL");
         }
+        // Big enough to hold the record, but the pointer is unusable → -EFAULT.
+        if listdir(p, n, 0, 0, 128) != Some(EFAULT) {
+            return Err("listdir(null out buf) must be -EFAULT");
+        }
+        if listdir(p, n, 0, BAD_PTR, 128) != Some(EFAULT) {
+            return Err("listdir with a faulting out buf must be -EFAULT");
+        }
+        // A faulting PATH is -EFAULT too, and it is checked first.
+        let mut buf = [0u8; 128];
+        let out = buf.as_mut_ptr() as u64;
+        if listdir(BAD_PTR, 8, 0, out, 128) != Some(EFAULT) {
+            return Err("listdir with a faulting path must be -EFAULT");
+        }
+        // An empty pathname names nothing: `user_path_at(AT_FDCWD, "")`.
+        if listdir(p, 0, 0, out, 128) != Some(ENOENT) {
+            return Err("listdir(\"\") must be -ENOENT");
+        }
+        // Over-long pathname → -ENAMETOOLONG.
+        const ENAMETOOLONG: i64 = -36;
+        if listdir(p, 8192, 0, out, 128) != Some(ENAMETOOLONG) {
+            return Err("listdir with an over-long path must be -ENAMETOOLONG");
+        }
+        // A path that resolves to nothing → -ENOENT; one that resolves to a
+        // FILE → -ENOTDIR (`iterate_dir`'s `res = -ENOTDIR`). A tree walker
+        // branches on exactly this pair.
+        let gone = b"/p2/nope";
+        if listdir(gone.as_ptr() as u64, gone.len() as u64, 0, out, 128) != Some(ENOENT) {
+            return Err("listdir of a missing name must be -ENOENT");
+        }
+        let file = b"/p2/a";
+        if listdir(file.as_ptr() as u64, file.len() as u64, 0, out, 128) != Some(ENOTDIR) {
+            return Err("listdir of a regular file must be -ENOTDIR");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_neg);
+
+// Positive pins: an exhausted cursor is end-of-directory (0), and Linux
+// reports it WITHOUT touching the output buffer — `filldir64` is never
+// invoked, so a NULL or undersized buffer still returns 0 rather than an
+// error. A later tightening of the buffer checks must not break that.
+fn smoke_abi_pathx_listdir_eof_pos() -> TestResult {
+    with_memfs("/p3", "p3", &[("a", b"x")], || {
+        let path = b"/p3";
+        let mut buf = [0u8; 128];
+        let listdir = |cursor: u64, out: u64, out_len: u64| {
+            call(
+                Syscall::Listdir.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: path.len() as u64,
+                    arg2: cursor,
+                    arg3: out,
+                    arg4: out_len,
+                    arg5: 0,
+                },
+            )
+        };
+        // Cursor 0 yields the single entry.
+        match listdir(0, buf.as_mut_ptr() as u64, buf.len() as u64) {
+            Some(n) if n > 8 => {}
+            _ => return Err("listdir(cursor 0) should return > 8 bytes"),
+        }
+        // Cursor 1 is past the end → 0, with a usable buffer…
+        if listdir(1, buf.as_mut_ptr() as u64, buf.len() as u64) != Some(0) {
+            return Err("listdir past the end must return 0");
+        }
+        // …and equally with one the handler never gets to look at.
+        if listdir(1, 0, 0) != Some(0) {
+            return Err("end-of-directory must be 0 without inspecting the output buffer");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_eof_pos);
 
 // ── utime (NUL-term path) → 0 / -EFAULT ────────────────────────────
 //
@@ -2440,3 +2539,493 @@ fn smoke_abi_pathx_utimensat_missing_is_enoent() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_utimensat_missing_is_enoent);
+
+// ── errno conformance: the stat family + the cwd/root syscalls ─────────
+//
+// These handlers all used to signal failure with `SyscallReturn::ok(-1)`,
+// which libc reads as errno 1 = EPERM. That is the single most misleading
+// answer they can give: "does this path exist?" is the question a PATH
+// search, a config-file cascade and every create-if-missing helper asks, and
+// all of them branch on ENOENT while treating EPERM as a hard error to
+// report. The cases below pin the errno the kernel function named in each
+// handler's doc comment actually returns — including the ORDER, where Linux
+// makes one check win over another.
+
+// statx flag/mask bits, from include/uapi/linux/{stat,fcntl}.h. Kept local
+// to the test section so the assertions read against the ABI constants
+// rather than against NARF's own copies.
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+const AT_EMPTY_PATH: u64 = 0x1000;
+const AT_STATX_SYNC_TYPE: u64 = 0x6000;
+const STATX__RESERVED: u64 = 0x8000_0000;
+// An AT_* bit the kernel does not accept anywhere in the stat family.
+const AT_BOGUS_FLAG: u64 = 0x4_0000;
+const STATX_BASIC_STATS: u64 = 0x0000_07ff;
+
+fn a4(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
+        arg5: 0,
+    }
+}
+
+fn call_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> Option<i64> {
+    call(Syscall::Statx.raw(), a4(dirfd, path, flags, mask, buf))
+}
+
+// `fs/stat.c::SYSCALL_DEFINE2(newstat)` → vfs_stat → cp_new_stat.
+fn smoke_abi_pathx_stat_errnos() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let missing = b"/p2/nope\0";
+        let present = b"/p2/f\0";
+        let mut sb = [0u8; 144];
+
+        // POSITIVE FIRST: a later tightening of the error arms must not be
+        // able to turn a working stat into an error unnoticed.
+        if call_stat(present.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+            return Err("stat of the seeded file must still succeed");
+        }
+        // The headline case: a name that is simply not there is ENOENT.
+        // EPERM here makes busybox sh print "Operation not permitted" for
+        // every candidate of a `:`-separated PATH walk.
+        match call_stat(missing.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(ENOENT) => {}
+            Some(EPERM) => return Err("stat(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("stat(missing) must return -ENOENT"),
+        }
+        // A NULL pathname is the getname() arm: -EFAULT.
+        if call_stat(0, sb.as_mut_ptr() as u64) != Some(EFAULT) {
+            return Err("stat(NULL path) must return -EFAULT");
+        }
+        // cp_new_stat's copy_to_user arm.
+        if call_stat(present.as_ptr() as u64, 0) != Some(EFAULT) {
+            return Err("stat(existing, NULL statbuf) must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_stat_errnos);
+
+// `fs/stat.c::SYSCALL_DEFINE2(newlstat)` — same arms, AT_SYMLINK_NOFOLLOW.
+fn smoke_abi_pathx_lstat_errnos() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let missing = b"/p2/nope\0";
+        let present = b"/p2/f\0";
+        let mut sb = [0u8; 144];
+        if call(
+            Syscall::Lstat.raw(),
+            a1(present.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("lstat of the seeded file must still succeed");
+        }
+        match call(
+            Syscall::Lstat.raw(),
+            a1(missing.as_ptr() as u64, sb.as_mut_ptr() as u64),
+        ) {
+            Some(ENOENT) => Ok(()),
+            Some(EPERM) => Err("lstat(missing) returned EPERM — the bare -1 sentinel"),
+            _ => Err("lstat(missing) must return -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_lstat_errnos);
+
+// `fs/stat.c::SYSCALL_DEFINE2(newfstat)` → vfs_fstat: `fd_empty(f)` is
+// -EBADF and it is decided BEFORE the destination buffer is looked at.
+fn smoke_abi_pathx_fstat_errnos() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let present = b"/p2/f\0";
+        let mut sb = [0u8; 144];
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, present.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the fstat errno test could not open its seeded file"),
+        };
+        if call(Syscall::Fstat.raw(), a1(fd, sb.as_mut_ptr() as u64)) != Some(0) {
+            return Err("fstat of a live descriptor must still succeed");
+        }
+        // A descriptor the table does not hold. EBADF is the errno a caller
+        // recovers from (reopen); EPERM is one it reports and gives up on.
+        match call(Syscall::Fstat.raw(), a1(9999, sb.as_mut_ptr() as u64)) {
+            Some(EBADF) => {}
+            Some(EPERM) => return Err("fstat(bad fd) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("fstat(bad fd) must return -EBADF"),
+        }
+        // ORDER: a bad fd AND a NULL statbuf is EBADF, not EFAULT.
+        if call(Syscall::Fstat.raw(), a1(9999, 0)) != Some(EBADF) {
+            return Err("fstat(bad fd, NULL statbuf) must return -EBADF, not -EFAULT");
+        }
+        // cp_new_stat's arm, reached only once the fd is accepted.
+        if call(Syscall::Fstat.raw(), a1(fd, 0)) != Some(EFAULT) {
+            return Err("fstat(live fd, NULL statbuf) must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_fstat_errnos);
+
+// `fs/stat.c::SYSCALL_DEFINE5(statx)` → do_statx → vfs_statx → cp_statx.
+// The mask and sync-type checks precede path resolution; vfs_statx's flag
+// gate precedes the walk; cp_statx's copy comes last.
+fn smoke_abi_pathx_statx_errnos() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let present = b"/p2/f\0";
+        let missing = b"/p2/nope\0";
+        let mut sx = [0u8; 256];
+        let buf = sx.as_mut_ptr() as u64;
+
+        if call_statx(AT_FDCWD, present.as_ptr() as u64, 0, STATX_BASIC_STATS, buf) != Some(0) {
+            return Err("statx of the seeded file must still succeed");
+        }
+        match call_statx(AT_FDCWD, missing.as_ptr() as u64, 0, STATX_BASIC_STATS, buf) {
+            Some(ENOENT) => {}
+            Some(EPERM) => return Err("statx(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("statx(missing) must return -ENOENT"),
+        }
+        // do_statx: `mask & STATX__RESERVED` → -EINVAL.
+        if call_statx(AT_FDCWD, present.as_ptr() as u64, 0, STATX__RESERVED, buf) != Some(EINVAL) {
+            return Err("statx with a reserved mask bit must return -EINVAL");
+        }
+        // ORDER: that check runs before the path is resolved, so a reserved
+        // mask bit beats ENOENT on a name that does not exist.
+        if call_statx(AT_FDCWD, missing.as_ptr() as u64, 0, STATX__RESERVED, buf) != Some(EINVAL) {
+            return Err("a reserved statx mask bit must beat -ENOENT on a missing path");
+        }
+        // ORDER: it also beats -EFAULT on the pathname pointer, because
+        // getname()'s error is only surfaced later by filename_lookup.
+        if call_statx(AT_FDCWD, 0, 0, STATX__RESERVED, buf) != Some(EINVAL) {
+            return Err("a reserved statx mask bit must beat -EFAULT on the pathname");
+        }
+        // do_statx: FORCE_SYNC and DONT_SYNC together is contradictory.
+        if call_statx(
+            AT_FDCWD,
+            present.as_ptr() as u64,
+            AT_STATX_SYNC_TYPE,
+            0,
+            buf,
+        ) != Some(EINVAL)
+        {
+            return Err("statx with both AT_STATX_SYNC_* bits must return -EINVAL");
+        }
+        // vfs_statx: a flag outside the accepted set, on the lookup branch.
+        if call_statx(AT_FDCWD, present.as_ptr() as u64, AT_BOGUS_FLAG, 0, buf) != Some(EINVAL) {
+            return Err("statx with an unknown flag must return -EINVAL");
+        }
+        // A single sync-mode bit on its own IS accepted.
+        if call_statx(
+            AT_FDCWD,
+            present.as_ptr() as u64,
+            AT_STATX_SYNC_TYPE & !0x2000,
+            0,
+            buf,
+        ) != Some(0)
+        {
+            return Err("statx with one AT_STATX_SYNC_* bit must be accepted");
+        }
+        // getname()'s arm: an unreadable pathname with an otherwise valid call.
+        if call_statx(AT_FDCWD, 0, 0, 0, buf) != Some(EFAULT) {
+            return Err("statx(NULL path) must return -EFAULT");
+        }
+        // cp_statx's arm, last of all.
+        if call_statx(AT_FDCWD, present.as_ptr() as u64, 0, 0, 0) != Some(EFAULT) {
+            return Err("statx(existing, NULL buffer) must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_statx_errnos);
+
+// The AT_EMPTY_PATH branch: `statx(fd, "", AT_EMPTY_PATH, …)` goes through
+// do_statx_fd → vfs_statx_fd, which reports -EBADF for a dead descriptor and
+// — unlike vfs_statx — never validates `flags` at all.
+fn smoke_abi_pathx_statx_empty_path_fd() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let present = b"/p2/f\0";
+        let empty = b"\0";
+        let mut sx = [0u8; 256];
+        let buf = sx.as_mut_ptr() as u64;
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, present.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the statx AT_EMPTY_PATH test could not open its seeded file"),
+        };
+        if call_statx(
+            fd,
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH,
+            STATX_BASIC_STATS,
+            buf,
+        ) != Some(0)
+        {
+            return Err("statx(fd, \"\", AT_EMPTY_PATH) must succeed on a live descriptor");
+        }
+        // vfs_statx_fd bypasses the flag gate: a stray bit alongside
+        // AT_EMPTY_PATH still succeeds. glibc's fstat() is exactly this call,
+        // so rejecting it would turn every fstat into EINVAL.
+        if call_statx(
+            fd,
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH | AT_BOGUS_FLAG,
+            0,
+            buf,
+        ) != Some(0)
+        {
+            return Err("the statx fd branch must not validate flags");
+        }
+        // ...but the mask check lives in do_statx_fd, ahead of the fd lookup.
+        if call_statx(
+            9999,
+            empty.as_ptr() as u64,
+            AT_EMPTY_PATH,
+            STATX__RESERVED,
+            buf,
+        ) != Some(EINVAL)
+        {
+            return Err("a reserved mask bit must beat -EBADF on the statx fd branch");
+        }
+        match call_statx(9999, empty.as_ptr() as u64, AT_EMPTY_PATH, 0, buf) {
+            Some(EBADF) => Ok(()),
+            Some(EPERM) => Err("statx(bad fd, AT_EMPTY_PATH) returned EPERM — the -1 sentinel"),
+            _ => Err("statx(bad fd, AT_EMPTY_PATH) must return -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_statx_empty_path_fd);
+
+// `vfs_fstatat`: the AT_EMPTY_PATH-with-a-live-fd branch is taken before any
+// flag validation, and its accepted flag set (via vfs_statx) includes the
+// AT_STATX_SYNC_TYPE bits that fstatat(2)'s own man page does not mention.
+fn smoke_abi_pathx_newfstatat_flag_order() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let present = b"/p2/f\0";
+        let empty = b"\0";
+        let mut sb = [0u8; 144];
+        let out = sb.as_mut_ptr() as u64;
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, present.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the newfstatat flag-order test could not open its seeded file"),
+        };
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(fd, empty.as_ptr() as u64, out, AT_EMPTY_PATH),
+        ) != Some(0)
+        {
+            return Err("newfstatat(fd, \"\", AT_EMPTY_PATH) must succeed — this is glibc's fstat");
+        }
+        // vfs_fstat is reached before the flag word is examined.
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                fd,
+                empty.as_ptr() as u64,
+                out,
+                AT_EMPTY_PATH | AT_BOGUS_FLAG,
+            ),
+        ) != Some(0)
+        {
+            return Err("the newfstatat AT_EMPTY_PATH fd branch must not validate flags");
+        }
+        // fstatat funnels through vfs_statx, whose accepted set includes the
+        // statx sync-mode bits.
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                AT_FDCWD,
+                present.as_ptr() as u64,
+                out,
+                AT_SYMLINK_NOFOLLOW | 0x2000,
+            ),
+        ) != Some(0)
+        {
+            return Err("newfstatat must accept the AT_STATX_SYNC_* bits vfs_statx allows");
+        }
+        // A negative dirfd that is not AT_FDCWD is path_init's fdget failure.
+        match call(
+            Syscall::Newfstatat.raw(),
+            a3((-5i64) as u64, empty.as_ptr() as u64, out, AT_EMPTY_PATH),
+        ) {
+            Some(EBADF) => Ok(()),
+            _ => Err("newfstatat(-5, \"\", AT_EMPTY_PATH) must return -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_newfstatat_flag_order);
+
+// `fs/open.c::SYSCALL_DEFINE1(chdir)` — LOOKUP_FOLLOW|LOOKUP_DIRECTORY, so a
+// missing target is -ENOENT and a target that is a plain file is -ENOTDIR.
+fn smoke_abi_pathx_chdir_errnos() -> TestResult {
+    let r = with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        let file = b"/p2/f\0";
+        let missing = b"/p2/nope\0";
+        let empty = b"\0";
+
+        // POSITIVE FIRST.
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("chdir into the seeded mount root must still succeed");
+        }
+        // The case that made `cd /no/such/dir` print "Operation not
+        // permitted", and that every probe-then-mkdir helper branches on.
+        match call(Syscall::Chdir.raw(), a0(missing.as_ptr() as u64)) {
+            Some(ENOENT) => {}
+            Some(EPERM) => return Err("chdir(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("chdir(missing) must return -ENOENT"),
+        }
+        // LOOKUP_DIRECTORY: the name resolves, but not to a directory.
+        if call(Syscall::Chdir.raw(), a0(file.as_ptr() as u64)) != Some(ENOTDIR) {
+            return Err("chdir into a regular file must return -ENOTDIR");
+        }
+        // chdir carries no LOOKUP_EMPTY, so getname() rejects "".
+        if call(Syscall::Chdir.raw(), a0(empty.as_ptr() as u64)) != Some(ENOENT) {
+            return Err("chdir(\"\") must return -ENOENT, not succeed as a no-op");
+        }
+        if call(Syscall::Chdir.raw(), a0(0)) != Some(EFAULT) {
+            return Err("chdir(NULL) must return -EFAULT");
+        }
+        Ok(())
+    });
+    // chdir persists in CWD_TABLE for FAKE_TASK; restore it so later tests'
+    // relative paths are not resolved against "/p2".
+    crate::handlers::__test_cwd_reset();
+    r
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_chdir_errnos);
+
+// `fs/open.c::SYSCALL_DEFINE1(fchdir)`: -EBADF for a descriptor the table
+// does not hold, -ENOTDIR for one that does not name a directory. `rm -r`
+// and glibc's fts restore their saved cwd through this call and treat any
+// failure as fatal, so the two must not both come back as EPERM.
+fn smoke_abi_pathx_fchdir_errnos() -> TestResult {
+    let r = with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        let file = b"/p2/f\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the fchdir errno test could not open its directory"),
+        };
+        if call(Syscall::Fchdir.raw(), a0(dfd)) != Some(0) {
+            return Err("fchdir to a directory descriptor must still succeed");
+        }
+        let ffd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("the fchdir errno test could not open its regular file"),
+        };
+        if call(Syscall::Fchdir.raw(), a0(ffd)) != Some(ENOTDIR) {
+            return Err("fchdir to a regular-file descriptor must return -ENOTDIR");
+        }
+        match call(Syscall::Fchdir.raw(), a0(9999)) {
+            Some(EBADF) => Ok(()),
+            Some(EPERM) => Err("fchdir(bad fd) returned EPERM — the bare -1 sentinel"),
+            _ => Err("fchdir(bad fd) must return -EBADF"),
+        }
+    });
+    crate::handlers::__test_cwd_reset();
+    r
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_fchdir_errnos);
+
+// `fs/open.c::SYSCALL_DEFINE1(chroot)`: filename_lookup runs before the
+// CAP_SYS_CHROOT check, so a bad path outranks the privilege error. EPERM
+// from chroot tells a container runtime "you are not privileged"; ENOENT
+// tells it "the rootfs has not been staged yet".
+fn smoke_abi_pathx_chroot_errnos() -> TestResult {
+    let r = with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file = b"/p2/f\0";
+        let unmounted = b"/no-such-mount/rootfs\0";
+        let empty = b"\0";
+
+        // LOOKUP_DIRECTORY: a target that is a regular file is -ENOTDIR.
+        if call(Syscall::Chroot.raw(), a0(file.as_ptr() as u64)) != Some(ENOTDIR) {
+            return Err("chroot to a regular file must return -ENOTDIR");
+        }
+        // LINUX-GAP (see `sys_chroot.rs`): the existence test is "some mount
+        // covers this prefix". Under a booted kernel the root filesystem
+        // covers everything, so this reaches the ENOENT arm only when no
+        // mount does. Either way it must not be the EPERM sentinel.
+        match call(Syscall::Chroot.raw(), a0(unmounted.as_ptr() as u64)) {
+            Some(ENOENT) | Some(0) => {}
+            Some(EPERM) => return Err("chroot(missing) returned EPERM — the bare -1 sentinel"),
+            _ => return Err("chroot of an uncovered path returned an unexpected errno"),
+        }
+        if call(Syscall::Chroot.raw(), a0(empty.as_ptr() as u64)) != Some(ENOENT) {
+            return Err("chroot(\"\") must return -ENOENT");
+        }
+        if call(Syscall::Chroot.raw(), a0(0)) != Some(EFAULT) {
+            return Err("chroot(NULL) must return -EFAULT");
+        }
+        Ok(())
+    });
+    // None of the arms above should have installed a root, but reset anyway
+    // so a regression cannot strand later tests behind a stale prefix.
+    crate::handlers::__test_root_dir_reset();
+    r
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_chroot_errnos);
+
+// `fs/d_path.c::SYSCALL_DEFINE2(getcwd)`. Two contract points:
+//   * the success value is the path length INCLUDING the NUL terminator
+//     (the kernel prepends the NUL first, then the path, and returns the
+//     byte count) — glibc sizes its heap buffer from this number;
+//   * ERANGE is decided before the buffer is written, so a too-small buffer
+//     beats a faulting one and getcwd(NULL, 0) is ERANGE, not EFAULT.
+//     glibc's dynamic getcwd probes small and doubles on exactly ERANGE.
+fn smoke_abi_pathx_getcwd_contract() -> TestResult {
+    let r = with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let dir = b"/p2\0";
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("the getcwd test could not chdir into its mount root");
+        }
+        let mut buf = [0u8; 64];
+        // "/p2" is 3 bytes, so the kernel's `len` — and the return value —
+        // is 4.
+        match call(
+            Syscall::Getcwd.raw(),
+            a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(4) => {}
+            Some(3) => return Err("getcwd returned strlen, not strlen+1 (the NUL is counted)"),
+            _ => return Err("getcwd must return the path length including the NUL"),
+        }
+        if &buf[..4] != b"/p2\0" {
+            return Err("getcwd did not write a NUL-terminated /p2");
+        }
+        // Exactly big enough is not too small.
+        if call(Syscall::Getcwd.raw(), a1(buf.as_mut_ptr() as u64, 4)) != Some(4) {
+            return Err("getcwd with a buffer of exactly strlen+1 must succeed");
+        }
+        // One byte short → ERANGE.
+        if call(Syscall::Getcwd.raw(), a1(buf.as_mut_ptr() as u64, 3)) != Some(ERANGE) {
+            return Err("getcwd with a too-small buffer must return -ERANGE");
+        }
+        // ORDER: size is checked before the buffer is touched.
+        if call(Syscall::Getcwd.raw(), a1(0, 0)) != Some(ERANGE) {
+            return Err("getcwd(NULL, 0) must return -ERANGE, not -EFAULT");
+        }
+        // A big enough but unwritable destination is the copy_to_user arm.
+        if call(Syscall::Getcwd.raw(), a1(0, 64)) != Some(EFAULT) {
+            return Err("getcwd(NULL, 64) must return -EFAULT");
+        }
+        Ok(())
+    });
+    crate::handlers::__test_cwd_reset();
+    r
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_getcwd_contract);

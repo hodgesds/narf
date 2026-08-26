@@ -5,9 +5,15 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let user_pid = args.arg0;
     let _flags = args.arg1 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // `kernel/pid.c::SYSCALL_DEFINE2(pidfd_open)`:
+    //
+    //     if (flags & ~(PIDFD_NONBLOCK | PIDFD_THREAD)) return -EINVAL;
+    //     if (pid <= 0)                                 return -EINVAL;
+    //
+    // A non-positive pid is a malformed argument, NOT a missing process
+    // (that is the -ESRCH below it) and not a resource failure.
     if user_pid == 0 {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     // `pidfd_open(2)` accepts a PID in the caller's namespace. Keep the
@@ -20,7 +26,10 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     let pid_raw = match accept_pid_from(task, user_pid) {
         Some(pid) => pid,
         None => {
-            ctx.set_return(fail);
+            // `pid = find_get_pid(pid); if (!pid) return -ESRCH;` — the pid is
+            // well-formed but names no process, which is a different answer
+            // from the -EINVAL above and the -EMFILE below.
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
             return;
         }
     };
@@ -42,7 +51,9 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
         }) {
         Some(n) => n,
         None => {
-            ctx.set_return(fail);
+            // The descriptor comes from `get_unused_fd_flags`, so a table at
+            // RLIMIT_NOFILE is -EMFILE.
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };

@@ -336,6 +336,15 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_process_vm_writev_neg);
 fn smoke_abi_misc_ptrace_neg() -> TestResult {
     with_setup(|| {
         // PTRACE_TRACEME = 0; without a parent it returns -EINVAL (-22)
+        //
+        // LINUX-GAP: `kernel/ptrace.c::ptrace_traceme` has no such arm —
+        // every Linux task has a real_parent, and if that parent is
+        // PF_EXITING it returns 0 without linking rather than an error.
+        // "the caller has no parent" is a NARF-only state (an unparented
+        // harness/kernel task), so there is no kernel errno to match and
+        // EINVAL stands. The genuine EPERM arm — a second TRACEME on an
+        // already-traced task — is covered by
+        // smoke_abi_proc2_ptrace_traceme_second_call_is_eperm.
         match call(Syscall::Ptrace.raw(), a0(0)) {
             Some(-22) => Ok(()),
             _ => Err("ptrace TRACEME should return -EINVAL when parent-less"),

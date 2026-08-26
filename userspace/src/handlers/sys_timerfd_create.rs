@@ -20,7 +20,10 @@ pub(crate) fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
         }) {
         Some(n) => n,
         None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            // `fs/timerfd.c::SYSCALL_DEFINE2(timerfd_create)` finishes with
+            // `anon_inode_getfd(...)`, whose descriptor comes from
+            // `get_unused_fd_flags`: a table at RLIMIT_NOFILE is -EMFILE.
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };

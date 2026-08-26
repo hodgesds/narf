@@ -46,6 +46,11 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
     };
     match fd::install(task, entry) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
+        None => {
+            // `kernel/pid.c::SYSCALL_DEFINE3(pidfd_getfd)` ends in
+            // `get_unused_fd_flags`, so a full table is -EMFILE. -EBADF here
+            // would blame the caller's descriptor arguments, which were fine.
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+        }
     }
 }

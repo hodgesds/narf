@@ -196,6 +196,14 @@ impl FdTable {
         self.nofile_limit
     }
 
+    /// Whether a descriptor could be allocated right now — i.e. whether some
+    /// free number exists below the task's RLIMIT_NOFILE. A read-only probe
+    /// for callers that must decide BEFORE they reach the allocation, and
+    /// cannot report an error once they have.
+    pub fn can_allocate(&self) -> bool {
+        self.next_free_from(0).is_some()
+    }
+
     fn grow_max_fds_for(&mut self, fd: usize) {
         if fd < self.max_fds {
             return;
@@ -745,6 +753,12 @@ pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u3
         }
     })
     .flatten()
+}
+
+/// Whether `task` could allocate a descriptor right now. See
+/// [`FdTable::can_allocate`]; the limit is refreshed as for any allocation.
+pub fn has_free_descriptor(task_id: u64) -> bool {
+    with_table_alloc(task_id, |t| t.can_allocate()).unwrap_or(false)
 }
 
 /// As [`install`], but at the lowest free descriptor at or above `min`.

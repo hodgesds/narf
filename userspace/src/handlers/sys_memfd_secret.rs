@@ -8,7 +8,8 @@ use super::*;
 pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0 as u32;
     let task = current_task_id();
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // `mm/secretmem.c::SYSCALL_DEFINE1(memfd_secret)` allocates the
+    // descriptor with `get_unused_fd_flags`: a full table is -EMFILE.
     #[cfg(feature = "linux-compat")]
     {
         let mfd = crate::linux_compat::MemFdFile::new(0);
@@ -25,7 +26,7 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
             });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
+            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }
     }
     #[cfg(not(feature = "linux-compat"))]
@@ -40,7 +41,7 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
                 status_flags: crate::fd::O_RDWR,
             }) {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(fail),
+            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }
     }
 }

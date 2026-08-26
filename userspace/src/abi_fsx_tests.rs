@@ -21,6 +21,14 @@ use crate::abi_test_support::*;
 // it isn't in the shared harness errno set, so define it locally.
 const ENODATA: i64 = -61;
 
+// EBUSY isn't in the shared harness errno set either; pivot_root's
+// "loop, on the same file system" arm needs it.
+const EBUSY: i64 = -16;
+
+// A user-half address with nothing mapped behind it: every copy_from_user
+// against it faults, which is how the -EFAULT arms below are reached.
+const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
 // Open a MemFs-backed file via the (linux-compat) open syscall and return
 // its fd, or Err if the open failed. Used by the `f*xattr` tests which need
 // a live fd so `xattr_fd_key`/`fd_path_of` resolve to Some(placeholder).
@@ -594,12 +602,12 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_fremovexattr_neg);
 
 // ── mount ─────────────────────────────────────────────────────────────
 //
-// NARF mount ABI: arg0/arg1 = source ptr/len, arg2/arg3 = target ptr/len,
-// arg4 = fstype ptr, arg5 packs fstype_len in the top 32 bits and the MS_*
-// flag word in the bottom 32 bits. tmpfs/ramfs synthesize a fresh in-memory
-// FS and mount it. NOTE: the handler returns SyscallReturn::ok(!0) (value
-// -1) as its failure sentinel — both success (0) and failure (-1) come back
-// with NARF status Ok, so `call` returns Some in both cases.
+// Linux mount(2) ABI: arg0 = source, arg1 = target, arg2 = fstype (all
+// NUL-terminated), arg3 = MS_* flags, arg4 = fs-specific data. tmpfs/ramfs
+// synthesize a fresh in-memory FS and mount it. Failures come back as a
+// NEGATED errno with NARF status Ok, so `call` returns Some in both cases —
+// never the bare -1 sentinel, which userspace would read as EPERM and
+// confuse with the legitimate "you lack CAP_SYS_ADMIN" answer.
 
 fn smoke_abi_fsx_mount_pos() -> TestResult {
     with_setup(|| {
@@ -645,6 +653,180 @@ fn smoke_abi_fsx_mount_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_neg);
+
+// `SYSCALL_DEFINE5(mount)` stages `type`, `dev_name` and `data` through
+// `copy_mount_string`/`copy_mount_options` before anything else happens; a
+// faulting pointer in any of them is -EFAULT. NARF used to fold a faulting
+// `source` or `fstype` into an EMPTY STRING (`unwrap_or_default()`), so a
+// garbage fstype pointer came back as -ENODEV ("no such filesystem type") —
+// sending the caller off to modprobe a module for a string it never sent.
+fn smoke_abi_fsx_mount_string_efault_neg() -> TestResult {
+    with_setup(|| {
+        let source = b"none\0";
+        let target = b"/abi-mnt-efault\0";
+        let fstype = b"tmpfs\0";
+        // Faulting fstype.
+        let bad_type = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: BAD_PTR,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), bad_type) {
+            Some(v) if v == EFAULT => {}
+            Some(v) if v == ENODEV => {
+                return Err("mount folded a faulting fstype into an empty string → -ENODEV")
+            }
+            _ => return Err("mount with a faulting fstype must return -EFAULT"),
+        }
+        // Faulting source, valid everything else.
+        let bad_source = SyscallArgs {
+            arg0: BAD_PTR,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), bad_source) != Some(EFAULT) {
+            return Err("mount with a faulting source must return -EFAULT");
+        }
+        // Faulting data.
+        let bad_data = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: BAD_PTR,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), bad_data) != Some(EFAULT) {
+            return Err("mount with a faulting data pointer must return -EFAULT");
+        }
+        // Faulting target.
+        let bad_target = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: BAD_PTR,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), bad_target) != Some(EFAULT) {
+            return Err("mount with a faulting target must return -EFAULT");
+        }
+        // A NULL source is NOT a fault — `copy_mount_string(NULL)` yields
+        // NULL with no error, and MS_REMOUNT / propagation calls rely on it.
+        let null_source = SyscallArgs {
+            arg0: 0,
+            arg1: b"/abi-mnt-nullsrc\0".as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), null_source) != Some(0) {
+            return Err("mount with a NULL source must still mount a tmpfs");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_string_efault_neg);
+
+// `path_mount`'s first two flag rules, which NARF did not implement at all:
+//
+//   if ((flags & MS_MGC_MSK) == MS_MGC_VAL) flags &= ~MS_MGC_MSK;
+//   if (flags & MS_NOUSER) return -EINVAL;
+//
+// The order between them is load-bearing: MS_MGC_VAL (0xC0ED0000) has bit 31
+// set, which is MS_NOUSER — so a legacy caller that still ORs in the mount
+// magic is rejected outright unless the magic is stripped FIRST.
+fn smoke_abi_fsx_mount_flag_validation() -> TestResult {
+    with_setup(|| {
+        const MS_NOUSER: u64 = 1 << 31;
+        const MS_MGC_VAL: u64 = 0xC0ED_0000;
+        const MS_RDONLY: u64 = 1;
+        let source = b"none\0";
+        let fstype = b"tmpfs\0";
+
+        // MS_NOUSER is kernel-internal: userspace may not request it.
+        let nouser = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: b"/abi-mnt-nouser\0".as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: MS_NOUSER,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), nouser) != Some(EINVAL) {
+            return Err("mount(MS_NOUSER) must return -EINVAL");
+        }
+
+        // The legacy magic is discarded, so the same call succeeds.
+        let magic = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: b"/abi-mnt-magic\0".as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: MS_MGC_VAL | MS_RDONLY,
+            arg4: 0,
+            ..Default::default()
+        };
+        match call(Syscall::Mount.raw(), magic) {
+            Some(0) => Ok(()),
+            Some(v) if v == EINVAL => Err(
+                "mount(MS_MGC_VAL) was rejected — the magic is not being stripped before MS_NOUSER",
+            ),
+            _ => Err("mount(MS_MGC_VAL|MS_RDONLY) must succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_flag_validation);
+
+// Positive pin for the flags NARF accepts and (deliberately) ignores, plus
+// the propagation-only no-op: a later tightening of the flag word must not
+// turn any of these working calls into an error. systemd issues the
+// MS_SLAVE|MS_REC form immediately after clone(CLONE_NEWNS), and failing it
+// aborts the sandbox fork.
+fn smoke_abi_fsx_mount_accepted_flags_pos() -> TestResult {
+    with_setup(|| {
+        const MS_RDONLY: u64 = 1;
+        const MS_NOSUID: u64 = 1 << 1;
+        const MS_NODEV: u64 = 1 << 2;
+        const MS_NOEXEC: u64 = 1 << 3;
+        const MS_REC: u64 = 1 << 14;
+        const MS_SLAVE: u64 = 1 << 19;
+        const MS_RELATIME: u64 = 1 << 21;
+
+        let ok = SyscallArgs {
+            arg0: b"none\0".as_ptr() as u64,
+            arg1: b"/abi-mnt-flags\0".as_ptr() as u64,
+            arg2: b"tmpfs\0".as_ptr() as u64,
+            arg3: MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RELATIME,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), ok) != Some(0) {
+            return Err("mount with the accepted MNT_* option bits must return 0");
+        }
+        // Propagation-only: source, fstype and data are ignored and nothing
+        // is mounted. NARF models every mount as private, so this is 0.
+        let prop = SyscallArgs {
+            arg0: 0,
+            arg1: b"/abi-mnt-flags\0".as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_SLAVE | MS_REC,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), prop) != Some(0) {
+            return Err("mount(NULL, target, NULL, MS_SLAVE|MS_REC, NULL) must return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mount_accepted_flags_pos);
 
 // ── mount(2) FUSE options live in `data`, not `source` ────────────────
 //
@@ -772,9 +954,11 @@ kernel_test_in!(
 
 // ── umount2 ───────────────────────────────────────────────────────────
 //
-// arg0/arg1 = target ptr/len, arg2 = MNT_* flags. The registry pop-by-path
-// is unconditional; an unmount of a path with no mount returns the -1
-// sentinel (again Ok status). Mount a tmpfs first for the positive case.
+// Linux umount2(2): arg0 = NUL-terminated target, arg1 = MNT_* flags. The
+// registry pop-by-path is unconditional once the target is known to carry a
+// mount; the errno arms below pin `fs/namespace.c::ksys_umount`'s order —
+// flag word first, then the path lookup, then the mount checks. Mount a
+// tmpfs first for the positive case.
 
 fn smoke_abi_fsx_umount2_pos() -> TestResult {
     with_setup(|| {
@@ -804,17 +988,110 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_pos);
 
 fn smoke_abi_fsx_umount2_neg() -> TestResult {
     with_setup(|| {
+        // `user_path_at` fails first for a name that resolves to nothing at
+        // all → -ENOENT. (Was the bare -1 = EPERM, which a teardown loop
+        // reads as "not mine to unmount" and keeps forever in its list.)
         let target = b"/abi-not-mounted\0";
-        let uargs = a1(target.as_ptr() as u64, 0);
-        // LINUX-GAP: Linux returns -EINVAL for a path that isn't a mount
-        // point; NARF uses the -1 sentinel.
-        match call(Syscall::Umount2.raw(), uargs) {
-            Some(-1) => Ok(()),
-            _ => Err("umount2 of a non-mount path must return the -1 sentinel"),
+        match call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0)) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("umount2 of a path that names nothing must return -ENOENT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_neg);
+
+// `can_umount`: a path that DOES resolve but carries no mount is -EINVAL,
+// not -ENOENT — the split Linux draws between the path lookup and
+// `path_mounted()`. systemd's umount_recursive needs it: ENOENT means "gone,
+// drop it from the list", EINVAL means "never was a mount, skip it", and the
+// old -1/EPERM meant neither.
+fn smoke_abi_fsx_umount2_not_a_mount_point_neg() -> TestResult {
+    with_memfs("/abi-umnt-em", "umnt-em", &[("f", b"hi")], || {
+        let target = b"/abi-umnt-em/f\0";
+        match call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("umount2 of an existing non-mount path must return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_not_a_mount_point_neg);
+
+// `ksys_umount`'s comment is literal: "basic validity checks done first".
+// An unknown flag bit is -EINVAL BEFORE the target is even read, so the
+// same call against a path that does not exist is EINVAL and not ENOENT.
+// An unreadable target with a valid flag word is -EFAULT.
+fn smoke_abi_fsx_umount2_flags_and_fault_neg() -> TestResult {
+    with_setup(|| {
+        let target = b"/abi-not-mounted\0";
+        // Bit 8 is not one of MNT_FORCE/MNT_DETACH/MNT_EXPIRE/UMOUNT_NOFOLLOW.
+        const BOGUS_FLAG: u64 = 1 << 8;
+        if call(
+            Syscall::Umount2.raw(),
+            a1(target.as_ptr() as u64, BOGUS_FLAG),
+        ) != Some(EINVAL)
+        {
+            return Err("umount2 with an unknown flag bit must return -EINVAL before the lookup");
+        }
+        // `int flags`: the upper 32 bits are not part of the argument, so
+        // they must not be mistaken for unknown flag bits. This one still
+        // reaches the (nonexistent) path → -ENOENT.
+        if call(
+            Syscall::Umount2.raw(),
+            a1(target.as_ptr() as u64, 0xFFFF_FFFF_0000_0000),
+        ) != Some(ENOENT)
+        {
+            return Err("umount2 must ignore the upper 32 bits of its `int flags`");
+        }
+        // do_umount: MNT_EXPIRE is mutually exclusive with MNT_FORCE/MNT_DETACH.
+        // Checked after the mount resolves, so the nonexistent path still wins.
+        const MNT_FORCE: u64 = 1;
+        const MNT_EXPIRE: u64 = 1 << 2;
+        if call(
+            Syscall::Umount2.raw(),
+            a1(target.as_ptr() as u64, MNT_EXPIRE | MNT_FORCE),
+        ) != Some(ENOENT)
+        {
+            return Err("umount2(MNT_EXPIRE|MNT_FORCE) on a missing path must still be -ENOENT");
+        }
+        // An unreadable target → -EFAULT from user_path_at.
+        if call(Syscall::Umount2.raw(), a1(BAD_PTR, 0)) != Some(EFAULT) {
+            return Err("umount2 with a faulting target must return -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_flags_and_fault_neg);
+
+// Positive pin so a later tightening cannot turn a working teardown into an
+// error: every flag umount2(2) accepts must still unmount a real mount.
+fn smoke_abi_fsx_umount2_accepted_flags_pos() -> TestResult {
+    with_setup(|| {
+        const MNT_DETACH: u64 = 1 << 1;
+        const UMOUNT_NOFOLLOW: u64 = 1 << 3;
+        let source = b"none\0";
+        let target = b"/abi-umnt-flags\0";
+        let fstype = b"tmpfs\0";
+        let margs = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("setup mount failed");
+        }
+        match call(
+            Syscall::Umount2.raw(),
+            a1(target.as_ptr() as u64, MNT_DETACH | UMOUNT_NOFOLLOW),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("umount2(MNT_DETACH|UMOUNT_NOFOLLOW) of a real mount must return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_umount2_accepted_flags_pos);
 
 // systemd's switch-root does `fchdir(new_root_fd); pivot_root(".", ".");
 // umount2(".", MNT_DETACH)`. The RELATIVE "." must resolve against the cwd (the
@@ -873,14 +1150,120 @@ fn smoke_abi_fsx_pivot_root_neg() -> TestResult {
         let args = a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0);
         // This exercises the installed dispatcher slot, not just the handler
         // directly. The missing path must reach pivot_root and fail normally.
+        // `user_path_at(LOOKUP_DIRECTORY)` on a name that resolves to nothing
+        // is -ENOENT. It used to be the bare -1 = EPERM, which is the answer
+        // a runtime reads as "this kernel will not let me pivot" — so it
+        // falls back to chroot() and quietly loses its mount isolation.
         match call(Syscall::PivotRoot.raw(), args) {
-            Some(-1) => Ok(()),
-            Some(_) => Err("pivot_root with an unresolvable new_root must fail"),
+            Some(v) if v == ENOENT => Ok(()),
+            Some(_) => Err("pivot_root with an unresolvable new_root must return -ENOENT"),
             None => Err("linux-compat pivot_root must be present in the syscall table"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_pivot_root_neg);
+
+// The rest of `path_pivot_root`'s errno surface, in the kernel's order:
+// both names are copied and resolved before any topology check runs.
+fn smoke_abi_fsx_pivot_root_errno_arms_neg() -> TestResult {
+    with_memfs("/abi-pvr", "abi-pvr", &[("file", b"hi")], || {
+        let put_old = b"/abi-pvr\0";
+        // An unreadable new_root → -EFAULT, before anything is resolved.
+        if call(
+            Syscall::PivotRoot.raw(),
+            a2(BAD_PTR, put_old.as_ptr() as u64, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("pivot_root with a faulting new_root must return -EFAULT");
+        }
+        // An unreadable put_old is likewise -EFAULT (its own user_path_at).
+        let new_root = b"/abi-pvr\0";
+        if call(
+            Syscall::PivotRoot.raw(),
+            a2(new_root.as_ptr() as u64, BAD_PTR, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("pivot_root with a faulting put_old must return -EFAULT");
+        }
+        // `LOOKUP_DIRECTORY` on a new_root that resolves to a FILE → -ENOTDIR,
+        // distinct from the -ENOENT above. A runtime staging its root needs
+        // the difference: ENOTDIR means "you bound a file here".
+        let file_root = b"/abi-pvr/file\0";
+        if call(
+            Syscall::PivotRoot.raw(),
+            a2(file_root.as_ptr() as u64, put_old.as_ptr() as u64, 0),
+        ) != Some(ENOTDIR)
+        {
+            return Err("pivot_root with a non-directory new_root must return -ENOTDIR");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_pivot_root_errno_arms_neg);
+
+// `new_mnt == root_mnt` → -EBUSY ("loop, on the same file system"): the root
+// the caller is already standing on cannot also be the new root, because the
+// swap would have nowhere to move the old root to. EBUSY is the one answer
+// that tells a runtime "you already pivoted, this is a repeat" — as -1/EPERM
+// it looked like a privilege failure and the retry loop kept going.
+fn smoke_abi_fsx_pivot_root_same_root_busy_neg() -> TestResult {
+    with_memfs("/abi-pvr-busy", "abi-pvr-busy", &[("file", b"hi")], || {
+        if !crate::handlers::install_root_dir(FAKE_TASK, "/abi-pvr-busy") {
+            return Err("could not install the task root for the pivot_root busy case");
+        }
+        // "/" now resolves to the task's own root, i.e. new_root == root.
+        let same = b"/\0";
+        let put_old = b"/\0";
+        let r = call(
+            Syscall::PivotRoot.raw(),
+            a2(same.as_ptr() as u64, put_old.as_ptr() as u64, 0),
+        );
+        crate::handlers::__test_root_dir_reset();
+        match r {
+            Some(v) if v == EBUSY => Ok(()),
+            _ => Err("pivot_root onto the caller's current root must return -EBUSY"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_pivot_root_same_root_busy_neg);
+
+// Positive pin: the container idiom must keep working. A real directory
+// mount as new_root, with put_old inside it, still returns 0 — so the errno
+// arms above cannot be tightened into rejecting a legitimate pivot.
+fn smoke_abi_fsx_pivot_root_pos() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_root_dir_reset();
+        let source = b"none\0";
+        let new_root = b"/abi-pvr-ok\0";
+        let fstype = b"tmpfs\0";
+        let margs = SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: new_root.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("setup mount of the new root failed");
+        }
+        let put_old = b"/abi-pvr-ok/old\0";
+        let r = call(
+            Syscall::PivotRoot.raw(),
+            a2(new_root.as_ptr() as u64, put_old.as_ptr() as u64, 0),
+        );
+        let installed = crate::handlers::root_dir_of(FAKE_TASK);
+        let installed_ok = installed.as_deref() == Some("/abi-pvr-ok");
+        crate::handlers::__test_root_dir_reset();
+        crate::handlers::__test_cwd_reset();
+        match (r, installed_ok) {
+            (Some(0), true) => Ok(()),
+            (Some(0), false) => Err("pivot_root returned 0 without installing the new root"),
+            _ => Err("pivot_root into a real directory mount must return 0"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_pivot_root_pos);
 
 // ── name_to_handle_at / open_by_handle_at ─────────────────────────────
 //

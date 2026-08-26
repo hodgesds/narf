@@ -640,12 +640,12 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
 
 fn smoke_abi_signal_signalfd_neg() -> TestResult {
     with_setup(|| {
-        // fd_arg = 0 (>=0) but fd 0 is not a registered signalfd →
-        // signalfd_arc_from_fd misses → ok(-1).
-        // LINUX-GAP: Linux returns -EINVAL/-EBADF here.
+        // fd 0 is open (stdio) but is not a signalfd, so `do_signalfd4`'s
+        // `if (fd_file(f)->f_op != &signalfd_fops) return -EINVAL;` applies.
+        // A CLOSED descriptor takes the -EBADF arm above it instead.
         let r = call(Syscall::Signalfd.raw(), a3(0, 0, 8, 0));
-        if r != Some(-1) {
-            return Err("signalfd on a non-signalfd fd should return -1");
+        if r != Some(EINVAL) {
+            return Err("signalfd on a non-signalfd fd should return -EINVAL");
         }
         Ok(())
     })

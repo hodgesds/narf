@@ -633,11 +633,12 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_pos);
 
 fn smoke_abi_proc_pidfd_open_neg() -> TestResult {
     with_setup(|| {
-        // pid == 0 is rejected with the -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for pid 0; NARF returns -1.
+        // `SYSCALL_DEFINE2(pidfd_open)`: `if (pid <= 0) return -EINVAL;` — a
+        // malformed argument, distinct from the -ESRCH a valid-but-absent pid
+        // gets and from the -EMFILE an exhausted table gets.
         match call(Syscall::PidfdOpen.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("pidfd_open(0) did not return -1"),
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("pidfd_open(0) did not return -EINVAL"),
         }
     })
 }
@@ -1488,23 +1489,78 @@ fn smoke_abi_proc_unshare_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_unshare_pos);
 
-// ── setns(2) — no resolvable target ──
+// ── unshare(2) — `kernel/fork.c::check_unshare_flags` rejects unknown bits ──
+//
+// This is the first thing ksys_unshare does, before a single namespace is
+// touched, so an unsupported bit changes nothing and reports -EINVAL. NARF
+// used to IGNORE unknown bits and return 0 — worse than a wrong errno:
+// runc/bubblewrap/systemd probe for namespace support by calling
+// unshare(CLONE_NEW<x>) and treating EINVAL as "unsupported", so a blanket 0
+// told them a namespace existed and the workload then ran unisolated.
+fn smoke_abi_proc_unshare_unknown_flags_neg() -> TestResult {
+    with_setup(|| {
+        // CLONE_PIDFD (0x1000) is a valid clone(2) flag but is NOT in
+        // check_unshare_flags' accepted set.
+        const CLONE_PIDFD: u64 = 0x0000_1000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_PIDFD)) != Some(EINVAL) {
+            return Err("unshare(CLONE_PIDFD) must return -EINVAL");
+        }
+        // `unsigned long` flags: a bit in the upper half is equally invalid.
+        if call(Syscall::Unshare.raw(), a0(1u64 << 40)) != Some(EINVAL) {
+            return Err("unshare with a high flag bit must return -EINVAL");
+        }
+        // A valid bit ORed with an invalid one is still rejected, and must
+        // leave the valid namespace unshared (the check runs first).
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS | CLONE_PIDFD)) != Some(EINVAL) {
+            return Err("unshare(CLONE_NEWNS|CLONE_PIDFD) must return -EINVAL");
+        }
+        // Positive pin: every bit check_unshare_flags DOES accept, together,
+        // so the validation above cannot creep into rejecting a real call.
+        const CLONE_VM: u64 = 0x0000_0100;
+        const CLONE_FS: u64 = 0x0000_0200;
+        const CLONE_FILES: u64 = 0x0000_0400;
+        const CLONE_SIGHAND: u64 = 0x0000_0800;
+        const CLONE_THREAD: u64 = 0x0001_0000;
+        const CLONE_SYSVSEM: u64 = 0x0004_0000;
+        const CLONE_NEWTIME: u64 = 0x0000_0080;
+        let harmless = CLONE_FS | CLONE_FILES | CLONE_SYSVSEM | CLONE_NEWTIME;
+        if call(Syscall::Unshare.raw(), a0(harmless)) != Some(0) {
+            return Err("unshare of the accepted non-namespace bits must return 0");
+        }
+        let _ = (CLONE_VM, CLONE_SIGHAND, CLONE_THREAD);
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_unshare_unknown_flags_neg);
 
+// ── setns(2) — `kernel/nsproxy.c::SYSCALL_DEFINE2(setns)` ──
+//
+//   if (fd_empty(f)) return -EBADF;
+//   ... else err = -EINVAL;   /* an open fd that is not a namespace file */
+//
+// Both used to be the bare -1 = EPERM. That is the one answer setns never
+// gives here, and it is the answer a container runtime reads as "I am not
+// privileged enough to join" — so it abandons the join instead of fixing the
+// descriptor it closed too early (EBADF) or the nstype it mismatched (EINVAL).
 fn smoke_abi_proc_setns_neg() -> TestResult {
     with_setup(|| {
-        // setns with an fd that isn't an NsFd and a target that resolves to
-        // no namespace yields the -1 sentinel: under `container`, no
-        // supported nstype bits / no namespace → ok(!0); without `container`
-        // the whole syscall is a !0 stub. Either way the value is -1.
-        // LINUX-GAP: Linux returns -EBADF / -EINVAL here; NARF returns the
-        // bare -1 sentinel.
-        match call(Syscall::Setns.raw(), a1(4242, 0)) {
-            Some(-1) => Ok(()),
-            other => {
-                let _ = other;
-                Err("setns with an unresolvable target did not return -1")
-            }
+        // An fd number with nothing open behind it → -EBADF.
+        if call(Syscall::Setns.raw(), a1(4242, 0)) != Some(EBADF) {
+            return Err("setns on an unoccupied fd must return -EBADF");
         }
+        // A negative fd can never name an open file → -EBADF too.
+        if call(Syscall::Setns.raw(), a1((-1i64) as u64, 0)) != Some(EBADF) {
+            return Err("setns(-1) must return -EBADF");
+        }
+        // An fd that IS open but is not a namespace file → -EINVAL, the
+        // final `else` branch. fd 1 is the console every fresh fd table
+        // carries. (This is also the arm that used to reinterpret the number
+        // as a pid — see the pidns suite.)
+        if call(Syscall::Setns.raw(), a1(1, 0)) != Some(EINVAL) {
+            return Err("setns on an open non-namespace fd must return -EINVAL");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_setns_neg);

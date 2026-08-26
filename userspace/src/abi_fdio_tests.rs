@@ -536,11 +536,11 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fstat_pos);
 fn smoke_abi_fdio_fstat_neg() -> TestResult {
     with_setup(|| {
         let mut stat = [0u8; 256];
-        // fstat on a bad fd → -1 sentinel (Ok status, value -1).
-        // LINUX-GAP: Linux fstat(2) returns -EBADF, not the bare -1.
+        // `fs/stat.c::vfs_fstat` opens with `fd_empty(f) -> -EBADF`, and it
+        // runs before `cp_new_stat` ever looks at the destination.
         match call(Syscall::Fstat.raw(), a1(5252, stat.as_mut_ptr() as u64)) {
-            Some(-1) => Ok(()),
-            _ => Err("fstat on bad fd was not -1"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("fstat on a bad fd must return -EBADF"),
         }
     })
 }

@@ -10,7 +10,6 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let mask_ptr = args.arg1;
     let _sizemask = args.arg2;
     let flags = args.arg3 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     let mut mask: u64 = 0;
     if mask_ptr != 0 {
         let mut bytes = [0u8; 8];
@@ -39,7 +38,18 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(target as u64));
                 return;
             }
-            ctx.set_return(fail);
+            // `do_signalfd4`'s `ufd != -1` branch REPLACES the mask on an
+            // existing signalfd, and it is not an allocation at all:
+            //
+            //     CLASS(fd, f)(ufd);
+            //     if (fd_empty(f))                        return -EBADF;
+            //     if (fd_file(f)->f_op != &signalfd_fops) return -EINVAL;
+            //
+            // A closed descriptor and a descriptor that is simply not a
+            // signalfd are different mistakes and get different answers.
+            let open = fd::with_table(task, |t| t.get(fd_arg as u32).is_some()).unwrap_or(false);
+            let errno: i64 = if open { -22 } else { -9 }; // -EINVAL / -EBADF
+            ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
         let sfd = crate::linux_compat::SignalFdFile::new(mask, task);
@@ -56,7 +66,10 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
             }) {
             Some(n) => n,
             None => {
-                ctx.set_return(fail);
+                // `do_signalfd4` publishes the new signalfd with
+                // `get_unused_fd_flags`, so a table at RLIMIT_NOFILE is
+                // -EMFILE.
+                ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                 return;
             }
         };
@@ -81,7 +94,10 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
             }) {
             Some(n) => n,
             None => {
-                ctx.set_return(fail);
+                // Same allocation contract as the linux-compat branch above:
+                // `do_signalfd4` gets its descriptor from
+                // `get_unused_fd_flags`, so a full table is -EMFILE.
+                ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                 return;
             }
         };

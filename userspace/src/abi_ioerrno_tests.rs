@@ -2112,3 +2112,158 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_raising_the_limit_takes_effect
 );
+
+// ── every fd-creating syscall reports the SAME exhaustion errno ─────
+//
+// Enforcing RLIMIT_NOFILE made ~49 allocation-failure arms reachable for the
+// first time. Each one had inherited whatever sentinel its handler happened
+// to use, so the same condition — no free descriptor — surfaced as EPERM
+// from one syscall, EBADF from another and EMFILE from a third. Linux reaches
+// `get_unused_fd_flags` from all of them and answers -EMFILE.
+
+/// Fill the descriptor table so no free number remains below `limit`.
+///
+/// Pipes take two slots at a time, so an odd number of free slots would leave
+/// exactly one behind — and one free slot is enough for every single-fd
+/// syscall under test to succeed, which is how the first version of this
+/// helper quietly tested nothing. Fill the remainder with `dup`, which takes
+/// exactly one, then assert saturation rather than assuming it.
+fn saturate_descriptors(limit: u64) -> Result<(), &'static str> {
+    set_nofile(limit)?;
+    let mut next = 3u64; // stdio occupies 0..=2
+    while limit - next >= 2 {
+        make_pipe()?;
+        next += 2;
+    }
+    while next < limit {
+        match call(Syscall::Dup.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => next += 1,
+            _ => return Err("could not fill the final descriptor slot"),
+        }
+    }
+    // The whole point of the helper: prove there is nothing left to allocate.
+    match call(Syscall::Dup.raw(), a0(0)) {
+        Some(v) if v == EMFILE => Ok(()),
+        _ => Err("the descriptor table was not actually saturated"),
+    }
+}
+
+fn assert_emfile(num: u32, args: SyscallArgs, what: &'static str) -> Result<(), &'static str> {
+    let r = call_raw(num, args);
+    match (r.status == SyscallReturn::OK).then_some(r.value as i64) {
+        Some(v) if v == EMFILE => Ok(()),
+        _ => Err(what),
+    }
+}
+
+fn smoke_abi_ioerrno_timerfd_create_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        // `fs/timerfd.c` publishes via anon_inode_getfd -> get_unused_fd_flags.
+        assert_emfile(
+            Syscall::TimerfdCreate.raw(),
+            a1(1 /* CLOCK_MONOTONIC */, 0),
+            "timerfd_create at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_timerfd_create_reports_emfile
+);
+
+fn smoke_abi_ioerrno_signalfd_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        let mask = [0u8; 8];
+        assert_emfile(
+            Syscall::Signalfd.raw(),
+            a3(u64::MAX /* new fd */, mask.as_ptr() as u64, 8, 0),
+            "signalfd at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_signalfd_reports_emfile);
+
+fn smoke_abi_ioerrno_memfd_create_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        let name = b"m\0";
+        assert_emfile(
+            Syscall::MemfdCreate.raw(),
+            a1(name.as_ptr() as u64, 0),
+            "memfd_create at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_memfd_create_reports_emfile);
+
+fn smoke_abi_ioerrno_pidfd_open_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        assert_emfile(
+            Syscall::PidfdOpen.raw(),
+            a1(FAKE_TASK, 0),
+            "pidfd_open at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_pidfd_open_reports_emfile);
+
+fn smoke_abi_ioerrno_socket_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        // AF_UNIX / SOCK_STREAM — `sock_map_fd` -> get_unused_fd_flags.
+        assert_emfile(
+            Syscall::SocketOpen.raw(),
+            a2(1, 1, 0),
+            "socket at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_socket_reports_emfile);
+
+fn smoke_abi_ioerrno_epoll_create_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        assert_emfile(
+            Syscall::EpollCreate.raw(),
+            a0(0),
+            "epoll_create1 at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_create_reports_emfile);
+
+fn smoke_abi_ioerrno_eventfd_reports_emfile() -> TestResult {
+    with_setup(|| {
+        saturate_descriptors(8)?;
+        assert_emfile(
+            Syscall::Eventfd.raw(),
+            a1(0, 0),
+            "eventfd2 at the descriptor limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_eventfd_reports_emfile);
+
+fn smoke_abi_ioerrno_open_and_dup_agree_on_emfile() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        // The point of the sweep: one condition, one errno, whichever door
+        // the caller came through.
+        saturate_descriptors(8)?;
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(v) if v == EMFILE => {}
+            _ => return Err("open at the limit must be -EMFILE"),
+        }
+        expect(
+            call(Syscall::Dup.raw(), a0(0)),
+            EMFILE,
+            "dup at the limit must report the same -EMFILE as open",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_open_and_dup_agree_on_emfile
+);

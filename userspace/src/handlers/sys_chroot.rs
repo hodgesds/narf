@@ -1,10 +1,32 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `fs/open.c::SYSCALL_DEFINE1(chroot)`:
+///
+/// ```text
+///     unsigned int lookup_flags = LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+///     error = filename_lookup(AT_FDCWD, name, lookup_flags, &path, NULL);
+///     if (error) return error;
+///     error = path_permission(&path, MAY_EXEC | MAY_CHDIR);
+///     if (error) goto dput_and_out;
+///     error = -EPERM;
+///     if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT)) goto dput_and_out;
+/// ```
+///
+/// The lookup runs FIRST, so a bad path outranks the capability check: a
+/// missing target is -ENOENT and a target that is a plain file is -ENOTDIR
+/// even for an unprivileged caller. Returning the bare -1 for all of these
+/// meant every failure read back as EPERM, which is precisely the one errno
+/// a container runtime must not confuse — `chroot` failing with EPERM says
+/// "you are not root, give up", while ENOENT says "the rootfs you were told
+/// to enter has not been staged yet".
+///
+/// Note the lookup uses AT_FDCWD, so a RELATIVE target is legal and joins
+/// the caller's cwd (`chroot("rootfs")` is a normal thing to write). This
+/// handler used to reject any path not starting with '/' outright.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
     // Linux `chroot(const char *path)` passes a single NUL-terminated
     // path in arg0 — there is no length argument. (The earlier
     // `copy_user_path_raw(arg0, arg1)` form misread arg1 as a length,
@@ -13,17 +35,24 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // LINUX-GAP: as in sys_chdir, `getname()`'s -ENAMETOOLONG is
+            // folded into -EFAULT because copy_user_cstr cannot tell the
+            // two apart.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     };
-    if !raw.starts_with('/') {
-        ctx.set_return(fail);
+    // No LOOKUP_EMPTY here either — `getname()` rejects "" with -ENOENT.
+    if raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
         return;
     }
-    // Compose against any existing chroot (nested chroot resolves
-    // under the current root before installation).
-    let resolved = apply_chroot(&raw);
+    let task = current_task_id();
+    // AT_FDCWD anchoring: join a relative target to the cwd. resolve_cwd_path
+    // ALSO composes any existing chroot (a nested chroot resolves under the
+    // current root before installation), so apply_chroot must not run again
+    // on top of the result or the prefix is doubled.
+    let resolved = resolve_cwd_path(task, &raw);
     // Verify resolved exists as a directory under the global
     // registry — match Linux semantics: chroot fails if target
     // doesn't exist. We treat a covering mount as sufficient.
@@ -31,10 +60,26 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         .resolve_absolute(&resolved, |_fs, _rel| true)
         .unwrap_or(false);
     if !covered {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
         return;
     }
-    let task = current_task_id();
+    // LOOKUP_DIRECTORY: a target that resolves to a file, device or fifo is
+    // -ENOTDIR, not a successful root change. (A path that resolves to
+    // nothing inside a covering mount stays -ENOENT — see the LINUX-GAP
+    // below.)
+    if let Some((s, ..)) = stat_ino_path_dir_aware_ext(&resolved, true) {
+        if s.mode.file_type != narf_filesystem::FileType::Dir {
+            ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+            return;
+        }
+    }
+    // LINUX-GAP: the "covering mount" test above is weaker than
+    // filename_lookup — a path under an existing mount that names no entry
+    // still installs as a root instead of reporting -ENOENT. Tightening it
+    // would change which chroots succeed, not just their errno.
+    // LINUX-GAP: -EPERM for a caller without CAP_SYS_CHROOT in its user
+    // namespace, and -EACCES from path_permission, are not modelled — NARF
+    // has no per-task capability sets to consult here.
     task_map_set(&ROOT_DIR_TABLE, task, resolved);
     ctx.set_return(SyscallReturn::ok(0));
 }

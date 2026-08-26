@@ -1,6 +1,45 @@
 #[allow(unused_imports)]
 use super::*;
 
+const ENOENT: i64 = 2;
+const EFAULT: i64 = 14;
+const ENOTDIR: i64 = 20;
+const EINVAL: i64 = 22;
+const ENAMETOOLONG: i64 = 36;
+
+#[inline]
+fn fail(errno: i64) -> SyscallReturn {
+    SyscallReturn::ok((-errno) as u64)
+}
+
+/// `listdir` is NARF-native — there is no Linux syscall of this name — but it
+/// is `getdents64(2)` with the directory named by path instead of by an open
+/// fd, so it borrows that call's errno shape and check ORDER from
+/// `fs/readdir.c`:
+///
+/// ```text
+///   iterate_dir():  int res = -ENOTDIR;
+///                   if (!file->f_op->iterate_shared) goto out;
+///   filldir64():    buf->error = -EINVAL;   /* only used if we fail.. */
+///                   if (reclen > ctx->count) return false;
+///                   if (!user_write_access_begin(...)) goto efault;
+/// ```
+///
+/// plus `user_path_at`'s `-ENOENT` for a name that resolves to nothing, since
+/// this call does its own lookup rather than inheriting an already-open fd.
+///
+/// Every one of those was the bare `-1` sentinel, which libc decodes as
+/// EPERM. A directory walker cannot act on that: "the directory is gone"
+/// (retry the parent), "that is a file, not a directory" (stop descending)
+/// and "your buffer is too small for this name" (grow the buffer and repeat
+/// the same cursor) all demand different recovery, and all three arrived as
+/// "Operation not permitted".
+///
+/// The ORDER matters as much as the values. Linux resolves the directory
+/// before it looks at the output buffer, and `filldir64` is only reached once
+/// there is an entry to emit — so an exhausted cursor returns 0 without ever
+/// inspecting the buffer, and a too-small buffer is EINVAL (not EFAULT) even
+/// when the pointer is also unusable.
 pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let path_ptr = args.arg0;
@@ -8,21 +47,24 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
     let cursor = args.arg2 as usize;
     let out_ptr = args.arg3 as *mut u8;
     let out_len = args.arg4 as usize;
-    let fail = SyscallReturn::ok((-1i64) as u64);
 
-    if out_ptr.is_null() {
-        ctx.set_return(fail);
+    // Path first, buffer second — `iterate_dir` runs before `filldir64`.
+    // An empty pathname names nothing (Linux `user_path_at(AT_FDCWD, "")`
+    // is -ENOENT), an over-long one is -ENAMETOOLONG, and only an actual
+    // copy fault is -EFAULT. `copy_user_path` folds all three into `None`,
+    // so the two argument cases are split out ahead of it.
+    if path_len == 0 {
+        ctx.set_return(fail(ENOENT));
         return;
     }
-    if out_len < 8 {
-        // Need room for at least the header.
-        ctx.set_return(fail);
+    if path_len > 4096 {
+        ctx.set_return(fail(ENAMETOOLONG));
         return;
     }
     let path = match copy_user_path(path_ptr, path_len) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(fail(EFAULT));
             return;
         }
     };
@@ -56,20 +98,40 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
     let entries = match entries {
         Some(v) => v,
         None => {
-            ctx.set_return(fail);
+            // Linux splits this: the lookup itself fails with -ENOENT when
+            // nothing of that name exists, while a name that DOES resolve
+            // but has no `iterate_shared` is -ENOTDIR from `iterate_dir`.
+            // A caller descending a tree branches on exactly this — ENOENT
+            // means "raced with a rename, restart", ENOTDIR means "this is
+            // a leaf, stop".
+            let errno = if stat_path_dir_aware(&path).is_some() {
+                ENOTDIR
+            } else {
+                ENOENT
+            };
+            ctx.set_return(fail(errno));
             return;
         }
     };
     if entries.is_empty() {
-        // End of directory.
+        // End of directory. `filldir64` is never invoked, so Linux reports
+        // 0 without touching the output buffer at all — an exhausted cursor
+        // succeeds even against a NULL or undersized one.
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
     let (name, ftype) = &entries[0];
     let name_bytes = name.as_bytes();
     let total = 8 + name_bytes.len();
+    // `filldir64`: `reclen > ctx->count` is -EINVAL, and it is tested BEFORE
+    // the user-access window opens. "Grow the buffer and re-issue the same
+    // cursor" is a recoverable answer; EFAULT and EPERM are not.
     if total > out_len {
-        ctx.set_return(fail);
+        ctx.set_return(fail(EINVAL));
+        return;
+    }
+    if out_ptr.is_null() {
+        ctx.set_return(fail(EFAULT));
         return;
     }
     // Encode FileType to the wire ordinal: 0=File, 1=Dir, 2=Symlink,
@@ -94,7 +156,9 @@ pub(crate) fn sys_listdir(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the write of `record`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, &record) }.is_err() {
-        ctx.set_return(fail);
+        // `filldir64`'s `efault:` label — the record could not be handed to
+        // the caller's buffer.
+        ctx.set_return(fail(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(total as u64));

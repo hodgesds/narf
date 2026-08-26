@@ -661,8 +661,11 @@ kernel_test_in!(
 // with no ns translation. A caller passing a stray integer equal to a
 // namespaced task's outer pid could jump into that task's pid namespace. Linux
 // setns(2) takes only an fd. The fix rejects any non-NsFd target. Discriminator:
-// setns(<victim outer pid>, CLONE_NEWPID) returns -1 and leaves the caller in
-// its own namespace, rather than returning 0 and attaching it to the victim's.
+// setns(<victim outer pid>, CLONE_NEWPID) fails and leaves the caller in its
+// own namespace, rather than returning 0 and attaching it to the victim's.
+// The errno is `kernel/nsproxy.c`'s -EBADF: the number is an fd, and nothing
+// is open on it. (It used to be the bare -1 = EPERM, which a runtime reads as
+// "unprivileged" and retries after dropping into a user namespace.)
 fn smoke_abi_pidns_setns_rejects_pid_as_fd() -> TestResult {
     with_setup(|| {
         const CALLER_TASK: u64 = 0xED00;
@@ -681,11 +684,11 @@ fn smoke_abi_pidns_setns_rejects_pid_as_fd() -> TestResult {
             set_task(CALLER_TASK);
             // target == the victim's OUTER pid, passed where an fd is expected.
             match call(Syscall::Setns.raw(), a1(VICT_PID, CLONE_NEWPID)) {
-                Some(-1) => {}
+                Some(v) if v == EBADF => {}
                 Some(0) => {
                     return Err("setns joined a namespace by reinterpreting the fd number as a pid — legacy TaskId path not removed")
                 }
-                _ => return Err("setns(pid-as-fd) returned an unexpected result"),
+                _ => return Err("setns(pid-as-fd) must return -EBADF"),
             }
             // The caller must NOT have been attached to the victim's pid ns.
             if crate::pid_ns::ns_of(CALLER_TASK).is_some() {

@@ -1,6 +1,13 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `drivers/tty/pty.c::ptm_open_peer` ends in `FD_ADD`, which is
+/// `FD_PREPARE` + `fd_publish` over `get_unused_fd_flags`: a descriptor table
+/// at RLIMIT_NOFILE is -EMFILE. These arms only became reachable when the fd
+/// table started enforcing the limit, and the -EBADF they inherited blamed
+/// the caller's ioctl descriptor, which was perfectly valid.
+const EMFILE: i64 = 24;
+
 pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -381,7 +388,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+            None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
         }
         return;
     }
@@ -417,7 +424,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
                     ctx.set_return(SyscallReturn::ok(0));
                 }
-                None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+                None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
             }
             return;
         }
@@ -487,7 +494,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     });
                 match new_fd {
                     Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
-                    None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+                    None => ctx.set_return(SyscallReturn::ok((-(EMFILE as i64)) as u64)),
                 }
                 return;
             }

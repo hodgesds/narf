@@ -1798,12 +1798,15 @@ fn smoke_userspace_getrusage_writes_18_i64s() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getrusage.raw(), &mut ctx);
+    // `kernel/sys.c::SYSCALL_DEFINE2(getrusage)` ends in `copy_to_user`, so a
+    // NULL or faulting `ru` is -EFAULT. This asserted the `-1` sentinel until
+    // the time-syscall errno pass corrected the handler.
     let null_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-14i64) as u64,
     );
     if !null_rejected {
-        return TestResult::Fail("getrusage did not reject null buffer");
+        return TestResult::Fail("getrusage null buffer did not return -EFAULT");
     }
 
     __test_clear_global();

@@ -461,7 +461,10 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Getcwd.raw(), &mut ctx);
-    let len_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 4);
+    // `fs/d_path.c::SYSCALL_DEFINE2(getcwd)` prepends the NUL before the path
+    // (`prepend_char(&b, 0)`), so the returned length COUNTS it: `/foo` is 5,
+    // not 4. glibc's getcwd uses this to size its own allocation.
+    let len_ok = matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 5);
     let bytes_ok = &buf[..5] == b"/foo\0";
 
     // Buffer-too-small path: a 3-byte buf can't fit `/foo\0`. The
@@ -494,9 +497,11 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Chdir.raw(), &mut ctx);
+    // A chdir to a path no mount covers is -ENOENT (`filename_lookup`), not
+    // the `-1` sentinel this used to assert.
     let rel_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-2i64) as u64,
     );
 
     __test_clear_global();
@@ -504,7 +509,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
     unmount_foo();
 
     if !len_ok {
-        return TestResult::Fail("Getcwd did not return length 4");
+        return TestResult::Fail("Getcwd did not return strlen+1 (5) for `/foo`");
     }
     if !bytes_ok {
         return TestResult::Fail("Getcwd buffer did not match `/foo\\0`");
@@ -513,7 +518,7 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         return TestResult::Fail("Getcwd with too-small buf did not surface ERANGE");
     }
     if !rel_rejected {
-        return TestResult::Fail("Chdir(relative) did not surface -1 sentinel");
+        return TestResult::Fail("Chdir of an unmounted path did not return -ENOENT");
     }
     TestResult::Pass
 }

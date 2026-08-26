@@ -1466,6 +1466,13 @@ kernel_test_in!("userspace/mount", smoke_interp_read_uses_private_ns);
 // Linux ref: fs/namespace.c:do_move_mount / SyS_pivot_root ENOENT path.
 #[cfg(feature = "container")]
 fn smoke_pivot_root_missing_target() -> TestResult {
+    // This fixture hands the syscall kernel pointers as stand-in user
+    // buffers, so it needs the same scoped opt-in every other mount smoke
+    // takes. Without it the path copy fails and the handler answers -EFAULT
+    // before it ever looks at `new_root` — the case this test is named for
+    // was never actually exercised. That went unnoticed while both the copy
+    // failure and the missing-target failure returned the same `-1`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let task: u64 = 0x71_07;
     set_task(task);
     crate::handlers::__test_root_dir_reset();
@@ -1479,7 +1486,12 @@ fn smoke_pivot_root_missing_target() -> TestResult {
         ret: None,
     };
     crate::handlers::sys_pivot_root_for_test(&mut pctx);
-    let rejected = matches!(pctx.ret, Some(r) if r.value == (-1i64) as u64);
+    // `LOOKUP_DIRECTORY` splits the failure: a name resolving to a
+    // non-directory is -ENOTDIR, one resolving to nothing is -ENOENT.
+    // `/does_not_exist` is the latter. The old `-1` = EPERM told a container
+    // runtime it lacked privilege rather than that the rootfs had not been
+    // staged yet.
+    let rejected = matches!(pctx.ret, Some(r) if r.value == (-2i64) as u64);
     // root_dir must be unchanged (still the default: no per-task entry).
     let root_untouched = crate::handlers::root_dir_of(task).is_none();
 
@@ -2297,13 +2309,19 @@ fn smoke_umount_real_vs_nonmount() -> TestResult {
     let real_ok = matches!(u1.ret, Some(r) if r.value == 0);
     let removed = !registry_has("/um_real");
 
-    // umount2 of a path that was never mounted → the -1 sentinel (!0).
+    // umount2 of a path that was never mounted. Linux splits this two ways
+    // and so does the handler: `user_path_at` fails first for a name that
+    // resolves to nothing (-ENOENT), and only a path that DOES resolve
+    // reaches `can_umount`'s "not a mount point" (-EINVAL). `/um_never` is
+    // the former. Either way it must not be the -1 sentinel, which reaches
+    // userspace as EPERM — also a legitimate umount answer (missing
+    // CAP_SYS_ADMIN), and so indistinguishable from a real privilege fault.
     let mut u2 = StubCtx {
         args: unmount_args(b"/um_never\0", 0),
         ret: None,
     };
     crate::handlers::sys_umount2_for_test(&mut u2);
-    let nonmount_sentinel = matches!(u2.ret, Some(r) if r.value == (-1i64) as u64);
+    let nonmount_sentinel = matches!(u2.ret, Some(r) if r.value == (-2i64) as u64);
 
     crate::handlers::__test_root_dir_reset();
     let _ = unmount_for_test("/um_real");
@@ -2311,7 +2329,7 @@ fn smoke_umount_real_vs_nonmount() -> TestResult {
     if present_before && real_ok && removed && nonmount_sentinel {
         TestResult::Pass
     } else {
-        TestResult::Fail("umount2: real mount → 0 + removed; non-mount → -1 sentinel")
+        TestResult::Fail("umount2: real mount → 0 + removed; non-mount → -ENOENT")
     }
 }
 kernel_test_in!("userspace/mount", smoke_umount_real_vs_nonmount);

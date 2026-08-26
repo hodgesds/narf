@@ -1,10 +1,44 @@
 #[allow(unused_imports)]
 use super::*;
 
+const ENOENT: i64 = 2;
+const EBUSY: i64 = 16;
+const EFAULT: i64 = 14;
+const ENOTDIR: i64 = 20;
+
+#[inline]
+fn fail(errno: i64) -> SyscallReturn {
+    SyscallReturn::ok((-errno) as u64)
+}
+
+/// `fs/namespace.c::SYSCALL_DEFINE2(pivot_root)` → `path_pivot_root`:
+///
+/// ```text
+///   error = user_path_at(AT_FDCWD, new_root,
+///                        LOOKUP_FOLLOW | LOOKUP_DIRECTORY, &new);
+///   if (error) return error;                    /* -EFAULT/-ENOENT/-ENOTDIR */
+///   error = user_path_at(AT_FDCWD, put_old, ..., &old);
+///   if (error) return error;
+///   ...
+///   if (!may_mount())              return -EPERM;
+///   if (d_unlinked(new->dentry))   return -ENOENT;
+///   if (new_mnt == root_mnt || old_mnt == root_mnt)
+///           return -EBUSY;  /* loop, on the same file system  */
+///   if (!path_mounted(&root))      return -EINVAL; /* not a mountpoint */
+/// ```
+///
+/// Both path arguments are resolved before any of the mount-topology checks,
+/// so a bad pointer or a missing directory beats every later error.
+///
+/// These were all the bare `-1` sentinel = EPERM. For pivot_root that is
+/// specifically destructive: EPERM is the answer a container runtime expects
+/// when it is not running as a privileged user, so it treats it as "this
+/// kernel/user cannot pivot" and falls back to `chroot()` — silently giving
+/// up the mount isolation it asked for — when the actual fault was a typo in
+/// the new root path (ENOENT) or a bind that had not landed yet.
 #[cfg(feature = "linux-compat")]
 pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
     // Linux ABI: pivot_root(const char *new_root, const char *put_old).
     // Both arguments are NUL-terminated strings; there are no explicit
     // lengths. The old NARF-native four-argument decoder retained the
@@ -13,14 +47,15 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let new_root = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            // `user_path_at` on an unreadable name → -EFAULT.
+            ctx.set_return(fail(EFAULT));
             return;
         }
     };
     let put_old = match copy_user_cstr(args.arg1, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(fail(EFAULT));
             return;
         }
     };
@@ -50,7 +85,25 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // succeed, and install a garbage task root — corrupting every later path
     // lookup for the task. Linux returns ENOTDIR/ENOENT here.
     if resolve_dir_absolute(&new_root_resolved).is_none() {
-        ctx.set_return(fail);
+        // `LOOKUP_DIRECTORY` splits this two ways: a name that resolves to a
+        // non-directory is -ENOTDIR, a name that resolves to nothing at all is
+        // -ENOENT. A runtime that assembled its root under a staging path
+        // needs the difference — ENOTDIR means "you bound a file here",
+        // ENOENT means "the bind has not happened yet".
+        let errno = if stat_path_dir_aware(&new_root_resolved).is_some() {
+            ENOTDIR
+        } else {
+            ENOENT
+        };
+        ctx.set_return(fail(errno));
+        return;
+    }
+    // `new_mnt == root_mnt` → -EBUSY ("loop, on the same file system"): the
+    // new root may not be the root the caller is already standing on, or the
+    // swap would have nothing to move the old root onto. NARF compares the
+    // task root path, which is the whole of its root identity.
+    if new_root_resolved.trim_end_matches('/') == prior_root.trim_end_matches('/') {
+        ctx.set_return(fail(EBUSY));
         return;
     }
     // Bind-mount prior_root at put_old_resolved so the old root is
