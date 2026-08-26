@@ -1655,6 +1655,20 @@ fn smoke_abi_ipc_msgsnd_retains_kernel_snapshot() -> TestResult {
         if i64::from_ne_bytes(received[..8].try_into().unwrap()) != 7 || &received[8..] != b"old" {
             return Err("msgsnd re-imported user-mutated type or payload after park");
         }
+
+        let removed = make_msgq()?;
+        crate::sysvipc::__test_stage_msg_send(removed, 7, b"removed", 0);
+        crate::handlers::raise_signal_pending(crate::handlers::current_task_id(), 10);
+        if call(Syscall::Msgctl.raw(), a2(removed, IPC_RMID, 0)) != Some(0) {
+            return Err("setup: staged sender queue removal failed");
+        }
+        if call(
+            Syscall::Msgsnd.raw(),
+            a3(removed, BAD_PTR, u64::MAX, IPC_NOWAIT),
+        ) != Some(EIDRM)
+        {
+            return Err("RMID must beat a simultaneous signal for a staged sender");
+        }
         Ok(())
     })
 }
@@ -2241,6 +2255,7 @@ fn smoke_abi_ipc_msgctl_capacity_stat_and_rmid() -> TestResult {
         if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
             return Err("msgctl IPC_RMID failed");
         }
+        crate::handlers::raise_signal_pending(crate::handlers::current_task_id(), 10);
         let mut out = [0u8; 9];
         let result = call_raw(
             Syscall::Msgrcv.raw(),
@@ -2254,7 +2269,7 @@ fn smoke_abi_ipc_msgctl_capacity_stat_and_rmid() -> TestResult {
             },
         );
         if result.value as i64 != EIDRM {
-            return Err("message receiver awakened by RMID must receive EIDRM");
+            return Err("message receiver must observe RMID before a simultaneous signal");
         }
         Ok(())
     })

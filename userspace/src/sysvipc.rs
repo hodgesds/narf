@@ -530,26 +530,49 @@ fn copy_staged_sem_wait(
     })
 }
 
-fn take_staged_msg_send(task: u64, ipc_ns: u64, id: u64) -> Option<(i64, Vec<u8>, u64)> {
-    with_waits(|waits| {
-        let wait = waits.get_mut(&task)?;
-        if wait.kind != WaitKind::MsgSend
-            || wait.ipc_ns != ipc_ns
-            || wait.id != id
-            || wait.errno != 0
-        {
-            return None;
+enum MsgSendResume {
+    Fresh,
+    Staged(i64, Vec<u8>, u64),
+    Error(i64),
+}
+
+fn take_msg_send_resume(task: u64, ipc_ns: u64, id: u64) -> MsgSendResume {
+    let (resume, removed) = with_waits(|waits| {
+        let Some(wait) = waits.get(&task) else {
+            return (MsgSendResume::Fresh, None);
+        };
+        if wait.kind != WaitKind::MsgSend || wait.ipc_ns != ipc_ns || wait.id != id {
+            return (MsgSendResume::Fresh, waits.remove(&task));
         }
+        if wait.errno != 0 {
+            let errno = wait.errno;
+            return (MsgSendResume::Error(errno), waits.remove(&task));
+        }
+        let wait = waits.get_mut(&task).expect("checked SysV sender missing");
         wait.ready = false;
-        match &mut wait.data {
-            WaitData::MsgSend {
-                mtype,
-                payload,
-                msgflg,
-            } => Some((*mtype, payload.take()?, *msgflg)),
-            _ => None,
-        }
-    })
+        let WaitData::MsgSend {
+            mtype,
+            payload,
+            msgflg,
+        } = &mut wait.data
+        else {
+            panic!("staged SysV sender lost its payload state");
+        };
+        (
+            MsgSendResume::Staged(
+                *mtype,
+                payload
+                    .take()
+                    .expect("staged SysV sender payload already taken"),
+                *msgflg,
+            ),
+            None,
+        )
+    });
+    // A stale or terminal wait can own a waker/payload whose drop reaches
+    // scheduler or allocator state; release it after restoring IRQ state.
+    drop(removed);
+    resume
 }
 
 #[allow(clippy::too_many_arguments)] // One complete retained msgsnd operation.
@@ -704,14 +727,6 @@ fn clear_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) {
     drop(removed);
 }
 
-fn wait_active(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> bool {
-    with_waits(|waits| {
-        waits.get(&task).is_some_and(|wait| {
-            wait.kind == kind && wait.ipc_ns == ipc_ns && wait.id == id && wait.errno == 0
-        })
-    })
-}
-
 fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i64> {
     let (errno, removed) = with_waits(|waits| match waits.get(&task) {
         Some(wait)
@@ -727,6 +742,24 @@ fn take_wait_error(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i6
     });
     drop(removed);
     errno
+}
+
+/// Retire an interrupted message wait in the same transaction that observes
+/// its terminal RMID status.  Linux tests a deleted queue before a pending
+/// signal after wakeup; whichever state mutation acquires this lock first is
+/// therefore the observable winner (`EIDRM` or `EINTR`).
+fn finish_interrupted_msg_wait(task: u64, kind: WaitKind, ipc_ns: u64, id: u64) -> Option<i64> {
+    let (result, removed) = with_waits(|waits| {
+        let wait = waits.get(&task)?;
+        if wait.kind != kind || wait.ipc_ns != ipc_ns || wait.id != id {
+            return None;
+        }
+        let result = if wait.errno != 0 { wait.errno } else { EINTR };
+        Some((result, waits.remove(&task)))
+    })
+    .map_or((None, None), |(result, removed)| (Some(result), removed));
+    drop(removed);
+    result
 }
 
 #[doc(hidden)]
@@ -807,7 +840,8 @@ pub(crate) fn __test_stage_msg_send(id: u64, mtype: i64, payload: &[u8], msgflg:
 pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
     let task = crate::handlers::current_task_id();
     let ipc_ns = current_ipc_namespace_id();
-    let Some((mtype, payload, msgflg)) = take_staged_msg_send(task, ipc_ns, id) else {
+    let MsgSendResume::Staged(mtype, payload, msgflg) = take_msg_send_resume(task, ipc_ns, id)
+    else {
         return false;
     };
     with_msg_state(|state| {
@@ -2327,20 +2361,22 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
     let ipc_ns = current_ipc_namespace_id();
     let object = (ipc_ns, msqid);
     let (pid, caller_uid, caller_gid, caller_groups) = current_identity();
-    if let Some(errno) = take_wait_error(task, WaitKind::MsgSend, ipc_ns, msqid) {
+    let resumed = match take_msg_send_resume(task, ipc_ns, msqid) {
+        MsgSendResume::Fresh => None,
+        MsgSendResume::Staged(mtype, payload, msgflg) => Some((mtype, payload, msgflg)),
+        MsgSendResume::Error(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    if resumed.is_some() && crate::handlers::has_interrupting_signal(task) {
+        let errno =
+            finish_interrupted_msg_wait(task, WaitKind::MsgSend, ipc_ns, msqid).unwrap_or(EINTR);
         ctx.set_return(err(errno));
         return;
     }
-    if wait_active(task, WaitKind::MsgSend, ipc_ns, msqid)
-        && crate::handlers::has_interrupting_signal(task)
-    {
-        clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
-        ctx.set_return(err(EINTR));
-        return;
-    }
-    let staged = take_staged_msg_send(task, ipc_ns, msqid);
-    let (mtype, payload, msgflg) = if let Some(staged) = staged {
-        staged
+    let (mtype, payload, msgflg) = if let Some(resumed) = resumed {
+        resumed
     } else {
         let msgsz = a.arg2 as usize;
         let msgflg = a.arg3;
@@ -2460,11 +2496,12 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
             ctx.set_return(err(EAGAIN));
         }
         Ok(false) => {
-            if let Some(errno) = take_wait_error(task, WaitKind::MsgSend, ipc_ns, msqid) {
+            if crate::handlers::has_interrupting_signal(task) {
+                let errno = finish_interrupted_msg_wait(task, WaitKind::MsgSend, ipc_ns, msqid)
+                    .unwrap_or(EINTR);
                 ctx.set_return(err(errno));
-            } else if crate::handlers::has_interrupting_signal(task) {
-                clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
-                ctx.set_return(err(EINTR));
+            } else if let Some(errno) = take_wait_error(task, WaitKind::MsgSend, ipc_ns, msqid) {
+                ctx.set_return(err(errno));
             } else if !park_msg_wait(ctx) {
                 clear_wait(task, WaitKind::MsgSend, ipc_ns, msqid);
                 ctx.set_return(err(EAGAIN));
@@ -2661,11 +2698,12 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
             if flg & IPC_NOWAIT as i64 != 0 {
                 clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
                 ctx.set_return(err(ENOMSG));
+            } else if crate::handlers::has_interrupting_signal(task) {
+                let errno = finish_interrupted_msg_wait(task, WaitKind::MsgRecv, ipc_ns, msqid)
+                    .unwrap_or(EINTR);
+                ctx.set_return(err(errno));
             } else if let Some(errno) = take_wait_error(task, WaitKind::MsgRecv, ipc_ns, msqid) {
                 ctx.set_return(err(errno));
-            } else if crate::handlers::has_interrupting_signal(task) {
-                clear_wait(task, WaitKind::MsgRecv, ipc_ns, msqid);
-                ctx.set_return(err(EINTR));
             } else {
                 // Kernel-test contexts cannot sleep. Leave the receive staged
                 // rather than returning IPC_NOWAIT's ENOMSG; a later invocation
