@@ -588,21 +588,22 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_sethostname_pos);
 
 fn smoke_abi_creds_sethostname_neg() -> TestResult {
     with_setup(|| {
-        // len > HOSTNAME_MAX (64) ⇒ Ok(-1). LINUX-GAP: Linux -EINVAL.
+        // len > __NEW_UTS_LEN (64) ⇒ -EINVAL.
         let big = [b'x'; 65];
-        let r = call(
+        if call(
             Syscall::SetHostname.raw(),
             a1(big.as_ptr() as u64, big.len() as u64),
-        )
-        .ok_or("sethostname not Ok")?;
-        if r != -1 {
-            return Err("sethostname(len>64) expected -1");
+        ) != Some(EINVAL)
+        {
+            return Err("sethostname(len>64) expected -EINVAL");
         }
-        // len == 0 ⇒ Ok(-1).
-        let r2 = call(Syscall::SetHostname.raw(), a1(big.as_ptr() as u64, 0))
-            .ok_or("sethostname not Ok")?;
-        if r2 != -1 {
-            return Err("sethostname(len=0) expected -1");
+        // A faulting name of a valid length ⇒ -EFAULT.
+        if call(Syscall::SetHostname.raw(), a1(BAD_PTR, 8)) != Some(EFAULT) {
+            return Err("sethostname(faulting name) expected -EFAULT");
+        }
+        // len == 0 is legal in Linux (sets an empty hostname) ⇒ 0.
+        if call(Syscall::SetHostname.raw(), a1(big.as_ptr() as u64, 0)) != Some(0) {
+            return Err("sethostname(len=0) expected 0 (empty hostname)");
         }
         Ok(())
     })
@@ -630,10 +631,13 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_uname_pos);
 
 fn smoke_abi_creds_uname_neg() -> TestResult {
     with_setup(|| {
-        // NULL buf ⇒ Ok(-1). LINUX-GAP: Linux returns -EFAULT.
-        let r = call(Syscall::Uname.raw(), a0(NULL_PTR)).ok_or("uname not Ok")?;
-        if r != -1 {
-            return Err("uname(NULL) expected -1");
+        // NULL buf ⇒ -EFAULT (copy_to_user of the utsname struct).
+        if call(Syscall::Uname.raw(), a0(NULL_PTR)) != Some(EFAULT) {
+            return Err("uname(NULL) expected -EFAULT");
+        }
+        // A faulting non-NULL buf is likewise -EFAULT.
+        if call(Syscall::Uname.raw(), a0(BAD_PTR)) != Some(EFAULT) {
+            return Err("uname(faulting buf) expected -EFAULT");
         }
         Ok(())
     })
@@ -667,15 +671,18 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setdomainname_pos);
 
 fn smoke_abi_creds_setdomainname_neg() -> TestResult {
     with_setup(|| {
-        // len > 64 ⇒ Ok(-1). LINUX-GAP: Linux -EINVAL.
+        // len > 64 ⇒ -EINVAL.
         let big = [b'd'; 65];
-        let r = call(
+        if call(
             Syscall::Setdomainname.raw(),
             a1(big.as_ptr() as u64, big.len() as u64),
-        )
-        .ok_or("setdomainname not Ok")?;
-        if r != -1 {
-            return Err("setdomainname(len>64) expected -1");
+        ) != Some(EINVAL)
+        {
+            return Err("setdomainname(len>64) expected -EINVAL");
+        }
+        // A faulting name of a valid length ⇒ -EFAULT.
+        if call(Syscall::Setdomainname.raw(), a1(BAD_PTR, 8)) != Some(EFAULT) {
+            return Err("setdomainname(faulting name) expected -EFAULT");
         }
         Ok(())
     })
