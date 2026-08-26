@@ -37,6 +37,12 @@ const SHM_RDONLY: u64 = 0o10000;
 const SHM_RND: u64 = 0o20000;
 const SHM_REMAP: u64 = 0o40000;
 const SHM_EXEC: u64 = 0o100000;
+const SHM_LOCK: u64 = 11;
+const SHM_UNLOCK: u64 = 12;
+const SHM_STAT: u64 = 13;
+const SHM_INFO: u64 = 14;
+const SHM_STAT_ANY: u64 = 15;
+const SHM_LOCKED: u32 = 0o2000;
 const SETVAL: u64 = 16;
 const SETALL: u64 = 17;
 const GETPID: u64 = 11;
@@ -2847,6 +2853,148 @@ fn smoke_abi_ipc_shmctl_exact_order_permissions_and_set() -> TestResult {
 kernel_test_in!(
     "syscall_abi/shmat",
     smoke_abi_ipc_shmctl_exact_order_permissions_and_set
+);
+
+fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Shmget.raw(), a2(0, 1024 * 1024 + 1, IPC_CREAT)) != Some(EINVAL) {
+            return Err("shmget above configured SHMMAX must return EINVAL");
+        }
+        let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+            .filter(|id| *id > 0)
+            .ok_or("setup: shmget failed")? as u64;
+
+        let mut limits = [0u8; 72];
+        let ipc_info = call_raw(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_INFO, limits.as_mut_ptr() as u64),
+        );
+        let read_u64 = |bytes: &[u8], offset: usize| {
+            u64::from_ne_bytes(bytes[offset..offset + 8].try_into().unwrap())
+        };
+        if ipc_info.value < id
+            || read_u64(&limits, 0) != 1024 * 1024
+            || read_u64(&limits, 8) != 1
+            || read_u64(&limits, 16) != 4096
+            || read_u64(&limits, 24) != 4096
+            || read_u64(&limits, 32) != 4096 * 256
+        {
+            return Err("shmctl IPC_INFO did not expose configured shared-memory limits");
+        }
+        let mut usage = [0u8; 48];
+        let shm_info = call_raw(
+            Syscall::Shmctl.raw(),
+            a2(id, SHM_INFO, usage.as_mut_ptr() as u64),
+        );
+        if shm_info.value < id
+            || u32::from_ne_bytes(usage[..4].try_into().unwrap()) < 1
+            || read_u64(&usage, 8) < 1
+            || read_u64(&usage, 16) < 1
+            || read_u64(&usage, 24) != 0
+        {
+            return Err("shmctl SHM_INFO did not report resident namespace usage");
+        }
+
+        let mut stat = [0u8; 112];
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, SHM_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(id as i64)
+        {
+            return Err("shmctl SHM_STAT did not return the indexed segment's full id");
+        }
+        if call(Syscall::Shmctl.raw(), a2(987_654, SHM_STAT, BAD_PTR)) != Some(EINVAL)
+            || call(Syscall::Shmctl.raw(), a2(id, SHM_STAT, BAD_PTR)) != Some(EFAULT)
+            || call(
+                Syscall::Shmctl.raw(),
+                a2(u64::from(u32::MAX), IPC_INFO, BAD_PTR),
+            ) != Some(EINVAL)
+        {
+            return Err("extended shmctl lookup/copyout errno ordering diverged from Linux");
+        }
+
+        if call(Syscall::Shmctl.raw(), a2(id, SHM_LOCK, 0)) != Some(0) {
+            return Err("owner shmctl SHM_LOCK failed");
+        }
+        stat.fill(0);
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+            || u32::from_ne_bytes(stat[20..24].try_into().unwrap()) & SHM_LOCKED == 0
+        {
+            return Err("SHM_LOCK did not publish Linux's SHM_LOCKED mode bit");
+        }
+        if call(Syscall::Shmctl.raw(), a2(id, SHM_UNLOCK, 0)) != Some(0) {
+            return Err("owner shmctl SHM_UNLOCK failed");
+        }
+
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("failed to install non-owner test credentials");
+        }
+        let denied_stat = call(
+            Syscall::Shmctl.raw(),
+            a2(id, SHM_STAT, stat.as_mut_ptr() as u64),
+        );
+        let any_stat = call(
+            Syscall::Shmctl.raw(),
+            a2(id, SHM_STAT_ANY, stat.as_mut_ptr() as u64),
+        );
+        let denied_lock = call(Syscall::Shmctl.raw(), a2(id, SHM_LOCK, 0));
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if denied_stat != Some(EACCES) || any_stat != Some(id as i64) || denied_lock != Some(EPERM)
+        {
+            return Err("extended shmctl permission behavior diverged from Linux");
+        }
+
+        let mut owner = [0u8; 112];
+        owner[4..8].copy_from_slice(&1000u32.to_ne_bytes());
+        owner[8..12].copy_from_slice(&1000u32.to_ne_bytes());
+        owner[20..24].copy_from_slice(&0o600u32.to_ne_bytes());
+        if call(
+            Syscall::Shmctl.raw(),
+            a2(id, IPC_SET, owner.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("setup: could not assign SHM_LOCK test owner");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        let mut limit = [0u8; 16];
+        limit[8..].copy_from_slice(&(8u64 * 1024 * 1024).to_ne_bytes());
+        if call(Syscall::Setrlimit.raw(), a1(8, limit.as_ptr() as u64)) != Some(0)
+            || call(Syscall::Shmctl.raw(), a2(id, SHM_LOCK, 0)) != Some(EPERM)
+        {
+            return Err("zero RLIMIT_MEMLOCK must make owner SHM_LOCK return EPERM");
+        }
+        limit[..8].copy_from_slice(&4096u64.to_ne_bytes());
+        if call(Syscall::Setrlimit.raw(), a1(8, limit.as_ptr() as u64)) != Some(0)
+            || call(Syscall::Shmctl.raw(), a2(id, SHM_LOCK, 0)) != Some(0)
+        {
+            return Err("owner SHM_LOCK within RLIMIT_MEMLOCK failed");
+        }
+        let second = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))
+            .filter(|second| *second > 0)
+            .ok_or("setup: second SHM_LOCK segment failed")? as u64;
+        if call(Syscall::Shmctl.raw(), a2(second, SHM_LOCK, 0)) != Some(ENOMEM) {
+            return Err("aggregate SHM_LOCK charge above RLIMIT_MEMLOCK must be ENOMEM");
+        }
+        if call(Syscall::Shmctl.raw(), a2(id, SHM_UNLOCK, 0)) != Some(0)
+            || call(Syscall::Shmctl.raw(), a2(second, SHM_LOCK, 0)) != Some(0)
+            || call(Syscall::Shmctl.raw(), a2(second, IPC_RMID, 0)) != Some(0)
+        {
+            return Err("SHM_UNLOCK did not release the per-user lock charge");
+        }
+        crate::handlers::__test_set_fsids(task, 0, 0);
+        if call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("extended shmctl test cleanup failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_shmctl_info_stat_and_lock
 );
 
 fn smoke_abi_ipc_shmat_permission_denied_before_as() -> TestResult {

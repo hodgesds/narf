@@ -54,6 +54,27 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    const SHMMNI: usize = 4096;
+    let shmmax = (v.max_len)();
+    if size > shmmax {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
+    let requested_pages = size.div_ceil(4096);
+    let (live_ids, used_pages) = segs
+        .iter()
+        .filter(|((namespace, _), _)| *namespace == ipc_ns)
+        .fold((0usize, 0u64), |(ids, pages), (_, seg)| {
+            (
+                ids.saturating_add(usize::from(!seg.removed)),
+                pages.saturating_add(seg.len.div_ceil(4096)),
+            )
+        });
+    let shmall = SHMMNI as u64 * shmmax / 4096;
+    if used_pages.saturating_add(requested_pages) > shmall || live_ids >= SHMMNI {
+        ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // ENOSPC
+        return;
+    }
     // SysV segments belong to the IPC namespace, not to the creating
     // process. Owner id 0 exempts this backing from the generic per-process
     // shmem exit reaper; IPC_RMID/final detach owns destruction instead.
@@ -86,6 +107,7 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
             dtime: 0,
             ctime: shm_now_seconds(),
             nattch: 0,
+            locked: false,
             removed: false,
         },
     );

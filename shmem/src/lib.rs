@@ -59,6 +59,8 @@ pub struct Entry {
     /// Number of live user mappings for each backing frame.
     pub refs: Vec<u32>,
     pub len: u64,
+    /// User whose RLIMIT_MEMLOCK accounting owns this SHM_LOCK charge.
+    pub locked_user: Option<(u64, u32)>,
     /// IPC_RMID/process exit has removed the public handle. Existing
     /// mappings remain valid until their final per-page reference drops.
     pub removed: bool,
@@ -127,6 +129,7 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         frames,
         refs: alloc::vec![0; pages],
         len: len_pg,
+        locked_user: None,
         removed: false,
     }));
     Ok(handle)
@@ -336,16 +339,24 @@ pub fn syscall_vtable() -> &'static narf_userspace::handlers::ShmemSyscallVtable
     use narf_userspace::handlers::ShmemSyscallVtable;
     static V: ShmemSyscallVtable = ShmemSyscallVtable {
         create: vt_create,
+        max_len: vt_max_len,
         len_of: vt_len_of,
         frames: vt_frames,
         destroy: vt_destroy,
         pid_of: vt_pid_of,
         owns_frame: vt_owns_frame,
+        frame_locked: vt_frame_locked,
+        lock: vt_lock,
+        unlock: vt_unlock,
         replace_frame: vt_replace_frame,
         retain_frame: vt_retain_frame,
         release_frame: vt_release_frame,
     };
     &V
+}
+
+fn vt_max_len() -> u64 {
+    MAX_PAGES_PER_HANDLE as u64 * PAGE
 }
 
 fn vt_retain_frame(phys: u64) {
@@ -389,6 +400,55 @@ fn vt_owns_frame(phys: u64) -> bool {
         .lock()
         .iter()
         .any(|entry| entry.frames.contains(&phys))
+}
+
+fn vt_frame_locked(phys: u64) -> bool {
+    REGISTRY
+        .lock()
+        .iter()
+        .any(|entry| entry.locked_user.is_some() && entry.frames.contains(&phys))
+}
+
+fn vt_lock(
+    handle: u64,
+    user_ns: u64,
+    uid: u32,
+    limit: u64,
+    bypass: bool,
+) -> Result<(), narf_userspace::handlers::ShmemLockError> {
+    use narf_userspace::handlers::ShmemLockError;
+    let mut registry = REGISTRY.lock();
+    let Some(index) = registry
+        .iter()
+        .position(|entry| entry.handle == handle && !entry.removed)
+    else {
+        return Err(ShmemLockError::NotFound);
+    };
+    if registry[index].locked_user.is_some() {
+        return Ok(());
+    }
+    let user = (user_ns, uid);
+    let charged = registry
+        .iter()
+        .filter(|entry| entry.locked_user == Some(user))
+        .fold(0u64, |total, entry| total.saturating_add(entry.len));
+    if !bypass && charged.saturating_add(registry[index].len) > limit {
+        return Err(ShmemLockError::Limit);
+    }
+    registry[index].locked_user = Some(user);
+    Ok(())
+}
+
+fn vt_unlock(handle: u64) -> bool {
+    let mut registry = REGISTRY.lock();
+    let Some(entry) = registry
+        .iter_mut()
+        .find(|entry| entry.handle == handle && !entry.removed)
+    else {
+        return false;
+    };
+    entry.locked_user = None;
+    true
 }
 
 fn vt_replace_frame(old_phys: u64, new_phys: u64) -> bool {

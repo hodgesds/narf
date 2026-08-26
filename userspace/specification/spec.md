@@ -476,7 +476,15 @@ defers backing destruction until the final attachment closes. Native
 `shmctl(2)` imports the complete `shmid64_ds` before an `IPC_SET` lookup,
 resolves and permission-checks `IPC_STAT` before copyout, and reports owner,
 mode, size, creator/last-operation pids, attach count, and timestamps at their
-architecture ABI offsets.
+architecture ABI offsets. `IPC_INFO` reports the configured eager-backing
+SHMMAX/SHMMNI/SHMALL limits; `SHM_INFO` aggregates namespace-local live ids and
+resident pages; `SHM_STAT` returns the full indexed id, while `SHM_STAT_ANY`
+alone bypasses the read-mode check. `SHM_LOCK` and `SHM_UNLOCK` enforce Linux's
+owner/creator rule and `RLIMIT_MEMLOCK` error classes, retain per-user charges
+until delayed backing destruction, expose `SHM_LOCKED`, and make registry
+frames ineligible for explicit NUMA migration. `ShmemSyscallVtable` exposes
+the backing limit, per-frame lock query, and whole-handle charged lock/unlock
+operations needed to keep those semantics coupled to backing lifetime.
 AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
 queues an accept-ready endpoint. Accepting the final pending endpoint followed
 by a new connection before the next epoll scan remains a deliverable

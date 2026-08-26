@@ -14,6 +14,9 @@ fn migrate_registry_shared_page(
             // Device/DMA frames require their owner's quiesce/remap protocol.
             return Err(narf_memory::AddressSpaceError::SharedMapping);
         }
+        if (vtable.frame_locked)(old_phys) {
+            return Err(narf_memory::AddressSpaceError::LockFailed);
+        }
         let old = narf_memory::PhysAddr::new(old_phys);
         if numa_node_for_phys(old_phys) as usize == target {
             return Ok(());

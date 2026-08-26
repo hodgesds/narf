@@ -4887,16 +4887,31 @@ mod fb_console_owner {
 #[derive(Copy, Clone)]
 pub struct ShmemSyscallVtable {
     pub create: fn(pid: u64, len: u64) -> u64,
+    /// Largest supported handle, used for SysV SHMMAX/SHMALL reporting.
+    pub max_len: fn() -> u64,
     pub len_of: fn(handle: u64) -> u64,
     pub frames: fn(handle: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
     pub destroy: fn(handle: u64) -> bool,
     pub pid_of: fn(handle: u64) -> u64,
     /// True only for registry-owned movable RAM, never device/DMA mappings.
     pub owns_frame: fn(phys: u64) -> bool,
+    /// True when SHM_LOCK has made this registry frame unevictable.
+    pub frame_locked: fn(phys: u64) -> bool,
+    /// Charge and lock a whole handle, enforcing the caller's per-user limit.
+    pub lock:
+        fn(handle: u64, user_ns: u64, uid: u32, limit: u64, bypass: bool) -> Result<(), ShmemLockError>,
+    /// Unlock a whole handle and release its stored user charge.
+    pub unlock: fn(handle: u64) -> bool,
     /// Atomically replace one registry backing entry after all aliases moved.
     pub replace_frame: fn(old_phys: u64, new_phys: u64) -> bool,
     pub retain_frame: fn(phys: u64),
     pub release_frame: fn(phys: u64),
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ShmemLockError {
+    NotFound,
+    Limit,
 }
 
 impl core::fmt::Debug for ShmemSyscallVtable {
@@ -9797,6 +9812,9 @@ struct ShmSegment {
     dtime: i64,
     ctime: i64,
     nattch: u64,
+    /// Linux SHM_LOCKED state. Backing is eagerly resident; the shmem vtable
+    /// additionally blocks explicit frame migration while this is set.
+    locked: bool,
     /// `IPC_RMID` removes the id/key immediately but retains the backing and
     /// metadata until the last live (or in-progress) attachment is gone.
     removed: bool,
@@ -9991,6 +10009,8 @@ const IPC_RMID: u64 = 0;
 const IPC_SET: u64 = 1;
 #[cfg(feature = "linux-compat")]
 const IPC_STAT: u64 = 2;
+#[cfg(feature = "linux-compat")]
+const IPC_INFO: u64 = 3;
 #[cfg(feature = "linux-compat")]
 const SHM_RDONLY: u64 = 0o10000;
 #[cfg(feature = "linux-compat")]
@@ -10882,6 +10902,7 @@ mod shm_mremap_registry_tests {
                     dtime: 0,
                     ctime: 0,
                     nattch,
+                    locked: false,
                     removed: false,
                 },
             );
