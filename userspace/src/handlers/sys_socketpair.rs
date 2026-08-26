@@ -11,20 +11,37 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let raw_type = args.arg1 as u32;
     let _protocol = args.arg2 as u32;
     let sv_ptr = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
     // Peel the SOCK_CLOEXEC / SOCK_NONBLOCK flag bits off the type.
     let kind = raw_type & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK);
     let cloexec = raw_type & crate::fd::O_CLOEXEC != 0;
     let nonblock = raw_type & crate::fd::O_NONBLOCK != 0;
-    // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL; other
-    // families return EOPNOTSUPP. STREAM uses byte-stream delivery;
-    // SEQPACKET and DGRAM retain one record per send.
+    // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL. Match its error
+    // order: sock_create rejects an unknown family with -EAFNOSUPPORT; a known
+    // family that lacks a ->socketpair op (every non-UNIX family here) is
+    // -EOPNOTSUPP; and AF_UNIX with an unsupported type is -ESOCKTNOSUPPORT.
+    // STREAM is byte-stream; SEQPACKET and DGRAM retain one record per send.
+    let family_known = matches!(
+        domain,
+        crate::socket::AF_UNIX
+            | crate::socket::AF_INET
+            | crate::socket::AF_INET6
+            | crate::socket::AF_BYPASS
+            | crate::socket::AF_NETLINK
+    );
     let kind_ok = matches!(
         kind,
         crate::socket::SOCK_STREAM | crate::socket::SOCK_SEQPACKET | crate::socket::SOCK_DGRAM
     );
-    if domain != crate::socket::AF_UNIX || !kind_ok {
-        ctx.set_return(fail);
+    if !family_known {
+        ctx.set_return(SyscallReturn::ok((-97i64) as u64)); // -EAFNOSUPPORT
+        return;
+    }
+    if domain != crate::socket::AF_UNIX {
+        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        return;
+    }
+    if !kind_ok {
+        ctx.set_return(SyscallReturn::ok((-94i64) as u64)); // -ESOCKTNOSUPPORT
         return;
     }
     let (a, b) = crate::socket::SocketFile::unix_pair(kind);
@@ -59,7 +76,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let fd_a = match mk(a) {
         Some(n) => n,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };
@@ -67,7 +84,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
         Some(n) => n,
         None => {
             let _ = fd::with_table(task, |t| t.close(fd_a));
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };
@@ -82,7 +99,7 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
             t.close(fd_a);
             t.close(fd_b)
         });
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

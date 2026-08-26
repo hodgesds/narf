@@ -49,6 +49,12 @@ pub const ERANGE: i64 = -34;
 pub const ENAMETOOLONG: i64 = -36;
 pub const ENOSYS: i64 = -38;
 pub const ENOTEMPTY: i64 = -39;
+// Socket-family errnos (net/socket.c).
+pub const ENOTSOCK: i64 = -88;
+pub const EOPNOTSUPP: i64 = -95;
+pub const EAFNOSUPPORT: i64 = -97;
+pub const EADDRINUSE: i64 = -98;
+pub const ENOTCONN: i64 = -107;
 
 /// The pid every ABI test runs as (overridable per test via [`set_task`]).
 pub const FAKE_TASK: u64 = 99;
