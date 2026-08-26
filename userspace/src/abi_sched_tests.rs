@@ -507,12 +507,15 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_pos);
 
 fn smoke_abi_sched_setparam_null_buf_neg() -> TestResult {
     with_setup(|| {
-        // Null param pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL/-EFAULT for a bad param pointer.
-        match call(Syscall::SchedSetparam.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_setparam with null buffer should return -1"),
+        // do_sched_setscheduler: `!param` → -EINVAL (before the copy).
+        if call(Syscall::SchedSetparam.raw(), a1(0, 0)) != Some(EINVAL) {
+            return Err("sched_setparam with a null param should return -EINVAL");
         }
+        // A non-NULL but faulting param → -EFAULT (copy_from_user).
+        if call(Syscall::SchedSetparam.raw(), a1(0, BAD_PTR)) != Some(EFAULT) {
+            return Err("sched_setparam with a faulting param should return -EFAULT");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_null_buf_neg);
@@ -597,11 +600,11 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_rr_get_interval_pos);
 
 fn smoke_abi_sched_rr_get_interval_bad_ptr_neg() -> TestResult {
     with_setup(|| {
-        // Non-canonical timespec pointer ⇒ copy_to_user EFAULT ⇒ wire -1.
-        // LINUX-GAP: Linux returns -EFAULT for a bad timespec pointer.
+        // Non-canonical timespec pointer ⇒ put_timespec64's copy_to_user
+        // faults ⇒ -EFAULT.
         match call(Syscall::SchedRrGetInterval.raw(), a1(0, BAD_PTR)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_rr_get_interval with bad pointer should return -1"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("sched_rr_get_interval with a bad pointer should return -EFAULT"),
         }
     })
 }
