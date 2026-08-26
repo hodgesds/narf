@@ -6,5 +6,5 @@ use super::*;
 /// `pos_l` (arg3), so the core matches `preadv`; the RWF_* flags (arg5)
 /// are accepted but not specially honoured.
 pub(crate) fn sys_preadv2(ctx: &mut dyn TrapContext) {
-    preadv_pwritev(ctx, false);
+    preadv_pwritev(ctx, false, true);
 }

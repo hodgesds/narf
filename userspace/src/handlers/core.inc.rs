@@ -4638,126 +4638,174 @@ impl TrapContext for CaptureCtx<'_> {
 const MMSGHDR_SZ: u64 = 64;
 const MMSGHDR_MSGLEN_OFF: u64 = 56;
 
-/// Shared core for `preadv(2)` / `pwritev(2)` — vectored I/O at an
-/// explicit offset that does NOT advance the fd's own offset.
-fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool) {
+/// Shared core for `preadv`/`pwritev`/`preadv2`/`pwritev2`.
+///
+/// `fs/read_write.c::do_preadv` / `do_pwritev` ordering:
+///
+/// ```text
+///   if (pos < 0) return -EINVAL;
+///   f = fdget(fd); if (!fd_file(f)) return -EBADF;
+///   ret = -ESPIPE; if (f->f_mode & FMODE_PREAD) ret = vfs_readv(...);
+/// ```
+///
+/// `pos == -1` is the preadv2/pwritev2 escape hatch that
+/// `SYSCALL_DEFINE6(preadv2)` routes to plain `do_readv`/`do_writev`: it uses
+/// and advances the shared file position instead of an explicit offset.
+/// Delegating keeps a single implementation of the position lock, MAX_RW_COUNT
+/// cap, blocking/EAGAIN and partial-progress rules — the previous code read at
+/// literal offset `u64::MAX`, so a `preadv2(regular_fd, .., -1, ..)` reported
+/// a spurious EOF.
+///
+/// Every failure now carries the errno Linux would return. The old code
+/// collapsed bad fds, faulting iovecs and filesystem errors into a single `-1`,
+/// which userspace decodes as EPERM.
+fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     let a = *ctx.args();
     let fd = a.arg0 as u32;
     let iov_ptr = a.arg1;
     let iovcnt = a.arg2 as usize;
-    let mut off = a.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    const IOV_MAX: usize = 1024;
-    if iovcnt > IOV_MAX {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    let pos = a.arg3;
+
+    if v2 && pos == u64::MAX {
+        if is_write {
+            handler_sys_writev::sys_writev(ctx);
+        } else {
+            handler_sys_readv::sys_readv(ctx);
+        }
         return;
     }
-    // SAFETY: single-threaded syscall; the AS is active. copy_from_user_vec
-    // range-validates the iovec array.
-    let iov_buf = match unsafe { copy_from_user_vec(iov_ptr, iovcnt.saturating_mul(16)) } {
-        Ok(b) => b,
-        Err(e) => {
-            ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+    if (pos as i64) < 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+
+    let task = current_task_id();
+    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    };
+    // Positioned I/O on a pipe/FIFO/socket is -ESPIPE: streams never carry
+    // FMODE_PREAD/FMODE_PWRITE, so consuming their bytes "at an offset" (the
+    // old behaviour) silently corrupted the stream position.
+    {
+        use narf_filesystem::FileType;
+        let ty = endpoint.ops.stat().mode.file_type;
+        if ty == FileType::Fifo || ty == FileType::Socket {
+            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            return;
+        }
+    }
+    let permitted = if is_write {
+        endpoint.writable()
+    } else {
+        endpoint.readable()
+    };
+    if !permitted {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
+
+    // import_rw_iovecs applies IOV_MAX (-EINVAL), access_ok (-EFAULT) and the
+    // MAX_RW_COUNT cap to the complete vector before any I/O starts.
+    let iovecs = match import_rw_iovecs(iov_ptr, iovcnt) {
+        Ok(iovecs) => iovecs,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
             return;
         }
     };
-    let task = current_task_id();
-    // Positioned I/O on a pipe/FIFO/socket is -ESPIPE:
-    // `fs/read_write.c::ksys_pread64` starts from `ret = -ESPIPE` and only
-    // proceeds when the file has FMODE_PREAD/FMODE_PWRITE, which streams
-    // never get. Consuming pipe bytes "at an offset" (the old behaviour)
-    // silently corrupted the stream position. pos == -1 is exempt: the
-    // preadv2/pwritev2 entry points route it to plain readv/writev
-    // (`fs/read_write.c::SYSCALL_DEFINE6(preadv2)`), which pipes support.
-    if off != u64::MAX {
-        let seekless = fd::with_table(task, |t| {
-            t.get(fd).map(|e| {
-                let ty = e.ops.stat().mode.file_type;
-                ty == narf_filesystem::FileType::Fifo || ty == narf_filesystem::FileType::Socket
-            })
-        });
-        match seekless {
-            Some(Some(true)) => {
-                ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
-                return;
-            }
-            Some(None) => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-                return;
-            }
-            _ => {}
-        }
+    let count: usize = iovecs.iter().map(|iov| iov.len).sum();
+    if count == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     }
+
+    let mut off = pos;
     let mut total = 0usize;
-    for i in 0..iovcnt {
-        let o = i * 16;
-        let base = u64::from_le_bytes(iov_buf[o..o + 8].try_into().unwrap_or([0; 8]));
-        let len = u64::from_le_bytes(iov_buf[o + 8..o + 16].try_into().unwrap_or([0; 8])) as usize;
-        if len == 0 {
+    for iovec in &iovecs {
+        if iovec.len == 0 {
             continue;
         }
-        if is_write {
-            // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
-            let kbuf = match unsafe { copy_from_user_vec(base, len) } {
-                Ok(b) => b,
-                Err(_) => {
+        let outcome = if is_write {
+            // SAFETY: import_rw_iovecs validated this source range; the
+            // guarded copy still catches a protection change racing it.
+            let payload = match unsafe { copy_from_user_vec(iovec.base, iovec.len) } {
+                Ok(payload) => payload,
+                Err(errno) => {
                     if total == 0 {
-                        ctx.set_return(fail);
+                        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
                         return;
                     }
                     break;
                 }
             };
-            let w = fd::with_table(task, |t| {
-                let entry = t.get_mut(fd).ok_or(())?;
-                poll_blocking(entry.ops.write(off, &kbuf))
-                    .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
-                    .map_err(|_| ())
-            });
-            match w {
-                Some(Ok(written)) => {
-                    total += written;
-                    off = off.saturating_add(written as u64);
-                    if written < len {
-                        break;
+            poll_blocking(endpoint.ops.write(off, &payload))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+        } else {
+            let mut staging = alloc::vec![0u8; iovec.len];
+            let read = poll_blocking(endpoint.ops.read(off, &mut staging))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+            match read {
+                Ok(n) if n <= staging.len() => {
+                    // SAFETY: validated destination; guarded against a racing
+                    // unmap between import and copy.
+                    match unsafe { copy_to_user(iovec.base, &staging[..n]) } {
+                        Ok(()) => Ok(n),
+                        Err(errno) => {
+                            if total == 0 {
+                                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                                return;
+                            }
+                            break;
+                        }
                     }
                 }
-                _ => {
-                    if total == 0 {
-                        ctx.set_return(fail);
-                        return;
-                    }
-                    break;
+                other => other,
+            }
+        };
+        match outcome {
+            Ok(0) => break,
+            Ok(n) if n <= iovec.len => {
+                total += n;
+                off = off.saturating_add(n as u64);
+                if n < iovec.len {
+                    break; // short transfer / EOF
                 }
             }
-        } else {
-            let mut kbuf = alloc::vec![0u8; len];
-            let r = fd::with_table(task, |t| {
-                let entry = t.get_mut(fd).ok_or(())?;
-                poll_blocking(entry.ops.read(off, &mut kbuf))
-                    .unwrap_or(Ok(0))
-                    .map_err(|_| ())
-            });
-            match r {
-                Some(Ok(n)) => {
-                    // SAFETY: `base` is the user iovec destination; copy_to_user
-                    // validates the `n`-byte write.
-                    let _ = unsafe { copy_to_user(base, &kbuf[..n]) };
-                    total += n;
-                    off = off.saturating_add(n as u64);
-                    if n < len {
-                        break; // short read / EOF
-                    }
+            // A FileOps reporting more bytes than the buffer holds is a driver
+            // bug; Linux's iterators can never exceed the iov length.
+            Ok(_) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    return;
                 }
-                _ => {
-                    if total == 0 {
-                        ctx.set_return(fail);
-                        return;
-                    }
-                    break;
+                break;
+            }
+            Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
+                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                return;
+            }
+            Err(narf_filesystem::FsError::BrokenPipe) => {
+                raise_signal_pending(task, 13); // SIGPIPE even after a prefix
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                    return;
                 }
+                break;
+            }
+            Err(error) => {
+                if total == 0 {
+                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    return;
+                }
+                break;
             }
         }
+    }
+
+    #[cfg(feature = "linux-compat")]
+    if is_write && total != 0 {
+        crate::mqueue::notify_modify_fd(task, fd);
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

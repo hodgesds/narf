@@ -751,26 +751,61 @@ pub fn sys_epoll_create1(ctx: &mut dyn TrapContext) {
     }
 }
 
+/// `epoll_ctl(epfd, op, fd, event)` — `fs/eventpoll.c::do_epoll_ctl` errno
+/// order:
+///
+/// ```text
+///   if (ep_op_has_event(op) && copy_from_user(...)) return -EFAULT;
+///   f = fdget(epfd);  if (!f)  return -EBADF;
+///   tf = fdget(fd);   if (!tf) return -EBADF;
+///   if (f.file == tf.file || !is_file_epoll(f.file)) return -EINVAL;
+///   ADD on a registered fd     -> -EEXIST
+///   MOD / DEL on an unknown fd -> -ENOENT
+///   a cycle or too-deep nest   -> -ELOOP
+///   any other op               -> -EINVAL
+/// ```
+///
+/// Every one of those used to be the same `-1`, i.e. EPERM. That single value
+/// is load-bearing for event loops: libevent/libuv keep a shadow interest set
+/// and reconcile it against EEXIST (already added) and ENOENT (already gone),
+/// and glibc's `epoll_ctl` hands the errno straight through. A blanket EPERM
+/// turns a benign duplicate ADD into a fatal "Operation not permitted".
 pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let epfd = args.arg0 as u32;
     let op = args.arg1 as u32;
     let tfd = args.arg2 as i32;
     let ev_ptr = args.arg3 as *const u8;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    const EBADF: SyscallReturn = SyscallReturn::ok((-9i64) as u64);
+    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
+    const EEXIST: SyscallReturn = SyscallReturn::ok((-17i64) as u64);
+    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
+    const ENOENT: SyscallReturn = SyscallReturn::ok((-2i64) as u64);
+    const ELOOP: SyscallReturn = SyscallReturn::ok((-40i64) as u64);
     let task = current_task_id();
+
+    // `SYSCALL_DEFINE4(epoll_ctl)` imports the event word before anything
+    // else, so a faulting `event` outranks even a closed epfd.
+    let event = if op == EPOLL_CTL_ADD || op == EPOLL_CTL_MOD {
+        if ev_ptr.is_null() {
+            ctx.set_return(EFAULT);
+            return;
+        }
+        match read_epoll_event(ev_ptr as u64) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                ctx.set_return(EFAULT);
+                return;
+            }
+        }
+    } else {
+        None
+    };
 
     let ops = match epoll_ops(task, epfd) {
         Some(o) => o,
         None => {
-            ctx.set_return(fail);
-            return;
-        }
-    };
-    let instance = match as_epoll(&ops) {
-        Some(i) => i,
-        None => {
-            ctx.set_return(fail); // not an epoll fd (Linux: EINVAL)
+            ctx.set_return(EBADF);
             return;
         }
     };
@@ -786,68 +821,62 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     let (target_ops, target_offset) = match target {
         Some(target) => target,
         None => {
-            ctx.set_return(fail); // EBADF
+            ctx.set_return(EBADF);
+            return;
+        }
+    };
+    // Both "epfd names itself" and "epfd is not an epoll" are -EINVAL, and
+    // Linux checks them only after both descriptors resolve. The comparison
+    // is on the open file description (`fd_file(f) == fd_file(tf)`), not the
+    // descriptor number, so a dup() of epfd is caught too.
+    if Arc::ptr_eq(&ops, &target_ops) {
+        ctx.set_return(EINVAL);
+        return;
+    }
+    let instance = match as_epoll(&ops) {
+        Some(i) => i,
+        None => {
+            ctx.set_return(EINVAL);
             return;
         }
     };
 
     match op {
         EPOLL_CTL_ADD => {
-            if ev_ptr.is_null() {
-                ctx.set_return(fail);
-                return;
-            }
-            let (events, data) = match read_epoll_event(ev_ptr as u64) {
-                Ok(v) => v,
-                Err(_) => {
-                    ctx.set_return(fail);
-                    return;
-                }
-            };
+            let (events, data) = event.expect("ADD imported its event above");
             // Nested-epoll hardening, mirroring Linux ep_loop_check:
             // refuse an ADD that would make this epoll reachable from
             // itself (a cycle turns the recursive readiness poll into
             // unbounded kernel recursion) or nest epolls deeper than
-            // EP_MAX_NESTS. Linux returns ELOOP; this file's error
-            // convention is a bare -1 (LINUX-GAP: no per-errno codes).
+            // EP_MAX_NESTS.
             if let Some(target) = as_epoll(&target_ops) {
                 if core::ptr::eq(target, instance) || epoll_reaches(task, target, instance, 1) {
-                    ctx.set_return(fail);
+                    ctx.set_return(ELOOP);
                     return;
                 }
             }
             if instance.ctl_add(tfd, &target_ops, target_offset, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(fail); // EEXIST
+                ctx.set_return(EEXIST);
             }
         }
         EPOLL_CTL_MOD => {
-            if ev_ptr.is_null() {
-                ctx.set_return(fail);
-                return;
-            }
-            let (events, data) = match read_epoll_event(ev_ptr as u64) {
-                Ok(v) => v,
-                Err(_) => {
-                    ctx.set_return(fail);
-                    return;
-                }
-            };
+            let (events, data) = event.expect("MOD imported its event above");
             if instance.ctl_mod(tfd, &target_ops, events, data) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(fail); // ENOENT
+                ctx.set_return(ENOENT);
             }
         }
         EPOLL_CTL_DEL => {
             if instance.ctl_del(tfd, &target_ops, task) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(fail); // ENOENT
+                ctx.set_return(ENOENT);
             }
         }
-        _ => ctx.set_return(fail),
+        _ => ctx.set_return(EINVAL),
     }
 }
 

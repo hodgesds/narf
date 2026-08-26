@@ -1,60 +1,81 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `pread64(fd, buf, count, offset)` with `fs/read_write.c::ksys_pread64`
+/// error ordering:
+///
+/// ```text
+///   if (pos < 0) return -EINVAL;
+///   f = fdget(fd); if (!fd_file(f)) return -EBADF;
+///   ret = -ESPIPE; if (f->f_mode & FMODE_PREAD) ret = vfs_read(...);
+/// ```
+///
+/// `vfs_read` then checks FMODE_READ (-EBADF) before `access_ok` (-EFAULT),
+/// so a zero-length pread on a closed or write-only fd is still an error
+/// rather than a 0-byte success. Read failures propagate the filesystem's
+/// errno; the old blanket `-1` sentinel reached userspace as EPERM, which
+/// no caller of pread(2) can interpret.
 pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
     let ptr = args.arg1;
-    let len = args.arg2 as usize;
+    let requested = args.arg2 as usize;
     let offset = args.arg3;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    if len == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-    if let Err(e) = validate_user_range(ptr, len) {
-        ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+
+    // loff_t is signed: a negative offset is rejected before the fd lookup.
+    if (offset as i64) < 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let task = current_task_id();
-    // Bad fd → -EBADF, checked explicitly so it stays distinct from the
-    // -1 read-error path in the `_` arm below (a blanket change would
-    // mis-map genuine read failures).
-    if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    };
+    // pread(2) on a pipe/FIFO/socket is -ESPIPE: those file types never get
+    // FMODE_PREAD, so `ksys_pread64` returns its initial -ESPIPE without
+    // consuming any bytes "at an offset".
+    {
+        use narf_filesystem::FileType;
+        let ty = endpoint.ops.stat().mode.file_type;
+        if ty == FileType::Fifo || ty == FileType::Socket {
+            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            return;
+        }
+    }
+    if !endpoint.readable() {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     }
-    // pread(2) on a pipe/FIFO/socket is -ESPIPE: `fs/read_write.c::
-    // ksys_pread64` starts from `ret = -ESPIPE` and only proceeds when the
-    // file has FMODE_PREAD, which streams never get. The old path CONSUMED
-    // pipe bytes "at an offset".
-    let seekless = fd::with_table(task, |t| {
-        t.get(fd).map(|e| {
-            let ty = e.ops.stat().mode.file_type;
-            ty == narf_filesystem::FileType::Fifo || ty == narf_filesystem::FileType::Socket
-        })
-    });
-    if seekless == Some(Some(true)) {
-        ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+    if let Err(errno) = validate_rw_user_range(ptr, requested) {
+        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
         return;
     }
-    let mut kbuf = alloc::vec![0u8; len];
-    let outcome = fd::with_table(task, |t| {
-        let entry = t.get(fd)?;
-        let ops = entry.ops.clone();
-        let res = poll_blocking(ops.read(offset, &mut kbuf))
-            .unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
-        res.ok()
-    });
+    let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
+    if count == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    let mut kbuf = alloc::vec![0u8; count];
+    let outcome = poll_blocking(endpoint.ops.read(offset, &mut kbuf))
+        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
     match outcome {
-        Some(Some(n)) => {
-            // SAFETY: ptr validated above; AS still active.
-            if let Err(e) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
-                ctx.set_return(SyscallReturn::ok((-(e as i64)) as u64));
+        Ok(n) if n <= kbuf.len() => {
+            // SAFETY: the destination passed validate_rw_user_range above; the
+            // guarded copy still catches a protection change racing it.
+            if let Err(errno) = unsafe { copy_to_user(ptr, &kbuf[..n]) } {
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
             } else {
                 ctx.set_return(SyscallReturn::ok(n as u64));
             }
         }
-        _ => ctx.set_return(fail),
+        // A FileOps that claims more bytes than the buffer holds is a driver
+        // bug, not a user error; Linux's iterators cap at the iov length.
+        Ok(_) => ctx.set_return(SyscallReturn::ok((-22i64) as u64)),
+        Err(narf_filesystem::FsError::WouldBlock) => {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        }
+        Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
     }
 }

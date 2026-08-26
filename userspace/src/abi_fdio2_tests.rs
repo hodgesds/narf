@@ -87,10 +87,13 @@ fn smoke_abi_fdio2_pread64_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_pread64_neg);
 
 fn smoke_abi_fdio2_pread64_zero_len() -> TestResult {
-    with_setup(|| {
-        // len == 0 short-circuits to 0 BEFORE the fd is looked up, so even
-        // a bogus fd returns 0 (the boundary the handler special-cases).
-        match call(Syscall::Pread64.raw(), a3(4242, 0, 0, 0)) {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        // A zero-length pread is a 0-byte success only on a VALID descriptor:
+        // `ksys_pread64` resolves the fd and `vfs_read` checks FMODE_READ
+        // before the count reaches zero. See the `_zero_len_bad_fd` case in
+        // `abi_ioerrno_tests` for the -EBADF half of this boundary.
+        let fd = open_fd2(b"/abi/f\0")?;
+        match call(Syscall::Pread64.raw(), a3(fd as u64, 0, 0, 0)) {
             Some(0) => Ok(()),
             _ => Err("pread64 zero-len did not return 0"),
         }
@@ -171,9 +174,12 @@ fn smoke_abi_fdio2_preadv2_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_preadv2_pos);
 
 fn smoke_abi_fdio2_preadv2_neg() -> TestResult {
-    with_setup(|| {
-        // iovcnt > IOV_MAX (1024) → -EINVAL.
-        match call(Syscall::Preadv2.raw(), a3(3, 0x1000, 2000, 0)) {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        // iovcnt > IOV_MAX (1024) → -EINVAL. The descriptor must be OPEN for
+        // that to be the failure under test: `do_preadv`/`do_pwritev` resolve
+        // the fd first, so a closed one reports -EBADF before import_iovec.
+        let fd = open_fd2(b"/abi/f\0")?;
+        match call(Syscall::Preadv2.raw(), a3(fd as u64, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("preadv2 over IOV_MAX was not -EINVAL"),
         }
@@ -208,9 +214,12 @@ fn smoke_abi_fdio2_pwritev2_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_fdio2_pwritev2_pos);
 
 fn smoke_abi_fdio2_pwritev2_neg() -> TestResult {
-    with_setup(|| {
-        // iovcnt > IOV_MAX → -EINVAL.
-        match call(Syscall::Pwritev2.raw(), a3(3, 0x1000, 2000, 0)) {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        // iovcnt > IOV_MAX (1024) → -EINVAL. The descriptor must be OPEN for
+        // that to be the failure under test: `do_preadv`/`do_pwritev` resolve
+        // the fd first, so a closed one reports -EBADF before import_iovec.
+        let fd = open_fd2(b"/abi/f\0")?;
+        match call(Syscall::Pwritev2.raw(), a3(fd as u64, 0x1000, 2000, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("pwritev2 over IOV_MAX was not -EINVAL"),
         }
