@@ -52,9 +52,15 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
 
 /// `eventfd2(initval, flags)` — x86_64 290, aarch64 19. The form every libc
 /// `eventfd()` wrapper actually issues.
+///
+/// `SYSCALL_DEFINE2(eventfd2, unsigned int, count, int, flags)`: the initial
+/// counter is a 32-BIT argument. Reading the register as a full u64 seeded a
+/// counter Linux would have truncated — `eventfd2(1 << 32, 0)` starts at zero
+/// there and at 4294967296 here, so the first read returns a value that never
+/// existed and the semaphore drains 2^32 times instead of not at all.
 pub(crate) fn sys_eventfd2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    create_eventfd(ctx, args.arg0, args.arg1 as u32);
+    create_eventfd(ctx, u64::from(args.arg0 as u32), args.arg1 as u32);
 }
 
 /// `eventfd(initval)` — the original one-argument call, x86_64 284 only.
@@ -66,6 +72,7 @@ pub(crate) fn sys_eventfd2(ctx: &mut dyn TrapContext) {
 /// CLOEXEC or NONBLOCK descriptor it never asked for, or -EINVAL, entirely
 /// according to register garbage.
 pub(crate) fn sys_eventfd(ctx: &mut dyn TrapContext) {
-    let initval = ctx.args().arg0;
+    // `SYSCALL_DEFINE1(eventfd, unsigned int, count)` — 32-bit, as above.
+    let initval = u64::from(ctx.args().arg0 as u32);
     create_eventfd(ctx, initval, 0);
 }

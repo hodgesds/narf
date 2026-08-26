@@ -40,19 +40,32 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "linux-compat")]
     {
         if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
+            // `do_fcntl` receives an already-resolved `struct file *`, so a
+            // closed descriptor is -EBADF from the entry's fdget_raw before
+            // any per-command argument check runs.
+            if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
+                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                return;
+            }
             // `f_dupfd`: `if (from >= nofile) return -EINVAL;` — the floor is
             // rejected before any allocation is attempted, and separately from
             // the -EMFILE that a full table would produce. A caller doing
             // `fcntl(fd, F_DUPFD, 1024)` to park a descriptor above the
             // limit needs EINVAL to learn the floor is the problem.
+            //
+            // The floor is `int argi = (int)arg` widened back to `unsigned
+            // int` by f_dupfd's parameter, i.e. the low 32 bits — NOT the
+            // full register. `fcntl(fd, F_DUPFD, 1 << 32)` is a floor of 0 on
+            // Linux and duplicates; comparing the untruncated value rejected
+            // it with EINVAL instead.
+            let min_fd = arg as u32;
             let nofile = read_rlimit(task, 7)
                 .map(|limit| limit.cur)
                 .unwrap_or_else(|| default_rlimits()[7].cur);
-            if arg >= nofile {
+            if u64::from(min_fd) >= nofile {
                 ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                 return;
             }
-            let min_fd = arg as u32;
             let cloexec = cmd == F_DUPFD_CLOEXEC;
             let outcome = fd::with_table(task, |t| {
                 t.duplicate(fd, min_fd, if cloexec { crate::fd::FD_CLOEXEC } else { 0 })

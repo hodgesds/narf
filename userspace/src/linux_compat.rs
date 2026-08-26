@@ -283,14 +283,18 @@ impl MemFdFile {
     /// Err(()) when sealing is forbidden, F_SEAL_SEAL already set, or
     /// new_seals is out of range.
     pub fn add_seals(&self, new_seals: u32) -> Result<(), SealError> {
-        if !self.allow_sealing {
-            // A memfd created without MFD_ALLOW_SEALING starts with
-            // F_SEAL_SEAL, so this is the same refusal as the check below:
-            // `mm/memfd.c::memfd_add_seals` answers a sealed file -EPERM.
-            return Err(SealError::Denied);
-        }
-        // `if (seals & ~(unsigned int)F_ALL_SEALS) return -EINVAL;` — an
-        // undefined seal bit is a caller error, distinct from a refusal.
+        // `mm/memfd.c::memfd_add_seals` validates the requested set BEFORE
+        // it looks at what the file already carries:
+        //
+        //   if (seals & ~(unsigned int)F_ALL_SEALS) return -EINVAL;
+        //   ...
+        //   if (*file_seals & F_SEAL_SEAL) { error = -EPERM; }
+        //
+        // so an undefined seal bit is -EINVAL even on a file that could not
+        // have been sealed anyway. A separate `allow_sealing` early-return
+        // used to pre-empt this and answer -EPERM; it was also redundant,
+        // because a memfd created without MFD_ALLOW_SEALING already starts
+        // with F_SEAL_SEAL set and so fails the check below on its own.
         if (new_seals & !F_SEAL_ALL) != 0 {
             return Err(SealError::Invalid);
         }

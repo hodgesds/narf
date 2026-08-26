@@ -738,7 +738,12 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
             ops,
             offset: 0,
             flags: install_flags,
-            status_flags: 0,
+            // `do_epoll_create` opens the anon inode with
+            // `O_RDWR | (flags & O_CLOEXEC)`. The access mode is observable:
+            // a caller that probes `fcntl(epfd, F_GETFL)` — glibc's stdio
+            // does this on any fd handed to fdopen — saw O_RDONLY here and
+            // concluded the descriptor was not writable.
+            status_flags: crate::fd::O_RDWR,
         })
     });
 

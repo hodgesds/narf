@@ -4666,20 +4666,67 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     let iovcnt = a.arg2 as usize;
     let pos = a.arg3;
 
-    // `include/linux/fs.h::kiocb_set_rw_flags` validates the preadv2/pwritev2
-    // flag word before any I/O:
-    //
-    //   if (flags & ~RWF_SUPPORTED)                 return -EOPNOTSUPP;
-    //   if ((flags & RWF_APPEND) && (flags & RWF_NOAPPEND)) return -EINVAL;
-    //   if ((flags & RWF_NOWAIT) && !FMODE_NOWAIT)  return -EOPNOTSUPP;
-    //   if ((flags & RWF_ATOMIC) && rw_type != WRITE) return -EOPNOTSUPP;
-    //
-    // Silently ignoring the word (the old behaviour) is the worst answer for
-    // the two flags that carry durability and latency contracts: a caller that
-    // asked for RWF_DSYNC and got a buffered write believes its data is on
-    // stable storage, and one that asked for RWF_NOWAIT to keep an event loop
-    // off the blocking path gets blocked instead of the -EAGAIN it handles.
-    // Report EOPNOTSUPP for what NARF cannot honour and let the caller choose.
+    // `pos == -1` is the preadv2/pwritev2 escape hatch that
+    // `SYSCALL_DEFINE6(preadv2)` routes to plain `do_readv`/`do_writev`: it
+    // uses and advances the shared file position instead of an explicit
+    // offset. `preadv`/`pwritev` have no such case, so a negative offset is
+    // simply -EINVAL there.
+    let use_current_pos = v2 && pos == u64::MAX;
+
+    if !use_current_pos && (pos as i64) < 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+
+    let task = current_task_id();
+    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    };
+    // Positioned I/O on a pipe/FIFO/socket is -ESPIPE: streams never carry
+    // FMODE_PREAD/FMODE_PWRITE, so consuming their bytes "at an offset" (the
+    // old behaviour) silently corrupted the stream position. The `pos == -1`
+    // form is exempt — it IS readv/writev, which pipes support.
+    if !use_current_pos {
+        use narf_filesystem::FileType;
+        let ty = endpoint.ops.stat().mode.file_type;
+        if ty == FileType::Fifo || ty == FileType::Socket {
+            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            return;
+        }
+    }
+    let permitted = if is_write {
+        endpoint.writable()
+    } else {
+        endpoint.readable()
+    };
+    if !permitted {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
+
+    // import_rw_iovecs applies IOV_MAX (-EINVAL), access_ok (-EFAULT) and the
+    // MAX_RW_COUNT cap to the complete vector before any I/O starts.
+    let iovecs = match import_rw_iovecs(iov_ptr, iovcnt) {
+        Ok(iovecs) => iovecs,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            return;
+        }
+    };
+    let count: usize = iovecs.iter().map(|iov| iov.len).sum();
+    if count == 0 {
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
+    // Only now does the flag word matter. `vfs_readv`/`vfs_writev` reach
+    // `kiocb_set_rw_flags` (via do_iter_readv_writev) AFTER the FMODE check,
+    // after `import_iovec`, and after the `if (!tot_len) goto out;`
+    // short-circuit — so a bad descriptor outranks a bad flag, and an empty
+    // vector returns 0 without the flags ever being looked at. Validating the
+    // word first, as this handler briefly did, reported -EOPNOTSUPP where
+    // Linux reports -EBADF or success.
     if v2 {
         const RWF_HIPRI: u64 = 0x01;
         const RWF_DSYNC: u64 = 0x02;
@@ -4699,7 +4746,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
             | RWF_ATOMIC
             | RWF_DONTCACHE
             | RWF_NOSIGNAL;
-        // arg4 is pos_h, arg5 the rwf_t flag word (a 32-bit type).
+        // arg4 is pos_h, arg5 the rwf_t flag word (`int`, so 32 bits).
         let flags = a.arg5 & 0xffff_ffff;
         if flags != 0 {
             if flags & !RWF_SUPPORTED != 0 {
@@ -4754,7 +4801,11 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         }
     }
 
-    if v2 && pos == u64::MAX {
+    if use_current_pos {
+        // Hand the whole call to readv/writev, which own the position lock,
+        // the blocking/EAGAIN rules and partial-progress reporting. They
+        // repeat the descriptor and iovec checks above; that is cheap next to
+        // the I/O and keeps one implementation of those rules.
         if is_write {
             handler_sys_writev::sys_writev(ctx);
         } else {
@@ -4762,58 +4813,29 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
         }
         return;
     }
-    if (pos as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-        return;
-    }
 
-    let task = current_task_id();
-    let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    };
-    // Positioned I/O on a pipe/FIFO/socket is -ESPIPE: streams never carry
-    // FMODE_PREAD/FMODE_PWRITE, so consuming their bytes "at an offset" (the
-    // old behaviour) silently corrupted the stream position.
-    {
-        use narf_filesystem::FileType;
-        let ty = endpoint.ops.stat().mode.file_type;
-        if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
-            return;
-        }
-    }
-    let permitted = if is_write {
-        endpoint.writable()
-    } else {
-        endpoint.readable()
-    };
-    if !permitted {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
-    }
-
-    // import_rw_iovecs applies IOV_MAX (-EINVAL), access_ok (-EFAULT) and the
-    // MAX_RW_COUNT cap to the complete vector before any I/O starts.
-    let iovecs = match import_rw_iovecs(iov_ptr, iovcnt) {
-        Ok(iovecs) => iovecs,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
-            return;
-        }
-    };
-    let count: usize = iovecs.iter().map(|iov| iov.len).sum();
-    if count == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
-
+    // Bounded staging, as in readv/writev: `import_rw_iovecs` caps the whole
+    // vector at MAX_RW_COUNT, but a SINGLE iovec may still be far larger than
+    // NARF's 16-MiB copy limit, so each one is transferred a chunk at a time.
+    const CHUNK: usize = 64 * 1024;
     let mut off = pos;
     let mut total = 0usize;
+    let mut pending: alloc::vec::Vec<ImportedRwIovec> = alloc::vec::Vec::new();
     for iovec in &iovecs {
-        if iovec.len == 0 {
-            continue;
+        let mut remaining = *iovec;
+        while remaining.len != 0 {
+            let step = core::cmp::min(CHUNK, remaining.len);
+            pending.push(ImportedRwIovec {
+                base: remaining.base,
+                len: step,
+            });
+            remaining.base += step as u64;
+            remaining.len -= step;
         }
+    }
+    // Every entry is now at most CHUNK bytes, so each staging buffer and each
+    // guarded copy stays inside the 16-MiB limit.
+    for iovec in &pending {
         let outcome = if is_write {
             // SAFETY: import_rw_iovecs validated this source range; the
             // guarded copy still catches a protection change racing it.

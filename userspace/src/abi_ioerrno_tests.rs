@@ -1651,3 +1651,247 @@ fn smoke_abi_ioerrno_memfd_without_allow_sealing() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_memfd_without_allow_sealing);
+
+// ── precedence and argument width ──────────────────────────────────
+//
+// Getting an errno right is only half of it: the kernel also fixes WHERE in
+// the sequence each check runs, and how wide each argument is. These pin the
+// cases where a validation added above could otherwise pre-empt an earlier
+// check, or reject a value the kernel would have truncated into range.
+
+fn smoke_abi_ioerrno_preadv2_bad_fd_outranks_bad_flag() -> TestResult {
+    with_setup(|| {
+        let mut dst = [0u8; 4];
+        let iov = iovec(dst.as_mut_ptr() as u64, 4);
+        // `do_preadv` resolves the descriptor, and `vfs_readv` checks FMODE,
+        // imports the iovec and short-circuits an empty vector — all before
+        // the flag word reaches `kiocb_set_rw_flags`. So a closed fd is
+        // -EBADF even when the flags are also garbage.
+        expect(
+            preadv2_with_flags(4242, &iov, 0x1000),
+            EBADF,
+            "preadv2 must report -EBADF before it looks at the flag word",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_preadv2_bad_fd_outranks_bad_flag
+);
+
+fn smoke_abi_ioerrno_preadv2_empty_vector_ignores_flags() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `if (!tot_len) goto out;` returns 0 without ever validating flags.
+        let r = call_raw(
+            Syscall::Preadv2.raw(),
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: 0,
+                arg2: 0, // iovcnt == 0 → nothing to transfer
+                arg3: 0,
+                arg4: 0,
+                arg5: 0x1000, // an unsupported RWF_ bit, never reached
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            0,
+            "preadv2 over an empty vector must return 0 without checking flags",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_preadv2_empty_vector_ignores_flags
+);
+
+fn smoke_abi_ioerrno_eventfd2_count_is_32_bit() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE2(eventfd2, unsigned int, count, ...)` — the initial
+        // counter is 32 bits. Seeding from the full register would start this
+        // eventfd at (1 << 32) + 5 instead of 5, so the first read returns a
+        // value that never existed.
+        let fd = match call(Syscall::Eventfd.raw(), a1((1u64 << 32) | 5, 0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("eventfd2 failed"),
+        };
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Read.raw(),
+            a2(fd as u64, buf.as_mut_ptr() as u64, 8),
+        ) != Some(8)
+        {
+            return Err("eventfd read did not return 8 bytes");
+        }
+        match u64::from_ne_bytes(buf) {
+            5 => Ok(()),
+            _ => Err("eventfd2 must truncate its initial count to 32 bits"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_eventfd2_count_is_32_bit);
+
+fn smoke_abi_ioerrno_fcntl_dupfd_bad_fd_outranks_floor() -> TestResult {
+    with_setup(|| {
+        // `do_fcntl` is handed an already-resolved file, so the entry's
+        // fdget_raw reports -EBADF before F_DUPFD ever inspects its floor.
+        expect(
+            call(Syscall::Fcntl.raw(), a2(4242, 0 /* F_DUPFD */, 4096)),
+            EBADF,
+            "F_DUPFD on a closed fd must be -EBADF, not -EINVAL for the floor",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_fcntl_dupfd_bad_fd_outranks_floor
+);
+
+fn smoke_abi_ioerrno_fcntl_dupfd_floor_is_32_bit() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `int argi = (int)arg` — the floor is the low 32 bits, so this is a
+        // floor of 0 and duplicates normally. Comparing the untruncated
+        // register against RLIMIT_NOFILE rejected it with -EINVAL instead.
+        match call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, 0 /* F_DUPFD */, 1u64 << 32),
+        ) {
+            Some(new_fd) if new_fd >= 0 => Ok(()),
+            _ => Err("F_DUPFD must truncate its floor to 32 bits"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_dupfd_floor_is_32_bit);
+
+fn smoke_abi_ioerrno_memfd_bad_seal_bit_outranks_sealed() -> TestResult {
+    with_setup(|| {
+        // Created without MFD_ALLOW_SEALING, so it already carries
+        // F_SEAL_SEAL. `memfd_add_seals` still validates the REQUESTED set
+        // first, so an undefined bit is -EINVAL here, not the -EPERM the
+        // already-sealed state would otherwise produce.
+        let fd = make_memfd(0)?;
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_ADD_SEALS, 0x4000_0000),
+            ),
+            EINVAL,
+            "an undefined seal bit must be -EINVAL even on a sealed memfd",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_memfd_bad_seal_bit_outranks_sealed
+);
+
+// ── large transfers must be staged, not attempted in one copy ──────
+//
+// `validate_rw_user_range` deliberately skips NARF's generic 16-MiB
+// single-copy cap so a large request is not rejected outright. That only
+// works if the handler then honours the cap by chunking, the way sys_read and
+// sys_write do. A single allocation the size of the request both asks the
+// kernel heap for far too much and fails the copy on the 16-MiB limit — where
+// Linux caps at MAX_RW_COUNT and transfers.
+
+/// 16 MiB + 1: one byte past NARF's single-copy limit, so any handler that
+/// does the whole transfer in one buffer fails here.
+const OVER_COPY_LIMIT: usize = 16 * 1024 * 1024 + 1;
+
+fn smoke_abi_ioerrno_pread64_over_copy_limit_is_chunked() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let mut dst = alloc::vec![0u8; 64];
+        // A count past the copy limit against a 6-byte file: the transfer is
+        // short, but the handler must get there by staging rather than by
+        // allocating `count` bytes up front.
+        match call(
+            Syscall::Pread64.raw(),
+            a3(
+                fd as u64,
+                dst.as_mut_ptr() as u64,
+                OVER_COPY_LIMIT as u64,
+                0,
+            ),
+        ) {
+            Some(6) if &dst[..6] == b"abcdef" => Ok(()),
+            _ => Err("a pread past the 16-MiB copy limit must still transfer"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pread64_over_copy_limit_is_chunked
+);
+
+fn smoke_abi_ioerrno_pwrite64_over_copy_limit_is_chunked() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // The source really is one big buffer; the handler must copy it in
+        // bounded pieces. 17 MiB crosses the limit with room to spare.
+        let src = alloc::vec![b'q'; OVER_COPY_LIMIT];
+        match call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, src.as_ptr() as u64, src.len() as u64, 0),
+        ) {
+            Some(n) if n == OVER_COPY_LIMIT as i64 => {}
+            _ => return Err("a pwrite past the 16-MiB copy limit must still transfer"),
+        }
+        // Spot-check the far end so a short write that reported the full
+        // count cannot pass.
+        let mut tail = [0u8; 4];
+        match call(
+            Syscall::Pread64.raw(),
+            a3(
+                fd as u64,
+                tail.as_mut_ptr() as u64,
+                4,
+                (OVER_COPY_LIMIT - 4) as u64,
+            ),
+        ) {
+            Some(4) if &tail == b"qqqq" => Ok(()),
+            _ => Err("the tail of a chunked pwrite was not written"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pwrite64_over_copy_limit_is_chunked
+);
+
+fn smoke_abi_ioerrno_preadv_single_iovec_over_copy_limit() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // ONE iovec larger than the copy limit. import_rw_iovecs caps the
+        // whole vector at MAX_RW_COUNT, which is far above 16 MiB, so the
+        // per-iovec staging is what has to be bounded.
+        let mut dst = alloc::vec![0u8; OVER_COPY_LIMIT];
+        let iov = iovec(dst.as_mut_ptr() as u64, OVER_COPY_LIMIT as u64);
+        match call(
+            Syscall::Preadv.raw(),
+            a3(fd as u64, iov.as_ptr() as u64, 1, 0),
+        ) {
+            Some(6) if &dst[..6] == b"abcdef" => Ok(()),
+            _ => Err("a preadv iovec past the copy limit must still transfer"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_preadv_single_iovec_over_copy_limit
+);
+
+fn smoke_abi_ioerrno_epoll_fd_is_rdwr() -> TestResult {
+    with_setup(|| {
+        let ep = make_epoll()?;
+        // `do_epoll_create` opens the anon inode `O_RDWR | (flags & O_CLOEXEC)`.
+        // F_GETFL == 3.
+        match call(Syscall::Fcntl.raw(), a2(ep as u64, 3, 0)) {
+            Some(flags) if flags as u32 & crate::fd::O_ACCMODE == crate::fd::O_RDWR => Ok(()),
+            _ => Err("an epoll fd must report O_RDWR from F_GETFL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_fd_is_rdwr);
