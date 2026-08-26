@@ -430,6 +430,15 @@ Native `semctl(2)` and `msgctl(2)` implement architecture-correct IPC-64
 `IPC_STAT` layouts and full-structure-before-lookup `IPC_SET` import ordering;
 owner, creator, mode, supplementary-group, queue-limit, metadata timestamp,
 message count/byte count, and last-sender/receiver fields follow Linux.
+`msgctl(2)` also implements `IPC_INFO`, `MSG_INFO`, `MSG_STAT`, and
+`MSG_STAT_ANY`: information calls snapshot only the caller's IPC namespace and
+return its highest internal queue index, indexed-stat returns the full queue id,
+and `MSG_STAT_ANY` alone bypasses ordinary read-mode checks. Queue information
+uses Linux's native 32-byte `msginfo` layout and default MSGMNI/MSGMNB/MSGMAX
+limits. Creation admits at most 32,000 live queues per namespace and reports
+`ENOSPC` at that boundary. Last-sender and last-receiver identities are retained
+as outer process ids and translated into the querying task's PID namespace at
+copyout.
 Shared-memory, semaphore, and message identifiers and key lookups are scoped
 to the caller's current IPC namespace. Ordinary clone/fork inheritance shares
 the same namespace object and tables; `CLONE_NEWIPC` creates fresh empty tables

@@ -15,6 +15,8 @@
 
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
+#[cfg(feature = "kernel-test")]
+use core::sync::atomic::AtomicUsize;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::task::Waker;
 
@@ -34,6 +36,7 @@ const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
+const ENOSPC: i64 = 28;
 const ENOMSG: i64 = 42;
 const EIDRM: i64 = 43;
 const ERANGE: i64 = 34;
@@ -96,6 +99,7 @@ const SEM_BITMAP_WORDS: usize = MAX_SEMS_PER_SET.div_ceil(64);
 const IPC_RMID: u64 = 0;
 const IPC_SET: u64 = 1;
 const IPC_STAT: u64 = 2;
+const IPC_INFO: u64 = 3;
 
 // semctl cmds.
 const GETPID: u64 = 11;
@@ -105,6 +109,11 @@ const GETNCNT: u64 = 14;
 const GETZCNT: u64 = 15;
 const SETVAL: u64 = 16;
 const SETALL: u64 = 17;
+
+// msgctl cmds.
+const MSG_STAT: u64 = 11;
+const MSG_INFO: u64 = 12;
+const MSG_STAT_ANY: u64 = 13;
 
 #[cfg(target_arch = "x86_64")]
 const SEMID64_SIZE: usize = 104;
@@ -123,9 +132,14 @@ const SEM_CTIME_OFFSET: usize = 56;
 #[cfg(target_arch = "aarch64")]
 const SEM_NSEMS_OFFSET: usize = 64;
 const MSQID64_SIZE: usize = 120;
+const MSGINFO_SIZE: usize = 32;
 
 fn put_u32(out: &mut [u8], offset: usize, value: u32) {
     out[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+fn put_u16(out: &mut [u8], offset: usize, value: u16) {
+    out[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
 }
 
 fn put_i32(out: &mut [u8], offset: usize, value: i32) {
@@ -1945,8 +1959,10 @@ struct MsgQueue {
     ctime: i64,
     current_bytes: usize,
     max_bytes: usize,
-    last_send_pid: i32,
-    last_recv_pid: i32,
+    /// Outer PID retained for translation into each observer's PID namespace.
+    last_send_pid: u64,
+    /// Outer PID retained for translation into each observer's PID namespace.
+    last_recv_pid: u64,
 }
 
 struct QueuedMessage {
@@ -1965,9 +1981,29 @@ static MSG_STATE: IrqSafeSpinLock<Option<MsgState>> = IrqSafeSpinLock::new(None)
 static MSG_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 const MSG_MAX_BYTES: usize = 8192;
 const MSG_DEFAULT_QUEUE_BYTES: usize = 16384;
+const MSG_MAX_QUEUES: usize = 32_000;
+const MSG_POOL_KIB: i32 = (MSG_MAX_QUEUES * MSG_DEFAULT_QUEUE_BYTES / 1024) as i32;
+const MSG_MAP: i32 = MSG_DEFAULT_QUEUE_BYTES as i32;
+const MSG_TQL: i32 = MSG_DEFAULT_QUEUE_BYTES as i32;
+const MSG_SEGMENT_BYTES: i32 = 16;
+const MSG_SEGMENTS: u16 = u16::MAX;
 const MSG_NOERROR: i64 = 0o10000;
 const MSG_EXCEPT: i64 = 0o20000;
 const MSG_COPY: i64 = 0o40000;
+
+#[cfg(feature = "kernel-test")]
+static TEST_MSG_MAX_QUEUES: AtomicUsize = AtomicUsize::new(0);
+
+fn msg_max_queues() -> usize {
+    #[cfg(feature = "kernel-test")]
+    {
+        let override_limit = TEST_MSG_MAX_QUEUES.load(Ordering::Acquire);
+        if override_limit != 0 {
+            return override_limit;
+        }
+    }
+    MSG_MAX_QUEUES
+}
 
 fn with_msg_state<R>(f: impl FnOnce(&mut MsgState) -> R) -> R {
     let mut state = MSG_STATE.lock();
@@ -1976,6 +2012,22 @@ fn with_msg_state<R>(f: impl FnOnce(&mut MsgState) -> R) -> R {
 
 fn with_msgs<R>(f: impl FnOnce(&mut BTreeMap<IpcObjectKey, MsgQueue>) -> R) -> R {
     with_msg_state(|state| f(&mut state.queues))
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_set_msg_max_queues(limit: usize) {
+    TEST_MSG_MAX_QUEUES.store(limit, Ordering::Release);
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_msg_queue_count() -> usize {
+    let ipc_ns = current_ipc_namespace_id();
+    with_msgs(|queues| {
+        queues
+            .keys()
+            .filter(|(namespace, _)| *namespace == ipc_ns)
+            .count()
+    })
 }
 
 /// `msgget(key, msgflg)`.
@@ -2011,6 +2063,13 @@ pub fn sys_msgget(ctx: &mut dyn TrapContext) {
             if flg & IPC_CREAT == 0 {
                 return Err(ENOENT);
             }
+        }
+        if m.keys()
+            .filter(|(namespace, _)| *namespace == ipc_ns)
+            .count()
+            >= msg_max_queues()
+        {
+            return Err(ENOSPC);
         }
         let id = alloc_msg_id();
         m.insert(
@@ -2166,7 +2225,7 @@ pub fn sys_msgsnd(ctx: &mut dyn TrapContext) {
         });
         q.current_bytes += msgsz;
         q.stime = now_seconds();
-        q.last_send_pid = pid as i32;
+        q.last_send_pid = pid;
         notify_msg_waiters(state, WaitKind::MsgRecv, object);
         Ok(true)
     });
@@ -2325,7 +2384,7 @@ pub fn sys_msgrcv(ctx: &mut dyn TrapContext) {
                 let msg = q.msgs.remove(i).expect("selected SysV message");
                 q.current_bytes = q.current_bytes.saturating_sub(msg.payload.len());
                 q.rtime = now_seconds();
-                q.last_recv_pid = pid as i32;
+                q.last_recv_pid = pid;
                 Some((msg.mtype, msg.payload))
             }
             None => None,
@@ -2432,6 +2491,47 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
     let buf = a.arg2;
     let (_, caller_uid, caller_gid, caller_groups) = current_identity();
     match cmd {
+        IPC_INFO | MSG_INFO => {
+            let (queue_count, message_count, byte_count, max_index) = with_msgs(|queues| {
+                let mut queue_count = 0usize;
+                let mut message_count = 0usize;
+                let mut byte_count = 0usize;
+                let mut max_index = 0u64;
+                for ((namespace, id), queue) in queues.iter() {
+                    if *namespace != ipc_ns {
+                        continue;
+                    }
+                    queue_count = queue_count.saturating_add(1);
+                    message_count = message_count.saturating_add(queue.msgs.len());
+                    byte_count = byte_count.saturating_add(queue.current_bytes);
+                    max_index = core::cmp::max(max_index, *id);
+                }
+                (queue_count, message_count, byte_count, max_index)
+            });
+            let clamp_i32 = |value: usize| i32::try_from(value).unwrap_or(i32::MAX);
+            let mut out = [0u8; MSGINFO_SIZE];
+            if cmd == MSG_INFO {
+                put_i32(&mut out, 0, clamp_i32(queue_count));
+                put_i32(&mut out, 4, clamp_i32(message_count));
+                put_i32(&mut out, 24, clamp_i32(byte_count));
+            } else {
+                put_i32(&mut out, 0, MSG_POOL_KIB);
+                put_i32(&mut out, 4, MSG_MAP);
+                put_i32(&mut out, 24, MSG_TQL);
+            }
+            put_i32(&mut out, 8, MSG_MAX_BYTES as i32);
+            put_i32(&mut out, 12, MSG_DEFAULT_QUEUE_BYTES as i32);
+            put_i32(&mut out, 16, msg_max_queues().min(i32::MAX as usize) as i32);
+            put_i32(&mut out, 20, MSG_SEGMENT_BYTES);
+            put_u16(&mut out, 28, MSG_SEGMENTS);
+            // SAFETY: Linux computes the namespace snapshot before validating
+            // the output range; copy_to_user performs that final validation.
+            if unsafe { crate::handlers::copy_to_user(buf, &out) }.is_err() {
+                ctx.set_return(err(EFAULT));
+            } else {
+                ctx.set_return(SyscallReturn::ok(max_index));
+            }
+        }
         IPC_RMID => {
             let removed = with_msg_state(|state| {
                 let q = state.queues.get(&object).ok_or(EINVAL)?;
@@ -2458,23 +2558,26 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                 Err(e) => ctx.set_return(err(e)),
             }
         }
-        IPC_STAT => {
+        IPC_STAT | MSG_STAT | MSG_STAT_ANY => {
             let snapshot = with_msgs(|m| {
                 let q = m.get(&object).ok_or(EINVAL)?;
-                if !ipc_allowed(
-                    caller_uid,
-                    caller_gid,
-                    &caller_groups,
-                    q.uid,
-                    q.gid,
-                    q.cuid,
-                    q.cgid,
-                    q.mode,
-                    0o4,
-                ) {
+                if cmd != MSG_STAT_ANY
+                    && !ipc_allowed(
+                        caller_uid,
+                        caller_gid,
+                        &caller_groups,
+                        q.uid,
+                        q.gid,
+                        q.cuid,
+                        q.cgid,
+                        q.mode,
+                        0o4,
+                    )
+                {
                     return Err(EACCES);
                 }
                 Ok((
+                    msqid,
                     q.key,
                     q.uid,
                     q.gid,
@@ -2492,6 +2595,7 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
                 ))
             });
             let (
+                returned_id,
                 key,
                 uid,
                 gid,
@@ -2515,6 +2619,11 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             };
             let (uid, gid) = ipc_ids_to_user(uid, gid);
             let (cuid, cgid) = ipc_ids_to_user(cuid, cgid);
+            let observer = crate::handlers::current_task_id();
+            let last_send_pid =
+                i32::try_from(crate::handlers::report_pid_to(observer, last_send_pid)).unwrap_or(0);
+            let last_recv_pid =
+                i32::try_from(crate::handlers::report_pid_to(observer, last_recv_pid)).unwrap_or(0);
             let mut out = [0u8; MSQID64_SIZE];
             encode_perm(&mut out, key, uid, gid, cuid, cgid, mode);
             put_i64(&mut out, 48, stime);
@@ -2530,7 +2639,11 @@ pub fn sys_msgctl(ctx: &mut dyn TrapContext) {
             if unsafe { crate::handlers::copy_to_user(buf, &out) }.is_err() {
                 ctx.set_return(err(EFAULT));
             } else {
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(SyscallReturn::ok(if cmd == IPC_STAT {
+                    0
+                } else {
+                    returned_id
+                }));
             }
         }
         IPC_SET => {

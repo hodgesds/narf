@@ -31,6 +31,7 @@ const IPC_NOWAIT: u64 = 0o4000;
 const IPC_RMID: u64 = 0;
 const IPC_SET: u64 = 1;
 const IPC_STAT: u64 = 2;
+const IPC_INFO: u64 = 3;
 const IPC_64: u64 = 0x100;
 const SHM_RDONLY: u64 = 0o10000;
 const SHM_RND: u64 = 0o20000;
@@ -42,6 +43,9 @@ const GETPID: u64 = 11;
 const GETVAL: u64 = 12;
 const GETNCNT: u64 = 14;
 const GETZCNT: u64 = 15;
+const MSG_STAT: u64 = 11;
+const MSG_INFO: u64 = 12;
+const MSG_STAT_ANY: u64 = 13;
 const E2BIG: i64 = -7;
 const EFBIG: i64 = -27;
 const ENOMSG: i64 = -42;
@@ -49,6 +53,7 @@ const MSG_NOERROR: u64 = 0o10000;
 const MSG_COPY: u64 = 0o40000;
 const SEM_UNDO: i16 = 0o10000;
 const EIDRM: i64 = -43;
+const ENOSPC: i64 = -28;
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
 
 const O_CREAT: u64 = 0o100;
@@ -2076,6 +2081,121 @@ fn smoke_abi_ipc_msgctl_capacity_stat_and_rmid() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_msgctl_capacity_stat_and_rmid);
+
+fn smoke_abi_ipc_msgctl_info_and_indexed_stat() -> TestResult {
+    with_setup(|| {
+        let id = make_msgq()?;
+        let mut msg = [0u8; 9];
+        msg[..8].copy_from_slice(&1i64.to_ne_bytes());
+        msg[8] = b'i';
+        if call(Syscall::Msgsnd.raw(), a3(id, msg.as_ptr() as u64, 1, 0)) != Some(0) {
+            return Err("setup: msgctl info message send failed");
+        }
+
+        let read_i32 = |bytes: &[u8], offset: usize| {
+            i32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap())
+        };
+        let mut info = [0u8; 32];
+        let ipc_info = call_raw(
+            Syscall::Msgctl.raw(),
+            a2(id, IPC_INFO, info.as_mut_ptr() as u64),
+        );
+        if ipc_info.value < id
+            || read_i32(&info, 0) != 512_000
+            || read_i32(&info, 4) != 16_384
+            || read_i32(&info, 8) != 8_192
+            || read_i32(&info, 12) != 16_384
+            || read_i32(&info, 16) != 32_000
+            || read_i32(&info, 20) != 16
+            || read_i32(&info, 24) != 16_384
+            || u16::from_ne_bytes(info[28..30].try_into().unwrap()) != u16::MAX
+        {
+            return Err("msgctl IPC_INFO did not expose Linux message limits");
+        }
+
+        info.fill(0);
+        let msg_info = call_raw(
+            Syscall::Msgctl.raw(),
+            a2(id, MSG_INFO, info.as_mut_ptr() as u64),
+        );
+        if msg_info.value < id
+            || read_i32(&info, 0) < 1
+            || read_i32(&info, 4) < 1
+            || read_i32(&info, 24) < 1
+        {
+            return Err("msgctl MSG_INFO did not aggregate live queues/messages/bytes");
+        }
+
+        let mut stat = [0u8; 120];
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, MSG_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(id as i64)
+            || u64::from_ne_bytes(stat[72..80].try_into().unwrap()) != 1
+            || u64::from_ne_bytes(stat[80..88].try_into().unwrap()) != 1
+        {
+            return Err("msgctl MSG_STAT did not return the indexed queue and full id");
+        }
+        stat.fill(0);
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(id, MSG_STAT_ANY, stat.as_mut_ptr() as u64),
+        ) != Some(id as i64)
+        {
+            return Err("msgctl MSG_STAT_ANY did not return the full queue id");
+        }
+        if call(Syscall::Msgctl.raw(), a2(987_654, MSG_STAT, BAD_PTR)) != Some(EINVAL) {
+            return Err("msgctl MSG_STAT must resolve its index before copyout");
+        }
+        if call(Syscall::Msgctl.raw(), a2(id, MSG_STAT, BAD_PTR)) != Some(EFAULT) {
+            return Err("msgctl MSG_STAT bad output must return EFAULT after lookup");
+        }
+        if call(
+            Syscall::Msgctl.raw(),
+            a2(u64::from(u32::MAX), IPC_INFO, BAD_PTR),
+        ) != Some(EINVAL)
+        {
+            return Err("negative msgctl id must precede IPC_INFO copyout");
+        }
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("msgctl info test cleanup failed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msgctl_info_and_indexed_stat
+);
+
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_ipc_msgget_limit_is_enospc() -> TestResult {
+    struct ResetLimit;
+    impl Drop for ResetLimit {
+        fn drop(&mut self) {
+            crate::sysvipc::__test_set_msg_max_queues(0);
+        }
+    }
+
+    with_setup(|| {
+        let baseline = crate::sysvipc::__test_msg_queue_count();
+        crate::sysvipc::__test_set_msg_max_queues(baseline.saturating_add(1));
+        let _reset = ResetLimit;
+        let id = make_msgq()?;
+        if call(Syscall::Msgget.raw(), a1(0, IPC_CREAT)) != Some(ENOSPC) {
+            return Err("msgget at MSGMNI must return ENOSPC");
+        }
+        if call(Syscall::Msgctl.raw(), a2(id, IPC_RMID, 0)) != Some(0) {
+            return Err("msgget limit test cleanup failed");
+        }
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_msgget_limit_is_enospc
+);
 
 // ════════════════════════════════════════════════════════════════════
 // System V shared memory (linux-compat: sys_shmget_compat / shmat / …)
