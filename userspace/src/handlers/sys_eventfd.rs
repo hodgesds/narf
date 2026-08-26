@@ -24,8 +24,7 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
     }
     let efd = crate::io_mux::EventFd::new(initval, flags);
     let task = current_task_id();
-    let new_fd = fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = fd::install(task, crate::fd::FdEntry {
             ops: efd,
             offset: 0,
             flags: if flags & crate::fd::O_CLOEXEC != 0 {
@@ -39,8 +38,7 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
                 } else {
                     0
                 },
-        })
-    });
+        });
     match new_fd {
         // LINUX-GAP: a table that cannot allocate is -EMFILE, not -EINVAL.
         // NARF's fd table grows without bound today, so this arm is

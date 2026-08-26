@@ -34,14 +34,12 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     let state = crate::pidfd::mint_for(pid_raw, target_tid.unwrap_or(0), alive);
     let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: file,
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n,
         None => {
             ctx.set_return(fail);

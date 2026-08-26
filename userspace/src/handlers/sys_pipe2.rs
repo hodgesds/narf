@@ -39,25 +39,26 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
 
     let (rd, wr) = crate::pipe::pipe_pair();
     let task = current_task_id();
-    let fds = fd::with_table(task, |t| {
-        let r = t.open(crate::fd::FdEntry {
+    let fds = fd::install_pair(
+        task,
+        crate::fd::FdEntry {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
             status_flags: crate::fd::O_RDONLY | nb,
-        });
-        let w = t.open(crate::fd::FdEntry {
+        },
+        crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
             status_flags: crate::fd::O_WRONLY | nb,
-        });
-        (r, w)
-    });
+        },
+    );
     let (r, w) = match fds {
-        Some(p) => p,
+        Some(pair) => pair,
+        // Both ends are allocated or neither is; see `fd::install_pair`.
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };

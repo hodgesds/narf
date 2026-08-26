@@ -44,7 +44,7 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    match fd::with_table(task, |t| t.open(entry)) {
+    match fd::install(task, entry) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
     }

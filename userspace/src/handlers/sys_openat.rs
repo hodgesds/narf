@@ -60,14 +60,12 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
                 } else {
                     0
                 };
-                let reopened = fd::with_table(task, |t| {
-                    t.open(crate::fd::FdEntry {
+                let reopened = fd::install(task, crate::fd::FdEntry {
                         ops,
                         offset: 0,
                         flags: fd_flags,
                         status_flags,
-                    })
-                });
+                    });
                 ctx.set_return(SyscallReturn::ok(
                     reopened.map(|fd| fd as u64).unwrap_or((-24i64) as u64),
                 ));
@@ -112,14 +110,12 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
         let dup = fd::with_table(task, |t| t.get(n).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = dup {
             let sf = (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
-            let new_fd = fd::with_table(task, |t| {
-                t.open(crate::fd::FdEntry {
+            let new_fd = fd::install(task, crate::fd::FdEntry {
                     ops,
                     offset: 0,
                     flags: 0,
                     status_flags: sf,
-                })
-            });
+                });
             ctx.set_return(SyscallReturn::ok(
                 new_fd.map(|nf| nf as u64).unwrap_or((-24i64) as u64),
             ));

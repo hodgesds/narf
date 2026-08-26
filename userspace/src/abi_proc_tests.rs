@@ -751,14 +751,15 @@ fn smoke_abi_proc_pidfd_send_signal_missing_target() -> TestResult {
         let state = crate::pidfd::mint_for(MISSING_PID, 0, false);
         let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
             alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
-        let pidfd = crate::fd::with_table(FAKE_TASK, |t| {
-            t.open(crate::fd::FdEntry {
+        let pidfd = crate::fd::install(
+            FAKE_TASK,
+            crate::fd::FdEntry {
                 ops: file,
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
-        })
+            },
+        )
         .ok_or("fd table missing")?;
         match call(Syscall::PidfdSendSignal.raw(), a3(pidfd as u64, 0, 0, 0)) {
             Some(v) if v == ESRCH => Ok(()),
@@ -1668,14 +1669,15 @@ impl narf_filesystem::FileOps for ReentrantFdTableFile {
 fn smoke_abi_proc_fdinfo_read_no_deadlock() -> TestResult {
     with_setup(|| {
         let task = crate::handlers::current_task_id();
-        let fd = crate::fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let fd = crate::fd::install(
+            task,
+            crate::fd::FdEntry {
                 ops: alloc::sync::Arc::new(ReentrantFdTableFile),
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
-        });
+            },
+        );
         let fd = match fd {
             Some(f) => f,
             None => return Err("installing the probe fd failed"),

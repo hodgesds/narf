@@ -162,14 +162,15 @@ fn smoke_smap_sys_write_kbuf_roundtrip() -> TestResult {
 
     fd::__test_reset();
     install_task_id_lookup(task_w);
-    let fd_n = fd::with_table(FAKE_TASK_W, |t| {
-        t.open(FdEntry {
+    let fd_n = fd::install(
+        FAKE_TASK_W,
+        FdEntry {
             ops: Arc::new(SentinelFile),
             offset: 0,
             flags: 0,
             status_flags: fd::O_WRONLY,
-        })
-    })
+        },
+    )
     .expect("with_table");
 
     __test_clear_global();
@@ -353,14 +354,15 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
 
     fd::__test_reset();
     install_task_id_lookup(task_r);
-    let fd_n = fd::with_table(FAKE_TASK_R, |t| {
-        t.open(FdEntry {
+    let fd_n = fd::install(
+        FAKE_TASK_R,
+        FdEntry {
             ops: Arc::new(CcFile),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .expect("with_table");
 
     __test_clear_global();

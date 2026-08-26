@@ -13,25 +13,26 @@ pub(crate) fn sys_pipe(ctx: &mut dyn TrapContext) {
     // Access-mode status flags mirror `fs/pipe.c::create_pipe_files`:
     // the read end is O_RDONLY, the write end O_WRONLY (F_GETFL reports
     // them; the read/write direction checks live in the pipe FileOps).
-    let fds = fd::with_table(task, |t| {
-        let r = t.open(crate::fd::FdEntry {
+    let fds = fd::install_pair(
+        task,
+        crate::fd::FdEntry {
             ops: rd as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: 0,
             status_flags: crate::fd::O_RDONLY,
-        });
-        let w = t.open(crate::fd::FdEntry {
+        },
+        crate::fd::FdEntry {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: 0,
             status_flags: crate::fd::O_WRONLY,
-        });
-        (r, w)
-    });
+        },
+    );
     let (r, w) = match fds {
-        Some(p) => p,
+        Some(pair) => pair,
+        // Both ends are allocated or neither is; see `fd::install_pair`.
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }
     };

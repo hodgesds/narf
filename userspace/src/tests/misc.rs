@@ -3080,14 +3080,15 @@ fn smoke_proc_fd_hook_resolves_processid_to_taskid() -> TestResult {
 
     // Open an fd in the TASK's fd table (fresh tables seed stdio at 0,1,2, so
     // the first open lands at fd 3).
-    let fd = match crate::fd::with_table(tid, |t| {
-        t.open(crate::fd::FdEntry {
+    let fd = match crate::fd::install(
+        tid,
+        crate::fd::FdEntry {
             ops: narf_filesystem::memfs::new_anon_file(),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    }) {
+        },
+    ) {
         Some(f) => f,
         None => return TestResult::Fail("with_table open failed"),
     };

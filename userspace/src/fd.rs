@@ -148,6 +148,25 @@ pub struct FdTable {
     // semantic extent explicit instead of depending on Vec's allocator-
     // chosen capacity.
     max_fds: usize,
+    /// The owning task's RLIMIT_NOFILE soft limit — the `end` argument of
+    /// `fs/file.c::alloc_fd`, which reports -EMFILE once the lowest free
+    /// descriptor reaches it. Refreshed from the task's rlimits by
+    /// [`with_table`] on every access, so a `setrlimit` takes effect on the
+    /// next fd-creating call without the table having to be notified.
+    nofile_limit: u64,
+}
+
+/// Why a descriptor could not be allocated.
+///
+/// `fs/file.c` keeps these apart deliberately, and the two errnos are not
+/// interchangeable: a caller retries or sheds load on -EMFILE, and treats
+/// -EBADF as a bug in its own bookkeeping.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FdAllocError {
+    /// The source descriptor is not open. Linux: -EBADF.
+    BadFd,
+    /// No free descriptor below the task's RLIMIT_NOFILE. Linux: -EMFILE.
+    TooManyFiles,
 }
 
 impl FdTable {
@@ -159,7 +178,22 @@ impl FdTable {
             descriptions: Vec::new(),
             reserved: BTreeSet::new(),
             max_fds: Self::INITIAL_MAX_FDS,
+            // Until a task's rlimits are consulted, impose no limit: the
+            // boot path seeds stdio into tables that have no task behind
+            // them yet, and a limit of zero there would fail every one.
+            nofile_limit: u64::MAX,
         }
+    }
+
+    /// Publish the owning task's RLIMIT_NOFILE soft limit. Called by
+    /// [`with_table`] before handing the table to a caller.
+    pub fn set_nofile_limit(&mut self, limit: u64) {
+        self.nofile_limit = limit;
+    }
+
+    /// The limit descriptor allocation is measured against.
+    pub fn nofile_limit(&self) -> u64 {
+        self.nofile_limit
     }
 
     fn grow_max_fds_for(&mut self, fd: usize) {
@@ -196,29 +230,49 @@ impl FdTable {
     /// error`, asserting the reopened fd is exactly 0. Skipping 0..=2
     /// unconditionally made every `cmd &` in the distro fail with
     /// "can't open '/dev/null'".
-    pub fn open(&mut self, entry: FdEntry) -> u32 {
+    /// `None` is -EMFILE: no free descriptor below the task's RLIMIT_NOFILE.
+    pub fn open(&mut self, entry: FdEntry) -> Option<u32> {
         let description = Self::new_description(&entry);
-        let fd = self.next_free_from(0) as u32;
+        let fd = self.next_free_from(0)? as u32;
         self.set_with_description(fd, entry, description);
-        fd
+        Some(fd)
     }
 
     /// Insert `entry` at the lowest free slot ≥ `min`. Used by
     /// `fcntl(F_DUPFD)` / `F_DUPFD_CLOEXEC`, which POSIX defines as the
     /// lowest free fd at or above `min` — honour `min` verbatim (a free
     /// slot below 3, e.g. a closed stdio fd, is a valid target).
-    pub fn open_at_least(&mut self, entry: FdEntry, min: u32) -> u32 {
+    /// `None` is -EMFILE, as in [`Self::open`].
+    pub fn open_at_least(&mut self, entry: FdEntry, min: u32) -> Option<u32> {
         let description = Self::new_description(&entry);
-        let fd = self.next_free_from(min as usize) as u32;
+        let fd = self.next_free_from(min as usize)? as u32;
         self.set_with_description(fd, entry, description);
-        fd
+        Some(fd)
     }
 
-    fn next_free_from(&self, mut candidate: usize) -> usize {
+    /// Lowest free descriptor at or above `candidate`, or `None` once that
+    /// would reach the task's RLIMIT_NOFILE.
+    ///
+    /// This is `fs/file.c::alloc_fd`'s core:
+    ///
+    /// ```text
+    ///   fd = find_next_fd(fdt, fd);
+    ///   error = -EMFILE;
+    ///   if (unlikely(fd >= end)) goto out;
+    /// ```
+    ///
+    /// where `end` is `rlimit(RLIMIT_NOFILE)` for every ordinary fd-creating
+    /// call. Without the bound the search ran forever upward and NARF could
+    /// never report -EMFILE — so a descriptor leak grew without limit instead
+    /// of failing at the point the program could still notice.
+    fn next_free_from(&self, mut candidate: usize) -> Option<usize> {
         loop {
+            if candidate as u64 >= self.nofile_limit {
+                return None;
+            }
             let occupied = self.slots.get(candidate).is_some_and(Option::is_some);
             if !occupied && !self.reserved.contains(&(candidate as u32)) {
-                return candidate;
+                return Some(candidate);
             }
             candidate = candidate.saturating_add(1);
         }
@@ -245,10 +299,20 @@ impl FdTable {
     /// Reserve lowest-free fd numbers without publishing FileOps. Used by
     /// fanotify, whose metadata must contain the eventual fd number even though
     /// Linux does not install that fd until the user copy has succeeded.
-    pub(crate) fn reserve_fds(&mut self, count: usize) -> Vec<u32> {
+    /// `None` is -EMFILE: fanotify needs `count` descriptor numbers and the
+    /// task's RLIMIT_NOFILE does not have that many free. Reservations made
+    /// before the shortfall are rolled back, so a failed batch leaves the
+    /// table exactly as it was.
+    pub(crate) fn reserve_fds(&mut self, count: usize) -> Option<Vec<u32>> {
         let mut out = Vec::with_capacity(count);
         let mut candidate = 0u32;
         while out.len() < count {
+            if u64::from(candidate) >= self.nofile_limit {
+                for fd in &out {
+                    self.reserved.remove(fd);
+                }
+                return None;
+            }
             let occupied = self
                 .slots
                 .get(candidate as usize)
@@ -260,7 +324,7 @@ impl FdTable {
             }
             candidate = candidate.saturating_add(1);
         }
-        out
+        Some(out)
     }
 
     pub(crate) fn install_reserved_batch(&mut self, entries: Vec<(u32, FdEntry)>) -> bool {
@@ -296,10 +360,19 @@ impl FdTable {
 
     /// Duplicate `oldfd` into the lowest free slot, sharing its open-file
     /// description while resetting the new slot's descriptor flags.
-    pub fn duplicate(&mut self, oldfd: u32, min: u32, flags: u32) -> Option<u32> {
+    pub fn duplicate(&mut self, oldfd: u32, min: u32, flags: u32) -> Result<u32, FdAllocError> {
         let old = oldfd as usize;
-        let entry = self.slots.get(old)?.as_ref()?;
-        let description = self.descriptions.get(old)?.as_ref()?.clone();
+        let entry = self
+            .slots
+            .get(old)
+            .and_then(Option::as_ref)
+            .ok_or(FdAllocError::BadFd)?;
+        let description = self
+            .descriptions
+            .get(old)
+            .and_then(Option::as_ref)
+            .ok_or(FdAllocError::BadFd)?
+            .clone();
         let state = description.state.lock();
         let clone = FdEntry {
             ops: entry.ops.clone(),
@@ -310,14 +383,16 @@ impl FdTable {
         drop(state);
 
         let min = min as usize;
+        // Probe for a free slot BEFORE growing, so a request that cannot be
+        // satisfied does not extend the table on its way to -EMFILE.
+        let target = self.next_free_from(min).ok_or(FdAllocError::TooManyFiles)?;
         self.grow_max_fds_for(min);
         while self.slots.len() <= min {
             self.slots.push(None);
             self.descriptions.push(None);
         }
-        let target = self.next_free_from(min);
         self.set_with_description(target as u32, clone, description);
-        Some(target as u32)
+        Ok(target as u32)
     }
 
     /// Duplicate `oldfd` onto one exact slot, atomically replacing that slot.
@@ -357,13 +432,18 @@ impl FdTable {
 
     /// Install an SCM_RIGHTS file as a fresh fd slot while retaining the
     /// sender's open-file description identity.
+    /// `None` is -EMFILE. A descriptor arriving over SCM_RIGHTS is allocated
+    /// with `get_unused_fd_flags` like any other (`net/core/scm.c::
+    /// scm_detach_fds`), so a receiver at its RLIMIT_NOFILE must be told the
+    /// message could not be delivered rather than handed a slot past the
+    /// limit it set.
     pub(crate) fn open_transferred(
         &mut self,
         ops: Arc<dyn FileOps>,
         description: Option<Description>,
         status_flags: u32,
         flags: u32,
-    ) -> u32 {
+    ) -> Option<u32> {
         let entry = FdEntry {
             ops,
             offset: description
@@ -376,20 +456,16 @@ impl FdTable {
         let Some(description) = description else {
             return self.open(entry);
         };
-        let target = self
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or(self.slots.len());
-        if target == self.slots.len() {
-            self.grow_max_fds_for(target);
-            self.slots.push(Some(entry));
-            self.descriptions.push(Some(description));
-        } else {
-            self.slots[target] = Some(entry);
-            self.descriptions[target] = Some(description);
+        let target = self.next_free_from(0)?;
+        self.grow_max_fds_for(target);
+        while self.slots.len() <= target {
+            self.slots.push(None);
+            self.descriptions.push(None);
         }
-        target as u32
+        self.slots[target] = Some(entry);
+        self.descriptions[target] = Some(description);
+        self.reserved.remove(&(target as u32));
+        Some(target as u32)
     }
 
     /// Remove the entry at `fd`. Returns `true` if it existed.
@@ -611,6 +687,99 @@ pub fn with_table<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option
     };
     let mut table = arc.lock();
     Some(op(&mut table))
+}
+
+/// [`with_table`] for an operation that may ALLOCATE a descriptor.
+///
+/// The task's RLIMIT_NOFILE is read and published to the table first, so the
+/// allocation is bounded by the limit in force at this instant — a
+/// `setrlimit` therefore applies to the very next fd-creating call, with no
+/// table state to invalidate, and a table seeded before its task had rlimits
+/// (the boot path installs stdio that way) picks the real limit up on first
+/// use.
+///
+/// Kept separate from `with_table` deliberately. `with_table` is on the hot
+/// path — every read, write, epoll and poll resolves fd → FileOps through it —
+/// and refreshing the bound there would have put two global lock acquisitions
+/// into every one of those syscalls to serve the handful that can allocate.
+pub fn with_table_alloc<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> Option<R> {
+    // Read the limit BEFORE taking the table lock: the lookup reaches into
+    // the rlimit store, and nesting that under the table lock would fix a
+    // lock order this module has no reason to impose.
+    let limit = nofile_limit_for(task_id);
+    with_table(task_id, |t| {
+        t.set_nofile_limit(limit);
+        op(t)
+    })
+}
+
+/// Install `entry` in `task`'s table at the lowest free descriptor, honouring
+/// the task's RLIMIT_NOFILE.
+///
+/// `None` is -EMFILE. This is the shape every fd-creating syscall wants —
+/// `get_unused_fd_flags` + `fd_install` in one step — so handlers do not each
+/// have to reach through [`with_table`] and flatten two layers of `Option`.
+pub fn install(task_id: u64, entry: FdEntry) -> Option<u32> {
+    with_table_alloc(task_id, |t| t.open(entry)).flatten()
+}
+
+/// Install two descriptors that must both exist, or neither.
+///
+/// `fs/pipe.c::__do_pipe_flags` allocates the read end, then the write end,
+/// and if the second allocation fails it does `put_unused_fd(fdr)` before
+/// returning the error. That rollback is the whole contract: a `pipe(2)` that
+/// reports -EMFILE must not have consumed a descriptor on its way out, or a
+/// caller that frees a slot and retries loses one more slot every attempt and
+/// never recovers.
+///
+/// `None` is -EMFILE, with the table exactly as it was.
+pub fn install_pair(task_id: u64, first: FdEntry, second: FdEntry) -> Option<(u32, u32)> {
+    with_table_alloc(task_id, |t| {
+        let a = t.open(first)?;
+        match t.open(second) {
+            Some(b) => Some((a, b)),
+            None => {
+                t.close(a);
+                None
+            }
+        }
+    })
+    .flatten()
+}
+
+/// As [`install`], but at the lowest free descriptor at or above `min`.
+/// Backs `fcntl(F_DUPFD)`-shaped allocation.
+pub fn install_at_least(task_id: u64, entry: FdEntry, min: u32) -> Option<u32> {
+    with_table_alloc(task_id, |t| t.open_at_least(entry, min)).flatten()
+}
+
+/// Hook supplying a task's RLIMIT_NOFILE soft limit. The rlimit store lives
+/// in the syscall layer, above this module, so it is injected rather than
+/// reached for — the same shape as the task-id lookup.
+type NofileLimitFn = fn(u64) -> u64;
+static NOFILE_LIMIT_LOOKUP: IrqSafeSpinLock<Option<NofileLimitFn>> = IrqSafeSpinLock::new(None);
+
+/// Install the RLIMIT_NOFILE lookup. Until this is called every table is
+/// unbounded, which is what the early-boot seeding path needs.
+pub fn install_nofile_limit_lookup(f: NofileLimitFn) {
+    *NOFILE_LIMIT_LOOKUP.lock() = Some(f);
+}
+
+/// Drop the lookup again. Test-only: the kernel-test harness rebuilds global
+/// state between cases and must not inherit another case's limit.
+pub fn __test_clear_nofile_limit_lookup() {
+    *NOFILE_LIMIT_LOOKUP.lock() = None;
+}
+
+fn nofile_limit_for(task_id: u64) -> u64 {
+    // Copy the pointer out and drop the guard before calling: the callback
+    // takes the rlimit store's lock, and holding this one across it would
+    // create a lock order for no reason.
+    let lookup = *NOFILE_LIMIT_LOOKUP.lock();
+    match lookup {
+        Some(f) => f(task_id),
+        None => u64::MAX,
+    }
 }
 
 /// `with_table` for callers running in the timer trap, which can interrupt

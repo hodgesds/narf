@@ -1242,14 +1242,12 @@ mod tests {
             bytes: IrqSafeSpinLock::new(vec![0; 4096]),
             writes: AtomicUsize::new(0),
         });
-        let fd = crate::fd::with_table(TASK, |table| {
-            table.open(crate::fd::FdEntry {
+        let fd = crate::fd::install(TASK, crate::fd::FdEntry {
                 ops: Arc::clone(&file) as Arc<dyn FileOps>,
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
             })
-        })
         .unwrap_or(u32::MAX);
         if fd == u32::MAX {
             return TestResult::Fail("could not install test file fd");
@@ -1408,14 +1406,12 @@ mod tests {
     }
 
     fn install_fd(ops: Arc<dyn FileOps>) -> Option<u32> {
-        crate::fd::with_table(ARENA_TASK, |table| {
-            table.open(crate::fd::FdEntry {
+        crate::fd::install(ARENA_TASK, crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
             })
-        })
     }
 
     fn mmap_shared(fd: u32, len: u64) -> Option<u64> {

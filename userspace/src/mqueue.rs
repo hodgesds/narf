@@ -35,6 +35,7 @@ use crate::syscall::{SyscallReturn, TrapContext};
 // ── errno values returned as negated longs ──────────────────────────
 const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
+const EMFILE: i64 = 24;
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
@@ -264,9 +265,11 @@ pub fn sys_mq_open(ctx: &mut dyn TrapContext) {
     // Linux do_mq_open installs every mqd with O_CLOEXEC, independent of the
     // caller's flags (`FD_ADD(O_CLOEXEC, ...)`).
     let status_flags = oflag & (fd::O_ACCMODE | fd::O_NONBLOCK);
-    match task_open_call(task_open(file, fd::FD_CLOEXEC, status_flags)) {
+    match task_open_call(task_open(file, fd::FD_CLOEXEC, status_flags)).flatten() {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-        None => ctx.set_return(err(EBADF)),
+        // `do_mq_open` allocates the descriptor with `get_unused_fd_flags`,
+        // so an exhausted table is -EMFILE.
+        None => ctx.set_return(err(EMFILE)),
     }
 }
 
@@ -276,7 +279,7 @@ fn task_open(
     file: Arc<dyn FileOps>,
     flags: u32,
     status_flags: u32,
-) -> impl FnOnce(&mut fd::FdTable) -> u32 {
+) -> impl FnOnce(&mut fd::FdTable) -> Option<u32> {
     move |t| {
         t.open(fd::FdEntry {
             ops: file,
@@ -1092,7 +1095,7 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
     } else {
         0
     };
-    match task_open_call(task_open(file, cloexec, status)) {
+    match task_open_call(task_open(file, cloexec, status)).flatten() {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => ctx.set_return(err(EBADF)),
     }
@@ -1431,7 +1434,7 @@ pub fn sys_fanotify_init(ctx: &mut dyn TrapContext) {
     } else {
         0
     };
-    match task_open_call(task_open(file, cloexec, status)) {
+    match task_open_call(task_open(file, cloexec, status)).flatten() {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => ctx.set_return(err(EBADF)),
     }

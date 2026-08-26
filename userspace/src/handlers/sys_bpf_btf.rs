@@ -416,8 +416,7 @@ pub(crate) fn btf_load(attr_uptr: u64, size: usize) -> i64 {
 
     let ops: Arc<dyn narf_filesystem::FileOps> = Arc::new(BtfFile::load(btf));
     let task = current_task_id();
-    match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(task, crate::fd::FdEntry {
             ops,
             offset: 0,
             // Linux sets close-on-exec on every bpf fd
@@ -425,8 +424,7 @@ pub(crate) fn btf_load(attr_uptr: u64, size: usize) -> i64 {
             // leaked one is a leaked capability.
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }

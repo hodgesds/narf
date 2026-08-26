@@ -478,8 +478,9 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     install_task_id_lookup(task_lookup);
 
     // Open one fd in task 7's table.
-    let fd_n = fd::with_table(7, |t| {
-        t.open(FdEntry {
+    let fd_n = fd::install(
+        7,
+        FdEntry {
             ops: Arc::new(CountingFile),
             offset: 0,
             flags: 0,
@@ -487,8 +488,8 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
             // file description, so model an O_RDWR open rather than relying
             // on the old type-based access-mode exception.
             status_flags: crate::fd::O_RDWR,
-        })
-    })
+        },
+    )
     .expect("with_table");
     if fd_n != 3 {
         return TestResult::Fail("expected first user fd to be 3");
@@ -651,14 +652,15 @@ fn smoke_userspace_fcntl_flags_round_trip() -> TestResult {
     fd::__test_reset();
     install_task_id_lookup(task_lookup);
     let task = FAKE_TASK.load(Ordering::Relaxed);
-    let target = fd::with_table(task, |t| {
-        t.open(FdEntry {
+    let target = fd::install(
+        task,
+        FdEntry {
             ops: Arc::new(Sink),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .expect("with_table");
 
     __test_clear_global();
@@ -784,14 +786,15 @@ fn smoke_userspace_fcntl_status_flags() -> TestResult {
     fd::__test_reset();
     install_task_id_lookup(t);
     let task = TASK.load(Ordering::Relaxed);
-    let fd_n = fd::with_table(task, |x| {
-        x.open(FdEntry {
+    let fd_n = fd::install(
+        task,
+        FdEntry {
             ops: Arc::new(S),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .expect("table");
 
     __test_clear_global();
@@ -1070,27 +1073,29 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
     let task_b: u64 = 0xBB;
 
     // Open in task A: first user fd is 3 (slots 0..=2 reserved).
-    let fd_a = fd::with_table(task_a, |t| {
-        t.open(FdEntry {
+    let fd_a = fd::install(
+        task_a,
+        FdEntry {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    });
+        },
+    );
     if fd_a != Some(3) {
         return TestResult::Fail("first user fd should be 3");
     }
 
     // Independent task B starts with a fresh table.
-    let fd_b = fd::with_table(task_b, |t| {
-        t.open(FdEntry {
+    let fd_b = fd::install(
+        task_b,
+        FdEntry {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    });
+        },
+    );
     if fd_b != Some(3) {
         return TestResult::Fail("task B should also get fd 3");
     }
@@ -1130,14 +1135,15 @@ fn smoke_userspace_fd_table_roundtrip() -> TestResult {
     if closed != Some(true) {
         return TestResult::Fail("close should report true on live fd");
     }
-    let reused = fd::with_table(task_a, |t| {
-        t.open(FdEntry {
+    let reused = fd::install(
+        task_a,
+        FdEntry {
             ops: Arc::new(FixedFile),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    });
+        },
+    );
     if reused != Some(3) {
         return TestResult::Fail("close + open should reuse slot 3");
     }
@@ -1684,14 +1690,15 @@ fn smoke_userspace_open_fds_enumerates_with_gaps() -> TestResult {
     // Open three anon files → fds 3,4,5.
     let mut opened = [0u32; 3];
     for slot in opened.iter_mut() {
-        let n = crate::fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let n = crate::fd::install(
+            task,
+            crate::fd::FdEntry {
                 ops: narf_filesystem::memfs::new_anon_file(),
                 offset: 0,
                 flags: 0,
                 status_flags: 0,
-            })
-        });
+            },
+        );
         match n {
             Some(fd) => *slot = fd,
             None => return TestResult::Fail("with_table open failed"),
@@ -3469,14 +3476,15 @@ fn smoke_userspace_pty_slave_as_stdout_reaches_master() -> TestResult {
     };
 
     let install = |ops: Arc<dyn narf_filesystem::FileOps>, status_flags| {
-        fd::with_table(task, |tab| {
-            tab.open(FdEntry {
+        fd::install(
+            task,
+            FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags,
-            })
-        })
+            },
+        )
     };
     let slave: Arc<dyn narf_filesystem::FileOps> = slave;
     // posix_openpt/open(/dev/pts/N) are O_RDWR in the terminal-emulator path;
@@ -3762,14 +3770,15 @@ fn smoke_userspace_pty_job_control_ioctl_errno_matrix() -> TestResult {
     let slave: Arc<dyn FileOps> = slave_obj;
 
     let install = |task, ops: Arc<dyn FileOps>, status_flags| {
-        fd::with_table(task, |table| {
-            table.open(FdEntry {
+        fd::install(
+            task,
+            FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags,
-            })
-        })
+            },
+        )
     };
     let Some(owner_ro) = install(OWNER, slave.clone(), crate::fd::O_RDWR) else {
         return TestResult::Fail("could not install owner PTY fd");
@@ -3926,15 +3935,16 @@ fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
     let task = crate::handlers::current_task_id();
     let efd = crate::io_mux::EventFd::new(0, 0);
     let ops: Arc<dyn narf_filesystem::FileOps> = efd.clone();
-    let Some(fd_n) = fd::with_table(task, |tab| {
-        tab.open(FdEntry {
+    let Some(fd_n) = fd::install(
+        task,
+        FdEntry {
             ops,
             offset: 0,
             flags: 0,
             // Linux eventfd_file_create installs O_RDWR | user flags.
             status_flags: crate::fd::O_RDWR | crate::fd::O_NONBLOCK,
-        })
-    }) else {
+        },
+    ) else {
         __test_clear_global();
         return TestResult::Fail("could not install the eventfd in the fd table");
     };

@@ -59,21 +59,28 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // Linux and duplicates; comparing the untruncated value rejected
             // it with EINVAL instead.
             let min_fd = arg as u32;
-            let nofile = read_rlimit(task, 7)
+            let nofile = read_rlimit(task, RLIMIT_NOFILE_RESOURCE)
                 .map(|limit| limit.cur)
-                .unwrap_or_else(|| default_rlimits()[7].cur);
+                .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur);
             if u64::from(min_fd) >= nofile {
                 ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                 return;
             }
             let cloexec = cmd == F_DUPFD_CLOEXEC;
-            let outcome = fd::with_table(task, |t| {
+            let outcome = fd::with_table_alloc(task, |t| {
                 t.duplicate(fd, min_fd, if cloexec { crate::fd::FD_CLOEXEC } else { 0 })
             });
             match outcome {
-                Some(Some(new_fd)) => {
+                Some(Ok(new_fd)) => {
                     crate::mqueue::duplicate_fd_path(task, fd, new_fd);
                     ctx.set_return(SyscallReturn::ok(new_fd as u64));
+                }
+                // `f_dupfd` finishes with `alloc_fd(from, nofile, flags)`,
+                // whose -EMFILE is distinct from the -EINVAL the floor check
+                // above reports: the floor was legal, the table is simply
+                // full between it and the limit.
+                Some(Err(crate::fd::FdAllocError::TooManyFiles)) => {
+                    ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                 }
                 // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
                 _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),

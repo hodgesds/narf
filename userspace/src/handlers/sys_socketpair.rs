@@ -64,14 +64,12 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let status_flags = crate::fd::O_RDWR | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
     let task = current_task_id();
     let mk = |ops: alloc::sync::Arc<crate::socket::SocketFile>| {
-        fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: fd_flags,
                 status_flags,
             })
-        })
     };
     let fd_a = match mk(a) {
         Some(n) => n,

@@ -566,14 +566,15 @@ fn smoke_abi_ioerrno_flock_conflict_is_eagain() -> TestResult {
             .flatten()
             .ok_or("could not clone the locked file's ops")?;
         set_task(OTHER_TASK);
-        let other_fd = crate::fd::with_table(OTHER_TASK, |t| {
-            t.open(crate::fd::FdEntry {
+        let other_fd = crate::fd::install(
+            OTHER_TASK,
+            crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 status_flags: crate::fd::O_RDWR,
-            })
-        })
+            },
+        )
         .ok_or("could not install the second task's descriptor")?;
         // This is the single-instance idiom: `flock(lockfd, LOCK_EX|LOCK_NB)`
         // and treat EWOULDBLOCK as "another copy already holds it". The old
@@ -1895,3 +1896,219 @@ fn smoke_abi_ioerrno_epoll_fd_is_rdwr() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_fd_is_rdwr);
+
+// ── RLIMIT_NOFILE / EMFILE ─────────────────────────────────────────
+//
+// `fs/file.c::alloc_fd` bounds the descriptor NUMBER, not the count of open
+// descriptors:
+//
+//   fd = find_next_fd(fdt, fd);
+//   error = -EMFILE;
+//   if (unlikely(fd >= end)) goto out;
+//
+// with `end` = `rlimit(RLIMIT_NOFILE)` for every ordinary fd-creating call.
+// NARF's table used to search upward without a bound, so -EMFILE was
+// unreachable from every one of them and a descriptor leak grew silently
+// instead of failing where the program could still notice.
+
+const RLIMIT_NOFILE: u64 = 7;
+
+/// Lower this task's RLIMIT_NOFILE soft limit to `cur`.
+fn set_nofile(cur: u64) -> Result<(), &'static str> {
+    // struct rlimit { rlim_t rlim_cur; rlim_t rlim_max; }
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&cur.to_ne_bytes());
+    buf[8..].copy_from_slice(&4096u64.to_ne_bytes());
+    match call(
+        Syscall::Setrlimit.raw(),
+        a1(RLIMIT_NOFILE, buf.as_ptr() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("setrlimit(RLIMIT_NOFILE) failed"),
+    }
+}
+
+fn smoke_abi_ioerrno_open_reports_emfile_at_the_limit() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        // stdio occupies 0..=2, so a limit of 4 leaves exactly one slot.
+        set_nofile(4)?;
+        let first = open_rw(b"/abi/f\0")?;
+        if first != 3 {
+            return Err("the first open should land at fd 3");
+        }
+        // The next lowest free number is 4, which is the limit itself.
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(v) if v == EMFILE => Ok(()),
+            _ => Err("open past RLIMIT_NOFILE must be -EMFILE"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_open_reports_emfile_at_the_limit
+);
+
+fn smoke_abi_ioerrno_dup_reports_emfile() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(4)?;
+        let fd = open_rw(b"/abi/f\0")?;
+        // dup(2) asks for any free slot, so exhaustion is -EMFILE — the
+        // signal a server sheds load on. -EBADF would say its own descriptor
+        // bookkeeping was broken, which is a different kind of bug entirely.
+        expect(
+            call(Syscall::Dup.raw(), a0(fd as u64)),
+            EMFILE,
+            "dup past RLIMIT_NOFILE must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_dup_reports_emfile);
+
+fn smoke_abi_ioerrno_dup_bad_fd_still_ebadf_at_the_limit() -> TestResult {
+    with_setup(|| {
+        set_nofile(3)?; // stdio fills the table exactly
+                        // `fget_raw(fildes)` fails before `get_unused_fd_flags` is reached,
+                        // so a closed source is -EBADF even with no slot to put it in.
+        expect(
+            call(Syscall::Dup.raw(), a0(4242)),
+            EBADF,
+            "dup of a closed fd must be -EBADF, not -EMFILE",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_dup_bad_fd_still_ebadf_at_the_limit
+);
+
+fn smoke_abi_ioerrno_dup2_out_of_range_is_ebadf() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(8)?;
+        let fd = open_rw(b"/abi/f\0")?;
+        // `ksys_dup3`: `if (newfd >= rlimit(RLIMIT_NOFILE)) return -EBADF;`.
+        // dup2 names an exact descriptor, so out-of-range is a bad argument
+        // rather than exhaustion — the one place the two errnos diverge.
+        expect(
+            call(Syscall::Dup2.raw(), a1(fd as u64, 8)),
+            EBADF,
+            "dup2 to a descriptor at RLIMIT_NOFILE must be -EBADF, not -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_dup2_out_of_range_is_ebadf);
+
+fn smoke_abi_ioerrno_dup3_out_of_range_is_ebadf() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(8)?;
+        let fd = open_rw(b"/abi/f\0")?;
+        expect(
+            call(
+                Syscall::Dup3.raw(),
+                a2(fd as u64, 9, crate::fd::O_CLOEXEC as u64),
+            ),
+            EBADF,
+            "dup3 to a descriptor past RLIMIT_NOFILE must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_dup3_out_of_range_is_ebadf);
+
+fn smoke_abi_ioerrno_fcntl_dupfd_reports_emfile() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(5)?;
+        let fd = open_rw(b"/abi/f\0")?; // fd 3
+                                        // A floor of 4 is legal (below the limit), but the only slot at or
+                                        // above it is 4 — and once that is taken the allocation itself
+                                        // fails. `f_dupfd` reports the floor error as -EINVAL and this one
+                                        // as -EMFILE; they are separate answers to separate questions.
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, 0 /* F_DUPFD */, 4)) != Some(4) {
+            return Err("the first F_DUPFD at floor 4 should land at fd 4");
+        }
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd as u64, 0 /* F_DUPFD */, 4)),
+            EMFILE,
+            "F_DUPFD with no free slot below the limit must be -EMFILE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_dupfd_reports_emfile);
+
+fn smoke_abi_ioerrno_pipe_is_all_or_nothing_at_the_limit() -> TestResult {
+    with_setup(|| {
+        // stdio holds 0..=2; a limit of 4 leaves exactly ONE free slot, so
+        // the read end fits and the write end does not.
+        set_nofile(4)?;
+        let mut buf = [0u8; 8];
+        let r = call_raw(Syscall::Pipe.raw(), a0(buf.as_mut_ptr() as u64));
+        if r.status != SyscallReturn::OK || r.value as i64 != EMFILE {
+            return Err("pipe with one free slot must be -EMFILE");
+        }
+        // `__do_pipe_flags` does `put_unused_fd(fdr)` on the second failure.
+        // If the read end were left installed, this open would find no slot
+        // and the caller could never recover by freeing one descriptor.
+        match call_open(c"/dev/null".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(3) => Ok(()),
+            _ => Err("a failed pipe must not consume a descriptor"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pipe_is_all_or_nothing_at_the_limit
+);
+
+fn smoke_abi_ioerrno_emfile_is_positional_not_a_count() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(6)?;
+        // Open three (fds 3, 4, 5) then close the middle one. Two are open,
+        // well under a limit of 6 — but the lowest free NUMBER is 4, so the
+        // next open must succeed there. A count-based check would have let
+        // this through too; the distinction shows up in the reverse case,
+        // which the `open_reports_emfile_at_the_limit` case above pins.
+        let a = open_rw(b"/abi/f\0")?;
+        let b = open_rw(b"/abi/f\0")?;
+        let c = open_rw(b"/abi/f\0")?;
+        if (a, b, c) != (3, 4, 5) {
+            return Err("opens did not land at the lowest free descriptors");
+        }
+        if call(Syscall::Close.raw(), a0(b as u64)) != Some(0) {
+            return Err("close failed");
+        }
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(4) => {}
+            _ => return Err("open did not reuse the freed descriptor"),
+        }
+        // Now every number below the limit is taken.
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(v) if v == EMFILE => Ok(()),
+            _ => Err("open must be -EMFILE once every number below the limit is used"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_emfile_is_positional_not_a_count
+);
+
+fn smoke_abi_ioerrno_raising_the_limit_takes_effect() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        set_nofile(4)?;
+        let _fd = open_rw(b"/abi/f\0")?;
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(v) if v == EMFILE => {}
+            _ => return Err("expected -EMFILE at the lowered limit"),
+        }
+        // The bound is read from the task's rlimits on every fd-creating
+        // call, so a raise applies to the very next one — no table state to
+        // invalidate, which is what makes `setrlimit` usable as a recovery.
+        set_nofile(16)?;
+        match call_open(c"/abi/f".as_ptr() as u64, crate::fd::O_RDWR as u64) {
+            Some(v) if v >= 0 => Ok(()),
+            _ => Err("raising RLIMIT_NOFILE must let the next open succeed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_raising_the_limit_takes_effect
+);

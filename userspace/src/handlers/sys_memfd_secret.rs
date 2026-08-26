@@ -16,15 +16,13 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
         // FD_CLOEXEC shares MFD_CLOEXEC's bit value (1).
         let cloexec = (flags & crate::linux_compat::MFD_CLOEXEC) != 0;
         let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let fd = fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let fd = fd::install(task, crate::fd::FdEntry {
                 ops: mfd,
                 offset: 0,
                 flags: install_flags,
                 // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
                 status_flags: crate::fd::O_RDWR,
-            })
-        });
+            });
         match fd {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(fail),
@@ -34,15 +32,13 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
     {
         let _ = flags;
         let ops = narf_filesystem::new_anon_memfile();
-        match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        match fd::install(task, crate::fd::FdEntry {
                 ops,
                 offset: 0,
                 flags: 0,
                 // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
                 status_flags: crate::fd::O_RDWR,
-            })
-        }) {
+            }) {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(fail),
         }

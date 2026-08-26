@@ -742,16 +742,14 @@ pub(crate) fn bpf_btf_get_next_id(attr_uptr: u64, size: usize) -> i64 {
 /// that created the object. Closing the original leaves this one working, which
 /// is the entire reason `GET_FD_BY_ID` exists.
 fn install_fd(ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> i64 {
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops,
             offset: 0,
             // As `bpf_prog_new_fd` / `bpf_map_new_fd`: `O_CLOEXEC`, because a
             // leaked bpf fd is a leaked capability.
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }

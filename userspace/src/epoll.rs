@@ -733,8 +733,9 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
     let ops = EpollInstance::new() as Arc<dyn FileOps>;
 
     let task = current_task_id();
-    let new_fd = fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = fd::install(
+        task,
+        crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: install_flags,
@@ -744,8 +745,8 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
             // does this on any fd handed to fdopen — saw O_RDONLY here and
             // concluded the descriptor was not writable.
             status_flags: crate::fd::O_RDWR,
-        })
-    });
+        },
+    );
 
     match new_fd {
         Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),

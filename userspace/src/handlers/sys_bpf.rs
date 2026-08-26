@@ -632,8 +632,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(ProgFile::new(prog));
     let task = current_task_id();
-    match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(task, crate::fd::FdEntry {
             ops,
             offset: 0,
             // Linux always sets close-on-exec on a bpf fd
@@ -641,8 +640,7 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
             // because a leaked program fd is a leaked capability.
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }
@@ -904,16 +902,14 @@ pub(crate) fn install_map_fd(map: alloc::sync::Arc<BpfMap>, access: MapAccess) -
     };
     let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(MapFile::with_access(map, access));
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops,
             offset: 0,
             // Linux's `bpf_map_new_fd` always adds `O_CLOEXEC`: a leaked map
             // fd is a leaked authority, regardless of its access mode.
             flags: crate::fd::FD_CLOEXEC,
             status_flags,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }
@@ -1076,14 +1072,12 @@ fn enable_stats(attr_uptr: u64, size: usize) -> i64 {
         Err(narf_bpf::stats::StatsError::Busy) => return -EBUSY,
     };
     let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> = alloc::sync::Arc::new(file);
-    match fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match fd::install(current_task_id(), crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        }) {
         Some(n) => n as i64,
         None => -EMFILE,
     }

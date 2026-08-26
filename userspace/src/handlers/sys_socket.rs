@@ -64,8 +64,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         return;
     }
     socket_arc_register(&sock);
-    let new_fd = match fd::with_table(task, |t| {
-        t.open(crate::fd::FdEntry {
+    let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: sock.clone(),
             offset: 0,
             flags: if sock_cloexec {
@@ -79,8 +78,7 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
                 } else {
                     0
                 },
-        })
-    }) {
+        }) {
         Some(n) => n,
         None => {
             // Linux socket() → sock_map_fd → get_unused_fd_flags: a full

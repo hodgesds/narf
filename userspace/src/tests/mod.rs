@@ -289,14 +289,15 @@ impl narf_filesystem::FileOps for ReadyFile {
 /// Install `ReadyFile` at a fresh fd under `task_id`.
 /// Returns the fd number.
 fn install_ready_file(task_id: u64, mask: u32) -> u32 {
-    crate::fd::with_table(task_id, |t| {
-        t.open(crate::fd::FdEntry {
+    crate::fd::install(
+        task_id,
+        crate::fd::FdEntry {
             ops: Arc::new(ReadyFile(AtomicU32::new(mask))),
             offset: 0,
             flags: 0,
             status_flags: 0,
-        })
-    })
+        },
+    )
     .unwrap()
 }
 

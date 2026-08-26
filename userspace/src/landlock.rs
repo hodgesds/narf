@@ -182,14 +182,15 @@ pub fn sys_landlock_create_ruleset(ctx: &mut dyn TrapContext) {
     });
     let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
         alloc::sync::Arc::new(RulesetFile { id });
-    match crate::fd::with_table(current_task_id(), |t| {
-        t.open(crate::fd::FdEntry {
+    match crate::fd::install(
+        current_task_id(),
+        crate::fd::FdEntry {
             ops: file,
             offset: 0,
             flags: crate::fd::FD_CLOEXEC,
             status_flags: 0,
-        })
-    }) {
+        },
+    ) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => ctx.set_return(err(EBADF)),
     }

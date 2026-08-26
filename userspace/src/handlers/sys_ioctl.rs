@@ -371,16 +371,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             }
         };
         let ops_dyn: Arc<dyn narf_filesystem::FileOps> = slave;
-        let new_fd = fd::with_table(task, |t| {
-            t.open(fd::FdEntry {
+        let new_fd = fd::install(task, fd::FdEntry {
                 ops: ops_dyn,
                 offset: 0,
                 // `arg` carries open(2) flags from glibc (O_RDWR | O_NOCTTY |
                 // O_CLOEXEC). We mirror the CLOEXEC bit; the rest are no-ops.
                 flags: if (arg as u32) & 0o2000000 != 0 { 1 } else { 0 },
                 status_flags: arg as u32,
-            })
-        });
+            });
         match new_fd {
             Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
             None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
@@ -408,14 +406,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             };
             // DRM passes DRM_CLOEXEC (0x1) / DRM_RDWR (0x2) in `flags`.
             let prime_flags = read_user_u32(arg as u64 + 4);
-            let new_fd = fd::with_table(task, |t| {
-                t.open(fd::FdEntry {
+            let new_fd = fd::install(task, fd::FdEntry {
                     ops: dmabuf,
                     offset: 0,
                     flags: if prime_flags & 0x1 != 0 { 1 } else { 0 }, // CLOEXEC
                     status_flags: 0,
-                })
-            });
+                });
             match new_fd {
                 Some(f) => {
                     write_user_u32(arg as u64 + 8, f); // drm_prime_handle.fd
@@ -483,14 +479,12 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             if let Some(nsfd) = flavour.and_then(|f| namespace_fd_for_task(target_task, f)) {
                 let ops_dyn: Arc<dyn narf_filesystem::FileOps> = nsfd;
                 // Linux mints these O_CLOEXEC (pidfs open_namespace).
-                let new_fd = fd::with_table(task, |t| {
-                    t.open(fd::FdEntry {
+                let new_fd = fd::install(task, fd::FdEntry {
                         ops: ops_dyn,
                         offset: 0,
                         flags: crate::fd::FD_CLOEXEC,
                         status_flags: 0,
-                    })
-                });
+                    });
                 match new_fd {
                     Some(f) => ctx.set_return(SyscallReturn::ok(f as u64)),
                     None => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),

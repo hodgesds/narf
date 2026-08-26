@@ -48,14 +48,12 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
         let nonblock = (flags & crate::linux_compat::SFD_NONBLOCK) != 0;
         let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
         let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-        let new_fd = match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let new_fd = match fd::install(task, crate::fd::FdEntry {
                 ops: sfd,
                 offset: 0,
                 flags: install_flags,
                 status_flags,
-            })
-        }) {
+            }) {
             Some(n) => n,
             None => {
                 ctx.set_return(fail);
@@ -75,14 +73,12 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
         let nonblock = (flags & 0o4000) != 0;
         let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
         let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-        let new_fd = match fd::with_table(task, |t| {
-            t.open(crate::fd::FdEntry {
+        let new_fd = match fd::install(task, crate::fd::FdEntry {
                 ops: sfd,
                 offset: 0,
                 flags: install_flags,
                 status_flags,
-            })
-        }) {
+            }) {
             Some(n) => n,
             None => {
                 ctx.set_return(fail);
