@@ -176,6 +176,18 @@ pub const F_SEAL_WRITE: u32 = 0x0008;
 /// Mask of all valid seal bits.
 pub const F_SEAL_ALL: u32 = F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE;
 
+/// Why `MemFdFile::add_seals` refused. `fcntl(F_ADD_SEALS)` reports the two
+/// cases with different errnos — an undefined seal bit is -EINVAL, while a
+/// file that may not be sealed any further is -EPERM — and a caller that
+/// retries with a corrected seal set depends on telling them apart.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SealError {
+    /// A seal bit outside [`F_SEAL_ALL`]. Linux: -EINVAL.
+    Invalid,
+    /// The file is already sealed against further sealing. Linux: -EPERM.
+    Denied,
+}
+
 /// Wave-70 memfd_create backing. Anonymous growable byte buffer +
 /// Page-frame-backed store for a memfd. The content lives in dedicated
 /// physical frames (page-aligned, never relocated) rather than a heap
@@ -270,16 +282,21 @@ impl MemFdFile {
     /// Add `new_seals` to the seal word. Returns Ok(()) on success,
     /// Err(()) when sealing is forbidden, F_SEAL_SEAL already set, or
     /// new_seals is out of range.
-    pub fn add_seals(&self, new_seals: u32) -> Result<(), ()> {
+    pub fn add_seals(&self, new_seals: u32) -> Result<(), SealError> {
         if !self.allow_sealing {
-            return Err(());
+            // A memfd created without MFD_ALLOW_SEALING starts with
+            // F_SEAL_SEAL, so this is the same refusal as the check below:
+            // `mm/memfd.c::memfd_add_seals` answers a sealed file -EPERM.
+            return Err(SealError::Denied);
         }
+        // `if (seals & ~(unsigned int)F_ALL_SEALS) return -EINVAL;` — an
+        // undefined seal bit is a caller error, distinct from a refusal.
         if (new_seals & !F_SEAL_ALL) != 0 {
-            return Err(());
+            return Err(SealError::Invalid);
         }
         let cur = self.seals.load(Ordering::Acquire);
         if (cur & F_SEAL_SEAL) != 0 {
-            return Err(());
+            return Err(SealError::Denied);
         }
         self.seals.store(cur | new_seals, Ordering::Release);
         Ok(())

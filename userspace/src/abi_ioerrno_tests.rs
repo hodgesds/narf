@@ -999,3 +999,554 @@ fn smoke_abi_ioerrno_lseek_bad_whence() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_lseek_bad_whence);
+
+// ── eventfd / eventfd2 ─────────────────────────────────────────────
+//
+// `fs/eventfd.c::do_eventfd`: `if (flags & ~EFD_FLAGS_SET) return -EINVAL;`
+// where the set is EFD_SEMAPHORE | EFD_CLOEXEC | EFD_NONBLOCK. The one-arg
+// `SYSCALL_DEFINE1(eventfd)` calls `do_eventfd(count, 0)` — it has no flag
+// word at all.
+
+const EFD_SEMAPHORE: u64 = 1;
+
+fn smoke_abi_ioerrno_eventfd2_bad_flags() -> TestResult {
+    with_setup(|| {
+        expect(
+            call(Syscall::Eventfd.raw(), a1(0, 0x4000_0000)),
+            EINVAL,
+            "eventfd2 with an unknown flag must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_eventfd2_bad_flags);
+
+fn smoke_abi_ioerrno_eventfd2_known_flags_accepted() -> TestResult {
+    with_setup(|| {
+        let flags = EFD_SEMAPHORE | crate::fd::O_CLOEXEC as u64 | crate::fd::O_NONBLOCK as u64;
+        match call(Syscall::Eventfd.raw(), a1(0, flags)) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("eventfd2 rejected the full EFD_* set"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_eventfd2_known_flags_accepted
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_ioerrno_eventfd_legacy_ignores_arg1() -> TestResult {
+    with_setup(|| {
+        // x86_64 284 takes ONE argument. arg1 is whatever the caller left in
+        // rsi, so a handler that reads it as flags would fail here with
+        // EINVAL — or worse, silently hand back a CLOEXEC descriptor built
+        // from register garbage.
+        match call(Syscall::EventfdLegacy.raw(), a1(0, 0xdead_beef)) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("legacy eventfd must ignore arg1, not read it as flags"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_eventfd_legacy_ignores_arg1);
+
+// ── epoll_create / epoll_create1 ───────────────────────────────────
+
+fn smoke_abi_ioerrno_epoll_create1_bad_flags() -> TestResult {
+    with_setup(|| {
+        // `do_epoll_create`: `if (flags & ~EPOLL_CLOEXEC) return -EINVAL;`
+        expect(
+            call(Syscall::EpollCreate.raw(), a0(0x4000_0000)),
+            EINVAL,
+            "epoll_create1 with an unknown flag must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_create1_bad_flags);
+
+fn smoke_abi_ioerrno_epoll_create1_cloexec_is_set() -> TestResult {
+    with_setup(|| {
+        let fd = match call(Syscall::EpollCreate.raw(), a0(crate::fd::O_CLOEXEC as u64)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("epoll_create1(EPOLL_CLOEXEC) failed"),
+        };
+        // F_GETFD == 1. Without FD_CLOEXEC the epoll fd leaks through every
+        // exec in the process tree.
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, 1, 0)) {
+            Some(flags) if flags & crate::fd::FD_CLOEXEC as i64 != 0 => Ok(()),
+            _ => Err("epoll_create1(EPOLL_CLOEXEC) did not set FD_CLOEXEC"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_create1_cloexec_is_set
+);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_ioerrno_epoll_create_zero_size() -> TestResult {
+    with_setup(|| {
+        // x86_64 213 reads arg0 as a SIZE, and
+        // `SYSCALL_DEFINE1(epoll_create)` still rejects `size <= 0`.
+        expect(
+            call(Syscall::EpollCreateLegacy.raw(), a0(0)),
+            EINVAL,
+            "epoll_create(0) must be -EINVAL",
+        )
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_create_zero_size);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_ioerrno_epoll_create_positive_size() -> TestResult {
+    with_setup(|| match call(Syscall::EpollCreateLegacy.raw(), a0(1)) {
+        Some(fd) if fd >= 0 => Ok(()),
+        _ => Err("epoll_create(1) should succeed"),
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_epoll_create_positive_size);
+
+// ── preadv2 / pwritev2 RWF_* flags ─────────────────────────────────
+//
+// `include/linux/fs.h::kiocb_set_rw_flags`.
+
+fn preadv2_with_flags(fd: u32, iov: &[u8; 16], flags: u64) -> Option<i64> {
+    let r = call_raw(
+        Syscall::Preadv2.raw(),
+        SyscallArgs {
+            arg0: fd as u64,
+            arg1: iov.as_ptr() as u64,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: flags,
+        },
+    );
+    (r.status == SyscallReturn::OK).then_some(r.value as i64)
+}
+
+fn smoke_abi_ioerrno_preadv2_unknown_flag() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let mut dst = [0u8; 4];
+        let iov = iovec(dst.as_mut_ptr() as u64, 4);
+        // `if (flags & ~RWF_SUPPORTED) return -EOPNOTSUPP;`
+        expect(
+            preadv2_with_flags(fd, &iov, 0x1000),
+            EOPNOTSUPP,
+            "preadv2 with an unknown RWF_ bit must be -EOPNOTSUPP",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_preadv2_unknown_flag);
+
+fn smoke_abi_ioerrno_preadv2_nowait_unsupported() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let mut dst = [0u8; 4];
+        let iov = iovec(dst.as_mut_ptr() as u64, 4);
+        // RWF_NOWAIT without FMODE_NOWAIT is -EOPNOTSUPP. Silently ignoring
+        // it blocks an event loop that asked specifically not to be blocked.
+        expect(
+            preadv2_with_flags(fd, &iov, 0x8),
+            EOPNOTSUPP,
+            "preadv2 RWF_NOWAIT must be -EOPNOTSUPP, not silently ignored",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_preadv2_nowait_unsupported);
+
+fn smoke_abi_ioerrno_pwritev2_append_and_noappend() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let payload = *b"XY";
+        let iov = iovec(payload.as_ptr() as u64, 2);
+        // `if ((flags & RWF_APPEND) && (flags & RWF_NOAPPEND)) return -EINVAL;`
+        let r = call_raw(
+            Syscall::Pwritev2.raw(),
+            SyscallArgs {
+                arg0: fd as u64,
+                arg1: iov.as_ptr() as u64,
+                arg2: 1,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0x10 | 0x20,
+            },
+        );
+        expect(
+            (r.status == SyscallReturn::OK).then_some(r.value as i64),
+            EINVAL,
+            "pwritev2 with RWF_APPEND|RWF_NOAPPEND must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_pwritev2_append_and_noappend
+);
+
+fn smoke_abi_ioerrno_preadv2_sync_flags_accepted() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        let mut dst = [0u8; 4];
+        let iov = iovec(dst.as_mut_ptr() as u64, 4);
+        // RWF_HIPRI | RWF_DSYNC | RWF_SYNC are honourable on a coherent
+        // in-memory filesystem and must not be rejected.
+        match preadv2_with_flags(fd, &iov, 0x1 | 0x2 | 0x4) {
+            Some(4) if &dst[..4] == b"abcd" => Ok(()),
+            _ => Err("preadv2 rejected RWF_HIPRI|RWF_DSYNC|RWF_SYNC"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_preadv2_sync_flags_accepted);
+
+// ── fadvise64 / readahead / sync_file_range ────────────────────────
+
+fn smoke_abi_ioerrno_fadvise_bad_advice() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `generic_fadvise`'s switch ends in `default: return -EINVAL;`.
+        // 6 is the s390 DONTNEED value — a real portability bug on x86_64.
+        expect(
+            call(Syscall::Fadvise64.raw(), a3(fd as u64, 0, 0, 6)),
+            EINVAL,
+            "fadvise64 with an out-of-range advice must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fadvise_bad_advice);
+
+fn smoke_abi_ioerrno_fadvise_pipe_espipe() -> TestResult {
+    with_setup(|| {
+        let (rd, _wr) = make_pipe()?;
+        expect(
+            call(Syscall::Fadvise64.raw(), a3(rd as u64, 0, 0, 0)),
+            ESPIPE,
+            "fadvise64 on a pipe must be -ESPIPE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fadvise_pipe_espipe);
+
+fn smoke_abi_ioerrno_fadvise_valid_advice_ok() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // POSIX_FADV_WILLNEED — a hint NARF ignores, but must accept.
+        expect(
+            call(Syscall::Fadvise64.raw(), a3(fd as u64, 0, 0, 3)),
+            0,
+            "fadvise64 with a valid advice must succeed",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fadvise_valid_advice_ok);
+
+fn smoke_abi_ioerrno_readahead_pipe_einval() -> TestResult {
+    with_setup(|| {
+        let (rd, _wr) = make_pipe()?;
+        // `ksys_readahead`: only S_ISREG and S_ISBLK are eligible.
+        expect(
+            call(Syscall::Readahead.raw(), a2(rd as u64, 0, 4096)),
+            EINVAL,
+            "readahead on a pipe must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_readahead_pipe_einval);
+
+fn smoke_abi_ioerrno_readahead_wronly_fd() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_fd_flags(b"/abi/f\0", crate::fd::O_WRONLY as u64)?;
+        // `if (!(file->f_mode & FMODE_READ)) return -EBADF;`
+        expect(
+            call(Syscall::Readahead.raw(), a2(fd as u64, 0, 4096)),
+            EBADF,
+            "readahead on a write-only fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_readahead_wronly_fd);
+
+fn smoke_abi_ioerrno_sync_file_range_bad_flags() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `if (flags & ~VALID_FLAGS) goto out;` with ret = -EINVAL.
+        expect(
+            call(Syscall::SyncFileRange.raw(), a3(fd as u64, 0, 0, 8)),
+            EINVAL,
+            "sync_file_range with an unknown flag must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_sync_file_range_bad_flags);
+
+fn smoke_abi_ioerrno_sync_file_range_negative_offset() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        expect(
+            call(Syscall::SyncFileRange.raw(), a3(fd as u64, u64::MAX, 0, 0)),
+            EINVAL,
+            "sync_file_range with a negative offset must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_sync_file_range_negative_offset
+);
+
+fn smoke_abi_ioerrno_sync_file_range_pipe_espipe() -> TestResult {
+    with_setup(|| {
+        let (_rd, wr) = make_pipe()?;
+        expect(
+            call(Syscall::SyncFileRange.raw(), a3(wr as u64, 0, 0, 0)),
+            ESPIPE,
+            "sync_file_range on a pipe must be -ESPIPE",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_sync_file_range_pipe_espipe);
+
+// ── fcntl: F_DUPFD floor and memfd seals ───────────────────────────
+
+fn smoke_abi_ioerrno_fcntl_dupfd_floor_too_high() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `f_dupfd`: `if (from >= nofile) return -EINVAL;`. The harness's
+        // RLIMIT_NOFILE soft limit is 1024.
+        expect(
+            call(Syscall::Fcntl.raw(), a2(fd as u64, 0 /* F_DUPFD */, 4096)),
+            EINVAL,
+            "F_DUPFD above RLIMIT_NOFILE must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_dupfd_floor_too_high);
+
+fn smoke_abi_ioerrno_fcntl_get_seals_non_memfd() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `memfd_get_seals` returns -EINVAL when the file has no seal word.
+        // EPERM (the old answer) sends the caller hunting for a privilege.
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, 1034 /* F_GET_SEALS */, 0),
+            ),
+            EINVAL,
+            "F_GET_SEALS on a non-memfd must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_get_seals_non_memfd);
+
+fn smoke_abi_ioerrno_fcntl_seals_bad_fd() -> TestResult {
+    with_setup(|| {
+        // The fdget in the fcntl entry precedes memfd_fcntl entirely.
+        expect(
+            call(Syscall::Fcntl.raw(), a2(4242, 1034 /* F_GET_SEALS */, 0)),
+            EBADF,
+            "F_GET_SEALS on a closed fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_seals_bad_fd);
+
+// ── the positive paths these validations must not break ────────────
+//
+// Every check added above rejects something. These pin the other side: the
+// arguments that must keep working, so a later tightening cannot quietly
+// turn a supported call into an error.
+
+fn smoke_abi_ioerrno_fadvise_bad_fd() -> TestResult {
+    with_setup(|| {
+        expect(
+            call(Syscall::Fadvise64.raw(), a3(4242, 0, 0, 0)),
+            EBADF,
+            "fadvise64 on a closed fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fadvise_bad_fd);
+
+fn smoke_abi_ioerrno_fadvise_negative_len() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // `generic_fadvise`: `if (!mapping || len < 0) return -EINVAL;`
+        expect(
+            call(Syscall::Fadvise64.raw(), a3(fd as u64, 0, u64::MAX, 0)),
+            EINVAL,
+            "fadvise64 with a negative len must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fadvise_negative_len);
+
+fn smoke_abi_ioerrno_readahead_bad_fd() -> TestResult {
+    with_setup(|| {
+        expect(
+            call(Syscall::Readahead.raw(), a2(4242, 0, 4096)),
+            EBADF,
+            "readahead on a closed fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_readahead_bad_fd);
+
+fn smoke_abi_ioerrno_readahead_regular_file_ok() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        expect(
+            call(Syscall::Readahead.raw(), a2(fd as u64, 0, 4096)),
+            0,
+            "readahead on a readable regular file must succeed",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_readahead_regular_file_ok);
+
+fn smoke_abi_ioerrno_sync_file_range_bad_fd() -> TestResult {
+    with_setup(|| {
+        expect(
+            call(Syscall::SyncFileRange.raw(), a3(4242, 0, 0, 0)),
+            EBADF,
+            "sync_file_range on a closed fd must be -EBADF",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_sync_file_range_bad_fd);
+
+fn smoke_abi_ioerrno_sync_file_range_valid_ok() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // SYNC_FILE_RANGE_WRITE_AND_WAIT — the whole VALID_FLAGS set.
+        expect(
+            call(Syscall::SyncFileRange.raw(), a3(fd as u64, 0, 6, 7)),
+            0,
+            "sync_file_range over a valid range must succeed",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_sync_file_range_valid_ok);
+
+fn smoke_abi_ioerrno_fcntl_dupfd_valid_floor() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"x")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        // A floor inside RLIMIT_NOFILE still duplicates, at the lowest free
+        // slot at or above it — the new EINVAL check must not swallow this.
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, 0 /* F_DUPFD */, 100)) {
+            Some(new_fd) if new_fd >= 100 => Ok(()),
+            _ => Err("F_DUPFD with an in-range floor must return a new fd >= it"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fcntl_dupfd_valid_floor);
+
+// ── memfd seals: the three outcomes fcntl must tell apart ──────────
+//
+// `mm/memfd.c::memfd_add_seals`:
+//   !(file->f_mode & FMODE_WRITE)     -> -EPERM
+//   seals & ~F_ALL_SEALS              -> -EINVAL
+//   *file_seals & F_SEAL_SEAL         -> -EPERM
+// A caller that retries with a corrected seal set needs EINVAL and EPERM
+// distinguished; both were the same `-1` sentinel before.
+
+const F_ADD_SEALS: u64 = 1033;
+const F_GET_SEALS: u64 = 1034;
+const MFD_ALLOW_SEALING: u64 = 0x0002;
+const F_SEAL_SEAL: i64 = 0x0001;
+const F_SEAL_WRITE: u64 = 0x0008;
+
+fn make_memfd(flags: u64) -> Result<u32, &'static str> {
+    let name = b"seal-test\0";
+    match call(Syscall::MemfdCreate.raw(), a1(name.as_ptr() as u64, flags)) {
+        Some(fd) if fd >= 0 => Ok(fd as u32),
+        _ => Err("memfd_create failed"),
+    }
+}
+
+fn smoke_abi_ioerrno_memfd_add_seal_succeeds() -> TestResult {
+    with_setup(|| {
+        let fd = make_memfd(MFD_ALLOW_SEALING)?;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, F_ADD_SEALS, F_SEAL_WRITE),
+        ) != Some(0)
+        {
+            return Err("F_ADD_SEALS(F_SEAL_WRITE) on a sealable memfd should succeed");
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GET_SEALS, 0)) {
+            Some(seals) if seals as u64 & F_SEAL_WRITE != 0 => Ok(()),
+            _ => Err("F_GET_SEALS did not report the seal just added"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_memfd_add_seal_succeeds);
+
+fn smoke_abi_ioerrno_memfd_add_seal_unknown_bit() -> TestResult {
+    with_setup(|| {
+        let fd = make_memfd(MFD_ALLOW_SEALING)?;
+        // `if (seals & ~(unsigned int)F_ALL_SEALS) return -EINVAL;` — a bad
+        // seal set is a caller error, not a refusal, and the caller can fix
+        // it and retry. EPERM (the old answer) told it to give up instead.
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_ADD_SEALS, 0x4000_0000),
+            ),
+            EINVAL,
+            "F_ADD_SEALS with an undefined seal bit must be -EINVAL",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_memfd_add_seal_unknown_bit);
+
+fn smoke_abi_ioerrno_memfd_add_seal_already_sealed() -> TestResult {
+    with_setup(|| {
+        let fd = make_memfd(MFD_ALLOW_SEALING)?;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, F_ADD_SEALS, F_SEAL_SEAL as u64),
+        ) != Some(0)
+        {
+            return Err("F_ADD_SEALS(F_SEAL_SEAL) should succeed once");
+        }
+        // `if (*file_seals & F_SEAL_SEAL) { error = -EPERM; }` — a genuine
+        // refusal, and the one case that stays EPERM.
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_ADD_SEALS, F_SEAL_WRITE),
+            ),
+            EPERM,
+            "F_ADD_SEALS on an F_SEAL_SEAL'd memfd must be -EPERM",
+        )
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_memfd_add_seal_already_sealed
+);
+
+fn smoke_abi_ioerrno_memfd_without_allow_sealing() -> TestResult {
+    with_setup(|| {
+        // Without MFD_ALLOW_SEALING the file starts F_SEAL_SEAL'd, so it is
+        // still a memfd — F_GET_SEALS reports, F_ADD_SEALS refuses.
+        let fd = make_memfd(0)?;
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GET_SEALS, 0)) {
+            Some(seals) if seals == F_SEAL_SEAL => {}
+            _ => return Err("a non-sealable memfd must report F_SEAL_SEAL"),
+        }
+        expect(
+            call(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_ADD_SEALS, F_SEAL_WRITE),
+            ),
+            EPERM,
+            "F_ADD_SEALS without MFD_ALLOW_SEALING must be -EPERM",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_memfd_without_allow_sealing);

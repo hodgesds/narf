@@ -4666,6 +4666,63 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     let iovcnt = a.arg2 as usize;
     let pos = a.arg3;
 
+    // `include/linux/fs.h::kiocb_set_rw_flags` validates the preadv2/pwritev2
+    // flag word before any I/O:
+    //
+    //   if (flags & ~RWF_SUPPORTED)                 return -EOPNOTSUPP;
+    //   if ((flags & RWF_APPEND) && (flags & RWF_NOAPPEND)) return -EINVAL;
+    //   if ((flags & RWF_NOWAIT) && !FMODE_NOWAIT)  return -EOPNOTSUPP;
+    //   if ((flags & RWF_ATOMIC) && rw_type != WRITE) return -EOPNOTSUPP;
+    //
+    // Silently ignoring the word (the old behaviour) is the worst answer for
+    // the two flags that carry durability and latency contracts: a caller that
+    // asked for RWF_DSYNC and got a buffered write believes its data is on
+    // stable storage, and one that asked for RWF_NOWAIT to keep an event loop
+    // off the blocking path gets blocked instead of the -EAGAIN it handles.
+    // Report EOPNOTSUPP for what NARF cannot honour and let the caller choose.
+    if v2 {
+        const RWF_HIPRI: u64 = 0x01;
+        const RWF_DSYNC: u64 = 0x02;
+        const RWF_SYNC: u64 = 0x04;
+        const RWF_NOWAIT: u64 = 0x08;
+        const RWF_APPEND: u64 = 0x10;
+        const RWF_NOAPPEND: u64 = 0x20;
+        const RWF_ATOMIC: u64 = 0x40;
+        const RWF_DONTCACHE: u64 = 0x80;
+        const RWF_NOSIGNAL: u64 = 0x100;
+        const RWF_SUPPORTED: u64 = RWF_HIPRI
+            | RWF_DSYNC
+            | RWF_SYNC
+            | RWF_NOWAIT
+            | RWF_APPEND
+            | RWF_NOAPPEND
+            | RWF_ATOMIC
+            | RWF_DONTCACHE
+            | RWF_NOSIGNAL;
+        // arg4 is pos_h, arg5 the rwf_t flag word (a 32-bit type).
+        let flags = a.arg5 & 0xffff_ffff;
+        if flags != 0 {
+            if flags & !RWF_SUPPORTED != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            if flags & RWF_APPEND != 0 && flags & RWF_NOAPPEND != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+            // NARF has no FMODE_NOWAIT, no atomic-write support, and no
+            // per-I/O cache-drop; the kernel answers each of those with
+            // -EOPNOTSUPP on a file that cannot provide them.
+            if flags & (RWF_NOWAIT | RWF_ATOMIC | RWF_DONTCACHE) != 0 {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
+            // RWF_DSYNC / RWF_SYNC promise this write reaches stable storage
+            // before returning. NARF's filesystems are in-memory and coherent,
+            // so the promise already holds; HIPRI and NOSIGNAL are advisory.
+        }
+    }
+
     if v2 && pos == u64::MAX {
         if is_write {
             handler_sys_writev::sys_writev(ctx);
