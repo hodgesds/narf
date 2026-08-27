@@ -7,9 +7,7 @@
 //! call this on each, OR the bits, return matches.
 
 use alloc::boxed::Box;
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat, POLL_IN, POLL_OUT};
@@ -484,71 +482,5 @@ impl FileOps for SignalFd {
             crate::handlers::signal_readable_generation(self.owner_task),
             0,
         )
-    }
-}
-
-// ── epoll instance ──────────────────────────────────────────────
-
-/// Per-instance epoll interest list. Stage-1 level-triggered only;
-/// EPOLLET edge-triggered lands once a consumer needs it.
-#[derive(Debug)]
-pub struct EpollFile {
-    interest: IrqSafeSpinLock<BTreeMap<i32, EpollEntry>>,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct EpollEntry {
-    pub events: u32,
-    pub user_data: u64,
-}
-
-impl EpollFile {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            interest: IrqSafeSpinLock::new(BTreeMap::new()),
-        })
-    }
-
-    pub fn ctl_add(&self, fd: i32, entry: EpollEntry) {
-        self.interest.lock().insert(fd, entry);
-    }
-
-    pub fn ctl_mod(&self, fd: i32, entry: EpollEntry) {
-        self.interest.lock().insert(fd, entry);
-    }
-
-    pub fn ctl_del(&self, fd: i32) {
-        self.interest.lock().remove(&fd);
-    }
-
-    pub fn snapshot(&self) -> Vec<(i32, EpollEntry)> {
-        self.interest.lock().iter().map(|(k, v)| (*k, *v)).collect()
-    }
-}
-
-impl FileOps for EpollFile {
-    fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::Unsupported) })
-    }
-    fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
-        Box::pin(async move { Err(FsError::Unsupported) })
-    }
-    fn stat(&self) -> Stat {
-        Stat {
-            size: 0,
-            blocks: 0,
-            mode: Mode {
-                file_type: narf_filesystem::FileType::Special,
-                perms: 0o600,
-            },
-            mtime_cycles: 0,
-        }
-    }
-    fn poll_readiness(&self) -> u32 {
-        // An epoll fd is itself readable when any watched fd has
-        // events ready — a relatively expensive query that consumers
-        // typically don't do. Return 0 here; epoll_wait does the
-        // real walk.
-        0
     }
 }

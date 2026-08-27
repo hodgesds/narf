@@ -1913,27 +1913,6 @@ pub struct StatBuf {
     pub mtime_cycles: u64,
 }
 
-impl StatBuf {
-    fn from_stat(s: narf_filesystem::Stat) -> Self {
-        let ftype_bits: u32 = match s.mode.file_type {
-            narf_filesystem::FileType::File => 0o100000,
-            narf_filesystem::FileType::Dir => 0o040000,
-            narf_filesystem::FileType::Symlink => 0o120000,
-            narf_filesystem::FileType::Special => 0o020000,
-            narf_filesystem::FileType::Block => 0o060000,
-            narf_filesystem::FileType::Socket => 0o140000,
-            narf_filesystem::FileType::Fifo => 0o010000,
-        };
-        Self {
-            size: s.size,
-            blocks: s.blocks,
-            mode: ftype_bits | (s.mode.perms as u32),
-            _pad: 0,
-            mtime_cycles: s.mtime_cycles,
-        }
-    }
-}
-
 // ── Ftruncate — arg0=fd, arg1=len ──────────────────────────────────
 //
 // Resize the file backing `fd` to exactly `len` bytes. Routes
@@ -10167,11 +10146,6 @@ fn pack_utsname_field(dst: &mut [u8], src: &str) {
     let n = core::cmp::min(src.len(), UTSNAME_FIELD_LEN - 1);
     dst[..n].copy_from_slice(&src.as_bytes()[..n]);
     // remaining bytes already zeroed by caller
-}
-
-#[cfg(feature = "container")]
-fn current_or_default_ipc_ns(task: u64) -> alloc::sync::Arc<crate::namespaces::IpcNamespace> {
-    crate::namespaces::current_ipc_namespace(task)
 }
 
 // ── System V shared memory (linux-compat) ────────────────────────────
