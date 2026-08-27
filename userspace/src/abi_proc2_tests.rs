@@ -1263,6 +1263,14 @@ fn smoke_abi_proc2_setpgid_resolves_in_caller_pid_ns() -> TestResult {
             if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
                 return Err("worker was not assigned inner pid 2");
             }
+            // `inherit_into_child` models a fork, so publish the two rows a
+            // real fork would: the parent link (keyed by the child's
+            // ProcessId, per `parent_of_set` in sys_fork) and the inherited
+            // session. setpgid needs both — Linux only lets a caller move
+            // ITSELF or a CHILD, and only within its own session
+            // (kernel/sys.c), so without them the call is correctly refused.
+            crate::handlers::__test_parent_of_set(WORKER_PID, MANAGER_TASK);
+            crate::handlers::sid_fork(MANAGER_TASK, WORKER_TASK);
 
             set_task(MANAGER_TASK);
             // setpgid(inner worker 2, inner pgid 2): make the worker its own
@@ -1327,6 +1335,13 @@ fn smoke_abi_proc2_kill_pgrp_resolves_in_caller_pid_ns() -> TestResult {
             if crate::pid_ns::inherit_into_child(MANAGER_TASK, WORKER_TASK, WORKER_PID) != Some(2) {
                 return Err("worker was not assigned inner pid 2");
             }
+            // `inherit_into_child` models a fork; publish the two rows a real
+            // fork would (parent link keyed by the child's ProcessId, plus the
+            // inherited session) so setpgid's kernel/sys.c ladder — which only
+            // permits moving SELF or a CHILD, and only within the caller's own
+            // session — is satisfied.
+            crate::handlers::__test_parent_of_set(WORKER_PID, MANAGER_TASK);
+            crate::handlers::sid_fork(MANAGER_TASK, WORKER_TASK);
             set_task(MANAGER_TASK);
             // Put the worker in its own group (inner pgid 2).
             if call(Syscall::Setpgid.raw(), a1(2, 2)) != Some(0) {

@@ -8715,6 +8715,22 @@ fn read_sid(target: u64) -> u64 {
         .unwrap_or(target) // default: sid == pid
 }
 
+/// Linux `p->signal->leader` — set ONLY by `setsid()`, never by fork.
+///
+/// This must not go through [`read_sid`], whose `unwrap_or(target)` default
+/// ("sid == pid") is a convenience for readers and cannot tell a real session
+/// leader apart from a task that has simply never appeared in the table.
+/// `sys_setsid` publishes an EXPLICIT `sid_rows.insert(task, task)` row, so a
+/// leader is exactly "has a row, and that row names itself". Using the
+/// defaulted reader here would have made `setpgid` report -EPERM for every
+/// task that never called setsid — the opposite of the intended check.
+fn is_session_leader(target: u64) -> bool {
+    let g = SID_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&target).copied())
+        .is_some_and(|sid| sid == target)
+}
+
 /// Linux `session_of_pgrp`: resolve an internal process-group id to the
 /// session of one live member. The current task is checked explicitly because
 /// syscall-unit fixtures need not populate the scheduler task registry.
@@ -9673,23 +9689,48 @@ fn modify_prctl<F: FnOnce(&mut PrctlState)>(task: u64, f: F) -> bool {
 // param.sched_priority <= sched_get_priority_max(SCHED_RR)` sees
 // a coherent answer.
 
-const SCHED_OTHER: u64 = 0;
-const SCHED_FIFO: u64 = 1;
-const SCHED_RR: u64 = 2;
-const SCHED_BATCH: u64 = 3;
-const SCHED_IDLE: u64 = 5;
+const SCHED_OTHER: i32 = 0;
+const SCHED_FIFO: i32 = 1;
+const SCHED_RR: i32 = 2;
+const SCHED_BATCH: i32 = 3;
+const SCHED_IDLE: i32 = 5;
+/// `include/uapi/linux/sched.h`. Neither policy is admissible through
+/// `sched_setscheduler` (Linux routes SCHED_DEADLINE via `sched_setattr`,
+/// SCHED_EXT via a loaded BPF scheduler), but both are still *recognised*
+/// policy numbers for the priority-range query below.
+const SCHED_DEADLINE: i32 = 6;
+const SCHED_EXT: i32 = 7;
 
-fn priority_max_for_policy(policy: u64) -> Option<i64> {
+/// `kernel/sched/syscalls.c::SYSCALL_DEFINE1(sched_get_priority_max)`.
+///
+/// ```text
+/// int ret = -EINVAL;
+/// switch (policy) {
+/// case SCHED_FIFO: case SCHED_RR:  ret = MAX_RT_PRIO-1; break;   /* 99 */
+/// case SCHED_DEADLINE: case SCHED_NORMAL: case SCHED_BATCH:
+/// case SCHED_IDLE: case SCHED_EXT: ret = 0; break;
+/// }
+/// return ret;
+/// ```
+///
+/// Linux's version is a bare switch with NO capability or admission check,
+/// so SCHED_DEADLINE/SCHED_EXT report a range here even though
+/// `sched_setscheduler` refuses them. Reporting EINVAL for those two made
+/// a libc probing the range before choosing a policy conclude the kernel
+/// was too old to know the constant at all.
+fn priority_max_for_policy(policy: i32) -> Option<i64> {
     match policy {
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Some(0),
         SCHED_FIFO | SCHED_RR => Some(99),
         _ => None,
     }
 }
 
-fn priority_min_for_policy(policy: u64) -> Option<i64> {
+/// `kernel/sched/syscalls.c::SYSCALL_DEFINE1(sched_get_priority_min)` — the
+/// same switch, returning 1 for the two real-time policies.
+fn priority_min_for_policy(policy: i32) -> Option<i64> {
     match policy {
-        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE => Some(0),
+        SCHED_OTHER | SCHED_BATCH | SCHED_IDLE | SCHED_DEADLINE | SCHED_EXT => Some(0),
         SCHED_FIFO | SCHED_RR => Some(1),
         _ => None,
     }

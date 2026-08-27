@@ -404,17 +404,78 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_get_priority_max_pos);
 
 fn smoke_abi_sched_get_priority_max_bad_policy_neg() -> TestResult {
     with_setup(|| {
-        // Unknown policy 42 ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown policy.
+        // `kernel/sched/syscalls.c`: the switch opens `int ret = -EINVAL;`
+        // and an unrecognised policy falls straight through to it. A bare -1
+        // reaches the caller as errno 1 (EPERM), which glibc's pthread
+        // attribute code — it probes this range before validating a
+        // priority — reads as "not allowed to ask" rather than "no such
+        // policy".
         match call(Syscall::SchedGetPriorityMax.raw(), a0(42)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_get_priority_max bad policy should return -1"),
+            Some(-22) => Ok(()),
+            Some(-1) => {
+                Err("sched_get_priority_max bad policy still returns the -1/EPERM sentinel")
+            }
+            _ => Err("sched_get_priority_max bad policy should return -EINVAL"),
         }
     })
 }
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_get_priority_max_bad_policy_neg
+);
+
+fn smoke_abi_sched_get_priority_max_known_but_unadmittable() -> TestResult {
+    with_setup(|| {
+        // SCHED_DEADLINE (6) and SCHED_EXT (7) are recognised policy numbers
+        // in `include/uapi/linux/sched.h`, and sched_get_priority_max is a
+        // bare switch with no admission check — both report 0 even though
+        // neither is accepted by sched_setscheduler. Reporting EINVAL made a
+        // libc probing the range conclude the kernel predates the constant.
+        for policy in [6u64, 7u64] {
+            match call(Syscall::SchedGetPriorityMax.raw(), a0(policy)) {
+                Some(0) => {}
+                Some(-22) => return Err("sched_get_priority_max rejected a recognised policy"),
+                _ => return Err("sched_get_priority_max(SCHED_DEADLINE/EXT) should be 0"),
+            }
+            match call(Syscall::SchedGetPriorityMin.raw(), a0(policy)) {
+                Some(0) => {}
+                Some(-22) => return Err("sched_get_priority_min rejected a recognised policy"),
+                _ => return Err("sched_get_priority_min(SCHED_DEADLINE/EXT) should be 0"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_get_priority_max_known_but_unadmittable
+);
+
+fn smoke_abi_sched_get_priority_policy_is_int_wide() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE1(sched_get_priority_max, int, policy)` — only the
+        // low 32 bits are the argument. Matching the full 64-bit register
+        // sent a caller that left garbage in the upper half (legal for a
+        // libc stub; the psABI only promises the low half of an `int`) to
+        // the error arm for a perfectly valid policy.
+        let dirty = 0xdead_beef_0000_0002u64; // upper garbage + SCHED_RR
+        match call(Syscall::SchedGetPriorityMax.raw(), a0(dirty)) {
+            Some(99) => {}
+            Some(-22) => {
+                return Err("sched_get_priority_max matched the full register, not the low int")
+            }
+            _ => return Err("sched_get_priority_max(dirty SCHED_RR) should be 99"),
+        }
+        match call(Syscall::SchedGetPriorityMin.raw(), a0(dirty)) {
+            Some(1) => Ok(()),
+            Some(-22) => Err("sched_get_priority_min matched the full register, not the low int"),
+            _ => Err("sched_get_priority_min(dirty SCHED_RR) should be 1"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_get_priority_policy_is_int_wide
 );
 
 // ── sched_get_priority_min(policy) ──────────────────────────────────
@@ -436,11 +497,13 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_get_priority_min_pos);
 
 fn smoke_abi_sched_get_priority_min_bad_policy_neg() -> TestResult {
     with_setup(|| {
-        // Unknown policy 42 ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown policy.
+        // Same bare `int ret = -EINVAL;` fall-through as the max variant.
         match call(Syscall::SchedGetPriorityMin.raw(), a0(42)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_get_priority_min bad policy should return -1"),
+            Some(-22) => Ok(()),
+            Some(-1) => {
+                Err("sched_get_priority_min bad policy still returns the -1/EPERM sentinel")
+            }
+            _ => Err("sched_get_priority_min bad policy should return -EINVAL"),
         }
     })
 }
@@ -472,15 +535,79 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_pos);
 
 fn smoke_abi_sched_getparam_null_buf_neg() -> TestResult {
     with_setup(|| {
-        // Null param pointer ⇒ wire -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL/-EFAULT for a bad param pointer.
+        // `if (unlikely(!param || pid < 0)) return -EINVAL;` — a NULL param
+        // is EINVAL, not EFAULT: Linux rejects it by inspection before any
+        // access is attempted.
         match call(Syscall::SchedGetparam.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("sched_getparam with null buffer should return -1"),
+            Some(-22) => Ok(()),
+            Some(-1) => Err("sched_getparam null param still returns the -1/EPERM sentinel"),
+            Some(-14) => Err("sched_getparam null param returned EFAULT; Linux rejects it EINVAL"),
+            _ => Err("sched_getparam with null buffer should return -EINVAL"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_null_buf_neg);
+
+fn smoke_abi_sched_getparam_negative_pid_einval() -> TestResult {
+    with_setup(|| {
+        // The same guard covers `pid < 0`, and pid_t is `int` — reading the
+        // full register let a negative pid arrive as a huge positive u64 and
+        // miss the check entirely.
+        let mut buf = [0u8; 4];
+        let args = a1((-1i64) as u64, buf.as_mut_ptr() as u64);
+        match call(Syscall::SchedGetparam.raw(), args) {
+            Some(-22) => Ok(()),
+            Some(-3) => Err("sched_getparam(negative pid) returned ESRCH; Linux rejects it EINVAL"),
+            Some(0) => Err("sched_getparam accepted a negative pid"),
+            _ => Err("sched_getparam with a negative pid should return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_negative_pid_einval);
+
+fn smoke_abi_sched_getparam_null_beats_bad_pid() -> TestResult {
+    with_setup(|| {
+        // Ordering: `!param || pid < 0` is ONE guard evaluated before the
+        // find_process_by_pid lookup, so a null param wins over a pid that
+        // names no task. A caller must be able to tell its own null pointer
+        // apart from "that process went away".
+        match call(Syscall::SchedGetparam.raw(), a1(123456, 0)) {
+            Some(-22) => Ok(()),
+            Some(-3) => Err("sched_getparam looked up the pid before checking param (wrong order)"),
+            _ => Err("sched_getparam(bad pid, null param) should return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_null_beats_bad_pid);
+
+fn smoke_abi_sched_getparam_unknown_pid_esrch() -> TestResult {
+    with_setup(|| {
+        // Past the argument guard: `p = find_process_by_pid(pid);
+        // if (!p) return -ESRCH;`.
+        let mut buf = [0u8; 4];
+        let args = a1(123456, buf.as_mut_ptr() as u64);
+        match call(Syscall::SchedGetparam.raw(), args) {
+            Some(-3) => Ok(()),
+            Some(0) => Err("sched_getparam reported a priority for a non-existent pid"),
+            _ => Err("sched_getparam on an unknown pid should return -ESRCH"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_unknown_pid_esrch);
+
+fn smoke_abi_sched_getparam_bad_ptr_efault() -> TestResult {
+    with_setup(|| {
+        // `return copy_to_user(param, &lp, sizeof(*param)) ? -EFAULT : 0;`
+        // — a non-null but unmapped pointer is EFAULT, distinct from the
+        // EINVAL a null one gets.
+        match call(Syscall::SchedGetparam.raw(), a1(0, BAD_PTR)) {
+            Some(-14) => Ok(()),
+            Some(-1) => Err("sched_getparam copy fault still returns the -1/EPERM sentinel"),
+            _ => Err("sched_getparam with an unmapped param should return -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_bad_ptr_efault);
 
 // ── sched_setparam(pid, param*) ─────────────────────────────────────
 

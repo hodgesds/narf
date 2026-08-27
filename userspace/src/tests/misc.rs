@@ -2288,11 +2288,14 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
     if max_rr != 99 || min_rr != 1 {
         return TestResult::Fail("SCHED_RR bounds not (1, 99)");
     }
+    // `kernel/sched/syscalls.c`: the switch opens `int ret = -EINVAL;` and an
+    // unrecognised policy falls through to it. This used to assert the bare
+    // -1 sentinel, which reaches a libc as errno 1 (EPERM).
     let bad = call(Syscall::SchedGetPriorityMax, 99, 0)
         .map(|r| r.value)
         .unwrap_or(0);
-    if bad != (-1i64) as u64 {
-        return TestResult::Fail("bad policy not rejected");
+    if bad != (-22i64) as u64 {
+        return TestResult::Fail("bad policy not rejected with -EINVAL");
     }
 
     // Param round-trip: default 0, set to 50, read back 50.
@@ -2373,10 +2376,22 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
         return TestResult::Fail("default pgid != pid");
     }
 
-    // setpgid(0, 7) — explicitly stick pgid to 7.
+    // setpgid(0, 7) — join an existing group. Linux (kernel/sys.c) only
+    // permits this when process group 7 actually has a live member in the
+    // CALLER's session; `if (!g || task_session(g) != task_session(
+    // group_leader)) goto out;` is -EPERM otherwise. This step used to pass
+    // only because the handler validated nothing and inserted whatever it was
+    // given, so the group has to be made real first: a registered task, put
+    // in group 7, sharing the caller's session the way a fork would.
+    const GROUP_MEMBER: u64 = 7;
+    crate::task::release_task(GROUP_MEMBER);
+    let _member = crate::task::Task::new_registered(GROUP_MEMBER, GROUP_MEMBER);
+    crate::handlers::__test_set_pgid(GROUP_MEMBER, GROUP_MEMBER);
+    crate::handlers::sid_fork(pid, GROUP_MEMBER);
     let _ = call(Syscall::Setpgid, 0, 7);
     let p1 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
     if p1 != 7 {
+        crate::task::release_task(GROUP_MEMBER);
         return TestResult::Fail("setpgid(7) did not stick");
     }
 
@@ -2384,6 +2399,7 @@ fn smoke_userspace_pgid_round_trip() -> TestResult {
     // a fresh group leader).
     let _ = call(Syscall::Setpgid, 0, 0);
     let p2 = call(Syscall::Getpgid, 0, 0).map(|r| r.value).unwrap_or(!0);
+    crate::task::release_task(GROUP_MEMBER);
     if p2 != pid {
         return TestResult::Fail("setpgid(0,0) did not resolve to pid");
     }
@@ -2452,22 +2468,18 @@ fn smoke_userspace_setsid_makes_session_leader() -> TestResult {
         return TestResult::Fail("default sid != pid");
     }
 
-    // Stomp sid (no setter, so use pgid as a witness): setpgid
-    // table is wired to setsid below.
-
-    // Pre-stomp pgid to a distinct value, then setsid resets both.
-    let _ = {
-        let mut ctx = FakeCtx {
-            args: SyscallArgs {
-                arg0: 0,
-                arg1: 12345,
-                ..SyscallArgs::default()
-            },
-            ret: None,
-        };
-        kernel_syscall_entry(Syscall::Setpgid.raw(), &mut ctx);
-        ctx.ret
-    };
+    // setsid refuses a caller that already LEADS a process group
+    // (kernel/sys.c), and a task with no PGID row defaults to leading its
+    // own. So the caller has to be put in someone else's group first.
+    //
+    // This used to drive setpgid(0, 12345) to do it — which only worked
+    // because that handler validated nothing and inserted whatever it was
+    // given. Now that it enforces Linux's ladder, joining a group with no
+    // live member is -EPERM and the caller stayed a group leader, so setsid
+    // correctly refused and this test failed at its FIRST assertion. Seed the
+    // row directly instead: this smoke is about setsid, not setpgid, and
+    // `__test_set_pgid` exists precisely to bypass the syscall plumbing.
+    crate::handlers::__test_set_pgid(pid, 12345);
 
     let new_sid = call(Syscall::Setsid, 0).map(|r| r.value).unwrap_or(!0);
     if new_sid != pid {
