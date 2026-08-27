@@ -2361,15 +2361,24 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
     // length", every stat returns -1, errno = EPERM, busybox sh prints
     // "Operation not permitted" for every PATH-search candidate, and
     // every pipeline that touches an exec dies.
-    let out_ptr = out_arg as *mut linux_compat::Stat;
-    if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-        return;
-    }
-    let raw = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    // NOTE the ORDER. `SYSCALL_DEFINE2(newstat)` is
+    //
+    //     error = vfs_stat(filename, &stat);
+    //     if (unlikely(error)) return error;
+    //     return cp_new_stat(&stat, statbuf);
+    //
+    // so the pathname is copied and RESOLVED before `statbuf` is touched at
+    // all. Checking the output pointer first — which this did — reported
+    // -EFAULT for `stat("/does/not/exist", NULL)` where Linux reports
+    // -ENOENT, and hid every path error behind the destination check. The
+    // null test now lives in `stat_linux_path`, after resolution.
+    // `getname()`: -EFAULT for an unreadable pointer, -ENAMETOOLONG for a
+    // path that reaches PATH_MAX with no terminator. Folding both into
+    // -EFAULT told a caller its POINTER was bad when the pointer was fine.
+    let raw = match copy_user_cstr_checked(path_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -2381,10 +2390,6 @@ fn stat_linux_common(ctx: &mut dyn TrapContext, path_ptr: u64, out_arg: u64, fol
 /// `newfstatat(2)` first join its relative pathname to the supplied dirfd.
 fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_final: bool) {
     let out_ptr = out_arg as *mut linux_compat::Stat;
-    if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-        return;
-    }
     // Resolve relative paths (e.g. `ls`'s `lstat(".")`) against the
     // caller's cwd before chroot, so the stat family works from any
     // working directory — not just absolute paths.
@@ -2403,10 +2408,23 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
             // like libwayland's wl_socket_lock require the real errno.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            //
+            // `filename_lookup` also yields -ENOTDIR when a NON-FINAL
+            // component is not a directory, which is a different answer for
+            // the caller: ENOENT invites it to create the path, ENOTDIR says
+            // a prefix is a file and creating it never will work. The
+            // resolver reports no reason, so the walk is re-classified on
+            // this failure path — see `path_lookup_errno`.
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path)) as u64));
             return;
         }
     };
+    // `cp_new_stat(&stat, statbuf)` — the destination is inspected only now
+    // that the path has resolved, so a bad path outranks a bad statbuf.
+    if out_ptr.is_null() {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        return;
+    }
     // Report the device node's rdev (major:minor) for PATH stat too: seatd /
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).

@@ -31,13 +31,12 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // `copy_user_path_raw(arg0, arg1)` form misread arg1 as a length,
     // which is garbage for a real Linux binary, so every chroot from
     // unmodified userspace failed with -1.)
-    let raw = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            // LINUX-GAP: as in sys_chdir, `getname()`'s -ENAMETOOLONG is
-            // folded into -EFAULT because copy_user_cstr cannot tell the
-            // two apart.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    // `getname()`: -EFAULT for an unreadable pointer, -ENAMETOOLONG for a
+    // path at PATH_MAX with no terminator.
+    let raw = match copy_user_cstr_checked(args.arg0, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

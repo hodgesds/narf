@@ -3028,3 +3028,259 @@ fn smoke_abi_pathx_getcwd_contract() -> TestResult {
     r
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_getcwd_contract);
+
+// ─────────────────────────────────────────────────────────────────────
+// Path-walk failure reasons — fs/namei.c
+//
+// Two resolvers used to answer only "no", so every caller had to guess an
+// errno and they all guessed the same one:
+//
+//   * `copy_user_cstr` returned Option, folding -EFAULT (unreadable
+//     pointer) into the same None as -ENAMETOOLONG (path at PATH_MAX with
+//     no terminator). Every path syscall reported EFAULT for both, telling
+//     a caller its POINTER was bad when the pointer was fine.
+//   * `resolve_absolute` returned a bare None, folding -ENOTDIR into
+//     -ENOENT. Those two are not interchangeable: ENOENT invites a caller
+//     to create the path, ENOTDIR says a prefix is a file and creating it
+//     never will work.
+// ─────────────────────────────────────────────────────────────────────
+
+const EFAULT_E: i64 = -14;
+const ENOENT_E: i64 = -2;
+const ENOTDIR_E: i64 = -20;
+const ENAMETOOLONG_E: i64 = -36;
+
+/// A 5000-byte run of 'a' with NO NUL — `getname()`'s -ENAMETOOLONG case.
+/// Heap-allocated so the whole PATH_MAX window is genuinely readable; a
+/// short buffer would fault first and take the -EFAULT arm instead, which
+/// is precisely the confusion under test.
+fn overlong_path() -> alloc::vec::Vec<u8> {
+    alloc::vec![b'a'; 5000]
+}
+
+fn smoke_abi_pathx_stat_overlong_is_enametoolong() -> TestResult {
+    with_setup(|| {
+        let long = overlong_path();
+        let mut sb = [0u8; 256];
+        match call_stat(long.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(v) if v == ENAMETOOLONG_E => Ok(()),
+            Some(v) if v == EFAULT_E => {
+                Err("stat reported EFAULT for a readable but over-long path")
+            }
+            _ => Err("stat(over-long path) should be -ENAMETOOLONG"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_stat_overlong_is_enametoolong);
+
+fn smoke_abi_pathx_stat_bad_pointer_is_still_efault() -> TestResult {
+    with_setup(|| {
+        // The other half of the split must not regress: an unreadable
+        // pointer is still -EFAULT, not -ENAMETOOLONG.
+        const BAD: u64 = 0x0001_0000_0000_0000;
+        let mut sb = [0u8; 256];
+        match call_stat(BAD, sb.as_mut_ptr() as u64) {
+            Some(v) if v == EFAULT_E => Ok(()),
+            Some(v) if v == ENAMETOOLONG_E => {
+                Err("stat reported ENAMETOOLONG for an unreadable pointer")
+            }
+            _ => Err("stat(unmapped path pointer) should be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_stat_bad_pointer_is_still_efault
+);
+
+fn smoke_abi_pathx_chdir_overlong_is_enametoolong() -> TestResult {
+    with_setup(|| {
+        let long = overlong_path();
+        match call(Syscall::Chdir.raw(), a0(long.as_ptr() as u64)) {
+            Some(v) if v == ENAMETOOLONG_E => Ok(()),
+            Some(v) if v == EFAULT_E => {
+                Err("chdir reported EFAULT for a readable but over-long path")
+            }
+            _ => Err("chdir(over-long path) should be -ENAMETOOLONG"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chdir_overlong_is_enametoolong
+);
+
+fn smoke_abi_pathx_chroot_overlong_is_enametoolong() -> TestResult {
+    with_setup(|| {
+        let long = overlong_path();
+        match call(Syscall::Chroot.raw(), a0(long.as_ptr() as u64)) {
+            Some(v) if v == ENAMETOOLONG_E => Ok(()),
+            Some(v) if v == EFAULT_E => {
+                Err("chroot reported EFAULT for a readable but over-long path")
+            }
+            _ => Err("chroot(over-long path) should be -ENAMETOOLONG"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chroot_overlong_is_enametoolong
+);
+
+fn smoke_abi_pathx_statx_overlong_is_enametoolong() -> TestResult {
+    with_setup(|| {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let long = overlong_path();
+        let mut out = [0u8; 256];
+        match call(
+            Syscall::Statx.raw(),
+            a4(
+                AT_FDCWD,
+                long.as_ptr() as u64,
+                0,
+                0,
+                out.as_mut_ptr() as u64,
+            ),
+        ) {
+            Some(v) if v == ENAMETOOLONG_E => Ok(()),
+            Some(v) if v == EFAULT_E => {
+                Err("statx reported EFAULT for a readable but over-long path")
+            }
+            _ => Err("statx(over-long path) should be -ENAMETOOLONG"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_statx_overlong_is_enametoolong
+);
+
+// ── ENOTDIR vs ENOENT — link_path_walk's per-component rule ──────────
+
+fn smoke_abi_pathx_stat_through_a_file_is_enotdir() -> TestResult {
+    with_memfs("/pw", "pw", &[("f", b"data")], || {
+        // `/pw/f` is a regular file, so `/pw/f/child` has a NON-FINAL
+        // component that is not a directory:
+        //   if (unlikely(!d_can_lookup(nd->path.dentry))) return -ENOTDIR;
+        //
+        // This used to report ENOENT, which tells a caller the path is
+        // merely absent — so a configure script or installer would try to
+        // create it, and creating it can never work.
+        let p = b"/pw/f/child\0";
+        let mut sb = [0u8; 256];
+        match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(v) if v == ENOTDIR_E => Ok(()),
+            Some(v) if v == ENOENT_E => {
+                Err("stat through a regular file reported ENOENT, not ENOTDIR")
+            }
+            _ => Err("stat(\"/pw/f/child\") should be -ENOTDIR"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_stat_through_a_file_is_enotdir
+);
+
+fn smoke_abi_pathx_stat_missing_component_is_still_enoent() -> TestResult {
+    with_memfs("/pw2", "pw2", &[("f", b"data")], || {
+        // The classifier must not over-report: a component that is simply
+        // ABSENT is still -ENOENT. Getting this wrong in the other
+        // direction would break every existence probe (libwayland's
+        // wl_socket_lock only proceeds when stat() returns ENOENT).
+        let p = b"/pw2/nothing/child\0";
+        let mut sb = [0u8; 256];
+        match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(v) if v == ENOENT_E => Ok(()),
+            Some(v) if v == ENOTDIR_E => {
+                Err("stat through a MISSING component reported ENOTDIR, not ENOENT")
+            }
+            _ => Err("stat(\"/pw2/nothing/child\") should be -ENOENT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_stat_missing_component_is_still_enoent
+);
+
+fn smoke_abi_pathx_stat_absent_leaf_is_enoent() -> TestResult {
+    with_memfs("/pw3", "pw3", &[("f", b"data")], || {
+        // A walk whose ancestors are all fine and whose LEAF is absent is
+        // the ordinary ENOENT — the classifier only inspects non-final
+        // components, so it must leave this alone.
+        let p = b"/pw3/absent\0";
+        let mut sb = [0u8; 256];
+        match call_stat(p.as_ptr() as u64, sb.as_mut_ptr() as u64) {
+            Some(v) if v == ENOENT_E => Ok(()),
+            _ => Err("stat(\"/pw3/absent\") should be -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_stat_absent_leaf_is_enoent);
+
+fn smoke_abi_pathx_chdir_through_a_file_is_enotdir() -> TestResult {
+    with_memfs("/pw4", "pw4", &[("f", b"data")], || {
+        let p = b"/pw4/f/child\0";
+        match call(Syscall::Chdir.raw(), a0(p.as_ptr() as u64)) {
+            Some(v) if v == ENOTDIR_E => Ok(()),
+            Some(v) if v == ENOENT_E => {
+                Err("chdir through a regular file reported ENOENT, not ENOTDIR")
+            }
+            _ => Err("chdir(\"/pw4/f/child\") should be -ENOTDIR"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chdir_through_a_file_is_enotdir
+);
+
+fn smoke_abi_pathx_statx_through_a_file_is_enotdir() -> TestResult {
+    with_memfs("/pw5", "pw5", &[("f", b"data")], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        let p = b"/pw5/f/child\0";
+        let mut out = [0u8; 256];
+        match call(
+            Syscall::Statx.raw(),
+            a4(AT_FDCWD, p.as_ptr() as u64, 0, 0, out.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == ENOTDIR_E => Ok(()),
+            Some(v) if v == ENOENT_E => {
+                Err("statx through a regular file reported ENOENT, not ENOTDIR")
+            }
+            _ => Err("statx(\"/pw5/f/child\") should be -ENOTDIR"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_statx_through_a_file_is_enotdir
+);
+
+fn smoke_abi_pathx_stat_path_error_precedes_statbuf_check() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE2(newstat)`:
+        //     error = vfs_stat(filename, &stat);
+        //     if (unlikely(error)) return error;
+        //     return cp_new_stat(&stat, statbuf);
+        //
+        // The pathname is resolved BEFORE statbuf is touched, so a path
+        // that names nothing is -ENOENT even when the destination is also
+        // NULL. NARF checked the output pointer first, which reported
+        // -EFAULT and hid every path error behind the destination check —
+        // and made a caller debug the wrong argument.
+        let p = b"/definitely/not/here\0";
+        match call_stat(p.as_ptr() as u64, 0) {
+            Some(v) if v == ENOENT_E => Ok(()),
+            Some(v) if v == EFAULT_E => {
+                Err("stat checked the statbuf pointer before resolving the path")
+            }
+            _ => Err("stat(missing path, NULL statbuf) should be -ENOENT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_stat_path_error_precedes_statbuf_check
+);

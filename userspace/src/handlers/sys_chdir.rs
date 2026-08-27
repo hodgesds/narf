@@ -28,15 +28,14 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     // length, so musl/busybox's chdir(path) hit us with garbage in arg1
     // and failed every cd. Same fix as openat — see
     // [[narf-mmap-no-file-backed]] / the *at ABI cutover.)
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            // LINUX-GAP: `getname()` splits this into -EFAULT (unreadable)
-            // and -ENAMETOOLONG (>= PATH_MAX with no NUL). `copy_user_cstr`
-            // folds both into `None`, and a first-byte probe cannot tell a
-            // 5000-byte mapped path from one that faults at byte 3000, so
-            // the more common case wins.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    // `getname()` reports -EFAULT for an unreadable pointer and
+    // -ENAMETOOLONG for a path that reaches PATH_MAX with no terminator.
+    // Folding both into -EFAULT told a caller its POINTER was bad when the
+    // pointer was fine and the PATH was too long.
+    let path = match copy_user_cstr_checked(ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -72,14 +71,15 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
         let errno = match stat_ino_path_dir_aware_ext(&resolved, true) {
             // Exists, but is not a directory (regular file, device, fifo…).
             Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => -20i64,
-            // Nothing resolves here at all.
-            // LINUX-GAP: when a NON-final component is a non-directory Linux
-            // also says -ENOTDIR; NARF's resolver returns a bare `None` for
-            // the whole walk, so that case reports -ENOENT.
+            // The final component resolves to nothing. Re-classify the
+            // walk: a NON-final component that is not a directory is also
+            // -ENOTDIR in Linux (`link_path_walk`), which this used to
+            // report as -ENOENT.
+            //
             // LINUX-GAP: -EACCES from `path_permission(MAY_EXEC|MAY_CHDIR)`
-            // on a search-forbidden directory is not modelled (NARF does not
-            // enforce directory execute bits here).
-            _ => -2i64,
+            // on a search-forbidden directory is still not modelled — NARF
+            // enforces no directory execute bits.
+            _ => -path_lookup_errno(&resolved),
         };
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;

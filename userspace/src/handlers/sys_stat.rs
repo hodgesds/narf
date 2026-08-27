@@ -32,12 +32,12 @@ pub(crate) fn sys_stat(ctx: &mut dyn TrapContext) {
     // permitted", silently failing every `cat`/`tr`/`head` etc.)
     let path_ptr = args.arg0;
     let out_ptr = args.arg1 as *mut StatBuf;
-    let path_owned = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            // LINUX-GAP: `getname()`'s -ENAMETOOLONG is folded into -EFAULT;
-            // copy_user_cstr reports both as `None`.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    // `getname()`: -EFAULT for an unreadable pointer, -ENAMETOOLONG for a
+    // path at PATH_MAX with no terminator.
+    let path_owned = match copy_user_cstr_checked(path_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
@@ -67,12 +67,12 @@ pub(crate) fn stat_absolute(ctx: &mut dyn TrapContext, path: &str, out_ptr: *mut
     let ops = match ops {
         Some(o) => o,
         None => {
-            // LINUX-GAP: `filename_lookup` splits this into -ENOENT,
-            // -ENOTDIR (a non-final component is not a directory), -ELOOP
-            // and -EACCES. `resolve_absolute` returns a bare `None` with no
-            // failure reason, so the whole family collapses to the common
-            // case.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            // `filename_lookup` splits this into -ENOENT, -ENOTDIR, -ELOOP
+            // and -EACCES. `resolve_absolute` reports no reason, so the
+            // walk is re-classified after the fact: see `path_lookup_errno`
+            // for which of those NARF can recover (ENOENT / ENOTDIR) and
+            // which still need machinery it lacks.
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(path)) as u64));
             return;
         }
     };

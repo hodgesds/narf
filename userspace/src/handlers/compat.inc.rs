@@ -507,6 +507,55 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 // real inode number (0 for synthetic FS / dir-root synthesis). Used by
 // the stat/statx handlers so the Linux `st_ino` is a stable per-file id
 // rather than a size-derived hash that aliases same-size DSOs.
+/// `fs/namei.c::link_path_walk` — why did this path walk fail?
+///
+/// A resolver that reports only "no" forces every caller to guess, and the
+/// guess they all made was -ENOENT. But Linux distinguishes:
+///
+/// ```text
+/// /* link_path_walk, per non-final component */
+/// if (unlikely(!d_can_lookup(nd->path.dentry)))
+///         return -ENOTDIR;
+/// ```
+///
+/// so `stat("/etc/passwd/foo")` is -ENOTDIR, not -ENOENT — a real
+/// distinction, because ENOENT invites a caller to create the path while
+/// ENOTDIR says the prefix is a file and creating it never will work.
+/// Configure scripts and package installers branch on exactly this.
+///
+/// Classification runs only on the FAILURE path, so the cost (one stat per
+/// ancestor) is never paid by a successful lookup. It walks the ancestors
+/// in order and stops at the first one that is absent (-ENOENT, since no
+/// later component can be reached) or is not a directory (-ENOTDIR).
+///
+/// LINUX-GAP: -ELOOP needs symlink-depth accounting inside the resolver,
+/// and -EACCES needs directory execute bits that NARF does not enforce at
+/// all. Both still surface here as -ENOENT.
+fn path_lookup_errno(path: &str) -> i64 {
+    const ENOENT: i64 = 2;
+    const ENOTDIR: i64 = 20;
+    let trimmed = path.trim_end_matches('/');
+    // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
+    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+        return ENOENT;
+    };
+    let mut prefix = alloc::string::String::new();
+    for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(comp);
+        // Non-final components are always followed, as in a real walk.
+        match stat_ino_path_dir_aware_ext(&prefix, true) {
+            Some((st, ..)) => {
+                if st.mode.file_type != narf_filesystem::FileType::Dir {
+                    return ENOTDIR;
+                }
+            }
+            None => return ENOENT,
+        }
+    }
+    ENOENT
+}
+
 fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
     stat_ino_path_dir_aware_ext(path, true)
 }
@@ -1549,8 +1598,38 @@ fn copy_user_path(ptr: u64, len: usize) -> Option<alloc::string::String> {
 /// whose path arg is just a bare user pointer with no length, and
 /// the kernel finds the end at the NUL.
 pub(crate) fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
+    copy_user_cstr_checked(ptr, max_len).ok()
+}
+
+/// `fs/namei.c::getname_flags` — copy a NUL-terminated path from user
+/// memory, reporting WHY it failed.
+///
+/// ```text
+/// len = strncpy_from_user(kname, filename, EMBEDDED_NAME_MAX);
+/// if (unlikely(len < 0))          { ... return ERR_PTR(len); }   /* -EFAULT */
+/// ...
+/// if (unlikely(len == PATH_MAX))  { ... return ERR_PTR(-ENAMETOOLONG); }
+/// ```
+///
+/// Linux distinguishes two failures that [`copy_user_cstr`] folds into one
+/// `None`: a pointer it cannot read is -EFAULT, and a path that reaches
+/// PATH_MAX without a terminator is -ENAMETOOLONG. Every path syscall that
+/// mapped `None` to EFAULT therefore reported a bad POINTER for a caller
+/// whose pointer was fine and whose PATH was too long — which sends a
+/// program looking at the wrong argument entirely.
+///
+/// LINUX-GAP: a path that is valid bytes but not valid UTF-8 still takes
+/// the -EFAULT arm. Linux paths are byte strings with no encoding, so it
+/// has no counterpart to this case at all; NARF's VFS is UTF-8-only, and
+/// inventing an errno here would be a guess rather than a mapping.
+pub(crate) fn copy_user_cstr_checked(
+    ptr: u64,
+    max_len: usize,
+) -> Result<alloc::string::String, i64> {
+    const EFAULT: i64 = 14;
+    const ENAMETOOLONG: i64 = 36;
     if ptr == 0 || max_len == 0 || max_len > 65536 {
-        return None;
+        return Err(EFAULT);
     }
     // Bulk-reading `max_len` blindly would walk past the NUL into
     // pages that may not be mapped (a path string that ends near a
@@ -1569,16 +1648,17 @@ pub(crate) fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::
         // SAFETY: SMAP bracket inside copy_from_user; pointer
         // validated against canonical range there.
         // SAFETY: Valid memory or trusted environment
-        unsafe { copy_from_user(&mut chunk, cursor) }.ok()?;
+        unsafe { copy_from_user(&mut chunk, cursor) }.map_err(|_| EFAULT)?;
         if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul_pos]);
-            return alloc::string::String::from_utf8(out).ok();
+            return alloc::string::String::from_utf8(out).map_err(|_| EFAULT);
         }
         out.extend_from_slice(&chunk);
         cursor = chunk_end;
     }
-    // Never found NUL within max_len.
-    None
+    // `len == PATH_MAX` with no terminator — the path is too long, the
+    // pointer was perfectly readable.
+    Err(ENAMETOOLONG)
 }
 
 /// Walk a NULL-terminated user array of `char *` (e.g. argv or

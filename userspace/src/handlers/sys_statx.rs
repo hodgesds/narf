@@ -96,7 +96,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     //                                  cwd; any other negative dirfd is
     //                                  -EBADF from path_init's fdget.
     //   3. otherwise                → vfs_statx: validate `flags`, then walk.
-    let (fs_stat, mnt_id, is_mount_root) = if empty && dirfd >= 0 {
+    // `walked_path` carries the resolved pathname out of the branch so the
+    // failure arm can re-classify the walk (ENOENT vs ENOTDIR). The fd
+    // branch has no pathname and never reaches that arm.
+    let (fs_stat, mnt_id, is_mount_root, walked_path) = if empty && dirfd >= 0 {
         let task = current_task_id();
         let st = fd::with_table(task, |t| {
             t.get(dirfd as u32).map(|e| {
@@ -123,6 +126,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             Some(st),
             crate::mqueue::fd_mount_id(task, dirfd as u32),
             false,
+            alloc::string::String::new(),
         )
     } else {
         // vfs_statx's flag gate. It precedes filename_lookup, so an unknown
@@ -143,13 +147,12 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             // LOOKUP_EMPTY against AT_FDCWD == the cwd itself.
             alloc::string::String::from(".")
         } else {
-            match copy_user_cstr(path_uptr, 4096) {
-                Some(s) => s,
-                None => {
-                    // LINUX-GAP: `getname()` reports -ENAMETOOLONG for a
-                    // pathname >= PATH_MAX with no NUL and -EFAULT for an
-                    // unreadable one; copy_user_cstr collapses both to `None`.
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            // `getname()`: -EFAULT for an unreadable pointer,
+            // -ENAMETOOLONG for a path at PATH_MAX with no terminator.
+            match copy_user_cstr_checked(path_uptr, 4096) {
+                Ok(s) => s,
+                Err(errno) => {
+                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
                     return;
                 }
             }
@@ -190,7 +193,8 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
         let st = stat_ino_path_dir_aware_ext(&path_owned, follow_final);
         let is_mount_root = current_path_is_mount_root(&path_owned);
-        (st, current_mount_id_at(&path_owned), is_mount_root)
+        let mnt = current_mount_id_at(&path_owned);
+        (st, mnt, is_mount_root, path_owned)
     };
 
     let (s, ino, rdev, uid, gid) = match fs_stat {
@@ -201,10 +205,10 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             // existence (e.g. libwayland's wl_socket_lock, which only
             // proceeds when stat() of the socket path returns ENOENT) need
             // the real errno.
-            // LINUX-GAP: filename_lookup also yields -ENOTDIR, -ELOOP and
-            // -EACCES here; the dir-aware resolver returns a bare `None`
-            // with no failure reason, so they collapse into -ENOENT.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            // filename_lookup also yields -ENOTDIR, -ELOOP and -EACCES.
+            // The resolver reports no reason, so the walk is re-classified
+            // after the fact — see `path_lookup_errno`.
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&walked_path)) as u64));
             return;
         }
     };
