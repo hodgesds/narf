@@ -35,7 +35,6 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
     }
     // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
     // then forget the fd → path mapping.
-    #[cfg(feature = "linux-compat")]
     {
         crate::mqueue::notify_close_fd(task, fd);
         crate::mqueue::forget_fd_path(task, fd);

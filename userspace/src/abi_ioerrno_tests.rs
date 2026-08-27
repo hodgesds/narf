@@ -8,7 +8,6 @@
 //! failure with the `-1` sentinel, which reaches userspace as EPERM —
 //! "Operation not permitted" for a closed fd, a faulting buffer, an
 //! already-registered epoll fd, or a contended flock.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 const ELOOP: i64 = -40;

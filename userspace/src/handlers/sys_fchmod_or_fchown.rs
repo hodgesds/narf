@@ -31,7 +31,6 @@ pub(crate) fn sys_fchmod(ctx: &mut dyn TrapContext) {
     let mode = (ctx.args().arg1 as u32 & 0o7777) as u16;
     match poll_blocking(ops.set_perms(mode)) {
         Some(Ok(())) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_attrib_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(0));
         }
@@ -64,7 +63,6 @@ pub(crate) fn sys_fchown(ctx: &mut dyn TrapContext) {
     };
     match poll_blocking(ops.set_owners(uid, gid)) {
         Some(Ok(())) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_attrib_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(0));
         }

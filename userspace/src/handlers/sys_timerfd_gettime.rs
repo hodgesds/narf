@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;

@@ -44,14 +44,12 @@ pub mod lifecycle;
 pub mod loader;
 pub mod manifest;
 pub mod params;
-#[cfg(feature = "linux-compat")]
 pub mod proc_modules;
 pub mod refcount;
 pub mod relocator;
 pub mod sign;
 pub mod symbols;
 pub mod syscalls;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs_module;
 
 #[cfg(test)]
@@ -131,6 +129,5 @@ pub fn boot_init(kernel_abi_hash: u32) {
     symbols::set_kernel_abi(kernel_abi_hash);
     sign::install_verifier(alloc::boxed::Box::new(sign::AcceptAll));
     domain::install_standard_domains();
-    #[cfg(feature = "linux-compat")]
     proc_modules::install_proc_modules();
 }

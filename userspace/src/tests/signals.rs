@@ -756,7 +756,7 @@ kernel_test_in!("userspace", smoke_userspace_signal_hook_slots_round_trip);
 // re-arms to a future deadline so the slow sleep-pump can't double-fire
 // it. This is what makes a CPU-bound task's `setitimer(ITIMER_REAL)`
 // fire without the task ever parking.
-#[cfg(all(not(feature = "user-mode-e2e"), feature = "linux-compat"))]
+#[cfg(not(feature = "user-mode-e2e"))]
 fn smoke_userspace_itimer_real_check_due_irq_fires_and_rearms() -> TestResult {
     use crate::posix_timer::{
         __test_arm_itimer_real, __test_itimer_real_next_fire, __test_reset,
@@ -801,7 +801,7 @@ fn smoke_userspace_itimer_real_check_due_irq_fires_and_rearms() -> TestResult {
     __test_reset();
     TestResult::Pass
 }
-#[cfg(all(not(feature = "user-mode-e2e"), feature = "linux-compat"))]
+#[cfg(not(feature = "user-mode-e2e"))]
 kernel_test_in!(
     "userspace",
     smoke_userspace_itimer_real_check_due_irq_fires_and_rearms
@@ -2467,7 +2467,6 @@ kernel_test_in!(
 
 // ── Wave-70 linux-compat: signalfd4 + memfd seals ──────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2578,7 +2577,6 @@ fn smoke_userspace_signalfd_reads_pending_siginfo() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_signalfd_reads_pending_siginfo);
 
 // ── Wave-73: POSIX timer smokes ────────────────────────────────────────
@@ -2588,7 +2586,6 @@ kernel_test_in!("userspace", smoke_userspace_signalfd_reads_pending_siginfo);
 // remaining, delete/invalidation, clock_nanosleep abs-time, and
 // CLOCK_MONOTONIC_RAW/BOOTTIME sanity.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2704,10 +2701,8 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
         TestResult::Fail("SIGUSR1 not in pending after timer pump")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_posix_timer_signal_delivery);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2823,10 +2818,8 @@ fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_posix_timer_gettime_remaining);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2946,5 +2939,4 @@ fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
         _ => TestResult::Fail("timer_gettime after delete did not return -EINVAL"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_posix_timer_delete_cancels);

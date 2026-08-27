@@ -21,4 +21,3 @@ narf-filesystem   = { path = "../filesystem" }
 workspace = true
 
 [features]
-linux-compat = ["narf-filesystem/linux-compat"]

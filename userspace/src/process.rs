@@ -307,7 +307,6 @@ pub unsafe fn load_user_process_with_root(
     // its chroot before exec, so `apply_chroot` keyed on the current
     // task rewrites the interpreter path into the rootfs. Outside any
     // chroot, `apply_chroot` returns the path unchanged.
-    #[cfg(feature = "linux-compat")]
     let interp_fs_owned: Option<alloc::vec::Vec<u8>> = image
         .interp
         .as_deref()
@@ -320,8 +319,6 @@ pub unsafe fn load_user_process_with_root(
             };
             read_path_from_vfs(&resolved)
         });
-    #[cfg(not(feature = "linux-compat"))]
-    let interp_fs_owned: Option<alloc::vec::Vec<u8>> = None;
 
     if let Some(name) = image.interp.as_deref() {
         let registered: Option<&[u8]> = interp::lookup_interpreter(name).map(|s| s as &[u8]);
@@ -503,7 +500,7 @@ pub unsafe fn load_user_process_with_root(
     // NARF-native (no-interpreter) path keeps the all-zero top-of-
     // stack contract that the smoke tests assert against. We determine
     // this by checking if args/envp/auxv are completely empty.
-    #[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+    #[cfg(target_arch = "x86_64")]
     let (stack_top_v, at_random_vaddr) =
         if interp_loaded || !argv.is_empty() || !envp.is_empty() || !aux.is_empty() {
             let entropy_va = stack_top_v - 16;
@@ -524,7 +521,7 @@ pub unsafe fn load_user_process_with_root(
         } else {
             (stack_top_v, None)
         };
-    #[cfg(not(all(feature = "linux-compat", target_arch = "x86_64")))]
+    #[cfg(not(target_arch = "x86_64"))]
     let (stack_top_v, at_random_vaddr): (u64, Option<u64>) = (stack_top_v, None);
 
     // Build the final aux vector: caller-supplied entries take
@@ -950,7 +947,6 @@ fn aux_pair(e: &AuxEntry) -> (u32, u64) {
 /// vector. Returns `None` when the path doesn't resolve, the file
 /// is empty, the read exceeds 64 MiB (defensive cap — a sane ld-musl
 /// is <200 KiB), or any read short-circuits with `FsError`.
-#[cfg(feature = "linux-compat")]
 pub fn read_path_from_vfs(abs_path: &str) -> Option<alloc::vec::Vec<u8>> {
     use crate::handlers::poll_io_to_completion;
     use narf_filesystem::resolve_async;

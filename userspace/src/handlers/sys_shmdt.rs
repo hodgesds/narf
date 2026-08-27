@@ -25,7 +25,6 @@ use super::*;
 /// caller, and detaching a segment that was already IPC_RMID'd is a plain
 /// success, not -EIDRM. Every failure exit below therefore reports -EINVAL
 /// deliberately — none of them is a stand-in for an unwritten errno.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmdt(ctx: &mut dyn TrapContext) {
     // `shmaddr` is a `char __user *`, so unlike shmid/shmflg it really is the
     // whole register.

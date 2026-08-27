@@ -169,7 +169,6 @@ pub fn __reset_for_test() {
 /// `video_register_device` → `device_create` flow in
 /// `drivers/media/v4l2-core/v4l2-dev.c:__video_register_device`
 /// (GPL-2.0-or-later).
-#[cfg(feature = "linux-compat")]
 fn register_sysfs(idx: usize, camera_name: &str) {
     use narf_filesystem::sysfs::{class_device_register, class_register, kobject_add_attr};
 
@@ -266,9 +265,6 @@ impl FileOps for VideoFile {
 }
 
 // ── devfs lookup integration ──────────────────────────────────────────────
-
-#[cfg(not(feature = "linux-compat"))]
-fn register_sysfs(_idx: usize, _camera_name: &str) {}
 
 /// Look up a camera by its `video<N>` minor number.
 pub fn lookup_video(name: &str) -> Option<Arc<dyn FileOps>> {

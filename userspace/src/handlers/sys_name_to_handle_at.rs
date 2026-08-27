@@ -2,7 +2,6 @@
 use super::*;
 
 /// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     const EINVAL: i64 = 22;
     const ENOENT: i64 = 2;

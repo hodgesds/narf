@@ -18,7 +18,6 @@ narf-filesystem   = { path = "../../filesystem" }
 narf-block        = { path = "../../block" }
 
 [features]
-linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

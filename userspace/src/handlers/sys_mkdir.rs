@@ -77,7 +77,6 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     }
     match poll_blocking(parent.mkdir(&leaf)) {
         Some(Ok(directory)) => {
-            #[cfg(feature = "linux-compat")]
             {
                 let (uid, gid) = current_fs_ids();
                 let owner_result = poll_blocking(directory.set_dir_owners_async(uid, gid));
@@ -107,8 +106,6 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                 }
                 crate::mqueue::notify_create(&path, true);
             }
-            #[cfg(not(feature = "linux-compat"))]
-            let _ = (directory, mode);
             ctx.set_return(SyscallReturn::ok(0));
         }
         // A racing create of the same leaf → EEXIST (matches the exists check

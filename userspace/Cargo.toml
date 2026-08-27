@@ -44,7 +44,7 @@ narf-power        = { path = "../power" }
 # builds the Linux-shaped surface into the kernel. Strip with
 # --no-default-features at the workspace level if a future
 # non-Linux-shaped consumer wants them off.
-default = ["linux-compat"]
+default = []
 
 # Kernel-side syscall tracer (poor-man's strace; ptrace is a stub). When on,
 # the dispatch point logs process-lifecycle syscalls (clone/fork/execve/exit/
@@ -79,7 +79,6 @@ user-mode-e2e = []
 # set_tid_address, mprotect, madvise, dynamic-linker plumbing,
 # pthread bring-up under relibc, fcntl(2) extensions, signalfd, memfd,
 # Linux ABI struct stat + statx, mount/umount2/chroot, POSIX timers.
-linux-compat = ["narf-memory/linux-compat", "narf-filesystem/linux-compat"]
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
 # Orthogonal to linux-compat — a container runtime needs both; a

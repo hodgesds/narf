@@ -7691,7 +7691,6 @@ impl AddressSpace {
     /// - `Err(Unmapped)` if any page in a non-empty request is unmapped.
     /// - `Err(AlignmentMismatch)` if `base` is not page-aligned, or if
     ///   `new_perms` carries `WRITE | EXEC` (W^X). Length rounds upward.
-    #[cfg(feature = "linux-compat")]
     pub fn mprotect_range(
         &self,
         base: VirtAddr,
@@ -7777,7 +7776,6 @@ impl AddressSpace {
     /// live `Cap<Jit, Grant>`. Splitting it out this way keeps exactly one
     /// place where a W|X mapping can come into existence, and that place is
     /// capability-gated.
-    #[cfg(feature = "linux-compat")]
     pub(crate) fn mprotect_range_wx_checked(
         &self,
         base: VirtAddr,
@@ -8030,7 +8028,6 @@ impl AddressSpace {
     /// - `Ok(())` on a successful pass or zero-length no-op.
     /// - `Err(Unmapped)` if any page in a non-empty request is unmapped.
     /// - `Err(AlignmentMismatch)` for misaligned `base`; length rounds up.
-    #[cfg(feature = "linux-compat")]
     pub fn madvise_dontneed(&self, base: VirtAddr, len: u64) -> Result<(), AddressSpaceError> {
         if base.as_u64() & 0xFFF != 0 {
             return Err(AddressSpaceError::AlignmentMismatch);

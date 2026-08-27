@@ -443,13 +443,8 @@ const TFQ_PROBE_ADDR: usize = 40;
 /// Resolve the program `(id, fd_type)` behind a task fd. Backed by the
 /// perf-event layer, a `linux-compat` feature; without it there is no fd kind
 /// that carries a program, so this is `None` and the query returns `ENOTSUP`.
-#[cfg(feature = "linux-compat")]
 fn task_fd_prog_id(fd: u32) -> Option<(u32, u32)> {
     crate::perf_event::bpf_task_fd_query(fd)
-}
-#[cfg(not(feature = "linux-compat"))]
-fn task_fd_prog_id(_fd: u32) -> Option<(u32, u32)> {
-    None
 }
 
 /// `BPF_TASK_FD_QUERY` — given a task's fd that carries a BPF program, report

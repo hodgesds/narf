@@ -75,7 +75,6 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // Mirror into PROC_COMM so /proc/[pid]/comm reflects the new name.
             if let Ok(s) = core::str::from_utf8(&name[..nul_pos]) {
                 set_proc_comm(task, s);
-                #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_comm(task, s);
             }
             ctx.set_return(SyscallReturn::ok(0));

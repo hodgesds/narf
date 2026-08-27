@@ -238,19 +238,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
 
     let pages = (len >> 12) as usize;
     let perms = perms_of_prot(prot);
-    #[cfg(feature = "linux-compat")]
     let task = current_task_id();
-    #[cfg(feature = "linux-compat")]
     let lpid = task_to_pid_raw(task).unwrap_or(task);
-    #[cfg(feature = "linux-compat")]
     let as_key = shm_as_key(&as_ref);
-    #[cfg(feature = "linux-compat")]
     if flags & MAP_FIXED != 0 {
         shm_register_as_owner(as_key, lpid);
     }
-    #[cfg(feature = "linux-compat")]
     let shm_transaction = (flags & MAP_FIXED != 0).then(|| shm_mapping_transaction(as_key));
-    #[cfg(feature = "linux-compat")]
     let _shm_guard = shm_transaction
         .as_ref()
         .map(|transaction| transaction.lock());
@@ -278,7 +272,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // `mapped_file::publish_current_mapping` updated the file
                 // owner table under the VMA transaction. Only the independent
                 // SysV attachment index remains to mirror here.
-                #[cfg(feature = "linux-compat")]
                 {
                     shm_record_fixed_punch(as_key, hint, hint + len, lpid);
                 }
@@ -463,7 +456,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 record_fixed_replacement_owner_committed!();
-                #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
@@ -557,7 +549,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 // still reach them.
                 // Registration was committed atomically with VMA publication
                 // by `publish_current_mapping` above.
-                #[cfg(feature = "linux-compat")]
                 crate::perf_event::on_mmap(current_task_id(), fd, base, len, offset, prot, flags);
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
@@ -650,7 +641,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         ctx.set_return(SyscallReturn::ok((-12i64) as u64));
                         return;
                     }
-                    #[cfg(feature = "linux-compat")]
                     crate::perf_event::on_mmap(current_task_id(), -1, base, len, 0, prot, flags);
                     ctx.set_return(SyscallReturn::ok(base));
                     return;
@@ -929,7 +919,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         record_fixed_replacement_owner_committed!();
     }
 
-    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_mmap(
         current_task_id(),
         if anonymous { -1 } else { fd },

@@ -544,7 +544,6 @@ fn cgroup_of(pid: u64) -> Arc<Cgroup> {
 /// returns the caller's namespace-local pid. `None` when the hook is absent
 /// (pre-boot, or a build without linux-compat).
 fn caller_pid() -> Option<u64> {
-    #[cfg(feature = "linux-compat")]
     {
         let pid = crate::procfs::current_outer_pid();
         if pid != 0 {
@@ -1128,24 +1127,12 @@ fn parse_max(text: &str) -> Result<Option<u64>, FsError> {
     }
 }
 
-#[cfg(feature = "linux-compat")]
 fn report_pid(pid: u64) -> Option<u64> {
     crate::procfs::pid_report(pid)
 }
 
-#[cfg(not(feature = "linux-compat"))]
-fn report_pid(pid: u64) -> Option<u64> {
-    Some(pid)
-}
-
-#[cfg(feature = "linux-compat")]
 fn resolve_pid(pid: u64) -> Option<u64> {
     crate::procfs::pid_resolve(pid)
-}
-
-#[cfg(not(feature = "linux-compat"))]
-fn resolve_pid(pid: u64) -> Option<u64> {
-    Some(pid)
 }
 
 fn render_core(cg: &Arc<Cgroup>, f: CoreFile) -> String {

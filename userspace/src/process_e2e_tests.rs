@@ -934,7 +934,6 @@ kernel_test_in!("userspace/process", smoke_task_refcount_lifetime);
 /// so a missed row lived forever and kept receiving signals/timer fires).
 // Exercises ITIMER_REAL teardown (posix_timer test hooks), which only exist in
 // the linux-compat build.
-#[cfg(feature = "linux-compat")]
 fn smoke_exit_sweeps_task_tables() -> TestResult {
     const TID: u64 = 0xF1_00;
     const PID: u64 = 0xF1_01;
@@ -1001,7 +1000,6 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace/process", smoke_exit_sweeps_task_tables);
 
 /// The exit-time robust-futex walk reads fully user-controlled pointers
@@ -3838,7 +3836,7 @@ kernel_test_in!(
 //      on FUTEX_WAIT observes a wake. End-to-end signature of
 //      pthread_join's wake path.
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     use narf_memory::AddressSpace;
 
@@ -3953,7 +3951,7 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     *PROC_PARENT_AS.lock() = None;
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
 
 /// CLONE_SIGHAND/CLONE_THREAD share the LIVE signal-handler table: a
@@ -3963,7 +3961,7 @@ kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
 /// table and any signal to it took the default action (killing it) —
 /// which broke musl's setxid/pthread_cancel machinery. A plain fork,
 /// by contrast, must DEEP-COPY (post-fork installs stay private).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     use narf_memory::AddressSpace;
     const PARENT: u64 = 0xF0_67;
@@ -4074,13 +4072,12 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     crate::handlers::__test_sigaction_reset();
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace/process",
     smoke_clone_thread_shares_sighand_fork_copies
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_wave65_set_tid_address_records_and_returns_tid() -> TestResult {
     const ME: u64 = 0xF0_66;
     crate::syscall::__test_clear_global();
@@ -4140,13 +4137,12 @@ fn smoke_wave65_set_tid_address_records_and_returns_tid() -> TestResult {
     teardown_process_state();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace/process",
     smoke_wave65_set_tid_address_records_and_returns_tid
 );
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     use narf_memory::AddressSpace;
 
@@ -4294,13 +4290,13 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     *PROC_PARENT_AS.lock() = None;
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace/process",
     smoke_wave65_clone_child_cleartid_wakes_on_exit
 );
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_process_ptrace_e2e() -> TestResult {
     use crate::ptrace::*;
     use narf_memory::AddressSpace;
@@ -4571,7 +4567,7 @@ fn smoke_process_ptrace_e2e() -> TestResult {
     TestResult::Pass
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);
 
 // ── PTRACE_SYSCALL: syscall-entry/exit stops (strace core) ──────────
@@ -4589,7 +4585,7 @@ kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);
 // stop signal under PTRACE_O_TRACESYSGOOD, orig_rax pinning at the exit
 // stop, and PEEKUSER/GETREGSET reads. With no executor wired the stop
 // records state and returns instead of parking, so we can assert on it.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_process_ptrace_syscall_stop() -> TestResult {
     use crate::ptrace::*;
     use narf_memory::AddressSpace;
@@ -4890,10 +4886,10 @@ fn smoke_process_ptrace_syscall_stop() -> TestResult {
     TestResult::Pass
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_ptrace_syscall_stop);
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_process_coredump_e2e() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -5119,7 +5115,7 @@ fn smoke_process_coredump_e2e() -> TestResult {
     TestResult::Pass
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_coredump_e2e);
 
 // ── waitid(2) blocking-path smokes ────────────────────────────────────

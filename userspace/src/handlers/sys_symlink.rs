@@ -41,7 +41,6 @@ pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link
     match outcome {
         Some(Some(Ok(_))) => {
             // inotify: a new symlink is IN_CREATE on the link path.
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_create(link_path, false);
             ctx.set_return(SyscallReturn::ok(0))
         }

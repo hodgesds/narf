@@ -28,7 +28,6 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
     // Wave-70: prefer the new linux-compat SignalFdFile; replace mask
     // path uses its `set_mask`. Fall back to legacy SignalFd on a non-
     // linux-compat build (skip the side-table register, mint legacy).
-    #[cfg(feature = "linux-compat")]
     {
         if fd_arg >= 0 {
             // Replace mask on existing signalfd.
@@ -69,34 +68,6 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
                 // `do_signalfd4` publishes the new signalfd with
                 // `get_unused_fd_flags`, so a table at RLIMIT_NOFILE is
                 // -EMFILE.
-                ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
-                return;
-            }
-        };
-        ctx.set_return(SyscallReturn::ok(new_fd as u64));
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = fd_arg;
-        let sfd = crate::io_mux::SignalFd::new(mask, task);
-        // `crate::linux_compat` only exists under that feature; use the raw
-        // signalfd4 flag bits here (SFD_CLOEXEC == O_CLOEXEC == 0x80000,
-        // SFD_NONBLOCK == O_NONBLOCK == 0o4000) so this branch builds without it.
-        let cloexec = (flags & 0x80000) != 0;
-        let nonblock = (flags & 0o4000) != 0;
-        let install_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
-        let status_flags = if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-        let new_fd = match fd::install(task, crate::fd::FdEntry {
-                ops: sfd,
-                offset: 0,
-                flags: install_flags,
-                status_flags,
-            }) {
-            Some(n) => n,
-            None => {
-                // Same allocation contract as the linux-compat branch above:
-                // `do_signalfd4` gets its descriptor from
-                // `get_unused_fd_flags`, so a full table is -EMFILE.
                 ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
                 return;
             }

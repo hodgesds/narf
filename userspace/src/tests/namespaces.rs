@@ -235,143 +235,6 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_bootstrap_returns_config_page);
 
-#[cfg(all(target_arch = "x86_64", not(feature = "linux-compat")))]
-fn smoke_userspace_stat_returns_size() -> TestResult {
-    use crate::{
-        fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
-        syscall::__test_clear_global, StatBuf, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
-        TrapContext,
-    };
-    use alloc::boxed::Box;
-    use alloc::sync::Arc;
-    use core::sync::atomic::{AtomicU64, Ordering};
-    use narf_capabilities::{Cap, Grant};
-    use narf_filesystem::{
-        bootstrap_mount_authority, registry, DirEntry, DirOps, FileOps, FsFuture, FsInstance,
-        MountPoint, Stat,
-    };
-
-    static FILE_BYTES: &[u8] = b"STAT-PROBE-12345"; // 16 bytes
-    struct StubFile;
-    impl FileOps for StubFile {
-        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
-            Box::pin(async move { Ok(0) })
-        }
-        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
-            let n = b.len();
-            Box::pin(async move { Ok(n) })
-        }
-        fn stat(&self) -> Stat {
-            Stat {
-                size: FILE_BYTES.len() as u64,
-                blocks: 1,
-                mode: narf_filesystem::Mode::FILE_RO,
-                mtime_cycles: 0xC0FFEE,
-            }
-        }
-    }
-    struct StubDir;
-    impl DirOps for StubDir {
-        fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
-            if name == "stat-target" {
-                Some(Arc::new(StubFile))
-            } else {
-                None
-            }
-        }
-        fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-            Box::new(core::iter::empty())
-        }
-    }
-    struct StubFs;
-    impl FsInstance for StubFs {
-        fn root(&self) -> Arc<dyn DirOps> {
-            Arc::new(StubDir)
-        }
-        fn name(&self) -> &str {
-            "stat-stub"
-        }
-    }
-
-    let auth: Cap<MountPoint, Grant> = bootstrap_mount_authority();
-    // `/stat-test` is unique to this test; if a prior run already
-    // mounted it, the second mount surfaces Busy and we continue
-    // with the existing mount (file resolution still works).
-    let _ = registry().mount(&auth, "/stat-test", StubFs);
-
-    fd::__test_reset();
-    static FAKE_TASK: AtomicU64 = AtomicU64::new(0xD2);
-    fn task_lookup() -> u64 {
-        FAKE_TASK.load(Ordering::Relaxed)
-    }
-    install_task_id_lookup(task_lookup);
-
-    __test_clear_global();
-    let mut t = SyscallTable::new();
-    install_core_syscalls(&mut t);
-    install_global(t);
-
-    struct FakeCtx {
-        args: SyscallArgs,
-        ret: Option<SyscallReturn>,
-    }
-    impl TrapContext for FakeCtx {
-        fn args(&self) -> &SyscallArgs {
-            &self.args
-        }
-        fn set_return(&mut self, r: SyscallReturn) {
-            self.ret = Some(r);
-        }
-        fn user_rsp(&self) -> u64 {
-            0
-        }
-        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
-            false
-        }
-
-        fn rip(&self) -> u64 {
-            0
-        }
-        fn set_rip(&mut self, _rip: u64) {}
-    }
-
-    let mut out = StatBuf::default();
-    let path = b"/stat-test/stat-target";
-    let mut sctx = FakeCtx {
-        args: SyscallArgs {
-            arg0: path.as_ptr() as u64,
-            arg1: path.len() as u64,
-            arg2: &mut out as *mut StatBuf as u64,
-            ..Default::default()
-        },
-        ret: None,
-    };
-    kernel_syscall_entry(Syscall::Stat.raw(), &mut sctx);
-    if sctx.ret != Some(SyscallReturn::ok(0)) {
-        return TestResult::Fail("Stat did not return Ok");
-    }
-    if out.size != FILE_BYTES.len() as u64 {
-        if out.size == 0 {
-            return TestResult::Fail("StatBuf.size is 0");
-        } else {
-            return TestResult::Fail("StatBuf.size mismatch (not 0)");
-        }
-    }
-    if out.mtime_cycles != 0xC0FFEE {
-        return TestResult::Fail("StatBuf.mtime_cycles mismatch");
-    }
-    // Mode high bits should mark this as a regular file (0o100000).
-    if out.mode & 0o170000 != 0o100000 {
-        return TestResult::Fail("StatBuf.mode missing regular-file marker");
-    }
-
-    fd::__test_reset();
-    __test_clear_global();
-    TestResult::Pass
-}
-#[cfg(all(target_arch = "x86_64", not(feature = "linux-compat")))]
-kernel_test_in!("userspace", smoke_userspace_stat_returns_size);
-
 fn smoke_userspace_hostname_round_trip() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -1214,7 +1077,6 @@ fn smoke_wave72_sys_unshare_honours_new_flags() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_wave72_sys_unshare_honours_new_flags);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -1319,7 +1181,6 @@ fn smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target() -> TestR
         TestResult::Fail("monotonic_ns after clock_nanosleep is before target")
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_clock_nanosleep_abstime_returns_at_or_after_target

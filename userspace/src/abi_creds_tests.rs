@@ -1,5 +1,4 @@
 //! Linux syscall ABI conformance — creds group.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ─────────────────────────────────────────────────────────────────────

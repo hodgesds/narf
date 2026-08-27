@@ -33,7 +33,6 @@ use super::*;
 ///
 /// The path lookup also runs before `cp_new_stat`, so the dirfd's
 /// -EBADF/-ENOTDIR and the walk's -ENOENT all outrank a bad `statbuf`.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: `int fstatat(int dirfd, const char *pathname,

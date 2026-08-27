@@ -218,7 +218,6 @@ pub const KERNEL_TERMIOS2_LEN: usize = 44;
 /// A plausible fixed baud (38400) reported in the `c_ispeed`/`c_ospeed`
 /// fields of a TCGETS2 reply for a virtual console/PTY (which has no real
 /// line rate). tcgetattr only needs a self-consistent value.
-#[cfg(feature = "linux-compat")]
 const TERMIOS2_BAUD: u32 = 38400;
 
 // `c_lflag` bits we honour (asm-generic termbits).
@@ -343,7 +342,6 @@ pub struct Pty {
     /// Linux's `tty->ctrl.lock` protects the session and foreground process
     /// group as one state. Keeping both fields under one lock prevents a
     /// concurrent reader from observing half of a `TIOCSCTTY` publication.
-    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
     ctrl: IrqSafeSpinLock<PtyControl>,
 
     /// Allocation index; becomes the `/dev/pts/<N>` name.
@@ -399,7 +397,6 @@ pub struct Pty {
     /// `FsError::Io(...)` so the syscall layer surfaces -EIO.
     // Only read by the `linux-compat` lock/unlock paths; always constructed so
     // the field is dead only when that feature is off.
-    #[cfg_attr(not(feature = "linux-compat"), allow(dead_code))]
     pub(crate) locked: AtomicBool,
 }
 
@@ -418,7 +415,6 @@ impl Pty {
             && self.slave_opens.load(Ordering::Acquire) == 0
     }
 
-    #[cfg(feature = "linux-compat")]
     fn acquire_controlling_tty(&self, arg: usize, readable: bool) -> Result<(), FsError> {
         // Linux maps a PTY master to its slave-side `real_tty` before job
         // control ioctls, so both endpoints share this transaction.
@@ -582,7 +578,6 @@ pub fn pty_fg_pgrp(index: u32) -> u64 {
 /// layer to satisfy `TIOCGPTPEER` (musl/glibc prefer this over
 /// `ptsname()+open()`). Returns `None` if the master is gone, or
 /// `Some(Err(()))` if the slave is still locked.
-#[cfg(feature = "linux-compat")]
 pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
     let pty = pts_lookup(index)?;
     if pty.locked.load(Ordering::Acquire) {
@@ -603,7 +598,7 @@ pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
 // which is the case on every CPU NARF boots. See
 // `[[project_user_cstr_page_safety]]` for the broader pattern.
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -636,7 +631,7 @@ pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> 
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -655,7 +650,7 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
 // Non-x86_64 fallback — no SMAP, just raw pointer ops (aarch64 has
 // its own MTE/PAN dance but the FS layer here is still x86_64-only
 // in practice).
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -681,7 +676,7 @@ pub(crate) unsafe fn write_user_i32(uptr: usize, v: i32) -> Result<(), FsError> 
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -696,7 +691,6 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
 
 /// POSIX `struct winsize` — mirrors `userspace::fd::Winsize` so the FS
 /// crate can satisfy `TIOCGWINSZ`/`TIOCSWINSZ` without depending on it.
-#[cfg(feature = "linux-compat")]
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WireWinsize {
@@ -706,7 +700,7 @@ pub(crate) struct WireWinsize {
     pub(crate) ws_ypixel: u16,
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -722,7 +716,7 @@ pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsErr
     Ok(v)
 }
 
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -738,7 +732,7 @@ pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -751,7 +745,7 @@ pub(crate) unsafe fn read_user_winsize(uptr: usize) -> Result<WireWinsize, FsErr
     Ok(unsafe { core::ptr::read_unaligned(uptr as *const WireWinsize) })
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -768,7 +762,7 @@ pub(crate) unsafe fn write_user_winsize(uptr: usize, v: WireWinsize) -> Result<(
 /// Copy a pty's `struct termios` wire image (60 bytes) out to user memory
 /// for TCGETS. Mirrors what the program last set via TCSETS, so
 /// tcgetattr(tcsetattr(x)) round-trips.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn write_user_termios(
     uptr: usize,
     src: &[u8; TERMIOS_WIRE_LEN],
@@ -790,7 +784,7 @@ pub(crate) unsafe fn write_user_termios(
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn write_user_termios(
     uptr: usize,
     src: &[u8; TERMIOS_WIRE_LEN],
@@ -807,7 +801,7 @@ pub(crate) unsafe fn write_user_termios(
 
 /// Read a `struct termios` wire image (60 bytes) in from user memory for
 /// TCSETS.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -828,7 +822,7 @@ pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_
     Ok(out)
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -845,7 +839,7 @@ pub(crate) unsafe fn read_user_termios(uptr: usize) -> Result<[u8; TERMIOS_WIRE_
 
 /// TCGETS2: write a 44-byte `struct termios2` — the 36-byte kernel `termios`
 /// (first 36 bytes of our internal image) plus `c_ispeed`/`c_ospeed`.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn write_user_termios2(
     uptr: usize,
     src: &[u8; TERMIOS_WIRE_LEN],
@@ -867,7 +861,7 @@ pub(crate) unsafe fn write_user_termios2(
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn write_user_termios2(
     uptr: usize,
     src: &[u8; TERMIOS_WIRE_LEN],
@@ -886,7 +880,7 @@ pub(crate) unsafe fn write_user_termios2(
 
 /// TCSETS2: read a 44-byte `struct termios2`; keep the 36-byte `termios` part
 /// (the `c_ispeed`/`c_ospeed` speeds are meaningless for a virtual console).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -903,7 +897,7 @@ pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE
     Ok(out)
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn read_user_termios2(uptr: usize) -> Result<[u8; TERMIOS_WIRE_LEN], FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -1045,7 +1039,6 @@ impl FileOps for PtyMaster {
     /// Wave-76: PtyMaster identifies itself via the FileOps hook so
     /// `sys_ioctl(TIOCGPTPEER)` can allocate a fresh slave fd without
     /// a `Any`-based downcast on `Arc<dyn FileOps>`.
-    #[cfg(feature = "linux-compat")]
     fn as_pty_master_index(&self) -> Option<u32> {
         Some(self.pty.index)
     }
@@ -1066,7 +1059,6 @@ impl FileOps for PtyMaster {
     // The controlling-tty transaction and its CTTY hook are `linux-compat`
     // machinery; without the feature this override drops to the trait default
     // (`Ok(false)` — TIOCSCTTY is a no-op on non-Linux-ABI builds).
-    #[cfg(feature = "linux-compat")]
     fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
         self.pty.acquire_controlling_tty(arg, readable)?;
         Ok(true)
@@ -1080,7 +1072,6 @@ impl FileOps for PtyMaster {
     /// - `TIOCGPGRP`    — read fg_pgrp into *(i32*)arg
     /// - `TIOCGPTPEER`  — NOT handled here; the syscall layer special-cases
     ///   it to allocate a fresh fd in the caller's table.
-    #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             TIOCGPTN => {
@@ -1342,7 +1333,6 @@ impl FileOps for PtySlave {
     /// - `TIOCGPGRP`  — read the per-tty fg_pgrp
     /// - `TIOCSCTTY`  — install this PTY as the caller's controlling tty
     ///   via the userspace registry (see `set_controlling_tty_hook`).
-    #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             TIOCGPTN => {
@@ -1475,7 +1465,6 @@ impl FileOps for PtySlave {
 
     // See the master-side override above: gated to match the `linux-compat`
     // CTTY machinery, falling back to the trait default when the feature is off.
-    #[cfg(feature = "linux-compat")]
     fn tty_acquire_controlling(&self, arg: usize, readable: bool) -> Result<bool, FsError> {
         self.pty.acquire_controlling_tty(arg, readable)?;
         Ok(true)
@@ -1503,19 +1492,15 @@ impl FileOps for PtySlave {
 /// session AND its foreground process group as one operation. Without the
 /// pgrp half, `tcgetpgrp()` answers 0 forever and a job-control shell's
 /// `initialize_job_control` loop never converges — see the TIOCSCTTY arm.
-#[cfg(feature = "linux-compat")]
 type CttyHook =
     fn(pty_index: u32, tty_sid: u64, arg: usize, readable: bool) -> Result<(u64, u64), FsError>;
 
-#[cfg(feature = "linux-compat")]
 static CTTY_HOOK: IrqSafeSpinLock<Option<CttyHook>> = IrqSafeSpinLock::new(None);
 
-#[cfg(feature = "linux-compat")]
 static TIOCSCTTY_TXN: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
 
 /// Install the hook called from `PtySlave::ioctl(TIOCSCTTY)`. Userspace
 /// uses this to record the caller's controlling tty.
-#[cfg(feature = "linux-compat")]
 pub fn set_controlling_tty_hook(hook: CttyHook) {
     *CTTY_HOOK.lock() = Some(hook);
 }
@@ -1615,7 +1600,6 @@ impl DirOps for DevPts {
         // async path surfaces this as EIO. We can't return Err from
         // a sync `lookup`, so a locked PTY reports NotFound here.
         // The async path below distinguishes locked vs absent.
-        #[cfg(feature = "linux-compat")]
         if pty.locked.load(Ordering::Acquire) {
             return None;
         }
@@ -1629,7 +1613,6 @@ impl DirOps for DevPts {
             }
             let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
             let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
-            #[cfg(feature = "linux-compat")]
             if pty.locked.load(Ordering::Acquire) {
                 return Err(FsError::Busy);
             }

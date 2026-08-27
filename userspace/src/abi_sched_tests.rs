@@ -5,7 +5,6 @@
 //!
 //! Tests pin the implemented Linux-compatible wire behavior. Remaining
 //! cooperative-scheduler gaps are called out locally with LINUX-GAP comments.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

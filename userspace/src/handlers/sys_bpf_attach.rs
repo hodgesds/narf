@@ -552,12 +552,6 @@ pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
     };
     // Iterators live in `crate::bpf_iter`, a linux-compat module; without it
     // the command has no backing.
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = &ops;
-        -ENOTSUP
-    }
-    #[cfg(feature = "linux-compat")]
     match crate::bpf_iter::iter_from_link(&ops) {
         Some(iter) => open_cloexec_fd(iter),
         // The fd is real but is not an iterator link.
@@ -570,12 +564,6 @@ pub(crate) fn bpf_iter_create(attr_uptr: u64, size: usize) -> i64 {
 /// Linux's BTF `iter_info`.
 fn create_iter_link(attr: &[u8; ATTR_BUF]) -> i64 {
     // Iterator links live in `crate::bpf_iter`, a linux-compat module.
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = attr;
-        -ENOTSUP
-    }
-    #[cfg(feature = "linux-compat")]
     {
         let kind = u32_at(attr, LC_TARGET);
         if kind >= crate::bpf_iter::ITER_KIND_COUNT {

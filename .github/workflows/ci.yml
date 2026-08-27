@@ -746,11 +746,9 @@ jobs:
       matrix:
         features:
           - ""
-          - "linux-compat"
           - "container"
-          - "linux-compat,container"
           - "cgroup"
-          - "linux-compat,container,cgroup"
+          - "container,cgroup"
     steps:
       - uses: actions/checkout@v4
 

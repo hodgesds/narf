@@ -171,7 +171,6 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
     if !endpoint.ops.is_stream() {
         endpoint.description.set_offset(offset);
     }
-    #[cfg(feature = "linux-compat")]
     if total != 0 {
         crate::mqueue::notify_modify_fd(task, fd_num);
     }

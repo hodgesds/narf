@@ -468,7 +468,6 @@ kernel_test_in!(
     smoke_userspace_clock_settime_pushes_wall_offset
 );
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -577,7 +576,6 @@ fn smoke_userspace_clock_gettime_monotonic_raw_and_boottime() -> TestResult {
     __test_clear_global();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_userspace_clock_gettime_monotonic_raw_and_boottime

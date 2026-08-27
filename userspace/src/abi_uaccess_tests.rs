@@ -26,8 +26,6 @@
 //!    closes when its scope does, which is what keeps every other test in
 //!    the suite exercising the production predicate.
 
-#![cfg(feature = "linux-compat")]
-
 use crate::abi_test_support::*;
 
 /// Last addressable byte of the user half on both supported

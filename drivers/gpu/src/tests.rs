@@ -83,7 +83,6 @@ kernel_test_in!(
 // NULL and weston's find_primary_gpu reports "no drm device found" even
 // though /dev/dri/card0 exists. Guard the card0 uevent shape. The DRM
 // sysfs bridge is linux-compat-only, so this test follows that gate.
-#[cfg(feature = "linux-compat")]
 fn smoke_drm_card_uevent_has_major_and_devname() -> TestResult {
     let u = crate::drm_sysfs_bridge::card_uevent(0, "narf-drm");
     if !u.contains("MAJOR=226\n") {
@@ -97,7 +96,6 @@ fn smoke_drm_card_uevent_has_major_and_devname() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("drivers/gpu", smoke_drm_card_uevent_has_major_and_devname);
 
 // A DRM node's `st_rdev` must encode DRM_MAJOR(226):minor, or logind's

@@ -6,7 +6,6 @@
 //! per Linux. All user-pointer buffers here are kernel-owned arrays passed by
 //! address — the handlers access them through copy_from_user / copy_to_user,
 //! so the tests are deterministic and SMAP-agnostic in the test harness.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ── iocb / io_event field layout (Linux <uapi/linux/aio_abi.h>) ─────

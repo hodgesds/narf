@@ -783,7 +783,6 @@ kernel_test_in!("bluetooth/e2e", smoke_e2e_devfs_rfcomm_lifecycle);
 
 // ── 16. /sys/class/bluetooth/hci0/address from synthetic BD_ADDR ────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_e2e_sysfs_hci_address_after_bringup() -> TestResult {
     use crate::bootstrap_bluetooth_authority;
     use crate::sysfs_bridge::register_hci_controller;
@@ -820,7 +819,6 @@ fn smoke_e2e_sysfs_hci_address_after_bringup() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("bluetooth/e2e", smoke_e2e_sysfs_hci_address_after_bringup);
 
 // ── 17. A2DP source — SBC encode + sync word at frame start ────────

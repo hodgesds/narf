@@ -109,7 +109,6 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    #[cfg(feature = "linux-compat")]
     if let Some(ret) = tty_background_access(task, fd_num, false) {
         ctx.set_return(SyscallReturn::ok(ret as u64));
         return;
@@ -117,11 +116,9 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
 
     // fanotify descriptors synthesize metadata and install object fds while
     // draining their private event queue; preserve that special read surface.
-    #[cfg(feature = "linux-compat")]
     let fanotify_group = crate::mqueue::fanotify_active()
         .then(|| crate::mqueue::fanotify_instance_of(task, fd_num))
         .flatten();
-    #[cfg(feature = "linux-compat")]
     if let Some(group) = fanotify_group {
         let max = core::cmp::min(count, 64 * 1024);
         let result = fanotify_read_to_user(task, group, max, |bytes| {

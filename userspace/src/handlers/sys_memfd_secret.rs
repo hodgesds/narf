@@ -10,7 +10,6 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     // `mm/secretmem.c::SYSCALL_DEFINE1(memfd_secret)` allocates the
     // descriptor with `get_unused_fd_flags`: a full table is -EMFILE.
-    #[cfg(feature = "linux-compat")]
     {
         let mfd = crate::linux_compat::MemFdFile::new(0);
         memfd_arc_register(&mfd);
@@ -25,21 +24,6 @@ pub(crate) fn sys_memfd_secret(ctx: &mut dyn TrapContext) {
                 status_flags: crate::fd::O_RDWR,
             });
         match fd {
-            Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
-            None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
-        }
-    }
-    #[cfg(not(feature = "linux-compat"))]
-    {
-        let _ = flags;
-        let ops = narf_filesystem::new_anon_memfile();
-        match fd::install(task, crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: 0,
-                // memfd_secret(2), like memfd_create(2), returns an O_RDWR fd.
-                status_flags: crate::fd::O_RDWR,
-            }) {
             Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
             None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         }

@@ -9,8 +9,6 @@
 //! A separate file from `abi_bpf_tests.rs` on purpose — that file is being
 //! edited by two other agents at the same time.
 
-#![cfg(feature = "linux-compat")]
-
 use crate::abi_test_support::*;
 
 const BPF_BTF_LOAD: u64 = 18;

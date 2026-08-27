@@ -18,7 +18,6 @@
 //!
 //! Shares the harness in [`crate::abi_test_support`]; every test drives
 //! `kernel_syscall_entry` through a synthetic `AbiCtx`.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

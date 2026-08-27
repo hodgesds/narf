@@ -36,7 +36,6 @@ fn fail(errno: i64) -> SyscallReturn {
 /// kernel/user cannot pivot" and falls back to `chroot()` — silently giving
 /// up the mount isolation it asked for — when the actual fault was a typo in
 /// the new root path (ENOENT) or a bind that had not landed yet.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux ABI: pivot_root(const char *new_root, const char *put_old).

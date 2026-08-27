@@ -398,7 +398,6 @@ impl From<CapError> for WxError {
 /// Gated on `linux-compat` because the splitting `mprotect_range` it builds on
 /// is; the NARF-native `change_perms_range` is whole-region only and has no
 /// W^X classification to gate.
-#[cfg(feature = "linux-compat")]
 pub fn jit_mprotect(
     cap: &JitCap,
     space: &AddressSpace,
@@ -509,7 +508,6 @@ kernel_test_in!("memory", smoke_wx_classify_covers_every_arm);
 
 /// The cap-gated entry refuses X→WX even with a live capability, and refuses
 /// everything once the capability is revoked.
-#[cfg(feature = "linux-compat")]
 fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
     let space = AddressSpace::empty();
     let base = VirtAddr::new(0x4000_0000);
@@ -543,7 +541,6 @@ fn smoke_wx_jit_mprotect_refuses_x_to_wx() -> TestResult {
         _ => TestResult::Fail("a revoked JIT cap was still honoured"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("memory", smoke_wx_jit_mprotect_refuses_x_to_wx);
 
 #[cfg(test)]

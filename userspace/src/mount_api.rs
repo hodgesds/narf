@@ -124,22 +124,12 @@ fn mount_of(task: u64, fd_no: u32) -> Option<u64> {
 // feature is enabled. When it isn't, `mount -t proc|sysfs|cgroup2` still
 // succeeds against an empty in-memory directory so systemd's mount unit
 // passes (it degrades gracefully when the contents are absent).
-#[cfg(feature = "linux-compat")]
 fn real_procfs() -> Option<Arc<dyn FsInstance>> {
     Some(Arc::new(narf_filesystem::procfs::ProcFs))
 }
-#[cfg(not(feature = "linux-compat"))]
-fn real_procfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(MemFs::new("proc")))
-}
 
-#[cfg(feature = "linux-compat")]
 fn real_sysfs() -> Option<Arc<dyn FsInstance>> {
     Some(Arc::new(narf_filesystem::SysFs::new()))
-}
-#[cfg(not(feature = "linux-compat"))]
-fn real_sysfs() -> Option<Arc<dyn FsInstance>> {
-    Some(Arc::new(MemFs::new("sysfs")))
 }
 
 #[cfg(feature = "cgroup")]

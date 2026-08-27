@@ -72,7 +72,6 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
     match outcome {
         Some(Some(Ok(()))) => {
             // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_moved(old_path, new_path);
             ctx.set_return(SyscallReturn::ok(0));
         }

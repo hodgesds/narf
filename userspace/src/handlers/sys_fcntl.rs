@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-#[cfg(feature = "linux-compat")]
 fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
     let mut bytes = alloc::vec![0u8; flock_size()];
     // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
@@ -30,14 +29,12 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         if let Some(sock) = current_socket(fd) {
             sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
         }
-        #[cfg(feature = "linux-compat")]
         crate::mqueue::set_fd_nonblock(task, fd, (arg as u32) & crate::fd::O_NONBLOCK != 0);
     }
 
     // F_DUPFD / F_DUPFD_CLOEXEC: dup oldfd into the lowest free slot
     // >= arg. Linux returns the new fd. CLOEXEC variant stamps
     // FD_CLOEXEC atomically.
-    #[cfg(feature = "linux-compat")]
     {
         if cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC {
             // `do_fcntl` receives an already-resolved `struct file *`, so a
@@ -92,7 +89,6 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Gated
     // under linux-compat because the wire `struct flock` layout +
     // BTreeMap lock table only matter for Linux ABI consumers.
-    #[cfg(feature = "linux-compat")]
     {
         if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
             // Resolve the open-file identity from the fd table.
@@ -332,7 +328,6 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // Wave-70: memfd seals. Route F_ADD_SEALS / F_GET_SEALS before
     // the generic fd-table lookup so the seal word lives on the
     // concrete MemFdFile rather than as a per-fd flag.
-    #[cfg(feature = "linux-compat")]
     {
         // `fs/fcntl.c` routes both seal commands into `mm/memfd.c::
         // memfd_fcntl`, which reaches `memfd_file_seals_ptr(file)`:
@@ -389,10 +384,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     // closure — `current_socket` itself locks the table, which would
     // re-enter and deadlock if called from inside `with_table`.
     let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
-    #[cfg(feature = "linux-compat")]
     let mq_nb = crate::mqueue::fd_nonblock(task, fd);
-    #[cfg(not(feature = "linux-compat"))]
-    let mq_nb: Option<bool> = None;
 
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
@@ -426,10 +418,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // F_SETFL: only the settable subset (O_NONBLOCK | O_APPEND
             // | O_DIRECT) is honoured. Access-mode bits are ignored.
             F_SETFL => {
-                #[cfg(feature = "linux-compat")]
                 let mask = crate::fd::O_SETFL_MASK;
-                #[cfg(not(feature = "linux-compat"))]
-                let mask = 0o4000u32; // O_NONBLOCK only.
                 let new = (arg as u32) & mask;
                 let old = t.status_flags(fd)?;
                 t.set_status_flags(fd, (old & !mask) | new)?;

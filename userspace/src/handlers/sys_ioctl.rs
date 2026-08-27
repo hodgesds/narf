@@ -253,7 +253,6 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // PTY job-control ioctls need caller process state, fd access mode, PID
     // namespace translation, and Linux errno ordering. Keep that policy here;
     // the filesystem object owns only the shared raw tty control state.
-    #[cfg(feature = "linux-compat")]
     {
         use narf_filesystem::devfs_pty::{TIOCGPGRP, TIOCGSID, TIOCSCTTY, TIOCSPGRP};
 
@@ -355,7 +354,6 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     // Wave-76 special-case: TIOCGPTPEER allocates a fresh slave fd in
     // the caller's table. The fd-allocation side lives here (not in the
     // filesystem crate), so we hijack the dispatch before delegating.
-    #[cfg(feature = "linux-compat")]
     if cmd == narf_filesystem::devfs_pty::TIOCGPTPEER {
         let idx = match ops.as_pty_master_index() {
             Some(i) => i,

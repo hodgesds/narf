@@ -81,17 +81,11 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    #[cfg(feature = "linux-compat")]
     let task = current_task_id();
-    #[cfg(feature = "linux-compat")]
     let lpid = task_to_pid_raw(task).unwrap_or(task);
-    #[cfg(feature = "linux-compat")]
     let as_key = shm_as_key(&as_ref);
-    #[cfg(feature = "linux-compat")]
     shm_register_as_owner(as_key, lpid);
-    #[cfg(feature = "linux-compat")]
     let shm_transaction = shm_mapping_transaction(as_key);
-    #[cfg(feature = "linux-compat")]
     let _shm_guard = shm_transaction.lock();
     match munmap_core(&as_ref, args.arg0, args.arg1) {
         Ok(len) => {
@@ -102,7 +96,6 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             // freed frames through live PTEs.  The range form mirrors the VMA
             // split so surviving prefix/suffix owners retain their reference.
             crate::mapped_file::punch_current(args.arg0, len);
-            #[cfg(feature = "linux-compat")]
             {
                 shm_record_fixed_punch(as_key, args.arg0, args.arg0 + len, lpid);
             }
@@ -196,7 +189,6 @@ mod tests {
     }
     kernel_test_in!("userspace", smoke_munmap_preserves_glibc_arena_middle);
 
-    #[cfg(feature = "linux-compat")]
     fn smoke_sysv_mapping_transaction_is_shared_per_mm() -> TestResult {
         let first = Arc::new(AddressSpace::empty());
         let second = Arc::new(AddressSpace::empty());
@@ -217,6 +209,5 @@ mod tests {
         }
         TestResult::Pass
     }
-    #[cfg(feature = "linux-compat")]
     kernel_test_in!("userspace", smoke_sysv_mapping_transaction_is_shared_per_mm);
 }

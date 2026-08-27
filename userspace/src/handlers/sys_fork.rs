@@ -208,11 +208,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
     crate::fd::fork(parent_pid, child_tid.raw());
-    #[cfg(feature = "linux-compat")]
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
     cwd_fork(parent_pid, child_tid.raw());
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
-    #[cfg(feature = "linux-compat")]
     root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
     // brk is inherited by `clone_for_fork` (it's address-space state), not copied
@@ -224,7 +222,6 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // terminal's foreground pgrp (no spurious SIGTTIN on its first read).
     pgid_fork(parent_pid, child_tid.raw());
     sid_fork(parent_pid, child_tid.raw());
-    #[cfg(feature = "linux-compat")]
     ctty_fork(parent_pid, child_tid.raw());
     // Wave-67 — propagate the parent's PID + mount namespaces into
     // the child. Tasks in the root namespace skip the rebind (no
@@ -268,7 +265,6 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // Inherit the parent's cgroup-namespace root (if any).
     #[cfg(all(feature = "cgroup", feature = "container"))]
     narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_pid.raw());
-    #[cfg(feature = "linux-compat")]
     crate::perf_event::on_fork(
         task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
         child_pid.raw(),

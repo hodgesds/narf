@@ -10,7 +10,6 @@
 //! injected parent, `getpgid` of a non-self pid, and the `unshare`
 //! mount-namespace arm. Shares the harness in [`crate::abi_test_support`];
 //! every test drives `kernel_syscall_entry` against a synthetic `AbiCtx`.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

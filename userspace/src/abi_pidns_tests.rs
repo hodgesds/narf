@@ -15,7 +15,7 @@
 //!
 //! Gated on `container` (the pid-namespace tables only exist there) AND
 //! `linux-compat` (the ABI harness).
-#![cfg(all(feature = "linux-compat", feature = "container"))]
+#![cfg(feature = "container")]
 
 use crate::abi_test_support::*;
 

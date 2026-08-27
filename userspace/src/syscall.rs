@@ -2634,9 +2634,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Madvise, 28),
     (Syscall::Prctl, 157),
     (Syscall::Setrlimit, 160),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 161),
-    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 155),
     (Syscall::Mount, 165),
     (Syscall::Umount2, 166),
@@ -2652,17 +2650,11 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Getdents, 78), // legacy 32-bit-offset getdents (x86_64-only)
     (Syscall::ClockSetTime, 227),
     (Syscall::ClockGetTime, 228),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Gettimeofday, 96),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Settimeofday, 164),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Time, 201),
-    #[cfg(feature = "linux-compat")]
     (Syscall::InotifyInit, 253),
-    #[cfg(feature = "linux-compat")]
     (Syscall::IoprioSet, 251),
-    #[cfg(feature = "linux-compat")]
     (Syscall::IoprioGet, 252),
     (Syscall::Tgkill, 234),
     (Syscall::Openat, 257),
@@ -2733,22 +2725,14 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // SysV IPC get-by-key: the container build backs these with the IPC
     // namespace; the linux-compat build backs them (plus the full op
     // surface) with the self-contained `sysvipc` module.
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 29),
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 64),
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 68),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerCreate, 222),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerSettime, 223),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerGettime, 224),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerDelete, 226),
-    #[cfg(feature = "linux-compat")]
     (Syscall::ClockNanosleep, 230),
     // tcgetattr/tcsetattr are libc-only on Linux (ioctl(TCGETS) backed);
     // we keep them as direct syscalls and place them in the NARF range.
@@ -2785,9 +2769,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Dup3, 24),
     (Syscall::Fcntl, 25),
     (Syscall::Ioctl, 29),
-    #[cfg(feature = "linux-compat")]
     (Syscall::IoprioSet, 30),
-    #[cfg(feature = "linux-compat")]
     (Syscall::IoprioGet, 31),
     (Syscall::Flock, 32),
     (Syscall::Mkdirat, 34),
@@ -2798,9 +2780,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Renameat, 38),
     (Syscall::Umount2, 39),
     (Syscall::Mount, 40),
-    #[cfg(feature = "linux-compat")]
     (Syscall::PivotRoot, 41),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Chroot, 51),
     (Syscall::Truncate, 45),
     (Syscall::Ftruncate, 46),
@@ -2840,9 +2820,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Nanosleep, 101), // nanosleep (timespec* ABI, not native Sleep)
     (Syscall::ClockSetTime, 112),
     (Syscall::ClockGetTime, 113),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Gettimeofday, 169),
-    #[cfg(feature = "linux-compat")]
     (Syscall::Settimeofday, 170),
     (Syscall::Ptrace, 117),
     (Syscall::SchedSetparam, 118),
@@ -3070,22 +3048,14 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Uname, 160),
     (Syscall::Reboot, 142),
     (Syscall::Setdomainname, 162),
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Shmget, 194),
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Semget, 190),
-    #[cfg(any(feature = "container", feature = "linux-compat"))]
     (Syscall::Msgget, 186),
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerCreate, 107),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerGettime, 108),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerSettime, 110),
-    #[cfg(feature = "linux-compat")]
     (Syscall::TimerDelete, 111),
-    #[cfg(feature = "linux-compat")]
     (Syscall::ClockNanosleep, 115),
 ];
 
@@ -3612,14 +3582,12 @@ pub fn kernel_syscall_entry_plain_with_state(
     // differ from `n.raw()` after version-decoding, so pass what the user
     // put in rax. On the own-stack path the tracee parks here and this call
     // returns when the tracer resumes it; then the syscall dispatches.
-    #[cfg(feature = "linux-compat")]
     if !user_state.is_null() {
         crate::ptrace::ptrace_syscall_stop(&mut ctx, true, num as u64);
     }
     // Entry RIP, to detect a handler that parked to RE-EXECUTE (rewinds RIP
     // by the 2-byte `syscall` width). Such a syscall has not completed, so it
     // must NOT fire an exit-stop — the re-issued syscall will trace again.
-    #[cfg(feature = "linux-compat")]
     let entry_rip = ctx.rip();
     table.dispatch(n, &mut ctx);
     // Return-value half of the trace. Without it the log shows what was
@@ -3672,7 +3640,6 @@ pub fn kernel_syscall_entry_plain_with_state(
     // the syscall's actual value. Skip it when the handler rewound RIP for
     // re-execution (an interrupted/blocking syscall that will re-run) so an
     // exit-stop only ever pairs with a truly completed syscall.
-    #[cfg(feature = "linux-compat")]
     if !user_state.is_null() && ctx.rip() == entry_rip {
         let saved_ret = ctx.ret;
         crate::ptrace::ptrace_syscall_stop(&mut ctx, false, num as u64);
@@ -4391,7 +4358,6 @@ impl SyscallTable {
 
     pub fn dispatch_ctx_versioned(&self, variant: Syscall, version: u8, ctx: &mut dyn TrapContext) {
         narf_lib::perf::syscall();
-        #[cfg(feature = "linux-compat")]
         crate::perf_event::drain_irq_samples();
         if version != 0 {
             if let Some((_, _, handler)) = self

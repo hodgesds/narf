@@ -1,4 +1,3 @@
-#![cfg(feature = "linux-compat")]
 //! End-to-end smokes for sysfs uevent hotplug broadcast.
 //!
 //! Walks the full path a udev/systemd-tmpfiles consumer would see:
@@ -37,7 +36,6 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-#[cfg(feature = "linux-compat")]
 use crate::sysfs::{
     class_device_register, class_register, kobject_add_writable_attr, kobject_emit_uevent,
     kobject_emit_uevent_from_write, uevent_action_from_write, uevent_synth_uuid_from_write,
@@ -88,7 +86,6 @@ impl narf_block::BlockDeviceSync for FakeBlock {
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 /// Reset both uevent ring and sysfs state for test isolation.
-#[cfg(feature = "linux-compat")]
 fn reset() {
     crate::sysfs::__reset_for_test();
     uevent::__reset_for_test();
@@ -102,7 +99,6 @@ fn reset() {
 // device_add() (drivers/base/core.c:3549).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_manual_add() -> TestResult {
     reset();
 
@@ -143,14 +139,12 @@ fn smoke_uevent_e2e_manual_add() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_manual_add);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Smoke 2 — Manual emit REMOVE → reader receives
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_manual_remove() -> TestResult {
     reset();
 
@@ -182,7 +176,6 @@ fn smoke_uevent_e2e_manual_remove() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_manual_remove);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -192,7 +185,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_manual_remove);
 // atomic counter incremented on each kobject_uevent call.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_seqnum_monotonic() -> TestResult {
     reset();
 
@@ -220,7 +212,6 @@ fn smoke_uevent_e2e_seqnum_monotonic() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_seqnum_monotonic);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -231,7 +222,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_seqnum_monotonic);
 // (block/blk-sysfs.c:852, lib/kobject_uevent.c:639).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_block_register_fires_add() -> TestResult {
     reset();
 
@@ -275,14 +265,12 @@ fn smoke_uevent_e2e_block_register_fires_add() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_block_register_fires_add);
 
 // ══════════════════════════════════════════════════════════════════════════
 // Smoke 5 — Block device unregister fires REMOVE
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_block_unregister_fires_remove() -> TestResult {
     reset();
 
@@ -332,7 +320,6 @@ fn smoke_uevent_e2e_block_unregister_fires_remove() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_block_unregister_fires_remove);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -343,7 +330,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_block_unregister_fires_remove);
 // NARF equivalent.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_multi_reader_broadcast() -> TestResult {
     reset();
 
@@ -382,7 +368,6 @@ fn smoke_uevent_e2e_multi_reader_broadcast() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_multi_reader_broadcast);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -393,7 +378,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_multi_reader_broadcast);
 // consumer doesn't affect delivery to a fast one.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_slow_reader_independent_cursor() -> TestResult {
     reset();
 
@@ -456,7 +440,6 @@ kernel_test_in!(
 // seqnums start at 45 (events 1..44 were evicted).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_ring_overflow_no_panic() -> TestResult {
     reset();
 
@@ -501,7 +484,6 @@ fn smoke_uevent_e2e_ring_overflow_no_panic() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_ring_overflow_no_panic);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -512,7 +494,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_ring_overflow_no_panic);
 // kobj, KOBJ_ADD) with the kset name "net".
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_net_register_fires_add() -> TestResult {
     reset();
 
@@ -547,7 +528,6 @@ fn smoke_uevent_e2e_net_register_fires_add() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_net_register_fires_add);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -557,7 +537,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_net_register_fires_add);
 // kobject_uevent(kobj, KOBJ_ADD) after registering the evdev node.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_input_register_fires_add() -> TestResult {
     reset();
 
@@ -589,7 +568,6 @@ fn smoke_uevent_e2e_input_register_fires_add() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_input_register_fires_add);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -608,7 +586,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_input_register_fires_add);
 // launcher's hand-seeded seat-tag DB. Linux ref: uevent_store (core.c:2453).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_sysfs_write_add_triggers_emit() -> TestResult {
     reset();
 
@@ -667,7 +644,6 @@ fn smoke_uevent_e2e_sysfs_write_add_triggers_emit() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_sysfs_write_add_triggers_emit);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -678,7 +654,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_sysfs_write_add_triggers_emit);
 // All four mandatory keys must be present in that order.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_format_required_keys_order() -> TestResult {
     reset();
 
@@ -751,7 +726,6 @@ fn smoke_uevent_e2e_format_required_keys_order() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_format_required_keys_order);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -762,7 +736,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_format_required_keys_order);
 // the full fan-out of the global ring across subsystem boundaries.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_multiple_subsystems() -> TestResult {
     reset();
 
@@ -836,7 +809,6 @@ fn smoke_uevent_e2e_multiple_subsystems() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_multiple_subsystems);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -850,7 +822,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_multiple_subsystems);
 // kobject_uevent(KOBJ_ADD).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_coldplug_broadcasts_add() -> TestResult {
     reset();
 
@@ -914,7 +885,6 @@ fn smoke_uevent_e2e_coldplug_broadcasts_add() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_broadcasts_add);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -925,7 +895,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_broadcasts_add);
 // non-device nodes (which udevd would reject).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_e2e_coldplug_skips_containers() -> TestResult {
     reset();
 
@@ -944,7 +913,6 @@ fn smoke_uevent_e2e_coldplug_skips_containers() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_skips_containers);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -954,7 +922,6 @@ kernel_test_in!("uevent_e2e", smoke_uevent_e2e_coldplug_skips_containers);
 // second begin must extend the existing window, not move its start past DRM.
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_boot_replay_preserves_earliest_projection() -> TestResult {
     reset();
 
@@ -993,7 +960,6 @@ fn smoke_uevent_boot_replay_preserves_earliest_projection() -> TestResult {
     reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_boot_replay_preserves_earliest_projection
@@ -1024,7 +990,6 @@ kernel_test_in!(
 //
 // Linux ref: net/netlink/af_netlink.c::netlink_dump / netlink_overrun.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult {
     reset();
 
@@ -1088,7 +1053,6 @@ fn smoke_uevent_boot_replay_reader_silently_loses_overrun_window() -> TestResult
     reset();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_boot_replay_reader_silently_loses_overrun_window
@@ -1113,7 +1077,6 @@ kernel_test_in!(
 // recvmsg path, not in the payload, and are covered by the socket-layer
 // smokes; this pins the byte format.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_netlink_bytes_satisfy_libudev_validation() -> TestResult {
     reset();
     uevent::emit(
@@ -1190,7 +1153,6 @@ fn smoke_uevent_netlink_bytes_satisfy_libudev_validation() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "uevent_e2e",
     smoke_uevent_netlink_bytes_satisfy_libudev_validation
@@ -1208,7 +1170,6 @@ kernel_test_in!(
 // Linux ref: `kobject_synth_uevent` (lib/kobject_uevent.c).
 // ══════════════════════════════════════════════════════════════════════════
 
-#[cfg(feature = "linux-compat")]
 fn smoke_uevent_synth_uuid_round_trip() -> TestResult {
     reset();
 
@@ -1279,5 +1240,4 @@ fn smoke_uevent_synth_uuid_round_trip() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("uevent_e2e", smoke_uevent_synth_uuid_round_trip);

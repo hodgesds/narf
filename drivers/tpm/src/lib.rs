@@ -37,7 +37,6 @@ pub mod devfs_bridge;
 #[cfg(feature = "kernel-test")]
 pub mod e2e_tests;
 pub mod probe;
-#[cfg(feature = "linux-compat")]
 pub mod sysfs_bridge;
 pub mod tests;
 pub mod tis;

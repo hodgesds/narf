@@ -521,9 +521,9 @@ pub fn register_cooling_device_sysfs(dev: CoolingDeviceNode, index: u32) -> Cool
 ///
 /// Exposes:
 ///   - `state`     — comma-separated `data_port,cmd_port,status_byte_hex`.
-///                   Linux exposes `/sys/kernel/debug/ec/ec0/{gpe,io,state}`;
-///                   we collapse into a single `state` attr since NARF
-///                   has no debugfs split.
+///     Linux exposes `/sys/kernel/debug/ec/ec0/{gpe,io,state}`;
+///     we collapse into a single `state` attr since NARF
+///     has no debugfs split.
 ///   - `gpe`       — EC GPE bit (decimal), `unknown` when not bound.
 ///   - `address`   — `data,cmd` ports in hex (read-only convenience).
 ///
@@ -602,7 +602,6 @@ mod tests {
     use narf_filesystem::sysfs::{__reset_for_test, class_device_register, class_register};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use crate::acpi_thermal::ThermalZone as _;
     use crate::battery::{decode_bix, BatteryStateBits};
 
     // ── helpers ──────────────────────────────────────────────────────

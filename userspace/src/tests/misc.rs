@@ -1815,7 +1815,7 @@ kernel_test_in!(
 /// these waiters, and every glibc pthread_join degrades to the ~10 ms wheel
 /// backstop (`fire_clear_child_tid_on_exit` currently wakes only
 /// `futex_key(entry.futex_namespace, uaddr)`).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_cleartid_exit_wake_reaches_shared_waiter() -> TestResult {
     use crate::handlers::{
         __test_futex_wake_counter, __test_set_clear_child_tid_scoped, futex_drop_waiter,
@@ -1905,7 +1905,7 @@ fn smoke_userspace_cleartid_exit_wake_reaches_shared_waiter() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 kernel_test_in!(
     "userspace/futex",
     smoke_userspace_cleartid_exit_wake_reaches_shared_waiter

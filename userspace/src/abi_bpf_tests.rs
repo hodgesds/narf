@@ -7,8 +7,6 @@
 //! "this kernel does not do that" from "you passed nonsense", which is why the
 //! unimplemented arms are not `EINVAL`.
 
-#![cfg(feature = "linux-compat")]
-
 use crate::abi_test_support::*;
 
 // `enum bpf_cmd`, from include/uapi/linux/bpf.h.

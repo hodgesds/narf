@@ -7,7 +7,6 @@
 //! utime/utimes/utimensat time-stamp no-ops. Uses the shared harness + a
 //! MemFs scratch mount. The `*at` cases cover both `AT_FDCWD` and real
 //! directory-fd anchoring.
-#![cfg(feature = "linux-compat")]
 
 use crate::abi_test_support::*;
 

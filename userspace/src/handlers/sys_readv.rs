@@ -27,7 +27,6 @@ fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> Result<(),
 /// the active user address space before object fds can be published. Keep that
 /// policy confined to the fanotify branch; applying it to generic readv would
 /// reject valid guarded copies (including AP kernel-test scratch buffers).
-#[cfg(feature = "linux-compat")]
 fn scatter_fanotify_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> Result<(), u64> {
     for iovec in iovecs {
         if bytes.is_empty() {
@@ -78,17 +77,14 @@ pub(crate) fn sys_readv(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    #[cfg(feature = "linux-compat")]
     if let Some(ret) = tty_background_access(task, fd_num, false) {
         ctx.set_return(SyscallReturn::ok(ret as u64));
         return;
     }
 
-    #[cfg(feature = "linux-compat")]
     let fanotify_group = crate::mqueue::fanotify_active()
         .then(|| crate::mqueue::fanotify_instance_of(task, fd_num))
         .flatten();
-    #[cfg(feature = "linux-compat")]
     if let Some(group) = fanotify_group {
         let max = core::cmp::min(count, 64 * 1024);
         match fanotify_read_to_user(task, group, max, |bytes| {

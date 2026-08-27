@@ -165,7 +165,6 @@ pub fn rtc_time_from_unix(secs: i64) -> RtcTime {
 
 /// Current wall-clock time as broken-down UTC. Reads
 /// [`narf_time::wall::now_wall`] (UNIX seconds since epoch).
-#[cfg(feature = "linux-compat")]
 fn now_rtc_time() -> RtcTime {
     let w = narf_time::wall::now_wall();
     rtc_time_from_unix(w.secs)
@@ -177,7 +176,7 @@ fn now_rtc_time() -> RtcTime {
 /// [`RTC_TIME_LEN`] bytes. The SMAP window mirrors the pty ioctl
 /// helpers; a bare store to a user-only PTE at CPL=0 #PFs once
 /// CR4.SMAP = 1 (true on every CPU NARF boots).
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe fn write_user_rtc_time(uptr: usize, v: &RtcTime) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -197,7 +196,7 @@ unsafe fn write_user_rtc_time(uptr: usize, v: &RtcTime) -> Result<(), FsError> {
 /// Read a [`RtcTime`] in from user memory for `RTC_SET_TIME`. Validates
 /// the pointer even though the value is accepted-and-ignored, so a bogus
 /// pointer still faults cleanly rather than silently succeeding.
-#[cfg(all(feature = "linux-compat", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 unsafe fn read_user_rtc_time(uptr: usize) -> Result<RtcTime, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -215,7 +214,7 @@ unsafe fn read_user_rtc_time(uptr: usize) -> Result<RtcTime, FsError> {
 
 // Non-x86_64 fallback — no SMAP; raw pointer ops (the FS ioctl layer is
 // x86_64-only in practice, but keep the surface buildable everywhere).
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn write_user_rtc_time(uptr: usize, v: &RtcTime) -> Result<(), FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -228,7 +227,7 @@ unsafe fn write_user_rtc_time(uptr: usize, v: &RtcTime) -> Result<(), FsError> {
     Ok(())
 }
 
-#[cfg(all(feature = "linux-compat", not(target_arch = "x86_64")))]
+#[cfg(not(target_arch = "x86_64"))]
 unsafe fn read_user_rtc_time(uptr: usize) -> Result<RtcTime, FsError> {
     if uptr == 0 {
         return Err(FsError::InvalidData);
@@ -285,7 +284,6 @@ impl FileOps for DevRtc {
     /// the Linux convention (`rtc_dev_ioctl` default). `hwclock` probes
     /// `RTC_UIE_ON`/`OFF` and tolerates failure, but returning 0 is
     /// safest.
-    #[cfg(feature = "linux-compat")]
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, FsError> {
         match cmd {
             RTC_RD_TIME => {
@@ -316,7 +314,6 @@ impl FileOps for DevRtc {
 /// Format the current wall-clock as `YYYY-MM-DD` for the sysfs `date`
 /// attr. Public so `sysfs::populate_rtc_class` can render it.
 /// Linux ref: `drivers/rtc/sysfs.c::date_show`.
-#[cfg(feature = "linux-compat")]
 pub fn sysfs_date_string() -> alloc::string::String {
     let t = now_rtc_time();
     alloc::format!(
@@ -329,7 +326,6 @@ pub fn sysfs_date_string() -> alloc::string::String {
 
 /// Format the current wall-clock as `HH:MM:SS` for the sysfs `time`
 /// attr. Linux ref: `drivers/rtc/sysfs.c::time_show`.
-#[cfg(feature = "linux-compat")]
 pub fn sysfs_time_string() -> alloc::string::String {
     let t = now_rtc_time();
     alloc::format!("{:02}:{:02}:{:02}\n", t.tm_hour, t.tm_min, t.tm_sec)
@@ -337,7 +333,6 @@ pub fn sysfs_time_string() -> alloc::string::String {
 
 /// UNIX-seconds string for the sysfs `since_epoch` attr.
 /// Linux ref: `drivers/rtc/sysfs.c::since_epoch_show`.
-#[cfg(feature = "linux-compat")]
 pub fn sysfs_since_epoch_string() -> alloc::string::String {
     let w = narf_time::wall::now_wall();
     alloc::format!("{}\n", w.secs)
@@ -345,7 +340,6 @@ pub fn sysfs_since_epoch_string() -> alloc::string::String {
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};

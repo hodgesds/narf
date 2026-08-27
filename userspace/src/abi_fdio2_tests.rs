@@ -9,7 +9,6 @@
 //! bad-oldfd arms, and the close_range bad-flags / CLOSE_RANGE_CLOEXEC
 //! paths. Every test asserts the CURRENT NARF behavior (regression pin);
 //! Linux-ideal divergences carry a `// LINUX-GAP:` note.
-#![cfg(feature = "linux-compat")]
 use crate::abi_test_support::*;
 
 // ── Local helpers (mirrors abi_fdio_tests.rs; kept private to this file) ──

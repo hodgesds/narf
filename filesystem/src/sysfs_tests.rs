@@ -1,4 +1,3 @@
-#![cfg(feature = "linux-compat")]
 //! Smoke tests for `sysfs` (kobject hierarchy) and `uevent` (hotplug).
 //!
 //! Covers:
@@ -21,7 +20,6 @@ use alloc::vec::Vec;
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-#[cfg(feature = "linux-compat")]
 use crate::sysfs::{
     class_device_register, class_register, kobject_add_attr, kobject_emit_uevent, Kobject, SysFs,
 };
@@ -108,7 +106,6 @@ fn poll_once<F: core::future::Future>(mut fut: F) -> Option<F::Output> {
 
 // ── Test 1: Kobject create with parent ────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_create_with_parent() -> TestResult {
     crate::sysfs::__reset_for_test();
     let parent = Kobject::new_root("testroot");
@@ -121,7 +118,6 @@ fn smoke_sysfs_kobject_create_with_parent() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_create_with_parent);
 
 /// An absolute pointer (ABS axes + mouse buttons, no relative axes) must be
@@ -170,12 +166,10 @@ fn smoke_sysfs_abs_pointer_tagged_id_input_mouse() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_abs_pointer_tagged_id_input_mouse);
 
 // ── Test 2: Kobject attr show ──────────────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_attr_show() -> TestResult {
     crate::sysfs::__reset_for_test();
     let kobj = Kobject::new_root("foo");
@@ -186,12 +180,10 @@ fn smoke_sysfs_kobject_attr_show() -> TestResult {
         None => TestResult::Fail("attr_show returned None"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_attr_show);
 
 // ── Test 3: Kobject path ──────────────────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_path() -> TestResult {
     crate::sysfs::__reset_for_test();
     let root = Kobject::new_root("class");
@@ -203,12 +195,10 @@ fn smoke_sysfs_kobject_path() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_path);
 
 // ── Test 4: SysFs VFS lookup ──────────────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_vfs_lookup() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -257,7 +247,6 @@ fn smoke_sysfs_vfs_lookup() -> TestResult {
         _ => TestResult::Fail("read attr returned 0 or error"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_vfs_lookup);
 
 // ── /sys/dev/char/<maj>:<min> symlink traversal ──────────────────────
@@ -267,7 +256,6 @@ kernel_test_in!("filesystem", smoke_sysfs_vfs_lookup);
 // (sd_device_new_from_device_id) depends on it; without the link a DRM card
 // never attaches to seat0 and CanGraphical stays false. Verify the symlink
 // registered by register_char_dev_link resolves through to the target's attrs.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_dev_char_link_traverses() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -315,12 +303,10 @@ fn smoke_sysfs_dev_char_link_traverses() -> TestResult {
         _ => TestResult::Fail("readlink 226:0 returned 0 or error"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_dev_char_link_traverses);
 
 // ── Test 5: SysFs enumerate class/net ─────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_enumerate_class_net() -> TestResult {
     crate::sysfs::__reset_for_test();
 
@@ -351,7 +337,6 @@ fn smoke_sysfs_enumerate_class_net() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_enumerate_class_net);
 
 // ── Test 6: Uevent ring FIFO order ────────────────────────────────────
@@ -439,7 +424,6 @@ kernel_test_in!("filesystem", smoke_uevent_format_required_keys);
 
 // ── Test 8: Block-device class auto-population ────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -486,7 +470,6 @@ fn smoke_sysfs_block_class_auto_populate() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
 
 // ── Test 8b: a block device's canonical sysfs `uevent` is readable + carries ──
@@ -495,7 +478,6 @@ kernel_test_in!("filesystem", smoke_sysfs_block_class_auto_populate);
 // rejects a `/sys/class/...` DEVPATH as a non-device object. The synthesised
 // netlink message must fold in the MAJOR/MINOR.
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -556,13 +538,11 @@ fn smoke_sysfs_block_uevent_file_readable() -> TestResult {
     narf_block::registry::__restore_for_test(snap);
     result
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_block_uevent_file_readable);
 
 /// EFI boot queues block ADDs before PID 1 so the daemon can replay the ESP
 /// event even if the early udev trigger service is unavailable.  The queued
 /// event must use the canonical device path libudev accepts.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_add_events_are_canonical() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -598,7 +578,6 @@ kernel_test_in!("filesystem", smoke_sysfs_block_add_events_are_canonical);
 // A registered partition must not masquerade as a whole disk. udev only runs
 // its filesystem-identification rules (and thus creates UUID device links)
 // for the partition DEVTYPE on real GPT installs.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
     use narf_block::registry::{
         PartitionMetadata, __reset_for_test, __restore_for_test, __snapshot_for_test,
@@ -654,7 +633,6 @@ fn smoke_sysfs_block_partition_uevent_marks_partition() -> TestResult {
         _ => TestResult::Fail("partition block uevent omitted filesystem identity"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "filesystem",
     smoke_sysfs_block_partition_uevent_marks_partition
@@ -662,7 +640,6 @@ kernel_test_in!(
 
 // ── Test 9: kobject_emit_uevent helper ────────────────────────────────
 
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_kobject_emit_uevent() -> TestResult {
     crate::sysfs::__reset_for_test();
     uevent::__reset_for_test();
@@ -685,7 +662,6 @@ fn smoke_sysfs_kobject_emit_uevent() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);
 
 // ── Tests 10-13: /sys/devices/system/cpu/ ─────────────────────────────
@@ -700,7 +676,6 @@ kernel_test_in!("filesystem", smoke_sysfs_kobject_emit_uevent);
 ///
 /// With the default CPU count of 1, all three should render "0\n".
 /// With a bumped count of 4, they should render "0-3\n".
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_range_attrs() -> TestResult {
     crate::sysfs::__reset_for_test();
     // Scoped: restores the REAL cpu count + online bitmap on every exit
@@ -771,12 +746,10 @@ fn smoke_sysfs_cpu_range_attrs() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_range_attrs);
 
 /// Test 11: cpu0 dir exists; cpu0 has no `online` attr (Linux convention);
 /// cpuN dirs exist for all CPUs in the possible set.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
     crate::sysfs::__reset_for_test();
     // Scoped — see smoke_sysfs_cpu_range_attrs.
@@ -821,7 +794,6 @@ fn smoke_sysfs_cpu_dirs_and_online_attr() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_dirs_and_online_attr);
 
 /// Test 12: topology attrs render correct values for cpu2 with 4 CPUs.
@@ -831,7 +803,6 @@ kernel_test_in!("filesystem", smoke_sysfs_cpu_dirs_and_online_attr);
 /// - `core_cpus_list` == "2"
 /// - `thread_siblings_list` == "2"
 /// - `package_cpus_list` == "0-3"
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
     crate::sysfs::__reset_for_test();
     // Scoped — see smoke_sysfs_cpu_range_attrs.
@@ -871,7 +842,6 @@ fn smoke_sysfs_cpu_topology_attrs() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
 
 /// Test 13: hex mask format matches NUMA cpumap style (comma-grouped 32-bit words).
@@ -879,7 +849,6 @@ kernel_test_in!("filesystem", smoke_sysfs_cpu_topology_attrs);
 /// For cpu2 (bit 2 set): `core_cpus` == "00000000,00000000,00000000,00000004\n".
 /// For 4 CPUs total:  `package_cpus` == "00000000,00000000,00000000,0000000f\n".
 /// Linux ref: `node_read_cpumap` (drivers/base/node.c).
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
     crate::sysfs::__reset_for_test();
     // Scoped — see smoke_sysfs_cpu_range_attrs.
@@ -932,12 +901,10 @@ fn smoke_sysfs_cpu_hex_mask_format() -> TestResult {
 
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_cpu_hex_mask_format);
 
 /// Linux perf discovers PMU type numbers and raw-event bitfields through
 /// `/sys/bus/event_source/devices`.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_perf_event_sources() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_perf_event_sources();
@@ -999,7 +966,6 @@ fn smoke_sysfs_perf_event_sources() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_perf_event_sources);
 
 // ── Test 14: THP `enabled` attr renders with [never] active ──────────
@@ -1009,7 +975,6 @@ kernel_test_in!("filesystem", smoke_sysfs_perf_event_sources);
 /// probe this file at startup. NARF has no THP; `[never]` is the
 /// only valid active token here.
 /// Linux ref: `mm/huge_memory.c` `enabled_show` (6.9).
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_thp_enabled_contains_never() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_kernel_dir();
@@ -1028,11 +993,9 @@ fn smoke_sysfs_thp_enabled_contains_never() -> TestResult {
         None => TestResult::Fail("enabled attr not registered"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_thp_enabled_contains_never);
 
 /// `/sys/kernel/mm/transparent_hugepage/defrag` renders with [never] active.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_thp_defrag_contains_never() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_kernel_dir();
@@ -1051,7 +1014,6 @@ fn smoke_sysfs_thp_defrag_contains_never() -> TestResult {
         None => TestResult::Fail("defrag attr not registered"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_thp_defrag_contains_never);
 
 // ── Tests: desktop/laptop device classes ─────────────────────────────
@@ -1062,13 +1024,11 @@ kernel_test_in!("filesystem", smoke_sysfs_thp_defrag_contains_never);
 // checks the value + that the class enumerates its device(s).
 
 /// Read+trim a kobject attr, or None if absent.
-#[cfg(feature = "linux-compat")]
 fn attr_trimmed(kobj: &Arc<crate::sysfs::Kobject>, name: &str) -> Option<String> {
     kobj.attr_show(name).map(|s| s.trim().to_string())
 }
 
 /// Resolve `/sys/class/<class>` and return its enumerated child device names.
-#[cfg(feature = "linux-compat")]
 fn class_device_names(class: &str) -> Vec<String> {
     let root = crate::sysfs::sysfs_root();
     match root.get_child("class").and_then(|c| c.get_child(class)) {
@@ -1078,7 +1038,6 @@ fn class_device_names(class: &str) -> Vec<String> {
 }
 
 /// LED class — both devices enumerate; a brightness write is accepted+clamped.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_leds_class() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_leds();
@@ -1123,11 +1082,9 @@ fn smoke_sysfs_leds_class() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_leds_class);
 
 /// power_supply class — AC + BAT0 enumerate; BAT0/capacity == "100".
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_power_supply_class() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_power_supply();
@@ -1174,11 +1131,9 @@ fn smoke_sysfs_power_supply_class() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_power_supply_class);
 
 /// thermal class — thermal_zone0 enumerates; temp == "42000".
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_thermal_class() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_thermal();
@@ -1208,11 +1163,9 @@ fn smoke_sysfs_thermal_class() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_thermal_class);
 
 /// hwmon class — hwmon0 enumerates; temp1_input == "42000".
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_hwmon_class() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::sysfs::populate_hwmon();
@@ -1242,12 +1195,10 @@ fn smoke_sysfs_hwmon_class() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_hwmon_class);
 
 /// End-to-end VFS read of /sys/class/power_supply/BAT0/capacity.
 /// Mounts sysfs, resolves the attr path, reads it back == "100\n".
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_power_supply_vfs_read() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -1290,7 +1241,6 @@ fn smoke_sysfs_power_supply_vfs_read() -> TestResult {
         _ => TestResult::Fail("read capacity returned 0 or error"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_power_supply_vfs_read);
 
 // A registered BINARY attribute must be reachable from the VFS — both
@@ -1308,7 +1258,6 @@ kernel_test_in!("filesystem", smoke_sysfs_power_supply_vfs_read);
 // reason. This is the "verify the fix is observable before blaming the
 // consumer" case — the symptom is identical whether the producer omits the
 // data or the plumbing drops it.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_bin_attr_reachable_from_vfs() -> TestResult {
     crate::sysfs::__reset_for_test();
     crate::uevent::__reset_for_test();
@@ -1364,7 +1313,6 @@ fn smoke_sysfs_bin_attr_reachable_from_vfs() -> TestResult {
         _ => TestResult::Fail("bin attr ignored the read offset"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("filesystem", smoke_sysfs_bin_attr_reachable_from_vfs);
 
 /// The platform PARENT of the input devices must carry a `subsystem` link,
@@ -1395,7 +1343,6 @@ kernel_test_in!("filesystem", smoke_sysfs_bin_attr_reachable_from_vfs);
 /// The link TARGETS are asserted, not merely their presence: a `subsystem`
 /// pointing at the wrong depth resolves to nothing and fails exactly the same
 /// way while looking correct in a listing.
-#[cfg(feature = "linux-compat")]
 fn smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink() -> TestResult {
     crate::sysfs::populate_input_class();
     let root = crate::sysfs::get_root();
@@ -1439,7 +1386,6 @@ fn smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink() -> TestResult {
         None => TestResult::Fail("/sys/bus/platform/devices has no back-link to narf-input"),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "filesystem",
     smoke_sysfs_platform_parent_has_subsystem_and_bus_backlink

@@ -392,7 +392,6 @@ impl Drop for IpcNamespace {
         // Linux removes an IPC namespace's public ids when the final task/nsfd
         // reference disappears. Existing SysV SHM VMAs retain their backing
         // until their final detach; semaphore/message waiters wake with EIDRM.
-        #[cfg(feature = "linux-compat")]
         {
             crate::handlers::shm_ipc_namespace_drop(self.id);
             crate::sysvipc::ipc_namespace_drop(self.id);
@@ -535,7 +534,6 @@ pub fn unshare_net(task: u64) {
 
 /// Install a fresh per-task IPC namespace.
 pub fn unshare_ipc(task: u64) {
-    #[cfg(feature = "linux-compat")]
     crate::sysvipc::sem_undo_process_exit(
         crate::handlers::task_to_pid_raw(task).unwrap_or(task),
         task,
@@ -1056,7 +1054,6 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
         HeldNs::Net(n) => setns_net(caller, n.clone()),
         HeldNs::NetGlobal(_) => setns_initial_net(caller),
         HeldNs::Ipc(n) => {
-            #[cfg(feature = "linux-compat")]
             crate::sysvipc::sem_undo_process_exit(
                 crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
                 caller,
@@ -1064,7 +1061,6 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
             setns_ipc(caller, n.clone());
         }
         HeldNs::IpcGlobal(_) => {
-            #[cfg(feature = "linux-compat")]
             crate::sysvipc::sem_undo_process_exit(
                 crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
                 caller,

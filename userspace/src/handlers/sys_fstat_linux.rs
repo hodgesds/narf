@@ -18,7 +18,6 @@ use super::*;
 /// re-probes a stream's descriptor with fstat and libraries that cache fds
 /// across a fork/exec reopen on EBADF, while EPERM reads as "the file is
 /// there and you may not look at it" and gets reported to the user verbatim.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux declares `unsigned int fd`; a negative fd wraps and misses the

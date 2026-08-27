@@ -1025,7 +1025,6 @@ fn park_should_block(
             // carried in the ctx; an unlock that raced the registration is
             // caught by the 1 ms wheel backstop below, so the race costs one
             // backstop period, never a wedge.
-            #[cfg(feature = "linux-compat")]
             {
                 let fk = uc.flock_key.load(Ordering::Acquire);
                 if fk != 0 {
@@ -1703,7 +1702,6 @@ pub fn install_user_task_hooks() {
         crate::handlers::pause_current_kernel_span,
         crate::handlers::resume_current_kernel_span,
     );
-    #[cfg(feature = "linux-compat")]
     narf_scheduler::stackful::set_user_perf_switch_hook(crate::perf_event::on_task_switch);
     // Per-task-own-stack model: flips a trap/syscall from a user task onto that
     // task's OWN kernel stack with preemption via a clean kernel_switch

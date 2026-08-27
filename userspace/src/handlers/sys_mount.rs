@@ -310,7 +310,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // The fstype→backend dispatch lives in the linux-compat-only mount_api;
     // the mount(2) syscall itself is only wired under linux-compat, so the
     // non-linux-compat build just needs this to compile (no pseudo-fs there).
-    #[cfg(feature = "linux-compat")]
     let is_pseudo_fs = {
         let (uid, gid) = current_fs_ids();
         match crate::mount_api::build_fs_with_options(fstype.as_str(), data.as_str(), uid, gid) {
@@ -330,8 +329,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             }
         }
     };
-    #[cfg(not(feature = "linux-compat"))]
-    let is_pseudo_fs = false;
     if is_pseudo_fs && current_mount_list().iter().any(|m| m == &target) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -431,7 +428,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // uses, so both entry points recognize identical filesystems. Block-device
     // fstypes (fat/vfat/ext…) fall through below because build_fs can't
     // synthesize them without a device.
-    #[cfg(feature = "linux-compat")]
     {
         let (mount_uid, mount_gid) = current_fs_ids();
         match crate::mount_api::build_fs_with_options(

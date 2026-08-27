@@ -35,7 +35,6 @@ use super::*;
 /// arm in `do_shmat` only fires when RMID lands between the RCU lookup and
 /// `ipc_lock_object()`, a window that does not exist here because the
 /// segment table lock covers lookup and reservation together.
-#[cfg(feature = "linux-compat")]
 pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let signed_shmid = a.arg0 as u32 as i32;

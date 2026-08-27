@@ -27,7 +27,6 @@ narf-filesystem   = { path = "../../filesystem" }
 narf-kernel-test  = { path = "../../verification/kernel-test" }
 
 [features]
-linux-compat = ["narf-filesystem/linux-compat"]
 kernel-test = []
 
 [lints]

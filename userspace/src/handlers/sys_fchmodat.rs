@@ -103,7 +103,6 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     if let Some(file) = resolve_file_absolute_ext(&path, follow_final) {
         match poll_blocking(file.set_perms(mode)) {
             Some(Ok(())) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_attrib(&path, file.as_dir().is_some());
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -120,7 +119,6 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     if let Some(dir) = resolve_dir_absolute(&path) {
         match poll_blocking(dir.set_dir_mode_async(mode)) {
             Some(Ok(())) => {
-                #[cfg(feature = "linux-compat")]
                 crate::mqueue::notify_attrib(&path, true);
                 ctx.set_return(SyscallReturn::ok(0));
             }

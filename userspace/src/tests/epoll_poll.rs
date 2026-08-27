@@ -3297,7 +3297,6 @@ kernel_test_in!(
 
 /// Wave-64: eventfd2(0, 0) → fd. Write 8 bytes counter delta, read
 /// 8 bytes back; counter resets to 0 after a non-semaphore read.
-#[cfg(feature = "linux-compat")]
 fn smoke_wave64_eventfd_write_read_roundtrip() -> TestResult {
     let task = setup_poll_test();
     let r = call(
@@ -3368,12 +3367,10 @@ fn smoke_wave64_eventfd_write_read_roundtrip() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_eventfd_write_read_roundtrip);
 
 /// Wave-64: timerfd_create → settime (1 ms relative) → after the
 /// deadline passes, poll_readiness reports POLL_IN.
-#[cfg(feature = "linux-compat")]
 fn smoke_wave64_timerfd_create_settime_fires() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3433,13 +3430,11 @@ fn smoke_wave64_timerfd_create_settime_fires() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_timerfd_create_settime_fires);
 
 /// Wave-64: timerfd_gettime returns the configured interval and a
 /// value-remaining that drops toward zero. We arm with a 1 s
 /// one-shot, then gettime and check the remaining is ≤ 1 s.
-#[cfg(feature = "linux-compat")]
 fn smoke_wave64_timerfd_gettime_reports_remaining() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3505,14 +3500,12 @@ fn smoke_wave64_timerfd_gettime_reports_remaining() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_timerfd_gettime_reports_remaining);
 
 /// Wave-64: end-to-end — register an eventfd in an epoll instance,
 /// write to it, and confirm epoll_wait returns the event with the
 /// userdata round-tripped intact. Level-triggered (the io_mux
 /// epoll variant).
-#[cfg(feature = "linux-compat")]
 fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3625,13 +3618,11 @@ fn smoke_wave64_epoll_watches_eventfd() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_wave64_epoll_watches_eventfd);
 
 /// Run one two-source epoll batch with `maxevents=1` and return the userdata
 /// from two successive waits. Both eventfds start readable before the first
 /// wait, so the second result proves that the undisclosed entry was preserved.
-#[cfg(feature = "linux-compat")]
 fn epoll_maxevents_two_ready(flags: u32) -> Result<[u64; 2], &'static str> {
     let _kbuf = crate::handlers::kernel_buffers_guard();
     setup_poll_test();
@@ -3700,7 +3691,6 @@ fn epoll_maxevents_two_ready(flags: u32) -> Result<[u64; 2], &'static str> {
 /// consumed and an EPOLLONESHOT registration is not disarmed. Level-triggered
 /// entries are requeued at the ready-list tail, giving successive short waits
 /// round-robin behavior.
-#[cfg(feature = "linux-compat")]
 fn smoke_epoll_maxevents_preserves_undisclosed_ready_entries() -> TestResult {
     for flags in [0, crate::epoll::EPOLLET, crate::epoll::EPOLLONESHOT] {
         let seen = match epoll_maxevents_two_ready(flags) {
@@ -3713,7 +3703,6 @@ fn smoke_epoll_maxevents_preserves_undisclosed_ready_entries() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_epoll_maxevents_preserves_undisclosed_ready_entries
@@ -3754,7 +3743,6 @@ impl narf_filesystem::FileOps for AckClearsReadyFile {
 /// into the current result batch. This models one-shot change sources whose
 /// acknowledgement itself clears readiness; acknowledging past `maxevents`
 /// would make the second source permanently disappear.
-#[cfg(feature = "linux-compat")]
 fn smoke_epoll_maxevents_does_not_ack_undisclosed_source() -> TestResult {
     let _kbuf = crate::handlers::kernel_buffers_guard();
     let task = setup_poll_test();
@@ -3833,7 +3821,6 @@ fn smoke_epoll_maxevents_does_not_ack_undisclosed_source() -> TestResult {
         Err(msg) => TestResult::Fail(msg),
     }
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!(
     "userspace",
     smoke_epoll_maxevents_does_not_ack_undisclosed_source
@@ -3842,7 +3829,6 @@ kernel_test_in!(
 /// EPOLLET must observe an eventfd drain/refill transition even when no epoll
 /// scan occurs while the counter is zero. Both scans then see POLLIN, so the
 /// provider's readable transition token is the only evidence of the new edge.
-#[cfg(feature = "linux-compat")]
 fn smoke_epoll_epollet_eventfd_hidden_refill_edge() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -3947,10 +3933,8 @@ fn smoke_epoll_epollet_eventfd_hidden_refill_edge() -> TestResult {
     crate::syscall::__test_clear_global();
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_epoll_epollet_eventfd_hidden_refill_edge);
 
-#[cfg(feature = "linux-compat")]
 fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -4136,7 +4120,6 @@ fn smoke_userspace_signalfd_epoll_wakes_on_signal() -> TestResult {
     }
     TestResult::Pass
 }
-#[cfg(feature = "linux-compat")]
 kernel_test_in!("userspace", smoke_userspace_signalfd_epoll_wakes_on_signal);
 
 /// The stall watchdog's stranded-poller probe (`dbg_stranded_poll_waiters`)

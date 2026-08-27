@@ -24,7 +24,6 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
     });
     match outcome {
         Some(Some(Ok(()))) => {
-            #[cfg(feature = "linux-compat")]
             crate::mqueue::notify_delete(path, true);
             ctx.set_return(SyscallReturn::ok(0));
         }
