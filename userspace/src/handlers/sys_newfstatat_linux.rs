@@ -127,12 +127,12 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let raw = match copy_user_cstr(path_uptr, 4096) {
-        Some(path) => path,
-        None => {
-            // LINUX-GAP: -ENAMETOOLONG (>= PATH_MAX, no NUL) is folded into
-            // -EFAULT — copy_user_cstr reports both as `None`.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    // `getname()`: -EFAULT for an unreadable pointer, -ENAMETOOLONG for a
+    // path at PATH_MAX with no terminator.
+    let raw = match copy_user_cstr_checked(path_uptr, 4096) {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

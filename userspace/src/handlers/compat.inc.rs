@@ -507,6 +507,55 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 // real inode number (0 for synthetic FS / dir-root synthesis). Used by
 // the stat/statx handlers so the Linux `st_ino` is a stable per-file id
 // rather than a size-derived hash that aliases same-size DSOs.
+/// `fs/namei.c::link_path_walk` — why did this path walk fail?
+///
+/// A resolver that reports only "no" forces every caller to guess, and the
+/// guess they all made was -ENOENT. But Linux distinguishes:
+///
+/// ```text
+/// /* link_path_walk, per non-final component */
+/// if (unlikely(!d_can_lookup(nd->path.dentry)))
+///         return -ENOTDIR;
+/// ```
+///
+/// so `stat("/etc/passwd/foo")` is -ENOTDIR, not -ENOENT — a real
+/// distinction, because ENOENT invites a caller to create the path while
+/// ENOTDIR says the prefix is a file and creating it never will work.
+/// Configure scripts and package installers branch on exactly this.
+///
+/// Classification runs only on the FAILURE path, so the cost (one stat per
+/// ancestor) is never paid by a successful lookup. It walks the ancestors
+/// in order and stops at the first one that is absent (-ENOENT, since no
+/// later component can be reached) or is not a directory (-ENOTDIR).
+///
+/// LINUX-GAP: -ELOOP needs symlink-depth accounting inside the resolver,
+/// and -EACCES needs directory execute bits that NARF does not enforce at
+/// all. Both still surface here as -ENOENT.
+fn path_lookup_errno(path: &str) -> i64 {
+    const ENOENT: i64 = 2;
+    const ENOTDIR: i64 = 20;
+    let trimmed = path.trim_end_matches('/');
+    // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
+    let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
+        return ENOENT;
+    };
+    let mut prefix = alloc::string::String::new();
+    for comp in parent.split('/').filter(|c| !c.is_empty()) {
+        prefix.push('/');
+        prefix.push_str(comp);
+        // Non-final components are always followed, as in a real walk.
+        match stat_ino_path_dir_aware_ext(&prefix, true) {
+            Some((st, ..)) => {
+                if st.mode.file_type != narf_filesystem::FileType::Dir {
+                    return ENOTDIR;
+                }
+            }
+            None => return ENOENT,
+        }
+    }
+    ENOENT
+}
+
 fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
     stat_ino_path_dir_aware_ext(path, true)
 }
@@ -1549,8 +1598,38 @@ fn copy_user_path(ptr: u64, len: usize) -> Option<alloc::string::String> {
 /// whose path arg is just a bare user pointer with no length, and
 /// the kernel finds the end at the NUL.
 pub(crate) fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::String> {
+    copy_user_cstr_checked(ptr, max_len).ok()
+}
+
+/// `fs/namei.c::getname_flags` — copy a NUL-terminated path from user
+/// memory, reporting WHY it failed.
+///
+/// ```text
+/// len = strncpy_from_user(kname, filename, EMBEDDED_NAME_MAX);
+/// if (unlikely(len < 0))          { ... return ERR_PTR(len); }   /* -EFAULT */
+/// ...
+/// if (unlikely(len == PATH_MAX))  { ... return ERR_PTR(-ENAMETOOLONG); }
+/// ```
+///
+/// Linux distinguishes two failures that [`copy_user_cstr`] folds into one
+/// `None`: a pointer it cannot read is -EFAULT, and a path that reaches
+/// PATH_MAX without a terminator is -ENAMETOOLONG. Every path syscall that
+/// mapped `None` to EFAULT therefore reported a bad POINTER for a caller
+/// whose pointer was fine and whose PATH was too long — which sends a
+/// program looking at the wrong argument entirely.
+///
+/// LINUX-GAP: a path that is valid bytes but not valid UTF-8 still takes
+/// the -EFAULT arm. Linux paths are byte strings with no encoding, so it
+/// has no counterpart to this case at all; NARF's VFS is UTF-8-only, and
+/// inventing an errno here would be a guess rather than a mapping.
+pub(crate) fn copy_user_cstr_checked(
+    ptr: u64,
+    max_len: usize,
+) -> Result<alloc::string::String, i64> {
+    const EFAULT: i64 = 14;
+    const ENAMETOOLONG: i64 = 36;
     if ptr == 0 || max_len == 0 || max_len > 65536 {
-        return None;
+        return Err(EFAULT);
     }
     // Bulk-reading `max_len` blindly would walk past the NUL into
     // pages that may not be mapped (a path string that ends near a
@@ -1569,16 +1648,17 @@ pub(crate) fn copy_user_cstr(ptr: u64, max_len: usize) -> Option<alloc::string::
         // SAFETY: SMAP bracket inside copy_from_user; pointer
         // validated against canonical range there.
         // SAFETY: Valid memory or trusted environment
-        unsafe { copy_from_user(&mut chunk, cursor) }.ok()?;
+        unsafe { copy_from_user(&mut chunk, cursor) }.map_err(|_| EFAULT)?;
         if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul_pos]);
-            return alloc::string::String::from_utf8(out).ok();
+            return alloc::string::String::from_utf8(out).map_err(|_| EFAULT);
         }
         out.extend_from_slice(&chunk);
         cursor = chunk_end;
     }
-    // Never found NUL within max_len.
-    None
+    // `len == PATH_MAX` with no terminator — the path is too long, the
+    // pointer was perfectly readable.
+    Err(ENAMETOOLONG)
 }
 
 /// Walk a NULL-terminated user array of `char *` (e.g. argv or
@@ -7626,25 +7706,6 @@ pub fn maybe_deliver_signal_for_input(byte: u8) -> bool {
 
 // ── I/O multiplexing — poll / epoll / eventfd / timerfd / signalfd ──
 
-const EPOLL_CTL_ADD: u32 = 1;
-const EPOLL_CTL_DEL: u32 = 2;
-const EPOLL_CTL_MOD: u32 = 3;
-
-// EpollFile recovery from FdEntry — same shape as the SocketFile
-// side table since Arc<dyn FileOps> can't be downcast generically.
-static EPOLL_ARCS: ArcShardTable<crate::io_mux::EpollFile> =
-    [const { ArcShard::new() }; ARC_SHARDS];
-
-fn epoll_arc_register(arc: &alloc::sync::Arc<crate::io_mux::EpollFile>) {
-    arc_shard_register(&EPOLL_ARCS, arc);
-}
-
-fn epoll_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::EpollFile>> {
-    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
-    let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    arc_shard_get(&EPOLL_ARCS, raw)
-}
-
 // Wave-61: pidfd_open(pid, flags) → fd that signals POLLIN on exit.
 // Linux x86_64 number 434. flags is currently ignored — PIDFD_NONBLOCK
 // (0x0800) is the only documented bit and our pidfd reads return
@@ -7853,19 +7914,10 @@ fn init_module_result(
 /// (e.g. a real file-descriptor-backed `Read`).
 pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Bootstrap, "bootstrap", RawFnHandler(sys_bootstrap));
-    table.install_raw(Syscall::OpenFile, "open", RawFnHandler(sys_open));
     table.install_raw(Syscall::Write, "write", RawFnHandler(sys_write));
     table.install_raw(Syscall::Writev, "writev", RawFnHandler(sys_writev));
     table.install_raw(Syscall::Read, "read", RawFnHandler(sys_read));
     table.install_raw(Syscall::Close, "close", RawFnHandler(sys_close));
-    table.install_raw(Syscall::Stat, "stat", RawFnHandler(sys_stat));
-    table.install_raw(Syscall::Fstat, "fstat", RawFnHandler(sys_fstat));
-    table.install_raw(Syscall::Lstat, "lstat", RawFnHandler(sys_stat));
-    table.install_raw(
-        Syscall::Newfstatat,
-        "newfstatat",
-        RawFnHandler(sys_newfstatat),
-    );
     table.install_raw(Syscall::Mmap, "mmap", RawFnHandler(sys_mmap));
     table.install_raw(Syscall::Munmap, "munmap", RawFnHandler(sys_munmap));
     table.install_raw(Syscall::Mremap, "mremap", RawFnHandler(sys_mremap));
@@ -8031,20 +8083,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "sock_send_zc",
         RawFnHandler(sys_sock_send_zc),
     );
-    table.install_raw(Syscall::Poll, "poll", RawFnHandler(sys_poll));
-    // Shadowed below by the `crate::epoll` implementations; kept so the
-    // legacy `io_mux::EpollFile` path stays wired while it still exists.
-    table.install_raw(
-        Syscall::EpollCreate,
-        "epoll_create1",
-        RawFnHandler(sys_epoll_create),
-    );
-    table.install_raw(Syscall::EpollCtl, "epoll_ctl", RawFnHandler(sys_epoll_ctl));
-    table.install_raw(
-        Syscall::EpollWait,
-        "epoll_wait",
-        RawFnHandler(sys_epoll_wait),
-    );
     table.install_raw(Syscall::Eventfd, "eventfd2", RawFnHandler(sys_eventfd2));
     table.install_raw(Syscall::Bpf, "bpf", RawFnHandler(sys_bpf));
     table.install_raw(
@@ -8165,7 +8203,6 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     #[cfg(feature = "container")]
     {
-        table.install_raw(Syscall::Shmget, "shmget", RawFnHandler(sys_shmget));
         // The self-contained sysvipc module supersedes the id-by-key
         // semget/msgget in any linux-compat build; only register the
         // container-namespace versions when linux-compat is absent.
@@ -9584,12 +9621,6 @@ mod handler_sys_dup;
 mod handler_sys_dup2;
 #[path = "sys_dup3.rs"]
 mod handler_sys_dup3;
-#[path = "sys_epoll_create.rs"]
-mod handler_sys_epoll_create;
-#[path = "sys_epoll_ctl.rs"]
-mod handler_sys_epoll_ctl;
-#[path = "sys_epoll_wait.rs"]
-mod handler_sys_epoll_wait;
 #[path = "sys_eventfd.rs"]
 mod handler_sys_eventfd;
 #[path = "sys_execve.rs"]
@@ -9640,8 +9671,6 @@ mod handler_sys_fork;
 mod handler_sys_fremovexattr;
 #[path = "sys_fsetxattr.rs"]
 mod handler_sys_fsetxattr;
-#[path = "sys_fstat.rs"]
-mod handler_sys_fstat;
 #[path = "sys_fstat_linux.rs"]
 mod handler_sys_fstat_linux;
 #[path = "sys_fstatfs.rs"]
@@ -9790,8 +9819,6 @@ mod handler_sys_munlockall;
 mod handler_sys_munmap;
 #[path = "sys_name_to_handle_at.rs"]
 mod handler_sys_name_to_handle_at;
-#[path = "sys_newfstatat.rs"]
-mod handler_sys_newfstatat;
 #[path = "sys_newfstatat_linux.rs"]
 mod handler_sys_newfstatat_linux;
 #[path = "sys_noop_ok.rs"]
@@ -9830,8 +9857,6 @@ mod handler_sys_pkey_alloc;
 mod handler_sys_pkey_free;
 #[path = "sys_pkey_mprotect.rs"]
 mod handler_sys_pkey_mprotect;
-#[path = "sys_poll.rs"]
-mod handler_sys_poll;
 #[path = "sys_prctl.rs"]
 mod handler_sys_prctl;
 #[path = "sys_pread64.rs"]
@@ -9982,8 +10007,6 @@ mod handler_sys_shmem_create;
 mod handler_sys_shmem_destroy;
 #[path = "sys_shmem_map.rs"]
 mod handler_sys_shmem_map;
-#[path = "sys_shmget.rs"]
-mod handler_sys_shmget;
 #[path = "sys_shmget_compat.rs"]
 mod handler_sys_shmget_compat;
 #[path = "sys_sigaction.rs"]
@@ -10042,8 +10065,6 @@ mod handler_sys_socket_shutdown;
 mod handler_sys_socketpair;
 #[path = "sys_splice.rs"]
 mod handler_sys_splice;
-#[path = "sys_stat.rs"]
-mod handler_sys_stat;
 #[path = "sys_stat_linux.rs"]
 mod handler_sys_stat_linux;
 #[path = "sys_statfs.rs"]
@@ -10168,8 +10189,6 @@ pub(crate) use handler_sys_shmctl::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_shmdt::*;
 #[allow(unused_imports)]
-pub(crate) use handler_sys_shmget::*;
-#[allow(unused_imports)]
 pub(crate) use handler_sys_shmget_compat::*;
 #[allow(unused_imports)]
 pub(crate) use handler_sys_stat_linux::*;
@@ -10202,9 +10221,6 @@ pub(crate) use {
     handler_sys_dup::sys_dup,
     handler_sys_dup2::sys_dup2,
     handler_sys_dup3::sys_dup3,
-    handler_sys_epoll_create::sys_epoll_create,
-    handler_sys_epoll_ctl::sys_epoll_ctl,
-    handler_sys_epoll_wait::sys_epoll_wait,
     handler_sys_eventfd::sys_eventfd,
     handler_sys_eventfd::sys_eventfd2,
     handler_sys_execve::sys_execve,
@@ -10231,7 +10247,6 @@ pub(crate) use {
     handler_sys_fork::sys_fork,
     handler_sys_fremovexattr::sys_fremovexattr,
     handler_sys_fsetxattr::sys_fsetxattr,
-    handler_sys_fstat::sys_fstat,
     handler_sys_fstatfs::sys_fstatfs,
     handler_sys_fsync::{sys_fdatasync, sys_fsync},
     handler_sys_ftruncate::sys_ftruncate,
@@ -10300,7 +10315,6 @@ pub(crate) use {
     handler_sys_munlock::sys_munlock,
     handler_sys_munlockall::sys_munlockall,
     handler_sys_munmap::sys_munmap,
-    handler_sys_newfstatat::sys_newfstatat,
     handler_sys_noop_ok::sys_noop_ok,
     handler_sys_open::sys_open,
     handler_sys_open_linux::sys_open_linux,
@@ -10316,7 +10330,6 @@ pub(crate) use {
     handler_sys_pkey_alloc::sys_pkey_alloc,
     handler_sys_pkey_free::sys_pkey_free,
     handler_sys_pkey_mprotect::sys_pkey_mprotect,
-    handler_sys_poll::sys_poll,
     handler_sys_prctl::sys_prctl,
     handler_sys_pread64::sys_pread64,
     handler_sys_preadv::sys_preadv,
@@ -10415,7 +10428,6 @@ pub(crate) use {
     handler_sys_socket_shutdown::sys_socket_shutdown,
     handler_sys_socketpair::sys_socketpair,
     handler_sys_splice::sys_splice,
-    handler_sys_stat::{stat_absolute, sys_stat},
     handler_sys_statfs::sys_statfs,
     handler_sys_symlink::{symlink_absolute, sys_symlink},
     handler_sys_symlinkat::sys_symlinkat,
