@@ -154,6 +154,12 @@ mod stall_wd {
     static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Idle-stall wedge detector: consecutive windows with a collapsed syscall
+    /// rate, tracked INDEPENDENT of `runnable`. The `runnable > 0` panic path
+    /// is blind to a lost wakeup that parks EVERY task (runnable==0) — the SMP
+    /// signal-wake strand — so this fires the per-task census on that case.
+    static WEDGE_STREAK: AtomicU64 = AtomicU64::new(0);
+    static WEDGE_CENSUS_COUNT: AtomicU64 = AtomicU64::new(0);
     /// Flat windows during which NOTHING was runnable — idle, or a lost
     /// wakeup. Counted separately from `FLAT_WINDOWS` so the two verdicts
     /// cannot reset each other.
@@ -388,15 +394,54 @@ mod stall_wd {
         // the census is the only way to see which wait it is actually in.
         if wc == 180 {
             let _ = writeln!(TrapWriter, "PARK-CENSUS: begin");
-            for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
-                narf_userspace::task::dbg_park_snapshot()
+            for (
+                tid,
+                pid,
+                st,
+                dl,
+                fu,
+                fns,
+                fgen,
+                fval,
+                netio,
+                waitchild,
+                flock,
+                parked,
+                sigwait,
+                console_read,
+                epoll_fd,
+                has_sigwaker,
+            ) in narf_userspace::task::dbg_park_snapshot()
             {
                 let _ = writeln!(
                     TrapWriter,
-                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked}"
+                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigwait={sigwait:#x} console_read={console_read} epoll_fd={epoll_fd} has_sigwaker={has_sigwaker}"
                 );
             }
             let _ = writeln!(TrapWriter, "PARK-CENSUS: end");
+        }
+
+        // Idle-stall wedge census. The `runnable > 0` panic below cannot see a
+        // lost wakeup that leaves every task parked (runnable == 0) — precisely
+        // the SMP signal-wake strand (all workers/parent parked, CPU idle-halts,
+        // syscall rate collapses). Trigger on the collapsed rate ALONE, dump the
+        // per-task census (which now carries has_sigwaker + strand) so the
+        // waker-less park is named. Spaced (streak resets each fire) and capped
+        // so a genuinely slow-but-progressing run isn't flooded.
+        if wc > 20 && delta < 5_000 {
+            let n = WEDGE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 3 {
+                WEDGE_STREAK.store(0, Ordering::Relaxed);
+                if WEDGE_CENSUS_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
+                    let _ = writeln!(
+                        TrapWriter,
+                        "STALL-WD: idle-stall wedge (delta={delta} runnable={runnable} wc={wc}) — per-task census:"
+                    );
+                    dump(sc);
+                }
+            }
+        } else {
+            WEDGE_STREAK.store(0, Ordering::Relaxed);
         }
 
         // A single wedged task does not stall the system: other tasks keep
@@ -627,8 +672,24 @@ mod stall_wd {
                 "STALL-WD virtio-blk: sector={sector} head={head} avail={avail} last_used={last_used} device_used={device_used} free={free} status={status:#x}"
             );
         }
-        for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
-            narf_userspace::task::dbg_park_snapshot()
+        for (
+            tid,
+            pid,
+            st,
+            dl,
+            fu,
+            fns,
+            fgen,
+            fval,
+            netio,
+            waitchild,
+            flock,
+            parked,
+            sigwait,
+            console_read,
+            epoll_fd,
+            has_sigwaker,
+        ) in narf_userspace::task::dbg_park_snapshot()
         {
             let sig = narf_userspace::handlers::signal_pending_bits(tid);
             let (live_gen, futex_waiters) = if fu != 0 {
@@ -636,9 +697,19 @@ mod stall_wd {
             } else {
                 (0, 0)
             };
+            // `strand=true` flags the smoking gun: a parked task with a
+            // deliverable pending signal that has NO signal waker AND is in
+            // none of the deadline/io/child waits that would otherwise re-poll
+            // it — i.e. nothing will rouse it to take the signal.
+            let strand = parked
+                && sig != 0
+                && !has_sigwaker
+                && !netio
+                && !waitchild
+                && (dl == 0 || dl == u64::MAX);
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen}/{live_gen} futex_waiters={futex_waiters} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigpend={sig:#x}",
+                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen}/{live_gen} futex_waiters={futex_waiters} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigwait={sigwait:#x} console_read={console_read} epoll_fd={epoll_fd} has_sigwaker={has_sigwaker} sigpend={sig:#x} strand={strand}",
                 dl != 0 && dl != u64::MAX && now_ns > dl
             );
         }
