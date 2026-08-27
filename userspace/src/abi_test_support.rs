@@ -118,6 +118,20 @@ pub fn setup() {
     crate::handlers::__test_root_dir_reset();
     #[cfg(feature = "container")]
     crate::pid_ns::__test_reset();
+    // UTS / NET / IPC / USER namespaces were the hole in the fresh-view
+    // promise above: pid and mount namespaces were reset here, but a test
+    // that called `unshare(CLONE_NEWUSER)` or `unshare(CLONE_NEWIPC)` left
+    // its namespace installed for EVERY LATER TEST in the image. That is
+    // not hypothetical — it cost 27 SysV IPC failures, because IPC objects
+    // are looked up per-namespace, so the leaked namespace silently moved
+    // every subsequent msgsnd/semop into a different world. Individual
+    // tests used to call this themselves; making it part of the harness is
+    // what stops the next one forgetting.
+    //
+    // The module is `container`-gated, so the reset must be too — the CI
+    // clippy stage builds `kernel-test,cgroup-all` WITHOUT container.
+    #[cfg(feature = "container")]
+    crate::namespaces::__test_reset_all();
     __test_clear_global();
     fd::__test_reset();
     // The descriptor-allocation bound is a global hook; a case that lowered
@@ -158,6 +172,8 @@ pub fn teardown() {
     crate::handlers::__test_root_dir_reset();
     #[cfg(feature = "container")]
     crate::pid_ns::__test_reset();
+    #[cfg(feature = "container")]
+    crate::namespaces::__test_reset_all();
     __test_clear_global();
     fd::__test_reset();
     crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());
@@ -211,6 +227,18 @@ pub fn a3(arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> SyscallArgs {
         arg1,
         arg2,
         arg3,
+        ..Default::default()
+    }
+}
+
+/// Five-argument form — `mount(2)` and friends.
+pub fn a4(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> SyscallArgs {
+    SyscallArgs {
+        arg0,
+        arg1,
+        arg2,
+        arg3,
+        arg4,
         ..Default::default()
     }
 }

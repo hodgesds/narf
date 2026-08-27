@@ -3670,6 +3670,7 @@ const CAP_VERSION_3: u32 = 0x2008_0522;
 pub(crate) const CAP_SETGID: u32 = 6;
 pub(crate) const CAP_SETUID: u32 = 7;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
+pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
 
@@ -3837,6 +3838,17 @@ pub fn caps_init() {
 #[doc(hidden)]
 pub fn __test_caps_reset() {
     *CAP_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Test-only: move a task's EFFECTIVE uid, so a case can exercise the
+/// "not your process" arm of `set_one_prio_perm` without a second live
+/// credential context.
+#[doc(hidden)]
+pub fn __test_set_uidgid_euid(task: u64, euid: u32) {
+    let _ = write_uidgid(task, |e| {
+        e.uid = euid;
+        e.euid = euid;
+    });
 }
 
 /// Test-only: run the fork credential inheritance directly, without
@@ -9554,6 +9566,17 @@ fn default_rlimits() -> [RLimitPair; RLIMIT_COUNT] {
         cur: 8 * 1024 * 1024,
         max: RLIM_INFINITY,
     };
+    // RLIMIT_NICE = 13. Linux's default is 0, NOT infinity
+    // (`include/asm-generic/resource.h`: `[RLIMIT_NICE] = { 0, 0 }`), and
+    // the value is a CEILING ON PRIVILEGE, not on consumption: `can_nice`
+    // permits a nice REDUCTION only while `20 - nice <= RLIMIT_NICE`, so a
+    // limit of 0 means "may not lower nice at all without CAP_SYS_NICE".
+    //
+    // Defaulting it to infinity let any task renice itself to -20 and made
+    // setpriority's -EACCES arm unreachable by construction — the same
+    // everything-is-privileged shape as the capability gaps this branch
+    // closes, wearing an rlimit's clothes.
+    t[13] = RLimitPair { cur: 0, max: 0 };
     // RLIMIT_CORE = 4.
     t[4] = RLimitPair {
         cur: 0,
@@ -9631,6 +9654,7 @@ fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     Some(row[resource])
 }
 
+const RLIMIT_NICE: usize = 13;
 const RLIMIT_DATA: usize = 2;
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_MEMLOCK: usize = 8;

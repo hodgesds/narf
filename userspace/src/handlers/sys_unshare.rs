@@ -65,11 +65,7 @@ const UNSHARE_VALID_FLAGS: u64 = CLONE_THREAD
 /// -ENOMEM, not the `-1`/EPERM it used to report. A caller retries ENOMEM;
 /// EPERM tells it to give up and drop privileges it never lacked.
 ///
-/// LINUX-GAP, both about checks NARF cannot make yet:
-///   * `unshare(CLONE_NEWNS)` without CAP_SYS_ADMIN in the owning user
-///     namespace is -EPERM (`fs/namespace.c::copy_mnt_ns`); NARF models no
-///     per-task capability set here.
-///   * `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS first,
+/// LINUX-GAP: `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS first,
 ///     and `check_unshare_flags` then rejects CLONE_THREAD/SIGHAND/VM with
 ///     -EINVAL unless the caller is single-threaded — so `unshare(CLONE_NEWUSER)`
 ///     from a multi-threaded process fails on Linux and succeeds here.
@@ -80,6 +76,35 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     // bit leaves the caller's namespaces untouched.
     if flags & !UNSHARE_VALID_FLAGS != 0 {
         ctx.set_return(fail(EINVAL));
+        return;
+    }
+
+    // `kernel/nsproxy.c::unshare_nsproxy_namespaces`:
+    //
+    // ```text
+    // if (!(unshare_flags & (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC |
+    //                        CLONE_NEWNET | CLONE_NEWPID | CLONE_NEWCGROUP |
+    //                        CLONE_NEWTIME)))
+    //         return 0;
+    // user_ns = new_cred ? new_cred->user_ns : current_user_ns();
+    // if (!ns_capable(user_ns, CAP_SYS_ADMIN))
+    //         return -EPERM;
+    // ```
+    //
+    // CLONE_NEWUSER is deliberately ABSENT from that list. Creating a user
+    // namespace unprivileged is the entire point of user namespaces — it is
+    // how an ordinary user gets a context in which it holds capabilities —
+    // so gating it on CAP_SYS_ADMIN would invert the feature. Every OTHER
+    // namespace type requires the capability.
+    const NS_NEEDS_SYS_ADMIN: u64 = CLONE_NEWNS
+        | CLONE_NEWUTS
+        | CLONE_NEWIPC
+        | CLONE_NEWNET
+        | CLONE_NEWPID
+        | CLONE_NEWCGROUP
+        | CLONE_NEWTIME;
+    if flags & NS_NEEDS_SYS_ADMIN != 0 && !capable(CAP_SYS_ADMIN) {
+        ctx.set_return(fail(1)); // -EPERM
         return;
     }
 

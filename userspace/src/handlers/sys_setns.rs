@@ -36,9 +36,14 @@ fn fail(errno: i64) -> SyscallReturn {
 /// the `container` namespace bundle too — there, no descriptor can ever be a
 /// namespace file, so every open fd is EINVAL.
 ///
-/// LINUX-GAP: `prepare_nsset`/`validate_nsset` reject a caller lacking
-/// CAP_SYS_ADMIN in the target user namespace with -EPERM after these
-/// checks; NARF models no per-task capability set here.
+/// `prepare_nsset`/`validate_nsset` reject a caller lacking CAP_SYS_ADMIN
+/// in the target user namespace with -EPERM, AFTER the descriptor checks —
+/// so a bad fd is still -EBADF for an unprivileged caller.
+///
+/// LINUX-GAP: the check is `ns_capable` against the TARGET namespace's
+/// owning user namespace, which lets a task that owns a user namespace
+/// join namespaces beneath it without being globally privileged. NARF
+/// consults the effective set only — the restrictive direction.
 pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Both arguments are `int`: the upper 32 bits of the syscall registers
@@ -52,6 +57,14 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
     // `fd_empty(f)` → -EBADF.
     if fd < 0 || !crate::fd::with_table(caller, |t| t.get(fd as u32).is_some()).unwrap_or(false) {
         ctx.set_return(fail(EBADF));
+        return;
+    }
+
+    // `validate_nsset`: `if (!ns_capable(nsset->cred->user_ns,
+    // CAP_SYS_ADMIN)) return -EPERM;` — after the fd is validated, before
+    // any namespace is installed.
+    if !capable(CAP_SYS_ADMIN) {
+        ctx.set_return(fail(1)); // -EPERM
         return;
     }
 
