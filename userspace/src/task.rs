@@ -536,7 +536,6 @@ pub fn dbg_park_census(tag: &str) {
 /// under the lock, reads the
 /// atomics lock-free after.
 #[allow(clippy::type_complexity)]
-#[allow(clippy::type_complexity)]
 pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
     u64,
     u64,
