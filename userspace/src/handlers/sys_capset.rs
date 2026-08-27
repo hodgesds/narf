@@ -93,8 +93,10 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let mut caps = [0u64; 3];
-    for (field, slot) in caps.iter_mut().enumerate() {
+    // `struct __user_cap_data_struct { __u32 effective, permitted,
+    // inheritable; }`, in that order.
+    let mut requested = [0u64; 3];
+    for (field, slot) in requested.iter_mut().enumerate() {
         let lo = u32::from_le_bytes(buf[field * 4..field * 4 + 4].try_into().unwrap()) as u64;
         let hi = if ndata == 2 {
             u32::from_le_bytes(buf[12 + field * 4..12 + field * 4 + 4].try_into().unwrap()) as u64
@@ -103,10 +105,17 @@ pub(crate) fn sys_capset(ctx: &mut dyn TrapContext) {
         };
         *slot = lo | (hi << 32);
     }
-    {
-        let mut g = CAP_TABLE.lock();
-        let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        m.insert(task, caps);
+    let [effective, permitted, inheritable] = requested;
+    // `security/commoncap.c::cap_capset` — this call used to write whatever
+    // it was handed straight into the table, so any task could grant itself
+    // any capability. Every `capable()` gate elsewhere in the tree depends
+    // on this check: without it, a syscall guarded by CAP_SETUID is reached
+    // simply by asking for CAP_SETUID first.
+    match cap_capset(read_caps(task), effective, permitted, inheritable) {
+        Ok(new) => {
+            write_caps(task, new);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
     }
-    ctx.set_return(SyscallReturn::ok(0));
 }

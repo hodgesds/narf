@@ -943,3 +943,565 @@ fn smoke_abi_creds_getrandom_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_getrandom_neg);
+
+// ─────────────────────────────────────────────────────────────────────
+// Capability enforcement — security/commoncap.c + kernel/sys.c
+//
+// Before this existed, CAP_TABLE was an ABI round-trip store: capset
+// wrote whatever it was handed, and no syscall consulted the result. The
+// tests below pin the two halves that make it a credential instead of a
+// buffer — capset refusing to grant, and the call sites consulting it.
+//
+// The harness task holds `Caps::boot` (the full set) unless a case drops
+// it with `__test_set_caps`, which mirrors boot: init is privileged and
+// everything else descends from it.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Build a v3 capget/capset header + data pair. Data is
+/// `{ effective, permitted, inheritable }` x2 (low then high 32 bits).
+fn cap_hdr(pid: i32) -> [u8; 8] {
+    let mut h = [0u8; 8];
+    h[..4].copy_from_slice(&CAP_VERSION_3.to_le_bytes());
+    h[4..].copy_from_slice(&pid.to_le_bytes());
+    h
+}
+
+fn cap_data(effective: u64, permitted: u64, inheritable: u64) -> [u8; 24] {
+    let mut d = [0u8; 24];
+    for (i, v) in [effective, permitted, inheritable].into_iter().enumerate() {
+        d[i * 4..i * 4 + 4].copy_from_slice(&(v as u32).to_le_bytes());
+        d[12 + i * 4..12 + i * 4 + 4].copy_from_slice(&((v >> 32) as u32).to_le_bytes());
+    }
+    d
+}
+
+fn do_capset(effective: u64, permitted: u64, inheritable: u64) -> Option<i64> {
+    let hdr = cap_hdr(0);
+    let data = cap_data(effective, permitted, inheritable);
+    call(
+        Syscall::Capset.raw(),
+        a1(hdr.as_ptr() as u64, data.as_ptr() as u64),
+    )
+}
+
+/// Read back (effective, permitted, inheritable) via capget.
+fn do_capget() -> Result<(u64, u64, u64), &'static str> {
+    let hdr = cap_hdr(0);
+    let mut data = [0u8; 24];
+    match call(
+        Syscall::Capget.raw(),
+        a1(hdr.as_ptr() as u64, data.as_mut_ptr() as u64),
+    ) {
+        Some(0) => {}
+        _ => return Err("capget failed"),
+    }
+    let field = |i: usize| {
+        let lo = u32::from_le_bytes(data[i * 4..i * 4 + 4].try_into().unwrap()) as u64;
+        let hi = u32::from_le_bytes(data[12 + i * 4..12 + i * 4 + 4].try_into().unwrap()) as u64;
+        lo | (hi << 32)
+    };
+    Ok((field(0), field(1), field(2)))
+}
+
+const CAP_SETUID_BIT: u64 = 1 << 7;
+const CAP_SETGID_BIT: u64 = 1 << 6;
+const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+const CAP_SYS_CHROOT_BIT: u64 = 1 << 18;
+const CAP_SYS_TIME_BIT: u64 = 1 << 25;
+
+fn drop_all_caps() {
+    crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+}
+
+fn set_caps(effective: u64, permitted: u64) {
+    crate::handlers::__test_set_caps(FAKE_TASK, effective, permitted);
+}
+
+// ── capset: the gate that makes every other check meaningful ─────────
+
+fn smoke_abi_caps_capset_cannot_grant_beyond_permitted() -> TestResult {
+    with_setup(|| {
+        // `if (!cap_issubset(*permitted, old->cap_permitted)) return -EPERM;`
+        //
+        // This is THE load-bearing rule. Without it a task hands itself
+        // CAP_SETUID and every capable() gate in the tree is decorative:
+        // `capset(CAP_SETUID); setuid(0);` would succeed from an
+        // unprivileged process.
+        drop_all_caps();
+        match do_capset(CAP_SETUID_BIT, CAP_SETUID_BIT, 0) {
+            Some(-1) => {}
+            Some(0) => return Err("capset granted a capability the task did not hold"),
+            _ => return Err("capset with an out-of-permitted raise: want -EPERM"),
+        }
+        // And the store must be unchanged, not partially written.
+        match do_capget()? {
+            (0, 0, 0) => Ok(()),
+            _ => Err("a refused capset still mutated the credential"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_capset_cannot_grant_beyond_permitted
+);
+
+fn smoke_abi_caps_capset_may_drop() -> TestResult {
+    with_setup(|| {
+        // Shrinking pP is always allowed — that is how a privileged
+        // service sheds capabilities it no longer needs.
+        set_caps(
+            CAP_SETUID_BIT | CAP_SETGID_BIT,
+            CAP_SETUID_BIT | CAP_SETGID_BIT,
+        );
+        match do_capset(CAP_SETGID_BIT, CAP_SETGID_BIT, 0) {
+            Some(0) => {}
+            _ => return Err("capset could not drop a capability"),
+        }
+        match do_capget()? {
+            (e, p, _) if e == CAP_SETGID_BIT && p == CAP_SETGID_BIT => Ok(()),
+            _ => Err("capget did not read back the dropped credential"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_capset_may_drop);
+
+fn smoke_abi_caps_capset_drop_is_irreversible() -> TestResult {
+    with_setup(|| {
+        // The consequence of pP being monotonically shrinking: once
+        // dropped, a capability cannot be re-raised. A drop that could be
+        // undone is not a drop.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if do_capset(0, 0, 0) != Some(0) {
+            return Err("capset could not drop to the empty set");
+        }
+        match do_capset(CAP_SETUID_BIT, CAP_SETUID_BIT, 0) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("a dropped capability was re-raised"),
+            _ => Err("re-raising a dropped capability: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_capset_drop_is_irreversible);
+
+fn smoke_abi_caps_capset_effective_must_be_within_permitted() -> TestResult {
+    with_setup(|| {
+        // `if (!cap_issubset(*effective, *permitted)) return -EPERM;`
+        // An effective bit with no permitted bit behind it would be a
+        // capability the task can exercise but was never granted.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        match do_capset(CAP_SETUID_BIT, 0, 0) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("capset allowed pE to exceed pP"),
+            _ => Err("capset with pE outside pP: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_capset_effective_must_be_within_permitted
+);
+
+fn smoke_abi_caps_capset_inheritable_bounded() -> TestResult {
+    with_setup(|| {
+        // `if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable,
+        //                    old->cap_permitted))) return -EPERM;`
+        // pI cannot name something the task neither holds nor already
+        // inherits.
+        drop_all_caps();
+        match do_capset(0, 0, CAP_SETUID_BIT) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("capset allowed pI outside pP|pI"),
+            _ => Err("capset with an unbacked inheritable bit: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_capset_inheritable_bounded);
+
+// ── setuid / setgid: the CAP_SETUID rule from kernel/sys.c ───────────
+
+fn smoke_abi_caps_setuid_unprivileged_is_eperm() -> TestResult {
+    with_setup(|| {
+        // `else if (!uid_eq(kuid, old->uid) && !uid_eq(kuid, new->suid))
+        //          goto error;`  /* -EPERM */
+        // The harness task is uid 0 / suid 0, so 4242 is neither.
+        drop_all_caps();
+        match call(Syscall::SetUid.raw(), a0(4242)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("an unprivileged task changed its uid to an arbitrary id"),
+            _ => Err("unprivileged setuid: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_setuid_unprivileged_is_eperm);
+
+fn smoke_abi_caps_setuid_needs_capset_first_and_capset_refuses() -> TestResult {
+    with_setup(|| {
+        // The composed attack the whole design exists to stop: ask for the
+        // capability, then use it. Both halves must refuse.
+        drop_all_caps();
+        if do_capset(CAP_SETUID_BIT, CAP_SETUID_BIT, 0) == Some(0) {
+            return Err("capset self-granted CAP_SETUID");
+        }
+        match call(Syscall::SetUid.raw(), a0(0xFFFF_FFFE)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("capset+setuid escalated an unprivileged task"),
+            _ => Err("setuid after a refused capset: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setuid_needs_capset_first_and_capset_refuses
+);
+
+fn smoke_abi_caps_setuid_privileged_moves_every_id() -> TestResult {
+    with_setup(|| {
+        // `new->suid = new->uid = kuid; ... new->fsuid = new->euid = kuid;`
+        // With CAP_SETUID the change is total, which is what makes it
+        // irreversible: no id is left holding the old value to return to.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if call(Syscall::SetUid.raw(), a0(1000)) != Some(0) {
+            return Err("privileged setuid failed");
+        }
+        let (mut r, mut e, mut s) = (0u32, 0u32, 0u32);
+        if call(
+            Syscall::Getresuid.raw(),
+            a2(
+                &mut r as *mut u32 as u64,
+                &mut e as *mut u32 as u64,
+                &mut s as *mut u32 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("getresuid failed");
+        }
+        if (r, e, s) == (1000, 1000, 1000) {
+            Ok(())
+        } else {
+            Err("privileged setuid did not move real, effective AND saved uid")
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setuid_privileged_moves_every_id
+);
+
+fn smoke_abi_caps_setuid_unprivileged_restore_from_saved() -> TestResult {
+    with_setup(|| {
+        // The reason the saved uid has to be a real field: an unprivileged
+        // caller may switch to `old->suid`, and only euid/fsuid move. That
+        // is a set-uid program dropping privilege reversibly.
+        //
+        // Reach the state the way a real program does — a privileged
+        // setresuid(-1, 1000, 0) leaves suid 0 behind — then drop caps.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if call(Syscall::Setresuid.raw(), a2(u32::MAX as u64, 1000, 0)) != Some(0) {
+            return Err("setresuid setup failed");
+        }
+        drop_all_caps();
+        // suid is 0, so switching back to 0 is permitted without CAP_SETUID.
+        if call(Syscall::SetUid.raw(), a0(0)) != Some(0) {
+            return Err("unprivileged setuid to the SAVED uid was refused");
+        }
+        let (mut r, mut e, mut s) = (9u32, 9u32, 9u32);
+        if call(
+            Syscall::Getresuid.raw(),
+            a2(
+                &mut r as *mut u32 as u64,
+                &mut e as *mut u32 as u64,
+                &mut s as *mut u32 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("getresuid failed");
+        }
+        // Only the effective id moved; real and saved are untouched.
+        if e != 0 {
+            return Err("unprivileged setuid did not move the effective uid");
+        }
+        if s != 0 {
+            return Err("unprivileged setuid clobbered the saved uid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setuid_unprivileged_restore_from_saved
+);
+
+fn smoke_abi_caps_getresuid_reports_a_distinct_saved_id() -> TestResult {
+    with_setup(|| {
+        // getresuid used to write the same value into all three slots
+        // because no saved id existed. A set-uid program reads the third
+        // slot to learn what it can still restore, so duplicating the
+        // effective id there reports a reversible drop as permanent.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if call(Syscall::Setresuid.raw(), a2(0, 1000, 0)) != Some(0) {
+            return Err("setresuid setup failed");
+        }
+        let (mut r, mut e, mut s) = (9u32, 9u32, 9u32);
+        if call(
+            Syscall::Getresuid.raw(),
+            a2(
+                &mut r as *mut u32 as u64,
+                &mut e as *mut u32 as u64,
+                &mut s as *mut u32 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("getresuid failed");
+        }
+        match (r, e, s) {
+            (0, 1000, 0) => Ok(()),
+            (0, 1000, 1000) => Err("getresuid reported the effective uid as the saved uid"),
+            _ => Err("getresuid did not report (real, effective, saved)"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_getresuid_reports_a_distinct_saved_id
+);
+
+fn smoke_abi_caps_setresuid_permutation_needs_no_capability() -> TestResult {
+    with_setup(|| {
+        // `ruid_new = ruid != -1 && !uid_eq(kruid, old->uid) &&
+        //             !uid_eq(kruid, old->euid) && !uid_eq(kruid, old->suid);`
+        // Only a GENUINELY NEW id needs CAP_SETUID; rearranging ids the
+        // task already holds does not.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if call(Syscall::Setresuid.raw(), a2(0, 1000, 0)) != Some(0) {
+            return Err("setresuid setup failed");
+        }
+        drop_all_caps();
+        // Swap effective and saved — both ids are already held.
+        match call(Syscall::Setresuid.raw(), a2(u32::MAX as u64, 0, 1000)) {
+            Some(0) => {}
+            Some(-1) => return Err("setresuid refused a permutation of ids already held"),
+            _ => return Err("setresuid permutation: unexpected return"),
+        }
+        // But introducing a new id is -EPERM.
+        match call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 4242, u32::MAX as u64),
+        ) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("setresuid introduced a new uid without CAP_SETUID"),
+            _ => Err("setresuid with a new id: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setresuid_permutation_needs_no_capability
+);
+
+fn smoke_abi_caps_setgid_unprivileged_is_eperm() -> TestResult {
+    with_setup(|| {
+        // `else if (gid_eq(kgid, old->gid) || gid_eq(kgid, old->sgid)) ...
+        //  else goto error;`
+        drop_all_caps();
+        match call(Syscall::SetGid.raw(), a0(4242)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("an unprivileged task changed its gid to an arbitrary id"),
+            _ => Err("unprivileged setgid: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_setgid_unprivileged_is_eperm);
+
+fn smoke_abi_caps_setreuid_saved_is_a_source_for_euid_only() -> TestResult {
+    with_setup(|| {
+        // The permitted source sets DIFFER between setreuid's two
+        // arguments: a new REAL uid may come from {uid, euid}; a new
+        // EFFECTIVE uid may come from {uid, euid, suid}. So with
+        // (uid=0, euid=1000, suid=0), setreuid(-1, 0) is allowed by the
+        // saved id but setreuid(2000, -1) is not.
+        set_caps(CAP_SETUID_BIT, CAP_SETUID_BIT);
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 0)) != Some(0) {
+            return Err("setresuid setup failed");
+        }
+        drop_all_caps();
+        // euid <- 0 is permitted: 0 is the saved uid.
+        if call(Syscall::Setreuid.raw(), a1(u32::MAX as u64, 0)) != Some(0) {
+            return Err("setreuid(-1, saved) was refused");
+        }
+        // ruid <- 2000 is not: it is none of uid/euid.
+        match call(Syscall::Setreuid.raw(), a1(2000, u32::MAX as u64)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("setreuid took a real uid from outside {uid, euid}"),
+            _ => Err("setreuid with an unrelated real uid: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setreuid_saved_is_a_source_for_euid_only
+);
+
+// ── CAP_SYS_ADMIN / CHROOT / TIME, and where each check SITS ─────────
+
+fn smoke_abi_caps_sethostname_requires_sys_admin() -> TestResult {
+    with_setup(|| {
+        drop_all_caps();
+        let name = b"host\0";
+        match call(Syscall::SetHostname.raw(), a1(name.as_ptr() as u64, 4)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task set the hostname"),
+            _ => return Err("unprivileged sethostname: want -EPERM"),
+        }
+        set_caps(CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        match call(Syscall::SetHostname.raw(), a1(name.as_ptr() as u64, 4)) {
+            Some(0) => Ok(()),
+            _ => Err("sethostname with CAP_SYS_ADMIN should succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_sethostname_requires_sys_admin);
+
+fn smoke_abi_caps_sethostname_eperm_precedes_einval_and_efault() -> TestResult {
+    with_setup(|| {
+        // `if (!ns_capable(...)) return -EPERM;` is the FIRST line of
+        // SYSCALL_DEFINE2(sethostname) — before the length check and
+        // before the copy. An unprivileged caller learns nothing about
+        // whether its other arguments were also wrong.
+        drop_all_caps();
+        // Over-long length AND an unmapped buffer, together.
+        match call(Syscall::SetHostname.raw(), a1(BAD_PTR, 1 << 20)) {
+            Some(-1) => Ok(()),
+            Some(-22) => Err("sethostname checked the length before the capability"),
+            Some(-14) => Err("sethostname copied from the buffer before the capability check"),
+            _ => Err("sethostname(bad len, bad ptr, no cap): want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_sethostname_eperm_precedes_einval_and_efault
+);
+
+fn smoke_abi_caps_settimeofday_eperm_comes_last() -> TestResult {
+    with_setup(|| {
+        // The mirror image of sethostname, and the reason each site had to
+        // be placed individually rather than by rule: `security_settime64`
+        // sits INSIDE do_sys_settimeofday64, after the wrapper's EFAULT and
+        // after the value EINVAL. An unprivileged caller with a bad pointer
+        // gets -EFAULT, not -EPERM.
+        drop_all_caps();
+        match call(Syscall::Settimeofday.raw(), a1(BAD_PTR, 0)) {
+            Some(-14) => {}
+            Some(-1) => return Err("settimeofday checked the capability before the pointer"),
+            _ => return Err("settimeofday(bad ptr): want -EFAULT"),
+        }
+        // Valid pointer, invalid tv_usec → EINVAL still beats EPERM.
+        let tv: [i64; 2] = [1, 2_000_000];
+        match call(Syscall::Settimeofday.raw(), a1(tv.as_ptr() as u64, 0)) {
+            Some(-22) => {}
+            Some(-1) => return Err("settimeofday checked the capability before the value"),
+            _ => return Err("settimeofday(bad tv_usec): want -EINVAL"),
+        }
+        // Everything valid, still unprivileged → EPERM.
+        let good: [i64; 2] = [1, 0];
+        match call(Syscall::Settimeofday.raw(), a1(good.as_ptr() as u64, 0)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("an unprivileged task set the wall clock"),
+            _ => Err("unprivileged settimeofday: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_settimeofday_eperm_comes_last);
+
+fn smoke_abi_caps_clock_settime_requires_sys_time() -> TestResult {
+    with_setup(|| {
+        let ts: [i64; 2] = [1, 0];
+        drop_all_caps();
+        match call(Syscall::ClockSetTime.raw(), a1(0, ts.as_ptr() as u64)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task set CLOCK_REALTIME"),
+            _ => return Err("unprivileged clock_settime: want -EPERM"),
+        }
+        set_caps(CAP_SYS_TIME_BIT, CAP_SYS_TIME_BIT);
+        match call(Syscall::ClockSetTime.raw(), a1(0, ts.as_ptr() as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("clock_settime with CAP_SYS_TIME should succeed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_clock_settime_requires_sys_time
+);
+
+fn smoke_abi_caps_chroot_enoent_still_precedes_eperm() -> TestResult {
+    with_setup(|| {
+        // `error = -EPERM; if (!ns_capable(current_user_ns(),
+        //  CAP_SYS_CHROOT)) goto dput_and_out;` runs AFTER filename_lookup,
+        // so a path that does not exist is -ENOENT even for an
+        // unprivileged caller. Hoisting the capability check to the top of
+        // the handler would leak less than Linux does — and diverge from
+        // it, breaking a program that tells the two apart.
+        // The probe is the EMPTY path, whose -ENOENT arm (`getname()`
+        // rejects "" with -ENOENT) is the one NARF actually reaches before
+        // the capability check.
+        //
+        // A non-existent path like "/definitely-not-here" does NOT work as
+        // the probe here, and the reason is a pre-existing gap rather than
+        // anything to do with capabilities: NARF's existence test is
+        // `resolve_absolute(...).unwrap_or(false)`, which asks whether a
+        // filesystem COVERS the path, not whether the entry exists. With
+        // "/" mounted, every absolute path is covered — the LINUX-GAP
+        // already recorded in sys_chroot.rs.
+        drop_all_caps();
+        let path = b"\0";
+        match call(Syscall::Chroot.raw(), a0(path.as_ptr() as u64)) {
+            Some(-2) => Ok(()),
+            Some(-1) => Err("chroot checked the capability before resolving the path"),
+            _ => Err("chroot on an empty path: want -ENOENT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_chroot_enoent_still_precedes_eperm
+);
+
+fn smoke_abi_caps_chroot_requires_sys_chroot() -> TestResult {
+    with_setup(|| {
+        // Past the lookup, on a path that DOES resolve, the capability is
+        // what decides.
+        let root = b"/\0";
+        drop_all_caps();
+        match call(Syscall::Chroot.raw(), a0(root.as_ptr() as u64)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task called chroot"),
+            _ => return Err("unprivileged chroot on an existing dir: want -EPERM"),
+        }
+        set_caps(CAP_SYS_CHROOT_BIT, CAP_SYS_CHROOT_BIT);
+        match call(Syscall::Chroot.raw(), a0(root.as_ptr() as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("chroot(\"/\") with CAP_SYS_CHROOT should succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_chroot_requires_sys_chroot);
+
+fn smoke_abi_caps_fork_inherits_the_credential() -> TestResult {
+    with_setup(|| {
+        // `kernel/fork.c` copies the parent's struct cred wholesale;
+        // capabilities are transformed at EXECVE, not at fork. A child
+        // that did not inherit a dropped set would undo the drop.
+        set_caps(CAP_SETGID_BIT, CAP_SETGID_BIT);
+        const CHILD: u64 = 0xCA9F;
+        crate::handlers::__test_cap_fork(FAKE_TASK, CHILD);
+        if !crate::handlers::__test_task_capable(CHILD, 6) {
+            return Err("fork child did not inherit CAP_SETGID");
+        }
+        if crate::handlers::__test_task_capable(CHILD, 7) {
+            return Err("fork child gained CAP_SETUID its parent did not hold");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_fork_inherits_the_credential);

@@ -703,6 +703,7 @@ pub fn init_per_task_state() {
     narf_memory::wx::jit_grants_init();
     pgid_init();
     sid_init();
+    caps_init();
     wait_init();
     pkey_init();
     narf_filesystem::fuse_conn::install_request_context_provider(fuse_request_context);
@@ -3652,16 +3653,219 @@ const CAP_VERSION_1: u32 = 0x1998_0330;
 const CAP_VERSION_2: u32 = 0x2007_1026;
 const CAP_VERSION_3: u32 = 0x2008_0522;
 
-/// Per-task [effective, permitted, inheritable] capability masks.
+// ── POSIX capability credentials ───────────────────────────────────
+//
+// Linux capability numbers, `include/uapi/linux/capability.h`. Only the
+// ones NARF actually consults are named; the rest still round-trip
+// through capget/capset as opaque bits.
+//
+// NOTE these are the LINUX ambient-authority capabilities (CAP_SETUID and
+// friends), which are a completely different mechanism from NARF's own
+// object capabilities in the `capabilities/` crate (`CapKind::MountPoint`,
+// unforgeable references minted by the TCB). The two share a word and
+// nothing else; do not route one through the other.
+// Only the capabilities actually CONSULTED are named. The rest still
+// round-trip through capget/capset as opaque bits — naming one before
+// something enforces it would advertise a check that does not exist.
+pub(crate) const CAP_SETGID: u32 = 6;
+pub(crate) const CAP_SETUID: u32 = 7;
+pub(crate) const CAP_SYS_CHROOT: u32 = 18;
+pub(crate) const CAP_SYS_ADMIN: u32 = 21;
+pub(crate) const CAP_SYS_TIME: u32 = 25;
+
+/// `CAP_FULL_SET` — every capability up to and including `CAP_LAST_CAP`
+/// (`include/linux/capability.h`: `CAP_VALID_MASK`).
+const CAP_FULL_SET: u64 = if CAP_LAST_CAP >= 63 {
+    u64::MAX
+} else {
+    (1u64 << (CAP_LAST_CAP + 1)) - 1
+};
+
+/// Linux's five per-task capability sets (`struct cred`, include/linux/cred.h:
+/// `cap_effective`, `cap_permitted`, `cap_inheritable`, `cap_bset`,
+/// `cap_ambient`).
+///
+/// The previous store was a bare `[u64; 3]` holding only the first three,
+/// which is exactly the ABI shape capget/capset exchange — fine as a
+/// round-trip buffer, but a bounding set is what makes a drop irreversible,
+/// so without it there was nothing for `cap_capset` to check a raise
+/// against.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Caps {
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
+    pub bounding: u64,
+    pub ambient: u64,
+}
+
+impl Caps {
+    /// The credential a task has before anything narrows it: everything
+    /// permitted and effective, the full bounding set, nothing inheritable
+    /// or ambient. This is what Linux gives init (`kernel/cred.c`'s
+    /// `init_cred` uses `CAP_FULL_SET` for permitted/effective/bset).
+    const fn boot() -> Self {
+        Self {
+            effective: CAP_FULL_SET,
+            permitted: CAP_FULL_SET,
+            inheritable: 0,
+            bounding: CAP_FULL_SET,
+            ambient: 0,
+        }
+    }
+}
+
+/// Per-task capability credential.
 static CAP_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, [u64; 3]>>,
+    Option<alloc::collections::BTreeMap<u64, Caps>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-fn cap_fork(parent: u64, child: u64) {
+/// Read a task's credential, defaulting to [`Caps::boot`].
+///
+/// The default is deliberately the FULL set rather than the empty one, and
+/// the reason is worth stating because the opposite instinct is the usual
+/// one for a security default.
+///
+/// NARF has no single "spawn init" moment in `userspace/` to seed a row at
+/// — init is created by the boot path — so a fail-closed default would
+/// leave the very first task with no capabilities and nothing able to grant
+/// it any, breaking boot outright. Every task that is FORKED gets an
+/// explicit row (see `cap_fork`), so the default applies only to the boot
+/// task, whose Linux counterpart holds exactly this credential. The result
+/// is that enforcement can only ever RESTRICT relative to today's
+/// behaviour, never grant something that was previously refused.
+fn read_caps(task: u64) -> Caps {
+    let g = CAP_TABLE.lock();
+    g.as_ref()
+        .and_then(|m| m.get(&process_state_key(task)).copied())
+        .unwrap_or_else(Caps::boot)
+}
+
+fn write_caps(task: u64, caps: Caps) {
     let mut g = CAP_TABLE.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
-    let inherited = m.get(&parent).copied().unwrap_or([0; 3]);
-    m.insert(child, inherited);
+    m.insert(process_state_key(task), caps);
+}
+
+/// `kernel/capability.c::capable(cap)` — does the CURRENT task hold `cap`
+/// in its effective set?
+///
+/// LINUX-GAP: Linux's `capable()` is `ns_capable(&init_user_ns, cap)` and
+/// the per-namespace `ns_capable()` additionally grants a capability to a
+/// task that owns the target user namespace. NARF checks the effective set
+/// only, so a user-namespace owner is refused where Linux would allow it —
+/// the restrictive direction, which fails safe.
+pub(crate) fn capable(cap: u32) -> bool {
+    task_capable(current_task_id(), cap)
+}
+
+/// `capable()` for an explicit task.
+pub(crate) fn task_capable(task: u64, cap: u32) -> bool {
+    if u64::from(cap) > CAP_LAST_CAP {
+        return false;
+    }
+    read_caps(task).effective & (1u64 << cap) != 0
+}
+
+/// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
+/// parent's `struct cred` wholesale; capabilities are transformed at
+/// EXECVE, not at fork).
+fn cap_fork(parent: u64, child: u64) {
+    let inherited = read_caps(parent);
+    write_caps(child, inherited);
+}
+
+/// `security/commoncap.c::cap_capset` — the rules that make a capability
+/// credential trustworthy rather than merely stored.
+///
+/// ```text
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable,
+///                                             old->cap_permitted)))
+///         return -EPERM;          /* (when cap_inh_is_capped()) */
+/// if (!cap_issubset(*inheritable, cap_combine(old->cap_inheritable,
+///                                             old->cap_bset)))
+///         return -EPERM;          /* no new pI outside the bounding set */
+/// if (!cap_issubset(*permitted, old->cap_permitted))
+///         return -EPERM;          /* pP may only ever SHRINK */
+/// if (!cap_issubset(*effective, *permitted))
+///         return -EPERM;          /* pE must be within the new pP */
+/// new->cap_ambient = cap_intersect(new->cap_ambient,
+///                                  cap_intersect(*permitted, *inheritable));
+/// ```
+///
+/// `!cap_issubset(*permitted, old->cap_permitted)` is the load-bearing
+/// line. Without it a task can hand itself any capability it likes, so
+/// gating a syscall on `capable()` would be defeated by calling
+/// `capset` first — enforcement that looks real and is not, which is
+/// strictly worse than an honest unenforced note.
+///
+/// Returns the new credential, or `Err(EPERM)`.
+fn cap_capset(old: Caps, effective: u64, permitted: u64, inheritable: u64) -> Result<Caps, i64> {
+    const EPERM: i64 = 1;
+    let subset = |a: u64, b: u64| a & !b == 0;
+    // `cap_inh_is_capped()` is 1 on any kernel without SECURE_NO_CAP_AMBIENT
+    // relaxation, which is the configuration NARF models.
+    if !subset(inheritable, old.inheritable | old.permitted) {
+        return Err(EPERM);
+    }
+    if !subset(inheritable, old.inheritable | old.bounding) {
+        return Err(EPERM);
+    }
+    if !subset(permitted, old.permitted) {
+        return Err(EPERM);
+    }
+    if !subset(effective, permitted) {
+        return Err(EPERM);
+    }
+    Ok(Caps {
+        effective,
+        permitted,
+        inheritable,
+        bounding: old.bounding,
+        ambient: old.ambient & permitted & inheritable,
+    })
+}
+
+/// Initialise the per-task capability registry. An empty map means every
+/// task reads [`Caps::boot`], which is the boot task's credential — see
+/// `read_caps` for why the default is the full set rather than the empty
+/// one.
+pub fn caps_init() {
+    *CAP_TABLE.lock() = Some(BTreeMap::new());
+}
+
+#[doc(hidden)]
+pub fn __test_caps_reset() {
+    *CAP_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Test-only: run the fork credential inheritance directly, without
+/// spawning a task.
+#[doc(hidden)]
+pub fn __test_cap_fork(parent: u64, child: u64) {
+    cap_fork(parent, child);
+}
+
+/// Test-only: [`task_capable`] for an explicit task.
+#[doc(hidden)]
+pub fn __test_task_capable(task: u64, cap: u32) -> bool {
+    task_capable(task, cap)
+}
+
+/// Test-only: install an explicit credential for `task`, so a case can
+/// exercise an UNPRIVILEGED path (the default is [`Caps::boot`]).
+#[doc(hidden)]
+pub fn __test_set_caps(task: u64, effective: u64, permitted: u64) {
+    write_caps(
+        task,
+        Caps {
+            effective,
+            permitted,
+            inheritable: 0,
+            bounding: CAP_FULL_SET,
+            ambient: 0,
+        },
+    );
 }
 
 /// Data-element count for a capability version; None if unsupported.
@@ -8987,10 +9191,19 @@ struct UidGid {
     /// Real uid/gid.
     uid: u32,
     gid: u32,
-    /// Effective uid/gid (geteuid/getegid). No separate saved-id is
-    /// tracked; getres*id reports the effective id as the saved id too.
+    /// Effective uid/gid (geteuid/getegid).
     euid: u32,
     egid: u32,
+    /// Saved set-user-ID / set-group-ID (`struct cred`'s `suid`/`sgid`).
+    ///
+    /// This is not bookkeeping for `getresuid` alone — it is an INPUT to
+    /// the permission rule. `kernel/sys.c::__sys_setuid` lets a caller
+    /// WITHOUT CAP_SETUID switch only to `old->uid` or `new->suid`, which
+    /// is precisely how a set-uid program drops privilege and later
+    /// regains it. Reporting the effective id in this slot (the previous
+    /// behaviour) made that rule unstatable.
+    suid: u32,
+    sgid: u32,
     /// Filesystem uid/gid (setfsuid/setfsgid). Tracks the effective id
     /// unless overridden by setfs*id.
     fsuid: u32,
@@ -9275,9 +9488,9 @@ fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
 /// Write `val` into each of the (up to three) user `u32` out-pointers
 /// `p0/p1/p2`, skipping NULLs. Returns 0 on success, -1 (EFAULT shape)
 /// if any copy_to_user fails. Shared by getresuid / getresgid.
-fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, val: u32) {
-    let buf = val.to_ne_bytes();
-    for p in [p0, p1, p2] {
+fn write_res_ids(ctx: &mut dyn TrapContext, p0: u64, p1: u64, p2: u64, vals: [u32; 3]) {
+    for (p, val) in [p0, p1, p2].into_iter().zip(vals) {
+        let buf = val.to_ne_bytes();
         if p != 0 {
             // SAFETY: `p` is a user `uid_t*`/`gid_t*` out-pointer;
             // copy_to_user range-validates the 4-byte write.

@@ -17,8 +17,10 @@ use super::*;
 /// (valid-but-unsettable like CLOCK_MONOTONIC, or entirely unknown) is the
 /// same -EINVAL Linux returns.
 ///
-/// LINUX-GAP: `security_settime64` rejects a caller without CAP_SYS_TIME with
-/// -EPERM; NARF does not model that capability here.
+/// `clock_settime(CLOCK_REALTIME)` routes through `posix_clock_realtime_set`
+/// into `do_sys_settimeofday64`, so it inherits that function's ordering:
+/// the CAP_SYS_TIME check in `security_settime64` runs LAST, after the
+/// clock-id EINVAL, the copy EFAULT, and the timespec-validity EINVAL.
 pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
@@ -46,6 +48,12 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let nsec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    // (4) `security_settime64` — after every argument check, as in
+    // do_sys_settimeofday64.
+    if !capable(CAP_SYS_TIME) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);

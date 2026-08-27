@@ -90,14 +90,14 @@ pub(crate) fn sys_capget(ctx: &mut dyn TrapContext) {
             }
         }
     };
-    let caps = {
-        let g = CAP_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&target).copied())
-            .unwrap_or([0; 3])
-    };
+    let caps = read_caps(target);
+    // `struct __user_cap_data_struct { __u32 effective, permitted,
+    // inheritable; }` — capget/capset exchange exactly these three of the
+    // five sets. The bounding set is read through prctl(PR_CAPBSET_READ)
+    // and the ambient set through prctl(PR_CAP_AMBIENT), not here.
+    let fields = [caps.effective, caps.permitted, caps.inheritable];
     let mut out = alloc::vec![0u8; ndata * 12];
-    for (field, &val) in caps.iter().enumerate() {
+    for (field, &val) in fields.iter().enumerate() {
         // data[0] carries the low 32 bits; data[1] (v2/v3) the high.
         out[field * 4..field * 4 + 4].copy_from_slice(&(val as u32).to_le_bytes());
         if ndata == 2 {

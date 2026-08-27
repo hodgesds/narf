@@ -6,11 +6,16 @@ use super::*;
 ///   - `len < 0 || len > __NEW_UTS_LEN(64)` → -EINVAL (`len == 0` sets empty),
 ///   - a faulting `name` → -EFAULT.
 ///
-/// LINUX-GAP: a caller without CAP_SYS_ADMIN is -EPERM first; not modelled here.
+/// As in sethostname, `if (!ns_capable(..., CAP_SYS_ADMIN)) return -EPERM;`
+/// runs before the length check and the copy.
 pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let buf = args.arg0;
     let len = args.arg1 as usize;
+    if !capable(CAP_SYS_ADMIN) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     if len > HOSTNAME_MAX {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
