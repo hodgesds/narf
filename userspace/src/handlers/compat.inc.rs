@@ -7666,10 +7666,30 @@ fn timerfd_arc_register(arc: &alloc::sync::Arc<crate::io_mux::TimerFd>) {
     arc_shard_register(&TIMERFD_ARCS, arc);
 }
 
-fn timerfd_arc_from_fd(task: u64, fd: u32) -> Option<alloc::sync::Arc<crate::io_mux::TimerFd>> {
-    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()?;
+/// Recover the concrete `TimerFd` behind a descriptor, distinguishing Linux's two rejection reasons.
+/// `do_timerfd_gettime`/`do_timerfd_settime` (fs/timerfd.c) both open with
+///
+/// ```text
+/// CLASS(fd, f)(ufd);
+/// if (fd_empty(f))                             return -EBADF;
+/// if (fd_file(f)->f_op != &timerfd_fops)       return -EINVAL;
+/// ```
+///
+/// so "no such descriptor" and "that descriptor is not a timerfd" are
+/// different errnos. Collapsing both into one `None` (and then into a bare
+/// -1 → EPERM) hid a plain programming error behind a permissions failure.
+/// Returns `Err(EBADF)` / `Err(EINVAL)` as positive errno codes.
+pub(crate) fn timerfd_arc_from_fd_checked(
+    task: u64,
+    fd: u32,
+) -> Result<alloc::sync::Arc<crate::io_mux::TimerFd>, i64> {
+    const EBADF: i64 = 9;
+    const EINVAL: i64 = 22;
+    let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()))
+        .flatten()
+        .ok_or(EBADF)?;
     let raw = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
-    arc_shard_get(&TIMERFD_ARCS, raw)
+    arc_shard_get(&TIMERFD_ARCS, raw).ok_or(EINVAL)
 }
 
 // ── Wave-70 SignalFdFile side table ────────────────────────────────

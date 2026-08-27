@@ -116,25 +116,158 @@ fn smoke_abi_proc_getpgid_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getpgid_pos);
 
-fn smoke_abi_proc_setpgid_neg() -> TestResult {
+// ── setpgid(2) error ladder — kernel/sys.c::SYSCALL_DEFINE2(setpgid) ──
+//
+// This handler used to validate NOTHING: it translated both arguments and
+// inserted into PGID_TABLE unconditionally, always returning 0. Silent
+// acceptance is worse than a wrong errno — a shell doing job-control setup
+// could "successfully" move a pid that does not exist, or join a group in
+// another session, and never learn. One test per arm of Linux's ladder.
+
+fn smoke_abi_proc_setpgid_unknown_pid_esrch() -> TestResult {
     with_setup(|| {
-        // NARF's setpgid never validates the target's existence/session;
-        // it inserts unconditionally and returns 0. The only failure path
-        // is an uninitialised table, which can't happen post-boot — so the
-        // negative case here is the absence of an error: a setpgid against
-        // an arbitrary (unknown) target pid still returns 0, not an errno.
-        // LINUX-GAP: Linux returns -ESRCH for a non-existent target pid and
-        // -EPERM across session boundaries; NARF accepts any pid with ok(0).
+        // `p = find_task_by_vpid(pid); if (!p) { err = -ESRCH; goto out; }`
         match call(Syscall::Setpgid.raw(), a1(123456, 0)) {
-            Some(0) => Ok(()),
-            other => {
-                let _ = other;
-                Err("setpgid on an unknown pid changed from ok(0)")
-            }
+            Some(-3) => Ok(()),
+            Some(0) => Err("setpgid on a non-existent pid still returns 0 (no target validation)"),
+            Some(_) => Err("setpgid on a non-existent pid: wrong errno, want -ESRCH"),
+            None => Err("setpgid returned non-Ok status"),
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_neg);
+kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_unknown_pid_esrch);
+
+fn smoke_abi_proc_setpgid_negative_pgid_einval() -> TestResult {
+    with_setup(|| {
+        // `if (pgid < 0) return -EINVAL;` — and pgid_t is `int`, so the
+        // argument is the low 32 bits. Reading the whole register made a
+        // negative pgid arrive as a huge positive u64 and skip this check.
+        match call(Syscall::Setpgid.raw(), a1(0, (-5i64) as u64)) {
+            Some(-22) => Ok(()),
+            Some(0) => Err("setpgid with a negative pgid succeeded"),
+            Some(_) => Err("setpgid with a negative pgid: wrong errno, want -EINVAL"),
+            None => Err("setpgid returned non-Ok status"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_negative_pgid_einval);
+
+fn smoke_abi_proc_setpgid_negative_pgid_beats_bad_pid() -> TestResult {
+    with_setup(|| {
+        // Ordering: `if (pgid < 0) return -EINVAL;` sits BEFORE the
+        // find_task_by_vpid lookup, so a negative pgid wins over a target
+        // that also does not exist. A caller must be able to tell its own
+        // bad argument apart from a process that went away.
+        match call(Syscall::Setpgid.raw(), a1(123456, (-5i64) as u64)) {
+            Some(-22) => Ok(()),
+            Some(-3) => Err("setpgid checked the target before the negative pgid (wrong order)"),
+            Some(_) => Err("setpgid(bad pid, negative pgid): want -EINVAL"),
+            None => Err("setpgid returned non-Ok status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_setpgid_negative_pgid_beats_bad_pid
+);
+
+fn smoke_abi_proc_setpgid_unrelated_target_esrch() -> TestResult {
+    with_setup(|| {
+        // A live task that is neither the caller nor a child of it:
+        // `else { err = -ESRCH; if (p != group_leader) goto out; }`.
+        // Linux deliberately reports ESRCH (not EPERM) so setpgid cannot be
+        // used to probe whether an unrelated pid exists.
+        const OTHER: u64 = 0xC001;
+        crate::task::release_task(OTHER);
+        let _ = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_task_to_pid(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let result = match call(Syscall::Setpgid.raw(), a1(OTHER, 0)) {
+            Some(-3) => Ok(()),
+            Some(0) => Err("setpgid moved an unrelated process into a group"),
+            Some(-1) => Err("setpgid on an unrelated process leaked EPERM (probeable existence)"),
+            Some(_) => Err("setpgid on an unrelated process: want -ESRCH"),
+            None => Err("setpgid returned non-Ok status"),
+        };
+        crate::task::release_task(OTHER);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_unrelated_target_esrch);
+
+fn smoke_abi_proc_setpgid_session_leader_eperm() -> TestResult {
+    with_setup(|| {
+        // `err = -EPERM; if (p->signal->leader) goto out;` — a session
+        // leader's process group IS its session and cannot be changed.
+        // setsid() publishes the explicit sid == pid row that marks one.
+        crate::handlers::__test_sid_reset();
+        let result = (|| {
+            // setsid itself refuses a caller that is ALREADY a process-group
+            // leader, and a task with no PGID row defaults to leading its own
+            // group. Put the caller in its parent's group first — exactly
+            // what fork does — so setsid has a legal starting state.
+            const PARENT_GROUP: u64 = 0xC010;
+            crate::handlers::__test_set_pgid(FAKE_TASK, PARENT_GROUP);
+            match call(Syscall::Setsid.raw(), a0(0)) {
+                Some(v) if v >= 0 => {}
+                Some(_) => return Err("setsid setup failed"),
+                None => return Err("setsid returned non-Ok status"),
+            }
+            match call(Syscall::Setpgid.raw(), a1(0, 0)) {
+                Some(-1) => Ok(()),
+                Some(0) => Err("setpgid on a session leader succeeded"),
+                Some(_) => Err("setpgid on a session leader: wrong errno, want -EPERM"),
+                None => Err("setpgid returned non-Ok status"),
+            }
+        })();
+        crate::handlers::__test_sid_reset();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_session_leader_eperm);
+
+fn smoke_abi_proc_setpgid_join_unknown_group_eperm() -> TestResult {
+    with_setup(|| {
+        // `if (pgid != pid) { pgrp = find_vpid(pgid);
+        //    g = pid_task(pgrp, PIDTYPE_PGID);
+        //    if (!g || task_session(g) != task_session(group_leader)) goto out; }`
+        // with err still -EPERM from the session-leader check above. Joining
+        // a group that has no live member is refused, not silently recorded.
+        match call(Syscall::Setpgid.raw(), a1(0, 4242)) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("setpgid joined a process group with no live member"),
+            Some(_) => Err("setpgid into an unknown group: wrong errno, want -EPERM"),
+            None => Err("setpgid returned non-Ok status"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_setpgid_join_unknown_group_eperm
+);
+
+fn smoke_abi_proc_setpgid_self_is_not_a_leader() -> TestResult {
+    with_setup(|| {
+        // Regression pin on `is_session_leader`. `read_sid` defaults to
+        // "sid == pid" for a task with NO table row, which is a convenience
+        // for readers but cannot distinguish a real session leader from a
+        // task that never called setsid. Reusing that defaulted reader for
+        // the -EPERM leader check would reject EVERY ordinary setpgid(0,0) —
+        // the single most common form of the call.
+        crate::handlers::__test_sid_reset();
+        let result = match call(Syscall::Setpgid.raw(), a1(0, 0)) {
+            Some(0) => Ok(()),
+            Some(-1) => Err(
+                "setpgid(0,0) reported EPERM — a task with no SID row was misread as a session leader",
+            ),
+            Some(_) => Err("setpgid(0,0) failed with an unexpected errno"),
+            None => Err("setpgid returned non-Ok status"),
+        };
+        crate::handlers::__test_sid_reset();
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_setpgid_self_is_not_a_leader);
 
 // ── getpgrp(2) — caller's pgid, no args ──
 

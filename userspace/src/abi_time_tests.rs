@@ -13,6 +13,11 @@ const CLOCK_MONOTONIC_COARSE: u64 = 6;
 /// SIGALRM — `timer_create`'s default signo when `sigevent` is NULL.
 const SIGALRM_SIGNO: i32 = 14;
 
+/// A canonical-but-unmapped user address: non-null, so it passes any
+/// null check and only fails when actually accessed. Distinguishes the
+/// EFAULT arms from the EINVAL ones.
+const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
 // ── sysinfo(buf) ──────────────────────────────────────────────────────
 // buf==0 → ok(-EFAULT); a valid 112-byte buffer → ok(0).
 
@@ -1111,18 +1116,212 @@ fn smoke_abi_time_timerfd_settime_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_settime_pos);
 
+// The `timerfd_settime` error ladder — fs/timerfd.c. The SYSCALL wrapper
+// reads `utmr` FIRST, so -EFAULT beats every other error; only then does
+// do_timerfd_settime validate flags/value, and only then the descriptor:
+//
+//   get_itimerspec64(&new, utmr)                    -> -EFAULT
+//   (flags & ~TFD_SETTIME_FLAGS) || !valid(new)     -> -EINVAL
+//   fd_empty(f)                                     -> -EBADF
+//   f_op != &timerfd_fops                           -> -EINVAL
+//   otmr && put_itimerspec64(&old, otmr)            -> -EFAULT
+
 fn smoke_abi_time_timerfd_settime_neg() -> TestResult {
     with_setup(|| {
         let fd = make_timerfd()?;
-        // NULL new value → -1 sentinel (checked before the fd lookup).
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
+        // NULL `utmr` faults in get_itimerspec64 — Linux has no null check
+        // here, the copy simply fails. -1 reached the caller as EPERM.
         match call(Syscall::TimerfdSettime.raw(), a3(fd, 0, 0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("timerfd_settime(_, _, NULL, _) should return -1"),
+            Some(-14) => Ok(()),
+            Some(-1) => Err("timerfd_settime(NULL new) still returns the -1/EPERM sentinel"),
+            _ => Err("timerfd_settime(_, _, NULL, _) should return -EFAULT"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_settime_neg);
+
+fn smoke_abi_time_timerfd_settime_efault_beats_ebadf() -> TestResult {
+    with_setup(|| {
+        // `get_itimerspec64` runs in the SYSCALL wrapper, before
+        // do_timerfd_settime ever sees `ufd`. So a bad pointer AND a bad
+        // descriptor together is -EFAULT, not -EBADF.
+        match call(Syscall::TimerfdSettime.raw(), a3(4242, 0, 0, 0)) {
+            Some(-14) => Ok(()),
+            Some(-9) => Err("timerfd_settime checked the fd before reading utmr (wrong order)"),
+            _ => Err("timerfd_settime(bad fd, NULL new) should return -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_efault_beats_ebadf
+);
+
+fn smoke_abi_time_timerfd_settime_bad_flags_einval() -> TestResult {
+    with_setup(|| {
+        // `if ((flags & ~TFD_SETTIME_FLAGS) || ...) return -EINVAL;` with
+        // TFD_SETTIME_FLAGS = TFD_TIMER_ABSTIME|TFD_TIMER_CANCEL_ON_SET.
+        // The old handler read bit 0 and DISCARDED the rest, so an
+        // unsupported flag armed a timer while the caller believed it had
+        // semantics it never got — an accepted-and-ignored argument, which
+        // is worse than a wrong errno because nothing reports it.
+        let fd = make_timerfd()?;
+        let new: [i64; 4] = [0, 0, 1, 0];
+        match call(
+            Syscall::TimerfdSettime.raw(),
+            a3(fd, 0x4, new.as_ptr() as u64, 0),
+        ) {
+            Some(-22) => Ok(()),
+            Some(0) => Err("timerfd_settime accepted and ignored an unsupported flag"),
+            _ => Err("timerfd_settime with an unknown flag should return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_bad_flags_einval
+);
+
+fn smoke_abi_time_timerfd_settime_abstime_accepted() -> TestResult {
+    with_setup(|| {
+        // Both defined flags must still be accepted: TFD_TIMER_ABSTIME (1)
+        // and TFD_TIMER_CANCEL_ON_SET (2). Pins that the new mask rejects
+        // only what Linux rejects.
+        let new: [i64; 4] = [0, 0, 1, 0];
+        for flags in [0u64, 1, 2, 3] {
+            let fd = make_timerfd()?;
+            match call(
+                Syscall::TimerfdSettime.raw(),
+                a3(fd, flags, new.as_ptr() as u64, 0),
+            ) {
+                Some(0) => {}
+                _ => return Err("timerfd_settime rejected a flag combination Linux accepts"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_abstime_accepted
+);
+
+fn smoke_abi_time_timerfd_settime_bad_itimerspec_einval() -> TestResult {
+    with_setup(|| {
+        // `!itimerspec64_valid(new)` -> -EINVAL. `timespec64_valid`
+        // (include/linux/time64.h) rejects tv_sec < 0 and, via a cast to
+        // unsigned long, ANY tv_nsec outside [0, NSEC_PER_SEC).
+        //
+        // This was unvalidated, and the consequence was not merely a missing
+        // errno: a negative tv_sec went through
+        // `(value_sec as u64).saturating_mul(1_000_000_000)`, reinterpreting
+        // the sign bit as an enormous positive delay — a timer that silently
+        // never fires instead of an error at the call site.
+        let cases: [([i64; 4], &str); 4] = [
+            ([0, 0, -1, 0], "negative value tv_sec"),
+            ([0, 0, 0, 1_000_000_000], "value tv_nsec >= NSEC_PER_SEC"),
+            ([0, 0, 0, -1], "negative value tv_nsec"),
+            ([-1, 0, 1, 0], "negative interval tv_sec"),
+        ];
+        for (new, what) in cases {
+            let fd = make_timerfd()?;
+            match call(
+                Syscall::TimerfdSettime.raw(),
+                a3(fd, 0, new.as_ptr() as u64, 0),
+            ) {
+                Some(-22) => {}
+                Some(0) => {
+                    let _ = what;
+                    return Err("timerfd_settime armed a timer from an invalid itimerspec");
+                }
+                _ => return Err("timerfd_settime with an invalid itimerspec should be -EINVAL"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_bad_itimerspec_einval
+);
+
+fn smoke_abi_time_timerfd_settime_bad_fd_ebadf() -> TestResult {
+    with_setup(|| {
+        // Past the EFAULT and EINVAL guards: `if (fd_empty(f)) return -EBADF;`
+        let new: [i64; 4] = [0, 0, 1, 0];
+        match call(
+            Syscall::TimerfdSettime.raw(),
+            a3(4242, 0, new.as_ptr() as u64, 0),
+        ) {
+            Some(-9) => Ok(()),
+            Some(-1) => Err("timerfd_settime(bad fd) still returns the -1/EPERM sentinel"),
+            _ => Err("timerfd_settime on an unopened fd should return -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_settime_bad_fd_ebadf);
+
+fn smoke_abi_time_timerfd_settime_not_a_timerfd_einval() -> TestResult {
+    with_setup(|| {
+        // `if (fd_file(f)->f_op != &timerfd_fops) return -EINVAL;` — a live
+        // descriptor of the wrong type is EINVAL, distinct from the EBADF a
+        // never-opened one gets. Collapsing both into one -1 hid a plain
+        // programming error behind a permissions failure.
+        let ok = match call(Syscall::Eventfd.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("eventfd2 setup failed"),
+        };
+        let new: [i64; 4] = [0, 0, 1, 0];
+        match call(
+            Syscall::TimerfdSettime.raw(),
+            a3(ok, 0, new.as_ptr() as u64, 0),
+        ) {
+            Some(-22) => Ok(()),
+            Some(-9) => Err("timerfd_settime reported EBADF for a live non-timerfd descriptor"),
+            _ => Err("timerfd_settime on a non-timerfd should return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_not_a_timerfd_einval
+);
+
+fn smoke_abi_time_timerfd_settime_old_fault_still_arms() -> TestResult {
+    with_setup(|| {
+        // `old` is snapshotted inside do_timerfd_settime BEFORE the re-arm,
+        // but the `otmr` copy-out happens in the SYSCALL wrapper AFTER
+        // do_timerfd_settime returns — so a faulting `otmr` reports -EFAULT
+        // with the new timer ALREADY ARMED. Writing `otmr` before arming
+        // would make that EFAULT mean "nothing changed", and a caller that
+        // fixed its pointer and retried would re-arm an already-running
+        // timer.
+        let fd = make_timerfd()?;
+        let new: [i64; 4] = [0, 0, 500, 0];
+        match call(
+            Syscall::TimerfdSettime.raw(),
+            a3(fd, 0, new.as_ptr() as u64, BAD_PTR),
+        ) {
+            Some(-14) => {}
+            _ => return Err("timerfd_settime with an unmapped otmr should return -EFAULT"),
+        }
+        // The timer must nevertheless be armed: gettime reports a non-zero
+        // remaining value.
+        let mut cur = [0i64; 4];
+        match call(
+            Syscall::TimerfdGettime.raw(),
+            a1(fd, cur.as_mut_ptr() as u64),
+        ) {
+            Some(0) if cur[2] != 0 || cur[3] != 0 => Ok(()),
+            Some(0) => Err("timerfd_settime rolled back the arm when otmr faulted"),
+            _ => Err("timerfd_gettime failed after a faulting otmr"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_settime_old_fault_still_arms
+);
 
 // ── timerfd_gettime(fd, curr) ─────────────────────────────────────────
 // A real timerfd + valid out → ok(0). A bad fd → ok(-1).
@@ -1142,21 +1341,87 @@ fn smoke_abi_time_timerfd_gettime_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_gettime_pos);
 
+// The `timerfd_gettime` ladder — fs/timerfd.c. Note there is NO null check
+// on `otmr`: the descriptor is validated first, and a bad output pointer
+// simply fails in put_itimerspec64.
+//
+//   fd_empty(f)                             -> -EBADF
+//   f_op != &timerfd_fops                   -> -EINVAL
+//   put_itimerspec64(&kotmr, otmr)          -> -EFAULT
+
 fn smoke_abi_time_timerfd_gettime_neg() -> TestResult {
     with_setup(|| {
         let mut cur = [0i64; 4];
-        // fd 4242 was never opened → -1 sentinel.
-        // LINUX-GAP: Linux returns -EBADF; NARF returns the -1 sentinel.
+        // fd 4242 was never opened: `if (fd_empty(f)) return -EBADF;`
         match call(
             Syscall::TimerfdGettime.raw(),
             a1(4242, cur.as_mut_ptr() as u64),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("timerfd_gettime on a bad fd should return -1"),
+            Some(-9) => Ok(()),
+            Some(-1) => Err("timerfd_gettime(bad fd) still returns the -1/EPERM sentinel"),
+            _ => Err("timerfd_gettime on a bad fd should return -EBADF"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_gettime_neg);
+
+fn smoke_abi_time_timerfd_gettime_not_a_timerfd_einval() -> TestResult {
+    with_setup(|| {
+        // A live descriptor of the wrong type: -EINVAL, not -EBADF.
+        let ok = match call(Syscall::Eventfd.raw(), a1(0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("eventfd2 setup failed"),
+        };
+        let mut cur = [0i64; 4];
+        match call(
+            Syscall::TimerfdGettime.raw(),
+            a1(ok, cur.as_mut_ptr() as u64),
+        ) {
+            Some(-22) => Ok(()),
+            Some(-9) => Err("timerfd_gettime reported EBADF for a live non-timerfd descriptor"),
+            _ => Err("timerfd_gettime on a non-timerfd should return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_gettime_not_a_timerfd_einval
+);
+
+fn smoke_abi_time_timerfd_gettime_null_out_efault() -> TestResult {
+    with_setup(|| {
+        // Linux never null-checks `otmr` — it reaches put_itimerspec64 and
+        // faults, which is -EFAULT. The old handler checked `out_ptr == 0`
+        // first and returned -1 (EPERM).
+        let fd = make_timerfd()?;
+        match call(Syscall::TimerfdGettime.raw(), a1(fd, 0)) {
+            Some(-14) => Ok(()),
+            Some(-1) => Err("timerfd_gettime(NULL out) still returns the -1/EPERM sentinel"),
+            _ => Err("timerfd_gettime with a NULL out pointer should return -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_gettime_null_out_efault
+);
+
+fn smoke_abi_time_timerfd_gettime_ebadf_beats_efault() -> TestResult {
+    with_setup(|| {
+        // Ordering: the descriptor is validated BEFORE the output pointer is
+        // touched, so a bad fd and a null out together is -EBADF. The old
+        // handler checked the pointer first and got this backwards.
+        match call(Syscall::TimerfdGettime.raw(), a1(4242, 0)) {
+            Some(-9) => Ok(()),
+            Some(-14) => Err("timerfd_gettime checked the out pointer before the fd (wrong order)"),
+            _ => Err("timerfd_gettime(bad fd, NULL out) should return -EBADF"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timerfd_gettime_ebadf_beats_efault
+);
 
 // ── gettimeofday(timeval, timezone) ───────────────────────────────────
 // Valid timeval* → ok(0) with a normalized, non-regressing timeval.
