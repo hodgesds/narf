@@ -271,7 +271,6 @@ pub mod tests {
 
     use alloc::string::ToString;
     use alloc::sync::Arc;
-    use core::sync::atomic::Ordering;
 
     use narf_filesystem::sysfs::__reset_for_test as sysfs_reset;
     use narf_kernel_test::{kernel_test_in, TestResult};

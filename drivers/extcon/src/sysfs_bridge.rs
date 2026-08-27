@@ -77,7 +77,7 @@ pub fn populate_extcon_class() {
         // Linux ref: `extcon.c::cable_state_show` (line ~462):
         //   prints "CABLE_NAME=0\n" or "CABLE_NAME=1\n" for each cable.
         let dev_arc = dev.clone();
-        let cables: Vec<_> = dev.supported_cables().iter().copied().collect();
+        let cables: Vec<_> = dev.supported_cables().to_vec();
         kobject_add_attr(&dev_kobj, "state", move || {
             let mut s = alloc::string::String::new();
             for &cable in &cables {
