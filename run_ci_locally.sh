@@ -119,25 +119,27 @@ fi
 
 if should "$RUN_KERNEL_TEST"; then
   echo "Running kernel-test (x86_64)"
-  # Full runtime feature set so the container / PID-namespace / linux-compat
-  # kernel tests (e.g. the pid_ns translation suite) actually EXECUTE — cgroup-all
-  # alone leaves `container`+`linux-compat`-gated tests compiled-but-unregistered.
+  # Full runtime feature set so the container / PID-namespace kernel tests
+  # (e.g. the pid_ns translation suite) actually EXECUTE — cgroup-all alone
+  # leaves `container`-gated tests compiled-but-unregistered. Linux-compatible
+  # behaviour is unconditional now, so there is no feature to add for it.
   # In --affected mode a non-empty subsystem filter runs only the relevant tests.
   if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container,linux-compat --subsystem "$SUBS"
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container --subsystem "$SUBS"
   else
-    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container,linux-compat
+    XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container
   fi
 fi
 
 if should "$RUN_FEATURE_MATRIX"; then
   echo "Running feature checks"
+  # Keep this list identical to the `features:` matrix in
+  # .github/workflows/ci.yml — a combination checked here but not there (or
+  # the reverse) is a gate that only one of the two can catch.
   cargo check -p narf-userspace --no-default-features
-  cargo check -p narf-userspace --no-default-features --features 'linux-compat'
   cargo check -p narf-userspace --no-default-features --features 'container'
-  cargo check -p narf-userspace --no-default-features --features 'linux-compat,container'
   cargo check -p narf-userspace --no-default-features --features 'cgroup'
-  cargo check -p narf-userspace --no-default-features --features 'linux-compat,container,cgroup'
+  cargo check -p narf-userspace --no-default-features --features 'container,cgroup'
 
   # The same sweep for the KERNEL crate, which the userspace-only checks above
   # cannot cover: `narf-frame` is where cross-crate hook installation lives, so a
@@ -152,7 +154,7 @@ if should "$RUN_FEATURE_MATRIX"; then
   # `cargo check` on the kernel target needs the build-std flags; these are the
   # same ones the clippy stages above use.
   KFLAGS="-Zbuild-std=core,compiler_builtins,alloc -Zbuild-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128"
-  for f in 'container' 'cgroup' 'container,cgroup' 'cgroup-all' 'container,cgroup-all,linux-compat'; do
+  for f in 'container' 'cgroup' 'container,cgroup' 'cgroup-all' 'container,cgroup-all'; do
     echo "  narf-frame --features $f"
     # shellcheck disable=SC2086
     cargo check -p narf-frame --target x86_64-unknown-none $KFLAGS --features "$f"
