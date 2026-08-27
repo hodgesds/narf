@@ -1505,3 +1505,184 @@ fn smoke_abi_caps_fork_inherits_the_credential() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_fork_inherits_the_credential);
+
+// ─────────────────────────────────────────────────────────────────────
+// The remaining permission gates, now that capable() exists.
+//
+// These were the LINUX-GAP notes that said the check "is not modelled" —
+// true only because there was no credential to consult. Each is placed
+// where Linux places it, which differs per call.
+// ─────────────────────────────────────────────────────────────────────
+
+const CAP_SYS_NICE_BIT: u64 = 1 << 23;
+
+fn smoke_abi_caps_mount_requires_sys_admin() -> TestResult {
+    with_setup(|| {
+        // `path_mount`: `if (!may_mount()) return -EPERM;` where may_mount
+        // is ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN).
+        let src = b"none\0";
+        let tgt = b"/mnt\0";
+        let fst = b"tmpfs\0";
+        drop_all_caps();
+        match call(
+            Syscall::Mount.raw(),
+            a4(
+                src.as_ptr() as u64,
+                tgt.as_ptr() as u64,
+                fst.as_ptr() as u64,
+                0,
+                0,
+            ),
+        ) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("an unprivileged task mounted a filesystem"),
+            _ => Err("unprivileged mount: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_mount_requires_sys_admin);
+
+fn smoke_abi_caps_mount_efault_precedes_eperm() -> TestResult {
+    with_setup(|| {
+        // `may_mount()` sits inside path_mount, AFTER the four
+        // copy_mount_string calls in the syscall wrapper. So an
+        // unprivileged caller with a faulting pointer still gets -EFAULT.
+        drop_all_caps();
+        let tgt = b"/mnt\0";
+        let fst = b"tmpfs\0";
+        match call(
+            Syscall::Mount.raw(),
+            a4(0, tgt.as_ptr() as u64, fst.as_ptr() as u64, 0, BAD_PTR),
+        ) {
+            Some(-14) => Ok(()),
+            Some(-1) => Err("mount checked the capability before copying its strings"),
+            _ => Err("mount(bad data ptr, no cap): want -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_mount_efault_precedes_eperm);
+
+fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
+    with_setup(|| {
+        // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|
+        // NEWNET|NEWPID|NEWCGROUP|NEWTIME on CAP_SYS_ADMIN — and pointedly
+        // does NOT gate CLONE_NEWUSER. Creating a user namespace
+        // unprivileged is the entire point of user namespaces; gating it
+        // would invert the feature.
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        drop_all_caps();
+        match call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task unshared its mount namespace"),
+            _ => return Err("unprivileged unshare(CLONE_NEWNS): want -EPERM"),
+        }
+        match call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) {
+            Some(0) => Ok(()),
+            Some(-1) => Err("unshare(CLONE_NEWUSER) was gated on CAP_SYS_ADMIN; Linux allows it"),
+            _ => Err("unprivileged unshare(CLONE_NEWUSER) should succeed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_unshare_needs_sys_admin_except_newuser
+);
+
+fn smoke_abi_caps_unshare_einval_precedes_eperm() -> TestResult {
+    with_setup(|| {
+        // `check_unshare_flags` runs before the capability check, so an
+        // unsupported bit is -EINVAL even unprivileged — and, importantly,
+        // leaves the caller's namespaces untouched either way.
+        drop_all_caps();
+        match call(Syscall::Unshare.raw(), a0(1 << 62)) {
+            Some(-22) => Ok(()),
+            Some(-1) => Err("unshare checked the capability before validating its flags"),
+            _ => Err("unshare(unsupported flag): want -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_unshare_einval_precedes_eperm);
+
+fn smoke_abi_caps_setns_ebadf_precedes_eperm() -> TestResult {
+    with_setup(|| {
+        // `validate_nsset`'s CAP_SYS_ADMIN check runs after the descriptor
+        // is resolved, so a bad fd is -EBADF regardless of privilege.
+        drop_all_caps();
+        match call(Syscall::Setns.raw(), a1(4242, 0)) {
+            Some(-9) => Ok(()),
+            Some(-1) => Err("setns checked the capability before the descriptor"),
+            _ => Err("setns(bad fd): want -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_setns_ebadf_precedes_eperm);
+
+fn smoke_abi_caps_setpriority_foreign_uid_is_eperm() -> TestResult {
+    with_setup(|| {
+        // `set_one_prio_perm`: the caller's EFFECTIVE uid must match the
+        // target's real OR effective uid, else CAP_SYS_NICE, else -EPERM.
+        // Move the caller's euid away from the target's (both are the same
+        // task here, so change euid and leave the target row at 0).
+        const OTHER: u64 = 0xC201;
+        crate::task::release_task(OTHER);
+        let _t = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_task_to_pid(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        crate::handlers::__test_set_uidgid_euid(OTHER, 4242);
+        drop_all_caps();
+        let r = call(Syscall::Setpriority.raw(), a2(0, OTHER, 5));
+        crate::task::release_task(OTHER);
+        match r {
+            Some(-1) => Ok(()),
+            Some(0) => Err("an unprivileged task reniced a process it does not own"),
+            _ => Err("setpriority on a foreign uid: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setpriority_foreign_uid_is_eperm
+);
+
+fn smoke_abi_caps_setpriority_reduction_is_eacces_not_eperm() -> TestResult {
+    with_setup(|| {
+        // The second, DIFFERENT arm: the process is yours, but making it
+        // more favourable needs CAP_SYS_NICE (or RLIMIT_NICE headroom,
+        // whose Linux default is 0).
+        //
+        // -EPERM means "not your process"; -EACCES means "yours, but you
+        // may not raise its priority". renice reports them differently, so
+        // collapsing them sends a user after the wrong problem.
+        drop_all_caps();
+        match call(Syscall::Setpriority.raw(), a2(0, 0, (-5i64) as u64)) {
+            Some(-13) => {}
+            Some(-1) => return Err("a nice REDUCTION reported EPERM; Linux uses EACCES"),
+            Some(0) => return Err("an unprivileged task lowered its own nice value"),
+            _ => return Err("unprivileged nice reduction: want -EACCES"),
+        }
+        // Raising nice (less favourable) is always allowed.
+        match call(Syscall::Setpriority.raw(), a2(0, 0, 5)) {
+            Some(0) => Ok(()),
+            _ => Err("raising nice should not need a capability"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setpriority_reduction_is_eacces_not_eperm
+);
+
+fn smoke_abi_caps_setpriority_sys_nice_permits_reduction() -> TestResult {
+    with_setup(|| {
+        set_caps(CAP_SYS_NICE_BIT, CAP_SYS_NICE_BIT);
+        match call(Syscall::Setpriority.raw(), a2(0, 0, (-5i64) as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("CAP_SYS_NICE should permit a nice reduction"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setpriority_sys_nice_permits_reduction
+);

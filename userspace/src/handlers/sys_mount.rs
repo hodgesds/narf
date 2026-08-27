@@ -100,9 +100,6 @@ const MS_NOUSER: u64 = 1 << 31;
 /// of them look like a privilege problem.
 ///
 /// LINUX-GAPs still open in this handler, all noted where they occur:
-///   * `may_mount()`'s -EPERM (CAP_SYS_ADMIN in the mount namespace's user
-///     namespace) is never checked — NARF has no per-task capability set to
-///     consult here.
 ///   * The target is never required to exist: Linux's `user_path_at` gives
 ///     -ENOENT for a missing target and -ENOTDIR for a non-directory one
 ///     BEFORE any of the flag handling, and NARF's flat mount table happily
@@ -205,6 +202,23 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     };
     if flags & MS_NOUSER != 0 {
         ctx.set_return(einval);
+        return;
+    }
+    // `if (!may_mount()) return -EPERM;` — `may_mount()` is
+    // `ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN)`.
+    //
+    // Its position inside `path_mount` is after the four string copies and
+    // after the MS_NOUSER rejection, so a faulting pointer is still -EFAULT
+    // and the in-kernel-only flag is still -EINVAL for an unprivileged
+    // caller. It sits before any mount state is touched, which is what
+    // matters: an unprivileged mount must not partially register.
+    //
+    // LINUX-GAP: this is `ns_capable` against the MOUNT namespace's owning
+    // user namespace, so a task that created a user+mount namespace pair may
+    // mount inside it without being globally privileged. NARF checks the
+    // effective set only — the restrictive direction.
+    if !capable(CAP_SYS_ADMIN) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
 
