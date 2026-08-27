@@ -76,9 +76,20 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // filename_lookup — a path under an existing mount that names no entry
     // still installs as a root instead of reporting -ENOENT. Tightening it
     // would change which chroots succeed, not just their errno.
-    // LINUX-GAP: -EPERM for a caller without CAP_SYS_CHROOT in its user
-    // namespace, and -EACCES from path_permission, are not modelled — NARF
-    // has no per-task capability sets to consult here.
+    // `error = -EPERM; if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT))
+    // goto dput_and_out;` — note the position: Linux runs the lookup and
+    // `path_permission` FIRST, so an unprivileged caller naming a path that
+    // does not exist still gets -ENOENT, not -EPERM. Hoisting this check to
+    // the top of the handler would leak less information than Linux does,
+    // but it would also diverge from it, and a program that distinguishes
+    // "no such directory" from "not allowed" would misreport.
+    //
+    // LINUX-GAP: -EACCES from `path_permission(MAY_EXEC | MAY_CHDIR)` is
+    // still not modelled — NARF enforces no directory execute bits.
+    if !capable(CAP_SYS_CHROOT) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     task_map_set(&ROOT_DIR_TABLE, task, resolved);
     ctx.set_return(SyscallReturn::ok(0));
 }

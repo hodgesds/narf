@@ -640,8 +640,16 @@ fn smoke_abi_proc_capset_capget_pos() -> TestResult {
         // data: 2 * cap_user_data_t, each { u32 effective; u32 permitted;
         // u32 inheritable }. For ndata=2 the layout is field-major: 3 lo
         // words then 3 hi words. Plant a low-word effective bit.
+        //
+        // Both the effective AND the permitted word carry the bit:
+        // `cap_capset` refuses an effective set that is not a subset of the
+        // new permitted set (`security/commoncap.c`), because an effective
+        // bit with no permitted bit behind it is a capability the task can
+        // exercise but was never granted. This case used to set only the
+        // effective word, which capset now correctly rejects with -EPERM.
         let mut data = [0u8; 24];
         data[0..4].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // effective lo
+        data[4..8].copy_from_slice(&0x0000_0001u32.to_le_bytes()); // permitted lo
         match call(
             Syscall::Capset.raw(),
             a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),

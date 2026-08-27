@@ -6,12 +6,22 @@ use super::*;
 ///     be negative; `len == 0` is legal and sets an empty hostname),
 ///   - a faulting `name` → -EFAULT.
 ///
-/// LINUX-GAP: a caller without CAP_SYS_ADMIN in the UTS user-ns is -EPERM
-/// before either check; NARF does not model that capability here.
+/// The capability check comes FIRST in Linux, before the length and the
+/// copy: `if (!ns_capable(...uts_ns->user_ns, CAP_SYS_ADMIN)) return -EPERM;`
+/// So an unprivileged caller gets -EPERM even when its length is also
+/// invalid and its buffer also faults — it learns nothing about either.
+///
+/// LINUX-GAP: the check is per-UTS-namespace (`ns_capable` against the UTS
+/// namespace's owning user namespace); NARF consults the task's effective
+/// set only, which is the restrictive direction.
 pub(crate) fn sys_sethostname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let buf = args.arg0;
     let len = args.arg1 as usize;
+    if !capable(CAP_SYS_ADMIN) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     if len > HOSTNAME_MAX {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;

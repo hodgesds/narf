@@ -10,9 +10,21 @@ use super::*;
 ///   - `timeval_valid` (`tv_sec < 0` or `tv_usec` outside `[0, USEC_PER_SEC)`)
 ///     → -EINVAL.
 ///
-/// LINUX-GAP: `security_settime64` rejects a caller without CAP_SYS_TIME with
-/// -EPERM before any of this; NARF does not model that capability here and
-/// lets any task set the clock.
+/// `security_settime64` (→ `cap_settime`) rejects a caller without
+/// CAP_SYS_TIME with -EPERM, and its POSITION is not where it reads: it
+/// sits inside `do_sys_settimeofday64`, AFTER the syscall wrapper's EFAULT
+/// and tv_usec-range EINVAL and after `timespec64_valid_settod`:
+///
+/// ```text
+/// if (tv && !timespec64_valid_settod(tv))  return -EINVAL;
+/// error = security_settime64(tv, tz);
+/// if (error)                               return error;   /* -EPERM */
+/// ```
+///
+/// So an unprivileged caller passing a bad pointer gets -EFAULT, and one
+/// passing an out-of-range tv_usec gets -EINVAL — the permission answer
+/// comes last. (An earlier note here claimed -EPERM came "before any of
+/// this", which would have reported EPERM for a faulting pointer.)
 pub(crate) fn sys_settimeofday(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let tv_ptr = args.arg0;
@@ -35,6 +47,11 @@ pub(crate) fn sys_settimeofday(ctx: &mut dyn TrapContext) {
     // Validate: tv_usec must be in [0, 1_000_000).
     if sec < 0 || !(0..1_000_000).contains(&usec) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    // `security_settime64` — last of the checks, per the order above.
+    if !capable(CAP_SYS_TIME) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     // Convert µs → ns and set wall clock.
