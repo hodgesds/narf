@@ -1548,6 +1548,47 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             } else {
                 frame.rip
             };
+            // DIAG (stall-watchdog): a user #PF reached the SIGSEGV surface —
+            // demand-paging/stack-grow/COW all declined it. Dump the region
+            // table's view of the faulting address so an unresolved anon fault
+            // (the stress-ng malloc page_touch SIGSEGV) is classified: NO REGION
+            // (region-table miss), phys[off]=0 (should have demand-allocated —
+            // backing path bug), off past phys_len (structural region bug), or a
+            // non-zero phys (PTE-install/flush bug).
+            #[cfg(feature = "stall-watchdog")]
+            if vector == 14 {
+                static SEGV_DIAG: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                if SEGV_DIAG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 30 {
+                    let desc = narf_userspace::active_user_as().and_then(|as_arc| {
+                        as_arc.lookup(narf_memory::VirtAddr::new(addr)).map(|r| {
+                            let off = (addr - r.base.as_u64()) / 4096;
+                            let phys = r
+                                .phys
+                                .get(off as usize)
+                                .map(|p| p.raw())
+                                .unwrap_or(u64::MAX);
+                            (r.base.as_u64(), r.len, r.perms.0, off, r.phys.len(), phys)
+                        })
+                    });
+                    match desc {
+                        Some((base, len, perms, off, nphys, phys)) => {
+                            let _ = writeln!(
+                                TrapWriter,
+                                "USERSEGV-DIAG cr2={addr:#x} rip={:#x} ec={:#x} region base={base:#x} len={len:#x} perms={perms:#x} page_off={off} phys_len={nphys} phys_off={phys:#x}",
+                                frame.rip, frame.error_code
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                TrapWriter,
+                                "USERSEGV-DIAG cr2={addr:#x} rip={:#x} ec={:#x} NO-REGION",
+                                frame.rip, frame.error_code
+                            );
+                        }
+                    }
+                }
+            }
             let info = narf_userspace::SyncFaultInfo { addr };
             let mut ctx = X86TrapContext::from_int80(frame);
             if hook(&mut ctx, vector, info) {
