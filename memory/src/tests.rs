@@ -12578,7 +12578,8 @@ fn smoke_memory_shared_mremap_installs_destination_rmap() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<PhysAddr> {
-        // SAFETY: caller supplies this test's live, exclusively-owned user root.
+        // SAFETY: same contract as the x86_64 arm above — the caller supplies
+        // this test's live, exclusively-owned user root.
         unsafe { crate::aarch64::paging::translate(address_space.root, va) }
     }
 
@@ -12711,6 +12712,19 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
         AddressSpace, MremapLimits, PhysFrame, Region, RegionPerms, SharedMremapMode, VirtAddr,
     };
 
+    // `free_frame` is rmap-agnostic: it returns the frame to the buddy
+    // allocator without touching its owner list, because in production the
+    // unmap path has already called `rmap::remove` for every mapping. A test
+    // that frees a frame it never unmapped therefore leaves owners behind,
+    // and the NEXT test to be handed that frame inherits them.
+    //
+    // That is exactly what happened here. This test asserts an owner count of
+    // two, and was reading a frame that arrived with stale owners from an
+    // earlier case — so it failed on a count of >2 while its own two owners
+    // were both correctly registered. Every other rmap-sensitive test in this
+    // crate (see `migrate.rs`) resets first; this one did not.
+    crate::rmap::__reset_for_test();
+
     #[cfg(target_arch = "x86_64")]
     unsafe fn translated(address_space: &AddressSpace, va: VirtAddr) -> Option<crate::PhysAddr> {
         // SAFETY: caller supplies this test's live, exclusively-owned user root.
@@ -12731,11 +12745,6 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
         Ok(frame) => frame.start_address(),
         Err(_) => return TestResult::Skip("shared Duplicate backing allocation failed"),
     };
-    // The reverse map is process-global and owners are only retired on explicit
-    // unmap; a prior test that dropped its address space without unmapping can
-    // leave stale owners on a since-freed frame we just re-allocated. Clear it
-    // so `owner_count(frame)` reflects only the mappings this test installs.
-    crate::rmap::__reset_for_test();
     let source = VirtAddr::new(0x0000_4096_0000_0000);
     let destination = VirtAddr::new(0x0000_4097_0000_0000);
     let mapped = address_space.with_vma_transaction(|| {
@@ -12770,20 +12779,54 @@ fn smoke_memory_shared_duplicate_clones_residency() -> TestResult {
     let source_translation = unsafe { translated(&address_space, source) };
     // SAFETY: same live-root proof as the source translation.
     let destination_translation = unsafe { translated(&address_space, destination) };
-    // Duplicate clones residency: the source stays mapped, the destination is
-    // installed to the same frame, and the frame gains a second rmap owner.
-    let correct = duplicated.is_ok()
-        && source_translation == Some(frame)
-        && destination_translation == Some(frame)
-        && crate::rmap::owner_count(frame) == 2
-        && address_space.residency_range(source, 0x1000) == Ok(alloc::vec![1])
-        && address_space.residency_range(destination, 0x1000) == Ok(alloc::vec![1]);
+    // Report WHICH invariant broke. As a single six-way conjunction this
+    // could only ever say "something about Duplicate is wrong", which is not
+    // enough to act on — the alias, the rmap owner count and the two
+    // residency views fail for quite different reasons.
+    let owners = crate::rmap::owner_count(frame);
+    let source_owned = crate::rmap::contains_owner(frame, address_space.root, source);
+    let destination_owned = crate::rmap::contains_owner(frame, address_space.root, destination);
+    let source_residency = address_space.residency_range(source, 0x1000);
+    let destination_residency = address_space.residency_range(destination, 0x1000);
+    let verdict: Result<(), &'static str> = (|| {
+        if duplicated.is_err() {
+            return Err("shared Duplicate alias failed outright");
+        }
+        if source_translation != Some(frame) {
+            return Err("shared Duplicate dropped the SOURCE translation");
+        }
+        if destination_translation != Some(frame) {
+            return Err("shared Duplicate did not map the DESTINATION to the frame");
+        }
+        if owners != 2 {
+            // Say WHICH owner is missing: the destination never being
+            // registered and the source being lost are different bugs with
+            // different fixes, and "the count is wrong" distinguishes neither.
+            return Err(match (source_owned, destination_owned) {
+                (true, false) => "shared Duplicate never registered the DESTINATION rmap owner",
+                (false, true) => "shared Duplicate LOST the source rmap owner",
+                (false, false) => "shared Duplicate left the frame with no rmap owner at all",
+                (true, true) if owners > 2 => {
+                    "shared Duplicate left MORE than two rmap owners on the frame"
+                }
+                (true, true) => {
+                    "shared Duplicate registered both owners but the count is below two"
+                }
+            });
+        }
+        if source_residency != Ok(alloc::vec![1]) {
+            return Err("shared Duplicate cleared the SOURCE residency (moved, not cloned)");
+        }
+        if destination_residency != Ok(alloc::vec![1]) {
+            return Err("shared Duplicate left the DESTINATION non-resident");
+        }
+        Ok(())
+    })();
     drop(address_space);
     crate::free_frame(PhysFrame::new(frame));
-    if correct {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("shared Duplicate moved rather than cloned residency")
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(msg) => TestResult::Fail(msg),
     }
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
