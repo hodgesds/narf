@@ -1420,6 +1420,39 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         let cr2_in_user_half = cr2 < 0x0000_8000_0000_0000;
         let from_user = (frame.cs & 3) == 3;
 
+        // DIAG (stall-watchdog): detect a fault LOOP — the same CPU faulting on
+        // the same (rip, cr2) repeatedly means the fault handler "resolves" it
+        // but the retry re-faults (e.g. a stack-grow that installs a page the
+        // faulting store still can't use). Distinguishes a stuck worker from an
+        // intermittent stall. Per-CPU; logged once per threshold crossing.
+        #[cfg(feature = "stall-watchdog")]
+        if from_user {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            const NC: usize = narf_lib::percpu::MAX_CPUS;
+            static LAST_RIP: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            static LAST_CR2: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            static COUNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            let c = narf_lib::percpu::current_cpu();
+            if c < NC {
+                let same = LAST_RIP[c].load(Ordering::Relaxed) == frame.rip
+                    && LAST_CR2[c].load(Ordering::Relaxed) == cr2;
+                if same {
+                    let n = COUNT[c].fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 50_000 {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "FAULTLOOP cpu={c} rip={:#x} cr2={cr2:#x} ec={:#x} — {n} consecutive same-page user faults (handler resolves but retry re-faults)",
+                            frame.rip, frame.error_code
+                        );
+                    }
+                } else {
+                    LAST_RIP[c].store(frame.rip, Ordering::Relaxed);
+                    LAST_CR2[c].store(cr2, Ordering::Relaxed);
+                    COUNT[c].store(0, Ordering::Relaxed);
+                }
+            }
+        }
+
         // Demand paging: P=0 means the page wasn't mapped at fault
         // time. Two cases get serviced through the active user AS's
         // lazy region table:
