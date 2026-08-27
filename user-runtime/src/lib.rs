@@ -1273,6 +1273,12 @@ pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
     // anonymous read/write maps, so prot=READ|WRITE, fd=-1, offset=0.
     const PROT_READ: u64 = 0x1;
     const PROT_WRITE: u64 = 0x2;
+    // fd=-1 without MAP_ANONYMOUS is a *file* mapping on a bad descriptor,
+    // which the kernel rejects with -EBADF. This entry point is
+    // anonymous-only (it hardcodes fd=-1), so force MAP_PRIVATE|MAP_ANONYMOUS
+    // regardless of what the caller passed.
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_ANONYMOUS: u64 = 0x20;
     // SAFETY: SYS_MMAP with the documented 6-arg layout.
     let r = unsafe {
         syscall6(
@@ -1280,15 +1286,49 @@ pub unsafe fn mmap(hint: usize, len: usize, flags: u32) -> *mut u8 {
             hint as u64,
             len as u64,
             PROT_READ | PROT_WRITE,
-            flags as u64,
+            flags as u64 | MAP_PRIVATE | MAP_ANONYMOUS,
             !0u64, // fd = -1 (anonymous)
             0,     // offset
         )
     };
-    if r == 0 || r == !0u64 {
+    mmap_return_ptr(r)
+}
+
+/// Classify a raw `SYS_MMAP` return value into a pointer. A `0` result, or a
+/// negative errno in the last page of the address space (Linux MAX_ERRNO =
+/// 4095), is a failure and maps to null. A bare `== -1` check would let
+/// `-EBADF` and other errnos through as a bogus pointer the caller then
+/// dereferences.
+#[inline]
+fn mmap_return_ptr(r: u64) -> *mut u8 {
+    if r == 0 || r >= (-4095i64) as u64 {
         core::ptr::null_mut()
     } else {
         r as *mut u8
+    }
+}
+
+#[cfg(test)]
+mod mmap_return_tests {
+    use super::mmap_return_ptr;
+
+    #[test]
+    fn zero_and_errno_returns_are_null() {
+        assert!(mmap_return_ptr(0).is_null(), "0 is a failure");
+        assert!(mmap_return_ptr((-1i64) as u64).is_null(), "MAP_FAILED");
+        // -EBADF: the exact value the old `== -1` check let through, which
+        // init's malloc then dereferenced (write to addr -9 -> #PF).
+        assert!(mmap_return_ptr((-9i64) as u64).is_null(), "-EBADF");
+        assert!(mmap_return_ptr((-12i64) as u64).is_null(), "-ENOMEM");
+        assert!(mmap_return_ptr((-4095i64) as u64).is_null(), "MAX_ERRNO");
+    }
+
+    #[test]
+    fn valid_addresses_pass_through() {
+        assert_eq!(mmap_return_ptr(0x1000) as u64, 0x1000);
+        assert_eq!(mmap_return_ptr(0x8000_0000_0000) as u64, 0x8000_0000_0000);
+        // -4096 is past MAX_ERRNO, so it is an address, not an error.
+        assert_eq!(mmap_return_ptr((-4096i64) as u64) as u64, (-4096i64) as u64);
     }
 }
 

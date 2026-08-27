@@ -240,9 +240,10 @@ unsafe fn pop_fit(need: usize) -> *mut Chunk {
 /// actual mapped length, or null on mmap failure.
 unsafe fn grow_heap(min_bytes: usize) -> *mut Chunk {
     let want = page_round_up(core::cmp::max(min_bytes, MIN_GROW_BYTES));
-    // SAFETY: mmap with hint=0 lets the kernel pick the vaddr; flags
-    // = 0 is the default RW user mapping. The returned pointer (if
-    // non-null) is valid for `want` bytes per the kernel contract.
+    // SAFETY: mmap with hint=0 lets the kernel pick the vaddr; the runtime
+    // entry point forces MAP_PRIVATE|MAP_ANONYMOUS and RW prot, so no extra
+    // flags are needed here. The returned pointer (if non-null) is valid for
+    // `want` bytes per the kernel contract.
     // SAFETY: Valid memory or trusted environment
     let p = unsafe { narf_user_runtime::mmap(0, want, 0) };
     if p.is_null() {
