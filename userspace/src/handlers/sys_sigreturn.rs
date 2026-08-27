@@ -15,14 +15,21 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     // the restorer return address). NARF's own libc trampoline instead
     // forwards the SigContext vaddr in arg0.
     let task = current_task_id();
-    if sigreturn_use_rsp(task) || sc_vaddr == 0 {
+    // Pop THIS handler's delivery record (a per-task stack — nested handlers each
+    // restore their own frame). A missing record falls back to modern defaults
+    // (rt layout, trust arg0). Consuming it here is correct: the record belongs
+    // to exactly this sigreturn, and LIFO handler nesting keeps the stack ordered.
+    let rec = pop_sigreturn_record(task);
+    let use_rsp = rec.map(|r| r.use_rsp).unwrap_or(false);
+    if use_rsp || sc_vaddr == 0 {
         sc_vaddr = ctx.user_rsp();
     }
 
     // Pass the authoritative frame layout the kernel recorded at delivery so the
     // arch code reads RIP/regs from the correct offsets instead of guessing from
-    // user memory (which could pull a selector field into RIP → #UD).
-    let is_rt = sigreturn_is_rt(task);
+    // user memory (which could pull a selector field into RIP → #UD). Default
+    // `true`: modern (rt_sigaction + SA_SIGINFO/restorer) is the overwhelming case.
+    let is_rt = rec.map(|r| r.is_rt).unwrap_or(true);
     if !ctx.perform_sigreturn(sc_vaddr, is_rt) {
         ctx.set_return(SyscallReturn::invalid_op());
         return;
@@ -32,7 +39,7 @@ pub(crate) fn sys_sigreturn(ctx: &mut dyn TrapContext) {
     // path records a saved mask; a `None` (e.g. a sync-fault handler return)
     // leaves the mask untouched. Without this the delivered signal stays blocked
     // forever and a second occurrence is never taken.
-    if let Some(saved) = take_sigreturn_saved_mask(task) {
+    if let Some(saved) = rec.and_then(|r| r.saved_mask) {
         let _ = set_signal_mask_for_task(task, saved);
     }
 }

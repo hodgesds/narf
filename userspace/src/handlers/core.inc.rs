@@ -8099,13 +8099,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(tid)].values.lock().as_mut() {
         m.retain(|&(t, _), _| t != tid);
     }
-    if let Some(m) = SIGRETURN_USE_RSP.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SIGRETURN_IS_RT.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SIGRETURN_SAVED_MASK.lock().as_mut() {
+    if let Some(m) = SIGRETURN_STACK.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = SUSPEND_SAVED_MASK.lock().as_mut() {

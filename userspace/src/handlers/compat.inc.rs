@@ -3698,73 +3698,72 @@ const UNBLOCKABLE_MASK: u64 = (1 << 8) | (1 << 18);
 // from registers alone (a restorer leaves arbitrary garbage in RDI),
 // so we remember the delivery style here. `true` ⇒ resolve the frame
 // from RSP; `false` ⇒ trust arg0.
-static SIGRETURN_USE_RSP: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, bool>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Per-delivery sigreturn metadata. NARF's compact signal frame is not fully
+/// self-describing, so the kernel records at delivery how `sys_sigreturn` must
+/// read it back:
+///   - `use_rsp`: resolve the frame from the user RSP (restorer-based
+///     rt_sigframe) vs. trust arg0 (NARF's own libc trampoline).
+///   - `is_rt`:   rt_sigframe (McContext at sc_vaddr+168) vs. legacy SigContext.
+///     A wrong layout reads RIP from the wrong offset — landing on the frame's
+///     `cs`/`ss` selector fields → control transfer to a corrupt address
+///     (#UD/#GP). Mirrors deliver_signal's `want_siginfo || force_rt` exactly.
+///   - `saved_mask`: the pre-handler signal mask to restore on return (POSIX),
+///     undoing the delivery's auto-block. `None` for a sync-fault handler (it
+///     doesn't auto-block); the async path fills it after building the frame.
+#[derive(Clone, Copy)]
+struct SigReturnRecord {
+    use_rsp: bool,
+    is_rt: bool,
+    saved_mask: Option<u64>,
+}
 
-fn set_sigreturn_use_rsp(task: u64, use_rsp: bool) {
-    let mut g = SIGRETURN_USE_RSP.lock();
+/// Per-task STACK of sigreturn records — one push per delivered handler, one
+/// pop per `sys_sigreturn`. A STACK (not the former single slot) is REQUIRED
+/// for nested handlers: a second signal delivered while the first handler runs
+/// must not clobber the OUTER handler's frame layout. With a single slot the
+/// inner delivery overwrote it, so the outer `sys_sigreturn` read RIP from the
+/// wrong (rt vs legacy) offset and jumped to a corrupt address — the
+/// intermittent stress-ng malloc `#GP`/SIGSEGV under SMP signal churn. Handler
+/// returns are strictly LIFO, so a stack pops each frame's own record.
+static SIGRETURN_STACK: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, alloc::vec::Vec<SigReturnRecord>>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Push a fresh record for a signal delivery. `saved_mask` starts `None`; the
+/// async path fills it via `set_sigreturn_saved_mask` after the frame is built.
+fn push_sigreturn_record(task: u64, use_rsp: bool, is_rt: bool) {
+    let mut g = SIGRETURN_STACK.lock();
     let map = g.get_or_insert_with(BTreeMap::new);
-    map.insert(task, use_rsp);
+    map.entry(task).or_default().push(SigReturnRecord {
+        use_rsp,
+        is_rt,
+        saved_mask: None,
+    });
 }
 
-fn sigreturn_use_rsp(task: u64) -> bool {
-    SIGRETURN_USE_RSP
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        .unwrap_or(false)
-}
-
-// Per-task record of the LAST delivered signal frame's layout: `true` ⇒ the
-// kernel laid out an rt_sigframe (McContext at sc_vaddr+168), `false` ⇒ a legacy
-// SigContext. `sys_sigreturn` reads this and hands it to `perform_sigreturn` so
-// the restore reads RIP from the correct offset. Previously the arch code GUESSED
-// rt-vs-legacy by sniffing the user `si_signo` word — a wrong guess (e.g. user
-// data in (0,64) over a legacy frame) read RIP from the rt offset, which lands on
-// the frame's `cs`/`ss` selector fields → control transfer to a tiny RPL-3 address
-// (#UD). The kernel BUILT the frame, so it must record the layout, not re-derive it.
-// `is_rt` mirrors deliver_signal's `want_siginfo || force_rt` decision exactly.
-static SIGRETURN_IS_RT: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, bool>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
-fn set_sigreturn_is_rt(task: u64, is_rt: bool) {
-    let mut g = SIGRETURN_IS_RT.lock();
-    let map = g.get_or_insert_with(BTreeMap::new);
-    map.insert(task, is_rt);
-}
-
-fn sigreturn_is_rt(task: u64) -> bool {
-    SIGRETURN_IS_RT
-        .lock()
-        .as_ref()
-        .and_then(|m| m.get(&task).copied())
-        // Default true: modern (rt_sigaction + SA_SIGINFO/restorer) is the
-        // overwhelming case; a missing record means rt.
-        .unwrap_or(true)
-}
-
-// Pre-handler signal mask, saved when a signal is delivered so `sys_sigreturn`
-// can restore it. POSIX: on return from a handler the signal mask in effect
-// just before the handler ran is restored — crucially undoing the auto-block of
-// the delivered signal. Without this the auto-blocked signal stays masked
-// forever, so a SECOND occurrence is never delivered (observed: a second
-// setitimer(ITIMER_REAL)/raise SIGALRM never firing after the first handler ran
-// — whichever alarm phase ran second hung). Single-slot per task, matching the
-// SIGRETURN_IS_RT / SIGRETURN_USE_RSP records (nested handlers share NARF's
-// existing single-record limitation). Only the async delivery path records here
-// (it is the one that auto-blocks); a `None` on return leaves the mask alone.
-static SIGRETURN_SAVED_MASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-
+/// Record the pre-handler mask on the CURRENT (top) delivery record.
 fn set_sigreturn_saved_mask(task: u64, mask: u64) {
-    let mut g = SIGRETURN_SAVED_MASK.lock();
-    let map = g.get_or_insert_with(BTreeMap::new);
-    map.insert(task, mask);
+    let mut g = SIGRETURN_STACK.lock();
+    if let Some(rec) = g
+        .as_mut()
+        .and_then(|m| m.get_mut(&task))
+        .and_then(|v| v.last_mut())
+    {
+        rec.saved_mask = Some(mask);
+    }
 }
 
-fn take_sigreturn_saved_mask(task: u64) -> Option<u64> {
-    let mut g = SIGRETURN_SAVED_MASK.lock();
-    g.as_mut().and_then(|m| m.remove(&task))
+/// Pop the current handler's record at `sys_sigreturn`. `None` (no record) →
+/// the caller falls back to modern defaults (is_rt, !use_rsp, no mask restore).
+fn pop_sigreturn_record(task: u64) -> Option<SigReturnRecord> {
+    let mut g = SIGRETURN_STACK.lock();
+    let map = g.as_mut()?;
+    let stack = map.get_mut(&task)?;
+    let rec = stack.pop();
+    if stack.is_empty() {
+        map.remove(&task);
+    }
+    rec
 }
 
 // Pre-`rt_sigsuspend` signal mask, saved when sigsuspend installs its
@@ -3772,8 +3771,8 @@ fn take_sigreturn_saved_mask(task: u64) -> Option<u64> {
 // restored by the interrupting handler's sigreturn must be the mask in
 // effect BEFORE sigsuspend replaced it — NOT the temporary suspend mask.
 // Without this record, `default_signal_delivery` captured the live (=
-// suspend) mask into SIGRETURN_SAVED_MASK, so the temporary mask survived
-// the handler return and the process ran on the suspend mask forever.
+// suspend) mask into the sigreturn record's `saved_mask`, so the temporary
+// mask survived the handler return and the process ran on it forever.
 // Consumed (take) by the first delivery after the suspend; a record left
 // by an aborted suspend is dropped by the next explicit sigprocmask
 // install (the user retook control of the mask) and swept on task exit.
@@ -6447,11 +6446,15 @@ pub(crate) fn default_signal_delivery_restricted(
     }
     // Remember whether this frame is the restorer-based Linux
     // rt_sigframe so `sys_sigreturn` resolves it from RSP.
-    set_sigreturn_use_rsp(task, params.restorer != 0);
-    // Record the frame layout we just built so sys_sigreturn restores from the
-    // right offsets — must match deliver_signal's `want_siginfo || force_rt`
-    // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
-    set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
+    // Record how sys_sigreturn must read this frame back — resolve-from-RSP and
+    // the rt-vs-legacy layout — pushing a fresh stack record so a nested handler
+    // can't clobber it. The layout must match deliver_signal's `want_siginfo ||
+    // force_rt` (SA_SIGINFO=0x4, see syscall.rs). Never re-derive from user memory.
+    push_sigreturn_record(
+        task,
+        params.restorer != 0,
+        (params.flags & 0x4) != 0 || params.restorer != 0,
+    );
     // Clear only after the rewrite succeeded — a failed
     // delivery (e.g. arch returns false) should leave pending
     // alone so the next trap retries.
@@ -6803,11 +6806,15 @@ pub fn default_sync_signal_delivery(
     );
     let delivered = ctx.deliver_signal(&params);
     if delivered {
-        set_sigreturn_use_rsp(task, params.restorer != 0);
-        // Record the frame layout we just built so sys_sigreturn restores from the
-        // right offsets — must match deliver_signal's `want_siginfo || force_rt`
-        // (SA_SIGINFO=0x4, see syscall.rs). Never re-derive the layout from user memory.
-        set_sigreturn_is_rt(task, (params.flags & 0x4) != 0 || params.restorer != 0);
+        // Push this (sync-fault) frame's sigreturn record. A stack push, not a
+        // single-slot write, so a SIGSEGV handler delivered ON TOP of an async
+        // handler pops only its own record and leaves the outer one intact —
+        // must match deliver_signal's `want_siginfo || force_rt` (SA_SIGINFO=0x4).
+        push_sigreturn_record(
+            task,
+            params.restorer != 0,
+            (params.flags & 0x4) != 0 || params.restorer != 0,
+        );
         return true;
     }
     // The handler's signal frame couldn't be placed — `deliver_signal` only
