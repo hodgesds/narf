@@ -12,7 +12,9 @@ pub(crate) fn sys_setdomainname(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let buf = args.arg0;
     let len = args.arg1 as usize;
-    if !capable(CAP_SYS_ADMIN) {
+    // Same per-UTS-namespace rule as `sethostname`:
+    // `ns_capable(current->nsproxy->uts_ns->user_ns, CAP_SYS_ADMIN)`.
+    if !uts_admin(current_task_id()) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }

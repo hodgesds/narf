@@ -617,6 +617,17 @@ pub enum FsError {
     OperationNotPermitted,
     Io(BlockError),
     InvalidPath,
+    /// Resolution gave up after SYMLOOP_MAX symlink hops. Maps to POSIX
+    /// `ELOOP` (`fs/namei.c`: `if (unlikely(nd->total_link_count++ >=
+    /// MAXSYMLINKS)) return ERR_PTR(-ELOOP);`).
+    ///
+    /// Distinct from [`FsError::InvalidPath`] on purpose. Both used to come
+    /// back as one error, so a symlink cycle was reported as ENOENT — which
+    /// tells a caller the path is free to create, when in fact something IS
+    /// there and no amount of retrying or re-creating will resolve it. `ln -s
+    /// a b; ln -s b a; cat a` is the canonical case, and shells, `find`, and
+    /// package installers all branch on ELOOP to stop descending.
+    SymlinkLoop,
     /// Operation would cross a filesystem/overlay boundary. Maps to EXDEV.
     CrossDevice,
     Busy,
@@ -2033,7 +2044,7 @@ pub fn resolve_async_ext<'a>(
 
             if kind == FileType::Symlink {
                 if symlinks_followed >= SYMLOOP_MAX {
-                    return Err(FsError::InvalidPath);
+                    return Err(FsError::SymlinkLoop);
                 }
                 symlinks_followed += 1;
                 // Read the target. POSIX symlink targets are bounded

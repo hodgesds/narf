@@ -528,12 +528,18 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// in order and stops at the first one that is absent (-ENOENT, since no
 /// later component can be reached) or is not a directory (-ENOTDIR).
 ///
-/// LINUX-GAP: -ELOOP needs symlink-depth accounting inside the resolver,
-/// and -EACCES needs directory execute bits that NARF does not enforce at
-/// all. Both still surface here as -ENOENT.
+/// -ELOOP is classified the same way. `fs/namei.c` gives up after
+/// MAXSYMLINKS hops; the resolver reports that as
+/// [`narf_filesystem::FsError::SymlinkLoop`], distinct from any other
+/// resolution failure, and [`path_symlink_loop`] asks for exactly it. Without
+/// that distinction a cycle came back as -ENOENT, which tells a caller the
+/// name is free — so `mkdir` on it fails with EEXIST it cannot explain, and a
+/// shell following `a -> b -> a` reports "No such file" for a link that
+/// plainly exists.
 fn path_lookup_errno(path: &str) -> i64 {
     const ENOENT: i64 = 2;
     const ENOTDIR: i64 = 20;
+    const ELOOP: i64 = 40;
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
     let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
@@ -563,10 +569,38 @@ fn path_lookup_errno(path: &str) -> i64 {
                     return EACCES;
                 }
             }
+            // This ancestor did not resolve. A cycle here stops the walk just
+            // as a missing component does, but means something quite
+            // different, so ask before defaulting.
+            None if path_symlink_loop(&prefix) => return ELOOP,
             None => return ENOENT,
         }
     }
+    // Every ancestor resolved, so any cycle is in the final component.
+    if path_symlink_loop(path) {
+        return ELOOP;
+    }
     ENOENT
+}
+
+/// Did resolving `path` fail specifically because of a symlink cycle?
+///
+/// Runs only from the failure classifier above, so the extra walk is never
+/// paid by a lookup that succeeded. It deliberately re-resolves through the
+/// same `resolve_async_ext` the stat path uses rather than re-deriving the
+/// hop count here: a second implementation of the walk would be free to
+/// disagree with the first about what counts as a hop, and then the errno
+/// would depend on which one ran.
+fn path_symlink_loop(path: &str) -> bool {
+    current_resolve_absolute(path, |fs, rel| {
+        // A mount root is a directory, never a symlink, so it cannot cycle.
+        !rel.is_empty()
+            && matches!(
+                poll_blocking(narf_filesystem::resolve_async_ext(fs.root(), rel, true)),
+                Some(Err(narf_filesystem::FsError::SymlinkLoop))
+            )
+    })
+    .unwrap_or(false)
 }
 
 fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {

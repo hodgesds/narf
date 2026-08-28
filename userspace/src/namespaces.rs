@@ -156,6 +156,15 @@ pub const DEFAULT_HOSTNAME: &str = "narf";
 #[derive(Debug)]
 pub struct UtsNamespace {
     id: NsId,
+    /// Linux's `uts_ns->user_ns`: the user namespace of the task that created
+    /// this one, fixed at creation. `sethostname` is gated on CAP_SYS_ADMIN
+    /// *here*, not in the host namespace, which is what lets an unprivileged
+    /// `unshare -Ur --uts` set its own hostname.
+    ///
+    /// `None` is the initial user namespace — every namespace existing before
+    /// any `unshare(CLONE_NEWUSER)`. Keeping it an Option lets the boot-time
+    /// constructors run before the initial user namespace is materialised.
+    owner: Option<Arc<UserNamespace>>,
     inner: IrqSafeSpinLock<UtsInner>,
 }
 
@@ -170,6 +179,7 @@ impl UtsNamespace {
     pub fn new_default() -> Arc<Self> {
         Arc::new(Self {
             id: alloc_ns_id(),
+            owner: None,
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: String::from(DEFAULT_HOSTNAME),
                 domainname: String::from("(none)"),
@@ -186,9 +196,21 @@ impl UtsNamespace {
     /// semantics for UTS are "copy on unshare", so the child sees
     /// the parent's hostname until it overwrites it.
     pub fn clone_from(other: &Self) -> Arc<Self> {
+        Self::clone_from_in(other, None)
+    }
+
+    /// The user namespace this one belongs to (`uts_ns->user_ns`).
+    pub fn owner_user_ns(&self) -> Arc<UserNamespace> {
+        self.owner.clone().unwrap_or_else(global_user)
+    }
+
+    /// [`Self::clone_from`] recording the creating task's user namespace as
+    /// the owner, per `create_uts_ns`'s `ns->user_ns = get_user_ns(user_ns)`.
+    pub fn clone_from_in(other: &Self, owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
         let g = other.inner.lock();
         Arc::new(Self {
             id: alloc_ns_id(),
+            owner,
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: g.hostname.clone(),
                 domainname: g.domainname.clone(),
@@ -514,7 +536,9 @@ pub fn current_ipc_namespace(task: u64) -> Arc<IpcNamespace> {
 /// currently sees. Called from `sys_unshare(CLONE_NEWUTS)`.
 pub fn unshare_uts(task: u64) {
     let cur = current_uts_ns(task);
-    let fresh = UtsNamespace::clone_from(&cur);
+    // `copy_utsname` stamps the creating task's user namespace onto the new
+    // one; that is what the later CAP_SYS_ADMIN check is measured against.
+    let fresh = UtsNamespace::clone_from_in(&cur, user_ns_of(task));
     ensure_uts_table();
     let mut g = UTS_BY_TASK.lock();
     if let Some(map) = g.as_mut() {
@@ -744,6 +768,33 @@ impl UserNamespace {
 
     pub fn is_initial(&self) -> bool {
         self.parent.is_none()
+    }
+
+    /// Enclosing user namespace; `None` only for the initial one.
+    pub fn parent(&self) -> Option<&Arc<UserNamespace>> {
+        self.parent.as_ref()
+    }
+
+    /// Nesting depth, initial namespace = 0 — Linux's `user_namespace.level`.
+    ///
+    /// `security/commoncap.c::cap_capable` compares it before granting the
+    /// owner of a namespace authority over it:
+    ///
+    ///     if ((ns->level > cred->user_ns->level) && uid_eq(ns->owner, cred->euid))
+    ///             return 0;
+    ///
+    /// Without the depth test a namespace on an UNRELATED branch that merely
+    /// shares an owner uid would grant that owner capabilities inside it. The
+    /// chain is shallow, so walking it beats storing a field that creation
+    /// order could get wrong.
+    pub fn level(&self) -> u32 {
+        let mut level = 0;
+        let mut cursor = self.parent.as_ref();
+        while let Some(parent) = cursor {
+            level += 1;
+            cursor = parent.parent.as_ref();
+        }
+        level
     }
 
     /// Translate an inner uid to a host-absolute uid. Unmapped ids

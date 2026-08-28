@@ -1001,6 +1001,123 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
 // Resolves a symlink and copies its target into buf, returning the byte
 // count. Build the symlink first via symlinkat, then read it back.
 
+/// `fs/namei.c` gives up on a symlink cycle with -ELOOP:
+///
+///     if (unlikely(nd->total_link_count++ >= MAXSYMLINKS))
+///             return ERR_PTR(-ELOOP);
+///
+/// NARF's resolver had the hop cap but folded exhaustion into the same
+/// "resolution failed" answer as everything else, so `a -> b -> a` came back
+/// as -ENOENT. That is not a cosmetic difference: ENOENT tells a caller the
+/// name is FREE, so it goes on to create it and gets an unexplainable EEXIST,
+/// and a shell reports "No such file" for a link plainly visible in `ls`.
+///
+/// The ENOENT control arm is what keeps this honest — it shows the classifier
+/// still reports a genuinely missing name correctly, rather than having been
+/// turned into an ELOOP machine.
+fn smoke_abi_pathx_stat_symlink_loop_is_eloop() -> TestResult {
+    const ELOOP: i64 = -40;
+    with_memfs("/loopfs", "loopfs", &[("real", b"hi")], || {
+        // /loopfs/a -> b, /loopfs/b -> a: a two-hop cycle.
+        for (target, link) in [
+            (b"b\0".as_slice(), b"/loopfs/a\0".as_slice()),
+            (b"a\0".as_slice(), b"/loopfs/b\0".as_slice()),
+        ] {
+            if call(
+                Syscall::Symlinkat.raw(),
+                a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("building the symlink cycle failed");
+            }
+        }
+        let mut st = [0u8; 256];
+        let looping = b"/loopfs/a\0";
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, looping.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        ) != Some(ELOOP)
+        {
+            return Err("stat of a symlink cycle was not -ELOOP");
+        }
+        // A cycle in a non-final component stops the walk just the same.
+        let through = b"/loopfs/a/x\0";
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, through.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        ) != Some(ELOOP)
+        {
+            return Err("stat through a looping ancestor was not -ELOOP");
+        }
+        // Control: a genuinely absent name is still -ENOENT, and an existing
+        // file still resolves. Neither must be collateral damage.
+        let missing = b"/loopfs/nope\0";
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, missing.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        ) != Some(ENOENT_E)
+        {
+            return Err("a missing name stopped being -ENOENT");
+        }
+        let real = b"/loopfs/real\0";
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(AT_FDCWD, real.as_ptr() as u64, st.as_mut_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("an ordinary file stopped resolving");
+        }
+        // lstat does NOT follow the final component, so the link itself is a
+        // perfectly good object: AT_SYMLINK_NOFOLLOW must succeed, not ELOOP.
+        // Reporting ELOOP here would break every `ls -l` of a cyclic link.
+        const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+        if call(
+            Syscall::Newfstatat.raw(),
+            a3(
+                AT_FDCWD,
+                looping.as_ptr() as u64,
+                st.as_mut_ptr() as u64,
+                AT_SYMLINK_NOFOLLOW,
+            ),
+        ) != Some(0)
+        {
+            return Err("lstat of a cyclic link should stat the link itself");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_stat_symlink_loop_is_eloop);
+
+/// `chdir(2)` resolves with LOOKUP_FOLLOW|LOOKUP_DIRECTORY, so a cyclic path
+/// is -ELOOP there too — it shares the same failure classifier as stat.
+fn smoke_abi_pathx_chdir_symlink_loop_is_eloop() -> TestResult {
+    const ELOOP: i64 = -40;
+    with_memfs("/loopcd", "loopcd", &[("real", b"hi")], || {
+        for (target, link) in [
+            (b"b\0".as_slice(), b"/loopcd/a\0".as_slice()),
+            (b"a\0".as_slice(), b"/loopcd/b\0".as_slice()),
+        ] {
+            if call(
+                Syscall::Symlinkat.raw(),
+                a2(target.as_ptr() as u64, AT_FDCWD, link.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("building the symlink cycle failed");
+            }
+        }
+        let looping = b"/loopcd/a\0";
+        if call(Syscall::Chdir.raw(), a0(looping.as_ptr() as u64)) != Some(ELOOP) {
+            return Err("chdir into a symlink cycle was not -ELOOP");
+        }
+        let missing = b"/loopcd/nope\0";
+        if call(Syscall::Chdir.raw(), a0(missing.as_ptr() as u64)) != Some(ENOENT_E) {
+            return Err("chdir to a missing name stopped being -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_chdir_symlink_loop_is_eloop);
+
 fn smoke_abi_pathx_readlinkat_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         // Create /p2/lnk -> "target" (Linux symlinkat: target, dirfd, linkpath).
