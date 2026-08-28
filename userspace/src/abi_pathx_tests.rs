@@ -3284,3 +3284,127 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pathx_stat_path_error_precedes_statbuf_check
 );
+
+// ─────────────────────────────────────────────────────────────────────
+// DAC: the privilege test is a capability, not uid 0
+//
+// `posix_access_ok` short-circuited on `accessor.uid == 0`. That was the
+// only privilege test available before capabilities were enforceable, and
+// it conflates two things Linux keeps apart in BOTH directions: a uid-0
+// service that dropped CAP_DAC_OVERRIDE to sandbox itself stayed
+// omnipotent, and a non-root task granted the capability stayed locked
+// out. The decision now comes from the effective set.
+// ─────────────────────────────────────────────────────────────────────
+
+const DAC_EACCES: i64 = -13;
+const CAP_DAC_OVERRIDE_BIT: u64 = 1 << 1;
+const CAP_DAC_READ_SEARCH_BIT: u64 = 1 << 2;
+
+fn smoke_abi_pathx_dac_root_without_the_cap_is_denied() -> TestResult {
+    with_memfs("/dac1", "dac1", &[("secret", b"x")], || {
+        // uid 0, but CAP_DAC_OVERRIDE dropped. Under the old `uid == 0`
+        // test this was omnipotent — which is exactly the sandbox a
+        // privileged daemon builds for itself by shedding capabilities and
+        // then expects to be held to.
+        // chmod while still privileged (the harness task starts with the
+        // full capability set), THEN drop.
+        let path = b"/dac1/secret\0";
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o000)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        match call_open(path.as_ptr() as u64, 0) {
+            Some(v) if v == DAC_EACCES => Ok(()),
+            Some(v) if v >= 0 => Err("uid 0 without CAP_DAC_OVERRIDE still opened a 0000 file"),
+            _ => Err("open of a 0000 file without the capability should be -EACCES"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_dac_root_without_the_cap_is_denied
+);
+
+fn smoke_abi_pathx_dac_override_grants_access() -> TestResult {
+    with_memfs("/dac2", "dac2", &[("secret", b"x")], || {
+        // The other direction: holding CAP_DAC_OVERRIDE grants it back.
+        // Pins that the check consults the capability rather than simply
+        // denying everything once uid==0 stopped being special.
+        let path = b"/dac2/secret\0";
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o000)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, CAP_DAC_OVERRIDE_BIT, CAP_DAC_OVERRIDE_BIT);
+        match call_open(path.as_ptr() as u64, 0) {
+            Some(v) if v >= 0 => Ok(()),
+            Some(v) if v == DAC_EACCES => Err("CAP_DAC_OVERRIDE did not grant read of a 0000 file"),
+            _ => Err("open with CAP_DAC_OVERRIDE should succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_dac_override_grants_access);
+
+fn smoke_abi_pathx_dac_override_cannot_make_data_executable() -> TestResult {
+    with_memfs("/dac3", "dac3", &[("data", b"x")], || {
+        // `if (!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO))` — read and
+        // write are always overridable, but EXECUTE only when the file
+        // already carries an execute bit. This is the one thing
+        // CAP_DAC_OVERRIDE is careful NOT to grant, so a privileged
+        // process still cannot run a data file.
+        let path = b"/dac3/data\0";
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o600)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, CAP_DAC_OVERRIDE_BIT, CAP_DAC_OVERRIDE_BIT);
+        const X_OK: u64 = 1;
+        match call(Syscall::Access.raw(), a1(path.as_ptr() as u64, X_OK)) {
+            Some(v) if v == DAC_EACCES => {}
+            Some(0) => return Err("CAP_DAC_OVERRIDE made a non-executable file executable"),
+            _ => return Err("access(X_OK) on a 0600 file should be -EACCES"),
+        }
+        // With an exec bit present, the override applies.
+        // Restore privilege to chmod, then re-test with an exec bit set.
+        crate::handlers::__test_caps_reset();
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o700)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, CAP_DAC_OVERRIDE_BIT, CAP_DAC_OVERRIDE_BIT);
+        match call(Syscall::Access.raw(), a1(path.as_ptr() as u64, X_OK)) {
+            Some(0) => Ok(()),
+            _ => Err("access(X_OK) on a 0700 file should succeed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_dac_override_cannot_make_data_executable
+);
+
+fn smoke_abi_pathx_chdir_needs_search_permission() -> TestResult {
+    with_memfs("/dac4", "dac4", &[("f", b"x")], || {
+        // `path_permission(&path, MAY_EXEC | MAY_CHDIR)` — a directory a
+        // task cannot search is one it cannot make its cwd. This was the
+        // documented -EACCES gap in sys_chdir.
+        let dir = b"/dac4\0";
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o000)) != Some(0) {
+            return Err("chmod dir setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        match call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) {
+            Some(v) if v == DAC_EACCES => {}
+            Some(0) => return Err("chdir into an unsearchable directory succeeded"),
+            _ => return Err("chdir into a 0000 directory should be -EACCES"),
+        }
+        // CAP_DAC_READ_SEARCH grants search on a directory (but not write).
+        crate::handlers::__test_set_caps(
+            FAKE_TASK,
+            CAP_DAC_READ_SEARCH_BIT,
+            CAP_DAC_READ_SEARCH_BIT,
+        );
+        match call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) {
+            Some(0) => Ok(()),
+            _ => Err("CAP_DAC_READ_SEARCH should grant directory search"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_chdir_needs_search_permission);

@@ -539,6 +539,8 @@ fn path_lookup_errno(path: &str) -> i64 {
     let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
         return ENOENT;
     };
+    const EACCES: i64 = 13;
+    let task = current_task_id();
     let mut prefix = alloc::string::String::new();
     for comp in parent.split('/').filter(|c| !c.is_empty()) {
         prefix.push('/');
@@ -548,6 +550,17 @@ fn path_lookup_errno(path: &str) -> i64 {
             Some((st, ..)) => {
                 if st.mode.file_type != narf_filesystem::FileType::Dir {
                     return ENOTDIR;
+                }
+                // `link_path_walk` requires MAY_EXEC on every directory it
+                // traverses. This is what makes a 0700 directory actually
+                // hide its contents: without it a caller who cannot open
+                // the directory can still stat straight through it to a
+                // file inside, and learn the file exists.
+                //
+                // It runs AFTER the type check, so a non-directory
+                // component is still -ENOTDIR rather than -EACCES.
+                if !dir_search_permitted(&prefix, task) {
+                    return EACCES;
                 }
             }
             None => return ENOENT,

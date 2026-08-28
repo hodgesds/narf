@@ -90,7 +90,14 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
                 let st = file.stat();
                 let (uid, gid) = file.owners();
-                set_access_result(ctx, mode, st.mode.perms, uid, gid);
+                set_access_result(
+                    ctx,
+                    mode,
+                    st.mode.perms,
+                    uid,
+                    gid,
+                    st.mode.file_type == narf_filesystem::FileType::Dir,
+                );
             }
             _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
         }
@@ -104,21 +111,36 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
     // the successful mount and abort PID 1.
     if let Some(dir) = resolve_dir_absolute(path) {
         let (uid, gid) = dir.dir_owners();
-        set_access_result(ctx, mode, dir.dir_mode(), uid, gid);
+        set_access_result(ctx, mode, dir.dir_mode(), uid, gid, true);
     } else {
         ctx.set_return(SyscallReturn::ok((-2i64) as u64));
     }
 }
 
-fn set_access_result(ctx: &mut dyn TrapContext, mode: u32, perms: u16, uid: u32, gid: u32) {
+/// `is_dir` selects Linux's directory override rules: CAP_DAC_READ_SEARCH
+/// grants search on a directory but never write, while on a regular file
+/// CAP_DAC_OVERRIDE cannot grant execute unless some execute bit is set.
+fn set_access_result(
+    ctx: &mut dyn TrapContext,
+    mode: u32,
+    perms: u16,
+    uid: u32,
+    gid: u32,
+    is_dir: bool,
+) {
     let request = narf_filesystem::AccessRequest {
         read: mode & 4 != 0,
         write: mode & 2 != 0,
         exec: mode & 1 != 0,
     };
     let allowed = narf_filesystem::posix_access_ok(
-        narf_filesystem::FileOwner { uid, gid, perms },
-        &current_accessor(current_task_id()),
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(current_task_id(), uid, gid),
         request,
     );
     ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));

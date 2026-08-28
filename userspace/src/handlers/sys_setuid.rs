@@ -71,5 +71,9 @@ pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
             return;
         }
     }
+    // `security_task_fix_setuid(new, old, LSM_SETID_*)` -> cap_task_fix_setuid
+    // -> cap_emulate_setxuid: the capability sets follow the uid change, so
+    // dropping away from root actually drops privilege.
+    cap_emulate_setxuid(task, old, read_uidgid(task));
     ctx.set_return(SyscallReturn::ok(0));
 }

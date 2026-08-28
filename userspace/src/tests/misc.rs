@@ -776,20 +776,26 @@ fn smoke_userspace_setuid_setgid_round_trip() -> TestResult {
         return TestResult::Fail("default uid/gid not (0, 0)");
     }
 
-    // setuid(1234) → getuid sees 1234; gid unchanged.
-    let _ = call(Syscall::SetUid, 1234);
+    // GID FIRST, then uid — the order matters and it is not stylistic.
+    // `setuid` away from root clears the capability sets
+    // (cap_emulate_setxuid), so a `setgid` afterwards has no CAP_SETGID
+    // and is refused. Dropping the group while still privileged and the
+    // uid last is the correct privilege-drop sequence; doing it the other
+    // way round is the classic bug where a process believes it shed its
+    // group membership and did not.
+    let _ = call(Syscall::SetGid, 56);
     let u1 = call(Syscall::GetUid, 0).map(|r| r.value).unwrap_or(!0);
     let g1 = call(Syscall::GetGid, 0).map(|r| r.value).unwrap_or(!0);
-    if u1 != 1234 || g1 != 0 {
-        return TestResult::Fail("setuid did not stick");
+    if u1 != 0 || g1 != 56 {
+        return TestResult::Fail("setgid did not stick / overwrote uid");
     }
 
-    // setgid(56) → getgid sees 56; uid unchanged.
-    let _ = call(Syscall::SetGid, 56);
+    // setuid(1234) → getuid sees 1234; gid unchanged.
+    let _ = call(Syscall::SetUid, 1234);
     let u2 = call(Syscall::GetUid, 0).map(|r| r.value).unwrap_or(!0);
     let g2 = call(Syscall::GetGid, 0).map(|r| r.value).unwrap_or(!0);
     if u2 != 1234 || g2 != 56 {
-        return TestResult::Fail("setgid did not stick / overwrote uid");
+        return TestResult::Fail("setuid did not stick");
     }
 
     crate::handlers::__test_uidgid_reset();

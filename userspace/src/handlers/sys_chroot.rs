@@ -83,8 +83,14 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // but it would also diverge from it, and a program that distinguishes
     // "no such directory" from "not allowed" would misreport.
     //
-    // LINUX-GAP: -EACCES from `path_permission(MAY_EXEC | MAY_CHDIR)` is
-    // still not modelled — NARF enforces no directory execute bits.
+    // `error = path_permission(&path, MAY_EXEC | MAY_CHDIR);` runs BEFORE
+    // the capability check in fs/open.c, so an unprivileged caller naming a
+    // directory it cannot search gets -EACCES rather than -EPERM — it
+    // learns which of the two problems it has.
+    if !dir_search_permitted(&resolved, task) {
+        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        return;
+    }
     if !capable(CAP_SYS_CHROOT) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;

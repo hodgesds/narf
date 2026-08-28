@@ -416,6 +416,8 @@ pub fn open(
                     uid: queue.owner,
                     gid: queue.group,
                     perms: queue.mode,
+                    // A message queue is a file, never a directory.
+                    is_dir: false,
                 },
                 &Accessor::new(uid, gid),
                 want,

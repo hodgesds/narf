@@ -1346,17 +1346,20 @@ fn open_impl(
     let access_mode = flags & 0o3;
     let want_r = access_mode == 0 || access_mode == 2;
     let want_w = access_mode == 1 || access_mode == 2;
-    // SECURITY: build the Accessor through the single translation
-    // funnel so a task inside a user-ns has its in-ns fsuid/fsgid mapped
-    // to HOST-absolute ids before posix_access_ok (which treats uid==0
-    // as host-root). File owners stay host-absolute. See current_accessor.
+    // SECURITY: build the Accessor through the single translation funnel so
+    // a task inside a user-ns has its in-ns fsuid/fsgid mapped to
+    // HOST-absolute ids before posix_access_ok. File owners stay
+    // host-absolute. See current_accessor, which also supplies the DAC
+    // capability decision (it used to be inferred from uid == 0 inside
+    // posix_access_ok itself).
     if !narf_filesystem::posix_access_ok(
         narf_filesystem::FileOwner {
             uid: file_uid,
             gid: file_gid,
             perms: stat.mode.perms,
+            is_dir: stat.mode.file_type == narf_filesystem::FileType::Dir,
         },
-        &current_accessor(task),
+        &accessor_for_inode(task, file_uid, file_gid),
         narf_filesystem::AccessRequest {
             read: want_r,
             write: want_w,
@@ -3688,6 +3691,8 @@ const CAP_VERSION_3: u32 = 0x2008_0522;
 // Only the capabilities actually CONSULTED are named. The rest still
 // round-trip through capget/capset as opaque bits — naming one before
 // something enforces it would advertise a check that does not exist.
+pub(crate) const CAP_DAC_OVERRIDE: u32 = 1;
+pub(crate) const CAP_DAC_READ_SEARCH: u32 = 2;
 pub(crate) const CAP_SETGID: u32 = 6;
 pub(crate) const CAP_SETUID: u32 = 7;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
@@ -3787,6 +3792,60 @@ pub(crate) fn task_capable(task: u64, cap: u32) -> bool {
         return false;
     }
     read_caps(task).effective & (1u64 << cap) != 0
+}
+
+/// `security/commoncap.c::cap_emulate_setxuid` — make the capability sets
+/// follow a uid change.
+///
+/// ```text
+/// if ((old->uid == 0 || old->euid == 0 || old->suid == 0) &&
+///     (new->uid != 0 && new->euid != 0 && new->suid != 0)) {
+///         if (!issecure(SECURE_KEEP_CAPS)) {
+///                 cap_clear(new->cap_permitted);
+///                 cap_clear(new->cap_effective);
+///         }
+///         cap_clear(new->cap_ambient);
+/// }
+/// if (old->euid == 0 && new->euid != 0)  cap_clear(new->cap_effective);
+/// if (old->euid != 0 && new->euid == 0)  new->cap_effective = new->cap_permitted;
+/// ```
+///
+/// This is what makes "drop to an unprivileged uid" actually drop
+/// privilege, and it became load-bearing the moment DAC stopped testing
+/// `uid == 0` and started testing CAP_DAC_OVERRIDE. Without it a service
+/// that called `setuid(1000)` would keep every capability it held and so
+/// keep bypassing DAC — the old code got the right ANSWER here for the
+/// wrong reason, because uid was the only thing it looked at.
+///
+/// Note the last clause is a RAISE: returning the effective euid to 0
+/// restores effective from permitted, which is how a set-uid-root helper
+/// regains its powers after temporarily dropping them.
+///
+/// LINUX-GAP: `SECURE_KEEP_CAPS` and `SECURE_NO_SETUID_FIXUP` (the
+/// securebits that suppress this) are not modelled, so the fixup always
+/// runs. Both default to off in Linux, so this matches the default.
+fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
+    let was_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
+    let is_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
+    let mut caps = read_caps(task);
+    let mut changed = false;
+    if was_root && !is_root {
+        caps.permitted = 0;
+        caps.effective = 0;
+        caps.ambient = 0;
+        changed = true;
+    }
+    if old.euid == 0 && new.euid != 0 {
+        caps.effective = 0;
+        changed = true;
+    }
+    if old.euid != 0 && new.euid == 0 {
+        caps.effective = caps.permitted;
+        changed = true;
+    }
+    if changed {
+        write_caps(task, caps);
+    }
 }
 
 /// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
@@ -9413,6 +9472,11 @@ pub fn report_ucred_to(reader: u64, mut cred: crate::socket::Ucred) -> crate::so
 /// for a real syscall MUST go through here. (Verified by grep: the
 /// open path is the sole call site; the only other `Accessor {…}`
 /// literals are in `tests.rs`.)
+/// NOTE: the DAC capability flags this returns are NOT safe to pair with
+/// an arbitrary inode — see [`accessor_for_inode`], which clears them for
+/// a file whose owners are unmapped in the caller's user namespace. Use
+/// this directly only when no inode is involved (e.g. building a FUSE
+/// request context, which needs the ids alone).
 fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     let acc = read_uidgid(task);
     // Supplementary groups are part of the identity, not an extra. Linux's
@@ -9437,6 +9501,8 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
                     .iter()
                     .map(|g| uns.translate_gid_to_host(*g))
                     .collect(),
+                dac_override: task_capable(task, CAP_DAC_OVERRIDE),
+                dac_read_search: task_capable(task, CAP_DAC_READ_SEARCH),
             };
         }
     }
@@ -9445,6 +9511,13 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
         uid: acc.fsuid,
         gid: acc.fsgid,
         groups,
+        // The DAC overrides come from the EFFECTIVE capability set, not
+        // from `uid == 0`. Those are different questions: a uid-0 service
+        // that dropped CAP_DAC_OVERRIDE to sandbox itself was still
+        // omnipotent under the old test, and a non-root task granted the
+        // capability was still locked out.
+        dac_override: task_capable(task, CAP_DAC_OVERRIDE),
+        dac_read_search: task_capable(task, CAP_DAC_READ_SEARCH),
     }
 }
 
@@ -9485,6 +9558,87 @@ pub fn uidgid_fork(parent: u64, child: u64) {
             map.insert(child, v);
         }
     }
+}
+
+// ── DAC: path-walk search permission ───────────────────────────────
+//
+// `narf_filesystem::posix_access_ok` is the discretionary check on a
+// single inode, and `sys_open` / `access(2)` already use it. What was
+// missing is Linux's check on the PATH: `link_path_walk` requires
+// MAY_EXEC (search) on every directory it traverses, which is what makes
+// a 0700 directory actually hide its contents from other users. Without
+// it, a caller who could not open the directory could still stat straight
+// through it to a file inside.
+
+/// Does `task` hold search (MAY_EXEC) permission on the directory at
+/// `path`? Built on the same `posix_access_ok` the open path uses, so
+/// there is one DAC algorithm in the tree rather than two.
+/// `kernel/capability.c::capable_wrt_inode_uidgid` — a DAC override
+/// applies only to an inode whose owners are MAPPED in the caller's user
+/// namespace:
+///
+/// ```text
+/// return ns_capable(ns, cap) && privileged_wrt_inode_uidgid(ns, idmap, inode);
+/// /* ... which is kuid_has_mapping(ns, i_uid) && kgid_has_mapping(ns, i_gid) */
+/// ```
+///
+/// This is not a refinement, it is the whole containment property. A task
+/// that is root INSIDE a user namespace holds the full capability set
+/// there; without the mapping test that capability would also override DAC
+/// on HOST files the namespace has no view of, and unprivileged user
+/// namespaces would be a way to read /etc/shadow. The previous `uid == 0`
+/// check got this right by accident, because an unmapped in-ns root
+/// translates to OVERFLOW_ID rather than 0.
+fn accessor_for_inode(task: u64, file_uid: u32, file_gid: u32) -> narf_filesystem::Accessor {
+    #[allow(unused_mut)]
+    let mut acc = current_accessor(task);
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial()
+            && (uns.translate_uid_from_host(file_uid).is_none()
+                || uns.translate_gid_from_host(file_gid).is_none())
+        {
+            acc.dac_override = false;
+            acc.dac_read_search = false;
+        }
+    }
+    let _ = (file_uid, file_gid);
+    acc
+}
+
+/// Test hook for [`accessor_for_inode`] — the per-inode form is the only
+/// safe one, so tests must exercise it rather than pairing a bare
+/// `current_accessor` with an arbitrary file.
+#[doc(hidden)]
+pub fn __test_accessor_for_inode(
+    task: u64,
+    file_uid: u32,
+    file_gid: u32,
+) -> narf_filesystem::Accessor {
+    accessor_for_inode(task, file_uid, file_gid)
+}
+
+fn dir_search_permitted(path: &str, task: u64) -> bool {
+    let Some(dir) = resolve_dir_absolute(path) else {
+        // Nothing to search; the caller reports ENOENT/ENOTDIR itself.
+        return true;
+    };
+    let (uid, gid) = dir.dir_owners();
+    narf_filesystem::posix_access_ok(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms: dir.dir_mode(),
+            is_dir: true,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: false,
+            exec: true,
+        },
+    )
 }
 
 pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {

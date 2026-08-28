@@ -3773,12 +3773,27 @@ fn smoke_abi_ipc_shmctl_exact_order_permissions_and_set() -> TestResult {
             return Err("IPC_SET fields did not round-trip through IPC_STAT");
         }
 
-        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+        // Move only the EFFECTIVE uid, keeping the saved uid at 0 as the
+        // way back. `setresuid(1000, 1000, 1000)` moves all three and is
+        // IRREVERSIBLE — Linux clears the capability sets on a root ->
+        // non-root transition (cap_emulate_setxuid), so the restore
+        // afterwards would need a CAP_SETUID the task no longer holds.
+        // Dropping euid alone clears only the EFFECTIVE set, and returning
+        // euid to 0 restores it from permitted, which is exactly how a
+        // set-uid helper brackets a privileged section.
+        if call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 1000, u32::MAX as u64),
+        ) != Some(0)
+        {
             return Err("failed to install non-owner test credentials");
         }
         let non_owner_set = call(Syscall::Shmctl.raw(), a2(id, IPC_SET, set.as_ptr() as u64));
         let non_owner_rmid = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 0, u32::MAX as u64),
+        );
         if non_owner_set != Some(EPERM) || non_owner_rmid != Some(EPERM) {
             return Err("non-owner shmctl mutation was not EPERM");
         }
@@ -3865,7 +3880,11 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
             return Err("owner shmctl SHM_UNLOCK failed");
         }
 
-        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+        if call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 1000, u32::MAX as u64),
+        ) != Some(0)
+        {
             return Err("failed to install non-owner test credentials");
         }
         let denied_stat = call(
@@ -3877,7 +3896,10 @@ fn smoke_abi_ipc_shmctl_info_stat_and_lock() -> TestResult {
             a2(id, SHM_STAT_ANY, stat.as_mut_ptr() as u64),
         );
         let denied_lock = call(Syscall::Shmctl.raw(), a2(id, SHM_LOCK, 0));
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 0, u32::MAX as u64),
+        );
         if denied_stat != Some(EACCES) || any_stat != Some(id as i64) || denied_lock != Some(EPERM)
         {
             return Err("extended shmctl permission behavior diverged from Linux");
@@ -3938,10 +3960,16 @@ fn smoke_abi_ipc_shmat_permission_denied_before_as() -> TestResult {
         let id = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o400))
             .filter(|id| *id > 0)
             .ok_or("setup: shmget failed")? as u64;
-        let _ = call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000));
+        let _ = call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 1000, u32::MAX as u64),
+        );
         let readonly = call(Syscall::Shmat.raw(), a2(id, 0, SHM_RDONLY));
         let writable = call(Syscall::Shmat.raw(), a2(id, 0, 0));
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 0, u32::MAX as u64),
+        );
         let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
         if readonly != Some(EACCES) || writable != Some(EACCES) {
             Err("shmat did not enforce read/write IPC permissions before mapping")
@@ -3982,7 +4010,11 @@ fn smoke_abi_ipc_shmctl_eperm_vs_eacces_vs_einval() -> TestResult {
         let mut set = [0u8; 112];
         set[20..24].copy_from_slice(&0o666u32.to_ne_bytes());
 
-        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+        if call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 1000, u32::MAX as u64),
+        ) != Some(0)
+        {
             return Err("failed to install non-owner test credentials");
         }
         // ipcperms grants the read, so IPC_STAT succeeds ...
@@ -4010,7 +4042,10 @@ fn smoke_abi_ipc_shmctl_eperm_vs_eacces_vs_einval() -> TestResult {
         // the lookup. IPC_64 is not stripped by the native entry point.
         let neg_id = call(Syscall::Shmctl.raw(), a2(u64::from(u32::MAX), 0x7f, 0));
         let unknown_cmd = call(Syscall::Shmctl.raw(), a2(open_id, 0x7f, 0));
-        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        let _ = call(
+            Syscall::Setresuid.raw(),
+            a2(u32::MAX as u64, 0, u32::MAX as u64),
+        );
 
         if open_stat != Some(0) {
             return Err("mode 0o666 IPC_STAT was refused although ipcperms grants read");

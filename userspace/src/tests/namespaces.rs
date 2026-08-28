@@ -1204,12 +1204,14 @@ fn smoke_dac_shadow_denies_nonroot() -> TestResult {
         uid: 0,
         gid: 0,
         perms: 0o600,
+        is_dir: false,
     };
     // A world-readable 0o666 file.
     let public = FileOwner {
         uid: 0,
         gid: 0,
         perms: 0o666,
+        is_dir: false,
     };
     // root reads the 0600 shadow.
     if !posix_access_ok(shadow, &Accessor::new(0, 0), rd) {
@@ -1468,8 +1470,14 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
         uid: 0,
         gid: 0,
         perms: 0o600,
+        is_dir: false,
     };
-    if posix_access_ok(host_shadow, &acc, rd) {
+    // The accessor must be built PER INODE: `capable_wrt_inode_uidgid`
+    // clears the DAC overrides for a file whose owners are unmapped in the
+    // caller's user namespace. Reusing one accessor across inodes of
+    // different mapping status is exactly the hole this test guards.
+    let acc_shadow = crate::handlers::__test_accessor_for_inode(task, 0, 0);
+    if posix_access_ok(host_shadow, &acc_shadow, rd) {
         return TestResult::Fail("SECURITY: in-ns root read a host-root 0600 file");
     }
     // A file owned by the mapped outer uid (1000) at 0600 IS readable.
@@ -1477,8 +1485,10 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
         uid: 1000,
         gid: 1000,
         perms: 0o600,
+        is_dir: false,
     };
-    if !posix_access_ok(owned, &acc, rd) {
+    let acc_owned = crate::handlers::__test_accessor_for_inode(task, 1000, 1000);
+    if !posix_access_ok(owned, &acc_owned, rd) {
         return TestResult::Fail("in-ns root denied its own (mapped) file");
     }
 
@@ -1498,7 +1508,7 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
     let task2: u64 = 0xBEEF;
     crate::handlers::__test_set_fsids(task2, 0, 0);
     crate::namespaces::setns_user(task2, priv_ns);
-    let acc2 = crate::handlers::__test_current_accessor(task2);
+    let acc2 = crate::handlers::__test_accessor_for_inode(task2, 0, 0);
     if acc2.uid != 0 || !posix_access_ok(host_shadow, &acc2, rd) {
         return TestResult::Fail("inner-0→host-0 mapping failed to grant host root");
     }
