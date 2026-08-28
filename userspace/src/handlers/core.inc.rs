@@ -10327,6 +10327,19 @@ pub(crate) enum WhoScope {
 /// `who == 0` means the caller's own process, process group, or REAL uid
 /// depending on the scope — note it is `cred->uid`, not euid, for the user
 /// case (kernel/sys.c: `if (!who) uid = cred->uid;`).
+/// `thread_group_empty(current)` — is the caller the ONLY live thread in
+/// its thread group?
+///
+/// NARF models a thread by mapping its TaskId onto its leader's process
+/// key (see `process_state_key`), so the group is every live task sharing
+/// the caller's key.
+pub(crate) fn thread_group_empty(task: u64) -> bool {
+    let me = process_state_key(task);
+    !crate::task::task_ids()
+        .into_iter()
+        .any(|t| t != task && process_state_key(t) == me)
+}
+
 pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> alloc::vec::Vec<u64> {
     let mut out = alloc::vec::Vec::new();
     match scope {

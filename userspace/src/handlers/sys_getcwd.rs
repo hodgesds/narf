@@ -36,6 +36,23 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     // The kernel's `len`: the path plus its NUL terminator. This is both the
     // ERANGE threshold and the value returned on success.
     let needed = cwd.len() + 1;
+    // `fs/d_path.c::SYSCALL_DEFINE2(getcwd)` orders these two, and the order
+    // is observable:
+    //
+    //     len = PATH_MAX - b.len;
+    //     if (unlikely(len > PATH_MAX))  error = -ENAMETOOLONG;
+    //     else if (unlikely(len > size)) error = -ERANGE;
+    //
+    // ENAMETOOLONG comes FIRST. That matters to glibc's dynamic getcwd,
+    // which doubles its buffer on exactly ERANGE: a path that can never fit
+    // in ANY buffer must not report ERANGE, or the caller reallocates
+    // forever instead of failing. Reporting ERANGE for a >PATH_MAX cwd is
+    // an unbounded retry loop, not a wrong errno.
+    const PATH_MAX: usize = 4096;
+    if needed > PATH_MAX {
+        ctx.set_return(SyscallReturn::ok((-36i64) as u64)); // -ENAMETOOLONG
+        return;
+    }
     if needed > len {
         // Buffer too small for the path + NUL → ERANGE, ahead of any check
         // on `buf` itself (Linux never touches the buffer on this path).
@@ -59,9 +76,8 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
-    // LINUX-GAP: Linux answers -ENOENT when the cwd's dentry has been
-    // unlinked (`d_unlinked(pwd.dentry)`), and -ENAMETOOLONG when the
-    // reconstructed path exceeds PATH_MAX. NARF stores the cwd as a string
-    // and never invalidates it, so neither state is representable here.
+    // LINUX-GAP: `d_unlinked(pwd.dentry)` -> -ENOENT has no counterpart —
+    // NARF stores the cwd as a string with no dentry to invalidate, so a
+    // directory removed out from under a task keeps working here.
     ctx.set_return(SyscallReturn::ok(needed as u64));
 }
