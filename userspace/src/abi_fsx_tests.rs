@@ -2785,3 +2785,203 @@ fn smoke_abi_fsx_rename_replaces_existing() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_rename_replaces_existing);
+
+// ─────────────────────────────────────────────────────────────────────
+// ACL follow-ups: open(2) consults the ACL, and setxattr reports why
+//
+// The ACL implementation landed with these two deliberately unwired,
+// because they live in files its author was fenced out of. Both are
+// observable from userspace:
+//
+//   * `may_open` ends in `inode_permission(idmap, inode, MAY_OPEN|acc_mode)`
+//     which reaches check_acl, so an ACL that access(2) honours must also
+//     be honoured by the open that follows it. Otherwise `setfacl` appears
+//     to work and the program still cannot open the file.
+//   * setxattr collapsed every ACL rejection into -EIO, which points the
+//     reader at the disk rather than at their ACL.
+// ─────────────────────────────────────────────────────────────────────
+
+/// A minimal well-formed ACCESS ACL granting `uid` exactly `perm`.
+/// Layout: `__le32 a_version`, then `{__le16 tag, __le16 perm, __le32 id}`.
+fn acl_blob(uid: u32, perm: u16) -> alloc::vec::Vec<u8> {
+    const ACL_USER_OBJ: u16 = 0x01;
+    const ACL_USER: u16 = 0x02;
+    const ACL_GROUP_OBJ: u16 = 0x04;
+    const ACL_MASK: u16 = 0x10;
+    const ACL_OTHER: u16 = 0x20;
+    const UNDEF: u32 = u32::MAX;
+    let mut v = alloc::vec::Vec::new();
+    v.extend_from_slice(&2u32.to_le_bytes()); // POSIX_ACL_XATTR_VERSION
+    let mut ent = |tag: u16, p: u16, id: u32| {
+        v.extend_from_slice(&tag.to_le_bytes());
+        v.extend_from_slice(&p.to_le_bytes());
+        v.extend_from_slice(&id.to_le_bytes());
+    };
+    // Order matters: posix_acl_valid requires USER_OBJ, USER*, GROUP_OBJ,
+    // GROUP*, MASK, OTHER in that sequence, and the MASK must follow the
+    // entries it limits (the forward-scan rule).
+    // USER_OBJ 6 and OTHER 0 make `posix_acl_update_mode` derive a 06x0
+    // mode, so the owner keeps access and "other" has none — the named-user
+    // entry is then the only thing that can grant an unrelated uid.
+    ent(ACL_USER_OBJ, 6, UNDEF);
+    ent(ACL_USER, perm, uid);
+    ent(ACL_GROUP_OBJ, 0, UNDEF);
+    ent(ACL_MASK, perm, UNDEF);
+    ent(ACL_OTHER, 0, UNDEF);
+    v
+}
+
+fn smoke_abi_fsx_setxattr_malformed_acl_is_einval() -> TestResult {
+    with_memfs("/aclx", "aclx", &[("f", b"data")], || {
+        // `posix_acl_fix_xattr_common` rejects a ragged buffer with
+        // -EINVAL. This used to report -EIO.
+        let path = b"/aclx/f\0";
+        let name = b"system.posix_acl_access\0";
+        let ragged = [2u8, 0, 0]; // shorter than the 4-byte header
+        match call(
+            Syscall::Setxattr.raw(),
+            a3(
+                path.as_ptr() as u64,
+                name.as_ptr() as u64,
+                ragged.as_ptr() as u64,
+                ragged.len() as u64,
+            ),
+        ) {
+            Some(-22) => Ok(()),
+            Some(-5) => Err("a malformed ACL still reports -EIO instead of -EINVAL"),
+            _ => Err("setxattr of a malformed ACL should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setxattr_malformed_acl_is_einval
+);
+
+fn smoke_abi_fsx_setxattr_bad_acl_version_is_eopnotsupp() -> TestResult {
+    with_memfs("/aclv", "aclv", &[("f", b"data")], || {
+        // `if (header->a_version != cpu_to_le32(POSIX_ACL_XATTR_VERSION))
+        //      return -EOPNOTSUPP;`
+        //
+        // This previously fell through to the generic xattr table, which
+        // STORED the rejected bytes — a later read would hand back an ACL
+        // the kernel had refused.
+        let path = b"/aclv/f\0";
+        let name = b"system.posix_acl_access\0";
+        let v1 = 1u32.to_le_bytes();
+        match call(
+            Syscall::Setxattr.raw(),
+            a3(
+                path.as_ptr() as u64,
+                name.as_ptr() as u64,
+                v1.as_ptr() as u64,
+                v1.len() as u64,
+            ),
+        ) {
+            Some(-95) => {}
+            Some(0) => return Err("a bad-version ACL was accepted and stored"),
+            _ => return Err("setxattr of a bad-version ACL should be -EOPNOTSUPP"),
+        }
+        // And nothing was stored: the read must miss, not return the bytes.
+        let mut out = [0u8; 64];
+        match call(
+            Syscall::Getxattr.raw(),
+            a3(
+                path.as_ptr() as u64,
+                name.as_ptr() as u64,
+                out.as_mut_ptr() as u64,
+                out.len() as u64,
+            ),
+        ) {
+            Some(v) if v < 0 => Ok(()),
+            _ => Err("the refused ACL was stored anyway and read back"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setxattr_bad_acl_version_is_eopnotsupp
+);
+
+fn smoke_abi_fsx_open_honours_the_acl() -> TestResult {
+    with_memfs("/aclo", "aclo", &[("f", b"data")], || {
+        // The point of the follow-up: an ACL that access(2) honours must
+        // also be honoured by the open(2) that follows it.
+        //
+        // The grant has to come from a NAMED-USER entry, and the caller
+        // has to be neither the owner nor in the file's group. Two reasons,
+        // both learned by getting this wrong:
+        //
+        //   * `acl_permission_check` short-circuits on an owner match
+        //     BEFORE consulting the ACL, so an ACL_USER entry naming the
+        //     owner's own uid is never reached — ACL_USER_OBJ governs.
+        //   * `posix_acl_update_mode` rewrites the file mode from
+        //     USER_OBJ / MASK / OTHER when the ACL is stored, so anything
+        //     the owner or group triplet grants is ALSO granted by the mode
+        //     bits alone. Only a named-user entry is invisible to the mode,
+        //     which is what makes this a discriminator rather than a
+        //     tautology.
+        //
+        // So: file is uid 0 / gid 0, mode ends up 0640 from the ACL, and
+        // the caller becomes uid 1000 / gid 1000 — the "other" triplet,
+        // which is 0. Mode bits alone refuse; the ACL_USER entry grants.
+        let path = b"/aclo/f\0";
+        let name = b"system.posix_acl_access\0";
+        let blob = acl_blob(1000, 4);
+        if call(
+            Syscall::Setxattr.raw(),
+            a3(
+                path.as_ptr() as u64,
+                name.as_ptr() as u64,
+                blob.as_ptr() as u64,
+                blob.len() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("storing the ACL failed");
+        }
+        // Become an unrelated user. gid first, then uid — setuid away from
+        // root clears the capability sets (cap_emulate_setxuid), so the
+        // other order would leave setgid without CAP_SETGID.
+        if call(Syscall::SetGid.raw(), a0(1000)) != Some(0) {
+            return Err("setgid(1000) failed");
+        }
+        if call(Syscall::SetUid.raw(), a0(1000)) != Some(0) {
+            return Err("setuid(1000) failed");
+        }
+        match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => Ok(()),
+            Some(-13) => Err("open ignored the ACL and refused on mode bits alone"),
+            _ => Err("open of an ACL-granted file should succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_open_honours_the_acl);
+
+fn smoke_abi_fsx_open_still_refuses_without_an_acl() -> TestResult {
+    with_memfs("/aclo2", "aclo2", &[("f", b"data")], || {
+        // The control. Same identity change, same 0640-shaped mode, but no
+        // named-user entry — so the "other" triplet decides and open is
+        // refused. Without this, the test above would pass even if open
+        // had simply stopped checking permissions at all.
+        let path = b"/aclo2/f\0";
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o640)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        if call(Syscall::SetGid.raw(), a0(1000)) != Some(0) {
+            return Err("setgid(1000) failed");
+        }
+        if call(Syscall::SetUid.raw(), a0(1000)) != Some(0) {
+            return Err("setuid(1000) failed");
+        }
+        match call_open(path.as_ptr() as u64, 0) {
+            Some(-13) => Ok(()),
+            Some(fd) if fd >= 0 => Err("open granted read on a 0640 file to an unrelated uid"),
+            _ => Err("open without an ACL grant should be -EACCES"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_open_still_refuses_without_an_acl
+);

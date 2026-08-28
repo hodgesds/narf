@@ -1364,7 +1364,32 @@ fn open_impl(
     // host-absolute. See current_accessor, which also supplies the DAC
     // capability decision (it used to be inferred from uid == 0 inside
     // posix_access_ok itself).
-    if !narf_filesystem::posix_access_ok(
+    // `may_open` ends in `inode_permission(idmap, inode, MAY_OPEN|acc_mode)`,
+    // which reaches `generic_permission` -> `check_acl`, so open consults the
+    // inode's ACCESS ACL exactly as `access(2)` does. Without this fetch the
+    // check silently degrades to the mode bits and refuses a path that a
+    // `setfacl -m u:$uid:rw` grants — the ACL would be stored, honoured by
+    // access(2), and ignored by the open that follows it.
+    let acl = match poll_blocking(narf_filesystem::acl_of_file(
+        ops.as_ref(),
+        narf_filesystem::AclType::Access,
+    )) {
+        Some(Ok(acl)) => acl,
+        // A stored ACL that does not decode is NOT a fallback to the mode
+        // bits: `check_acl` returns the decode error and `generic_permission`
+        // passes anything that is not -EACCES straight out, so the errno
+        // reaches open(2) unchanged.
+        Some(Err(narf_filesystem::FsError::Unsupported)) => {
+            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+            return;
+        }
+        Some(Err(_)) => {
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            return;
+        }
+        None => None,
+    };
+    if !narf_filesystem::posix_access_ok_with_acl(
         narf_filesystem::FileOwner {
             uid: file_uid,
             gid: file_gid,
@@ -1377,6 +1402,7 @@ fn open_impl(
             write: want_w,
             exec: false,
         },
+        acl.as_ref(),
     ) {
         // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2) is
         // explicit: EACCES is "the requested access to the file is not
@@ -4029,6 +4055,16 @@ fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOp
 
 /// `setxattr` / `lsetxattr` / `fsetxattr` core (name/value/size/flags at
 /// arg1..arg4; the key path is resolved by the caller).
+/// Is `name` one of the two POSIX ACL xattrs?
+///
+/// Used only to disambiguate `FsError::Unsupported`, which means "no xattr
+/// store here" for an ordinary name but "unsupported ACL version" for
+/// these two.
+fn is_acl_xattr(name: &str) -> bool {
+    name == narf_filesystem::AclType::Access.xattr_name()
+        || name == narf_filesystem::AclType::Default.xattr_name()
+}
+
 fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let name = match copy_user_cstr(a.arg1, 256) {
@@ -4058,6 +4094,19 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
+            // `Unsupported` is ambiguous and the two readings need
+            // different answers. For an ORDINARY xattr it means "this
+            // filesystem has no xattr store", and falling through to the
+            // generic table below is right. For an ACL name it is
+            // `posix_acl_fix_xattr_common`'s `a_version !=
+            // POSIX_ACL_XATTR_VERSION` -> -EOPNOTSUPP, and falling through
+            // would STORE the rejected bytes raw — worse than any errno,
+            // because a later read would hand back an ACL the kernel
+            // refused.
+            Some(Err(narf_filesystem::FsError::Unsupported)) if is_acl_xattr(&name) => {
+                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                return;
+            }
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
             Some(Err(narf_filesystem::FsError::Busy)) => {
                 ctx.set_return(SyscallReturn::ok((-17i64) as u64));
@@ -4069,6 +4118,21 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
             Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
                 ctx.set_return(SyscallReturn::ok((-122i64) as u64));
+                return;
+            }
+            // `posix_acl_fix_xattr_common` rejects a short or ragged buffer
+            // and an unknown tag with -EINVAL, and `posix_acl_valid` uses
+            // the same. These reached the -EIO arm below, so `setfacl` on a
+            // malformed ACL reported an I/O error — which sends the reader
+            // looking at the disk instead of at their ACL.
+            Some(Err(narf_filesystem::FsError::InvalidData)) => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+            // `if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
+            //      return acl ? -EACCES : 0;`
+            Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
+                ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
                 return;
             }
             _ => {
