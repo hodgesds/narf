@@ -838,6 +838,16 @@ pub enum AllocContext {
     Kernel,
     /// Userspace-backing allocation — must leave the `min` reserve intact.
     User,
+    /// Userspace-backing allocation that MUST succeed to keep a running
+    /// process correct, and so may consume the `min` reserve like `Kernel`
+    /// while staying `Movable` like `User`. The sole user is a copy-on-write
+    /// break (`cow_split_on_write`): the faulting task already owns the shared
+    /// page and is performing a legitimate write; refusing the private-copy
+    /// frame at the watermark would deliver a spurious SIGSEGV on writable
+    /// memory. Linux likewise lets a CoW break dip into reserves rather than
+    /// fail the fault. Not a general escape hatch — ordinary demand/mmap/brk
+    /// faults stay `User` so userspace still cannot drain the reserve.
+    UserReserve,
 }
 
 impl AllocContext {
@@ -850,15 +860,17 @@ impl AllocContext {
     pub fn migrate_type(self) -> buddy::MigrateType {
         match self {
             AllocContext::Kernel => buddy::MigrateType::Unmovable,
-            AllocContext::User => buddy::MigrateType::Movable,
+            AllocContext::User | AllocContext::UserReserve => buddy::MigrateType::Movable,
         }
     }
 }
 
 /// Central reserve gate. Returns `Exhausted` (and wakes the reclaimer) when a
-/// `User` allocation would breach the `min` watermark reserve; `Kernel`
-/// allocations always pass. Enforced once, here, so every allocation entry
-/// inherits the same policy — a user path cannot silently drain the reserve.
+/// `User` allocation would breach the `min` watermark reserve; `Kernel` and
+/// `UserReserve` allocations always pass (the latter is a CoW break that must
+/// not fault a writable page — see [`AllocContext::UserReserve`]). Enforced
+/// once, here, so every allocation entry inherits the same policy — an ordinary
+/// user path cannot silently drain the reserve.
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
     let node = current_cpu_node();
@@ -895,6 +907,18 @@ pub fn alloc_user_frame() -> Result<PhysFrame, FrameAllocError> {
     #[cfg(feature = "frame-alloc-audit")]
     crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
     alloc_frame_on_inner_ctx(current_cpu_node(), AllocContext::User)
+}
+
+/// Allocate one CPU-local `Movable` frame for a copy-on-write break, permitted
+/// to dip into the `min` reserve. See [`AllocContext::UserReserve`]: a CoW split
+/// is a legitimate write to a page the process already owns, so it must not be
+/// refused at the watermark and turned into a spurious SIGSEGV. Only
+/// `cow_split_on_write` uses this; every other user-backing fault stays on the
+/// reserve-respecting [`alloc_user_frame`].
+pub fn alloc_user_frame_urgent() -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
+    alloc_frame_on_inner_ctx(current_cpu_node(), AllocContext::UserReserve)
 }
 
 /// Reserve-respecting `User`-context variant of [`alloc_frame_on`].

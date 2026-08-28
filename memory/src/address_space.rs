@@ -9051,7 +9051,12 @@ impl AddressSpace {
             (ticket, old_phys)
         };
 
-        let new_frame = match crate::frame::alloc_user_frame() {
+        // A CoW break must not be refused at the `min` watermark: the faulting
+        // task already owns this shared page and is doing a legitimate write, so
+        // failing here would deliver a spurious SIGSEGV on writable memory.
+        // `alloc_user_frame_urgent` stays `Movable` (frees in bulk on teardown)
+        // but may consume the reserve, matching Linux's CoW-break policy.
+        let new_frame = match crate::frame::alloc_user_frame_urgent() {
             Ok(frame) => frame,
             Err(_) => {
                 let mut regions = self.regions.lock();

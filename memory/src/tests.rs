@@ -4171,6 +4171,86 @@ kernel_test_in!(
     smoke_memory_clone_for_fork_shares_frames_then_splits
 );
 
+fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
+    // Regression: a copy-on-write break must NOT be refused at the `min`
+    // reserve watermark. `cow_split_on_write` allocates the private copy via
+    // `alloc_user_frame_urgent` (AllocContext::UserReserve), which may consume
+    // the reserve — the faulting task already owns the shared page and is doing
+    // a legitimate write, so refusing it would deliver a spurious SIGSEGV on
+    // writable memory. Before the fix the split used the reserve-respecting
+    // `alloc_user_frame`, so at the watermark it returned Err → the trap path
+    // fell through to SIGSEGV, killing stress-ng workers and wedging the run.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::{reclaim, VirtAddr};
+
+    cow::__test_clear();
+    // SAFETY: paging and the frame allocator are live in kernel tests.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent"),
+    };
+    const VADDR: u64 = 0x0000_0080_0000_0000;
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent");
+    }
+    // SAFETY: the operation upholds its documented invariant.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+    if cow::count(frame) != 2 {
+        return TestResult::Fail("COW: refcount should be 2 after fork");
+    }
+
+    // Force the user reserve gate closed by raising WMARK_MIN above current
+    // free. It clamps to the 65536-page (256 MiB) ceiling, so a host with more
+    // than ~256 MiB free cannot be forced into a breach — Skip rather than pass
+    // vacuously (the split would succeed trivially with the reserve intact).
+    let saved_min = reclaim::watermark_min();
+    reclaim::set_min_free_pages(u64::MAX);
+    let forced = reclaim::user_alloc_would_breach_reserve();
+    let result = if !forced {
+        TestResult::Skip("cannot force reserve breach: >256 MiB free")
+    } else if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+        // The bug: refused at the watermark.
+        TestResult::Fail("CoW break refused at the reserve watermark (SIGSEGV regression)")
+    } else if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+        TestResult::Fail("remap_page after reserve-watermark split")
+    } else {
+        let c = child
+            .lookup(VirtAddr::new(VADDR))
+            .expect("child post-split");
+        if c.phys[0] == frame {
+            TestResult::Fail("reserve-watermark split did not allocate a private frame")
+        } else if !c.perms.contains(RegionPerms::WRITE) {
+            TestResult::Fail("split lost logical WRITE")
+        } else {
+            TestResult::Pass
+        }
+    };
+    reclaim::set_min_free_pages(saved_min);
+
+    // Cleanup: `parent`/`child` Drop return their frames via unmap_region_pages.
+    drop(child);
+    drop(parent);
+    cow::__test_clear();
+    result
+}
+kernel_test_in!("memory", smoke_memory_cow_split_survives_reserve_watermark);
+
 fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResult {
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::{self, cow};
