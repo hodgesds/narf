@@ -4171,6 +4171,106 @@ kernel_test_in!(
     smoke_memory_clone_for_fork_shares_frames_then_splits
 );
 
+fn smoke_memory_fork_child_demand_faults_lazily() -> TestResult {
+    // Lazy child materialize (the sys_fork path that skips eager `materialize()`):
+    // after `clone_for_fork` the child has NO leaf PTE installed for an inherited
+    // base page. The production #PF path (`demand_alloc_page`) faults it in from
+    // the resident, shared `region.phys` as a READ-ONLY COW leaf; a write then
+    // splits it, copying the parent's bytes. Proves the child sees correct data
+    // without the whole address space being installed up front.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::paging::translate;
+    use crate::VirtAddr;
+
+    cow::__test_clear();
+    // SAFETY: paging is live in the running kernel test environment.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("AddressSpace::new_for_user not available"),
+    };
+    let frame = match crate::frame::alloc_frame() {
+        Ok(f) => f.start_address(),
+        Err(_) => return TestResult::Fail("alloc_frame parent"),
+    };
+    const VADDR: u64 = 0x0000_0080_0000_0000;
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(VADDR),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![frame],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region parent");
+    }
+    // SAFETY: identity-mapped phys; sole owner. Sentinel proves the split copy.
+    unsafe {
+        *(frame.raw() as *mut u32) = 0xC0FF_EE42;
+    }
+    // SAFETY: paging live; new child AS, no concurrent writers.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(c) => c,
+        Err(_) => return TestResult::Fail("clone_for_fork"),
+    };
+
+    let result = (|| {
+        let va = VirtAddr::new(VADDR);
+        // Lazy: no leaf installed for the inherited page yet.
+        // SAFETY: child.root is a valid PML4; translate only reads tables.
+        if unsafe { translate(child.root, va) }.is_some() {
+            return TestResult::Fail("child leaf present before demand fault (not lazy)");
+        }
+        // Demand-fault it in — the production #PF path for a resident COW page.
+        // SAFETY: child AS live; identity map present.
+        if unsafe { child.demand_alloc_page(va) }.is_err() {
+            return TestResult::Fail("demand_alloc_page failed on a shared COW page");
+        }
+        // Now mapped to the SHARED frame, READ-ONLY (COW not yet split).
+        // SAFETY: as above.
+        if unsafe { translate(child.root, va) } != Some(frame) {
+            return TestResult::Fail("demand fault did not map the shared frame");
+        }
+        // The demand-faulted COW leaf must be read-only so a write splits it.
+        // The writable-bit flag name is arch-specific (x86 WRITABLE vs aarch64
+        // AP_RW_EL0), so assert it on x86_64 where the perf work runs.
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::paging::{flags_at, PtFlags};
+            // SAFETY: child.root is a valid PML4; flags_at only reads tables.
+            if unsafe { flags_at(child.root, va) }.is_some_and(|f| f.contains(PtFlags::WRITABLE)) {
+                return TestResult::Fail("demand-faulted COW page must be read-only");
+            }
+        }
+        if cow::count(frame) != 2 {
+            return TestResult::Fail("still shared: refcount should be 2");
+        }
+        // A write splits: child gets a fresh private frame with the sentinel.
+        // SAFETY: VADDR names the child's present COW mapping.
+        if unsafe { child.cow_split_on_write(va) }.is_err() {
+            return TestResult::Fail("cow_split_on_write");
+        }
+        // SAFETY: pairs with the split to install the new leaf (production #PF flow).
+        if unsafe { child.remap_page(va) }.is_err() {
+            return TestResult::Fail("remap_page");
+        }
+        let c = child.lookup(va).expect("child post-split");
+        if c.phys[0] == frame {
+            return TestResult::Fail("split should allocate a fresh child frame");
+        }
+        // SAFETY: identity-mapped fresh frame.
+        if unsafe { *(c.phys[0].raw() as *const u32) } != 0xC0FF_EE42 {
+            return TestResult::Fail("split didn't memcpy the sentinel from the shared frame");
+        }
+        TestResult::Pass
+    })();
+    let _ = child;
+    cow::__test_clear();
+    result
+}
+kernel_test_in!("memory", smoke_memory_fork_child_demand_faults_lazily);
+
 fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
     // Regression: a copy-on-write break must NOT be refused at the `min`
     // reserve watermark. `cow_split_on_write` allocates the private copy via
