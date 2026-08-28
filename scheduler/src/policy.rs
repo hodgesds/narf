@@ -687,6 +687,43 @@ pub(crate) fn with_scheduler<R>(cpu: CpuId, f: impl FnOnce(Option<&dyn Scheduler
         .map(|entry| entry.instance.policy.as_ref()))
 }
 
+/// Non-blocking `with_scheduler`: run `f` against `cpu`'s policy slot only if
+/// the slot lock is uncontended, otherwise return `None` without spinning.
+///
+/// This is the cross-CPU variant. `with_scheduler` blocks, which is correct for
+/// a CPU acting on its own slot (dispatch) or an operation that must complete
+/// (a cross-core enqueue). A remote *best-effort* caller — work-stealing — must
+/// instead skip a contended victim: blocking on a remote `CPU_SCHEDULERS[victim]`
+/// lets a horde of idle thieves starve the victim's own dispatch of its slot
+/// (the SPIN-NOT-POLLING stall on a queue-rich victim). Skipping is always safe
+/// for stealing: the slot stays for the lock holder or another thief. Mirrors
+/// the non-blocking `READY[victim].try_lock()` the steal path already uses.
+pub(crate) fn try_with_scheduler<R>(
+    cpu: CpuId,
+    f: impl FnOnce(Option<&dyn Scheduler>) -> R,
+) -> Option<R> {
+    let cpu = (cpu.0 as usize).min(narf_lib::percpu::MAX_CPUS - 1);
+    let published = CPU_SCHEDULERS[cpu].try_lock()?;
+    Some(f(published
+        .as_ref()
+        .map(|entry| entry.instance.policy.as_ref())))
+}
+
+/// Test hook for the steal-path contention fix: hold `cpu`'s policy slot and
+/// probe `try_with_scheduler` against it, returning `(skipped_while_held,
+/// ran_when_free)`. Lives here because `CPU_SCHEDULERS` is module-private. A
+/// *blocking* `with_scheduler` in its place would deadlock this single thread —
+/// which is exactly the cross-core starvation the non-blocking variant avoids.
+#[doc(hidden)]
+pub fn __try_with_scheduler_contention_probe(cpu: CpuId) -> (bool, bool) {
+    let idx = (cpu.0 as usize).min(narf_lib::percpu::MAX_CPUS - 1);
+    let held = CPU_SCHEDULERS[idx].lock();
+    let skipped_while_held = try_with_scheduler(cpu, |_| ()).is_none();
+    drop(held);
+    let ran_when_free = try_with_scheduler(cpu, |_| ()).is_some();
+    (skipped_while_held, ran_when_free)
+}
+
 /// Executor entry: pop the policy's pick from the per-CPU queue.
 /// Returns the detached `TaskSlot` plus the handle the policy
 /// reported. None when the policy declined (queue empty / no
