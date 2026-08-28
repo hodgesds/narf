@@ -832,3 +832,294 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_misc_reserved_native_ring_entries_are_invalid_op
 );
+
+// ─────────────────────────────────────────────────────────────────────
+// Accepted-and-ignored arguments, and the last of the -1 sentinels.
+//
+// A discarded argument is the SILENT half of the errno bug class, and the
+// worse half: a wrong errno at least tells the caller something went
+// wrong, while an ignored flag reports success for semantics the kernel
+// never applied. Nothing in the return value can reveal it.
+// ─────────────────────────────────────────────────────────────────────
+
+const AI_EFAULT: i64 = -14;
+const AI_EINVAL: i64 = -22;
+const AI_EINTR: i64 = -4;
+const AI_ESRCH: i64 = -3;
+const AI_ENAMETOOLONG: i64 = -36;
+const AI_BAD_PTR: u64 = 0x0001_0000_0000_0000;
+
+fn ai_overlong() -> alloc::vec::Vec<u8> {
+    alloc::vec![b'a'; 5000]
+}
+
+// ── getrandom: flags were read into `_flags` and dropped ─────────────
+
+fn smoke_abi_misc_getrandom_rejects_unknown_flags() -> TestResult {
+    with_setup(|| {
+        // `if (flags & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
+        //          return -EINVAL;`
+        // The old handler bound this to `_flags` and discarded it, so a
+        // caller asking for semantics NARF does not implement was told the
+        // request succeeded and handed bytes generated under different
+        // rules. There is no way to detect that from the return value.
+        let mut buf = [0u8; 16];
+        match call(
+            Syscall::GetRandom.raw(),
+            a2(buf.as_mut_ptr() as u64, 16, 0x8000),
+        ) {
+            Some(v) if v == AI_EINVAL => Ok(()),
+            Some(16) => Err("getrandom accepted and ignored an unknown flag"),
+            _ => Err("getrandom(unknown flag) should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_getrandom_rejects_unknown_flags
+);
+
+fn smoke_abi_misc_getrandom_rejects_insecure_plus_random() -> TestResult {
+    with_setup(|| {
+        // Both bits are individually valid; TOGETHER they are refused,
+        // because "give me insecure bytes" and "block until the pool is
+        // properly seeded" are contradictory requests. Linux rejects the
+        // pair explicitly rather than silently picking one.
+        const GRND_RANDOM: u64 = 0x0002;
+        const GRND_INSECURE: u64 = 0x0004;
+        let mut buf = [0u8; 16];
+        match call(
+            Syscall::GetRandom.raw(),
+            a2(buf.as_mut_ptr() as u64, 16, GRND_RANDOM | GRND_INSECURE),
+        ) {
+            Some(v) if v == AI_EINVAL => {}
+            _ => return Err("getrandom(GRND_RANDOM|GRND_INSECURE) should be -EINVAL"),
+        }
+        // Each alone is accepted.
+        for f in [0u64, GRND_RANDOM, GRND_INSECURE, 0x0001] {
+            match call(Syscall::GetRandom.raw(), a2(buf.as_mut_ptr() as u64, 16, f)) {
+                Some(16) => {}
+                _ => return Err("getrandom rejected a flag combination Linux accepts"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_getrandom_rejects_insecure_plus_random
+);
+
+fn smoke_abi_misc_getrandom_flags_precede_buffer() -> TestResult {
+    with_setup(|| {
+        // The flags check is the FIRST statement of the syscall, before
+        // import_ubuf looks at the buffer — so a bad flag beats a bad
+        // pointer.
+        match call(Syscall::GetRandom.raw(), a2(AI_BAD_PTR, 16, 0x8000)) {
+            Some(v) if v == AI_EINVAL => Ok(()),
+            Some(v) if v == AI_EFAULT => {
+                Err("getrandom checked the buffer before the flags (wrong order)")
+            }
+            _ => Err("getrandom(bad ptr, bad flags) should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_getrandom_flags_precede_buffer);
+
+fn smoke_abi_misc_getrandom_bad_buffer_is_efault() -> TestResult {
+    with_setup(|| {
+        // `import_ubuf`'s `access_ok` arm. This was the -1 sentinel.
+        match call(Syscall::GetRandom.raw(), a2(AI_BAD_PTR, 16, 0)) {
+            Some(v) if v == AI_EFAULT => Ok(()),
+            Some(-1) => Err("getrandom(bad buffer) still returns the -1/EPERM sentinel"),
+            _ => Err("getrandom(bad buffer) should be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_getrandom_bad_buffer_is_efault);
+
+// ── sched_rr_get_interval: `pid` was read and discarded ──────────────
+
+fn smoke_abi_misc_rr_interval_resolves_its_pid() -> TestResult {
+    with_setup(|| {
+        // The cooperative policy has no quantum, so the VALUE is {0,0}
+        // either way — but the value is not the only thing the call
+        // communicates. Answering 0 for a negative pid or a dead one tells
+        // the caller its target is alive and running with no quantum.
+        let mut ts = [0u8; 16];
+        match call(
+            Syscall::SchedRrGetInterval.raw(),
+            a1((-1i64) as u64, ts.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == AI_EINVAL => {}
+            Some(0) => return Err("sched_rr_get_interval accepted a negative pid"),
+            _ => return Err("sched_rr_get_interval(-1) should be -EINVAL"),
+        }
+        match call(
+            Syscall::SchedRrGetInterval.raw(),
+            a1(123456, ts.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == AI_ESRCH => {}
+            Some(0) => return Err("sched_rr_get_interval reported a quantum for a dead pid"),
+            _ => return Err("sched_rr_get_interval(unknown pid) should be -ESRCH"),
+        }
+        // pid 0 is the caller and still succeeds.
+        match call(
+            Syscall::SchedRrGetInterval.raw(),
+            a1(0, ts.as_mut_ptr() as u64),
+        ) {
+            Some(0) => Ok(()),
+            _ => Err("sched_rr_get_interval(0) should succeed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_rr_interval_resolves_its_pid);
+
+// ── pause / rt_sigsuspend: never succeed, so errno is the whole answer ──
+
+fn smoke_abi_misc_pause_is_eintr_not_eperm() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE0(pause)` ends `return -ERESTARTNOHAND;`, which
+        // surfaces as -EINTR. pause(2) never succeeds, so its return value
+        // carries no information and every caller reads errno — where the
+        // bare -1 said EPERM, i.e. "not allowed to wait for a signal".
+        match call(Syscall::Pause.raw(), a0(0)) {
+            Some(v) if v == AI_EINTR => Ok(()),
+            Some(-1) => Err("pause still returns the -1/EPERM sentinel, not -EINTR"),
+            _ => Err("pause should return -EINTR"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_pause_is_eintr_not_eperm);
+
+fn smoke_abi_misc_rt_sigsuspend_arg_errors() -> TestResult {
+    with_setup(|| {
+        // `if (sigsetsize != sizeof(sigset_t)) return -EINVAL;`
+        // then `if (copy_from_user(...)) return -EFAULT;`
+        let set = [0u8; 8];
+        match call(Syscall::RtSigsuspend.raw(), a1(set.as_ptr() as u64, 4)) {
+            Some(v) if v == AI_EINVAL => {}
+            Some(-1) => return Err("rt_sigsuspend(bad size) still returns the -1/EPERM sentinel"),
+            _ => return Err("rt_sigsuspend(sigsetsize != 8) should be -EINVAL"),
+        }
+        match call(Syscall::RtSigsuspend.raw(), a1(AI_BAD_PTR, 8)) {
+            Some(v) if v == AI_EFAULT => Ok(()),
+            Some(-1) => Err("rt_sigsuspend(bad ptr) still returns the -1/EPERM sentinel"),
+            _ => Err("rt_sigsuspend(unreadable set) should be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_rt_sigsuspend_arg_errors);
+
+fn smoke_abi_misc_rt_sigsuspend_size_precedes_pointer() -> TestResult {
+    with_setup(|| {
+        // The size check is first, so a bad size beats a bad pointer.
+        match call(Syscall::RtSigsuspend.raw(), a1(AI_BAD_PTR, 4)) {
+            Some(v) if v == AI_EINVAL => Ok(()),
+            Some(v) if v == AI_EFAULT => {
+                Err("rt_sigsuspend read the set before checking sigsetsize")
+            }
+            _ => Err("rt_sigsuspend(bad ptr, bad size) should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_rt_sigsuspend_size_precedes_pointer
+);
+
+// ── nanosleep: clock / pointer / value all took one sentinel ─────────
+
+fn smoke_abi_misc_nanosleep_arg_errors() -> TestResult {
+    with_setup(|| {
+        // clock_nanosleep: bad clock -> -EINVAL, faulting rqtp -> -EFAULT,
+        // !timespec64_valid -> -EINVAL. All three were the -1 sentinel, so
+        // a caller that simply passed a bad pointer was told it lacked
+        // permission to sleep.
+        match call(Syscall::Nanosleep.raw(), a1(AI_BAD_PTR, 0)) {
+            Some(v) if v == AI_EFAULT => {}
+            Some(-1) => return Err("nanosleep(bad ptr) still returns the -1/EPERM sentinel"),
+            _ => return Err("nanosleep(unreadable req) should be -EFAULT"),
+        }
+        // tv_nsec out of range -> EINVAL.
+        let bad: [i64; 2] = [0, 2_000_000_000];
+        match call(Syscall::Nanosleep.raw(), a1(bad.as_ptr() as u64, 0)) {
+            Some(v) if v == AI_EINVAL => Ok(()),
+            Some(-1) => Err("nanosleep(bad timespec) still returns the -1/EPERM sentinel"),
+            _ => Err("nanosleep(tv_nsec >= NSEC_PER_SEC) should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_nanosleep_arg_errors);
+
+// ── the path family's last -1: getname's two failures ────────────────
+
+fn smoke_abi_misc_path_family_efault_and_enametoolong() -> TestResult {
+    with_setup(|| {
+        // mkdir / rmdir / unlink / symlink / link all mapped a failed
+        // pathname copy onto one `fail` sentinel (EPERM). Linux splits it
+        // into -EFAULT and -ENAMETOOLONG.
+        let long = ai_overlong();
+        let lp = long.as_ptr() as u64;
+        let cases: [(u32, &str); 4] = [
+            (Syscall::Mkdir.raw(), "mkdir"),
+            (Syscall::Rmdir.raw(), "rmdir"),
+            (Syscall::Unlink.raw(), "unlink"),
+            (Syscall::Chdir.raw(), "chdir"),
+        ];
+        for (num, what) in cases {
+            match call(num, a1(AI_BAD_PTR, 0o755)) {
+                Some(v) if v == AI_EFAULT => {}
+                Some(-1) => {
+                    let _ = what;
+                    return Err("a path syscall still returns the -1/EPERM sentinel on EFAULT");
+                }
+                _ => return Err("path syscall with an unreadable path should be -EFAULT"),
+            }
+            match call(num, a1(lp, 0o755)) {
+                Some(v) if v == AI_ENAMETOOLONG => {}
+                Some(v) if v == AI_EFAULT => {
+                    return Err("a path syscall reported EFAULT for a readable over-long path")
+                }
+                _ => return Err("path syscall with an over-long path should be -ENAMETOOLONG"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_path_family_efault_and_enametoolong
+);
+
+fn smoke_abi_misc_link_reports_the_old_name_first() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE5(linkat)` names old then new, and
+        // filename_linkat propagates the OLD name's error first. The tuple
+        // destructure this replaced evaluated both and reported one shared
+        // sentinel, losing both which pathname was at fault and why.
+        let good = b"/tmp/x\0";
+        // Bad OLD name, good new name.
+        match call(Syscall::Link.raw(), a1(AI_BAD_PTR, good.as_ptr() as u64)) {
+            Some(v) if v == AI_EFAULT => {}
+            Some(-1) => return Err("link(bad old) still returns the -1/EPERM sentinel"),
+            _ => return Err("link with an unreadable oldpath should be -EFAULT"),
+        }
+        // Good old name, over-long new name -> the NEW name's reason.
+        let long = ai_overlong();
+        match call(
+            Syscall::Link.raw(),
+            a1(good.as_ptr() as u64, long.as_ptr() as u64),
+        ) {
+            Some(v) if v == AI_ENAMETOOLONG => Ok(()),
+            Some(v) if v == AI_EFAULT => {
+                Err("link reported EFAULT for a readable over-long newpath")
+            }
+            _ => Err("link with an over-long newpath should be -ENAMETOOLONG"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_link_reports_the_old_name_first
+);

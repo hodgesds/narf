@@ -4,8 +4,12 @@ use super::*;
 /// `tcgetattr` ≡ `ioctl(fd, TCGETS, termios)`. Linux `get_termios` copies the
 /// ktermios out with `kernel_termios_to_user_termios` → -EFAULT on a faulting
 /// (or NULL) destination.
-/// LINUX-GAP: the ioctl path first validates the fd (-EBADF) and that it is a
-/// tty (-ENOTTY); this NARF shim uses the task's termios and ignores `_fd`.
+/// NOT a Linux syscall. `Syscall::Tcgetattr` is NARF-native (0x4050) and
+/// libc's `tcgetattr(3)` reaches the kernel as `ioctl(fd, TCGETS, …)`, so
+/// no Linux-ABI program arrives here — which is why `_fd` being ignored is
+/// a design choice about a NARF-only entry point rather than a conformance
+/// gap. (It was previously filed as a LINUX-GAP, implying an errno a real
+/// caller could observe.) The ioctl path is where -EBADF / -ENOTTY belong.
 pub(crate) fn sys_tcgetattr(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _fd = args.arg0;

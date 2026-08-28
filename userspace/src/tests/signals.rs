@@ -1697,13 +1697,19 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
     };
     kernel_syscall_entry(Syscall::RtSigsuspend.raw(), &mut s);
     // POSIX: rt_sigsuspend returns -1 always.
-    let returned_minus_one =
-        matches!(s.ret, Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64 as u64));
+    // rt_sigsuspend never succeeds: it either rejects its arguments or
+    // blocks and comes back -EINTR (Linux's -ERESTARTNOHAND). In this
+    // harness there is no executor to park on, so the pause fallback
+    // reports EINTR immediately. This used to assert the bare -1, which
+    // reaches libc as errno 1 (EPERM) — an answer that says the caller was
+    // not permitted to wait.
+    let returned_eintr =
+        matches!(s.ret, Some(r) if r.status == SyscallReturn::OK && r.value == (-4i64 as u64));
     let mask_after = crate::handlers::signal_mask_of(0xF000);
     __test_clear_global();
     crate::handlers::__test_signal_reset();
-    if !returned_minus_one {
-        return TestResult::Fail("rt_sigsuspend must return -1 (EINTR)");
+    if !returned_eintr {
+        return TestResult::Fail("rt_sigsuspend must return -EINTR");
     }
     if mask_after != 0xF0 {
         return TestResult::Fail("rt_sigsuspend did not replace mask");

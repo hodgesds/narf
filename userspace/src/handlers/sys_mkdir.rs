@@ -4,11 +4,15 @@ use super::*;
 pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let ptr = args.arg0;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let path = match copy_user_cstr(ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // `getname()` (fs/namei.c): -EFAULT for an unreadable pointer,
+    // -ENAMETOOLONG for a path that reaches PATH_MAX with no terminator.
+    // Both used to take the shared `fail` sentinel, which reaches libc as
+    // errno 1 (EPERM) — an answer that says "you may not do this" about a
+    // caller whose only mistake was a bad pointer or an over-long name.
+    let path = match copy_user_cstr_checked(ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

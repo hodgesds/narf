@@ -4,9 +4,13 @@ use super::*;
 /// `tcsetattr` ≡ `ioctl(fd, TCSETS, termios)`. Linux `set_termios` copies the
 /// termios in with `user_termios_to_kernel_termios` → -EFAULT on a faulting
 /// (or NULL) source.
-/// LINUX-GAP: the ioctl path first validates the fd (-EBADF) and that it is a
-/// tty (-ENOTTY), and rejects an unknown TCSETS/TCSETSW/TCSETSF action; this
-/// NARF shim writes the task's termios and ignores `_fd` / `_action`.
+/// NOT a Linux syscall — `Syscall::Tcsetattr` is NARF-native (0x4051), and
+/// libc's `tcsetattr(3)` reaches the kernel as `ioctl(fd, TCSETS…)`. No
+/// Linux-ABI program arrives here, so ignoring `_fd` / `_action` is a
+/// design choice about a NARF-only entry point rather than an observable
+/// conformance gap. (It was previously filed as a LINUX-GAP, which implied
+/// an errno a real caller could see.) -EBADF, -ENOTTY and the unknown
+/// TCSETS/TCSETSW/TCSETSF rejection belong on the ioctl path.
 pub(crate) fn sys_tcsetattr(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let _fd = args.arg0;
