@@ -90,6 +90,35 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
             Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
                 let st = file.stat();
                 let (uid, gid) = file.owners();
+                // `fs/namei.c::acl_permission_check` consults the inode's
+                // ACCESS ACL between the owner test and the group/other
+                // mode bits. Fetch it here so `access(2)` answers the same
+                // question the ACL'd inode would: without this the check
+                // silently degrades to mode bits and reports EACCES for a
+                // path a `setfacl -m u:$uid:rwx` grants.
+                let acl = match poll_blocking(narf_filesystem::acl_of_file(
+                    file.as_ref(),
+                    narf_filesystem::AclType::Access,
+                )) {
+                    Some(Ok(acl)) => acl,
+                    // A stored ACL that does not decode is NOT a fallback
+                    // to the mode bits: `check_acl` returns the decode
+                    // error and `generic_permission` passes anything that
+                    // is not -EACCES straight out to the caller.
+                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+                        return;
+                    }
+                    Some(Err(_)) => {
+                        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                        return;
+                    }
+                    // `poll_blocking` gave up — the park failed or the
+                    // fallback poll budget ran out. Fall back to the mode
+                    // bits, which is what the sibling `file.access(mode)`
+                    // arm above already does for its own `None`.
+                    None => None,
+                };
                 set_access_result(
                     ctx,
                     mode,
@@ -97,6 +126,7 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
                     uid,
                     gid,
                     st.mode.file_type == narf_filesystem::FileType::Dir,
+                    acl.as_ref(),
                 );
             }
             _ => ctx.set_return(SyscallReturn::ok((-5i64) as u64)),
@@ -111,7 +141,10 @@ fn access_path(ctx: &mut dyn TrapContext, path: &str, mode: u32) {
     // the successful mount and abort PID 1.
     if let Some(dir) = resolve_dir_absolute(path) {
         let (uid, gid) = dir.dir_owners();
-        set_access_result(ctx, mode, dir.dir_mode(), uid, gid, true);
+        // `DirOps` has no xattr surface, so a directory's ACL is not
+        // reachable from here — see the LINUX-GAP note on `acl_of_file`
+        // consumers in `filesystem/src/posix_acl.rs`.
+        set_access_result(ctx, mode, dir.dir_mode(), uid, gid, true, None);
     } else {
         ctx.set_return(SyscallReturn::ok((-2i64) as u64));
     }
@@ -127,13 +160,14 @@ fn set_access_result(
     uid: u32,
     gid: u32,
     is_dir: bool,
+    acl: Option<&narf_filesystem::PosixAcl>,
 ) {
     let request = narf_filesystem::AccessRequest {
         read: mode & 4 != 0,
         write: mode & 2 != 0,
         exec: mode & 1 != 0,
     };
-    let allowed = narf_filesystem::posix_access_ok(
+    let allowed = narf_filesystem::posix_access_ok_with_acl(
         narf_filesystem::FileOwner {
             uid,
             gid,
@@ -142,6 +176,7 @@ fn set_access_result(
         },
         &accessor_for_inode(current_task_id(), uid, gid),
         request,
+        acl,
     );
     ctx.set_return(SyscallReturn::ok(if allowed { 0 } else { (-13i64) as u64 }));
 }

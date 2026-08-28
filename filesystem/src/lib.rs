@@ -81,6 +81,7 @@ pub mod mqueuefs;
 pub mod ntty;
 pub mod overlayfs;
 pub mod page_cache;
+pub mod posix_acl;
 pub mod procfs;
 pub mod root_mount;
 pub mod root_selector;
@@ -95,6 +96,7 @@ mod fs_mount_e2e_tests;
 mod memfs_tests;
 mod mqueuefs_tests;
 mod page_cache_tests;
+mod posix_acl_tests;
 mod procsys_e2e_tests;
 mod random_e2e_tests;
 mod sysfs_e2e_tests;
@@ -122,6 +124,12 @@ pub use memfs::{
 pub use mqueuefs::{MqueueAttr, MqueueError, MqueueFs, MqueueNotification, MqueueOpenOptions};
 pub use overlayfs::{OverlayFs, OPAQUE_MARKER, WHITEOUT_PREFIX};
 pub use page_cache::{CachePage, Page, PageCache, PageKey, PAGE_SIZE};
+pub use posix_acl::{
+    posix_acl_create, posix_acl_permission, posix_acl_update_mode, AclCreate, AclDecision,
+    AclEntry, AclType, PosixAcl, ACL_EXECUTE, ACL_GROUP, ACL_GROUP_OBJ, ACL_MASK, ACL_OTHER,
+    ACL_READ, ACL_USER, ACL_USER_OBJ, ACL_WRITE, XATTR_NAME_POSIX_ACL_ACCESS,
+    XATTR_NAME_POSIX_ACL_DEFAULT,
+};
 pub use sysfs::{
     class_device_register, class_register, get_or_create_child, get_root,
     install_net_snapshot_hook, kobject_add_attr, kobject_add_bin_attr, kobject_add_uevent_attr,
@@ -386,14 +394,20 @@ pub struct AccessRequest {
 /// return -EACCES;
 /// ```
 ///
-/// and `acl_permission_check`, minus the POSIX-ACL branches (NARF stores
-/// no ACLs, so `IS_POSIXACL` is false everywhere):
+/// and `acl_permission_check`:
 ///
 /// ```text
-/// if (!((mask & 7) * 0111 & ~mode)) return 0;      /* everybody may */
+/// if (!((mask & 7) * 0111 & ~mode)) {      /* everybody may */
+///         if (no_acl_inode(inode))  return 0;
+///         if (!IS_POSIXACL(inode))  return 0;
+/// }
 /// if (vfsuid_eq_kuid(vfsuid, current_fsuid())) {
 ///         mask &= 7; mode >>= 6;
 ///         return (mask & ~mode) ? -EACCES : 0;     /* owner is EXCLUSIVE */
+/// }
+/// if (IS_POSIXACL(inode) && (mode & S_IRWXG)) {
+///         int error = check_acl(idmap, inode, mask);
+///         if (error != -EAGAIN) return error;
 /// }
 /// mask &= 7;
 /// if (mask & (mode ^ (mode >> 3)))
@@ -401,18 +415,40 @@ pub struct AccessRequest {
 /// return (mask & ~mode) ? -EACCES : 0;
 /// ```
 ///
-/// Two details are easy to get wrong and both are load-bearing:
+/// Three details are easy to get wrong and all are load-bearing:
 ///
 ///   * the owner triplet is EXCLUSIVE. An owner whose user bits deny the
 ///     access is refused even when the group or other bits would allow it
 ///     — `chmod 044 file` locks its own owner out. A "most permissive
 ///     wins" reading silently grants what Linux refuses.
+///   * the owner test comes BEFORE the ACL, so a named `ACL_USER` entry
+///     for the owner is dead weight: the mode's user triplet decides.
 ///   * the previous implementation short-circuited on `accessor.uid == 0`
 ///     before looking at anything else. That was the only privilege test
 ///     available before capabilities were enforceable; it is now wrong in
 ///     both directions, and the fix is that the caller supplies the
 ///     capability decision in [`Accessor`].
+///
+/// This entry point passes no ACL, which is the `IS_POSIXACL(inode) ==
+/// false` case. Callers that can produce the inode's
+/// `system.posix_acl_access` — see [`acl_of_file`] — should use
+/// [`posix_access_ok_with_acl`] instead.
 pub fn posix_access_ok(file: FileOwner, accessor: &Accessor, want: AccessRequest) -> bool {
+    posix_access_ok_with_acl(file, accessor, want, None)
+}
+
+/// [`posix_access_ok`], with the inode's ACCESS ACL supplied.
+///
+/// `acl == None` is Linux's `!IS_POSIXACL(inode)` — identical to
+/// [`posix_access_ok`]. `acl == Some(..)` enables the
+/// `fs/namei.c::check_acl` branch that `posix_access_ok` alone cannot
+/// reach.
+pub fn posix_access_ok_with_acl(
+    file: FileOwner,
+    accessor: &Accessor,
+    want: AccessRequest,
+    acl: Option<&PosixAcl>,
+) -> bool {
     let mut mask = 0u32;
     if want.read {
         mask |= 0o4;
@@ -423,8 +459,12 @@ pub fn posix_access_ok(file: FileOwner, accessor: &Accessor, want: AccessRequest
     if want.exec {
         mask |= 0o1;
     }
-    if acl_permission_check(file, accessor, mask) {
-        return true;
+    match acl_permission_check(file, accessor, mask, acl) {
+        AclDecision::Granted => return true,
+        // `generic_permission` does `if (ret != -EACCES) return ret;`, so a
+        // corrupt ACL (-EIO) is NOT overridable by CAP_DAC_OVERRIDE.
+        AclDecision::Malformed => return false,
+        AclDecision::Denied => {}
     }
     if file.is_dir {
         // DACs are overridable for directories.
@@ -445,20 +485,49 @@ pub fn posix_access_ok(file: FileOwner, accessor: &Accessor, want: AccessRequest
     false
 }
 
-/// The discretionary half: the owner/group/other triplet algebra, with no
-/// capability involvement. Returns `true` when the mode bits alone permit
-/// the access.
-fn acl_permission_check(file: FileOwner, accessor: &Accessor, mask: u32) -> bool {
+/// `fs/namei.c::acl_permission_check` — the discretionary half: the
+/// owner/group/other triplet algebra plus the POSIX-ACL branch, with no
+/// capability involvement.
+fn acl_permission_check(
+    file: FileOwner,
+    accessor: &Accessor,
+    mask: u32,
+    acl: Option<&PosixAcl>,
+) -> AclDecision {
     let mode = u32::from(file.perms & 0o777);
     // Cheap path: every class already carries the requested bits, so no
-    // owner or group comparison is needed.
-    if ((mask & 7) * 0o111) & !mode == 0 {
-        return true;
+    // owner or group comparison is needed — but ONLY when there is no ACL
+    // to narrow them. Linux guards this with `no_acl_inode(inode)` before
+    // `IS_POSIXACL(inode)`; `acl == None` covers both.
+    if ((mask & 7) * 0o111) & !mode == 0 && acl.is_none() {
+        return AclDecision::Granted;
     }
     // Owner match is exclusive — see the note above.
     if accessor.uid == file.uid {
         let owner = mode >> 6;
-        return (mask & 7) & !owner == 0;
+        return if (mask & 7) & !owner == 0 {
+            AclDecision::Granted
+        } else {
+            AclDecision::Denied
+        };
+    }
+    // `if (IS_POSIXACL(inode) && (mode & S_IRWXG))`. The group-bit guard is
+    // not an optimisation to be dropped. The mode's group triplet always
+    // mirrors one ACL entry — the ACL_MASK if there is one, and the
+    // ACL_GROUP_OBJ otherwise (posix_acl_equiv_mode and
+    // __posix_acl_chmod_masq keep exactly that pair in step, and
+    // posix_acl_valid forbids named entries without a mask). So
+    // `mode & 0o070 == 0` means either every maskable entry is capped to
+    // nothing or the sole group entry grants nothing; the remaining
+    // ACL_USER_OBJ and ACL_OTHER entries mirror the mode's outer triplets,
+    // which the code below already applies.
+    if let Some(acl) = acl {
+        if mode & 0o070 != 0 {
+            // Linux's check_acl returns -EAGAIN only when there is no
+            // cached ACL to consult; here there is one, so its verdict is
+            // always final.
+            return posix_acl_permission(acl, file, accessor, mask);
+        }
     }
     let mut mode = mode;
     // Consult group membership only when the group and other bits actually
@@ -466,7 +535,44 @@ fn acl_permission_check(file: FileOwner, accessor: &Accessor, mask: u32) -> bool
     if (mask & 7) & (mode ^ (mode >> 3)) != 0 && accessor.in_group(file.gid) {
         mode >>= 3;
     }
-    (mask & 7) & !mode == 0
+    if (mask & 7) & !mode == 0 {
+        AclDecision::Granted
+    } else {
+        AclDecision::Denied
+    }
+}
+
+/// Read and decode one of an open file's POSIX ACLs.
+///
+/// The transport is the xattr the ACL is stored under
+/// (`system.posix_acl_access` / `system.posix_acl_default`), which is how
+/// the on-disk filesystems keep them: `fs/ext4/acl.c::ext4_get_acl`,
+/// `fs/btrfs/acl.c::btrfs_get_acl` and friends all read that name and run
+/// the bytes through `fs/posix_acl.c::posix_acl_from_xattr`.
+///
+/// `Ok(None)` is "this inode has no ACL" — Linux's
+/// `get_inode_acl() == NULL` and its `!IS_POSIXACL(inode)`, which the
+/// caller must treat as the plain mode-bit check. A filesystem with no
+/// xattr support at all lands here too.
+///
+/// `Err` is a stored value that does NOT decode, and the caller must NOT
+/// silently fall back to the mode bits: `fs/namei.c::check_acl` does
+/// `if (IS_ERR(acl)) return PTR_ERR(acl)` and both
+/// `acl_permission_check` and `generic_permission` pass anything that is
+/// not `-EACCES` straight out, so a corrupt on-disk ACL fails the access
+/// with the decode errno (`-EINVAL`, or `-EOPNOTSUPP` for an unknown
+/// `a_version`) rather than degrading to a weaker check.
+///
+/// This is a different failure from [`AclDecision::Malformed`], which is
+/// an ACL that DECODED but whose entry sequence is corrupt (`-EIO`).
+pub async fn acl_of_file(file: &dyn FileOps, ty: AclType) -> Result<Option<PosixAcl>, FsError> {
+    match file.get_xattr(ty.xattr_name()).await {
+        Ok(raw) => PosixAcl::from_xattr(&raw),
+        // No such attribute, or a filesystem with no xattr store: both are
+        // "no ACL on this inode".
+        Err(FsError::NotFound) | Err(FsError::Unsupported) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Combined `(FileType, perms)` mode word.

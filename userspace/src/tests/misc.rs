@@ -2332,18 +2332,34 @@ fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
         return TestResult::Fail("bad policy not rejected with -EINVAL");
     }
 
-    // Param round-trip: default 0, set to 50, read back 50.
+    // Param round-trip. `__sched_setscheduler` enforces
+    //
+    //     if (rt_policy(policy) != (attr->sched_priority != 0)) return -EINVAL;
+    //
+    // and every NARF task is SCHED_OTHER, so 0 is the ONLY accepted value —
+    // Linux's own comment beside that line says "valid priority for
+    // SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE is 0". This used to set 50
+    // and assert it stuck, which is behaviour Linux rejects outright.
     let mut prio: i32 = 0xAB;
     let _ = call(Syscall::SchedGetparam, 0, &mut prio as *mut i32 as u64);
     if prio != 0 {
         return TestResult::Fail("default sched_priority not 0");
     }
-    let want: i32 = 50;
+    let want: i32 = 0;
     let _ = call(Syscall::SchedSetparam, 0, &want as *const i32 as u64);
     let mut got: i32 = 0xCD;
     let _ = call(Syscall::SchedGetparam, 0, &mut got as *mut i32 as u64);
-    if got != 50 {
-        return TestResult::Fail("setparam did not stick");
+    if got != 0 {
+        return TestResult::Fail("setparam(0) did not stick");
+    }
+    // An RT priority on a SCHED_OTHER task is refused.
+    let rt: i32 = 50;
+    let rejected = matches!(
+        call(Syscall::SchedSetparam, 0, &rt as *const i32 as u64),
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-22i64) as u64,
+    );
+    if !rejected {
+        return TestResult::Fail("setparam(50) on SCHED_OTHER must be -EINVAL");
     }
 
     crate::handlers::__test_sched_param_reset();

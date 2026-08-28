@@ -10163,6 +10163,21 @@ pub fn sched_param_init() {
 }
 
 #[doc(hidden)]
+/// Test-only: seed a task's stored `sched_priority` directly.
+///
+/// `sched_setparam` only accepts 0 for a SCHED_OTHER task (Linux's
+/// `rt_policy(policy) != (attr->sched_priority != 0)` rule), so a test that
+/// needs a DISTINGUISHABLE value — to prove which task's slot was written,
+/// say — cannot get one through the syscall. Seeding here keeps those
+/// tests testing what they are about (pid-namespace translation) instead
+/// of the priority validation.
+#[doc(hidden)]
+pub fn __test_set_sched_param(task: u64, val: i32) {
+    let mut g = SCHED_PARAM_TABLE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    m.insert(task, val);
+}
+
 pub fn __test_sched_param_reset() {
     *SCHED_PARAM_TABLE.lock() = Some(BTreeMap::new());
 }

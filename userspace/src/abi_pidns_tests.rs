@@ -191,7 +191,19 @@ fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
             register(WORKER_TASK, WORKER_PID);
             build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
 
-            let prio = 99i32;
+            // Seed the worker's slot with a sentinel, then have the manager
+            // write 0 to it by INNER pid. If the translation resolves, the
+            // sentinel is overwritten; if setparam keyed the raw inner pid
+            // instead, the sentinel survives.
+            //
+            // The value written has to be 0 — `sched_setparam` accepts only
+            // 0 for a SCHED_OTHER task — so the discriminator is the
+            // sentinel's disappearance rather than a distinctive value
+            // arriving. (This test used to write 99, which Linux rejects
+            // outright on SCHED_OTHER.)
+            const SENTINEL: i32 = 0x5A5A;
+            crate::handlers::__test_set_sched_param(WORKER_TASK, SENTINEL);
+            let prio = 0i32;
             set_task(MANAGER_TASK);
             if call(
                 Syscall::SchedSetparam.raw(),
@@ -202,7 +214,7 @@ fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
             }
             // Worker reads its own param (self arm — unaffected by the bug).
             set_task(WORKER_TASK);
-            let mut out = 0i32;
+            let mut out = -1i32;
             if call(
                 Syscall::SchedGetparam.raw(),
                 a1(0, &mut out as *mut i32 as u64),
@@ -210,7 +222,7 @@ fn smoke_abi_pidns_sched_setparam_resolves_in_caller_pid_ns() -> TestResult {
             {
                 return Err("reading the worker's sched param failed");
             }
-            if out == 99 {
+            if out == 0 {
                 Ok(())
             } else {
                 Err("sched_setparam wrote the raw inner pid's TaskId slot, not the worker's — accept_pid_from -> pid_to_task_raw missing")
@@ -245,15 +257,13 @@ fn smoke_abi_pidns_sched_getparam_resolves_in_caller_pid_ns() -> TestResult {
             register(WORKER_TASK, WORKER_PID);
             build_manager_worker(MANAGER_TASK, MANAGER_PID, WORKER_TASK, WORKER_PID)?;
 
-            let prio = 77i32;
-            set_task(WORKER_TASK);
-            if call(
-                Syscall::SchedSetparam.raw(),
-                a1(0, &prio as *const i32 as u64),
-            ) != Some(0)
-            {
-                return Err("seeding the worker's sched param failed");
-            }
+            // Seed the worker's slot DIRECTLY with a distinguishable value.
+            // `sched_setparam` accepts only 0 on a SCHED_OTHER task, so it
+            // cannot produce one — and a value of 0 would be
+            // indistinguishable from the unset default, leaving this test
+            // passing without proving the lookup resolved anything.
+            const SEEDED: i32 = 77;
+            crate::handlers::__test_set_sched_param(WORKER_TASK, SEEDED);
             set_task(MANAGER_TASK);
             let mut out = 0i32;
             if call(
@@ -263,7 +273,7 @@ fn smoke_abi_pidns_sched_getparam_resolves_in_caller_pid_ns() -> TestResult {
             {
                 return Err("sched_getparam(inner 2) did not succeed");
             }
-            if out == 77 {
+            if out == SEEDED {
                 Ok(())
             } else {
                 Err("sched_getparam read the raw inner pid's TaskId slot, not the worker's — accept_pid_from -> pid_to_task_raw missing")

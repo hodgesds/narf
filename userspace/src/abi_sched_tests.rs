@@ -620,19 +620,48 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getparam_bad_ptr_efault);
 
 fn smoke_abi_sched_setparam_pos() -> TestResult {
     with_setup(|| {
-        // Set sched_priority 50, then read it back via sched_getparam.
-        let inbuf = 50i32.to_ne_bytes();
-        match call(Syscall::SchedSetparam.raw(), a1(0, inbuf.as_ptr() as u64)) {
+        // `__sched_setscheduler`:
+        //
+        //     if (attr->sched_priority > MAX_RT_PRIO-1)  return -EINVAL;
+        //     if (rt_policy(policy) != (attr->sched_priority != 0))
+        //                                                return -EINVAL;
+        //
+        // with Linux's own comment above it: "valid priority for
+        // SCHED_NORMAL, SCHED_BATCH and SCHED_IDLE is 0". Every NARF task
+        // is SCHED_OTHER, so 0 is the ONLY value that agrees with the
+        // policy.
+        //
+        // This used to set 50 and read it back, and its own final arm
+        // returned Ok either way — so it asserted nothing while documenting
+        // behaviour Linux rejects. A caller that got 0 back from setparam
+        // believed it held a real-time priority on a policy that has none.
+        let zero = 0i32.to_ne_bytes();
+        match call(Syscall::SchedSetparam.raw(), a1(0, zero.as_ptr() as u64)) {
             Some(0) => {}
-            _ => return Err("smoke_abi_sched_setparam_pos: unexpected syscall return"),
+            _ => return Err("sched_setparam(0) on a SCHED_OTHER task should succeed"),
         }
-        let mut rbuf = [0u8; 4];
+        let mut rbuf = [0xFFu8; 4];
         match call(
             Syscall::SchedGetparam.raw(),
             a1(0, rbuf.as_mut_ptr() as u64),
         ) {
-            Some(0) if i32::from_ne_bytes(rbuf) == 50 => Ok(()),
-            _ => Ok(()),
+            Some(0) if i32::from_ne_bytes(rbuf) == 0 => {}
+            Some(0) => return Err("sched_getparam did not read back the stored priority"),
+            _ => return Err("sched_getparam should succeed"),
+        }
+        // A non-zero priority disagrees with SCHED_OTHER.
+        let fifty = 50i32.to_ne_bytes();
+        match call(Syscall::SchedSetparam.raw(), a1(0, fifty.as_ptr() as u64)) {
+            Some(-22) => {}
+            Some(0) => return Err("sched_setparam accepted an RT priority on SCHED_OTHER"),
+            _ => return Err("sched_setparam(50) on SCHED_OTHER should be -EINVAL"),
+        }
+        // And one past MAX_RT_PRIO-1 is rejected by the range check that
+        // precedes it, so it is -EINVAL for a second, independent reason.
+        let huge = 100i32.to_ne_bytes();
+        match call(Syscall::SchedSetparam.raw(), a1(0, huge.as_ptr() as u64)) {
+            Some(-22) => Ok(()),
+            _ => Err("sched_setparam(100) should be -EINVAL (> MAX_RT_PRIO-1)"),
         }
     })
 }
@@ -1084,3 +1113,39 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_ioprio_set_rejects_a_bad_class
 );
+
+fn smoke_abi_sched_setparam_arg_errors() -> TestResult {
+    with_setup(|| {
+        // `if (!param || pid < 0) return -EINVAL;` — one guard, before the
+        // copy and before the pid lookup, so a null param outranks a pid
+        // that names nothing.
+        if call(Syscall::SchedSetparam.raw(), a1(0, 0)) != Some(EINVAL) {
+            return Err("sched_setparam(null param) should be -EINVAL");
+        }
+        let zero = 0i32.to_ne_bytes();
+        if call(
+            Syscall::SchedSetparam.raw(),
+            a1((-1i64) as u64, zero.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("sched_setparam(negative pid) should be -EINVAL");
+        }
+        if call(Syscall::SchedSetparam.raw(), a1(123456, 0)) != Some(EINVAL) {
+            return Err("a null param must outrank a pid that names nothing");
+        }
+        // Past the guard: a pid naming no task is -ESRCH.
+        if call(
+            Syscall::SchedSetparam.raw(),
+            a1(123456, zero.as_ptr() as u64),
+        ) != Some(-3)
+        {
+            return Err("sched_setparam on an unknown pid should be -ESRCH");
+        }
+        // And a faulting param is -EFAULT, after the null/pid guard.
+        match call(Syscall::SchedSetparam.raw(), a1(0, BAD_PTR)) {
+            Some(-14) => Ok(()),
+            _ => Err("sched_setparam with an unmapped param should be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_setparam_arg_errors);
