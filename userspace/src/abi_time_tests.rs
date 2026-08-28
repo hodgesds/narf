@@ -1589,14 +1589,25 @@ kernel_test_in!("syscall_abi", smoke_abi_time_ioprio_roundtrip);
 
 fn smoke_abi_time_ioprio_default() -> TestResult {
     with_setup(|| {
-        // ioprio_get on an unset (which, who) returns the default.
-        // Default is (IOPRIO_CLASS_BE=2 << 13) | 4 = 0x4004.
-        let val = call(Syscall::IoprioGet.raw(), a1(1, 9999)).ok_or("ioprio_get failed")?;
+        // A task with no stored ioprio reports Linux's default —
+        // (IOPRIO_CLASS_BE = 2) << 13 | 4 = 0x4004. `who == 0` is the
+        // caller, which exists.
+        let val = call(Syscall::IoprioGet.raw(), a1(1, 0)).ok_or("ioprio_get failed")?;
         let default = (2i64 << 13) | 4;
         if val != default {
-            return Err("ioprio_get on unset entry should return default (0x4004)");
+            return Err("ioprio_get on an unset task should return default (0x4004)");
         }
-        Ok(())
+        // A pid naming NO task is -ESRCH, not the default: `ret` starts at
+        // -ESRCH and only a visited task overwrites it. This probe used to
+        // read 9999 and get the default back, because the table was keyed
+        // by the raw (which, who) tuple and simply missed.
+        match call(Syscall::IoprioGet.raw(), a1(1, 9999)) {
+            Some(-3) => Ok(()),
+            Some(v) if v == default => {
+                Err("ioprio_get reported a default for a pid that names no task")
+            }
+            _ => Err("ioprio_get on a non-existent pid should be -ESRCH"),
+        }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_ioprio_default);

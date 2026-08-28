@@ -704,6 +704,7 @@ pub fn init_per_task_state() {
     pgid_init();
     sid_init();
     caps_init();
+    ioprio_init();
     wait_init();
     pkey_init();
     narf_filesystem::fuse_conn::install_request_context_provider(fuse_request_context);
@@ -10216,7 +10217,95 @@ const UMASK_DEFAULT: u32 = 0o022;
 // running batch work. Honouring the round-trip lets that pattern
 // stick.
 
-const PRIO_PROCESS_VAL: i64 = 0;
+/// Which set of tasks a `(which, who)` argument pair names.
+///
+/// `getpriority`, `setpriority`, `ioprio_get` and `ioprio_set` all take
+/// this shape and all four had PGRP/USER unimplemented. They differ only
+/// in the NUMBERS they use for the three cases — PRIO_* counts from 0 and
+/// IOPRIO_WHO_* from 1 — so the selection logic is shared and each caller
+/// maps its own constants onto this.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub(crate) enum WhoScope {
+    Process,
+    Pgrp,
+    User,
+}
+
+/// Resolve `(which, who)` to the tasks it names, following Linux's
+/// `find_task_by_vpid` / `do_each_pid_thread(PIDTYPE_PGID)` /
+/// `for_each_process_thread` selection.
+///
+/// Returns an EMPTY vector rather than an error when nothing matches:
+/// every one of these syscalls starts its result at `-ESRCH` and lets a
+/// successful visit overwrite it, so "no such target" and "no tasks in
+/// that set" are the same answer and the caller expresses it once.
+///
+/// `who == 0` means the caller's own process, process group, or REAL uid
+/// depending on the scope — note it is `cred->uid`, not euid, for the user
+/// case (kernel/sys.c: `if (!who) uid = cred->uid;`).
+pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> alloc::vec::Vec<u64> {
+    let mut out = alloc::vec::Vec::new();
+    match scope {
+        WhoScope::Process => {
+            if who == 0 {
+                out.push(process_state_key(caller));
+                return out;
+            }
+            let Some(outer) = accept_pid_from(caller, who as u64) else {
+                return out;
+            };
+            let t = process_state_key(proc_pid_to_tid(outer));
+            // `find_task_by_vpid` returning NULL is the empty set —
+            // `proc_pid_to_tid` falls back to identity for an unregistered
+            // pid, so an existence check is what implements that.
+            if t == process_state_key(caller) || crate::task::task_get(t).is_some() {
+                out.push(t);
+            }
+        }
+        WhoScope::Pgrp => {
+            let target = if who == 0 {
+                read_pgid(process_state_key(caller))
+            } else {
+                let g = pgid_from_user(who as u64);
+                if g == 0 {
+                    return out;
+                }
+                process_state_key(g)
+            };
+            // The caller is checked explicitly because syscall-unit
+            // fixtures need not populate the scheduler task registry.
+            let me = process_state_key(caller);
+            if read_pgid(me) == target {
+                out.push(me);
+            }
+            for t in crate::task::task_ids() {
+                let key = process_state_key(t);
+                if key != me && read_pgid(key) == target && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+        WhoScope::User => {
+            let me = process_state_key(caller);
+            let target_uid = if who == 0 {
+                read_uidgid(me).uid
+            } else {
+                who as u32
+            };
+            if read_uidgid(me).uid == target_uid {
+                out.push(me);
+            }
+            for t in crate::task::task_ids() {
+                let key = process_state_key(t);
+                if key != me && read_uidgid(key).uid == target_uid && !out.contains(&key) {
+                    out.push(key);
+                }
+            }
+        }
+    }
+    out
+}
+
 
 static NICE_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);

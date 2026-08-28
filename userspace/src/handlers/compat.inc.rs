@@ -2768,11 +2768,33 @@ const CLOCK_BOOTTIME: u64 = 7;
 
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
 //
-// Store I/O priority per (which, who) tuple. ioprio_get returns the
-// stored value or a Linux default.
-
-static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<(i32, u64), u32>>> =
+// Keyed PER TASK, as in Linux, where `ioprio` lives in `task_struct->
+// io_context` and the `which` argument only selects WHICH TASKS to visit
+// (block/ioprio.c: `set_task_ioprio(p, ioprio)` per task).
+//
+// The previous key was the `(which, who)` tuple itself, which made the
+// three scopes disjoint stores rather than three views of one value: an
+// `ioprio_set(IOPRIO_WHO_PROCESS, pid)` was invisible to an
+// `ioprio_get(IOPRIO_WHO_PGRP, pgid)` covering that same process, because
+// they landed on different keys. That is not a missing feature, it is a
+// wrong answer — and it could not be fixed without re-keying first.
+static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Linux's default when a task has no io_context: `IOPRIO_CLASS_BE` in the
+/// class field with priority 4 (`IOPRIO_NORM`).
+const IOPRIO_DEFAULT: u32 = (2u32 << 13) | 4;
+
+/// Initialise the per-task ioprio registry.
+///
+/// Now that the table is keyed by TASK rather than by the `(which, who)`
+/// argument tuple, it is per-task state like PGID/SID/rlimits and belongs
+/// in `init_per_task_state` with them — without that a value set by one
+/// kernel-test leaks into every later one, which is exactly what the
+/// tuple-keyed version's obscurity had been hiding.
+pub fn ioprio_init() {
+    *IOPRIO_TABLE.lock() = Some(BTreeMap::new());
+}
 
 // ── Signal delivery: pending + mask + delivery hook ────────────────
 //

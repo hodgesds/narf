@@ -1020,9 +1020,15 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
         return TestResult::Fail("setpriority(100) did not clamp to MAX_NICE(19)");
     }
 
-    // Bad which (1 = PRIO_PGRP) is -EINVAL, matching Linux
-    // SYSCALL_DEFINE2(getpriority)'s `which > PRIO_USER` rejection.
-    let r = call(Syscall::Getpriority, 1, 0, 0);
+    // Out-of-range `which` is -EINVAL, matching Linux
+    // SYSCALL_DEFINE2(getpriority)'s `which > PRIO_USER || which <
+    // PRIO_PROCESS` rejection.
+    //
+    // The probe used to be 1 (PRIO_PGRP) with a comment calling it "bad
+    // which" — but 1 is not > PRIO_USER(2), so it was never bad in Linux
+    // either; it only looked rejected because the scope was unimplemented.
+    // 3 is genuinely out of range.
+    let r = call(Syscall::Getpriority, 3, 0, 0);
     let bad_which = matches!(
         r,
         Some(rr) if rr.status == SyscallReturn::OK && rr.value == (-22i64) as u64,

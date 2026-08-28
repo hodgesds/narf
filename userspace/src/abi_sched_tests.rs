@@ -79,11 +79,15 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getpriority_pos);
 
 fn smoke_abi_sched_getpriority_bad_which_neg() -> TestResult {
     with_setup(|| {
-        // `which` outside [PRIO_PROCESS, PRIO_USER] → -EINVAL (kernel/sys.c).
-        // LINUX-GAP: PRIO_PGRP(1)/PRIO_USER(2) are unimplemented and also
-        // reported as -EINVAL here.
-        if call(Syscall::Getpriority.raw(), a1(1, 0)) != Some(EINVAL) {
-            return Err("getpriority with non-PRIO_PROCESS should return -EINVAL");
+        // `which` outside [PRIO_PROCESS, PRIO_USER] → -EINVAL
+        // (kernel/sys.c). PRIO_PGRP(1) and PRIO_USER(2) are now
+        // implemented, so the out-of-range probe is 3 — using 1 here would
+        // be asserting that a supported scope is rejected.
+        if call(Syscall::Getpriority.raw(), a1(3, 0)) != Some(EINVAL) {
+            return Err("getpriority with an out-of-range which should return -EINVAL");
+        }
+        if call(Syscall::Getpriority.raw(), a1((-1i64) as u64, 0)) != Some(EINVAL) {
+            return Err("getpriority with a negative which should return -EINVAL");
         }
         Ok(())
     })
@@ -125,8 +129,11 @@ fn smoke_abi_sched_setpriority_out_of_range_neg() -> TestResult {
         if high == low {
             return Err("out-of-range setpriority did not clamp to distinct nice bounds");
         }
-        // An unsupported `which` (PRIO_USER=2, or out of [0,2]) → -EINVAL.
-        if call(Syscall::Setpriority.raw(), a2(2, 0, 0)) != Some(EINVAL) {
+        // `if (which > PRIO_USER || which < PRIO_PROCESS) goto out;` —
+        // only a value OUTSIDE [0, 2] is -EINVAL. PRIO_USER(2) used to be
+        // rejected here because the scope was unimplemented; it is now a
+        // supported selection, so the probe moved to 3.
+        if call(Syscall::Setpriority.raw(), a2(3, 0, 0)) != Some(EINVAL) {
             return Err("setpriority with an unsupported which should return -EINVAL");
         }
         Ok(())
@@ -921,3 +928,159 @@ fn smoke_abi_sched_yield_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_yield_pos);
+
+// ─────────────────────────────────────────────────────────────────────
+// PRIO_PGRP / PRIO_USER and IOPRIO_WHO_PGRP / IOPRIO_WHO_USER
+//
+// All four syscalls take a (which, who) pair and all four had the group
+// and user scopes unimplemented, taking -EINVAL. They differ only in the
+// numbers they use for the three cases, so the selection is one shared
+// resolver — the same root-cause shape as the rest of this audit.
+// ─────────────────────────────────────────────────────────────────────
+
+const WHO_ESRCH: i64 = -3;
+const WHO_EINVAL: i64 = -22;
+const PRIO_PROCESS_W: u64 = 0;
+const PRIO_PGRP_W: u64 = 1;
+const PRIO_USER_W: u64 = 2;
+const IOPRIO_WHO_PROCESS_W: u64 = 1;
+const IOPRIO_WHO_PGRP_W: u64 = 2;
+const IOPRIO_WHO_USER_W: u64 = 3;
+
+fn smoke_abi_sched_getpriority_scopes_are_implemented() -> TestResult {
+    with_setup(|| {
+        // All three scopes must resolve; only a `which` outside
+        // [PRIO_PROCESS, PRIO_USER] is -EINVAL. `who == 0` means the
+        // caller's own process / group / real uid.
+        for which in [PRIO_PROCESS_W, PRIO_PGRP_W, PRIO_USER_W] {
+            match call(Syscall::Getpriority.raw(), a1(which, 0)) {
+                // nice_to_rlimit(0) == 20 for the default nice.
+                Some(20) => {}
+                Some(v) if v == WHO_EINVAL => {
+                    return Err("a PRIO_* scope is still unimplemented (-EINVAL)")
+                }
+                _ => return Err("getpriority(scope, 0) should report the caller's nice"),
+            }
+        }
+        match call(Syscall::Getpriority.raw(), a1(9, 0)) {
+            Some(v) if v == WHO_EINVAL => Ok(()),
+            _ => Err("getpriority with an out-of-range which should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_getpriority_scopes_are_implemented
+);
+
+fn smoke_abi_sched_getpriority_group_reports_the_most_favoured() -> TestResult {
+    with_setup(|| {
+        // `if (niceval > retval) retval = niceval;` over the group, where
+        // niceval is `20 - nice`. So the answer is the MAXIMUM wire value,
+        // i.e. the numerically LOWEST nice — the most favoured member.
+        // Taking the minimum would describe the group as less favoured
+        // than it actually is.
+        //
+        // Renice the caller to 5, then check the group answer tracks the
+        // best member rather than the last one visited.
+        if call(Syscall::Setpriority.raw(), a2(PRIO_PROCESS_W, 0, 5)) != Some(0) {
+            return Err("setpriority setup failed");
+        }
+        match call(Syscall::Getpriority.raw(), a1(PRIO_PGRP_W, 0)) {
+            Some(15) => Ok(()), // 20 - 5
+            Some(v) if v == WHO_ESRCH => Err("PRIO_PGRP found no tasks in the caller's own group"),
+            _ => Err("getpriority(PRIO_PGRP) did not report the group's best nice"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_getpriority_group_reports_the_most_favoured
+);
+
+fn smoke_abi_sched_setpriority_group_applies_to_the_caller() -> TestResult {
+    with_setup(|| {
+        // A group renice must actually reach its members. The caller is in
+        // its own group, so PRIO_PGRP with who == 0 includes it.
+        if call(Syscall::Setpriority.raw(), a2(PRIO_PGRP_W, 0, 7)) != Some(0) {
+            return Err("setpriority(PRIO_PGRP, 0) failed");
+        }
+        match call(Syscall::Getpriority.raw(), a1(PRIO_PROCESS_W, 0)) {
+            Some(13) => Ok(()), // 20 - 7
+            _ => Err("a PRIO_PGRP renice did not reach the caller"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setpriority_group_applies_to_the_caller
+);
+
+fn smoke_abi_sched_setpriority_unmatched_user_is_esrch() -> TestResult {
+    with_setup(|| {
+        // `error = -ESRCH` and only a visited task clears it. A uid that
+        // owns no task leaves it, which is how a caller learns nothing was
+        // renamed rather than believing it succeeded.
+        match call(Syscall::Setpriority.raw(), a2(PRIO_USER_W, 4242, 5)) {
+            Some(v) if v == WHO_ESRCH => Ok(()),
+            Some(0) => Err("setpriority(PRIO_USER, unowned uid) reported success"),
+            _ => Err("setpriority for a uid owning no task should be -ESRCH"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setpriority_unmatched_user_is_esrch
+);
+
+fn smoke_abi_sched_ioprio_scopes_share_one_per_task_value() -> TestResult {
+    with_setup(|| {
+        // The table used to be keyed by the `(which, who)` tuple, so the
+        // three scopes were disjoint stores rather than three views of one
+        // value: a WHO_PROCESS set was invisible to a WHO_PGRP get over
+        // the same process. Linux keeps ioprio in the task, and `which`
+        // only selects which tasks to visit.
+        const PRIO: u64 = (1u64 << 13) | 3; // IOPRIO_CLASS_RT, level 3
+        if call(Syscall::IoprioSet.raw(), a2(IOPRIO_WHO_PROCESS_W, 0, PRIO)) != Some(0) {
+            return Err("ioprio_set(WHO_PROCESS, 0) failed");
+        }
+        // Read it back through a DIFFERENT scope covering the same task.
+        match call(Syscall::IoprioGet.raw(), a1(IOPRIO_WHO_PGRP_W, 0)) {
+            Some(v) if v as u64 == PRIO => {}
+            Some(v) if v as u64 == (2u64 << 13) | 4 => {
+                return Err("WHO_PGRP read the default — the scopes are still separate stores")
+            }
+            _ => return Err("ioprio_get(WHO_PGRP) did not see the per-task value"),
+        }
+        match call(Syscall::IoprioGet.raw(), a1(IOPRIO_WHO_USER_W, 0)) {
+            Some(v) if v as u64 == PRIO => Ok(()),
+            _ => Err("ioprio_get(WHO_USER) did not see the per-task value"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_ioprio_scopes_share_one_per_task_value
+);
+
+fn smoke_abi_sched_ioprio_set_rejects_a_bad_class() -> TestResult {
+    with_setup(|| {
+        // `ioprio_check_cap(ioprio)` runs FIRST, before the `which`
+        // switch, so a bad class beats a `who` that names nothing.
+        let bad_class = 9u64 << 13;
+        match call(
+            Syscall::IoprioSet.raw(),
+            a2(IOPRIO_WHO_USER_W, 4242, bad_class),
+        ) {
+            Some(v) if v == WHO_EINVAL => Ok(()),
+            Some(v) if v == WHO_ESRCH => {
+                Err("ioprio_set selected tasks before validating the class")
+            }
+            _ => Err("ioprio_set with an undefined class should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_ioprio_set_rejects_a_bad_class
+);
