@@ -686,6 +686,16 @@ static CLASSES: [SizeClass; N_CLASSES] = [
 /// leak patterns without instrumenting every caller.
 static LARGE_IN_USE: AtomicUsize = AtomicUsize::new(0);
 
+/// Frames currently held by LARGE allocations.
+///
+/// `LARGE_IN_USE` counts allocations, which is the wrong unit for anyone
+/// asking how much of the buddy the heap is holding: one order-4 block is
+/// a single allocation and sixteen frames. Both the contiguous path
+/// (`alloc_pages_on(0, order)` → `1 << order` frames) and the scattered
+/// vmalloc fallback (`n_pages` order-0 frames) publish their real frame
+/// count here so [`frames_held`] can be exact.
+static LARGE_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
 /// Why an allocation failed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SlabError {
@@ -1131,6 +1141,7 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // Fast path: a physically-contiguous buddy block.
     if let Ok(frame) = alloc_pages_on(0, order) {
         LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
+        LARGE_FRAMES.fetch_add(1usize << order, Ordering::Relaxed);
         let p = frame.start_address().kernel_mut_ptr::<u8>();
         // SAFETY: `p` is reachable through the per-arch kernel
         // mapping + page-aligned to its order.
@@ -1145,6 +1156,10 @@ fn alloc_large(layout: Layout) -> Result<NonNull<u8>, SlabError> {
     // kernel when the pool is fragmented but not empty.
     let p = crate::vmalloc::valloc(layout.size()).ok_or(SlabError::NoMemory)?;
     LARGE_IN_USE.fetch_add(1, Ordering::Relaxed);
+    // The scattered path takes `n_pages` order-0 frames, not `1 << order` —
+    // that is the whole point of the fallback, so it must not be accounted
+    // as though it had allocated a contiguous block.
+    LARGE_FRAMES.fetch_add(n_pages, Ordering::Relaxed);
     Ok(p)
 }
 
@@ -1157,6 +1172,7 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
         // slab always frees a large block with its original layout).
         unsafe { crate::vmalloc::vfree(ptr, layout.size()) };
         LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
+        LARGE_FRAMES.fetch_sub(layout.size().div_ceil(PAGE_SIZE_USIZE), Ordering::Relaxed);
         return;
     }
     // `alloc_large` handed out `frame.start_address().kernel_mut_ptr()`,
@@ -1197,6 +1213,7 @@ unsafe fn dealloc_large(ptr: NonNull<u8>, layout: Layout) {
     let order = pages_to_order(n_pages).unwrap_or(0);
     free_pages(frame, order);
     LARGE_IN_USE.fetch_sub(1, Ordering::Relaxed);
+    LARGE_FRAMES.fetch_sub(1usize << order, Ordering::Relaxed);
 }
 
 /// Smallest buddy order that fits `n_pages`. Returns Err when the
@@ -1323,6 +1340,38 @@ fn ensure_slab_shrinker_registered() {
             scan: slab_shrink,
         });
     }
+}
+
+/// Frames the kernel heap is CURRENTLY holding from the buddy allocator.
+///
+/// The heap grows by calling `alloc_frame()` when a size class runs dry
+/// (see `refill_from_frame`), so ANY Rust allocation can consume a buddy
+/// frame as a side effect. A test that measures `frame::stats().free`
+/// across a window is therefore measuring the code under test MINUS
+/// whatever the heap took, and whether it took anything depends on how
+/// full the magazines already were — i.e. on what ran before. Sampling
+/// this on both sides lets a caller subtract that noise instead of hoping
+/// it is absent.
+///
+/// Both halves of the heap's footprint are counted:
+///
+///   * size classes, via each class's `grown` BLOCK counter converted to
+///     whole frames by that class's blocks-per-frame ratio. `grown` is
+///     current occupancy rather than a lifetime total — the shrinker
+///     decrements it in `detach_class_frames` — so frames the heap gives
+///     BACK are reflected too, and a caller does not drift upward across a
+///     reclaim.
+///   * large allocations, via [`LARGE_FRAMES`]. `LARGE_IN_USE` cannot
+///     serve here: it counts allocations, and one order-4 block is a
+///     single allocation holding sixteen frames.
+pub fn frames_held() -> usize {
+    let mut n = LARGE_FRAMES.load(Ordering::Relaxed);
+    for (class_index, class) in CLASSES.iter().enumerate() {
+        let grown = class.grown.load(Ordering::Relaxed);
+        let blocks_per_frame = PAGE_SIZE_USIZE / class_size(class_index);
+        n = n.saturating_add(grown / blocks_per_frame);
+    }
+    n
 }
 
 /// Shrinker `count`: an upper bound on reclaimable base pages. Free blocks are

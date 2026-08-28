@@ -1690,6 +1690,27 @@ mod tests {
         // a single-threaded kernel test sees between two adjacent samples.
         const PAGES: usize = 16;
 
+        /// Buddy free-count corrected for what the kernel HEAP took during
+        /// the same window.
+        ///
+        /// The heap's slab calls `alloc_frame()` when a size class runs
+        /// dry, so any Rust allocation inside the code under measurement
+        /// consumes a buddy frame as a side effect — and whether it needs
+        /// to depends on how full the magazines already were, i.e. on
+        /// whatever test ran before. That is what made this test flaky:
+        /// `munmap` returned all 16 arena frames every time, but the raw
+        /// delta came up short whenever munmap's own bookkeeping happened
+        /// to grow a size class.
+        ///
+        /// The original comment here claimed 16 frames was "far more than
+        /// the noise a single-threaded kernel test sees between two
+        /// adjacent samples". The noise is not unrelated frame traffic; it
+        /// is caused BY the code being measured, so no margin makes it go
+        /// away.
+        fn free_frames_net() -> usize {
+            narf_memory::frame::stats().free + narf_memory::slab::frames_held()
+        }
+
         let Some(aspace) = arena_test_setup() else {
             return TestResult::Fail("new_for_user failed");
         };
@@ -1716,9 +1737,9 @@ mod tests {
         crate::fd::with_table(ARENA_TASK, |table| table.close(fd));
         drop(file);
         drop(arena);
-        let before = narf_memory::frame::stats().free;
+        let before = free_frames_net();
         drop(group);
-        let while_mapped = narf_memory::frame::stats().free.saturating_sub(before);
+        let while_mapped = free_frames_net().saturating_sub(before);
         if while_mapped >= PAGES {
             arena_test_teardown();
             return TestResult::Fail(
@@ -1728,7 +1749,7 @@ mod tests {
 
         // Now release the mapping. Its `Arc<dyn FileOps>` was the last
         // reference, so this is the drop that must free them.
-        let before = narf_memory::frame::stats().free;
+        let before = free_frames_net();
         let mut call = TestCtx {
             args: SyscallArgs {
                 arg0: base,
@@ -1742,10 +1763,17 @@ mod tests {
             arena_test_teardown();
             return TestResult::Fail("munmap of the arena mapping failed");
         }
-        let after_munmap = narf_memory::frame::stats().free.saturating_sub(before);
+        let after_munmap = free_frames_net().saturating_sub(before);
         if after_munmap < PAGES {
             arena_test_teardown();
-            return TestResult::Fail("munmap did not return the arena's frames to the buddy");
+            // If this ever fires again the corrected accounting has missed a
+            // source. `frames_held` covers both halves of the heap's
+            // footprint — size-class growth and large allocations — so the
+            // next candidate is a frame consumer that is not the heap at
+            // all (a driver, or a deferred reclaim landing mid-window).
+            return TestResult::Fail(
+                "munmap did not return the arena's frames to the buddy (net of heap growth)",
+            );
         }
         // The region is gone too, so a later fault cannot reach the freed
         // frames through a stale mapping.
