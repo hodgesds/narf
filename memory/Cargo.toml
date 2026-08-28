@@ -68,6 +68,17 @@ slab-free-audit = []
 # atomic op per alloc/free.
 frame-alloc-audit = []
 
+# Reverse-map free-site audit: the Linux `free_pages_prepare` "nonzero
+# mapcount" `bad_page` analogue. On every buddy free of a final-owner frame,
+# assert the frame has no `rmap` owners; panic at the SOURCE naming the
+# stale (root, va) if one survives. Catches a teardown/unmap path that
+# returned a frame without a paired `rmap::remove`, whose stale owner would
+# otherwise poison the frame's next allocation (and flake any later
+# rmap-sensitive test handed that frame). Off by default — takes the frame's
+# rmap shard lock per free, and it currently trips on a real latent
+# nested-fork/shared-alias teardown leak (COW refcount 0 but one owner left).
+rmap-free-audit = []
+
 # Kernel Address Sanitizer (KASAN) write-catch. Compiles the KASAN runtime
 # (src/kasan.rs) — the `__asan_*` callbacks + shadow poison/unpoison hooks —
 # and the slab poisons freed blocks so a dangling cross-CPU write trips the

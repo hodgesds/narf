@@ -1711,6 +1711,45 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
 
 /// Complete work that must precede publication of a final-owner frame.
 fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
+    // DEBUG_VM analogue of Linux `free_pages_prepare`'s "nonzero mapcount"
+    // `bad_page` check (mm/page_alloc.c): a frame genuinely returning to the
+    // buddy (COW refcount just reached 0) must have no reverse-map owners. A
+    // surviving owner means some unmap/teardown path returned the frame without
+    // a paired `rmap::remove`, so the next allocation of this frame inherits a
+    // stale (root, va) owner and corrupts every reverse-map-driven decision
+    // (TLB shootdown, page migration, COW split) — and, in the test suite,
+    // makes any rmap-sensitive test later handed the frame flake (the
+    // long-standing shared-alias/mremap test flakiness).
+    //
+    // Perf: this takes the frame's rmap shard lock on every buddy free, so it
+    // must NOT run in release. Gated exactly like Linux's DEBUG_VM — compiled
+    // out unless `debug_assertions` is set (debug builds) — so release/production
+    // pays nothing. `rmap-free-audit` additionally force-enables it in a
+    // release-mode build for a targeted hunt (the default kernel-test suite
+    // runs release). It currently TRIPS on a real latent leak (nested
+    // fork/shared-alias teardown drops a frame with COW refcount 0 while one
+    // rmap owner survives); once that teardown accounting is fixed the check
+    // stays as the permanent regression guard for the whole class.
+    #[cfg(any(debug_assertions, feature = "rmap-free-audit"))]
+    {
+        let owners = crate::rmap::owner_count(phys);
+        if owners != 0 {
+            let mut first_va = u64::MAX;
+            let mut first_root = 0u64;
+            crate::rmap::for_each_owner(phys, |o| {
+                if first_va == u64::MAX {
+                    first_va = o.va.as_u64();
+                    first_root = o.root.raw();
+                }
+            });
+            panic!(
+                "buddy free of {phys:?} with {owners} live rmap owner(s) \
+                 (first root={first_root:#x} va={first_va:#x}): a teardown/free \
+                 path returned this frame without rmap::remove (Linux bad_page: \
+                 nonzero mapcount)"
+            );
+        }
+    }
     // cgroup memory uncharge: only here, where the frame is genuinely
     // returned to the buddy — i.e. the COW refcount has reached 0 — does
     // it balance the single charge taken at `alloc_frame_on`. The
