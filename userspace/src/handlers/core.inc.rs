@@ -3821,13 +3821,104 @@ fn write_caps(task: u64, caps: Caps) {
 /// `kernel/capability.c::capable(cap)` — does the CURRENT task hold `cap`
 /// in its effective set?
 ///
-/// LINUX-GAP: Linux's `capable()` is `ns_capable(&init_user_ns, cap)` and
-/// the per-namespace `ns_capable()` additionally grants a capability to a
-/// task that owns the target user namespace. NARF checks the effective set
-/// only, so a user-namespace owner is refused where Linux would allow it —
-/// the restrictive direction, which fails safe.
+/// This is `ns_capable(&init_user_ns, cap)`: authority over the HOST. A
+/// resource that lives in a namespace must ask [`task_ns_capable`] against
+/// that namespace's owning user namespace instead, or an unprivileged
+/// container owner is refused inside its own namespace.
 pub(crate) fn capable(cap: u32) -> bool {
     task_capable(current_task_id(), cap)
+}
+
+/// `security/commoncap.c::cap_capable` — does `task` hold `cap` with respect
+/// to the user namespace `target`?
+///
+/// ```text
+/// struct user_namespace *ns = targ_ns;
+/// for (;;) {
+///         if (likely(ns == cred->user_ns))
+///                 return cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
+///         if (ns == &init_user_ns)
+///                 return -EPERM;
+///         if ((ns->level > cred->user_ns->level) && uid_eq(ns->owner, cred->euid))
+///                 return 0;
+///         ns = ns->parent;
+/// }
+/// ```
+///
+/// Two rules, and both matter. Reaching the caller's OWN namespace decides on
+/// the effective set, exactly as [`task_capable`] does — so a host-privileged
+/// task is unaffected by any of this. Otherwise, a namespace strictly BENEATH
+/// the caller's whose owner uid is the caller's euid grants every capability
+/// inside it: that is what makes `unshare -Ur --uts hostname foo` work for a
+/// user with no host privilege at all.
+///
+/// The depth comparison is not redundant with the walk. Without it a
+/// namespace on an unrelated branch that happens to share an owner uid would
+/// grant authority there too — privilege leaking sideways between sibling
+/// containers owned by the same user, which is precisely what a user
+/// namespace is supposed to prevent.
+///
+/// Walking upward terminates at the initial namespace, so an unprivileged
+/// task can never acquire authority over the host by nesting.
+#[cfg(feature = "container")]
+pub(crate) fn task_ns_capable(
+    task: u64,
+    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
+    cap: u32,
+) -> bool {
+    if u64::from(cap) > CAP_LAST_CAP {
+        return false;
+    }
+    let cred_ns = crate::namespaces::current_user_ns(task);
+    let cred_level = cred_ns.level();
+    // Host-absolute effective uid — `cred->euid` is a host id, and
+    // `ns->owner` was recorded as one at creation.
+    let cred_euid = read_uidgid(task).euid;
+    let mut cursor: Option<&alloc::sync::Arc<crate::namespaces::UserNamespace>> = Some(target);
+    while let Some(ns) = cursor {
+        if ns.id() == cred_ns.id() {
+            return task_capable(task, cap);
+        }
+        if ns.is_initial() {
+            return false;
+        }
+        if ns.level() > cred_level && ns.owner_uid() == cred_euid {
+            return true;
+        }
+        cursor = ns.parent();
+    }
+    false
+}
+
+/// [`task_ns_capable`] for the current task.
+#[cfg(feature = "container")]
+#[allow(dead_code)]
+pub(crate) fn ns_capable(
+    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
+    cap: u32,
+) -> bool {
+    task_ns_capable(current_task_id(), target, cap)
+}
+
+/// CAP_SYS_ADMIN with respect to `task`'s UTS namespace — the check
+/// `sethostname`/`setdomainname` actually require
+/// (`ns_capable(current->nsproxy->uts_ns->user_ns, CAP_SYS_ADMIN)`).
+///
+/// Without the `container` feature there are no namespaces, so every resource
+/// is the host's and the question collapses to plain `capable()`.
+pub(crate) fn uts_admin(task: u64) -> bool {
+    #[cfg(feature = "container")]
+    {
+        task_ns_capable(
+            task,
+            &crate::namespaces::current_uts_ns(task).owner_user_ns(),
+            CAP_SYS_ADMIN,
+        )
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        task_capable(task, CAP_SYS_ADMIN)
+    }
 }
 
 /// `capable()` for an explicit task.
@@ -3986,6 +4077,23 @@ pub fn __test_cap_fork(parent: u64, child: u64) {
 #[doc(hidden)]
 pub fn __test_task_capable(task: u64, cap: u32) -> bool {
     task_capable(task, cap)
+}
+
+/// Test-only: [`task_ns_capable`] for an explicit task and target user ns.
+#[doc(hidden)]
+#[cfg(feature = "container")]
+pub fn __test_task_ns_capable(
+    task: u64,
+    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
+    cap: u32,
+) -> bool {
+    task_ns_capable(task, target, cap)
+}
+
+/// Test-only: [`uts_admin`] for an explicit task.
+#[doc(hidden)]
+pub fn __test_uts_admin(task: u64) -> bool {
+    uts_admin(task)
 }
 
 /// Test-only: install an explicit credential for `task`, so a case can

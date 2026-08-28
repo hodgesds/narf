@@ -1520,6 +1520,177 @@ fn smoke_user_ns_dac_no_host_root_escape() -> TestResult {
 #[cfg(feature = "container")]
 kernel_test_in!("userspace", smoke_user_ns_dac_no_host_root_escape);
 
+/// `security/commoncap.c::cap_capable` — a capability question is always
+/// asked *with respect to* a user namespace:
+///
+///     for (;;) {
+///             if (likely(ns == cred->user_ns))
+///                     return cap_raised(cred->cap_effective, cap) ? 0 : -EPERM;
+///             if (ns == &init_user_ns)
+///                     return -EPERM;
+///             if ((ns->level > cred->user_ns->level) && uid_eq(ns->owner, cred->euid))
+///                     return 0;
+///             ns = ns->parent;
+///     }
+///
+/// The three arms pull in different directions and each one is pinned below.
+/// Checking only the effective set (what NARF did) collapses all three into
+/// the first, which refuses the owner of a namespace inside its own
+/// namespace. Granting on owner-uid alone — the obvious over-correction —
+/// would let privilege leak sideways between unrelated namespaces that
+/// happen to share an owner, which is the one thing a user namespace must
+/// never allow.
+#[cfg(feature = "container")]
+fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
+    use crate::namespaces::UserNamespace;
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+
+    const CAP_SYS_ADMIN: u32 = 21;
+    // The genuine initial namespace, not a fresh `new_initial()` look-alike.
+    // A second parentless namespace compares as a DIFFERENT namespace, so the
+    // walk stops at its `is_initial()` arm instead of matching the caller's —
+    // and the test then passes or fails for reasons unrelated to the rule.
+    let host = crate::namespaces::current_user_ns(0xBEEF_00);
+    // Two sibling namespaces beneath the host, BOTH owned by host uid 1000 —
+    // the shape a single user running two rootless containers produces.
+    let mine = UserNamespace::new_child(host.clone(), 1000);
+    let sibling = UserNamespace::new_child(host.clone(), 1000);
+    // A third owned by a different user, to show the owner uid is compared
+    // and not merely the depth.
+    let stranger = UserNamespace::new_child(host.clone(), 2000);
+    // And one nested inside `mine`, which its owner should also govern.
+    let nested = UserNamespace::new_child(mine.clone(), 1000);
+
+    let task: u64 = 0xBEEF_01;
+    // Unprivileged: no capabilities at all in the host.
+    crate::handlers::__test_set_caps(task, 0, 0);
+    crate::handlers::__test_set_uidgid_euid(task, 1000);
+    crate::namespaces::setns_user(task, mine.clone());
+
+    // Arm 1 — the caller's OWN namespace decides on the effective set, which
+    // is empty. Owning a namespace does not grant capabilities *in* it via
+    // the owner rule; the walk terminates at the first arm.
+    if crate::handlers::__test_task_ns_capable(task, &mine, CAP_SYS_ADMIN) {
+        return TestResult::Fail("empty effective set granted a capability in the caller's own ns");
+    }
+    // Arm 3 — a namespace strictly BENEATH the caller's, owned by the
+    // caller's euid: full authority. This is what makes an unprivileged
+    // `unshare -Ur` able to administer what it creates.
+    if !crate::handlers::__test_task_ns_capable(task, &nested, CAP_SYS_ADMIN) {
+        return TestResult::Fail("owner was refused authority over a namespace beneath its own");
+    }
+    // The sideways leak. `sibling` is owned by the same uid and is NOT
+    // beneath `mine`; the walk reaches the host and stops.
+    if crate::handlers::__test_task_ns_capable(task, &sibling, CAP_SYS_ADMIN) {
+        return TestResult::Fail("authority leaked sideways into a sibling namespace");
+    }
+    // Arm 2 — the host is never reachable by an unprivileged task.
+    if crate::handlers::__test_task_ns_capable(task, &host, CAP_SYS_ADMIN) {
+        return TestResult::Fail("unprivileged task acquired authority over the host");
+    }
+    // Different owner: refused even though it is one level down.
+    if crate::handlers::__test_task_ns_capable(task, &stranger, CAP_SYS_ADMIN) {
+        return TestResult::Fail("authority granted over a namespace owned by another user");
+    }
+
+    // A host-privileged task is unaffected by any of this: arm 1 answers for
+    // its own (initial) namespace, and every target above it resolves there.
+    let root: u64 = 0xBEEF_02;
+    crate::handlers::__test_set_caps(root, !0, !0);
+    crate::handlers::__test_set_uidgid_euid(root, 0);
+    if !crate::handlers::__test_task_ns_capable(root, &host, CAP_SYS_ADMIN) {
+        return TestResult::Fail("host-privileged task lost CAP_SYS_ADMIN over the host");
+    }
+
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_user_ns_capable_is_scoped_to_the_target_namespace
+);
+
+/// `sethostname` is gated on `ns_capable(uts_ns->user_ns, CAP_SYS_ADMIN)`
+/// (`kernel/sys.c::__do_sys_sethostname`), so the answer depends on WHICH UTS
+/// namespace the task is in, not on its host effective set alone.
+///
+/// The third arm is the one that changes behaviour. A task that unshares a
+/// user namespace has its credentials rebound to it, so it can no longer
+/// reach the host's UTS namespace even holding CAP_SYS_ADMIN — `cap_capable`
+/// walks up to the initial namespace and stops there:
+///
+///     if (ns == &init_user_ns)
+///             return -EPERM;
+///
+/// Consulting the effective set alone let exactly that task rename the HOST,
+/// from inside a namespace it had just separated itself into.
+#[cfg(feature = "container")]
+fn smoke_user_ns_uts_admin_follows_the_uts_namespace() -> TestResult {
+    use crate::namespaces::UserNamespace;
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+
+    const CAP_SYS_ADMIN: u64 = 21;
+    let admin_bit = 1u64 << CAP_SYS_ADMIN;
+
+    // 1. Unprivileged, entirely in the host's namespaces: refused.
+    let plain: u64 = 0xBEEF_11;
+    crate::handlers::__test_set_caps(plain, 0, 0);
+    crate::handlers::__test_set_uidgid_euid(plain, 1000);
+    if crate::handlers::__test_uts_admin(plain) {
+        return TestResult::Fail("unprivileged task could set the host hostname");
+    }
+
+    // 2. CAP_SYS_ADMIN in the host, host UTS namespace: allowed, unchanged.
+    let admin: u64 = 0xBEEF_12;
+    crate::handlers::__test_set_caps(admin, admin_bit, admin_bit);
+    crate::handlers::__test_set_uidgid_euid(admin, 0);
+    if !crate::handlers::__test_uts_admin(admin) {
+        return TestResult::Fail("CAP_SYS_ADMIN no longer sets the host hostname");
+    }
+
+    // 3. CAP_SYS_ADMIN, but the task has moved into its own user namespace
+    // while STAYING in the host UTS namespace. Its capabilities are bound to
+    // the new namespace, so the host's hostname is out of reach.
+    let escapee: u64 = 0xBEEF_13;
+    crate::handlers::__test_set_caps(escapee, admin_bit, admin_bit);
+    crate::handlers::__test_set_uidgid_euid(escapee, 1000);
+    let host = crate::namespaces::current_user_ns(0xBEEF_10);
+    let uns = UserNamespace::new_child(host, 1000);
+    crate::namespaces::setns_user(escapee, uns);
+    if crate::handlers::__test_uts_admin(escapee) {
+        return TestResult::Fail("a task inside a user namespace renamed the host");
+    }
+
+    // 4. Once it unshares UTS too, the new namespace records that user
+    // namespace as its owner, the walk matches at the first arm, and the
+    // effective set decides — which for this task grants it.
+    crate::namespaces::unshare_uts(escapee);
+    if !crate::handlers::__test_uts_admin(escapee) {
+        return TestResult::Fail("task was refused its own UTS namespace's hostname");
+    }
+    // The grant is scoped: the unprivileged host task is still refused.
+    if crate::handlers::__test_uts_admin(plain) {
+        return TestResult::Fail("the grant leaked to a task outside the namespace");
+    }
+
+    crate::namespaces::__test_reset_all();
+    crate::handlers::__test_uidgid_reset();
+    crate::handlers::__test_caps_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "container")]
+kernel_test_in!(
+    "userspace",
+    smoke_user_ns_uts_admin_follows_the_uts_namespace
+);
+
 /// fork inheritance: a child shares the parent's UTS / IPC / User
 /// namespace Arc (not a fresh copy) when no CLONE_NEW* is requested.
 #[cfg(feature = "container")]
