@@ -4232,9 +4232,19 @@ fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
         Ok((parent, child, frame)) => {
             let r = if cow::count(frame) != 2 {
                 TestResult::Fail("COW: refcount should be 2 after fork")
+            // SAFETY: `cow_split_on_write` requires a live low-4-GiB identity
+            // map (it memcpys the old frame's bytes into the new one) and an
+            // initialised frame allocator + COW refcount table. All three hold
+            // inside a kernel test: the identity map is established at boot,
+            // and `cow::count(frame) == 2` immediately above proves the
+            // refcount table is live for this very frame. VADDR names the
+            // present COW mapping the fixture just forked.
             } else if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
                 // The bug: the CoW break was refused at the watermark.
                 TestResult::Fail("CoW break refused at the reserve watermark (SIGSEGV regression)")
+            // SAFETY: same address-space and direct-map prerequisites, and the
+            // split above has just installed a private frame at VADDR, so the
+            // PTE this re-walks is present.
             } else if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
                 TestResult::Fail("remap_page after reserve-watermark split")
             } else {
