@@ -6353,7 +6353,18 @@ pub(crate) fn default_signal_delivery_restricted(
             }
         })
         .unwrap_or(0);
-    let deliverable = pending & !mask & restrict & !sigwait_reserved;
+    // SIGKILL(9)/SIGSTOP(19) are unblockable AND unwaitable: Linux never lets a
+    // signal mask OR a sigtimedwait set/reservation swallow them. The mask
+    // already strips them at sigprocmask time, but `sigwait_reserved` does not —
+    // so a CPU-bound task holding a STICKY `sigwait_reserve` from an earlier
+    // rt_sigtimedwait (released only at its next non-sigwait park, which a
+    // busy-looping stress-ng worker never reaches) would otherwise blackhole
+    // even SIGKILL and run forever. That is the stress-ng `--sequential` SMP
+    // stall: a wedged worker group `timeout(1)` itself could not SIGKILL-reap.
+    // Force SIGKILL/SIGSTOP past the reservation.
+    let kill_stop = sig_bit(9) | sig_bit(19);
+    let deliverable =
+        (pending & !mask & restrict & !sigwait_reserved) | (pending & restrict & kill_stop);
     if deliverable == 0 {
         return false;
     }
