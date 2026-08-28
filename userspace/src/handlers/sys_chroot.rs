@@ -91,7 +91,12 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
         return;
     }
-    if !capable(CAP_SYS_CHROOT) {
+    // `fs/open.c::SYSCALL_DEFINE1(chroot)`:
+    //     if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT))
+    // — the caller's OWN user namespace, so a task that unshared one may
+    // chroot inside it. `capable()` here would ask the host question and
+    // refuse every containerised caller.
+    if !capable_in_own_ns(CAP_SYS_CHROOT) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }

@@ -217,7 +217,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // user namespace, so a task that created a user+mount namespace pair may
     // mount inside it without being globally privileged. NARF checks the
     // effective set only — the restrictive direction.
-    if !capable(CAP_SYS_ADMIN) {
+    // `may_mount`: `ns_capable(current->nsproxy->mnt_ns->user_ns,
+    // CAP_SYS_ADMIN)` — the MOUNT namespace's owner, not the host. Asking the
+    // host question refuses a container that unshared its own mount
+    // namespace, which is the one place mounting is supposed to be allowed.
+    if !mount_admin(current_task_id()) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }

@@ -53,7 +53,7 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
 
     // "new" means: requested, and not already one of the three ids held.
     let is_new = |v: u32| v != NOCHANGE && v != old.uid && v != old.euid && v != old.suid;
-    if (is_new(ruid) || is_new(euid) || is_new(suid)) && !capable(CAP_SETUID) {
+    if (is_new(ruid) || is_new(euid) || is_new(suid)) && !capable_in_own_ns(CAP_SETUID) {
         ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
         return;
     }

@@ -3863,7 +3863,7 @@ pub(crate) fn capable(cap: u32) -> bool {
 #[cfg(feature = "container")]
 pub(crate) fn task_ns_capable(
     task: u64,
-    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
+    target: &crate::namespaces::UserNamespace,
     cap: u32,
 ) -> bool {
     if u64::from(cap) > CAP_LAST_CAP {
@@ -3874,10 +3874,14 @@ pub(crate) fn task_ns_capable(
     // Host-absolute effective uid — `cred->euid` is a host id, and
     // `ns->owner` was recorded as one at creation.
     let cred_euid = read_uidgid(task).euid;
-    let mut cursor: Option<&alloc::sync::Arc<crate::namespaces::UserNamespace>> = Some(target);
+    let mut cursor: Option<&crate::namespaces::UserNamespace> = Some(target);
     while let Some(ns) = cursor {
         if ns.id() == cred_ns.id() {
-            return task_capable(task, cap);
+            // The question is about the caller's own namespace, so the
+            // effective set answers it directly. Recursing through
+            // `task_capable` here would ask the HOST question instead and
+            // deny every namespaced task.
+            return cap_effective(task, cap);
         }
         if ns.is_initial() {
             return false;
@@ -3885,7 +3889,7 @@ pub(crate) fn task_ns_capable(
         if ns.level() > cred_level && ns.owner_uid() == cred_euid {
             return true;
         }
-        cursor = ns.parent();
+        cursor = ns.parent().map(|parent| &**parent);
     }
     false
 }
@@ -3893,10 +3897,7 @@ pub(crate) fn task_ns_capable(
 /// [`task_ns_capable`] for the current task.
 #[cfg(feature = "container")]
 #[allow(dead_code)]
-pub(crate) fn ns_capable(
-    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
-    cap: u32,
-) -> bool {
+pub(crate) fn ns_capable(target: &crate::namespaces::UserNamespace, cap: u32) -> bool {
     task_ns_capable(current_task_id(), target, cap)
 }
 
@@ -3921,12 +3922,116 @@ pub(crate) fn uts_admin(task: u64) -> bool {
     }
 }
 
-/// `capable()` for an explicit task.
+/// `ns_capable(__task_cred(p)->user_ns, cap)` — authority over ANOTHER task,
+/// measured in THAT task's user namespace.
+///
+/// `kernel/sys.c::set_one_prio_perm` and `sched_setaffinity` both use this
+/// shape, and the comment above the former says so outright: "or has
+/// CAP_SYS_NICE to p's user_ns". Asking the host question instead would let
+/// a host-privileged task renice a process inside a container it has no
+/// authority over, and refuse a container's own root over its own processes.
+pub(crate) fn capable_over_task(target: u64, cap: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        return task_ns_capable(
+            current_task_id(),
+            &crate::namespaces::current_user_ns(target),
+            cap,
+        );
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = target;
+        task_capable(current_task_id(), cap)
+    }
+}
+
+/// CAP_SYS_ADMIN with respect to `task`'s MOUNT namespace — the check
+/// `mount(2)` requires (`fs/namespace.c::may_mount`):
+///
+///     return ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN);
+///
+/// A task that unshared a user namespace and then a mount namespace owns the
+/// result and may mount inside it. A task in a user namespace still using the
+/// HOST mount namespace may not — its owner is the initial user namespace,
+/// which the walk refuses to reach.
+pub(crate) fn mount_admin(task: u64) -> bool {
+    #[cfg(feature = "container")]
+    {
+        let ns = current_mount_namespace();
+        let owned = ns.as_ref().and_then(|ns| ns.owner()).and_then(|owner| {
+            owner
+                .as_any()
+                .downcast_ref::<crate::namespaces::UserNamespace>()
+        });
+        return match owned {
+            Some(user_ns) => task_ns_capable(task, user_ns, CAP_SYS_ADMIN),
+            // No recorded owner is the initial user namespace, which is
+            // exactly the host question.
+            None => task_capable(task, CAP_SYS_ADMIN),
+        };
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        task_capable(task, CAP_SYS_ADMIN)
+    }
+}
+
+/// `capable()` for an explicit task — authority over the HOST.
+///
+/// `capable(cap)` is `ns_capable(&init_user_ns, cap)`, and `cap_capable`
+/// walking to the initial namespace answers:
+///
+///     if (ns == &init_user_ns)
+///             return -EPERM;
+///
+/// So a task in ANY non-initial user namespace has no host authority,
+/// whatever its effective set says. That is what makes the full capability
+/// set `unshare(CLONE_NEWUSER)` grants safe to hold: the caps are real, but
+/// they buy nothing outside the namespace they are bound to. Testing the
+/// effective set alone here would turn that grant into a host privilege
+/// escalation available to any unprivileged process.
 pub(crate) fn task_capable(task: u64, cap: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        if !crate::namespaces::current_user_ns(task).is_initial() {
+            return false;
+        }
+    }
+    cap_effective(task, cap)
+}
+
+/// The raw `cap_raised(cred->cap_effective, cap)` test, with no namespace
+/// scoping. Only the two functions that have ALREADY established which
+/// namespace the question is about may use it.
+fn cap_effective(task: u64, cap: u32) -> bool {
     if u64::from(cap) > CAP_LAST_CAP {
         return false;
     }
     read_caps(task).effective & (1u64 << cap) != 0
+}
+
+/// `ns_capable(current_user_ns(), cap)` for an explicit task — authority over
+/// resources the task's OWN user namespace governs (its credentials, its
+/// root directory, the namespaces it unshares).
+///
+/// The walk matches at its first arm, so this is the effective set — but it
+/// is the effective set for a reason that survives `capable()` becoming
+/// host-scoped, which the bare test would not.
+pub(crate) fn task_capable_in_own_ns(task: u64, cap: u32) -> bool {
+    #[cfg(feature = "container")]
+    {
+        return task_ns_capable(task, &crate::namespaces::current_user_ns(task), cap);
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        cap_effective(task, cap)
+    }
+}
+
+/// [`task_capable_in_own_ns`] for the current task.
+pub(crate) fn capable_in_own_ns(cap: u32) -> bool {
+    task_capable_in_own_ns(current_task_id(), cap)
 }
 
 /// `security/commoncap.c::cap_emulate_setxuid` — make the capability sets
@@ -4084,7 +4189,7 @@ pub fn __test_task_capable(task: u64, cap: u32) -> bool {
 #[cfg(feature = "container")]
 pub fn __test_task_ns_capable(
     task: u64,
-    target: &alloc::sync::Arc<crate::namespaces::UserNamespace>,
+    target: &crate::namespaces::UserNamespace,
     cap: u32,
 ) -> bool {
     task_ns_capable(task, target, cap)
@@ -4094,6 +4199,44 @@ pub fn __test_task_ns_capable(
 #[doc(hidden)]
 pub fn __test_uts_admin(task: u64) -> bool {
     uts_admin(task)
+}
+
+/// `kernel/user_namespace.c::set_cred_user_ns` — rebind `task`'s credentials
+/// to a freshly created user namespace.
+///
+/// ```text
+/// cred->securebits = SECUREBITS_DEFAULT;
+/// cred->cap_inheritable = CAP_EMPTY_SET;
+/// cred->cap_permitted = CAP_FULL_SET;
+/// cred->cap_effective = CAP_FULL_SET;
+/// cred->cap_ambient = CAP_EMPTY_SET;
+/// cred->cap_bset = CAP_FULL_SET;
+/// ```
+///
+/// The comment above it in Linux — "Start with the same capabilities as init
+/// but useless for doing anything as the capabilities are bound to the new
+/// user namespace" — is the whole design. THIS is what makes an unprivileged
+/// `unshare -Ur` able to administer what it creates; the owner rule in
+/// `cap_capable` covers a different case (a task looking at a namespace
+/// beneath its own).
+///
+/// The grant is only sound because [`task_capable`] is host-scoped: these
+/// capabilities are real inside the new namespace and worth nothing outside
+/// it. Inheritable and ambient are deliberately CLEARED — a full set that
+/// survived an execve into a setuid-root binary would carry namespace-bound
+/// authority somewhere it was never meant to reach.
+#[cfg(feature = "container")]
+fn set_cred_user_ns_caps(task: u64) {
+    write_caps(
+        task,
+        Caps {
+            effective: CAP_FULL_SET,
+            permitted: CAP_FULL_SET,
+            inheritable: 0,
+            bounding: CAP_FULL_SET,
+            ambient: 0,
+        },
+    );
 }
 
 /// Test-only: install an explicit credential for `task`, so a case can

@@ -118,6 +118,45 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    let mut any = false;
+
+    // `ksys_unshare` builds the new credential BEFORE the capability check
+    // for the other namespaces:
+    //
+    //     err = unshare_userns(unshare_flags, &new_cred);
+    //     ...
+    //     err = unshare_nsproxy_namespaces(unshare_flags, &new_nsproxy,
+    //                                      new_cred, new_fs);
+    //
+    // and that check reads `user_ns = new_cred ? new_cred->user_ns :
+    // current_user_ns()`. The order is the whole mechanism: CLONE_NEWUSER
+    // grants a full capability set bound to the new namespace, and the
+    // CAP_SYS_ADMIN test for CLONE_NEWUTS|NEWNS|… is then asked against THAT
+    // namespace. Checking first, with the old credentials, is why
+    // `unshare(CLONE_NEWUSER | CLONE_NEWUTS)` — what every rootless container
+    // runtime issues at startup — came back -EPERM for an ordinary user.
+    #[cfg(feature = "container")]
+    if flags & crate::namespaces::CLONE_NEWUSER != 0 {
+        let task = current_task_id();
+        // The creator's HOST uid is recorded as the namespace owner, and the
+        // caller becomes uid 0 INSIDE it.
+        let host_uid = read_uidgid(task).euid;
+        let _ns = crate::namespaces::unshare_user(task, host_uid);
+        let _ = write_uidgid(task, |e| {
+            e.uid = 0;
+            e.gid = 0;
+            e.euid = 0;
+            e.egid = 0;
+            e.fsuid = 0;
+            e.fsgid = 0;
+        });
+        // `set_cred_user_ns`: full permitted/effective/bounding, empty
+        // inheritable/ambient — worth everything inside the new namespace and
+        // nothing outside it, because `capable()` is host-scoped.
+        set_cred_user_ns_caps(task);
+        any = true;
+    }
+
     const NS_NEEDS_SYS_ADMIN: u64 = CLONE_NEWNS
         | CLONE_NEWUTS
         | CLONE_NEWIPC
@@ -125,12 +164,12 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         | CLONE_NEWPID
         | CLONE_NEWCGROUP
         | CLONE_NEWTIME;
-    if flags & NS_NEEDS_SYS_ADMIN != 0 && !capable(CAP_SYS_ADMIN) {
+    // `if (!ns_capable(user_ns, CAP_SYS_ADMIN)) return -EPERM;` — against the
+    // caller's user namespace, which the block above may just have replaced.
+    if flags & NS_NEEDS_SYS_ADMIN != 0 && !capable_in_own_ns(CAP_SYS_ADMIN) {
         ctx.set_return(fail(1)); // -EPERM
         return;
     }
-
-    let mut any = false;
 
     if flags & CLONE_NEWNS != 0 {
         task_mount_ns_init();
@@ -159,25 +198,8 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     {
         let task = current_task_id();
-        // CLONE_NEWUSER must be applied FIRST: Linux makes the caller
-        // uid 0 inside the new user-ns and (in a real cap model) grants
-        // a full cap set, which is what authorises the other unshares.
-        // We record the creator's HOST uid as the ns owner, then set
-        // the caller's in-ns uid/gid to 0 so it is root *inside*.
-        if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-            let host_uid = read_uidgid(task).euid;
-            let _ns = crate::namespaces::unshare_user(task, host_uid);
-            // The caller becomes uid 0 inside the new namespace.
-            let _ = write_uidgid(task, |e| {
-                e.uid = 0;
-                e.gid = 0;
-                e.euid = 0;
-                e.egid = 0;
-                e.fsuid = 0;
-                e.fsgid = 0;
-            });
-            any = true;
-        }
+        // CLONE_NEWUSER was applied above, before the CAP_SYS_ADMIN gate —
+        // these unshares are authorised by the credential it installed.
         if flags & crate::namespaces::CLONE_NEWUTS != 0 {
             crate::namespaces::unshare_uts(task);
             any = true;

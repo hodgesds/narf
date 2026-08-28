@@ -43,7 +43,7 @@ pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
         }
     }
     let old = read_uidgid(task);
-    if capable(CAP_SETUID) {
+    if capable_in_own_ns(CAP_SETUID) {
         // Privileged: every id moves.
         if !write_uidgid(task, |e| {
             e.uid = uid;

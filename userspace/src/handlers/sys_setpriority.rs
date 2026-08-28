@@ -78,7 +78,10 @@ pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
         let caller_euid = read_uidgid(current_task_id()).euid;
         let target = read_uidgid(task);
         let owns = target.uid == caller_euid || target.euid == caller_euid;
-        if !owns && !capable(CAP_SYS_NICE) {
+        // `if (ns_capable(pcred->user_ns, CAP_SYS_NICE)) return 1;` — the
+        // TARGET's user namespace, per the comment on `set_one_prio_perm`:
+        // "or has CAP_SYS_NICE to p's user_ns".
+        if !owns && !capable_over_task(task, CAP_SYS_NICE) {
             result = -EPERM;
             continue;
         }
@@ -92,7 +95,7 @@ pub(crate) fn sys_setpriority(ctx: &mut dyn TrapContext) {
         if prio < current {
             let nice_rlim = (20 - prio) as u64;
             let ceiling = read_rlimit(task, RLIMIT_NICE).map(|l| l.cur).unwrap_or(0);
-            if nice_rlim > ceiling && !capable(CAP_SYS_NICE) {
+            if nice_rlim > ceiling && !capable_over_task(task, CAP_SYS_NICE) {
                 result = -EACCES;
                 continue;
             }

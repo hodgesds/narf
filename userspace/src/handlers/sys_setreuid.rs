@@ -40,7 +40,7 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let old = read_uidgid(task);
 
-    if ruid != NOCHANGE && ruid != old.uid && ruid != old.euid && !capable(CAP_SETUID) {
+    if ruid != NOCHANGE && ruid != old.uid && ruid != old.euid && !capable_in_own_ns(CAP_SETUID) {
         ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
         return;
     }
@@ -48,7 +48,7 @@ pub(crate) fn sys_setreuid(ctx: &mut dyn TrapContext) {
         && euid != old.uid
         && euid != old.euid
         && euid != old.suid
-        && !capable(CAP_SETUID)
+        && !capable_in_own_ns(CAP_SETUID)
     {
         ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
         return;
