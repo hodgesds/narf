@@ -1562,6 +1562,137 @@ fn smoke_abi_caps_mount_efault_precedes_eperm() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_mount_efault_precedes_eperm);
 
+/// `unshare(CLONE_NEWUSER)` rebinds the caller's credentials to the new
+/// namespace with a FULL capability set
+/// (`kernel/user_namespace.c::set_cred_user_ns`):
+///
+///     cred->cap_permitted = CAP_FULL_SET;
+///     cred->cap_effective = CAP_FULL_SET;
+///     cred->cap_bset      = CAP_FULL_SET;
+///
+/// above the comment "Start with the same capabilities as init but useless
+/// for doing anything as the capabilities are bound to the new user
+/// namespace". `ksys_unshare` builds that credential BEFORE
+/// `unshare_nsproxy_namespaces` tests CAP_SYS_ADMIN, and that test reads
+/// `user_ns = new_cred ? new_cred->user_ns : current_user_ns()` — so the
+/// combined call authorises itself.
+///
+/// This is the whole of rootless containers, and NARF refused it: the
+/// capability test ran first, against the old unprivileged credentials.
+///
+/// The last arm is the one that makes the grant safe rather than a hole. A
+/// full capability set that also worked on the HOST would be an escalation
+/// available to any process, since creating a user namespace needs no
+/// privilege at all.
+fn smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        drop_all_caps();
+
+        // Control: on its own, CLONE_NEWUTS needs CAP_SYS_ADMIN and the
+        // caller has none.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUTS)) != Some(-1) {
+            return Err("unprivileged unshare(CLONE_NEWUTS) should be -EPERM");
+        }
+        // Combined, the user namespace is created first and authorises the
+        // rest. Same caller, same (absent) host privilege.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER | CLONE_NEWUTS)) != Some(0) {
+            return Err("unshare(CLONE_NEWUSER|CLONE_NEWUTS) was refused");
+        }
+        // Authority INSIDE: naming its own UTS namespace is now permitted.
+        let name = b"narf-container";
+        if call(
+            Syscall::SetHostname.raw(),
+            a1(name.as_ptr() as u64, name.len() as u64),
+        ) != Some(0)
+        {
+            return Err("owner could not name its own UTS namespace");
+        }
+        // Authority OUTSIDE: the host clock is governed by the initial user
+        // namespace, which this task can never reach. `capable()` walking to
+        // the initial namespace returns -EPERM before ever reading the
+        // effective set, so the full set granted above buys nothing here.
+        let mut tv = [0u8; 16];
+        tv[..8].copy_from_slice(&1_700_000_000i64.to_ne_bytes());
+        if call(Syscall::Settimeofday.raw(), a1(tv.as_ptr() as u64, 0)) != Some(-1) {
+            return Err("namespace-bound capabilities reached the host clock");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace
+);
+
+/// `fs/namespace.c::may_mount` gates mount(2) on the MOUNT namespace's owner:
+///
+///     return ns_capable(current->nsproxy->mnt_ns->user_ns, CAP_SYS_ADMIN);
+///
+/// So the two arms below differ only in whether the caller unshared a mount
+/// namespace, and they must differ in outcome. A container that unshared one
+/// owns it and may mount inside it; a task that unshared only a USER
+/// namespace is still using the host's mount namespace, whose owner is the
+/// initial user namespace, and may not.
+///
+/// Asking the host question for both — what `capable()` does — gets one of
+/// them wrong whichever way the caller's credentials happen to fall.
+fn smoke_abi_caps_mount_follows_the_mount_namespace_owner() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWNS: u64 = 0x0002_0000;
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        let tgt = b"/mnt\0";
+        let fst = b"tmpfs\0";
+        let src = b"none\0";
+
+        // Arm 1: a user namespace only. The host mount namespace is out of
+        // reach, so mount is -EPERM.
+        drop_all_caps();
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) != Some(0) {
+            return Err("unshare(CLONE_NEWUSER) failed");
+        }
+        if call(
+            Syscall::Mount.raw(),
+            a4(
+                src.as_ptr() as u64,
+                tgt.as_ptr() as u64,
+                fst.as_ptr() as u64,
+                0,
+                0,
+            ),
+        ) != Some(-1)
+        {
+            return Err("a user namespace alone allowed a host mount");
+        }
+
+        // Arm 2: unshare the mount namespace too. The caller now owns it, so
+        // the capability gate passes — whatever the mount itself then does,
+        // it must not be -EPERM.
+        if call(Syscall::Unshare.raw(), a0(CLONE_NEWNS)) != Some(0) {
+            return Err("unshare(CLONE_NEWNS) was refused inside a user namespace");
+        }
+        match call(
+            Syscall::Mount.raw(),
+            a4(
+                src.as_ptr() as u64,
+                tgt.as_ptr() as u64,
+                fst.as_ptr() as u64,
+                0,
+                0,
+            ),
+        ) {
+            Some(-1) => Err("owner of a mount namespace was refused a mount inside it"),
+            Some(_) => Ok(()),
+            None => Err("mount inside a private namespace returned InvalidOp"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_mount_follows_the_mount_namespace_owner
+);
+
 fn smoke_abi_caps_unshare_needs_sys_admin_except_newuser() -> TestResult {
     with_setup(|| {
         // `unshare_nsproxy_namespaces` gates CLONE_NEWNS|NEWUTS|NEWIPC|

@@ -2286,6 +2286,20 @@ pub fn drm_prime_export(card_index: u32, gem_handle: u32) -> Option<Arc<dyn File
     f(card_index, gem_handle)
 }
 
+/// The user namespace owning a namespace-scoped resource — Linux's
+/// `mnt_ns->user_ns`, fixed at creation by `copy_mnt_ns`.
+///
+/// `narf-filesystem` sits BELOW the namespace layer and cannot name
+/// `UserNamespace`, so it holds the owner opaquely and the layer above
+/// downcasts it back. Storing it IN the namespace, rather than in a side
+/// table keyed by namespace id, gives the owner exactly the mount
+/// namespace's lifetime: a table would keep every user namespace that ever
+/// owned a mount namespace alive, and would have to be pruned from a place
+/// that cannot see when the last reference goes away.
+pub trait NsOwner: Send + Sync + core::fmt::Debug {
+    fn as_any(&self) -> &dyn core::any::Any;
+}
+
 /// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
 /// per-task NS can diverge from the global registry without
 /// affecting it.
@@ -2294,12 +2308,17 @@ pub struct MountNamespace {
     /// Stable namespace id (nsfs inode in Linux), drawn from the
     /// process-global `NsId` counter via `NS_ID_ALLOC_HOOK`.
     id: u64,
+    /// `mnt_ns->user_ns`: the user namespace of the task that created this
+    /// one. `mount(2)` is gated on CAP_SYS_ADMIN *here*, not in the host
+    /// namespace. `None` is the initial user namespace — every mount
+    /// namespace built before any `unshare(CLONE_NEWUSER)`.
+    owner: Option<Arc<dyn NsOwner>>,
     inner: IrqSafeSpinLock<Vec<Mount>>,
     mountinfo_generation: core::sync::atomic::AtomicU64,
 }
 
 impl MountNamespace {
-    fn from_mounts(mounts: &[Mount]) -> Arc<Self> {
+    fn from_mounts(mounts: &[Mount], owner: Option<Arc<dyn NsOwner>>) -> Arc<Self> {
         let copied = mounts
             .iter()
             .map(|m| Mount {
@@ -2311,6 +2330,7 @@ impl MountNamespace {
             .collect();
         Arc::new(Self {
             id: alloc_mount_ns_id(),
+            owner,
             inner: IrqSafeSpinLock::new(copied),
             mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
         })
@@ -2321,8 +2341,20 @@ impl MountNamespace {
     /// `Arc<dyn FsInstance>` — a bind-mount-style relationship,
     /// not a deep copy.
     pub fn snapshot_global() -> Arc<Self> {
+        Self::snapshot_global_owned_by(None)
+    }
+
+    /// [`Self::snapshot_global`] recording the creating task's user
+    /// namespace, per `copy_mnt_ns`'s `new_ns->user_ns = get_user_ns(user_ns)`.
+    pub fn snapshot_global_owned_by(owner: Option<Arc<dyn NsOwner>>) -> Arc<Self> {
         let g = REGISTRY.inner.lock();
-        Self::from_mounts(&g)
+        Self::from_mounts(&g, owner)
+    }
+
+    /// The user namespace this mount namespace belongs to, if it is not the
+    /// initial one. The caller downcasts through [`NsOwner::as_any`].
+    pub fn owner(&self) -> Option<&Arc<dyn NsOwner>> {
+        self.owner.as_ref()
     }
 
     /// Copy this namespace's current mount table into a new namespace.
@@ -2330,8 +2362,16 @@ impl MountNamespace {
     /// Linux `unshare(CLONE_NEWNS)` and `clone(CLONE_NEWNS)` copy the
     /// caller's current namespace, including mounts private to it.
     pub fn snapshot(&self) -> Arc<Self> {
+        self.snapshot_owned_by(None)
+    }
+
+    /// [`Self::snapshot`] recording the creating task's user namespace. The
+    /// owner is the UNSHARING task's, not the parent namespace's — a task
+    /// that unshares a user namespace and then a mount namespace owns the
+    /// result even though it copied a table it did not own.
+    pub fn snapshot_owned_by(&self, owner: Option<Arc<dyn NsOwner>>) -> Arc<Self> {
         let g = self.inner.lock();
-        Self::from_mounts(&g)
+        Self::from_mounts(&g, owner)
     }
 
     /// Stable namespace id (nsfs inode in Linux).

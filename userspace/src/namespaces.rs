@@ -719,6 +719,14 @@ pub struct UserNamespace {
     inner: IrqSafeSpinLock<UserInner>,
 }
 
+/// A user namespace can own a mount namespace. `narf-filesystem` holds the
+/// owner opaquely (it sits below this layer); this is the downcast target.
+impl narf_filesystem::NsOwner for UserNamespace {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+}
+
 impl UserNamespace {
     /// The initial (host/root) user namespace: identity map for the
     /// full id range, no parent. Created lazily and shared.

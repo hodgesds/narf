@@ -31,7 +31,7 @@ pub(crate) fn sys_setgid(ctx: &mut dyn TrapContext) {
         }
     }
     let old = read_uidgid(task);
-    let ok = if capable(CAP_SETGID) {
+    let ok = if capable_in_own_ns(CAP_SETGID) {
         write_uidgid(task, |e| {
             e.gid = gid;
             e.egid = gid;

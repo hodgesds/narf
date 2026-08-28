@@ -2241,9 +2241,34 @@ pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::Mou
 
 pub(crate) fn snapshot_current_mount_namespace() -> alloc::sync::Arc<narf_filesystem::MountNamespace>
 {
+    // `copy_mnt_ns` stamps the UNSHARING task's user namespace onto the new
+    // mount namespace, which is what `mount(2)`'s CAP_SYS_ADMIN check is
+    // later measured against. Without it a task that unshared a user
+    // namespace and then a mount namespace would own neither as far as the
+    // capability check could tell, and could not mount inside its own.
+    let owner = mount_ns_owner_for(current_task_id());
     current_mount_namespace()
-        .map(|ns| ns.snapshot())
-        .unwrap_or_else(narf_filesystem::MountNamespace::snapshot_global)
+        .map(|ns| ns.snapshot_owned_by(owner.clone()))
+        .unwrap_or_else(|| narf_filesystem::MountNamespace::snapshot_global_owned_by(owner))
+}
+
+/// The creating task's user namespace as an opaque mount-namespace owner.
+/// `None` means the initial user namespace, which is also the answer in
+/// builds without the `container` feature — there are no user namespaces
+/// there, so every mount namespace is the host's.
+pub(crate) fn mount_ns_owner_for(
+    task: u64,
+) -> Option<alloc::sync::Arc<dyn narf_filesystem::NsOwner>> {
+    #[cfg(feature = "container")]
+    {
+        crate::namespaces::user_ns_of(task)
+            .map(|ns| ns as alloc::sync::Arc<dyn narf_filesystem::NsOwner>)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = task;
+        None
+    }
 }
 
 pub(crate) fn clear_current_mount_namespace_for_test() {

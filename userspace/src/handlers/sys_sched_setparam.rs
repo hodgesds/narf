@@ -96,7 +96,10 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     // TARGET's real or effective uid — the same test setpriority applies.
     let caller_euid = read_uidgid(caller).euid;
     let target = read_uidgid(task);
-    if target.uid != caller_euid && target.euid != caller_euid && !capable(CAP_SYS_NICE) {
+    // `if (!ns_capable(__task_cred(p)->user_ns, CAP_SYS_NICE)) return -EPERM;`
+    // — measured in the TARGET's user namespace, like setpriority's.
+    if target.uid != caller_euid && target.euid != caller_euid && !capable_over_task(task, CAP_SYS_NICE)
+    {
         ctx.set_return(SyscallReturn::ok((-EPERM) as u64));
         return;
     }
