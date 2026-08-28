@@ -153,9 +153,10 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // LINUX-GAP: `stat_linux_path` (core.inc.rs) checks its destination
-    // pointer BEFORE resolving, so `newfstatat(AT_FDCWD, "/missing", NULL, 0)`
-    // still reports -EFAULT where Linux reports -ENOENT. Fixing that means
-    // reordering the shared helper, which is outside this file.
+    // `stat_linux_path` resolves the pathname before it inspects the
+    // destination, matching `vfs_stat` running ahead of `cp_new_stat`, so
+    // `newfstatat(AT_FDCWD, "/missing", NULL, 0)` is -ENOENT. (This file
+    // carried a LINUX-GAP saying the opposite until the shared helper was
+    // reordered.)
     stat_linux_path(ctx, &effective, stat_out, follow_final);
 }

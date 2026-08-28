@@ -159,11 +159,30 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
                 return;
             }
-            // Null uaddr: no wait queue — immediate (POSIX-permitted) spurious
-            // wake so wake-path smokes run without a backing mapping.
-            // LINUX-GAP: Linux would fault the read and answer -EFAULT.
+            // `kernel/futex/core.c::get_futex_key`:
+            //
+            //     if (unlikely((address % sizeof(u32)) != 0)) return -EINVAL;
+            //     if (unlikely(!access_ok(uaddr, size)))      return -EFAULT;
+            //
+            // so a null word is -EFAULT (it is aligned, and fails access_ok).
+            //
+            // This used to report success — a "POSIX-permitted spurious
+            // wake" — with the stated reason being "so wake-path smokes run
+            // without a backing mapping". That is production behaviour bent
+            // to suit a test, and it turns a caller's bad pointer into a
+            // HANG rather than an error: musl's and glibc's condvar loops
+            // treat a spurious wake as "re-check the predicate and wait
+            // again", so a null futex word spins forever instead of
+            // reporting EFAULT.
+            //
+            // One kernel test DID depend on the old behaviour
+            // (`smoke_userspace_futex_wait_and_wake_no_op` passed arg0 = 0
+            // and asserted 0), which is the concrete cost of bending a
+            // syscall to suit a fixture: the fixture then pins the bend in
+            // place. It now supplies a real word and asserts the genuine
+            // outcomes instead.
             if uaddr == 0 {
-                ctx.set_return(SyscallReturn::ok(0));
+                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
                 return;
             }
             // Seqlock read: sample the wake generation BEFORE reading `*uaddr`

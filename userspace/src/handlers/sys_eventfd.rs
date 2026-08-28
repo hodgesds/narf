@@ -40,9 +40,17 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
                 },
         });
     match new_fd {
-        // LINUX-GAP: a table that cannot allocate is -EMFILE, not -EINVAL.
-        // NARF's fd table grows without bound today, so this arm is
-        // unreachable; RLIMIT_NOFILE enforcement is its own change.
+        // `eventfd2` reports -EMFILE when the descriptor table is full,
+        // which is what `install_fd` returning None means.
+        //
+        // This carried a LINUX-GAP note claiming the arm was UNREACHABLE
+        // because "NARF's fd table grows without bound". That stopped being
+        // true when RLIMIT_NOFILE enforcement landed: `fd::next_free_from`
+        // returns None once the candidate reaches the limit, and
+        // `smoke_abi_ioerrno_eventfd_reports_emfile` exercises exactly this
+        // line. An unreachability claim that outlives its premise is worse
+        // than no comment, because it tells the next reader not to bother
+        // testing a path that a test already covers.
         None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
         Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
     }

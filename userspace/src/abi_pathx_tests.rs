@@ -3408,3 +3408,106 @@ fn smoke_abi_pathx_chdir_needs_search_permission() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_chdir_needs_search_permission);
+
+// ─────────────────────────────────────────────────────────────────────
+// Comments that were protecting bugs
+//
+// Each of these had a note explaining why the divergence was acceptable.
+// Two of the three explanations had stopped being true, and one was never
+// a justification at all — it described bending production behaviour to
+// suit a test.
+// ─────────────────────────────────────────────────────────────────────
+
+fn smoke_abi_pathx_futex_null_word_is_efault() -> TestResult {
+    with_setup(|| {
+        // `get_futex_key`: a null word is aligned but fails access_ok, so
+        // -EFAULT. This returned SUCCESS — a "POSIX-permitted spurious
+        // wake" — with the comment explaining it existed "so wake-path
+        // smokes run without a backing mapping".
+        //
+        // The consequence is worse than a wrong errno: musl's and glibc's
+        // condvar loops treat a spurious wake as "re-check and wait again",
+        // so a caller with a null or corrupted futex word spun forever
+        // instead of being told its pointer was bad.
+        const FUTEX_WAIT: u64 = 0;
+        match call(Syscall::Futex.raw(), a3(0, FUTEX_WAIT, 0, 0)) {
+            Some(-14) => Ok(()),
+            Some(0) => Err("FUTEX_WAIT on a null word reported a spurious wake, not -EFAULT"),
+            _ => Err("FUTEX_WAIT on a null word should be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_futex_null_word_is_efault);
+
+fn smoke_abi_pathx_fchdir_needs_search_permission() -> TestResult {
+    with_memfs("/fcd", "fcd", &[("f", b"x")], || {
+        // `file_permission(fd_file(f), MAY_EXEC | MAY_CHDIR)` — holding an
+        // open descriptor is not itself authority to make the directory a
+        // cwd. Permissions can change after the open, and Linux re-checks
+        // rather than trusting the fd.
+        const O_DIRECTORY: u64 = 0o200000;
+        let dir = b"/fcd\0";
+        let fd = match call_open(dir.as_ptr() as u64, O_DIRECTORY) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening the directory failed"),
+        };
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o000)) != Some(0) {
+            return Err("chmod setup failed");
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        match call(Syscall::Fchdir.raw(), a0(fd)) {
+            Some(-13) => Ok(()),
+            Some(0) => Err("fchdir into an unsearchable directory succeeded via a held fd"),
+            _ => Err("fchdir on a 0000 directory should be -EACCES"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_fchdir_needs_search_permission
+);
+
+fn smoke_abi_pathx_fchdir_ebadf_precedes_eacces() -> TestResult {
+    with_setup(|| {
+        // Ordering: file_permission runs after the descriptor checks, so a
+        // descriptor the table does not know is still -EBADF for an
+        // unprivileged caller.
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        match call(Syscall::Fchdir.raw(), a0(4242)) {
+            Some(-9) => Ok(()),
+            Some(-13) => Err("fchdir checked permission before the descriptor"),
+            _ => Err("fchdir(bad fd) should be -EBADF"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_fchdir_ebadf_precedes_eacces);
+
+fn smoke_abi_pathx_ioprio_rt_class_is_privileged() -> TestResult {
+    with_setup(|| {
+        // `ioprio_check_cap`: IOPRIO_CLASS_RT needs CAP_SYS_NICE or
+        // CAP_SYS_ADMIN. This was unenforced on the argument that the class
+        // "is already inert" without an I/O scheduler — but the value
+        // round-trips through ioprio_get, so an unprivileged task could
+        // read back a real-time reservation it was never granted.
+        const RT: u64 = 1 << 13;
+        const CAP_SYS_NICE_BITS: u64 = 1 << 23;
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        match call(Syscall::IoprioSet.raw(), a2(1, 0, RT | 3)) {
+            Some(-1) => {}
+            Some(0) => return Err("an unprivileged task claimed IOPRIO_CLASS_RT"),
+            _ => return Err("unprivileged ioprio_set(RT) should be -EPERM"),
+        }
+        // And the state stays honest: the refused request left no value
+        // behind for ioprio_get to report.
+        match call(Syscall::IoprioGet.raw(), a1(1, 0)) {
+            Some(v) if v as u64 == (2u64 << 13) | 4 => {}
+            _ => return Err("a refused ioprio_set still altered the reported class"),
+        }
+        crate::handlers::__test_set_caps(FAKE_TASK, CAP_SYS_NICE_BITS, CAP_SYS_NICE_BITS);
+        match call(Syscall::IoprioSet.raw(), a2(1, 0, RT | 3)) {
+            Some(0) => Ok(()),
+            _ => Err("CAP_SYS_NICE should permit IOPRIO_CLASS_RT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_ioprio_rt_class_is_privileged);

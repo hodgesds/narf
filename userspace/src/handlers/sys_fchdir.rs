@@ -22,8 +22,9 @@ use super::*;
 /// cwd with `fchdir` and treats a failure there as fatal, so the errno is
 /// what tells the caller "the fd went away" from "you handed me a file".
 ///
-/// LINUX-GAP: -EACCES from `file_permission(MAY_EXEC|MAY_CHDIR)` on a
-/// search-forbidden directory is not modelled here.
+/// `file_permission(MAY_EXEC | MAY_CHDIR)` runs LAST, after both of those,
+/// so a bad descriptor is still -EBADF and a non-directory still -ENOTDIR
+/// for a caller that also lacks search permission.
 pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // Linux declares `unsigned int fd`, so a negative fd wraps to a huge
@@ -53,6 +54,15 @@ pub(crate) fn sys_fchdir(ctx: &mut dyn TrapContext) {
         // `d_can_lookup()` failing, i.e. -ENOTDIR (never -ENOENT: the fd
         // pinned the object, so it cannot have gone missing).
         ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
+        return;
+    }
+    // `error = file_permission(fd_file(f), MAY_EXEC | MAY_CHDIR);` — the
+    // same search check sys_chdir applies to its target. Holding an open
+    // descriptor is not itself authority to make the directory a cwd:
+    // permissions can have changed since the open, and Linux re-checks
+    // here rather than trusting the fd.
+    if !dir_search_permitted(&abs, task) {
+        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
         return;
     }
     task_map_set(&CWD_TABLE, task, user_abs);
