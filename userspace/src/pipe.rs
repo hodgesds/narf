@@ -236,6 +236,62 @@ impl PipeBufs {
         }
     }
 
+    /// Duplicate up to `max` bytes into `dst` WITHOUT consuming them, carrying
+    /// each frame's packet flag — the tee(2) counterpart of
+    /// [`Self::move_prefix_to`].
+    ///
+    /// `fs/splice.c::link_pipe` copies whole `struct pipe_buffer`s and keeps
+    /// their flags:
+    ///
+    ///     *obuf = *ibuf;
+    ///     obuf->flags &= ~PIPE_BUF_FLAG_GIFT;
+    ///     obuf->flags &= ~PIPE_BUF_FLAG_CAN_MERGE;
+    ///     if (obuf->len > len)
+    ///             obuf->len = len;
+    ///
+    /// so PIPE_BUF_FLAG_PACKET survives a tee and the destination reads back
+    /// the same records the source holds. The final buffer may be TRUNCATED to
+    /// the caller's remaining length and still keeps its flag — a short tee of
+    /// a packet yields a shorter packet, not a stream fragment.
+    ///
+    /// Its loop stops on `pipe_full(o_head, o_tail, opipe->max_usage)`, a
+    /// buffer-count test, which is what `dst.room` reproduces.
+    ///
+    /// The one flag not modelled is CAN_MERGE: Linux clears it so a later
+    /// write on the destination cannot extend a teed buffer, whereas
+    /// [`Self::push_frame`] will merge into it. That is unobservable to a
+    /// reader — non-packet boundaries are invisible to `pipe_read` — and it
+    /// only shifts the destination's buffer COUNT, which already diverges
+    /// because this queue merges past the page boundary Linux stops at.
+    /// Modelling half of the merge rule would make that divergence less
+    /// predictable, not more.
+    fn copy_prefix_to(&self, dst: &mut PipeBufs, max: usize) -> usize {
+        let mut copied = 0;
+        // Byte offset of the current frame within `bytes`. `VecDeque::range`
+        // seeks in O(1), so this stays linear in the bytes actually copied.
+        let mut offset = 0;
+        for frame in self.frames.iter() {
+            if copied >= max {
+                break;
+            }
+            let room = dst.room(frame.packet);
+            let n = core::cmp::min(core::cmp::min(max - copied, frame.len), room);
+            if n == 0 {
+                break;
+            }
+            dst.bytes
+                .extend(self.bytes.range(offset..offset + n).copied());
+            dst.push_frame(n, frame.packet);
+            copied += n;
+            if n < frame.len {
+                // Truncated tail buffer — nothing after it can be copied.
+                break;
+            }
+            offset += frame.len;
+        }
+        copied
+    }
+
     /// Move up to `max` bytes into `dst`, carrying each frame's packet flag.
     ///
     /// `fs/splice.c` moves whole `struct pipe_buffer`s between pipes rather
@@ -526,6 +582,51 @@ impl PipeRead {
         Ok(moved)
     }
 
+    /// Duplicate a prefix into another pipe without consuming it — tee(2).
+    ///
+    /// Locking both queues in stable address order is the same ABBA guard
+    /// `fs/splice.c::link_pipe` documents ("two different processes could
+    /// deadlock (one doing tee from A -> B, the other from B -> A)") and that
+    /// [`Self::splice_to_pipe`] already uses.
+    pub(crate) fn tee_to(
+        &self,
+        dst: &PipeWrite,
+        max: usize,
+    ) -> Result<usize, narf_filesystem::FsError> {
+        if Arc::ptr_eq(&self.shared, &dst.shared) {
+            // `if (!ipipe || !opipe || ipipe == opipe) return -EINVAL;`
+            return Err(narf_filesystem::FsError::InvalidData);
+        }
+        if dst.shared.reader_closed.load(Ordering::Acquire) {
+            // `if (!opipe->readers) { send_sig(SIGPIPE, ...); ret = -EPIPE; }`
+            return Err(narf_filesystem::FsError::BrokenPipe);
+        }
+        let writer_closed = self.shared.writer_closed.load(Ordering::Acquire);
+        let src_addr = Arc::as_ptr(&self.shared) as usize;
+        let dst_addr = Arc::as_ptr(&dst.shared) as usize;
+        let (copied, dst_was_empty) = if src_addr < dst_addr {
+            let src = self.shared.queue.lock();
+            let mut dstq = dst.shared.queue.lock();
+            copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
+        } else {
+            let mut dstq = dst.shared.queue.lock();
+            let src = self.shared.queue.lock();
+            copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
+        };
+
+        if dst_was_empty && copied != 0 {
+            dst.shared.readable_token.fetch_add(1, Ordering::Release);
+        }
+        if copied != 0 {
+            // Only the destination changed: tee leaves the source queue intact,
+            // so the source's readiness is unchanged and must not be
+            // republished as an edge.
+            dst.shared.sync_readiness();
+            narf_net::readiness::notify(0);
+        }
+        Ok(copied)
+    }
+
     /// Copy the current pipe prefix to `dst`, consuming it only after the
     /// guarded user copy succeeds.  Keeping the queue lock across the copy is
     /// deliberate: another reader must not consume or reorder the prefix
@@ -598,6 +699,30 @@ impl PipeRead {
         narf_net::readiness::notify(0);
         Ok(n)
     }
+}
+
+fn copy_pipe_prefix(
+    src: &PipeBufs,
+    dst: &mut PipeBufs,
+    max: usize,
+    writer_closed: bool,
+) -> Result<(usize, bool), narf_filesystem::FsError> {
+    if src.is_empty() {
+        // `ipipe_prep`: an empty source is end-of-stream only once the last
+        // writer is gone; otherwise the caller waits or takes -EAGAIN.
+        return if writer_closed {
+            Ok((0, dst.is_empty()))
+        } else {
+            Err(narf_filesystem::FsError::WouldBlock)
+        };
+    }
+    let dst_was_empty = dst.is_empty();
+    let copied = src.copy_prefix_to(dst, max);
+    if copied == 0 {
+        // The destination could not take even the head buffer.
+        return Err(narf_filesystem::FsError::WouldBlock);
+    }
+    Ok((copied, dst_was_empty))
 }
 
 fn move_pipe_prefix(

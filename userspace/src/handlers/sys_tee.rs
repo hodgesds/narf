@@ -67,7 +67,45 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Peek without consuming: tee leaves the source queue intact.
+    // Anonymous pipe on both sides: duplicate buffers directly, so each
+    // buffer's PIPE_BUF_FLAG_PACKET reaches the destination.
+    // `fs/splice.c::link_pipe` copies `*obuf = *ibuf` and clears only GIFT and
+    // CAN_MERGE, so a teed packet is still a packet on the far side. Going
+    // through `pipe_peek` + the destination's ordinary `write` instead handed
+    // the payload to the destination's OWN framing: teeing a packet pipe ran
+    // every record together, and teeing into a packet pipe invented record
+    // boundaries the source never had.
+    let paired = input
+        .ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        .zip(
+            output
+                .ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>()),
+        );
+    if let Some((pipe_in, pipe_out)) = paired {
+        match pipe_in.tee_to(pipe_out, len) {
+            // 0 reaches here only from `ipipe_prep`'s end-of-stream arm — an
+            // empty source whose last writer is gone. Every other empty-source
+            // case is WouldBlock below, so a caller never reads a transient
+            // empty pipe as EOF.
+            Ok(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
+            Err(narf_filesystem::FsError::WouldBlock) => {
+                tee_wait(ctx, task, &input, &output, flags);
+            }
+            Err(narf_filesystem::FsError::BrokenPipe) => {
+                raise_signal_pending(task, 13); // SIGPIPE
+                ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+            }
+            Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
+        }
+        return;
+    }
+
+    // Fallback for a FIFO that is not an anonymous pipe pair: peek without
+    // consuming (tee leaves the source queue intact) and write the bytes.
     let data = input.ops.pipe_peek(len).unwrap_or_default();
     if data.is_empty() {
         // An empty pipe whose write end is still open is NOT end-of-stream.
@@ -125,4 +163,47 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
         Some(Err(error)) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
         None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
     }
+}
+
+/// `tee_to` reports WouldBlock for two distinct states — an empty source with
+/// its writer still open, and a destination with no room — and Linux waits on
+/// a different pipe in each case (`ipipe_prep` on the source, the output-room
+/// loop on the destination). Park on whichever is actually blocking, or the
+/// caller sleeps on an fd that will never signal.
+fn tee_wait(
+    ctx: &mut dyn TrapContext,
+    task: u64,
+    input: &CopyFdEndpoint,
+    output: &CopyFdEndpoint,
+    flags: u64,
+) {
+    const SPLICE_F_NONBLOCK: u64 = 0x2;
+    let source_empty = input.ops.poll_readiness() & narf_filesystem::POLL_IN == 0;
+    if flags & SPLICE_F_NONBLOCK != 0 || input.nonblocking() || output.nonblocking() {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+    if source_empty && has_interrupting_signal(task) {
+        // `ipipe_prep` returns -ERESTARTSYS from the source wait only.
+        ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+        return;
+    }
+    // Nothing has been consumed or published, so re-executing the whole tee is
+    // safe from either wait.
+    let (ops, mask) = if source_empty {
+        (
+            input.ops.as_ref(),
+            narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+        )
+    } else {
+        (
+            output.ops.as_ref(),
+            narf_filesystem::POLL_OUT | narf_filesystem::POLL_ERR,
+        )
+    };
+    if park_reexecute_on_fd(ctx, ops, mask) {
+        return;
+    }
+    // Kernel-test context cannot park; report the non-blocking answer.
+    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
 }
