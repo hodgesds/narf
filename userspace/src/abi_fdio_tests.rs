@@ -1211,6 +1211,229 @@ kernel_test_in!(
     smoke_abi_fdio_fcntl_setfl_direct_reframes_pipe_writes
 );
 
+/// `fs/splice.c::link_pipe` copies whole `struct pipe_buffer`s into the
+/// destination and clears only GIFT and CAN_MERGE — `PIPE_BUF_FLAG_PACKET`
+/// survives. So teeing a packet pipe into an ORDINARY pipe hands the reader
+/// the source's records, not the destination's framing.
+///
+/// Routing tee through a byte peek plus the destination's own `write` gave the
+/// payload the destination's framing instead, running every record together.
+/// The source must also still hold its data afterwards: tee copies, it does
+/// not consume.
+fn smoke_abi_fdio_tee_carries_packet_framing_to_a_stream_pipe() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let (src_rd, src_wr) = make_packet_pipe(O_NONBLOCK)?;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2 for the tee destination failed");
+        }
+        let dst_rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let dst_wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+
+        for payload in [b"abc".as_slice(), b"defgh".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(src_wr, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(payload.len() as i64)
+            {
+                return Err("priming the packet source failed");
+            }
+        }
+        // Both records, 8 bytes, in one tee.
+        if call(Syscall::Tee.raw(), a3(src_rd, dst_wr, 64, 0)) != Some(8) {
+            return Err("tee did not duplicate both records");
+        }
+        // The destination is an ORDINARY pipe, yet reads back records: the
+        // flag travelled with the payload. Without it this first read takes
+        // all 8 bytes.
+        let mut dst = [0u8; 64];
+        if call(Syscall::Read.raw(), a2(dst_rd, dst.as_mut_ptr() as u64, 64)) != Some(3) {
+            return Err("teed packet lost its boundary in the destination");
+        }
+        if &dst[..3] != b"abc" {
+            return Err("teed first record has the wrong bytes");
+        }
+        if call(Syscall::Read.raw(), a2(dst_rd, dst.as_mut_ptr() as u64, 64)) != Some(5) {
+            return Err("teed second record missing or merged");
+        }
+        // tee does not consume: the source still holds both records.
+        if call(Syscall::Read.raw(), a2(src_rd, dst.as_mut_ptr() as u64, 64)) != Some(3) {
+            return Err("tee consumed the source pipe");
+        }
+        if call(Syscall::Read.raw(), a2(src_rd, dst.as_mut_ptr() as u64, 64)) != Some(5) {
+            return Err("tee disturbed the source's second record");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_tee_carries_packet_framing_to_a_stream_pipe
+);
+
+/// The converse: teeing a BYTE-STREAM pipe into a packet pipe must not invent
+/// records. `link_pipe` copies the source buffer's flags, so a non-packet
+/// buffer stays non-packet however the destination was opened — the
+/// destination's O_DIRECT governs its own `write` calls, not data teed into
+/// it.
+///
+/// Two 4-byte tees are what separate the two implementations: framed by the
+/// destination they arrive as two 4-byte packets and the first read returns 4;
+/// carried from the source they are ordinary bytes that coalesce, and the read
+/// returns all 8.
+fn smoke_abi_fdio_tee_does_not_invent_records_in_a_packet_pipe() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2 for the stream source failed");
+        }
+        let src_rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let src_wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let (dst_rd, dst_wr) = make_packet_pipe(O_NONBLOCK)?;
+
+        let payload = b"abcdefgh";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(8)
+        {
+            return Err("priming the stream source failed");
+        }
+        // tee does not consume, so both calls copy the same leading 4 bytes.
+        for _ in 0..2 {
+            if call(Syscall::Tee.raw(), a3(src_rd, dst_wr, 4, 0)) != Some(4) {
+                return Err("4-byte tee did not copy 4 bytes");
+            }
+        }
+        let mut dst = [0u8; 64];
+        if call(Syscall::Read.raw(), a2(dst_rd, dst.as_mut_ptr() as u64, 64)) != Some(8) {
+            return Err("tee framed stream bytes as packets in the destination");
+        }
+        if &dst[..8] != b"abcdabcd" {
+            return Err("teed stream bytes came back wrong");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_tee_does_not_invent_records_in_a_packet_pipe
+);
+
+/// `link_pipe` truncates its LAST buffer to the caller's remaining length and
+/// keeps the flag:
+///
+///     if (obuf->len > len)
+///             obuf->len = len;
+///
+/// so a short tee of a packet yields a SHORTER PACKET, not a stream fragment.
+/// Two 4-byte tees of one 10-byte record must therefore arrive as two separate
+/// 4-byte records; if the flag were dropped on truncation they would coalesce
+/// and the first read would return 8.
+fn smoke_abi_fdio_tee_truncated_packet_keeps_its_flag() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let (src_rd, src_wr) = make_packet_pipe(O_NONBLOCK)?;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2 for the tee destination failed");
+        }
+        let dst_rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let dst_wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+
+        let payload = b"0123456789";
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(10)
+        {
+            return Err("priming the packet source failed");
+        }
+        for _ in 0..2 {
+            if call(Syscall::Tee.raw(), a3(src_rd, dst_wr, 4, 0)) != Some(4) {
+                return Err("short tee of a packet did not copy 4 bytes");
+            }
+        }
+        let mut dst = [0u8; 64];
+        if call(Syscall::Read.raw(), a2(dst_rd, dst.as_mut_ptr() as u64, 64)) != Some(4) {
+            return Err("truncated packet lost its flag on tee");
+        }
+        if &dst[..4] != b"0123" {
+            return Err("truncated packet has the wrong bytes");
+        }
+        if call(Syscall::Read.raw(), a2(dst_rd, dst.as_mut_ptr() as u64, 64)) != Some(4) {
+            return Err("second truncated packet missing");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_tee_truncated_packet_keeps_its_flag
+);
+
+/// `link_pipe`'s loop stops on `pipe_full(o_head, o_tail, opipe->max_usage)` —
+/// a BUFFER-count test on the destination. A destination holding 16 packets
+/// takes nothing more, so a non-blocking tee is -EAGAIN rather than a partial
+/// copy or a 0 the caller would read as end-of-stream.
+///
+/// The EOF arm is the contrast that gives the EAGAIN its meaning: 0 is
+/// reserved for a source whose last writer is gone (`ipipe_prep`).
+fn smoke_abi_fdio_tee_full_destination_is_eagain() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        const SPLICE_F_NONBLOCK: u64 = 0x2;
+        let (src_rd, src_wr) = make_packet_pipe(O_NONBLOCK)?;
+        let (_dst_rd, dst_wr) = make_packet_pipe(O_NONBLOCK)?;
+        let byte = b"x";
+        if call(Syscall::Write.raw(), a2(src_wr, byte.as_ptr() as u64, 1)) != Some(1) {
+            return Err("priming the tee source failed");
+        }
+        // Fill the destination's 16 buffers with 16 bytes.
+        for _ in 0..16 {
+            if call(Syscall::Write.raw(), a2(dst_wr, byte.as_ptr() as u64, 1)) != Some(1) {
+                return Err("filling the tee destination failed");
+            }
+        }
+        if call(
+            Syscall::Tee.raw(),
+            a3(src_rd, dst_wr, 64, SPLICE_F_NONBLOCK),
+        ) != Some(EAGAIN)
+        {
+            return Err("tee into a buffer-full destination was not -EAGAIN");
+        }
+        // Contrast: an empty source whose writer is gone is a real EOF (0).
+        let (eof_rd, eof_wr) = make_packet_pipe(O_NONBLOCK)?;
+        if call(Syscall::Close.raw(), a0(eof_wr)) != Some(0) {
+            return Err("closing the tee source writer failed");
+        }
+        let (_spare_rd, spare_wr) = make_packet_pipe(O_NONBLOCK)?;
+        if call(
+            Syscall::Tee.raw(),
+            a3(eof_rd, spare_wr, 64, SPLICE_F_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("tee from a writerless empty source was not EOF");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_tee_full_destination_is_eagain);
+
 /// `pipe_write` copies at most one page into each buffer
 /// (`copy_page_from_iter(page, 0, PAGE_SIZE, from)`) and loops, so a packet
 /// write LARGER than a page becomes several packets rather than one oversized
