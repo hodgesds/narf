@@ -858,8 +858,9 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_neg);
 
 /// pipe2(2) flag validation — `fs/pipe.c::do_pipe2`: any flag outside
 /// O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL.
-/// LINUX-GAP: NARF also rejects O_DIRECT (packet mode unimplemented) with
-/// -EINVAL, where Linux would accept it.
+/// LINUX-GAP: O_NOTIFICATION_PIPE (watch queues) is unimplemented and is
+/// rejected here rather than ignored, so a caller sees "unsupported" instead
+/// of an ordinary pipe on which its watches never fire.
 fn smoke_abi_fdio_pipe2_bad_flags_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 8];
@@ -868,15 +869,388 @@ fn smoke_abi_fdio_pipe2_bad_flags_neg() -> TestResult {
         if call(Syscall::Pipe2.raw(), a1(buf.as_mut_ptr() as u64, O_APPEND)) != Some(EINVAL) {
             return Err("pipe2(O_APPEND) was not -EINVAL");
         }
-        // O_DIRECT (packet mode): unimplemented → -EINVAL (LINUX-GAP above).
-        const O_DIRECT: u64 = 0o40000;
-        if call(Syscall::Pipe2.raw(), a1(buf.as_mut_ptr() as u64, O_DIRECT)) != Some(EINVAL) {
-            return Err("pipe2(O_DIRECT) was not -EINVAL");
+        // O_NOTIFICATION_PIPE (0x0080_0000) — a real pipe2 flag on Linux, but
+        // unimplemented here, so still -EINVAL (LINUX-GAP above).
+        const O_NOTIFICATION_PIPE: u64 = 0x0080_0000;
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NOTIFICATION_PIPE),
+        ) != Some(EINVAL)
+        {
+            return Err("pipe2(O_NOTIFICATION_PIPE) was not -EINVAL");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_bad_flags_neg);
+
+const O_DIRECT_FLAG: u64 = 0o40000;
+
+/// Open a packet-mode pipe, returning `(read fd, write fd)`.
+fn make_packet_pipe(extra: u64) -> Result<(u64, u64), &'static str> {
+    let mut buf = [0u8; 8];
+    if call(
+        Syscall::Pipe2.raw(),
+        a1(buf.as_mut_ptr() as u64, O_DIRECT_FLAG | extra),
+    ) != Some(0)
+    {
+        return Err("pipe2(O_DIRECT) failed");
+    }
+    let rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+    let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+    Ok((rd, wr))
+}
+
+/// `pipe2(O_DIRECT)` is packet mode: `pipe_write` gives each write its own
+/// buffer tagged `PIPE_BUF_FLAG_PACKET` (`fs/pipe.c::is_packetized`), and
+/// `pipe_read` stops at the end of one such buffer:
+///
+///     /* Was it a packet buffer? Clean up and exit */
+///     if (buf->flags & PIPE_BUF_FLAG_PACKET) {
+///             total_len = chars;
+///             buf->len = 0;
+///     }
+///
+/// So a read large enough for both records still returns only the first. The
+/// byte-stream control arm is the point of the test: without it, a read that
+/// returned 3 could simply mean the second write had not landed yet.
+fn smoke_abi_fdio_pipe2_direct_preserves_record_boundaries() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let (rd, wr) = make_packet_pipe(O_NONBLOCK)?;
+        for payload in [b"abc".as_slice(), b"defgh".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(payload.len() as i64)
+            {
+                return Err("packet-pipe write failed");
+            }
+        }
+        // One read, buffer far larger than both records: exactly the first.
+        let mut dst = [0u8; 64];
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(3) {
+            return Err("packet read crossed a record boundary");
+        }
+        if &dst[..3] != b"abc" {
+            return Err("packet read returned the wrong first record");
+        }
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(5) {
+            return Err("second packet read did not return the second record");
+        }
+        if &dst[..5] != b"defgh" {
+            return Err("packet read returned the wrong second record");
+        }
+        // Control: the same two writes on a byte-stream pipe coalesce, so a
+        // 64-byte read takes all 8 bytes at once. This is what proves the
+        // boundary above came from O_DIRECT and not from write scheduling.
+        let (rd2, wr2) = make_pipe()?;
+        for payload in [b"abc".as_slice(), b"defgh".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr2 as u64, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(payload.len() as i64)
+            {
+                return Err("stream-pipe write failed");
+            }
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(rd2 as u64, dst.as_mut_ptr() as u64, 64),
+        ) != Some(8)
+        {
+            return Err("stream pipe did not coalesce two writes into one read");
+        }
+        if &dst[..8] != b"abcdefgh" {
+            return Err("stream pipe returned the wrong bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe2_direct_preserves_record_boundaries
+);
+
+/// `buf->len = 0` in the packet arm of `pipe_read` retires the whole buffer
+/// however few bytes were copied, so a read too small for the packet returns
+/// the truncated prefix and the REMAINDER IS LOST — pipe(7): "the excess bytes
+/// in the packet are discarded".
+///
+/// This is the arm most easily got wrong by returning the leftover on the next
+/// read, which silently turns one record into two and desynchronises every
+/// subsequent one. The O_NONBLOCK EAGAIN is what makes "nothing left" testable
+/// without blocking.
+fn smoke_abi_fdio_pipe2_direct_short_read_discards_remainder() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let (rd, wr) = make_packet_pipe(O_NONBLOCK)?;
+        let payload = b"0123456789";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("packet write failed");
+        }
+        let mut dst = [0u8; 16];
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 4)) != Some(4) {
+            return Err("short packet read did not return the requested prefix");
+        }
+        if &dst[..4] != b"0123" {
+            return Err("short packet read returned the wrong prefix");
+        }
+        // The other six bytes are gone, not queued.
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 16)) != Some(EAGAIN) {
+            return Err("packet remainder survived a short read");
+        }
+        // Control: a byte-stream pipe keeps the remainder, so the same
+        // sequence yields the other six bytes. Without this, a broken read
+        // that returned EAGAIN for every follow-up would still pass above.
+        let (rd2, wr2) = make_pipe()?;
+        if call(
+            Syscall::Write.raw(),
+            a2(wr2 as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("stream write failed");
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(rd2 as u64, dst.as_mut_ptr() as u64, 4),
+        ) != Some(4)
+        {
+            return Err("stream short read did not return 4 bytes");
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(rd2 as u64, dst.as_mut_ptr() as u64, 16),
+        ) != Some(6)
+        {
+            return Err("stream pipe lost the remainder of a partially-read write");
+        }
+        if &dst[..6] != b"456789" {
+            return Err("stream pipe returned the wrong remainder");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe2_direct_short_read_discards_remainder
+);
+
+/// `pipe_full()` compares the BUFFER count against `pipe->max_usage`
+/// (`PIPE_DEF_BUFFERS` = 16), not a byte count. Each packet write claims a
+/// buffer of its own, so sixteen one-byte packets fill a 64 KiB pipe and the
+/// seventeenth write must block — -EAGAIN under O_NONBLOCK.
+///
+/// A byte-capacity-only model passes every other packet test and fails only
+/// here, by accepting writes into a pipe Linux considers full; the writer then
+/// never gets the EAGAIN it uses to switch to polling.
+fn smoke_abi_fdio_pipe2_direct_buffer_count_is_the_limit() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        let (rd, wr) = make_packet_pipe(O_NONBLOCK)?;
+        let byte = b"x";
+        for i in 0..16 {
+            if call(Syscall::Write.raw(), a2(wr, byte.as_ptr() as u64, 1)) != Some(1) {
+                return Err("packet pipe rejected a write below the buffer limit");
+            }
+            let _ = i;
+        }
+        // 16 buffers queued, 16 bytes of a 65536-byte pipe used.
+        if call(Syscall::Write.raw(), a2(wr, byte.as_ptr() as u64, 1)) != Some(EAGAIN) {
+            return Err("packet pipe accepted a 17th buffer");
+        }
+        // Draining one record frees exactly one buffer.
+        let mut dst = [0u8; 8];
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 8)) != Some(1) {
+            return Err("packet read did not return one 1-byte record");
+        }
+        if call(Syscall::Write.raw(), a2(wr, byte.as_ptr() as u64, 1)) != Some(1) {
+            return Err("freeing a buffer did not make the packet pipe writable");
+        }
+        // Control: on a byte-stream pipe those writes merge into one buffer,
+        // so seventeen of them are nowhere near full.
+        let (_rd2, wr2) = make_pipe()?;
+        for _ in 0..17 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr2 as u64, byte.as_ptr() as u64, 1),
+            ) != Some(1)
+            {
+                return Err("stream pipe hit a buffer limit it should not have");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe2_direct_buffer_count_is_the_limit
+);
+
+/// `create_pipe_files` puts O_DIRECT on the WRITE file only:
+///
+///     f = alloc_file_pseudo(inode, pipe_mnt, "",
+///                     O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT)), ...);
+///     res[0] = alloc_file_clone(f, O_RDONLY | (flags & O_NONBLOCK), ...);
+///
+/// so F_GETFL on the read end must not report it. Packet framing is a property
+/// of how records are written, and a reader that saw O_DIRECT on its own fd
+/// could reasonably conclude the pipe was in packet mode when the writer had
+/// never asked for it.
+fn smoke_abi_fdio_pipe2_direct_is_on_the_write_end_only() -> TestResult {
+    with_setup(|| {
+        const F_GETFL: u64 = 3;
+        const O_WRONLY: u64 = 1;
+        let (rd, wr) = make_packet_pipe(0)?;
+        match call(Syscall::Fcntl.raw(), a2(rd, F_GETFL, 0)) {
+            Some(v) if v as u64 & O_DIRECT_FLAG == 0 => {}
+            Some(_) => return Err("F_GETFL on the pipe read end reported O_DIRECT"),
+            None => return Err("F_GETFL on the pipe read end failed"),
+        }
+        match call(Syscall::Fcntl.raw(), a2(wr, F_GETFL, 0)) {
+            Some(v) if v as u64 & (O_DIRECT_FLAG | O_WRONLY) == O_DIRECT_FLAG | O_WRONLY => Ok(()),
+            Some(_) => Err("F_GETFL on the pipe write end lacks O_DIRECT|O_WRONLY"),
+            None => Err("F_GETFL on the pipe write end failed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe2_direct_is_on_the_write_end_only
+);
+
+/// `is_packetized(filp)` reads `filp->f_flags` on every `pipe_write`, so
+/// `fcntl(F_SETFL, O_DIRECT)` reframes subsequent writes on a pipe that was
+/// created as a byte stream — and clearing it reverts them.
+///
+/// Recording the flag only in the fd's status word would make F_GETFL claim
+/// packet mode while the writer kept emitting a byte stream; the reader would
+/// then look for record boundaries the writer never made.
+fn smoke_abi_fdio_fcntl_setfl_direct_reframes_pipe_writes() -> TestResult {
+    with_setup(|| {
+        const F_SETFL: u64 = 4;
+        const O_NONBLOCK: u64 = 0o4000;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(buf.as_mut_ptr() as u64, O_NONBLOCK),
+        ) != Some(0)
+        {
+            return Err("pipe2(O_NONBLOCK) failed");
+        }
+        let rd = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64;
+        let wr = i32::from_ne_bytes([buf[4], buf[5], buf[6], buf[7]]) as u64;
+        let mut dst = [0u8; 64];
+
+        // Created as a byte stream: two writes read back as one.
+        for payload in [b"aa".as_slice(), b"bb".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(2)
+            {
+                return Err("stream-mode write failed");
+            }
+        }
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(4) {
+            return Err("stream-mode writes did not coalesce");
+        }
+
+        // Switch to packet mode: the same pair now reads back separately.
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(wr, F_SETFL, O_NONBLOCK | O_DIRECT_FLAG),
+        ) != Some(0)
+        {
+            return Err("F_SETFL(O_DIRECT) failed");
+        }
+        for payload in [b"cc".as_slice(), b"dd".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(2)
+            {
+                return Err("packet-mode write failed");
+            }
+        }
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(2) {
+            return Err("F_SETFL(O_DIRECT) did not reframe subsequent writes");
+        }
+        if &dst[..2] != b"cc" {
+            return Err("packet-mode read returned the wrong record");
+        }
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(2) {
+            return Err("second packet-mode record missing");
+        }
+
+        // Clear it again: writes coalesce once more.
+        if call(Syscall::Fcntl.raw(), a2(wr, F_SETFL, O_NONBLOCK)) != Some(0) {
+            return Err("F_SETFL clearing O_DIRECT failed");
+        }
+        for payload in [b"ee".as_slice(), b"ff".as_slice()] {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+            ) != Some(2)
+            {
+                return Err("post-clear write failed");
+            }
+        }
+        if call(Syscall::Read.raw(), a2(rd, dst.as_mut_ptr() as u64, 64)) != Some(4) {
+            return Err("clearing O_DIRECT did not restore byte-stream framing");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_fcntl_setfl_direct_reframes_pipe_writes
+);
+
+/// `pipe_write` copies at most one page into each buffer
+/// (`copy_page_from_iter(page, 0, PAGE_SIZE, from)`) and loops, so a packet
+/// write LARGER than a page becomes several packets rather than one oversized
+/// record. A reader sized for the whole write gets only the first page.
+fn smoke_abi_fdio_pipe2_direct_splits_oversized_writes() -> TestResult {
+    with_setup(|| {
+        const O_NONBLOCK: u64 = 0o4000;
+        const PAGE: usize = 4096;
+        let (rd, wr) = make_packet_pipe(O_NONBLOCK)?;
+        let payload = alloc::vec![b'z'; PAGE + 100];
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("oversized packet write failed");
+        }
+        let mut dst = alloc::vec![0u8; PAGE * 2];
+        // A buffer twice the size of the write still stops at one page.
+        if call(
+            Syscall::Read.raw(),
+            a2(rd, dst.as_mut_ptr() as u64, dst.len() as u64),
+        ) != Some(PAGE as i64)
+        {
+            return Err("oversized packet write was not split at a page");
+        }
+        if call(
+            Syscall::Read.raw(),
+            a2(rd, dst.as_mut_ptr() as u64, dst.len() as u64),
+        ) != Some(100)
+        {
+            return Err("second packet of an oversized write was wrong");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe2_direct_splits_oversized_writes
+);
 
 /// pipe2(O_NONBLOCK) must land O_NONBLOCK on both descriptors: a read on
 /// the empty pipe is -EAGAIN (not a blocking park, and NOT a spurious 0 =

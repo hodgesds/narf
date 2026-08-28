@@ -421,7 +421,22 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 let mask = crate::fd::O_SETFL_MASK;
                 let new = (arg as u32) & mask;
                 let old = t.status_flags(fd)?;
+                // Clone the handle out before the mutable `set_status_flags`
+                // borrow so the pipe update below can still reach it.
+                let ops = entry.ops.clone();
                 t.set_status_flags(fd, (old & !mask) | new)?;
+                // `fs/pipe.c::is_packetized` re-reads `filp->f_flags` on every
+                // write, so O_DIRECT set (or cleared) here changes the framing
+                // of subsequent writes. Storing it only in `status_flags` would
+                // let F_GETFL report packet mode on a pipe that kept writing a
+                // byte stream — the read end would then find no record
+                // boundaries where the writer believed it had made them.
+                if let Some(pipe) = ops
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
+                {
+                    pipe.set_packetized(new & crate::fd::O_DIRECT != 0);
+                }
                 SyscallReturn::ok(0)
             }
             // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report the pipe buffer
