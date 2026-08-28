@@ -383,6 +383,15 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // Wave-71: MS_BIND or fstype=="bind" → bind mount. `source` is
     // an absolute path; `target` is the new path. No block device.
     if fstype == "bind" || (flags & MS_BIND) != 0 {
+        // `do_loopback`'s first line: `if (!old_name || !*old_name) return
+        // -EINVAL;`. A NULL source is legal for MS_REMOUNT and the
+        // propagation changes handled above, but a bind has nothing to bind
+        // FROM without one — and reaching the lookup with an empty string
+        // would resolve it against the cwd and bind something arbitrary.
+        if source.is_empty() {
+            ctx.set_return(einval);
+            return;
+        }
         let source_base = if source_resolved == "/" {
             "/"
         } else {
@@ -408,14 +417,31 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         // (226/EXIT_NAMESPACE). current_bind_mount handles a file source by
         // registering a FileMount, so a self-bind of a file is a real mount
         // whose lookups still resolve to the same file.
-        // LINUX-GAP (swallowed failure, NOT an errno bug): a failing bind
-        // reports 0 below. `fs/namespace.c::do_loopback` returns -ENOENT for
-        // a source that does not resolve and -EINVAL for one that may not be
-        // bound. Turning this into an errno is a behaviour change, not an
-        // errno fix — several live paths (systemd's self-binds over procfs
-        // control files, and the bind that pivot_root stages put_old with)
-        // currently depend on the success reply — so it is left recorded
-        // rather than changed under an audit that cannot run the boot.
+        // `fs/namespace.c::do_loopback` reports why a bind failed:
+        //
+        // ```text
+        // if (!old_name || !*old_name)             return -EINVAL;
+        // err = kern_path(old_name, LOOKUP_FOLLOW|LOOKUP_AUTOMOUNT, &old_path);
+        // if (err)                                 return err;   /* -ENOENT */
+        // err = -EINVAL;
+        // if (mnt_ns_loop(old_path.dentry))        goto out;
+        // if (!check_mnt(...))                     goto out;
+        // ```
+        //
+        // This arm used to report 0 for every failure. A swallowed failure is
+        // the worst shape in this whole audit: a wrong errno at least says
+        // something went wrong, but "success" for a mount that does not exist
+        // sends the caller on to use a path that was never attached. systemd
+        // then remounts, or execs into, a directory it believes it isolated.
+        //
+        // The previous note declined to change it because live paths were
+        // thought to depend on the success reply. Re-reading the failure
+        // modes, they do not: `bind_mount` fails only when no mount covers
+        // the source or `build_bind_fs` cannot resolve the leaf, and the two
+        // named cases are both fine — a procfs control file resolves and
+        // binds as a FileMount, and overmounting is explicitly supported
+        // (see `VfsRegistry::mount`'s doc), so a self-bind succeeds and never
+        // reaches this arm at all.
         return match current_bind_mount(&auth, source_resolved.as_str(), target.as_str()) {
             Ok(_h) => {
                 for (relative, fs) in descendants {
@@ -428,7 +454,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                 }
                 ctx.set_return(SyscallReturn::ok(0));
             }
-            Err(_) => ctx.set_return(SyscallReturn::ok(0)),
+            Err(e) => ctx.set_return(SyscallReturn::ok(bind_errno(e))),
         };
     }
 

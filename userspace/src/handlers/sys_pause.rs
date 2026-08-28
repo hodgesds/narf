@@ -40,9 +40,16 @@ pub(crate) fn sys_pause(ctx: &mut dyn TrapContext) {
     // in case a signal is about to become deliverable, retry delivery,
     // then surface EINTR rather than spinning forever — a real task
     // always takes the yield-hook path above and never reaches here.
+    //
+    // `SYSCALL_DEFINE0(pause)` ends `return -ERESTARTNOHAND;`, which the
+    // signal-return path turns into -EINTR. The comment above already said
+    // "surface EINTR", but the value written was the bare -1, i.e. errno 1
+    // = EPERM. pause(2) NEVER succeeds, so the return value carries no
+    // information and every caller reads errno — where EPERM says the task
+    // was not allowed to wait for a signal.
     narf_scheduler::sleep_pumps::run();
     if maybe_deliver_signal_before_yield(ctx, Syscall::Pause.raw()) {
         return;
     }
-    ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
 }

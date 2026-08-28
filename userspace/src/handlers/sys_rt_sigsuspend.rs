@@ -2,10 +2,21 @@
 use super::*;
 
 /// `rt_sigsuspend(set, sigsetsize)` — Linux `rt_sigsuspend(2)`.
-/// Atomically swap the signal mask to `set`, wait for one signal
-/// outside the new mask to be delivered, then restore the prior
-/// mask. Always returns -1 (after delivery); errno = EINTR per
-/// POSIX.
+/// ```text
+/// if (sigsetsize != sizeof(sigset_t))                 return -EINVAL;
+/// if (copy_from_user(&newset, unewset, sizeof(newset))) return -EFAULT;
+/// return sigsuspend(&newset);   /* -ERESTARTNOHAND -> -EINTR */
+/// ```
+///
+/// Atomically swap the signal mask to `set`, wait for one signal outside
+/// the new mask to be delivered, then restore the prior mask.
+///
+/// The doc here used to say "always returns -1; errno = EINTR", which was
+/// self-contradictory: -1 IS errno 1, EPERM. `rt_sigsuspend` never
+/// succeeds — its normal completion is -EINTR — so a caller cannot use
+/// the return value to distinguish outcomes and reads errno instead.
+/// Reporting EPERM there tells a program that installed a perfectly valid
+/// mask that it was not permitted to wait.
 ///
 /// The wait itself is `sys_pause`'s park (u64::MAX deadline, broken by
 /// `is_signal_pending` + `wake_signal`), which truly blocks under an
@@ -20,10 +31,19 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let set_uptr = args.arg0;
     let sigsetsize = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    const EFAULT: i64 = 14;
+    const EINVAL: i64 = 22;
 
-    if sigsetsize != 8 || set_uptr == 0 {
-        ctx.set_return(fail);
+    // `if (sigsetsize != sizeof(sigset_t)) return -EINVAL;` — a size
+    // mismatch is a malformed argument, checked before the pointer.
+    if sigsetsize != 8 {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    // A NULL `unewset` fails the copy below in Linux; there is no separate
+    // null arm.
+    if set_uptr == 0 {
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
         return;
     }
 
@@ -32,7 +52,7 @@ pub(crate) fn sys_rt_sigsuspend(ctx: &mut dyn TrapContext) {
     // checked above); copy_from_user range-validates it and SMAP-brackets the 8-byte read.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_from_user(&mut buf, set_uptr) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
         return;
     }
     // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout

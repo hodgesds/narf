@@ -16,13 +16,25 @@ use super::*;
 /// Both file the fd's anonymous inode into newpath via `link_node`.
 pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let (Some(old_raw), Some(new_raw)) = (
-        copy_user_cstr(args.arg1, 4096),
-        copy_user_cstr(args.arg3, 4096),
-    ) else {
-        ctx.set_return(fail);
-        return;
+    // `SYSCALL_DEFINE5(linkat)` takes `CLASS(filename, old)(oldname)` then
+    // `CLASS(filename, new)(newname)`, and `filename_linkat` propagates the
+    // OLD name's error first. The tuple form here evaluated both and then
+    // reported one shared sentinel, so which pathname was at fault was lost
+    // along with the reason; -EFAULT and -ENAMETOOLONG are now distinct and
+    // the old name is answered first, as Linux does.
+    let old_raw = match copy_user_cstr_checked(args.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+    let new_raw = match copy_user_cstr_checked(args.arg3, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
     };
     const AT_FDCWD: i64 = -100;
     const AT_EMPTY_PATH: u64 = 0x1000;

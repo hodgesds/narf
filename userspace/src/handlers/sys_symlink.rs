@@ -8,18 +8,21 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
     // target_len, link_ptr, link_len).)
     let target_ptr = args.arg0;
     let link_ptr = args.arg1;
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let target_str = match copy_user_cstr(target_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    // `SYSCALL_DEFINE2(symlink)`: `CLASS(filename, old)(oldname)` then
+    // `CLASS(filename, new)(newname)`. -EFAULT for an unreadable pointer,
+    // -ENAMETOOLONG for a name at PATH_MAX with no terminator — both used
+    // to collapse onto the shared `fail` sentinel (libc errno 1, EPERM).
+    let target_str = match copy_user_cstr_checked(target_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
-    let link_path = match copy_user_cstr(link_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    let link_path = match copy_user_cstr_checked(link_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

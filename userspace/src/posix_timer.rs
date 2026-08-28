@@ -768,16 +768,26 @@ fn nanosleep_common(
     req_ptr: u64,
     _rem_ptr: u64,
 ) {
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // `SYSCALL_DEFINE4(clock_nanosleep)`:
+    //   `kc = clockid_to_kclock(which_clock); if (!kc) return -EINVAL;`
+    //   `if (get_timespec64(&t, rqtp)) return -EFAULT;`
+    //   `if (!timespec64_valid(&t)) return -EINVAL;`
+    // All three took the shared -1 sentinel, which reaches libc as EPERM —
+    // so a caller that passed an unsupported clock, a bad pointer, or an
+    // out-of-range nanosecond field was told it lacked permission to sleep.
+    const EFAULT: i64 = 14;
+    const EINVAL: i64 = 22;
+    let einval = SyscallReturn::ok((-EINVAL) as u64);
+    let efault = SyscallReturn::ok((-EFAULT) as u64);
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {}
         _ => {
-            ctx.set_return(fail);
+            ctx.set_return(einval);
             return;
         }
     }
     if req_ptr == 0 {
-        ctx.set_return(fail);
+        ctx.set_return(efault);
         return;
     }
     let mut buf = [0u8; 16];
@@ -786,14 +796,15 @@ fn nanosleep_common(
     // SMAP window. Runs in the calling task's address space, not IRQ context.
     // SAFETY: Valid memory or trusted environment
     if unsafe { crate::handlers::copy_from_user(&mut buf, req_ptr) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(efault);
         return;
     }
     let (sec, nsec) = read_timespec(&buf);
+    // `timespec64_valid`: tv_sec < 0, or tv_nsec outside [0, NSEC_PER_SEC).
     let target_ns = match timespec_to_ns(sec, nsec) {
         Some(v) => v,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(einval);
             return;
         }
     };

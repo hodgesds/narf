@@ -401,12 +401,15 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_rt_tgsigqueueinfo_neg);
 
 fn smoke_abi_signal_rt_sigsuspend_neg() -> TestResult {
     with_setup(|| {
-        // set==0 → ok(-1) before any pause.
-        // LINUX-GAP: Linux returns -EFAULT for a NULL set; the suspend
-        // success path is -EINTR-after-block which the harness can't reach.
+        // `if (copy_from_user(&newset, unewset, sizeof(newset)))
+        //          return -EFAULT;` — a NULL set fails the copy. This used
+        // to assert the -1 sentinel, which reaches libc as EPERM.
+        //
+        // The suspend SUCCESS path is -EINTR-after-block, which this
+        // harness still cannot reach (no executor to park on).
         let r = call(Syscall::RtSigsuspend.raw(), a1(0, 8));
-        if r != Some(-1) {
-            return Err("rt_sigsuspend(NULL, 8) should return -1");
+        if r != Some(-14) {
+            return Err("rt_sigsuspend(NULL, 8) should return -EFAULT");
         }
         Ok(())
     })

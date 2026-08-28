@@ -397,14 +397,14 @@ kernel_test_in!("syscall_abi", smoke_abi_time_clock_nanosleep_pos);
 fn smoke_abi_time_clock_nanosleep_neg() -> TestResult {
     with_setup(|| {
         let req: [i64; 2] = [0, 0];
-        // Unknown clockid → -1 sentinel.
-        // LINUX-GAP: Linux returns -EINVAL; NARF returns the -1 sentinel.
+        // `clockid_to_kclock(which_clock)` returning NULL is -EINVAL.
         match call(
             Syscall::ClockNanosleep.raw(),
             a3(99, 0, req.as_ptr() as u64, 0),
         ) {
-            Some(-1) => Ok(()),
-            _ => Err("clock_nanosleep on an unknown clockid should return -1"),
+            Some(-22) => Ok(()),
+            Some(-1) => Err("clock_nanosleep(bad clockid) still returns the -1/EPERM sentinel"),
+            _ => Err("clock_nanosleep on an unknown clockid should be -EINVAL"),
         }
     })
 }
@@ -426,11 +426,11 @@ kernel_test_in!("syscall_abi", smoke_abi_time_nanosleep_pos);
 
 fn smoke_abi_time_nanosleep_neg() -> TestResult {
     with_setup(|| {
-        // NULL req → -1 sentinel.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
+        // `get_timespec64(&t, rqtp)` on a NULL rqtp is -EFAULT.
         match call(Syscall::Nanosleep.raw(), a1(0, 0)) {
-            Some(-1) => Ok(()),
-            _ => Err("nanosleep(NULL, _) should return the -1 sentinel"),
+            Some(-14) => Ok(()),
+            Some(-1) => Err("nanosleep(NULL) still returns the -1/EPERM sentinel"),
+            _ => Err("nanosleep(NULL, _) should be -EFAULT"),
         }
     })
 }

@@ -918,10 +918,10 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_getrandom_pos);
 
 fn smoke_abi_creds_getrandom_neg() -> TestResult {
     with_setup(|| {
-        // NULL pointer ⇒ Ok(-1). LINUX-GAP: Linux returns -EFAULT.
+        // `import_ubuf`'s `access_ok` arm: a NULL buffer is -EFAULT.
         let r = call(Syscall::GetRandom.raw(), a2(NULL_PTR, 16, 0)).ok_or("getrandom not Ok")?;
-        if r != -1 {
-            return Err("getrandom(NULL,16) expected -1");
+        if r != -14 {
+            return Err("getrandom(NULL,16) expected -EFAULT");
         }
         // len==0 with a valid pointer ⇒ Ok(0) (nothing to do).
         let mut one = [0u8; 1];

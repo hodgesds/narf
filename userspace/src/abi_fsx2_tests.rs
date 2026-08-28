@@ -2296,3 +2296,98 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_new_mount_api_procfd_target_pos
 );
+
+// ─────────────────────────────────────────────────────────────────────
+// Bind-mount failures used to report success — fs/namespace.c::do_loopback
+//
+// A swallowed failure is the worst shape in the whole errno audit. A wrong
+// errno at least tells the caller something went wrong; "success" for a
+// mount that was never attached sends it on to remount, or exec into, a
+// directory it believes it isolated.
+// ─────────────────────────────────────────────────────────────────────
+
+fn bind_call(source: &[u8], target: &[u8]) -> Option<i64> {
+    const MS_BIND: u64 = 0x1000;
+    call(
+        Syscall::Mount.raw(),
+        SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: 0,
+            arg3: MS_BIND,
+            arg4: 0,
+            ..Default::default()
+        },
+    )
+}
+
+fn smoke_abi_fsx2_bind_missing_source_is_enoent() -> TestResult {
+    with_setup(|| {
+        // `err = kern_path(old_name, ...); if (err) return err;` — an
+        // unresolvable source is -ENOENT. This reported 0.
+        let src = b"/abi-bind-nothing-here/deeper\0";
+        let dst = b"/abi-bind-missing-dst\0";
+        match bind_call(src, dst) {
+            Some(-2) => Ok(()),
+            Some(0) => Err("bind of a non-existent source reported SUCCESS"),
+            _ => Err("bind of a missing source should be -ENOENT"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_bind_missing_source_is_enoent);
+
+fn smoke_abi_fsx2_bind_empty_source_is_einval() -> TestResult {
+    with_setup(|| {
+        // `if (!old_name || !*old_name) return -EINVAL;` — a bind has
+        // nothing to bind FROM without a source, and an empty string would
+        // otherwise resolve against the cwd and bind something arbitrary.
+        let src = b"\0";
+        let dst = b"/abi-bind-empty-dst\0";
+        match bind_call(src, dst) {
+            Some(-22) => Ok(()),
+            Some(0) => Err("bind with an empty source reported SUCCESS"),
+            _ => Err("bind with an empty source should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_bind_empty_source_is_einval);
+
+fn smoke_abi_fsx2_bind_still_succeeds_for_a_real_source() -> TestResult {
+    with_setup(|| {
+        // The other half: reporting failures must not start refusing the
+        // binds that work. A real tmpfs source still binds, and — the case
+        // the previous "leave it alone" note was written about — a FILE
+        // bound over ITSELF still succeeds, because build_bind_fs registers
+        // a FileMount and overmounting is supported. systemd does exactly
+        // this to protect procfs control files.
+        let src_source = b"none\0";
+        let src_target = b"/abi-bind-ok-src\0";
+        let tmpfs = b"tmpfs\0";
+        let margs = SyscallArgs {
+            arg0: src_source.as_ptr() as u64,
+            arg1: src_target.as_ptr() as u64,
+            arg2: tmpfs.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::Mount.raw(), margs) != Some(0) {
+            return Err("source tmpfs setup mount failed");
+        }
+        let dst = b"/abi-bind-ok-dst\0";
+        match bind_call(src_target, dst) {
+            Some(0) => {}
+            _ => return Err("bind of a real source no longer succeeds"),
+        }
+        // Self-bind of the same mount root.
+        match bind_call(src_target, src_target) {
+            Some(0) => Ok(()),
+            Some(v) if v < 0 => Err("a self-bind now fails; systemd's ProtectKernelTunables path"),
+            _ => Err("self-bind returned an unexpected value"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_bind_still_succeeds_for_a_real_source
+);

@@ -1250,10 +1250,10 @@ fn smoke_userspace_getrandom_fills_buffer() -> TestResult {
     kernel_syscall_entry(Syscall::GetRandom.raw(), &mut ctx);
     let null_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::OK && r.value == (-1i64) as u64,
+        Some(r) if r.status == SyscallReturn::OK && r.value == (-14i64) as u64,
     );
     if !null_rejected {
-        return TestResult::Fail("getrandom did not reject null buffer");
+        return TestResult::Fail("getrandom must reject a null buffer with -EFAULT");
     }
 
     __test_clear_global();
