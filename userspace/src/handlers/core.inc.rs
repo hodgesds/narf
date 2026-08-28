@@ -2545,6 +2545,30 @@ fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
 /// mount-teardown does `rmdir("/run/systemd/propagate/<unit>")` and treats
 /// ENOENT (already gone) as success; a bare -1 → EPERM aborted the teardown
 /// with "Unable to remove propagation dir … Operation not permitted".
+/// Map an `FsError` from a bind mount to the errno `do_loopback`
+/// (fs/namespace.c) would report.
+///
+/// `kern_path` on an unresolvable source is -ENOENT; everything else
+/// do_loopback rejects — a namespace loop, a source outside the caller's
+/// namespace — falls through its `err = -EINVAL` default. A revoked mount
+/// authority has no Linux counterpart (the capability is TCB-minted, not
+/// something a caller holds), so it takes -EPERM, which is what
+/// `may_mount()` failing reports.
+fn bind_errno(e: narf_filesystem::FsError) -> u64 {
+    use narf_filesystem::FsError;
+    let code: i64 = match e {
+        // `kern_path(old_name, ...)` could not resolve the source.
+        FsError::NotFound => -2, // -ENOENT
+        FsError::PermissionDenied => -1, // -EPERM
+        FsError::ReadOnly => -30, // -EROFS
+        FsError::Busy => -16,    // -EBUSY
+        // do_loopback's `err = -EINVAL` default: a source that resolves but
+        // may not be bound.
+        _ => -22, // -EINVAL
+    };
+    code as u64
+}
+
 fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
