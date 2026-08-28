@@ -11,14 +11,19 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
         return;
     }
     // `fs/pipe.c::do_pipe2`: any flag outside O_CLOEXEC | O_NONBLOCK |
-    // O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL. LINUX-GAP: O_DIRECT
-    // (packet mode, `pipe_write`'s one-buffer-per-write regime) and
-    // watch-queue pipes are unimplemented, so those two are ALSO
-    // rejected with -EINVAL here rather than silently ignored — a
-    // caller that got a byte-stream pipe after asking for packet
-    // framing would corrupt its own record boundaries.
+    // O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL.
+    //
+    // O_DIRECT is packet mode (`pipe_write`'s one-buffer-per-write regime);
+    // the pipe honours it, so it is accepted here.
+    //
+    // LINUX-GAP: O_NOTIFICATION_PIPE (watch queues) is unimplemented and stays
+    // -EINVAL rather than being silently ignored. Silently dropping it would
+    // hand back an ordinary pipe on which `keyctl`/`fanotify` watches never
+    // arrive, and the caller would read that as "no events" forever instead of
+    // "not supported".
     let nonblock_bit = crate::fd::O_NONBLOCK as u64;
-    if flags & !(O_CLOEXEC_BIT | nonblock_bit) != 0 {
+    let direct_bit = crate::fd::O_DIRECT as u64;
+    if flags & !(O_CLOEXEC_BIT | nonblock_bit | direct_bit) != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
@@ -37,7 +42,14 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
         0
     };
 
-    let (rd, wr) = crate::pipe::pipe_pair();
+    // Packet mode is a property of the WRITE end alone: `create_pipe_files`
+    // builds the writer with `O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT))`
+    // and clones the reader with `O_RDONLY | (flags & O_NONBLOCK)`, so
+    // O_DIRECT never appears in the read fd's status flags and F_GETFL on the
+    // read end must not report it.
+    let packetized = flags & direct_bit != 0;
+    let (rd, wr) = crate::pipe::pipe_pair_flags(packetized);
+    let direct = if packetized { crate::fd::O_DIRECT } else { 0 };
     let task = current_task_id();
     let fds = fd::install_pair(
         task,
@@ -51,7 +63,7 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
             ops: wr as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
             offset: 0,
             flags: install_flags,
-            status_flags: crate::fd::O_WRONLY | nb,
+            status_flags: crate::fd::O_WRONLY | nb | direct,
         },
     );
     let (r, w) = match fds {

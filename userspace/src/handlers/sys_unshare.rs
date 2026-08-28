@@ -65,10 +65,18 @@ const UNSHARE_VALID_FLAGS: u64 = CLONE_THREAD
 /// -ENOMEM, not the `-1`/EPERM it used to report. A caller retries ENOMEM;
 /// EPERM tells it to give up and drop privileges it never lacked.
 ///
-/// LINUX-GAP: `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS first,
-///     and `check_unshare_flags` then rejects CLONE_THREAD/SIGHAND/VM with
-///     -EINVAL unless the caller is single-threaded — so `unshare(CLONE_NEWUSER)`
-///     from a multi-threaded process fails on Linux and succeeds here.
+/// `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS before
+/// validating, and `check_unshare_flags` then requires a single-threaded
+/// caller for CLONE_THREAD/SIGHAND/VM — so `unshare(CLONE_NEWUSER)` from a
+/// multi-threaded process is -EINVAL. That is not a formality: creating a
+/// user namespace re-credentials the caller, and doing so while siblings
+/// share its address space would leave those siblings running against the
+/// new namespace with the old credentials.
+///
+/// LINUX-GAP: the other two arms of `check_unshare_flags` — a sighand
+/// refcount above 1 for CLONE_SIGHAND/VM, and `current_is_single_threaded`
+/// for CLONE_VM — have no counterpart; NARF models neither a shared
+/// sighand nor mm sharing separately from the thread group.
 pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     let flags = ctx.args().arg0;
 
@@ -96,6 +104,20 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     // how an ordinary user gets a context in which it holds capabilities —
     // so gating it on CAP_SYS_ADMIN would invert the feature. Every OTHER
     // namespace type requires the capability.
+    // `ksys_unshare`: `if (unshare_flags & CLONE_NEWUSER) unshare_flags |=
+    // CLONE_THREAD | CLONE_FS;` then `check_unshare_flags`:
+    // `if (unshare_flags & (CLONE_THREAD|CLONE_SIGHAND|CLONE_VM)) { if
+    // (!thread_group_empty(current)) return -EINVAL; }`.
+    //
+    // The fold is why CLONE_NEWUSER appears in this mask at all — it is not
+    // itself one of the three, but implies CLONE_THREAD.
+    if flags & (CLONE_NEWUSER | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
+        && !thread_group_empty(current_task_id())
+    {
+        ctx.set_return(fail(EINVAL));
+        return;
+    }
+
     const NS_NEEDS_SYS_ADMIN: u64 = CLONE_NEWNS
         | CLONE_NEWUTS
         | CLONE_NEWIPC

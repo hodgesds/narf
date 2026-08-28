@@ -1325,6 +1325,27 @@ impl AddressSpace {
         self.regions.lock().by_base.fail_next_reserve_for_test();
     }
 
+    /// Does `[base, base+len)` overlap any HUGE mapping?
+    ///
+    /// Huge mappings live in their own `huge_regions` vector, not in
+    /// `regions`, so [`Self::perms_intersecting`] cannot see them. A caller
+    /// that asks "is anything already here?" and consults only the base-page
+    /// VMAs gets the wrong answer over a hugetlb mapping — which is exactly
+    /// what made `MAP_FIXED_NOREPLACE` replace one instead of reporting
+    /// -EEXIST. The admission path already scans this vector for overlap
+    /// (see `map_huge_region_locked`); this exposes the same predicate to
+    /// the syscall layer instead of leaving it to re-derive it.
+    pub fn huge_intersects(&self, base: VirtAddr, len: u64) -> bool {
+        let lo = base.as_u64();
+        let Some(hi) = lo.checked_add(len) else {
+            return false;
+        };
+        self.huge_regions.lock().iter().any(|r| {
+            let rb = r.base.as_u64();
+            rb < hi && lo < rb + r.len
+        })
+    }
+
     #[cfg(any(test, feature = "kernel-test"))]
     pub(crate) fn __test_huge_region_perms(&self, base: VirtAddr) -> Option<RegionPerms> {
         self.huge_regions

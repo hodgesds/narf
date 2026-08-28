@@ -3511,3 +3511,64 @@ fn smoke_abi_pathx_ioprio_rt_class_is_privileged() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_ioprio_rt_class_is_privileged);
+
+fn smoke_abi_pathx_getcwd_enametoolong_precedes_erange() -> TestResult {
+    with_setup(|| {
+        // `fs/d_path.c::SYSCALL_DEFINE2(getcwd)`:
+        //
+        //     if (unlikely(len > PATH_MAX))  error = -ENAMETOOLONG;
+        //     else if (unlikely(len > size)) error = -ERANGE;
+        //
+        // The order is observable, not cosmetic. glibc's dynamic getcwd
+        // doubles its buffer on exactly ERANGE, so a path that can never
+        // fit in ANY buffer must not report ERANGE — that is an unbounded
+        // realloc loop, not a wrong errno.
+        //
+        // Build a cwd past PATH_MAX by chdir'ing into a deep memfs tree is
+        // impractical here, so drive the boundary from the buffer side:
+        // with a normal cwd the small-buffer case is still ERANGE, which is
+        // the arm that must NOT swallow the ENAMETOOLONG one.
+        let mut tiny = [0u8; 1];
+        match call(Syscall::Getcwd.raw(), a1(tiny.as_mut_ptr() as u64, 1)) {
+            Some(-34) => Ok(()),
+            Some(-36) => Err("a short buffer reported ENAMETOOLONG; ERANGE is the growable one"),
+            _ => Err("getcwd with a 1-byte buffer should be -ERANGE"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_getcwd_enametoolong_precedes_erange
+);
+
+fn smoke_abi_pathx_unshare_newuser_needs_single_thread() -> TestResult {
+    with_setup(|| {
+        // `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS,
+        // and `check_unshare_flags` then requires `thread_group_empty`.
+        // The harness task is alone in its group, so the single-threaded
+        // case must still SUCCEED — the check must not reject everything.
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        match call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER)) {
+            Some(0) => {}
+            Some(-22) => return Err("unshare(CLONE_NEWUSER) rejected a single-threaded caller"),
+            _ => return Err("single-threaded unshare(CLONE_NEWUSER) should succeed"),
+        }
+        // Now register a sibling sharing the caller's process key — a second
+        // thread of the same group — and the same call must be -EINVAL.
+        const SIBLING: u64 = 0xD001;
+        crate::task::release_task(SIBLING);
+        let _t = crate::task::Task::new_registered(SIBLING, SIBLING);
+        crate::handlers::register_task_to_pid(SIBLING, FAKE_TASK);
+        let r = call(Syscall::Unshare.raw(), a0(CLONE_NEWUSER));
+        crate::task::release_task(SIBLING);
+        match r {
+            Some(-22) => Ok(()),
+            Some(0) => Err("unshare(CLONE_NEWUSER) succeeded with a second thread in the group"),
+            _ => Err("multi-threaded unshare(CLONE_NEWUSER) should be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_unshare_newuser_needs_single_thread
+);

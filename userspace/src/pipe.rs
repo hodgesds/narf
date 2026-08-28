@@ -51,13 +51,238 @@ const PIPE_BUF: usize = 4096;
 /// count as an `int` through the ioctl argument pointer.
 const FIONREAD: u32 = 0x541B;
 
+/// Linux `PIPE_DEF_BUFFERS` (`include/linux/pipe_fs_i.h`): a fresh pipe holds
+/// at most 16 `struct pipe_buffer`s. `pipe_full()` compares the BUFFER count
+/// against this limit, not a byte count:
+///
+///     return pipe_occupancy(head, tail) >= limit;
+///
+/// so sixteen one-byte packets fill a 64 KiB pipe. That only matters in packet
+/// mode: ordinary writes merge into the tail buffer, so a byte-stream pipe
+/// never accumulates buffers and only ever hits the byte limit.
+const PIPE_MAX_FRAMES: usize = 16;
+
+/// One queued `struct pipe_buffer`'s framing metadata.
+#[derive(Debug)]
+struct PipeFrame {
+    len: usize,
+    /// `PIPE_BUF_FLAG_PACKET` — set by `pipe_write` when the writing file has
+    /// O_DIRECT (`fs/pipe.c::is_packetized`). A packet is one record: a read
+    /// never returns more than one, and never returns part of one and keeps
+    /// the rest.
+    packet: bool,
+}
+
+/// The pipe's buffer list: a flat byte queue with the write boundaries laid
+/// over it. `frames` covers `bytes` exactly — the frame lengths always sum to
+/// `bytes.len()`.
+///
+/// Linux keeps a ring of `struct pipe_buffer`, each owning a page. Flattening
+/// the payload and carrying only the boundaries keeps every existing
+/// byte-stream path (splice, tee, FIONREAD, poll) working on one contiguous
+/// queue while still answering the only question packet mode asks: where does
+/// this record end?
+///
+/// The merge rule below is what makes that safe. Consecutive non-packet writes
+/// coalesce into a single frame, so a pipe that never sees O_DIRECT holds at
+/// most one frame and every query here degenerates to the byte arithmetic it
+/// replaced. Linux instead merges only up to a page boundary
+/// (`offset + chars <= PAGE_SIZE`), but that limit is invisible to a
+/// non-packet reader — `pipe_read` walks buffers without reporting where one
+/// ended — so coalescing further changes nothing a caller can observe.
+#[derive(Debug)]
+struct PipeBufs {
+    bytes: VecDeque<u8>,
+    frames: VecDeque<PipeFrame>,
+}
+
+impl PipeBufs {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(PIPE_BUF_BYTES),
+            frames: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Would `pipe_full()` stop a writer here? Either limit can bind: bytes
+    /// for a stream pipe, buffers for a packet pipe.
+    fn is_full(&self) -> bool {
+        self.bytes.len() >= PIPE_BUF_BYTES || self.frames.len() >= PIPE_MAX_FRAMES
+    }
+
+    /// Bytes a write of this kind can still deposit.
+    ///
+    /// A non-packet write that can merge into the tail buffer needs no new
+    /// buffer, so it is bounded by bytes alone — which is why a stream pipe
+    /// never notices `PIPE_MAX_FRAMES`. A packet write always needs a fresh
+    /// buffer per page, so it is bounded by both.
+    fn room(&self, packet: bool) -> usize {
+        let byte_room = PIPE_BUF_BYTES.saturating_sub(self.bytes.len());
+        let free_frames = PIPE_MAX_FRAMES.saturating_sub(self.frames.len());
+        if packet {
+            core::cmp::min(byte_room, free_frames.saturating_mul(PIPE_BUF))
+        } else if self.frames.back().is_some_and(|frame| !frame.packet) || free_frames > 0 {
+            byte_room
+        } else {
+            0
+        }
+    }
+
+    /// Record a frame boundary for `len` bytes already appended to `bytes`.
+    fn push_frame(&mut self, len: usize, packet: bool) {
+        if len == 0 {
+            return;
+        }
+        match self.frames.back_mut() {
+            Some(tail) if !packet && !tail.packet => tail.len += len,
+            _ => self.frames.push_back(PipeFrame { len, packet }),
+        }
+    }
+
+    fn push(&mut self, data: &[u8], packet: bool) {
+        if data.is_empty() {
+            return;
+        }
+        self.bytes.extend(data.iter().copied());
+        if packet {
+            // `pipe_write` copies at most one page into each buffer
+            // (`copy_page_from_iter(page, 0, PAGE_SIZE, from)`) and loops, so a
+            // packet write larger than a page arrives as SEVERAL packets — not
+            // one oversized record. A reader that assumed otherwise would treat
+            // the split as a lost boundary.
+            for chunk in data.chunks(PIPE_BUF) {
+                self.push_frame(chunk.len(), true);
+            }
+        } else {
+            self.push_frame(data.len(), false);
+        }
+    }
+
+    /// What a read of `max` bytes takes: `(copied, consumed)`.
+    ///
+    /// `fs/pipe.c::pipe_read` walks buffers until the request is satisfied, but
+    /// stops at the first packet buffer and drops whatever is left in it:
+    ///
+    ///     if (chars > total_len) {
+    ///             ...
+    ///             chars = total_len;
+    ///     }
+    ///     ...
+    ///     /* Was it a packet buffer? Clean up and exit */
+    ///     if (buf->flags & PIPE_BUF_FLAG_PACKET) {
+    ///             total_len = chars;
+    ///             buf->len = 0;
+    ///     }
+    ///
+    /// `buf->len = 0` retires the whole buffer however little was copied, and
+    /// `total_len = chars` ends the read. That is why the two counts differ: a
+    /// short read of a packet returns the truncated prefix and DISCARDS the
+    /// remainder. Reporting `consumed` separately is what lets each read path
+    /// perform that discard without folding it into the byte count it returns
+    /// to the caller — conflating them would report bytes that were never
+    /// copied.
+    ///
+    /// `PIPE_BUF_FLAG_WHOLE` (the -ENOBUFS "entire buffer or error" rule) is a
+    /// watch-queue flag, not a packet one; O_DIRECT truncates rather than
+    /// failing, so it is deliberately not modelled here.
+    fn read_span(&self, max: usize) -> (usize, usize) {
+        let mut copied = 0;
+        let mut consumed = 0;
+        let mut left = max;
+        for frame in self.frames.iter() {
+            if left == 0 {
+                break;
+            }
+            let take = core::cmp::min(left, frame.len);
+            copied += take;
+            left -= take;
+            if frame.packet {
+                consumed += frame.len;
+                break;
+            }
+            consumed += take;
+        }
+        (copied, consumed)
+    }
+
+    /// Drop `consumed` bytes from the front, keeping `frames` covering `bytes`.
+    fn commit(&mut self, consumed: usize) {
+        self.bytes.drain(..consumed);
+        self.retire_frames(consumed);
+    }
+
+    /// The frame half of [`Self::commit`], for callers that already moved the
+    /// bytes out of `bytes` themselves.
+    fn retire_frames(&mut self, consumed: usize) {
+        let mut left = consumed;
+        while left > 0 {
+            let Some(front) = self.frames.front_mut() else {
+                break;
+            };
+            if front.len > left {
+                front.len -= left;
+                break;
+            }
+            left -= front.len;
+            self.frames.pop_front();
+        }
+    }
+
+    /// Move up to `max` bytes into `dst`, carrying each frame's packet flag.
+    ///
+    /// `fs/splice.c` moves whole `struct pipe_buffer`s between pipes rather
+    /// than bytes, so the flags travel with the payload and a packet is never
+    /// split across the transfer. Hence the all-or-nothing step for a packet
+    /// frame: a destination without room for the whole record stops the move
+    /// instead of tearing it. A trailing NON-packet frame may still move
+    /// partially, because its boundary is invisible to any reader.
+    fn move_prefix_to(&mut self, dst: &mut PipeBufs, max: usize) -> usize {
+        let mut moved = 0;
+        while moved < max {
+            let Some(&PipeFrame { len, packet }) = self.frames.front() else {
+                break;
+            };
+            let room = dst.room(packet);
+            if room == 0 {
+                break;
+            }
+            let n = if packet {
+                if len > core::cmp::min(max - moved, room) {
+                    break;
+                }
+                len
+            } else {
+                core::cmp::min(core::cmp::min(max - moved, room), len)
+            };
+            if n == 0 {
+                break;
+            }
+            // Deque-to-deque move: no staging buffer, so nothing is allocated
+            // while the two queue locks are held.
+            dst.bytes.extend(self.bytes.drain(..n));
+            dst.push_frame(n, packet);
+            self.retire_frames(n);
+            moved += n;
+        }
+        moved
+    }
+}
+
 /// Shared mutable state between the read+write halves: the byte
 /// queue plus a "writer dropped" flag. The `closed_*` flags let
 /// either half observe the peer-side close from the read/write
 /// future without holding the queue lock.
 #[derive(Debug)]
 struct PipeShared {
-    queue: IrqSafeSpinLock<VecDeque<u8>>,
+    queue: IrqSafeSpinLock<PipeBufs>,
     /// Set when the write half is dropped. The read half observes
     /// this to flip empty-read from "try again" to EOF.
     writer_closed: AtomicBool,
@@ -87,7 +312,10 @@ impl PipeShared {
     /// write/read/close that changes state; the legacy edge tokens + `notify`
     /// stay belt-and-suspenders during the migration.
     fn sync_readiness(&self) {
-        let len = self.queue.lock().len();
+        let (len, full) = {
+            let q = self.queue.lock();
+            (q.len(), q.is_full())
+        };
         let writer_closed = self.writer_closed.load(Ordering::Acquire);
         let reader_closed = self.reader_closed.load(Ordering::Acquire);
         let mut add = 0u32;
@@ -97,7 +325,10 @@ impl PipeShared {
         } else {
             clear |= narf_filesystem::POLL_IN;
         }
-        if len < PIPE_BUF_BYTES {
+        // Room is a buffer question as well as a byte one — a packet pipe
+        // holding 16 short records is full at a few dozen bytes, and reporting
+        // POLL_OUT there would spin a writer that can never make progress.
+        if !full {
             add |= narf_filesystem::POLL_OUT;
         } else {
             clear |= narf_filesystem::POLL_OUT;
@@ -124,6 +355,14 @@ pub struct PipeRead {
 /// Write end of a pipe.
 pub struct PipeWrite {
     shared: Arc<PipeShared>,
+    /// `filp->f_flags & O_DIRECT`, consulted per write by
+    /// `fs/pipe.c::is_packetized`. Linux keeps it on the open file
+    /// description, which is exactly the lifetime of this object: `pipe2`
+    /// gives O_DIRECT to the WRITE file only
+    /// (`O_WRONLY | (flags & (O_NONBLOCK | O_DIRECT))` in
+    /// `create_pipe_files`, while the read file gets only O_NONBLOCK), every
+    /// `dup` shares it, and `fcntl(F_SETFL)` can flip it for later writes.
+    packetized: AtomicBool,
 }
 
 /// Result classes needed by the read-end `vmsplice(2)` transaction.  The
@@ -150,8 +389,14 @@ impl core::fmt::Debug for PipeWrite {
 /// `Arc<PipeShared>`; dropping either flips the corresponding
 /// `*_closed` flag for the peer to observe.
 pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
+    pipe_pair_flags(false)
+}
+
+/// Allocate a pipe pair whose write end is in packet mode when `packetized`
+/// (`pipe2(O_DIRECT)`).
+pub fn pipe_pair_flags(packetized: bool) -> (Arc<PipeRead>, Arc<PipeWrite>) {
     let shared = Arc::new(PipeShared {
-        queue: IrqSafeSpinLock::new(VecDeque::with_capacity(PIPE_BUF_BYTES)),
+        queue: IrqSafeSpinLock::new(PipeBufs::new()),
         writer_closed: AtomicBool::new(false),
         reader_closed: AtomicBool::new(false),
         readable_token: AtomicU64::new(0),
@@ -163,8 +408,20 @@ pub fn pipe_pair() -> (Arc<PipeRead>, Arc<PipeWrite>) {
         Arc::new(PipeRead {
             shared: shared.clone(),
         }),
-        Arc::new(PipeWrite { shared }),
+        Arc::new(PipeWrite {
+            shared,
+            packetized: AtomicBool::new(packetized),
+        }),
     )
+}
+
+impl PipeWrite {
+    /// Mirror `fcntl(F_SETFL, O_DIRECT)` onto the pipe. Linux re-reads
+    /// `filp->f_flags` on every `pipe_write`, so toggling O_DIRECT changes the
+    /// framing of subsequent writes without disturbing records already queued.
+    pub(crate) fn set_packetized(&self, packetized: bool) {
+        self.packetized.store(packetized, Ordering::Release);
+    }
 }
 
 impl PipeRead {
@@ -191,14 +448,20 @@ impl PipeRead {
                 Err(narf_filesystem::FsError::WouldBlock)
             };
         }
-        let n = core::cmp::min(max, avail);
-        staging.extend(q.iter().copied().take(n));
+        let was_full = q.is_full();
+        // `splice_from_pipe` hands the actor ONE buffer at a time, so the
+        // offered span stops at a packet boundary of its own accord.
+        let (n, _) = q.read_span(core::cmp::min(max, avail));
+        staging.extend(q.bytes.iter().copied().take(n));
         let written = write(&staging)?;
         if written > n {
             return Err(narf_filesystem::FsError::InvalidData);
         }
-        q.drain(..written);
-        let became_writable = avail == PIPE_BUF_BYTES && written != 0;
+        // No packet discard here: a short actor write advances the buffer
+        // (`buf->offset += ret; buf->len -= ret;`) and leaves the remainder
+        // queued. Only `pipe_read` retires a partially-copied packet.
+        q.commit(written);
+        let became_writable = was_full && written != 0;
         drop(q);
 
         if became_writable {
@@ -274,7 +537,10 @@ impl PipeRead {
         max: usize,
     ) -> Result<usize, VmspliceDrainError> {
         crate::handlers::validate_user_range(dst, max).map_err(VmspliceDrainError::User)?;
-        self.read_to_user(max, |bytes| {
+        // `discard_packets: false` — vmsplice drains through the splice actor
+        // (`pipe_to_user`), which advances a partially-copied buffer instead of
+        // retiring it. The packet discard belongs to `pipe_read` alone.
+        self.drain_to_user(max, false, |bytes| {
             // SAFETY: validate_user_range accepted the complete destination;
             // guarded copy catches a racing unmap/protection change.
             unsafe { crate::handlers::copy_to_user(dst, bytes) }
@@ -292,6 +558,18 @@ impl PipeRead {
         max: usize,
         copy: impl FnOnce(&[u8]) -> Result<(), u64>,
     ) -> Result<usize, VmspliceDrainError> {
+        self.drain_to_user(max, true, copy)
+    }
+
+    /// [`Self::read_to_user`] with the packet-retire rule made explicit:
+    /// `discard_packets` is read(2)'s `buf->len = 0`, which drops the tail of a
+    /// packet too large for the caller's buffer. Splice actors clear it.
+    fn drain_to_user(
+        &self,
+        max: usize,
+        discard_packets: bool,
+        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+    ) -> Result<usize, VmspliceDrainError> {
         // Allocate before disabling IRQs on the queue lock.  A pipe can never
         // supply more than its fixed capacity, even if the iovec is larger.
         let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, PIPE_BUF_BYTES));
@@ -304,12 +582,13 @@ impl PipeRead {
                 Err(VmspliceDrainError::WouldBlock)
             };
         }
-        let n = core::cmp::min(max, avail);
-        staging.extend(q.iter().copied().take(n));
+        let was_full = q.is_full();
+        let (n, packet_consumed) = q.read_span(max);
+        staging.extend(q.bytes.iter().copied().take(n));
 
         copy(&staging).map_err(VmspliceDrainError::User)?;
-        q.drain(..n);
-        let became_writable = avail == PIPE_BUF_BYTES;
+        q.commit(if discard_packets { packet_consumed } else { n });
+        let became_writable = was_full;
         drop(q);
 
         if became_writable {
@@ -322,8 +601,8 @@ impl PipeRead {
 }
 
 fn move_pipe_prefix(
-    src: &mut VecDeque<u8>,
-    dst: &mut VecDeque<u8>,
+    src: &mut PipeBufs,
+    dst: &mut PipeBufs,
     max: usize,
     writer_closed: bool,
 ) -> Result<(usize, bool, bool), narf_filesystem::FsError> {
@@ -334,14 +613,14 @@ fn move_pipe_prefix(
             Err(narf_filesystem::FsError::WouldBlock)
         };
     }
-    let room = PIPE_BUF_BYTES.saturating_sub(dst.len());
-    if room == 0 {
+    let src_was_full = src.is_full();
+    let dst_was_empty = dst.is_empty();
+    let n = src.move_prefix_to(dst, max);
+    if n == 0 {
+        // The destination could not take even the head frame — full, or short
+        // of room for a whole packet. Either way the caller must retry.
         return Err(narf_filesystem::FsError::WouldBlock);
     }
-    let src_was_full = src.len() == PIPE_BUF_BYTES;
-    let dst_was_empty = dst.is_empty();
-    let n = core::cmp::min(max, core::cmp::min(src.len(), room));
-    dst.extend(src.drain(..n));
     Ok((n, src_was_full, dst_was_empty))
 }
 
@@ -398,15 +677,19 @@ impl FileOps for PipeRead {
                     Err(narf_filesystem::FsError::WouldBlock)
                 };
             }
-            let n = core::cmp::min(buf.len(), avail);
-            // Bulk drain: `VecDeque::drain` copies the front `n` bytes in as
-            // few `memcpy`s as the ring's two contiguous slices allow, instead
-            // of `n` individual `pop_front`s — the byte-at-a-time loop dominated
-            // large pipe/splice transfers.
-            for (slot, byte) in buf.iter_mut().zip(q.drain(..n)) {
+            let was_full = q.is_full();
+            let (n, consumed) = q.read_span(buf.len());
+            // Bulk drain: `VecDeque::drain` copies the front bytes in as few
+            // `memcpy`s as the ring's two contiguous slices allow, instead of
+            // individual `pop_front`s — the byte-at-a-time loop dominated large
+            // pipe/splice transfers. `Drain` removes its whole range on drop
+            // even though `take(n)` stops copying early, which IS the packet
+            // discard: `consumed` bytes leave the pipe, `n` reach the caller.
+            for (slot, byte) in buf.iter_mut().zip(q.bytes.drain(..consumed).take(n)) {
                 *slot = byte;
             }
-            let became_writable = avail == PIPE_BUF_BYTES && n != 0;
+            q.retire_frames(consumed);
+            let became_writable = was_full && consumed != 0;
             drop(q);
             if became_writable {
                 self.shared.writable_token.fetch_add(1, Ordering::Release);
@@ -514,10 +797,19 @@ impl FileOps for PipeRead {
 
     fn pipe_peek(&self, max: usize) -> Option<alloc::vec::Vec<u8>> {
         let q = self.shared.queue.lock();
-        let n = core::cmp::min(max, q.len());
-        // Copy the front `n` bytes without consuming them — tee(2)
-        // duplicates pipe data, leaving the source readable.
-        Some(q.iter().copied().take(n).collect())
+        // Copy the front bytes without consuming them — tee(2) duplicates pipe
+        // data, leaving the source readable. `read_span` bounds the copy to one
+        // record, matching `fs/splice.c::tee` duplicating whole buffers.
+        //
+        // LINUX-GAP: tee/splice into another pipe carry the payload but not the
+        // PACKET flag, because this interface hands the destination a plain
+        // byte slice that its own write path re-frames. Linux copies the
+        // `pipe_buffer` flags across, so a teed packet stays a packet on the
+        // far side; here it takes the destination's framing. One call still
+        // copies at most one packet, so the records are not run together —
+        // only the flag that marks them as records is lost.
+        let (n, _) = q.read_span(max);
+        Some(q.bytes.iter().copied().take(n).collect())
     }
 
     fn pipe_capacity(&self) -> Option<usize> {
@@ -545,7 +837,10 @@ impl FileOps for PipeWrite {
             }
             let mut q = self.shared.queue.lock();
             let was_empty = q.is_empty();
-            let room = PIPE_BUF_BYTES.saturating_sub(q.len());
+            // `is_packetized(filp)` is re-read per write, so a mid-stream
+            // F_SETFL takes effect from the next write onward.
+            let packet = self.packetized.load(Ordering::Acquire);
+            let room = q.room(packet);
             // POSIX PIPE_BUF atomicity (`fs/pipe.c::pipe_write`): a write of
             // ≤ PIPE_BUF bytes is all-or-nothing — if it doesn't fit in the
             // free space, write NOTHING. The 0-progress result makes the
@@ -556,10 +851,11 @@ impl FileOps for PipeWrite {
                 return Ok(0);
             }
             let n = core::cmp::min(buf.len(), room);
-            // Bulk enqueue: `extend` appends the whole prefix in one pass
+            // Bulk enqueue: `push` appends the whole prefix in one pass
             // (amortised memcpy into the ring), replacing `n` individual
-            // `push_back`s that dominated large pipe/vmsplice writes.
-            q.extend(buf[..n].iter().copied());
+            // `push_back`s that dominated large pipe/vmsplice writes, and
+            // records the frame boundary this write establishes.
+            q.push(&buf[..n], packet);
             drop(q);
             if n != 0 {
                 if was_empty {
@@ -610,7 +906,7 @@ impl FileOps for PipeWrite {
         // saw the error condition Linux reports.
         let mut mask = 0;
         let q = self.shared.queue.lock();
-        if q.len() < PIPE_BUF_BYTES {
+        if !q.is_full() {
             mask |= narf_filesystem::POLL_OUT;
         }
         if self.shared.reader_closed.load(Ordering::Acquire) {
@@ -650,5 +946,12 @@ impl FileOps for PipeWrite {
 
     fn pipe_capacity(&self) -> Option<usize> {
         Some(PIPE_BUF_BYTES)
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        // `fcntl(F_SETFL, O_DIRECT)` downcasts through this to retarget packet
+        // mode; without it the flag would be recorded in the fd's status flags
+        // and never reach the write path.
+        Some(self)
     }
 }
