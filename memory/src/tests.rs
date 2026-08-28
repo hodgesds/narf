@@ -14025,3 +14025,72 @@ fn smoke_kernel_text_executable_bss_is_not_aarch64() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("memory", smoke_kernel_text_executable_bss_is_not_aarch64);
+
+// ── Why a raw `frame::stats().free` delta is not a measurement ──────
+//
+// The heap's slab calls `alloc_frame()` when a size class runs dry
+// (slab.rs::refill_from_frame), so ANY Rust allocation can consume a buddy
+// frame as a side effect. A test that brackets some operation with two
+// `stats().free` samples is therefore measuring that operation MINUS
+// whatever the heap took — and whether the heap took anything depends on
+// how full the magazines already were, i.e. on what ran before.
+//
+// That is what made `smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap`
+// flaky: munmap returned all 16 arena frames every time, but the raw delta
+// came up short whenever munmap's own bookkeeping happened to grow a class.
+// `slab::frames_held()` is the correction; this test is what makes the
+// mechanism a demonstrated fact rather than a plausible story.
+
+fn smoke_slab_growth_consumes_buddy_frames() -> TestResult {
+    use alloc::vec::Vec;
+
+    // Force a size class to grow by allocating far more blocks than one
+    // frame's worth, holding them so nothing is recycled.
+    //
+    // The outer vector is deliberately left UNRESERVED so it reallocs into
+    // LARGE blocks inside the window (4096 Vec headers is a 64 KiB order-4
+    // allocation). An earlier version of this test had to hoist that
+    // outside the window because `frames_held` only knew about size
+    // classes; it now counts large allocations too, so exercising both
+    // halves here is what keeps that fix honest.
+    let free_before = crate::frame::stats().free;
+    let held_before = crate::slab::frames_held();
+
+    let mut held: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..4096 {
+        held.push(alloc::vec![0u8; 64]);
+    }
+
+    let free_after = crate::frame::stats().free;
+    let held_after = crate::slab::frames_held();
+    let heap_took = held_after.saturating_sub(held_before);
+
+    // The premise: this burst DID make the heap take frames. Without that
+    // the test proves nothing, so assert it rather than assuming it.
+    if heap_took == 0 {
+        drop(held);
+        return TestResult::Fail("4096 x 64B did not grow the heap — premise broken");
+    }
+
+    // The raw free count went DOWN, which is exactly the noise a raw delta
+    // silently attributes to the code under test.
+    let raw_drop = free_before.saturating_sub(free_after);
+    if raw_drop == 0 {
+        drop(held);
+        return TestResult::Fail("heap growth did not reduce the raw buddy free count");
+    }
+
+    // And the corrected quantity — free + frames_held — is stable across
+    // the same window, because every frame the heap took is accounted for
+    // rather than lost. This is now an EXACT identity: with large
+    // allocations counted there is no remaining unattributed source, so a
+    // tolerance here would only hide the next one.
+    let net_before = free_before + held_before;
+    let net_after = free_after + held_after;
+    drop(held);
+    if net_before != net_after {
+        return TestResult::Fail("net (free + frames_held) drifted across pure heap growth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_growth_consumes_buddy_frames);
