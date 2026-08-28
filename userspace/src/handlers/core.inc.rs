@@ -1248,6 +1248,7 @@ fn open_impl(
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
                         narf_filesystem::FsError::InvalidPath
                         | narf_filesystem::FsError::InvalidData => 22, // EINVAL
+                        narf_filesystem::FsError::SymlinkLoop => 40,   // ELOOP
                         narf_filesystem::FsError::CrossDevice => 18,      // EXDEV
                         narf_filesystem::FsError::Busy => 16,             // EBUSY
                         narf_filesystem::FsError::ReadOnly => 30,         // EROFS
@@ -3309,6 +3310,11 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::InvalidPath
         | narf_filesystem::FsError::InvalidData
         | narf_filesystem::FsError::Unsupported => 22,
+        // `fs/namei.c`: a walk that exhausts MAXSYMLINKS is -ELOOP, not the
+        // -EINVAL a malformed path gets. Folding it into InvalidPath told
+        // callers the path was syntactically wrong when it was structurally
+        // circular.
+        narf_filesystem::FsError::SymlinkLoop => 40,
         narf_filesystem::FsError::CrossDevice => 18,
         narf_filesystem::FsError::Busy => 16,
         narf_filesystem::FsError::ReadOnly => 30,
