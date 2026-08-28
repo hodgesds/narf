@@ -5404,8 +5404,54 @@ pub(crate) struct FutexKey {
 }
 
 #[inline]
+/// Raw key constructor for an address that has ALREADY been validated.
+///
+/// Internal wake/register/robust-list paths hold an address they recorded
+/// from a syscall that already went through [`get_futex_key`], so they use
+/// this directly. Anything reached from a raw syscall ARGUMENT must not:
+/// see `get_futex_key`.
 pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
     FutexKey { namespace, uaddr }
+}
+
+/// `kernel/futex/core.c::get_futex_key` — the single funnel from a
+/// user-supplied futex address to a key.
+///
+/// ```text
+/// key->both.offset = address % PAGE_SIZE;
+/// if (unlikely((address % sizeof(u32)) != 0))   return -EINVAL;
+/// address -= key->both.offset;
+/// if (unlikely(!access_ok(uaddr, size)))        return -EFAULT;
+/// ```
+///
+/// This exists to make one class of bug unrepresentable rather than merely
+/// tested-against. Every futex entry point used to validate its own
+/// address, and three of them independently grew a "null address is fine"
+/// shortcut — the classic FUTEX_WAIT arm, the shared `futex_wait_core`
+/// that the FUTEX2 path uses, and `futex_wake`'s zero-count arm. Each had
+/// its own justification, and fixing one left the others, because nothing
+/// connected them.
+///
+/// With the decision made HERE, an entry point cannot decide differently:
+/// it never sees the raw address, only a key or an errno. A new futex op
+/// that forgets to call this does not compile into a working handler,
+/// because it has no other way to obtain a key from an argument.
+///
+/// Note the ORDER — alignment before accessibility — so a misaligned
+/// address is -EINVAL even when it is also unreadable.
+pub(crate) fn get_futex_key(namespace: u64, uaddr: u64) -> Result<FutexKey, i64> {
+    const EFAULT: i64 = 14;
+    const EINVAL: i64 = 22;
+    if uaddr % 4 != 0 {
+        return Err(EINVAL);
+    }
+    // `access_ok(uaddr, size)`. A null address is not special-cased here;
+    // it simply fails range validation, which is exactly how Linux rejects
+    // it and why no separate `uaddr == 0` arm should ever be written again.
+    if validate_user_range(uaddr, 4).is_err() {
+        return Err(EFAULT);
+    }
+    Ok(futex_key(namespace, uaddr))
 }
 
 /// Namespace for a futex operation. Private futexes are scoped to the live
@@ -5912,8 +5958,10 @@ pub fn futex_wake_waiters_for_test(uaddr: u64, n: u32) -> usize {
 ///    the wait until the condition is satisfied, so a `futex_wake` on the
 ///    same word makes the waiter progress.
 ///
-/// `uaddr == 0` is treated as an immediate (POSIX-permitted) spurious
-/// wake so wake-path smokes can run without a backing mapping.
+/// `uaddr == 0` is -EFAULT (`get_futex_key`'s access_ok arm). It used to
+/// be an immediate "POSIX-permitted spurious wake" so that wake-path
+/// smokes could run without a backing mapping — production behaviour bent
+/// to suit a fixture, which then pinned it in place.
 fn futex_wait_core(
     ctx: &mut dyn TrapContext,
     namespace: u64,
@@ -5923,14 +5971,21 @@ fn futex_wait_core(
 ) {
     const EAGAIN: i64 = 11;
     const EFAULT: i64 = 14;
-    if uaddr == 0 {
-        ctx.set_return(SyscallReturn::ok(0));
-        return;
-    }
+    // The address is validated ONLY here, by the shared funnel. This helper
+    // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
+    // kept reporting a spurious wake for a null word after the classic
+    // FUTEX_WAIT arm was corrected — the same bug in a second place, which
+    // is what a duplicated special case buys.
+    let key = match get_futex_key(namespace, uaddr) {
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     // Seqlock read: sample the wake generation BEFORE reading `*uaddr` (see
     // `futex_wait_seqlock_read` — sampling after the read loses a racing
     // FUTEX_WAKE and deadlocks a contended mutex/condvar under SMP).
-    let key = futex_key(namespace, uaddr);
     let (gen, current) = match futex_wait_seqlock_read_key(key, || {
         let mut buf4 = [0u8; 4];
         // SAFETY: copy_from_user range-validates `uaddr` + SMAP-brackets the read.

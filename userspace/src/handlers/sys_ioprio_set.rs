@@ -34,12 +34,29 @@ pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
     // `ioprio_check_cap(ioprio)` — the class must be a defined one. Runs
     // before the `which` switch in Linux.
     //
-    // LINUX-GAP: the CAP_SYS_NICE / CAP_SYS_ADMIN requirement for
-    // IOPRIO_CLASS_RT is not enforced — NARF has no I/O scheduler for the
-    // class to mean anything to, so gating it would refuse a request that
-    // is already inert.
     if ioprio >> 13 >= IOPRIO_NR_CLASSES {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    // `ioprio_check_cap`: the real-time class is privileged.
+    //
+    //     case IOPRIO_CLASS_RT:
+    //             if (!capable(CAP_SYS_NICE) && !capable(CAP_SYS_ADMIN))
+    //                     return -EPERM;
+    //
+    // A previous note argued this was not worth enforcing because NARF has
+    // no I/O scheduler, so the class "is already inert". That reasoning
+    // does not hold for a REQUEST: the value round-trips through
+    // ioprio_get, so an unprivileged task could read back
+    // IOPRIO_CLASS_RT and conclude it holds a real-time I/O reservation it
+    // was never granted. Refusing it costs nothing and keeps the reported
+    // state honest for whenever a scheduler does arrive.
+    const IOPRIO_CLASS_RT: u32 = 1;
+    if ioprio >> 13 == IOPRIO_CLASS_RT
+        && !capable(CAP_SYS_NICE)
+        && !capable(CAP_SYS_ADMIN)
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     let scope = match which {

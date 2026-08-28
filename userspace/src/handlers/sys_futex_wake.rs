@@ -54,15 +54,33 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
-    if uaddr % 4 != 0 {
-        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-        return;
-    }
+
+    // `kernel/futex/waitwake.c::futex_wake` fixes the ORDER:
+    //
+    //     ret = get_futex_key(uaddr, flags, &key, FUTEX_READ);
+    //     if (unlikely(ret != 0))                       return ret;   /* -EFAULT */
+    //     if ((flags & FLAGS_STRICT) && !nr_wake)       return 0;
+    //
+    // The key is resolved — and a null address faults — BEFORE the
+    // zero-count shortcut. This had the two inverted, so `futex_wake(NULL,
+    // 0)` reported success.
+    //
+    // The note here argued a null uaddr was "the same observable answer
+    // Linux gives (a valid-but-empty key wakes nobody)". Linux never
+    // reaches a key for a null address; `get_futex_key`'s access_ok fails
+    // first. A caller waking a corrupted or uninitialised futex pointer was
+    // told it had successfully woken nobody.
+    let key = match get_futex_key(futex_namespace((flags & FUTEX_PRIVATE) != 0), uaddr) {
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     let nr = args.arg2 as i32;
-    if nr == 0 || uaddr == 0 {
-        // FLAGS_STRICT: a zero count is a successful no-op. A null uaddr
-        // has no wait queue in NARF, which is the same observable answer
-        // Linux gives (a valid-but-empty key wakes nobody).
+    if nr == 0 {
+        // FLAGS_STRICT: a zero count is a successful no-op, once the key
+        // has resolved.
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
@@ -71,7 +89,6 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     let want = if nr < 0 { 1u32 } else { nr as u32 };
     // Bump the gen counter AND fire up to `want` parked waiters on the real
     // queue (futex2 and classic futex share the same words / queue).
-    let key = futex_key(futex_namespace((flags & FUTEX_PRIVATE) != 0), uaddr);
     futex_bump_counter_key(key);
     let _ = futex_wake_waiters_key(key, want);
     ctx.set_return(SyscallReturn::ok(want as u64))

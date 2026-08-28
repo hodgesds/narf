@@ -831,11 +831,15 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_futex_wake_pos);
 
 fn smoke_abi_async_futex_wake_null() -> TestResult {
     with_setup(|| {
-        // futex_wake(NULL, ..): a valid-but-empty key wakes nobody → 0.
+        // `futex_wake` resolves the key BEFORE the zero-count shortcut, so
+        // a null address is -EFAULT. This asserted 0 on the grounds that "a
+        // valid-but-empty key wakes nobody" — but Linux never reaches a key
+        // for a null address; get_futex_key's access_ok fails first.
         let args = a3(0, FUTEX_BITSET_MATCH_ANY, 5, FUTEX2_SIZE_U32);
         match call(Syscall::FutexWake.raw(), args) {
-            Some(0) => Ok(()),
-            _ => Err("futex_wake(NULL) should return 0"),
+            Some(-14) => Ok(()),
+            Some(0) => Err("futex_wake(NULL) reported success instead of -EFAULT"),
+            _ => Err("futex_wake(NULL) should be -EFAULT"),
         }
     })
 }
@@ -924,9 +928,9 @@ fn futex2_wait(uaddr: u64, val: u64, mask: u64, flags: u64, to: u64, clk: u64) -
 
 fn smoke_abi_async_futex_wait_pos() -> TestResult {
     with_setup(|| {
-        // futex_wait(NULL, 0): null uaddr → immediate spurious wake (0).
-        if futex2_wait(0, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(0) {
-            return Err("futex_wait(NULL) should return 0");
+        // futex_wait(NULL, 0) is -EFAULT — see the class test below.
+        if futex2_wait(0, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(-14) {
+            return Err("futex_wait(NULL) should be -EFAULT");
         }
         // A matching value parks; the harness has no task to park, so the
         // match branch falls through to a synchronous 0. This is the
@@ -1914,4 +1918,135 @@ fn smoke_abi_async_fanotify_read_efault_does_not_publish_fd() -> TestResult {
 kernel_test_in!(
     "syscall_abi/async",
     smoke_abi_async_fanotify_read_efault_does_not_publish_fd
+);
+
+// ─────────────────────────────────────────────────────────────────────
+// CLASS TEST: no futex entry point may accept a null user word
+//
+// `get_futex_key` resolves every futex address through `access_ok` before
+// the operation runs, so a null word is -EFAULT on EVERY op — there is no
+// "empty wait queue" or "spurious wake" shortcut anywhere in Linux.
+//
+// NARF had that shortcut in THREE places (the classic FUTEX_WAIT arm, the
+// shared `futex_wait_core` the FUTEX2 path uses, and `futex_wake`'s
+// zero-count arm), each added separately and each justified by its own
+// comment. Fixing one left the others, because nothing tied them together.
+//
+// This test is that tie. It enumerates every futex entry point rather than
+// spot-checking one, so a new op — or a new shortcut added to an existing
+// one — fails here rather than shipping a fourth copy of the same bug.
+// ─────────────────────────────────────────────────────────────────────
+
+fn smoke_abi_async_futex_null_word_is_always_efault() -> TestResult {
+    with_setup(|| {
+        const EFAULT: i64 = -14;
+
+        // `futex(uaddr, op, ...)` — every op that takes a user word, with
+        // and without the PRIVATE bit, since the private path is a separate
+        // branch in the handler.
+        //
+        // arg5 carries a NON-ZERO bitset for all of them. `futex_wake`
+        // opens `if (!bitset) return -EINVAL;` BEFORE get_futex_key, so a
+        // zero bitset masks the fault under EINVAL and the loop would pass
+        // without testing anything. It did exactly that on the first run —
+        // the ordering claim is load-bearing, not decorative.
+        for base in [
+            FUTEX_WAIT,
+            FUTEX_WAKE,
+            FUTEX_CMP_REQUEUE,
+            FUTEX_WAIT_BITSET,
+            FUTEX_WAKE_BITSET,
+        ] {
+            for op in [base, base | FUTEX_PRIVATE] {
+                let args = SyscallArgs {
+                    arg0: 0,
+                    arg1: op,
+                    arg2: 1,
+                    arg3: 0,
+                    arg4: 0,
+                    arg5: FUTEX_BITSET_MATCH_ANY,
+                };
+                match call(Syscall::Futex.raw(), args) {
+                    Some(v) if v == EFAULT => {}
+                    Some(0) => return Err("a futex op accepted a null word and reported success"),
+                    _ => return Err("a futex op on a null word did not report -EFAULT"),
+                }
+            }
+        }
+
+        // The inverse of that ordering, pinned so it cannot drift: a zero
+        // bitset IS -EINVAL, and it outranks the bad address.
+        let zero_bitset = SyscallArgs {
+            arg0: 0,
+            arg1: FUTEX_WAIT_BITSET,
+            arg2: 1,
+            arg3: 0,
+            arg4: 0,
+            arg5: 0,
+        };
+        match call(Syscall::Futex.raw(), zero_bitset) {
+            Some(-22) => {}
+            Some(v) if v == EFAULT => {
+                return Err("a null address outranked the zero-bitset EINVAL")
+            }
+            _ => return Err("FUTEX_WAIT_BITSET with a zero bitset should be -EINVAL"),
+        }
+
+        // The futex2 syscalls reach a different code path (the shared
+        // `futex_wait_core`), which is precisely why fixing the classic arm
+        // alone left this half broken.
+        if futex2_wait(0, 0, FUTEX_BITSET_MATCH_ANY, FUTEX2_SIZE_U32, 0, 0) != Some(EFAULT) {
+            return Err("futex_wait(NULL) must be -EFAULT");
+        }
+        match call(
+            Syscall::FutexWake.raw(),
+            a3(0, FUTEX_BITSET_MATCH_ANY, 1, FUTEX2_SIZE_U32),
+        ) {
+            Some(v) if v == EFAULT => {}
+            _ => return Err("futex_wake(NULL) must be -EFAULT"),
+        }
+
+        // And a zero count must NOT excuse the null address: Linux resolves
+        // the key first and only then honours the FLAGS_STRICT shortcut, so
+        // the count cannot mask a bad pointer. This is the exact inversion
+        // the old `nr == 0 || uaddr == 0` arm had.
+        match call(
+            Syscall::FutexWake.raw(),
+            a3(0, FUTEX_BITSET_MATCH_ANY, 0, FUTEX2_SIZE_U32),
+        ) {
+            Some(v) if v == EFAULT => Ok(()),
+            Some(0) => Err("a zero wake count masked a null futex address"),
+            _ => Err("futex_wake(NULL, nr=0) must be -EFAULT"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_futex_null_word_is_always_efault
+);
+
+fn smoke_abi_async_futex_valid_word_still_works() -> TestResult {
+    with_setup(|| {
+        // The other half of the class: making null faulting must not make
+        // every futex call fault. A real word still behaves.
+        let word: u32 = 0xAAAA;
+        let uaddr = &word as *const u32 as u64;
+
+        // A mismatched value is -EAGAIN, not -EFAULT.
+        match call(Syscall::Futex.raw(), a3(uaddr, FUTEX_WAIT, 0x1234, 0)) {
+            Some(-11) => {}
+            Some(-14) => return Err("a valid futex word reported -EFAULT"),
+            _ => return Err("FUTEX_WAIT on a mismatched word should be -EAGAIN"),
+        }
+        // A wake on a real word with nobody parked reports 0 woken.
+        match call(Syscall::Futex.raw(), a3(uaddr, FUTEX_WAKE, 1, 0)) {
+            Some(0) => Ok(()),
+            Some(-14) => Err("a valid futex word reported -EFAULT on wake"),
+            _ => Err("FUTEX_WAKE on a real word should report 0 waiters"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/async",
+    smoke_abi_async_futex_valid_word_still_works
 );

@@ -750,9 +750,13 @@ fn create_epoll(ctx: &mut dyn TrapContext, cloexec: bool) {
 
     match new_fd {
         Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
-        // LINUX-GAP: `ep_alloc` failing is -ENOMEM and a full descriptor
-        // table is -EMFILE. NARF's fd table grows without bound, so this arm
-        // is unreachable; RLIMIT_NOFILE enforcement is its own change.
+        // A full descriptor table is -EMFILE. The note here used to call
+        // this arm unreachable "because NARF's fd table grows without
+        // bound" — no longer true since RLIMIT_NOFILE enforcement, and
+        // `smoke_abi_ioerrno_epoll_create_reports_emfile` covers it.
+        //
+        // LINUX-GAP: `ep_alloc` failing separately is -ENOMEM; NARF has no
+        // distinct allocation-failure path here, so that half stands.
         None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
     }
 }

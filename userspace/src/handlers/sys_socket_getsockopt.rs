@@ -75,11 +75,39 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
         return;
     }
     if in_len == 0 {
-        // LINUX-GAP: an int option in sk_getsockopt clamps `len = min(len,
-        // sizeof(int))`, copies 0 bytes and returns 0 for optlen==0; NARF's
-        // generic getsockopt can't satisfy an unsized query, so it rejects.
-        // -EINVAL (optlen too small to hold the value) is the closest errno.
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        // `net/core/sock.c::sk_getsockopt` validates the length as
+        //
+        //     if (copy_from_sockptr(&len, optlen, sizeof(int))) return -EFAULT;
+        //     if (len < 0)                                      return -EINVAL;
+        //
+        // so ZERO is not rejected — only a negative length is. An int option
+        // then clamps `len = min_t(unsigned int, len, sizeof(int))`, copies
+        // `len` (i.e. nothing) and writes the clamped length back, returning
+        // 0.
+        //
+        // The previous note called -EINVAL "the closest errno" because the
+        // generic path "can't satisfy an unsized query". But an optlen of 0
+        // is not an unsized query: the answer does not depend on the
+        // option's width, because zero bytes are copied whatever it is. This
+        // is the shape a caller uses to ask "how big is it?", and returning
+        // EINVAL makes that probe look like a rejected option — the same
+        // failure the NETLINK_LIST_MEMBERSHIPS special case above was added
+        // to work around, one option at a time.
+        //
+        // `return copy_to_sockptr(optlen, &len, sizeof(int)) ? -EFAULT : 0;`
+        // — the write-back is checked, so a faulting optlen is -EFAULT.
+        // (`write_user_u32` discards its copy result, which is exactly the
+        // failure this arm has to report, so the copy is done directly.)
+        if len_ptr != 0 {
+            let zero = 0u32.to_ne_bytes();
+            // SAFETY: copy_to_user range-validates `len_ptr` and
+            // SMAP-brackets the 4-byte write.
+            if unsafe { copy_to_user(len_ptr, &zero) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                return;
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(0));
         return;
     }
     // Optional Unix-peer metadata needs a typed "protocol option unavailable"

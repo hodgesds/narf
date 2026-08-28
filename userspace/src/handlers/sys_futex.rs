@@ -44,7 +44,6 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // hand-written stub is the usual source) into an unrecognised op.
     let raw_op = args.arg1 as u32 as u64;
     let namespace = futex_namespace((raw_op & FUTEX_PRIVATE) != 0);
-    let key = futex_key(namespace, uaddr);
     let cmd = raw_op & FUTEX_OP_MASK;
     let val = args.arg2 as u32;
     // Start each futex op from clean park state so a stale `futex_uaddr` left
@@ -112,7 +111,19 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     // EINVAL, never EFAULT: a caller that mis-lays out its lock struct
     // must be able to tell "your pointer is skewed" (a bug it has to fix)
     // apart from "that page went away" (which a retry can resolve).
-    let aligned = |p: u64| p % 4 == 0;
+    //
+    // Resolved ONCE, here, for every op — not per-arm. Each arm used to
+    // validate the address itself, and that is how three separate "a null
+    // address is fine" shortcuts grew in three different places. An arm now
+    // receives a key it cannot have constructed from a bad address.
+    // It follows the `!bitset` gate above because Linux checks that first.
+    let key = match get_futex_key(namespace, uaddr) {
+        Ok(k) => k,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     // FUTEX_WAIT_BITSET behaves like FUTEX_WAIT for NARF's per-uaddr wait
     // queue (the bitmask only narrows WHICH wakes match; a superset wake is
     // safe and musl/glibc pass MATCH_ANY). Its timeout remains distinct:
@@ -129,10 +140,6 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
         FUTEX_WAKE_OP => {
             // `futex_wake_op` keys BOTH words, so either one being skewed
             // is -EINVAL before any of the RMW work happens.
-            if !aligned(uaddr) || !aligned(args.arg4) {
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                return;
-            }
             let r = futex_wake_op(
                 namespace,
                 uaddr,
@@ -155,17 +162,31 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // uaddr + a wake-counter snapshot for its lost-wakeup guard and
             // hand control back via the yield hook. On resume the user reads
             // RAX=0 and musl's recheck loop re-evaluates the word.
-            if !aligned(uaddr) {
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                return;
-            }
-            // Null uaddr: no wait queue — immediate (POSIX-permitted) spurious
-            // wake so wake-path smokes run without a backing mapping.
-            // LINUX-GAP: Linux would fault the read and answer -EFAULT.
-            if uaddr == 0 {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
+            // `kernel/futex/core.c::get_futex_key`:
+            //
+            //     if (unlikely((address % sizeof(u32)) != 0)) return -EINVAL;
+            //     if (unlikely(!access_ok(uaddr, size)))      return -EFAULT;
+            //
+            // so a null word is -EFAULT (it is aligned, and fails access_ok).
+            //
+            // This used to report success — a "POSIX-permitted spurious
+            // wake" — with the stated reason being "so wake-path smokes run
+            // without a backing mapping". That is production behaviour bent
+            // to suit a test, and it turns a caller's bad pointer into a
+            // HANG rather than an error: musl's and glibc's condvar loops
+            // treat a spurious wake as "re-check the predicate and wait
+            // again", so a null futex word spins forever instead of
+            // reporting EFAULT.
+            //
+            // One kernel test DID depend on the old behaviour
+            // (`smoke_userspace_futex_wait_and_wake_no_op` passed arg0 = 0
+            // and asserted 0), which is the concrete cost of bending a
+            // syscall to suit a fixture: the fixture then pins the bend in
+            // place. It now supplies a real word and asserts the genuine
+            // outcomes instead.
+            //
+            // No address check here any more — `get_futex_key` above ran it
+            // for every op, so this arm cannot disagree with the others.
             // Seqlock read: sample the wake generation BEFORE reading `*uaddr`
             // (see `futex_wait_seqlock_read` — sampling after the read loses a
             // racing FUTEX_WAKE and deadlocks a contended mutex/condvar on SMP).
@@ -243,10 +264,6 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             // waiters' wakers. Returns the number actually woken (Linux
             // contract). A waiter not yet registered when we fire is caught
             // by the gen guard on its next poll.
-            if !aligned(uaddr) {
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                return;
-            }
             futex_bump_counter_key(key);
             let woken = futex_wake_waiters_key(key, val);
             ctx.set_return(SyscallReturn::ok(woken as u64));
@@ -268,14 +285,16 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
                 return;
             }
-            if !aligned(uaddr) || !aligned(uaddr2) {
-                ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
-                return;
-            }
-            if uaddr2 == 0 {
-                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
-                return;
-            }
+            // `uaddr` came through the funnel above; the SECOND word needs
+            // the same treatment, and gets it from the same function rather
+            // than a hand-written pair of checks.
+            let key2 = match get_futex_key(namespace, uaddr2) {
+                Ok(k) => k,
+                Err(errno) => {
+                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                    return;
+                }
+            };
             if op == FUTEX_CMP_REQUEUE {
                 match futex_read_user_word(uaddr) {
                     Some(cur) if cur == args.arg5 as u32 => {}
@@ -301,7 +320,7 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
             let new_val = futex_read_user_word(uaddr2).unwrap_or(0);
             let (woken, moved) = futex_requeue_waiters_keyed(
                 key,
-                futex_key(namespace, uaddr2),
+                key2,
                 uaddr2,
                 val,
                 args.arg3 as u32,

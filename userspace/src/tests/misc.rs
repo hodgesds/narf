@@ -1369,12 +1369,23 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
     install_core_syscalls(&mut t);
     install_global(t);
 
-    fn call(op: u64) -> Option<SyscallReturn> {
+    // A REAL futex word. This test used to pass `arg0 = 0` and assert that
+    // FUTEX_WAIT returned 0 — which only held because the handler special-
+    // cased a null word into a "spurious wake". That special case existed,
+    // by its own comment, "so wake-path smokes run without a backing
+    // mapping": production behaviour bent to suit this fixture, which then
+    // pinned the bend in place. `get_futex_key` faults a null word with
+    // -EFAULT, so the word is now real and the assertions are the genuine
+    // outcomes.
+    let word: u32 = 1;
+    let uaddr = &word as *const u32 as u64;
+
+    fn call_at(uaddr: u64, op: u64, val: u64) -> Option<SyscallReturn> {
         let mut ctx = FakeCtx {
             args: SyscallArgs {
-                arg0: 0,
+                arg0: uaddr,
                 arg1: op,
-                arg2: 0,
+                arg2: val,
                 arg3: 0,
                 arg4: 0,
                 arg5: 0,
@@ -1384,18 +1395,29 @@ fn smoke_userspace_futex_wait_and_wake_no_op() -> TestResult {
         kernel_syscall_entry(Syscall::Futex.raw(), &mut ctx);
         ctx.ret
     }
+    let call = |op: u64| call_at(uaddr, op, 0);
 
-    // FUTEX_WAIT (0) → 0.
-    if !matches!(call(0), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
-        return TestResult::Fail("FUTEX_WAIT did not return 0");
+    // FUTEX_WAIT (0) with `*uaddr != val` → -EAGAIN, without blocking:
+    // `futex_wait_setup` compares the word against the expected value and
+    // bails when they differ, which is how a racing wake is detected. The
+    // word is 1 and `val` is 0, so this takes that arm.
+    if !matches!(call(0), Some(r) if r.status == SyscallReturn::OK && r.value == (-11i64) as u64) {
+        return TestResult::Fail("FUTEX_WAIT on a mismatched word must be -EAGAIN");
     }
-    // FUTEX_WAKE (1) → 0.
+    // FUTEX_WAKE (1) → 0 woken; nobody is parked on this word.
     if !matches!(call(1), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
-        return TestResult::Fail("FUTEX_WAKE did not return 0");
+        return TestResult::Fail("FUTEX_WAKE did not report 0 waiters woken");
     }
-    // FUTEX_WAIT | FUTEX_PRIVATE (0x80) → 0 (private bit stripped).
-    if !matches!(call(0x80), Some(r) if r.status == SyscallReturn::OK && r.value == 0) {
-        return TestResult::Fail("FUTEX_WAIT_PRIVATE did not return 0");
+    // FUTEX_WAIT | FUTEX_PRIVATE (0x80) — the private bit is stripped, so
+    // this behaves exactly as the plain wait above.
+    if !matches!(call(0x80), Some(r) if r.status == SyscallReturn::OK && r.value == (-11i64) as u64)
+    {
+        return TestResult::Fail("FUTEX_WAIT_PRIVATE did not strip the private bit");
+    }
+    // And the null word the old fixture relied on is -EFAULT.
+    if !matches!(call_at(0, 0, 0), Some(r) if r.status == SyscallReturn::OK && r.value == (-14i64) as u64)
+    {
+        return TestResult::Fail("FUTEX_WAIT on a null word must be -EFAULT");
     }
     // `kernel/futex/syscalls.c::do_futex` falls off its switch to
     // `return -ENOSYS;` for an op it does not implement — the errno that
