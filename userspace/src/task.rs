@@ -140,6 +140,20 @@ static TASKS: IrqSafeSpinLock<BTreeMap<u64, Arc<Task>>> = IrqSafeSpinLock::new(B
 /// `get_task_struct`: resolve a tid to a live (or zombie) task,
 /// taking a reference. Safe to dereference after the registry lock is
 /// released — that is the whole point.
+/// Snapshot of every live task id.
+///
+/// `for_each_process_thread` / `do_each_pid_thread` in Linux walk the task
+/// list under a lock; NARF's registry is a `BTreeMap` behind a spinlock, so
+/// callers take a SNAPSHOT rather than holding it across the per-task work.
+/// That is deliberate: the per-task work (reading creds, writing nice)
+/// takes other locks, and holding the registry lock across them is how a
+/// lock-order inversion gets introduced. A task that exits during the walk
+/// is simply skipped by the caller's own lookup, which matches the racy
+/// nature of the Linux syscall anyway.
+pub fn task_ids() -> alloc::vec::Vec<u64> {
+    TASKS.lock().keys().copied().collect()
+}
+
 pub fn task_get(tid: u64) -> Option<Arc<Task>> {
     TASKS.lock().get(&tid).cloned()
 }

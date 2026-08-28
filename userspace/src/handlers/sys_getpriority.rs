@@ -1,40 +1,59 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `getpriority(which, who)` — Linux `SYSCALL_DEFINE2(getpriority)`
-/// (kernel/sys.c):
-///   - `which` outside `[PRIO_PROCESS, PRIO_USER]` → -EINVAL,
-///   - the target pid is resolved in the caller's pid ns; not found → -ESRCH,
-///   - the value is `nice_to_rlimit(nice) = 20 - nice`, so nice -20..=19 maps
-///     to the wire range 40..=1 (never negative, so it can't be mistaken for
-///     an errno — glibc recovers the nice with `20 - ret`).
+/// `kernel/sys.c::SYSCALL_DEFINE2(getpriority, int, which, int, who)`.
 ///
-/// LINUX-GAP: PRIO_PGRP/PRIO_USER (group/user queries) are unimplemented (also
-/// -EINVAL here).
+/// ```text
+/// if (which > PRIO_USER || which < PRIO_PROCESS) return -EINVAL;
+/// retval = -ESRCH;
+/// /* per selected task: */
+///     niceval = nice_to_rlimit(task_nice(p));
+///     if (niceval > retval) retval = niceval;
+/// return retval;
+/// ```
+///
+/// Two things make the return value unusual and both are deliberate:
+///
+///   * it is `nice_to_rlimit(nice) = 20 - nice`, so a nice of -20..=19 maps
+///     to 40..=1 and can never be confused with a negative errno. glibc
+///     unwraps it with `20 - ret`.
+///   * across a GROUP the answer is the MAXIMUM of that value, i.e. the
+///     numerically LOWEST nice — the most favourable process in the set.
+///     Taking the minimum, or the first, would report a group as less
+///     favoured than it is.
+///
+/// PRIO_PGRP and PRIO_USER used to take the -EINVAL arm; the selection is
+/// now shared with setpriority and the ioprio pair via `resolve_who_targets`.
 pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
+    const ESRCH: i64 = 3;
+    const EINVAL: i64 = 22;
+    const PRIO_PROCESS: i64 = 0;
+    const PRIO_PGRP: i64 = 1;
+    const PRIO_USER: i64 = 2;
     let args = *ctx.args();
-    let which = args.arg0 as i64;
-    let who = args.arg1;
-    if which != PRIO_PROCESS_VAL {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-        return;
-    }
-    // PRIO_PROCESS `who` is a pid in the CALLER's pid namespace (Linux
-    // kernel/sys.c:282); who == 0 means the caller. Resolve it instead of
-    // discarding it, so `renice`/`getpriority -p N` reports N. Audit finding
-    // #28.
-    let task = if who == 0 {
-        current_task_id()
-    } else {
-        let Some(outer) = accept_pid_from(current_task_id(), who) else {
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+    // `int which`, `int who` — both 32-bit.
+    let which = args.arg0 as i32 as i64;
+    let who = args.arg1 as i32;
+    let scope = match which {
+        PRIO_PROCESS => WhoScope::Process,
+        PRIO_PGRP => WhoScope::Pgrp,
+        PRIO_USER => WhoScope::User,
+        _ => {
+            ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
             return;
-        };
-        proc_pid_to_tid(outer)
+        }
     };
-    let nice = read_nice(task);
-    // Linux nice_to_rlimit: the wire value is `20 - nice` (a -20..=19 nice maps
-    // to 40..=1), matching what glibc's getpriority() unwraps with `20 - ret`.
-    let wire = (20 - nice) as u64;
-    ctx.set_return(SyscallReturn::ok(wire));
+    let targets = resolve_who_targets(scope, who, current_task_id());
+    // `retval = -ESRCH` until a task is visited.
+    let mut best: Option<i64> = None;
+    for t in targets {
+        let wire = 20 - i64::from(read_nice(t));
+        if best.is_none_or(|b| wire > b) {
+            best = Some(wire);
+        }
+    }
+    match best {
+        Some(wire) => ctx.set_return(SyscallReturn::ok(wire as u64)),
+        None => ctx.set_return(SyscallReturn::ok((-ESRCH) as u64)),
+    }
 }
