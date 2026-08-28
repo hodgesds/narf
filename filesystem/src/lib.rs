@@ -291,6 +291,12 @@ pub struct FileOwner {
     pub gid: u32,
     /// Low 9 bits: rwxrwxrwx.
     pub perms: u16,
+    /// Whether the inode is a DIRECTORY. Linux's override rules differ by
+    /// type and the difference is not cosmetic: on a directory
+    /// CAP_DAC_READ_SEARCH grants search, while on a regular file
+    /// CAP_DAC_OVERRIDE cannot grant EXECUTE unless some execute bit is
+    /// already set — so a privileged process still cannot run a data file.
+    pub is_dir: bool,
 }
 
 /// The accessing process's identity for a POSIX access check.
@@ -312,14 +318,37 @@ pub struct Accessor {
     pub gid: u32,
     /// Supplementary groups from `setgroups(2)`. Empty is legal.
     pub groups: alloc::vec::Vec<u32>,
+    /// CAP_DAC_OVERRIDE in the accessor's EFFECTIVE set.
+    ///
+    /// The privilege decision is made by the caller and carried here
+    /// because this crate has no capability model — `narf_userspace` owns
+    /// the credential. It used to be inferred from `uid == 0`, which was
+    /// the only test available before POSIX capabilities were enforceable;
+    /// that conflates two things Linux keeps apart, so a uid-0 task that
+    /// deliberately dropped CAP_DAC_OVERRIDE stayed omnipotent and a
+    /// non-root task granted it stayed locked out.
+    pub dac_override: bool,
+    /// CAP_DAC_READ_SEARCH in the accessor's EFFECTIVE set. Weaker than
+    /// `dac_override`: it grants read and directory search, never write.
+    pub dac_read_search: bool,
 }
 
 impl Accessor {
     /// An accessor with no supplementary groups.
+    /// An accessor with no supplementary groups, whose DAC overrides are
+    /// derived from `uid == 0`.
+    ///
+    /// That derivation is a CONVENIENCE for callers with no capability
+    /// context (tests, and filesystems checking their own internal
+    /// nodes) — not the production rule. The real path builds an
+    /// `Accessor` from the task's effective capability set; see
+    /// `narf_userspace`'s `current_accessor`.
     pub fn new(uid: u32, gid: u32) -> Self {
         Accessor {
             uid,
             gid,
+            dac_override: uid == 0,
+            dac_read_search: uid == 0,
             groups: alloc::vec::Vec::new(),
         }
     }
@@ -339,44 +368,105 @@ pub struct AccessRequest {
     pub exec: bool,
 }
 
-/// POSIX-2017 §B.2.1 access check: given a file's mode/uid/gid and
-/// the accessor's identity, decide whether the requested operation
-/// (one of read/write/exec) is permitted.
+/// `fs/namei.c::generic_permission` — the POSIX discretionary check plus
+/// the capability overrides that make a privileged process privileged.
 ///
-/// - UID 0 (root) is always allowed (POSIX privileged-process rule).
-/// - Otherwise: pick owner / group / other triplet by matching uid
-///   then gid, and AND with the requested-mode bits (R=4, W=2, X=1).
+/// ```text
+/// ret = acl_permission_check(idmap, inode, mask);
+/// if (ret != -EACCES) return ret;
+/// if (S_ISDIR(inode->i_mode)) {
+///         if (!(mask & MAY_WRITE) && capable(CAP_DAC_READ_SEARCH)) return 0;
+///         if (capable(CAP_DAC_OVERRIDE))                           return 0;
+///         return -EACCES;
+/// }
+/// mask &= MAY_READ | MAY_WRITE | MAY_EXEC;
+/// if (mask == MAY_READ && capable(CAP_DAC_READ_SEARCH))            return 0;
+/// if ((!(mask & MAY_EXEC) || (inode->i_mode & S_IXUGO)) &&
+///     capable(CAP_DAC_OVERRIDE))                                   return 0;
+/// return -EACCES;
+/// ```
+///
+/// and `acl_permission_check`, minus the POSIX-ACL branches (NARF stores
+/// no ACLs, so `IS_POSIXACL` is false everywhere):
+///
+/// ```text
+/// if (!((mask & 7) * 0111 & ~mode)) return 0;      /* everybody may */
+/// if (vfsuid_eq_kuid(vfsuid, current_fsuid())) {
+///         mask &= 7; mode >>= 6;
+///         return (mask & ~mode) ? -EACCES : 0;     /* owner is EXCLUSIVE */
+/// }
+/// mask &= 7;
+/// if (mask & (mode ^ (mode >> 3)))
+///         if (vfsgid_in_group_p(vfsgid)) mode >>= 3;
+/// return (mask & ~mode) ? -EACCES : 0;
+/// ```
+///
+/// Two details are easy to get wrong and both are load-bearing:
+///
+///   * the owner triplet is EXCLUSIVE. An owner whose user bits deny the
+///     access is refused even when the group or other bits would allow it
+///     — `chmod 044 file` locks its own owner out. A "most permissive
+///     wins" reading silently grants what Linux refuses.
+///   * the previous implementation short-circuited on `accessor.uid == 0`
+///     before looking at anything else. That was the only privilege test
+///     available before capabilities were enforceable; it is now wrong in
+///     both directions, and the fix is that the caller supplies the
+///     capability decision in [`Accessor`].
 pub fn posix_access_ok(file: FileOwner, accessor: &Accessor, want: AccessRequest) -> bool {
-    if accessor.uid == 0 {
-        // Root always has read+write; exec still requires *some*
-        // exec bit on the file (matches Linux's get_acl_root path
-        // where root gets X iff any exec bit is set, otherwise the
-        // file is treated as data even for root).
-        if want.exec && (file.perms & 0o111) == 0 {
-            return false;
-        }
-        return true;
-    }
-    let triplet_shift = if accessor.uid == file.uid {
-        6 // owner: bits 8..6
-    } else if accessor.in_group(file.gid) {
-        // Linux: in_group_p(i_gid) — fsgid OR any supplementary group.
-        3 // group: bits 5..3
-    } else {
-        0 // other: bits 2..0
-    };
-    let bits = (file.perms >> triplet_shift) & 0o7;
-    let mut want_bits = 0u16;
+    let mut mask = 0u32;
     if want.read {
-        want_bits |= 0o4;
+        mask |= 0o4;
     }
     if want.write {
-        want_bits |= 0o2;
+        mask |= 0o2;
     }
     if want.exec {
-        want_bits |= 0o1;
+        mask |= 0o1;
     }
-    (bits & want_bits) == want_bits
+    if acl_permission_check(file, accessor, mask) {
+        return true;
+    }
+    if file.is_dir {
+        // DACs are overridable for directories.
+        if mask & 0o2 == 0 && accessor.dac_read_search {
+            return true;
+        }
+        return accessor.dac_override;
+    }
+    // Read alone is overridable by the weaker capability.
+    if mask == 0o4 && accessor.dac_read_search {
+        return true;
+    }
+    // Read/write are always overridable; EXECUTE only when the file
+    // already carries at least one execute bit.
+    if (mask & 0o1 == 0 || file.perms & 0o111 != 0) && accessor.dac_override {
+        return true;
+    }
+    false
+}
+
+/// The discretionary half: the owner/group/other triplet algebra, with no
+/// capability involvement. Returns `true` when the mode bits alone permit
+/// the access.
+fn acl_permission_check(file: FileOwner, accessor: &Accessor, mask: u32) -> bool {
+    let mode = u32::from(file.perms & 0o777);
+    // Cheap path: every class already carries the requested bits, so no
+    // owner or group comparison is needed.
+    if ((mask & 7) * 0o111) & !mode == 0 {
+        return true;
+    }
+    // Owner match is exclusive — see the note above.
+    if accessor.uid == file.uid {
+        let owner = mode >> 6;
+        return (mask & 7) & !owner == 0;
+    }
+    let mut mode = mode;
+    // Consult group membership only when the group and other bits actually
+    // DIFFER in a requested bit (Linux's own optimisation).
+    if (mask & 7) & (mode ^ (mode >> 3)) != 0 && accessor.in_group(file.gid) {
+        mode >>= 3;
+    }
+    (mask & 7) & !mode == 0
 }
 
 /// Combined `(FileType, perms)` mode word.

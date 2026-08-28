@@ -71,7 +71,11 @@ pub(crate) fn sys_setresuid(ctx: &mut dyn TrapContext) {
         // `new->fsuid = new->euid;` — the POSSIBLY-UPDATED effective uid.
         e.fsuid = e.euid;
     });
+    // `security_task_fix_setuid(new, old, LSM_SETID_*)` -> cap_task_fix_setuid
+    // -> cap_emulate_setxuid: the capability sets follow the uid change, so
+    // dropping away from root actually drops privilege.
     if ok {
+        cap_emulate_setxuid(task, old, read_uidgid(task));
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(SyscallReturn::ok((-EPERM) as u64));

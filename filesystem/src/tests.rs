@@ -1323,6 +1323,7 @@ fn smoke_fs_posix_access_root_bypass() -> TestResult {
                 uid: fu,
                 gid: fg,
                 perms: fp,
+                is_dir: false,
             },
             &Accessor::new(au, ag),
             AccessRequest {
@@ -1374,6 +1375,7 @@ fn smoke_fs_posix_access_supplementary_group() -> TestResult {
         uid: 0,
         gid: VIDEO,
         perms: 0o660,
+        is_dir: false,
     };
     let rw = AccessRequest {
         read: true,
@@ -1393,6 +1395,8 @@ fn smoke_fs_posix_access_supplementary_group() -> TestResult {
         uid: 1000,
         gid: 1000,
         groups: alloc::vec![4u32, VIDEO, 105],
+        dac_override: false,
+        dac_read_search: false,
     };
     if !crate::posix_access_ok(card0, &with_video, rw) {
         return TestResult::Fail("supplementary video group did not grant rw on 0660 root:video");
@@ -1404,6 +1408,8 @@ fn smoke_fs_posix_access_supplementary_group() -> TestResult {
         uid: 1000,
         gid: 1000,
         groups: alloc::vec![4u32, 105, 1001],
+        dac_override: false,
+        dac_read_search: false,
     };
     if crate::posix_access_ok(card0, &wrong, rw) {
         return TestResult::Fail("unrelated supplementary groups granted rw");
@@ -1415,6 +1421,7 @@ fn smoke_fs_posix_access_supplementary_group() -> TestResult {
         uid: 0,
         gid: VIDEO,
         perms: 0o640,
+        is_dir: false,
     };
     let w = AccessRequest {
         read: false,
@@ -1436,6 +1443,7 @@ fn smoke_fs_posix_access_owner_group_other() -> TestResult {
                 uid: fu,
                 gid: fg,
                 perms: fp,
+                is_dir: false,
             },
             &Accessor::new(au, ag),
             AccessRequest {

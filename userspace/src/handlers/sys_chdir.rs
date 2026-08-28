@@ -75,13 +75,22 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
             // walk: a NON-final component that is not a directory is also
             // -ENOTDIR in Linux (`link_path_walk`), which this used to
             // report as -ENOENT.
-            //
-            // LINUX-GAP: -EACCES from `path_permission(MAY_EXEC|MAY_CHDIR)`
-            // on a search-forbidden directory is still not modelled — NARF
-            // enforces no directory execute bits.
+            // `path_lookup_errno` also reports -EACCES when an ANCESTOR is
+            // not searchable, which is what Linux's walk would have failed
+            // with before it ever reached the final component.
             _ => -path_lookup_errno(&resolved),
         };
         ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `error = path_permission(&path, MAY_EXEC | MAY_CHDIR);` — the check
+    // runs AFTER the lookup, so a missing or non-directory target keeps its
+    // own errno and only a real directory can be refused for permission.
+    //
+    // This is the -EACCES that used to be a documented LINUX-GAP here: a
+    // directory a task cannot search is one it cannot make its cwd.
+    if !dir_search_permitted(&resolved, task) {
+        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
         return;
     }
     task_map_set(&CWD_TABLE, task, user_abs);
