@@ -163,7 +163,6 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use core::sync::atomic::AtomicPtr;
 use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
 
@@ -717,6 +716,35 @@ fn resched_remote(target_cpu: u32) {
     local_scheduler_telemetry()
         .resched_sent
         .fetch_add(1, Ordering::Relaxed);
+    send_resched_ipi(target_cpu);
+}
+
+/// Unconditional cross-core reschedule kick: send the IPI regardless of the
+/// target's published `CPU_HALTED`. Used for the wake-inbox empty->nonempty
+/// transition (Linux `__ttwu_queue_wakelist` -> `__smp_call_single_queue`
+/// always IPIs on the first entry): the target must drain the inbox in its IPI
+/// handler (`resched_ipi_drain`) promptly even while RUNNING, or a woken task
+/// waits out a whole ready-queue round. Gated by the caller on `was_empty` so it
+/// is one IPI per empty->nonempty edge, not one per wake (Linux `llist_add`'s
+/// "first entry" gate). A spurious IPI to a running target just drains an inbox
+/// that already looks empty — cheap. No-op for self / out-of-range.
+#[inline]
+fn resched_remote_force(target_cpu: u32) {
+    let me = narf_lib::percpu::current_cpu() as u32;
+    if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
+        return;
+    }
+    // Pair the push (release) with the target's drain (acquire): the staged slot
+    // must be visible before the IPI lands and the handler drains.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    local_scheduler_telemetry()
+        .resched_sent
+        .fetch_add(1, Ordering::Relaxed);
+    send_resched_ipi(target_cpu);
+}
+
+#[inline]
+fn send_resched_ipi(target_cpu: u32) {
     let p = RESCHED_IPI_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` was set by `set_resched_ipi_hook` from a `fn(u32)`.
@@ -1057,17 +1085,11 @@ pub fn __reset_queues_for_test() {
             d.clear();
         }
     }
-    // Reclaim any nodes left on the per-CPU wake lists so tasks don't leak or
-    // carry over between tests. Swapping to null then boxing each node back
-    // frees it (and drops the carried `TaskSlot`).
-    for head in WAKE_LIST.iter() {
-        let mut cur = head.swap(core::ptr::null_mut(), Ordering::AcqRel);
-        while !cur.is_null() {
-            // SAFETY: nodes were `Box::into_raw`'d in `wake_list_push`; after the
-            // swap we exclusively own the detached list and free each once.
-            let node = unsafe { Box::from_raw(cur) };
-            cur = node.next.load(Ordering::Relaxed);
-        }
+    // Clear any tasks left staged on the per-CPU wake inboxes so they don't
+    // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
+    for (cpu, inbox) in WAKE_INBOX.iter().enumerate() {
+        inbox.lock().clear();
+        WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
     }
 }
 
@@ -1481,95 +1503,81 @@ fn user_ap_affinity() -> Affinity {
 /// One node in a CPU's lock-free wake list. Boxed and CAS-pushed by a remote
 /// waker (`wake_list_push`), reclaimed by the target CPU when it folds the list
 /// into its own run queue (`drain_wake_list`).
-struct WakeNode {
-    /// Treiber-stack link (Linux `llist_node`). Only the pushing producer (via
-    /// CAS) and the single draining consumer (after an exclusive swap) touch it.
-    next: AtomicPtr<WakeNode>,
-    slot: TaskSlot,
-    reason: policy::TaskEnqueueReason,
-}
+/// Per-CPU cross-core wake inbox (Linux `ttwu_queue` staging + `sched_ttwu_pending`).
+/// A *remote* waker pushes a task here under a lightweight per-CPU lock and sends
+/// a reschedule IPI, instead of taking the target's `CPU_SCHEDULERS[target]`
+/// policy slot (which the direct enqueue holds across the policy `Enqueued`
+/// callback). The target folds the inbox into its own `READY[target]` under its
+/// own slot in `drain_wake_list` (activate on the target, as in Linux). This
+/// keeps a herd of cross-core wakers from spinning on — and starving — a
+/// queue-rich target's own dispatch of that slot lock.
+///
+/// The inbox is a `VecDeque` that RETAINS its ring-buffer capacity across
+/// push/drain (`push_back`/`pop_front` never free it), so a steady wake stream
+/// allocates nothing. This is deliberate: an earlier lock-free `llist` design
+/// boxed a node PER WAKE, and under a stress-ng wake storm that serialized all
+/// 16 CPUs on the global heap-allocator lock and wedged the executor (CPU 0
+/// spinning in `Box::new`). The inbox lock is held only for an O(1)
+/// `push_back`/`pop_front` — never across a policy callback or a blocking op — so
+/// its cross-core critical section is a small fraction of the policy slot's, and
+/// it is a leaf lock (never held while acquiring another), so it cannot deadlock.
+static WAKE_INBOX: [IrqSafeSpinLock<VecDeque<(TaskSlot, policy::TaskEnqueueReason)>>;
+    narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(VecDeque::new()) }; narf_lib::percpu::MAX_CPUS];
 
-/// Per-CPU lock-free MPSC wake list (Linux `rq->wake_list` of `llist_node`s). A
-/// *remote* waker CAS-pushes a task here and sends a reschedule IPI instead of
-/// taking the target's `CPU_SCHEDULERS[target]` policy slot; the target folds
-/// the list into its own `READY[target]` under its own slot in
-/// `drain_wake_list` (Linux `sched_ttwu_pending`). Off-loading the enqueue to
-/// the target keeps a herd of cross-core wakers from spinning on — and starving
-/// — a queue-rich target's own dispatch of that slot lock.
-static WAKE_LIST: [AtomicPtr<WakeNode>; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
+/// Lockless depth of `cpu`'s wake inbox, mirrored from `WAKE_INBOX` under its
+/// lock. Lets the idle-halt Dekker final-scan and the halt-poll spin probe the
+/// inbox on every check without taking its lock.
+static WAKE_INBOX_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
-/// CAS-push `slot` onto `cpu`'s wake list (Linux `llist_add`). Lock-free, so it
-/// is safe from IRQ context and never masks IRQs across a remote lock — it
-/// upholds the same "don't spin IRQ-off on a cross-core lock" invariant the
-/// steal path documents (a spin there stalls inbound TLB-shootdown IPIs).
-/// Returns `true` when the list was empty before this push, mirroring
-/// `llist_add`'s "first entry" return.
+/// Push `slot` onto `cpu`'s wake inbox (Linux `ttwu_queue` staging). Returns
+/// `true` when the inbox was empty before this push (mirrors `llist_add`'s
+/// "first entry" signal). Holds the inbox lock only for the `push_back`.
 fn wake_list_push(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) -> bool {
-    let node = Box::into_raw(Box::new(WakeNode {
-        next: AtomicPtr::new(core::ptr::null_mut()),
-        slot,
-        reason,
-    }));
-    let head = &WAKE_LIST[cpu];
-    let mut cur = head.load(Ordering::Relaxed);
-    loop {
-        // SAFETY: `node` is our freshly-allocated, not-yet-published box; we are
-        // its sole owner until the CAS below links it, so this store is a plain
-        // write to memory we exclusively own.
-        unsafe {
-            (*node).next.store(cur, Ordering::Relaxed);
-        }
-        match head.compare_exchange_weak(cur, node, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => return cur.is_null(),
-            Err(observed) => cur = observed,
-        }
-    }
+    let mut q = WAKE_INBOX[cpu].lock();
+    let was_empty = q.is_empty();
+    q.push_back((slot, reason));
+    WAKE_INBOX_LEN[cpu].store(q.len(), Ordering::Release);
+    was_empty
 }
 
-/// True when `cpu`'s wake list has at least one pending task. The idle-halt
+/// True when `cpu`'s wake inbox has at least one pending task. The idle-halt
 /// Dekker final-scan consults this so a CPU never commits to HLT with a wake
-/// already queued; a push that races *after* the commit is covered by the
-/// reschedule IPI (`resched_remote`).
+/// already staged; a push that races *after* the commit is covered by the
+/// reschedule IPI (`resched_remote`). Lockless — reads the mirrored length.
 #[inline]
 fn wake_list_pending(cpu: usize) -> bool {
-    !WAKE_LIST[cpu].load(Ordering::Acquire).is_null()
+    WAKE_INBOX_LEN[cpu].load(Ordering::Acquire) != 0
 }
 
-/// Fold `cpu`'s wake list into `READY[cpu]` (Linux `llist_del_all` +
-/// `sched_ttwu_pending`). MUST run on `cpu` itself: the whole list is claimed
-/// with one exclusive swap, then each task is enqueued under this CPU's OWN
-/// policy slot, running the `Enqueued` policy callback locally (the activate
-/// happens on the target, as in Linux). The list is a LIFO stack; it is
-/// reversed to arrival order so wakes dispatch roughly FIFO.
+/// Fold `cpu`'s wake inbox into `READY[cpu]` (Linux `sched_ttwu_pending`). MUST
+/// run on `cpu` itself: each staged task is enqueued under this CPU's OWN policy
+/// slot, running the `Enqueued` policy callback locally (activate on the target,
+/// as in Linux). Drains front-to-back (arrival order → FIFO). `pop_front` retains
+/// the ring-buffer capacity, so a steady wake stream reuses it without
+/// allocating; a concurrent remote `push_back` is picked up in the same loop.
 fn drain_wake_list(cpu: usize) {
-    let head = WAKE_LIST[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
-    if head.is_null() {
-        return;
-    }
-    // Claim + free every node exactly once; collect (slot, reason) in stack
-    // (LIFO) order.
-    let mut items: alloc::vec::Vec<(TaskSlot, policy::TaskEnqueueReason)> = alloc::vec::Vec::new();
-    let mut cur = head;
-    while !cur.is_null() {
-        // SAFETY: every node was `Box::into_raw`'d in `wake_list_push` and is
-        // reachable exactly once from the list we now exclusively own (post
-        // swap). We reconstitute the box to move its fields out and free it.
-        let node = unsafe { Box::from_raw(cur) };
-        let WakeNode { next, slot, reason } = *node;
-        cur = next.load(Ordering::Relaxed);
-        items.push((slot, reason));
-    }
-    for (slot, reason) in items.into_iter().rev() {
-        // Local enqueue: `cpu` is us, so `with_scheduler` takes only our own
-        // slot lock (the dispatch path already owns the round on this CPU) and
+    loop {
+        let item = {
+            let mut q = WAKE_INBOX[cpu].lock();
+            let item = q.pop_front();
+            WAKE_INBOX_LEN[cpu].store(q.len(), Ordering::Release);
+            item
+        };
+        let Some((slot, reason)) = item else {
+            break;
+        };
+        // Local enqueue: `cpu` is us, so `with_scheduler` takes only our own slot
+        // lock (the dispatch path already owns the round on this CPU) and
         // attributes the Enqueued event to this CPU.
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
         let meta = policy::TaskMeta::from_slot(&slot);
         policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
-            let mut q = READY[cpu].lock();
-            q.as_mut()
-                .expect("scheduler: wake-list drain before init")
+            let mut ready = READY[cpu].lock();
+            ready
+                .as_mut()
+                .expect("scheduler: wake-inbox drain before init")
                 .push_back(slot);
             if let Some(scheduler) = scheduler {
                 scheduler.on_task_queue_event(
@@ -1578,6 +1586,22 @@ fn drain_wake_list(cpu: usize) {
                 );
             }
         });
+    }
+}
+
+/// Reschedule-IPI handler body (Linux `sched_ttwu_pending`): fold THIS CPU's
+/// wake inbox into its run queue, right now, in the IPI. This is what makes the
+/// wake list low-latency — otherwise a woken task waits until the target's
+/// `run_until_empty` loops back to its top-of-round drain, which under a deep
+/// ready queue is many polls away (a wake-bound workload craters). Safe in IRQ
+/// context: `drain_wake_list` takes only IRQ-masking locks local to this CPU,
+/// and the CPU provably holds none of them when the IPI is delivered (holding
+/// any masks IRQs, so the IPI can't arrive) — the same invariant that lets
+/// Linux take `rq_lock_irqsave` inside `sched_ttwu_pending`.
+pub fn resched_ipi_drain() {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        drain_wake_list(cpu);
     }
 }
 
@@ -1590,32 +1614,50 @@ fn enqueue_on(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) {
     let awake = slot.awake.flag.load(Ordering::Acquire);
     let me = narf_lib::percpu::current_cpu();
 
-    // REMOTE target: off-load onto the target's lock-free wake list (Linux
-    // `ttwu_queue_wakelist`) and kick it, rather than reaching across to take
-    // its `CPU_SCHEDULERS[target]` policy slot. The target folds the task into
-    // its run queue under its own slot in `drain_wake_list`. This is the
-    // cross-core-contention fix: a queue-rich target's dispatch is no longer
-    // starved of its slot by a herd of remote wakers.
-    if cpu != me && cpu < narf_lib::percpu::MAX_CPUS {
-        wake_list_push(cpu, slot, reason);
-        // A spawn IS a wake: a freshly-enqueued runnable slot on a REMOTE CPU
-        // needs a reschedule kick, or an idle-halted target only notices it at
-        // its next timer tick (~10 ms spawn-to-first-poll latency for every
-        // pthread_create landing on an idle AP — the round-robin
-        // `user_ap_affinity` placement makes that the COMMON case for thread
-        // spawns). `resched_remote` pairs with the idle side's Dekker handshake:
-        // `run_until_empty`'s commit-to-halt publishes CPU_HALTED and re-scans
-        // both READY and `wake_list_pending`; the push above is the "set the
-        // wake" half, the fence + halted-check + IPI live in resched_remote.
-        if awake {
+    // REMOTE target off-load: stage onto the target's lock-free wake list (Linux
+    // `ttwu_queue_wakelist`) and kick it, rather than reaching across to take its
+    // `CPU_SCHEDULERS[target]` policy slot. The target folds the task into its
+    // run queue under its own slot in `drain_wake_list`. This is the cross-core
+    // contention fix: a queue-rich target's dispatch is no longer starved of its
+    // slot by a herd of remote wakers.
+    //
+    // Gate on the target running its dispatch loop (Active/Idle). Linux refuses
+    // the wakelist for a CPU that isn't ready to drain it — `ttwu_queue_cond`:
+    // `if (!cpu_active(cpu)) return false` (kernel/sched/core.c) — because a
+    // task staged on a Starting/Draining/Offline CPU's wake list would never be
+    // folded in (that CPU parks in `park_for_cpu_lifecycle` on lifecycle state,
+    // not on a work re-scan). Fall through to the direct enqueue for those; the
+    // slot lock on a quiesced CPU is uncontended, so there is nothing to avoid.
+    let target_drains = matches!(
+        policy::cpu_state(CpuId(cpu as u32)),
+        policy::CpuState::Active | policy::CpuState::Idle
+    );
+    if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
+        let was_empty = wake_list_push(cpu, slot, reason);
+        // Kick the target to drain its inbox in the IPI handler
+        // (`resched_ipi_drain` = Linux `sched_ttwu_pending`). On the
+        // empty->nonempty edge, kick UNCONDITIONALLY (even a running target) so
+        // the staged wake is folded into READY promptly instead of waiting out a
+        // whole ready-queue round — this is what keeps a wake-bound workload from
+        // cratering. Batched to one IPI per edge (Linux `llist_add` first-entry
+        // gate): once the inbox is non-empty an IPI is already accounted for.
+        // Off the edge, fall back to the halted-only kick (`resched_remote`),
+        // which pairs with the idle-side Dekker handshake: every commit-to-halt
+        // publishes CPU_HALTED, fences, and re-scans `wake_list_pending`.
+        if was_empty {
+            resched_remote_force(cpu as u32);
+        } else if awake {
             resched_remote(cpu as u32);
         }
         return;
     }
 
-    // LOCAL target: we are executing on `cpu`, so it is not halted and its slot
-    // is on the current dispatch path — enqueue directly. No cross-core IPI is
-    // needed (`resched_remote` no-ops for the current CPU anyway).
+    // LOCAL target (or a non-draining remote target): enqueue directly under the
+    // target's policy slot. For the local case we are executing on `cpu`, so it
+    // is not halted and its slot is on the current dispatch path; for a quiesced
+    // remote target the slot is uncontended. No cross-core IPI is needed for the
+    // local case (`resched_remote` no-ops for the current CPU); a quiesced remote
+    // target is driven by its lifecycle controller, not a wake kick.
     let meta = policy::TaskMeta::from_slot(&slot);
     policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
         let mut q = READY[cpu].lock();
@@ -3413,7 +3455,12 @@ pub fn run_until_empty() {
                                     .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
                                     .unwrap_or(false)
                             };
-                            if any {
+                            // A cross-core wake staged on the wake list is real
+                            // work too; count it as a hit so the spin bails to
+                            // the top-of-loop drain instead of stalling up to
+                            // the full window (and mis-scoring it as a miss,
+                            // which would shrink the adaptive poll budget).
+                            if any || wake_list_pending(cpu) {
                                 woke = true;
                                 break;
                             }
@@ -3423,7 +3470,8 @@ pub fn run_until_empty() {
                         // Window collapsed (idle CPU): one cheap probe before
                         // committing to the spin-grow cycle, so a lone wake
                         // that already landed skips the HLT.
-                        woke = narf_lib::deferred_wake::drain_and_wake() > 0;
+                        woke = narf_lib::deferred_wake::drain_and_wake() > 0
+                            || wake_list_pending(cpu);
                     }
                     if woke {
                         // Hit: grow the window (seed if collapsed, else ×2).
@@ -4045,7 +4093,16 @@ pub fn run_forever() -> ! {
                 .as_ref()
                 .map(|d| !d.is_empty())
                 .unwrap_or(false);
-            nonempty || narf_lib::deferred_wake::has_pending()
+            // `wake_list_pending` is load-bearing here, not just an optimization:
+            // a cross-core `enqueue_on` stages the task on WAKE_LIST[cpu] (NOT
+            // READY[cpu]) and its `resched_remote` kick is skipped while this CPU
+            // still reads halted=false. Without re-scanning the wake list under
+            // the published-HALTED fence, that wake is slept over indefinitely
+            // (a tickless idle AP has no periodic IRQ to rescue it). Mirrors
+            // Linux `current_clr_polling_and_test()` before HLT (idle.c).
+            nonempty
+                || narf_lib::deferred_wake::has_pending()
+                || wake_list_pending(cpu)
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);

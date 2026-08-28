@@ -95,14 +95,20 @@ pub fn install_tlb_shootdown_bridge() {
     narf_memory::tlb_shootdown::set_ipi_fanout(ipi_fanout_bridge);
 }
 
-/// Install the reschedule-IPI handler (a no-op) for [`VECTOR_RESCHED`].
+/// Install the reschedule-IPI handler for [`VECTOR_RESCHED`].
 /// `dispatch::install` registers into a global per-vector table, so one
 /// call from the BSP at boot covers every CPU. The IDT already routes
 /// 32..=254 to the common trap → dispatch path, so no gate work is
-/// needed. Receiving the IPI un-halts an idle CPU; nothing else to do.
+/// needed.
+///
+/// `handler` runs on IPI receipt. Besides un-halting an idle CPU (the
+/// interrupt itself does that), it folds this CPU's cross-core wake inbox
+/// into its run queue in the IPI — Linux `sched_ttwu_pending` from
+/// `flush_smp_call_function_queue` — so a woken task is dispatched with
+/// IPI latency, not after the target's next full ready-queue round.
 #[cfg(target_arch = "x86_64")]
-pub fn install_resched_ipi() {
-    dispatch::install(VECTOR_RESCHED, || {});
+pub fn install_resched_ipi(handler: fn()) {
+    dispatch::install(VECTOR_RESCHED, handler);
 }
 
 #[cfg(target_arch = "x86_64")]
