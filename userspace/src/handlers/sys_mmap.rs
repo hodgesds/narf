@@ -199,13 +199,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // "someone else owns that base, pick another". Ignoring it made the
         // probe destroy the mapping it was probing for.
         //
-        // LINUX-GAP: perms_intersecting reports ordinary VMAs only, so a
-        // MAP_FIXED_NOREPLACE landing on an existing hugetlb mapping is not
-        // detected and still replaces it.
+        // Huge mappings live in their own vector, so `perms_intersecting`
+        // alone answers "nothing is here" over a hugetlb mapping and the
+        // probe destroys the very thing it was probing for. Both sets have
+        // to be consulted.
         if flags & MAP_FIXED_NOREPLACE != 0
-            && !as_ref
+            && (!as_ref
                 .perms_intersecting(VirtAddr::new(hint), len)
                 .is_empty()
+                || as_ref.huge_intersects(VirtAddr::new(hint), len))
         {
             ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
             return;
@@ -227,9 +229,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // produced a working private mapping here and a hard EINVAL on Linux —
     // the divergence only shows up when the code is finally run on Linux.
     //
-    // LINUX-GAP: MAP_DROPPABLE (MAP_TYPE 0x08) is a valid type on 64-bit
-    // Linux; NARF has no droppable backing, so it lands in this EINVAL rather
-    // than silently behaving like an ordinary private mapping.
+    // MAP_DROPPABLE (MAP_TYPE 0x08) became a valid type in Linux 6.11. NARF
+    // has no droppable backing — pages that the kernel may reclaim without
+    // swapping and that read back as zeroes — so it lands in this EINVAL.
+    //
+    // That is not a divergence to fix by accepting the flag: -EINVAL is
+    // exactly what every pre-6.11 kernel returns for it, so a caller
+    // probing for support gets a true answer and falls back. Accepting it
+    // and handing back an ordinary private mapping would tell that caller
+    // its pages are droppable when they are pinned for the process's life —
+    // the failure would surface as memory never being reclaimed under
+    // pressure, far from here. Implementing it means the reclaim path,
+    // not this line.
     let map_type = flags & MAP_TYPE;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL

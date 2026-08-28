@@ -11635,6 +11635,204 @@ kernel_test_in!(
     smoke_memory_mprotect_mixed_huge_index_oom_is_preflight
 );
 
+/// Huge mappings are held in `huge_regions`, a vector entirely separate from
+/// the `regions` tree that [`AddressSpace::perms_intersecting`] walks. A
+/// caller asking "is anything mapped here?" through `perms_intersecting`
+/// alone therefore gets `false` over a live 2 MiB mapping — which is what let
+/// `MAP_FIXED_NOREPLACE` (whose whole contract is -EEXIST instead of
+/// replacement) unmap a hugetlb region it was supposed to refuse to touch.
+///
+/// This pins both halves: that `perms_intersecting` really is blind here (so
+/// the second query is load-bearing, not belt-and-braces), and that
+/// `huge_intersects` sees it with the right interval arithmetic. The
+/// one-byte-past-the-end and adjacent-regular-region arms are the ones that
+/// matter — a `<=` in place of `<` would make every FIXED_NOREPLACE probe
+/// that merely abuts a huge mapping fail with a spurious EEXIST.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_huge_intersects_sees_hugetlb_mappings() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, reserve_from_regions, HugeSize, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{AddressSpace, HugeRegion, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    const SYNTH_BASE: u64 = 0x40_4000_0000;
+    const USER_VA: u64 = 0x0000_5000_7000_0000;
+    let source = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    // SAFETY: the synthetic frame is used for mapping metadata only and is
+    // returned to the test reservation before this test exits.
+    let excludes = unsafe { reserve_from_regions(&[source], &[], 1, 0) };
+    if excludes.len() != 1 {
+        return TestResult::Fail("huge_intersects hugepage reservation failed");
+    }
+    // SAFETY: topology lookup does not dereference the synthetic frame.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("huge_intersects hugepage allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            let _ = alloc_hugepage_2m_on(node);
+            return TestResult::Fail("huge_intersects address-space creation failed");
+        }
+    };
+    let huge_base = VirtAddr::new(USER_VA);
+    // SAFETY: the fresh root, aligned VA, and owned aligned frame satisfy the
+    // huge mapping contract.
+    if unsafe {
+        address_space.map_huge_region(HugeRegion {
+            base: huge_base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("huge_intersects huge mapping failed");
+    }
+    let regular_base = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    if address_space
+        .map_region(Region {
+            base: regular_base,
+            len: 0x1000,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![PhysAddr::new(0); 1],
+        })
+        .is_err()
+    {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("huge_intersects regular mapping failed");
+    }
+
+    // The blindness this query exists to cover.
+    let base_page_view_is_blind = address_space
+        .perms_intersecting(huge_base, HUGEPAGE_2M_BYTES)
+        .is_empty();
+    let whole = address_space.huge_intersects(huge_base, HUGEPAGE_2M_BYTES);
+    // A single byte anywhere inside counts.
+    let inside = address_space.huge_intersects(VirtAddr::new(USER_VA + 0x1000), 1);
+    // A probe that spans the boundary from below.
+    let straddling = address_space.huge_intersects(VirtAddr::new(USER_VA - 0x1000), 0x2000);
+    // Abutting from above is NOT an overlap: `regular_base` is the first byte
+    // past the huge mapping's end.
+    let abutting_after = address_space.huge_intersects(regular_base, 0x1000);
+    // Abutting from below likewise.
+    let abutting_before = address_space.huge_intersects(VirtAddr::new(USER_VA - 0x1000), 0x1000);
+    // A zero-length probe overlaps nothing, and an overflowing one must not panic.
+    let empty = address_space.huge_intersects(huge_base, 0);
+    let overflow = address_space.huge_intersects(VirtAddr::new(u64::MAX - 1), 0x1000);
+
+    let unmapped = address_space.unmap_huge_region(huge_base).is_ok();
+    let _ = alloc_hugepage_2m_on(node);
+
+    if !base_page_view_is_blind {
+        return TestResult::Fail(
+            "perms_intersecting now sees huge mappings; second query is stale",
+        );
+    }
+    if !(whole && inside && straddling) {
+        return TestResult::Fail("huge_intersects missed an overlapping range");
+    }
+    if abutting_after || abutting_before || empty || overflow {
+        return TestResult::Fail("huge_intersects reported a non-overlapping range");
+    }
+    if !unmapped {
+        return TestResult::Fail("huge_intersects test failed to unmap");
+    }
+    TestResult::Pass
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_huge_intersects_sees_hugetlb_mappings);
+
+/// `mm/msync.c` rejects MS_INVALIDATE over a `VM_LOCKED` VMA with -EBUSY.
+/// NARF's msync reads that state back through `perms_intersecting`, so the
+/// handler is only correct if LOCKED actually survives into the perms this
+/// query reports — and only if the query reports the perms of *every* VMA the
+/// range touches, not just the first. A range that is half unlocked and half
+/// locked is still EBUSY on Linux, because the check sits inside the per-VMA
+/// walk and `goto`s out on the first locked one.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_perms_intersecting_reports_locked() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    const USER_VA: u64 = 0x0000_5000_8000_0000;
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Fail("locked-perms address-space creation failed"),
+    };
+    let unlocked_base = VirtAddr::new(USER_VA);
+    let locked_base = VirtAddr::new(USER_VA + 0x1000);
+    if address_space
+        .map_region(Region {
+            base: unlocked_base,
+            len: 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![PhysAddr::new(0); 1],
+        })
+        .is_err()
+        || address_space
+            .map_region(Region {
+                base: locked_base,
+                len: 0x1000,
+                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::LOCKED,
+                phys: alloc::vec![PhysAddr::new(0); 1],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("locked-perms mapping failed");
+    }
+
+    let locked_only = address_space
+        .perms_intersecting(locked_base, 0x1000)
+        .iter()
+        .any(|p| p.contains(RegionPerms::LOCKED));
+    // The unlocked VMA alone must not report LOCKED, or msync would return
+    // EBUSY for every MS_INVALIDATE and the flag would be unusable.
+    let unlocked_only = address_space
+        .perms_intersecting(unlocked_base, 0x1000)
+        .iter()
+        .any(|p| p.contains(RegionPerms::LOCKED));
+    // Spanning both: Linux stops at the first locked VMA, so the mixed range
+    // is EBUSY too. This is the arm that fails if the query ever collapses to
+    // "perms of the VMA containing `base`".
+    let spanning = address_space
+        .perms_intersecting(unlocked_base, 0x2000)
+        .iter()
+        .any(|p| p.contains(RegionPerms::LOCKED));
+
+    if locked_only && !unlocked_only && spanning {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("perms_intersecting misreported LOCKED across the range")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_perms_intersecting_reports_locked);
+
 /// Linux replaces `mm->def_flags` on every mlockall call rather than stacking
 /// successive MCL_FUTURE modes.  In particular, MCL_CURRENT without
 /// MCL_FUTURE clears a previously-installed future policy.

@@ -63,6 +63,31 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
         return;
     }
+    // `mm/msync.c`, inside the per-VMA walk:
+    //
+    //     if ((flags & MS_INVALIDATE) && (vma->vm_flags & VM_LOCKED)) {
+    //             error = -EBUSY;
+    //             goto out_unlock;
+    //     }
+    //
+    // The `goto` is immediate, so EBUSY OUTRANKS the -ENOMEM the loop defers
+    // for a partially-unmapped range (`unmapped_error`). Checking coverage
+    // first would report ENOMEM for a range that is both locked and ragged,
+    // and MS_INVALIDATE's whole contract is that it may discard clean pages —
+    // a caller told ENOMEM would widen its range and try again, while EBUSY
+    // says the discard can never be honoured here.
+    if flags & MS_INVALIDATE != 0 {
+        let locked = current_address_space().is_some_and(|as_ref| {
+            as_ref
+                .perms_intersecting(VirtAddr::new(addr), len)
+                .iter()
+                .any(|p| p.contains(narf_memory::RegionPerms::LOCKED))
+        });
+        if locked {
+            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // -EBUSY
+            return;
+        }
+    }
     let mapped = current_address_space()
         .is_some_and(|as_ref| as_ref.residency_range(VirtAddr::new(addr), len).is_ok());
     if mapped {
@@ -71,9 +96,6 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
             Err(()) => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
         }
     } else {
-        // LINUX-GAP: MS_INVALIDATE over an mlocked VMA is -EBUSY on Linux;
-        // NARF has no per-VMA lock query on this path and reports the
-        // coverage result instead.
         ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
     }
 }

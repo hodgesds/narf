@@ -385,3 +385,13 @@ kernel_test_in!(
 // arms. The `mapped == true → ok(0)` arm needs a live mapping in a
 // per-task AddressSpace the harness cannot build, so it is unreachable;
 // documented, no test.
+//
+// The MS_INVALIDATE-over-VM_LOCKED → -EBUSY arm (`mm/msync.c`) is
+// unreachable here for the same reason: with no AddressSpace,
+// `current_address_space()` is None and the check short-circuits to
+// false, leaving the existing no-mapping ENOMEM — which is what
+// smoke_abi_mem_msync_no_mapping_pos already pins, so that arm stays
+// covered. The state the EBUSY decision actually reads is pinned in the
+// memory crate by smoke_memory_perms_intersecting_reports_locked, which
+// covers the case this harness cannot: a range spanning an unlocked and
+// a locked VMA still reporting LOCKED.
