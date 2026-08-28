@@ -4171,6 +4171,100 @@ kernel_test_in!(
     smoke_memory_clone_for_fork_shares_frames_then_splits
 );
 
+fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
+    // Regression: a copy-on-write break must NOT be refused at the `min`
+    // reserve watermark. `cow_split_on_write` allocates the private copy via
+    // `alloc_user_frame_urgent` (AllocContext::UserReserve), which may consume
+    // the reserve — the faulting task already owns the shared page and is doing
+    // a legitimate write, so refusing it would deliver a spurious SIGSEGV on
+    // writable memory. Before the fix the split used the reserve-respecting
+    // `alloc_user_frame`, so at the watermark it returned Err → the trap path
+    // fell through to SIGSEGV, killing stress-ng workers and wedging the run.
+    use crate::address_space::{AddressSpace, Region, RegionPerms};
+    use crate::frame::cow;
+    use crate::{reclaim, VirtAddr};
+
+    // Decide up front whether this host can be driven into a reserve breach,
+    // reading the free-page count DIRECTLY rather than raising the watermark to
+    // probe it. `set_min_free_pages` clamps WMARK_MIN to the 65536-page
+    // (256 MiB) ceiling, so a host with more than that free can never be forced
+    // into a breach. Probing via a temporary `set_min_free_pages` would raise
+    // the watermark for other CPUs and can nudge kswapd into a reclaim pass that
+    // reorders the buddy free lists — perturbing later frame-order-sensitive
+    // tests. Skipping on a pure read keeps the skip path side-effect-free.
+    const WMARK_CEIL_PAGES: usize = 65536;
+    if crate::frame_stats().free > WMARK_CEIL_PAGES {
+        return TestResult::Skip("cannot force reserve breach: >256 MiB free");
+    }
+    let saved_min = reclaim::watermark_min();
+    reclaim::set_min_free_pages(u64::MAX);
+    if !reclaim::user_alloc_would_breach_reserve() {
+        reclaim::set_min_free_pages(saved_min);
+        return TestResult::Skip("cannot force reserve breach: free above ceiling");
+    }
+
+    const VADDR: u64 = 0x0000_0080_0000_0000;
+    cow::__test_clear();
+    let build = || -> Result<(AddressSpace, AddressSpace, crate::PhysAddr), &'static str> {
+        // SAFETY: the fresh roots are owned exclusively by this test and never
+        // activated as a live task address space.
+        let parent = unsafe { AddressSpace::new_for_user() }.map_err(|_| "new_for_user")?;
+        let frame = crate::frame::alloc_frame()
+            .map_err(|_| "alloc_frame")?
+            .start_address();
+        parent
+            .map_region(Region {
+                base: VirtAddr::new(VADDR),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![frame],
+            })
+            .map_err(|_| "map_region")?;
+        // SAFETY: upholds clone_for_fork's documented invariant.
+        let child = unsafe { parent.clone_for_fork() }.map_err(|_| "clone_for_fork")?;
+        Ok((parent, child, frame))
+    };
+    let result = match build() {
+        Err(e) => {
+            reclaim::set_min_free_pages(saved_min);
+            return TestResult::Fail(e);
+        }
+        Ok((parent, child, frame)) => {
+            let r = if cow::count(frame) != 2 {
+                TestResult::Fail("COW: refcount should be 2 after fork")
+            } else if unsafe { child.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
+                // The bug: the CoW break was refused at the watermark.
+                TestResult::Fail("CoW break refused at the reserve watermark (SIGSEGV regression)")
+            } else if unsafe { child.remap_page(VirtAddr::new(VADDR)) }.is_err() {
+                TestResult::Fail("remap_page after reserve-watermark split")
+            } else {
+                let c = child
+                    .lookup(VirtAddr::new(VADDR))
+                    .expect("child post-split");
+                if c.phys[0] == frame {
+                    TestResult::Fail("reserve-watermark split did not allocate a private frame")
+                } else if !c.perms.contains(RegionPerms::WRITE) {
+                    TestResult::Fail("split lost logical WRITE")
+                } else {
+                    TestResult::Pass
+                }
+            };
+            // `parent`/`child` Drop unmap every region, which calls rmap::remove
+            // for each mapping before returning its frame to the buddy — so no
+            // freed frame carries a live rmap owner into the next test (the
+            // invariant Linux enforces in free_pages_prepare via the "nonzero
+            // mapcount" bad_page check).
+            drop(child);
+            drop(parent);
+            r
+        }
+    };
+    reclaim::set_min_free_pages(saved_min);
+    cow::__test_clear();
+    result
+}
+kernel_test_in!("memory", smoke_memory_cow_split_survives_reserve_watermark);
+
 fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResult {
     use crate::address_space::{AddressSpace, Region, RegionPerms};
     use crate::frame::{self, cow};

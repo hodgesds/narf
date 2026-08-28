@@ -838,6 +838,16 @@ pub enum AllocContext {
     Kernel,
     /// Userspace-backing allocation — must leave the `min` reserve intact.
     User,
+    /// Userspace-backing allocation that MUST succeed to keep a running
+    /// process correct, and so may consume the `min` reserve like `Kernel`
+    /// while staying `Movable` like `User`. The sole user is a copy-on-write
+    /// break (`cow_split_on_write`): the faulting task already owns the shared
+    /// page and is performing a legitimate write; refusing the private-copy
+    /// frame at the watermark would deliver a spurious SIGSEGV on writable
+    /// memory. Linux likewise lets a CoW break dip into reserves rather than
+    /// fail the fault. Not a general escape hatch — ordinary demand/mmap/brk
+    /// faults stay `User` so userspace still cannot drain the reserve.
+    UserReserve,
 }
 
 impl AllocContext {
@@ -850,15 +860,17 @@ impl AllocContext {
     pub fn migrate_type(self) -> buddy::MigrateType {
         match self {
             AllocContext::Kernel => buddy::MigrateType::Unmovable,
-            AllocContext::User => buddy::MigrateType::Movable,
+            AllocContext::User | AllocContext::UserReserve => buddy::MigrateType::Movable,
         }
     }
 }
 
 /// Central reserve gate. Returns `Exhausted` (and wakes the reclaimer) when a
-/// `User` allocation would breach the `min` watermark reserve; `Kernel`
-/// allocations always pass. Enforced once, here, so every allocation entry
-/// inherits the same policy — a user path cannot silently drain the reserve.
+/// `User` allocation would breach the `min` watermark reserve; `Kernel` and
+/// `UserReserve` allocations always pass (the latter is a CoW break that must
+/// not fault a writable page — see [`AllocContext::UserReserve`]). Enforced
+/// once, here, so every allocation entry inherits the same policy — an ordinary
+/// user path cannot silently drain the reserve.
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
     let node = current_cpu_node();
@@ -895,6 +907,18 @@ pub fn alloc_user_frame() -> Result<PhysFrame, FrameAllocError> {
     #[cfg(feature = "frame-alloc-audit")]
     crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
     alloc_frame_on_inner_ctx(current_cpu_node(), AllocContext::User)
+}
+
+/// Allocate one CPU-local `Movable` frame for a copy-on-write break, permitted
+/// to dip into the `min` reserve. See [`AllocContext::UserReserve`]: a CoW split
+/// is a legitimate write to a page the process already owns, so it must not be
+/// refused at the watermark and turned into a spurious SIGSEGV. Only
+/// `cow_split_on_write` uses this; every other user-backing fault stays on the
+/// reserve-respecting [`alloc_user_frame`].
+pub fn alloc_user_frame_urgent() -> Result<PhysFrame, FrameAllocError> {
+    #[cfg(feature = "frame-alloc-audit")]
+    crate::buddy::audit_note_alloc_caller(core::panic::Location::caller());
+    alloc_frame_on_inner_ctx(current_cpu_node(), AllocContext::UserReserve)
 }
 
 /// Reserve-respecting `User`-context variant of [`alloc_frame_on`].
@@ -1687,6 +1711,48 @@ fn buddy_return_unreferenced_frame(f: PhysFrame) {
 
 /// Complete work that must precede publication of a final-owner frame.
 fn buddy_prepare_unreferenced_frame(phys: PhysAddr) {
+    // DEBUG_VM analogue of Linux `free_pages_prepare`'s "nonzero mapcount"
+    // `bad_page` check (mm/page_alloc.c): a frame genuinely returning to the
+    // buddy (COW refcount just reached 0) must have no reverse-map owners. A
+    // surviving owner means some unmap/teardown path returned the frame without
+    // a paired `rmap::remove`, so the next allocation of this frame inherits a
+    // stale (root, va) owner and corrupts every reverse-map-driven decision
+    // (TLB shootdown, page migration, COW split) — and, in the test suite,
+    // makes any rmap-sensitive test later handed the frame flake (the
+    // long-standing shared-alias/mremap test flakiness).
+    //
+    // Perf: this takes the frame's rmap shard lock on every buddy free, so it
+    // must NOT run in release. It is the Linux-DEBUG_VM analogue and its
+    // intended home is `#[cfg(debug_assertions)]` — on in debug builds, compiled
+    // out of release so production pays nothing. It is behind the opt-in
+    // `rmap-free-audit` feature FOR NOW (not `debug_assertions`) because it still
+    // TRIPS on remaining reclaim/teardown paths that free a frame without a
+    // paired `rmap::remove`: the `reap_anonymous` origin is fixed, but a debug
+    // sweep shows at least one more, and turning it on in debug before that
+    // sweep completes would break every debug build. Run `--features
+    // rmap-free-audit` to hunt the remainder; once the suite runs it clean,
+    // graduate this to `#[cfg(debug_assertions)]` as the permanent
+    // always-on-in-debug regression guard for the whole class.
+    #[cfg(feature = "rmap-free-audit")]
+    {
+        let owners = crate::rmap::owner_count(phys);
+        if owners != 0 {
+            let mut first_va = u64::MAX;
+            let mut first_root = 0u64;
+            crate::rmap::for_each_owner(phys, |o| {
+                if first_va == u64::MAX {
+                    first_va = o.va.as_u64();
+                    first_root = o.root.raw();
+                }
+            });
+            panic!(
+                "buddy free of {phys:?} with {owners} live rmap owner(s) \
+                 (first root={first_root:#x} va={first_va:#x}): a teardown/free \
+                 path returned this frame without rmap::remove (Linux bad_page: \
+                 nonzero mapcount)"
+            );
+        }
+    }
     // cgroup memory uncharge: only here, where the frame is genuinely
     // returned to the buddy — i.e. the COW refcount has reached 0 — does
     // it balance the single charge taken at `alloc_frame_on`. The

@@ -5566,10 +5566,25 @@ impl AddressSpace {
         // Pass 2: free the backing frames (allocation-free) and zero the
         // entries so the victim's own `Drop` teardown skips them — idempotent.
         let mut freed = 0usize;
+        let root = self.root;
         regions.for_each_mut(|r| {
             if !r.perms.contains(RegionPerms::SHARED) && !r.perms.contains(RegionPerms::LOCKED) {
                 let pages = ((r.len + 0xFFF) >> 12) as usize;
                 let n = pages.min(r.phys.len());
+                // Drop each page's reverse-map entry BEFORE its frame returns to
+                // the buddy, exactly as `free_region_frames` does on the ordinary
+                // teardown path. Zeroing `phys[i]` below makes the later `Drop`
+                // skip these pages, so this is the reaper's only opportunity to
+                // retire their rmap owners: omitting it leaked a stale (root, va)
+                // onto every reaped frame, which its next allocation inherited —
+                // the invariant Linux enforces in `free_pages_prepare` via the
+                // "nonzero mapcount" `bad_page` check.
+                for (i, p) in r.phys[..n].iter().enumerate() {
+                    if p.raw() != 0 {
+                        let va = VirtAddr::new(r.base.as_u64() + (i as u64) * 4096);
+                        crate::rmap::remove(*p, root, va);
+                    }
+                }
                 crate::frame::free_phys_batch(&r.phys[..n]);
                 for p in r.phys[..n].iter_mut() {
                     if p.raw() != 0 {
@@ -9051,7 +9066,12 @@ impl AddressSpace {
             (ticket, old_phys)
         };
 
-        let new_frame = match crate::frame::alloc_user_frame() {
+        // A CoW break must not be refused at the `min` watermark: the faulting
+        // task already owns this shared page and is doing a legitimate write, so
+        // failing here would deliver a spurious SIGSEGV on writable memory.
+        // `alloc_user_frame_urgent` stays `Movable` (frees in bulk on teardown)
+        // but may consume the reserve, matching Linux's CoW-break policy.
+        let new_frame = match crate::frame::alloc_user_frame_urgent() {
             Ok(frame) => frame,
             Err(_) => {
                 let mut regions = self.regions.lock();

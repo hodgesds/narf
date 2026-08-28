@@ -549,6 +549,13 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
     bool,
     usize,
     bool,
+    // Park-path discriminators — which interruptible wait the task is in, so a
+    // parked task that is in NONE of the wakeable waits (all zero/false) but
+    // still has `parked=true` + a pending signal is the waker-less strand.
+    u64,  // sigwait_set (sigtimedwait/sigwaitinfo park; 0 = not)
+    bool, // console_read_pending (fd-0 blocking read park)
+    u64,  // epoll_wait_fd (biased +1; 0 = not in epoll_wait)
+    bool, // has_signal_waker — can wake_signal actually rouse it?
 )> {
     let tasks: alloc::vec::Vec<Arc<Task>> = TASKS.lock().values().cloned().collect();
     tasks
@@ -567,6 +574,10 @@ pub fn dbg_park_snapshot() -> alloc::vec::Vec<(
                 t.uctx.wait_child_pending.load(Ordering::Relaxed),
                 t.uctx.flock_key.load(Ordering::Relaxed),
                 t.uctx.parked_in_syscall.load(Ordering::Relaxed),
+                t.uctx.sigwait_set.load(Ordering::Relaxed),
+                t.uctx.console_read_pending.load(Ordering::Relaxed),
+                t.uctx.epoll_wait_fd.load(Ordering::Relaxed),
+                crate::handlers::dbg_has_signal_waker(t.tid),
             )
         })
         .collect()

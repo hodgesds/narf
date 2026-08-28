@@ -154,6 +154,12 @@ mod stall_wd {
     static HIGH_WATER: AtomicU64 = AtomicU64::new(0);
     static FLAT_WINDOWS: AtomicU64 = AtomicU64::new(0);
     static DUMPED: AtomicBool = AtomicBool::new(false);
+    /// Idle-stall wedge detector: consecutive windows with a collapsed syscall
+    /// rate, tracked INDEPENDENT of `runnable`. The `runnable > 0` panic path
+    /// is blind to a lost wakeup that parks EVERY task (runnable==0) — the SMP
+    /// signal-wake strand — so this fires the per-task census on that case.
+    static WEDGE_STREAK: AtomicU64 = AtomicU64::new(0);
+    static WEDGE_CENSUS_COUNT: AtomicU64 = AtomicU64::new(0);
     /// Flat windows during which NOTHING was runnable — idle, or a lost
     /// wakeup. Counted separately from `FLAT_WINDOWS` so the two verdicts
     /// cannot reset each other.
@@ -388,15 +394,54 @@ mod stall_wd {
         // the census is the only way to see which wait it is actually in.
         if wc == 180 {
             let _ = writeln!(TrapWriter, "PARK-CENSUS: begin");
-            for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
-                narf_userspace::task::dbg_park_snapshot()
+            for (
+                tid,
+                pid,
+                st,
+                dl,
+                fu,
+                fns,
+                fgen,
+                fval,
+                netio,
+                waitchild,
+                flock,
+                parked,
+                sigwait,
+                console_read,
+                epoll_fd,
+                has_sigwaker,
+            ) in narf_userspace::task::dbg_park_snapshot()
             {
                 let _ = writeln!(
                     TrapWriter,
-                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked}"
+                    "PARK-CENSUS tid={tid} pid={pid} st={st} deadline={dl} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigwait={sigwait:#x} console_read={console_read} epoll_fd={epoll_fd} has_sigwaker={has_sigwaker}"
                 );
             }
             let _ = writeln!(TrapWriter, "PARK-CENSUS: end");
+        }
+
+        // Idle-stall wedge census. The `runnable > 0` panic below cannot see a
+        // lost wakeup that leaves every task parked (runnable == 0) — precisely
+        // the SMP signal-wake strand (all workers/parent parked, CPU idle-halts,
+        // syscall rate collapses). Trigger on the collapsed rate ALONE, dump the
+        // per-task census (which now carries has_sigwaker + strand) so the
+        // waker-less park is named. Spaced (streak resets each fire) and capped
+        // so a genuinely slow-but-progressing run isn't flooded.
+        if wc > 20 && delta < 5_000 {
+            let n = WEDGE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+            if n >= 3 {
+                WEDGE_STREAK.store(0, Ordering::Relaxed);
+                if WEDGE_CENSUS_COUNT.fetch_add(1, Ordering::Relaxed) < 4 {
+                    let _ = writeln!(
+                        TrapWriter,
+                        "STALL-WD: idle-stall wedge (delta={delta} runnable={runnable} wc={wc}) — per-task census:"
+                    );
+                    dump(sc);
+                }
+            }
+        } else {
+            WEDGE_STREAK.store(0, Ordering::Relaxed);
         }
 
         // A single wedged task does not stall the system: other tasks keep
@@ -627,8 +672,24 @@ mod stall_wd {
                 "STALL-WD virtio-blk: sector={sector} head={head} avail={avail} last_used={last_used} device_used={device_used} free={free} status={status:#x}"
             );
         }
-        for (tid, pid, st, dl, fu, fns, fgen, fval, netio, waitchild, flock, parked) in
-            narf_userspace::task::dbg_park_snapshot()
+        for (
+            tid,
+            pid,
+            st,
+            dl,
+            fu,
+            fns,
+            fgen,
+            fval,
+            netio,
+            waitchild,
+            flock,
+            parked,
+            sigwait,
+            console_read,
+            epoll_fd,
+            has_sigwaker,
+        ) in narf_userspace::task::dbg_park_snapshot()
         {
             let sig = narf_userspace::handlers::signal_pending_bits(tid);
             let (live_gen, futex_waiters) = if fu != 0 {
@@ -636,9 +697,19 @@ mod stall_wd {
             } else {
                 (0, 0)
             };
+            // `strand=true` flags the smoking gun: a parked task with a
+            // deliverable pending signal that has NO signal waker AND is in
+            // none of the deadline/io/child waits that would otherwise re-poll
+            // it — i.e. nothing will rouse it to take the signal.
+            let strand = parked
+                && sig != 0
+                && !has_sigwaker
+                && !netio
+                && !waitchild
+                && (dl == 0 || dl == u64::MAX);
             let _ = writeln!(
                 TrapWriter,
-                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen}/{live_gen} futex_waiters={futex_waiters} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigpend={sig:#x}",
+                "STALL-WD task tid={tid} pid={pid} st={st} dl={dl} dl_expired={} futex={fu:#x} futex_ns={fns:#x} futex_gen={fgen}/{live_gen} futex_waiters={futex_waiters} futex_val={fval:#x} netio={netio} waitchild={waitchild} flock={flock:#x} parked={parked} sigwait={sigwait:#x} console_read={console_read} epoll_fd={epoll_fd} has_sigwaker={has_sigwaker} sigpend={sig:#x} strand={strand}",
                 dl != 0 && dl != u64::MAX && now_ns > dl
             );
         }
@@ -1349,6 +1420,39 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         let cr2_in_user_half = cr2 < 0x0000_8000_0000_0000;
         let from_user = (frame.cs & 3) == 3;
 
+        // DIAG (stall-watchdog): detect a fault LOOP — the same CPU faulting on
+        // the same (rip, cr2) repeatedly means the fault handler "resolves" it
+        // but the retry re-faults (e.g. a stack-grow that installs a page the
+        // faulting store still can't use). Distinguishes a stuck worker from an
+        // intermittent stall. Per-CPU; logged once per threshold crossing.
+        #[cfg(feature = "stall-watchdog")]
+        if from_user {
+            use core::sync::atomic::{AtomicU64, Ordering};
+            const NC: usize = narf_lib::percpu::MAX_CPUS;
+            static LAST_RIP: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            static LAST_CR2: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            static COUNT: [AtomicU64; NC] = [const { AtomicU64::new(0) }; NC];
+            let c = narf_lib::percpu::current_cpu();
+            if c < NC {
+                let same = LAST_RIP[c].load(Ordering::Relaxed) == frame.rip
+                    && LAST_CR2[c].load(Ordering::Relaxed) == cr2;
+                if same {
+                    let n = COUNT[c].fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 50_000 {
+                        let _ = writeln!(
+                            TrapWriter,
+                            "FAULTLOOP cpu={c} rip={:#x} cr2={cr2:#x} ec={:#x} — {n} consecutive same-page user faults (handler resolves but retry re-faults)",
+                            frame.rip, frame.error_code
+                        );
+                    }
+                } else {
+                    LAST_RIP[c].store(frame.rip, Ordering::Relaxed);
+                    LAST_CR2[c].store(cr2, Ordering::Relaxed);
+                    COUNT[c].store(0, Ordering::Relaxed);
+                }
+            }
+        }
+
         // Demand paging: P=0 means the page wasn't mapped at fault
         // time. Two cases get serviced through the active user AS's
         // lazy region table:
@@ -1477,6 +1581,58 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
             } else {
                 frame.rip
             };
+            // DIAG (stall-watchdog): a user #PF reached the SIGSEGV surface —
+            // demand-paging/stack-grow/COW all declined it. Dump the region
+            // table's view of the faulting address so an unresolved anon fault
+            // (the stress-ng malloc page_touch SIGSEGV) is classified: NO REGION
+            // (region-table miss), phys[off]=0 (should have demand-allocated —
+            // backing path bug), off past phys_len (structural region bug), or a
+            // non-zero phys (PTE-install/flush bug).
+            // Fire for EVERY exception vector that reaches user SIGSEGV/-signal
+            // delivery (not just #PF): the intermittent stress-ng malloc SIGSEGV
+            // did NOT trip the vector-14 view, so log the vector to see whether
+            // it is a #GP(13)/#UD(6)/etc. — pointing at signal-frame corruption
+            // rather than a demand-paging miss. Region view only for #PF.
+            #[cfg(feature = "stall-watchdog")]
+            {
+                static SEGV_DIAG: core::sync::atomic::AtomicU64 =
+                    core::sync::atomic::AtomicU64::new(0);
+                if SEGV_DIAG.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 40 {
+                    let desc = if vector == 14 {
+                        narf_userspace::active_user_as().and_then(|as_arc| {
+                            as_arc.lookup(narf_memory::VirtAddr::new(addr)).map(|r| {
+                                let off = (addr - r.base.as_u64()) / 4096;
+                                let phys = r
+                                    .phys
+                                    .get(off as usize)
+                                    .map(|p| p.raw())
+                                    .unwrap_or(u64::MAX);
+                                (r.base.as_u64(), r.len, r.perms.0, off, r.phys.len(), phys)
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    match desc {
+                        Some((base, len, perms, off, nphys, phys)) => {
+                            let _ = writeln!(
+                                TrapWriter,
+                                "USERSEGV-DIAG vec={vector} addr={addr:#x} rip={:#x} ec={:#x} region base={base:#x} len={len:#x} perms={perms:#x} page_off={off} phys_len={nphys} phys_off={phys:#x}",
+                                frame.rip, frame.error_code
+                            );
+                        }
+                        None => {
+                            let _ = writeln!(
+                                TrapWriter,
+                                "USERSEGV-DIAG vec={vector} addr={addr:#x} rip={:#x} ec={:#x}{}",
+                                frame.rip,
+                                frame.error_code,
+                                if vector == 14 { " NO-REGION" } else { "" }
+                            );
+                        }
+                    }
+                }
+            }
             let info = narf_userspace::SyncFaultInfo { addr };
             let mut ctx = X86TrapContext::from_int80(frame);
             if hook(&mut ctx, vector, info) {

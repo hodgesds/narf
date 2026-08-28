@@ -1442,13 +1442,36 @@ unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) 
     }
     let mut g = class.head.lock();
     let taken = g.take();
-    // Validate every free block's canary before trusting its links.
+    // Validate every free block's canary before trusting its links, and bound
+    // the walk. The central list can hold at most `grown` blocks for this class,
+    // so a walk that runs past that has followed a corrupted/cyclic `next` link
+    // (a double-free or use-after-free spliced a cycle). Fail fast naming the
+    // offending block instead of looping forever under `class.head`: an
+    // unbounded loop here would silently wedge every CPU that allocates this
+    // class. This is defensive hardening — `double_free_confirmed` already caps
+    // its walk of this same list at 1M steps for the same reason; the reclaim
+    // walk was the asymmetric gap. The `+ n_blocks` slack absorbs a benign
+    // in-flight grow racing the `grown` snapshot.
+    let walk_cap = class
+        .grown
+        .load(Ordering::Relaxed)
+        .saturating_add(n_blocks)
+        .max(n_blocks);
     // SAFETY: every node on the central list we just took is a valid free block
     // of class `c`; we only read canaries and `next` links.
     unsafe {
         let mut cur = taken;
+        let mut steps = 0usize;
         while let Some(b) = cur {
             canary_check_free(b, c);
+            steps += 1;
+            assert!(
+                steps <= walk_cap,
+                "slab class {c} (block_size={block_size}) central free list \
+                 exceeded {walk_cap} blocks at node {:p} — corrupted/cyclic \
+                 `next` link (double-free or use-after-free)",
+                b.as_ptr(),
+            );
             cur = b.as_ref().next;
         }
     }

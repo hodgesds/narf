@@ -69,6 +69,17 @@ pub fn drop_signal_waker(task_id: u64) {
     }
 }
 
+/// Diagnostic (stall-watchdog): does `task_id` currently have a registered
+/// signal waker? A task parked with a pending, deliverable signal but NO
+/// signal waker cannot be roused by `wake_signal` — it strands until an
+/// unrelated wake (backstop IPI, timer) happens to re-poll it. Distinguishing
+/// that from an ordinary interruptible park is the whole question for the
+/// SMP signal-wake lost-wakeup.
+pub fn dbg_has_signal_waker(task_id: u64) -> bool {
+    let g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
+    g.as_ref().is_some_and(|m| m.contains_key(&task_id))
+}
+
 // ── Net I/O readiness wakers (epoll/poll) ───────────────────────────
 //
 // Tasks parked in `epoll_wait`/`poll` register their waker here while
@@ -8088,13 +8099,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = SIGQUEUE_INFO[sigqueue_bucket(tid)].values.lock().as_mut() {
         m.retain(|&(t, _), _| t != tid);
     }
-    if let Some(m) = SIGRETURN_USE_RSP.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SIGRETURN_IS_RT.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = SIGRETURN_SAVED_MASK.lock().as_mut() {
+    if let Some(m) = SIGRETURN_STACK.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = SUSPEND_SAVED_MASK.lock().as_mut() {
