@@ -31,6 +31,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+use crate::posix_acl::{AclType, PosixAcl, XATTR_NAME_POSIX_ACL_ACCESS};
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture, FsInstance, FsStat,
     Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS, QIF_BTIME,
@@ -1078,6 +1079,78 @@ impl MemFile {
         );
         Ok(())
     }
+
+    /// `fs/xattr.c::do_setxattr` -> `fs/posix_acl.c::do_set_acl` ->
+    /// `vfs_set_acl` -> `set_posix_acl` -> `simple_set_acl`, collapsed onto
+    /// one node.
+    ///
+    /// `value` is the raw `system.posix_acl_{access,default}` payload.
+    /// An EMPTY value, or a well-formed header with zero entries, removes
+    /// the ACL: `do_set_acl` only decodes `if (size)`, and
+    /// `posix_acl_from_xattr` returns NULL for a zero-entry header, so
+    /// both reach `vfs_set_acl(..., NULL)`.
+    ///
+    /// `setxattr`'s `XATTR_CREATE`/`XATTR_REPLACE` flags are deliberately
+    /// ignored — `fs/xattr.c::do_setxattr` drops them on the POSIX-ACL
+    /// path, passing only name/value/size to `do_set_acl`.
+    ///
+    /// A `MemFile` is never a directory, so a DEFAULT ACL is rejected with
+    /// `-EACCES` (and accepted as a no-op when it is a removal), which is
+    /// `set_posix_acl`'s `return acl ? -EACCES : 0`.
+    ///
+    /// LINUX-GAP: `set_posix_acl` also requires
+    /// `inode_owner_or_capable()` (`-EPERM` otherwise). `FileOps` methods
+    /// carry no credential, so that check has to live in the syscall
+    /// layer; nothing calls it there yet, so today any task that can reach
+    /// the inode can set its ACL.
+    fn set_acl(&self, ty: AclType, value: &[u8]) -> Result<(), FsError> {
+        let acl = if value.is_empty() {
+            None
+        } else {
+            PosixAcl::from_xattr(value)?
+        };
+        if ty == AclType::Default {
+            return match acl {
+                Some(_) => Err(FsError::PermissionDenied),
+                None => Ok(()),
+            };
+        }
+        let acl = match acl {
+            Some(acl) => acl,
+            None => {
+                self.xattrs.lock().remove(XATTR_NAME_POSIX_ACL_ACCESS);
+                return Ok(());
+            }
+        };
+        acl.valid()?;
+        // `simple_set_acl` -> `posix_acl_update_mode`: the mode's low 9
+        // bits become whatever the ACL says, and an ACL that is exactly
+        // expressible as mode bits is not stored at all.
+        //
+        // LINUX-GAP: the `in_group_or_capable()` half of
+        // `posix_acl_update_mode` drops S_ISGID when the caller is neither
+        // in the file's group nor CAP_FSETID-privileged. `FileOps` has no
+        // credential to test, so NARF passes `true` (keep the bit) — the
+        // same answer Linux gives for the common case of the owner acting
+        // on their own file, and never a widening of the rwx bits.
+        let (mode, stored) = crate::posix_acl::posix_acl_update_mode(
+            (self.perms.load(Ordering::Relaxed) & 0o7777) as u16,
+            acl,
+            true,
+        )?;
+        let mut attrs = self.xattrs.lock();
+        match stored {
+            Some(acl) => {
+                attrs.insert(String::from(XATTR_NAME_POSIX_ACL_ACCESS), acl.to_xattr());
+            }
+            None => {
+                attrs.remove(XATTR_NAME_POSIX_ACL_ACCESS);
+            }
+        }
+        drop(attrs);
+        self.perms.store(mode as u32, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
 impl Drop for MemFile {
@@ -1200,7 +1273,31 @@ impl FileOps for MemFile {
 
     fn set_perms<'a>(&'a self, perms: u16) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            self.perms.store((perms & 0o7777) as u32, Ordering::Relaxed);
+            let perms = perms & 0o7777;
+            // The other half of the mode<->ACL coherence rule. tmpfs —
+            // the filesystem MemFs stands in for — ends
+            // `mm/shmem.c::shmem_setattr` with
+            //     if (attr->ia_valid & ATTR_MODE)
+            //             error = posix_acl_chmod(idmap, dentry, inode->i_mode);
+            // and `fs/posix_acl.c::posix_acl_chmod` runs
+            // `__posix_acl_chmod_masq` over the ACCESS ACL. Without this a
+            // `chmod` would move the mode bits while the ACL kept granting
+            // the old rights — and since the mode's group triplet IS the
+            // ACL_MASK, dropping it makes `chmod g-w` a no-op for every
+            // maskable entry.
+            let mut attrs = self.xattrs.lock();
+            if let Some(raw) = attrs.get(XATTR_NAME_POSIX_ACL_ACCESS) {
+                // The stored blob is always a canonical `to_xattr()` of an
+                // ACL that already passed `valid()` in `set_acl`, so the
+                // decode cannot fail; the non-matching arm is unreachable
+                // rather than a silent skip of a corrupt ACL.
+                if let Ok(Some(mut acl)) = PosixAcl::from_xattr(raw) {
+                    acl.chmod_masq(perms)?;
+                    attrs.insert(String::from(XATTR_NAME_POSIX_ACL_ACCESS), acl.to_xattr());
+                }
+            }
+            drop(attrs);
+            self.perms.store(perms as u32, Ordering::Relaxed);
             Ok(())
         })
     }
@@ -1233,6 +1330,14 @@ impl FileOps for MemFile {
 
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // `system.posix_acl_{access,default}` are not opaque blobs: Linux
+            // routes them away from the generic xattr handler entirely
+            // (`fs/xattr.c::do_setxattr` -> `set_posix_acl`/`vfs_set_acl`),
+            // decodes and validates them, and keeps the file mode in step.
+            // See `set_acl` below.
+            if let Some(ty) = AclType::from_xattr_name(name) {
+                return self.set_acl(ty, value);
+            }
             if !(name.starts_with("user.")
                 || name.starts_with("trusted.")
                 || name.starts_with("security."))
@@ -1283,6 +1388,21 @@ impl FileOps for MemFile {
 
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // `fs/xattr.c::removexattr` routes the two ACL names to
+            // `vfs_remove_acl` -> `set_posix_acl(type, NULL)`, which for a
+            // DEFAULT ACL on a non-directory is `return acl ? -EACCES : 0`
+            // — a silent success, not ENODATA. A `MemFile` is never a
+            // directory, so removing its (impossible) default ACL is a
+            // no-op.
+            //
+            // Removing the ACCESS ACL takes the generic path below on
+            // purpose: `simple_set_acl` calls `posix_acl_update_mode` with
+            // a NULL acl, and `posix_acl_equiv_mode` returns 0 immediately
+            // for a NULL acl without touching `*mode_p`. So the mode must
+            // survive the removal untouched.
+            if AclType::from_xattr_name(name) == Some(AclType::Default) {
+                return Ok(());
+            }
             self.xattrs
                 .lock()
                 .remove(name)

@@ -81,7 +81,7 @@ pub(crate) fn sys_sched_setparam(ctx: &mut dyn TrapContext) {
     };
 
     // Priority range, then the policy/priority agreement rule.
-    if val < 0 || val > MAX_RT_PRIO_MINUS_1 {
+    if !(0..=MAX_RT_PRIO_MINUS_1).contains(&val) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
