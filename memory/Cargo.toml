@@ -75,8 +75,11 @@ frame-alloc-audit = []
 # returned a frame without a paired `rmap::remove`, whose stale owner would
 # otherwise poison the frame's next allocation (and flake any later
 # rmap-sensitive test handed that frame). Off by default — takes the frame's
-# rmap shard lock per free, and it currently trips on a real latent
-# nested-fork/shared-alias teardown leak (COW refcount 0 but one owner left).
+# rmap shard lock per free. It found the `reap_anonymous` reclaim leak (now
+# fixed); a debug sweep shows at least one more teardown/reclaim path still
+# skips `rmap::remove`, so enabling it currently still trips. Enable to hunt
+# the remainder; once the suite runs it clean this graduates to always-on
+# under `debug_assertions` (the Linux DEBUG_VM gating).
 rmap-free-audit = []
 
 # Kernel Address Sanitizer (KASAN) write-catch. Compiles the KASAN runtime
