@@ -135,6 +135,10 @@ frame-alloc-audit    = ["narf-memory/frame-alloc-audit"]
 # 16-byte block's captured {data, vtable} words so `addr2line` of the
 # vtable names the concrete type (the rip=0x3 vtable-UAF hunt).
 slab-free-audit      = ["narf-memory/slab-free-audit"]
+# Reverse-map free-site audit: Linux `free_pages_prepare` "nonzero mapcount"
+# `bad_page` analogue — panics at the SOURCE when a frame returns to the buddy
+# with a live rmap owner (a teardown/reclaim path that skipped `rmap::remove`).
+rmap-free-audit      = ["narf-memory/rmap-free-audit"]
 
 # Kernel Address Sanitizer write-catch (freed-slab write-after-free hunt).
 # Forwarded to narf-memory; the build must ALSO pass

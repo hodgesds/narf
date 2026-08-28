@@ -5282,6 +5282,17 @@ impl AddressSpace {
                         .filter(|phys| phys.raw() != 0),
                 );
             } else {
+                // Drop each punched page's rmap entry before its frame returns
+                // to the buddy, mirroring `free_region_frames`: a MAP_FIXED
+                // punch / munmap that frees resident private backing must not
+                // leave a stale (root, va) owner on the reclaimed frame (Linux
+                // free_pages_prepare's "nonzero mapcount" invariant).
+                for (off, phys) in old.phys[first..last].iter().enumerate() {
+                    if phys.raw() != 0 {
+                        let va = VirtAddr::new(rb + ((first + off) as u64) * 4096);
+                        crate::rmap::remove(*phys, self.root, va);
+                    }
+                }
                 to_free.extend(
                     old.phys[first..last]
                         .iter()
@@ -8194,6 +8205,15 @@ impl AddressSpace {
                     if p.raw() == 0 {
                         continue;
                     }
+                    // Retire the reverse-map entry before the frame returns to
+                    // the buddy, exactly as `free_region_frames` does on the
+                    // ordinary unmap path. Zeroing `phys[i]` makes the later
+                    // teardown skip this page, so MADV_DONTNEED/FREE is the only
+                    // place to drop its rmap owner; omitting it leaked a stale
+                    // (root, va) onto every reclaimed frame (Linux
+                    // free_pages_prepare's "nonzero mapcount" invariant).
+                    let va = VirtAddr::new(rb + (i as u64) * 4096);
+                    crate::rmap::remove(p, self.root, va);
                     to_release.push(crate::frame::PhysFrame::new(p));
                     r.phys[i] = PhysAddr::new(0);
                 }
