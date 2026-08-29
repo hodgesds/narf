@@ -273,9 +273,12 @@ impl<'a> RunQueue<'a> {
         // `pick_next` walks every queued slot, so this turns N rdtsc reads per
         // dispatch into one and evaluates all slots at a single instant.
         let now = narf_time::now_cycles();
-        self.inner
-            .iter()
-            .map(move |slot| (TaskHandle::from_id(slot.id), TaskMeta::from_slot_at(slot, now)))
+        self.inner.iter().map(move |slot| {
+            (
+                TaskHandle::from_id(slot.id),
+                TaskMeta::from_slot_at(slot, now),
+            )
+        })
     }
 
     /// Handle for the front-most candidate, without detaching it.
