@@ -224,6 +224,9 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// (emulated) device read plus a full-node checksum verification, and both
     /// are pure repetition for a block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
+    /// Set when a transaction was lost after its operations had already
+    /// reported success. See [`Self::abort_transaction`].
+    aborted: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
     /// An async mutex rather than a spinlock: an operation holds it across its
     /// tree reads and node writes, which is also what serialises the shared
@@ -259,9 +262,37 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     /// All checksum algorithms accepted at mount are emitted by the COW writer.
-    /// A subvolume marked read-only in its root item remains read-only.
+    /// A subvolume marked read-only in its root item remains read-only, and so
+    /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
-        self.state.lock().writable_fs_tree
+        !self.aborted.load(core::sync::atomic::Ordering::Acquire)
+            && self.state.lock().writable_fs_tree
+    }
+
+    /// Refuse all further writes, because a transaction was lost after its
+    /// operations had already reported success.
+    ///
+    /// This is `btrfs_abort_transaction`, whose comment states the same
+    /// reasoning: "We only mark the transaction aborted and then set the file
+    /// system read-only. This will prevent new transactions from starting."
+    /// There is nothing else honest to do. A batch commits many operations at
+    /// once; if it fails, the callers of the operations it held have already
+    /// been told those succeeded, and there is no one left to report the
+    /// failure to. Continuing to accept writes would build the next
+    /// transaction on a tree those callers believe contains their work and
+    /// which does not.
+    ///
+    /// Read paths keep working, and they show the last committed tree — the
+    /// lost operations are absent from it, which is the truth.
+    pub(crate) fn abort_transaction(&self) {
+        self.aborted
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a transaction has been aborted on this volume.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn transaction_aborted(&self) -> bool {
+        self.aborted.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// `(devid, physical capacity)` for every assembled member.
@@ -1118,6 +1149,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            aborted: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,

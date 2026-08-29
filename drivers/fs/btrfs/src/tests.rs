@@ -2194,6 +2194,17 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     if read_all(&child_file_after, payload.len() + 8).as_deref() != Some(payload.as_slice()) {
         return TestResult::Fail("qgroup hard-limit rejection was not atomic");
     }
+    // A reported rejection is not a transaction abort. The commit that refused
+    // this write was driven by the write itself, so the error reached the
+    // caller that caused it and nothing was silently lost — the boundary
+    // `FlushOrigin` draws. Aborting here would take a whole mount read-only
+    // every time anyone exceeded their quota.
+    if child.transaction_aborted() {
+        return TestResult::Fail("a reported quota rejection aborted the transaction");
+    }
+    if !child.supports_writes() {
+        return TestResult::Fail("a reported quota rejection took the subvolume read-only");
+    }
 
     // Batched commits: durable only once synced, as a real unmount would
     // flush. Without it this would assert UNSYNCED data survives.
@@ -9461,3 +9472,76 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_batch_cancels_intra_batch_data_extents
 );
+
+/// A batch commit that fails takes the filesystem read-only.
+///
+/// The loss a batch can inflict is different in kind from the one a single
+/// transaction can. When every operation committed on its own, a failed commit
+/// was reported to the operation that caused it and nothing else was affected.
+/// A batch holds operations whose callers have already been told they
+/// succeeded; if its commit fails, those are gone and there is nobody left to
+/// tell. Linux answers this with `btrfs_abort_transaction` — mark it aborted
+/// and set the filesystem read-only — and so does this.
+///
+/// The crash injector is the failure: it returns an error from `commit_txn`
+/// after the nodes are out and before the superblock, which is exactly a
+/// commit that did not happen.
+fn smoke_btrfs_failed_batch_commit_aborts() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.create("survivor.txt")), Some(Ok(_))) {
+        return TestResult::Fail("the committed create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+
+    // Three operations, each told its caller it succeeded, none committed.
+    for i in 0..3 {
+        if !matches!(
+            poll_once(root.create(&format!("doomed-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("a batched create failed");
+        }
+    }
+    if vol.transaction_aborted() {
+        return TestResult::Fail("staging operations aborted the transaction");
+    }
+
+    // Fail their commit. The sync is not one of the three, so all three are
+    // lost with no caller to report to.
+    vol.arm_crash_before_super();
+    if poll_once(vol.sync_to_disk()).is_none() {
+        return TestResult::Fail("the failing sync never completed a poll");
+    }
+    if !vol.transaction_aborted() {
+        return TestResult::Fail("a batch commit lost operations without aborting");
+    }
+    if vol.supports_writes() {
+        return TestResult::Fail("an aborted filesystem still accepts writes");
+    }
+    // EROFS, the errno Linux returns once the filesystem is in this state.
+    if !matches!(
+        poll_once(root.create("after-abort.txt")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a write after the abort was not refused with ReadOnly");
+    }
+
+    // Reads still work, and show the last tree that really committed.
+    let names = dir_names(&vol.root());
+    if !names.iter().any(|n| n == "survivor.txt") {
+        return TestResult::Fail("the abort hid a committed file");
+    }
+    if names.iter().any(|n| n.starts_with("doomed-")) {
+        return TestResult::Fail("a lost operation is still visible after the abort");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_failed_batch_commit_aborts);

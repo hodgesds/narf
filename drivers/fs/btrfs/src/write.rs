@@ -1058,7 +1058,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     let full = batch.ops >= batch.max_ops;
     drop(guard);
     if full {
-        flush_batch(vol).await?;
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
     Ok(data.len())
 }
@@ -1321,10 +1321,39 @@ async fn batch_stage<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Who asked for the batch to be committed, which decides what a failed commit
+/// costs.
+///
+/// A failed commit loses every operation the batch held. That is only an
+/// abort-worthy loss for operations whose callers were already told they
+/// succeeded — an operation still on the stack receives the error itself and
+/// is reported honestly.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FlushOrigin {
+    /// The operation that filled the batch, still on the stack. It will get
+    /// the error as its own return value, so it is not among the losses.
+    StagingOperation,
+    /// Anything else — a sync, a non-batchable transaction, a re-root. Every
+    /// operation in the batch has already returned success to its caller.
+    Elsewhere,
+}
+
+impl FlushOrigin {
+    /// How many operations of a batch of `ops` would be silently lost if its
+    /// commit failed.
+    fn silent_losses(self, ops: usize) -> usize {
+        match self {
+            FlushOrigin::StagingOperation => ops.saturating_sub(1),
+            FlushOrigin::Elsewhere => ops,
+        }
+    }
+}
+
 /// Commit one closed batch as a single transaction.
 async fn commit_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     batch: FsBatch,
+    origin: FlushOrigin,
 ) -> Result<(), FsError> {
     if batch.ops == 0 {
         // Nothing staged. `batch_gen` opens a batch before its caller has
@@ -1334,8 +1363,21 @@ async fn commit_batch<B: BlockDevice + 'static>(
         return Ok(());
     }
     let base_root = batch.base_root;
+    let silent_losses = origin.silent_losses(batch.ops);
     let result = commit_batch_inner(vol, batch).await;
     if result.is_err() {
+        if silent_losses > 0 {
+            // Operations in this batch were reported successful and are now
+            // gone, with no caller left to tell. `abort_transaction` explains
+            // why the only honest response is to stop accepting writes.
+            //
+            // The single-operation case does NOT come through here: when the
+            // operation that filled the batch is the one on the stack, it
+            // receives this error as its own return value, which is an
+            // accurate report and not a loss. That is the path a quota hard
+            // limit takes.
+            vol.abort_transaction();
+        }
         // Put the in-memory root back where the last successful commit left
         // it. Staging advanced it so that reads within the batch could see the
         // operations as they landed, but a commit that fails publishes
@@ -1407,9 +1449,16 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
 pub(crate) async fn flush_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    flush_batch_from(vol, FlushOrigin::Elsewhere).await
+}
+
+async fn flush_batch_from<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    origin: FlushOrigin,
+) -> Result<(), FsError> {
     let batch = vol.fs_batch().lock().await.take();
     match batch {
-        Some(batch) => commit_batch(vol, batch).await,
+        Some(batch) => commit_batch(vol, batch, origin).await,
         None => Ok(()),
     }
 }
@@ -1445,7 +1494,7 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
         batch.ops >= batch.max_ops
     };
     if full {
-        flush_batch(vol).await?;
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
     Ok(())
 }
