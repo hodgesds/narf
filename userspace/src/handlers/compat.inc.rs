@@ -2604,6 +2604,21 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 /// task used to make procfs render the backing paths directly (for example
 /// `/mnt/sys/kernel/debug` to PID 1 rooted at `/mnt`), so systemd could not
 /// find the mount it had just created when it rescanned mountinfo.
+/// Answer `narf_filesystem::caller_capable` for the task currently running.
+///
+/// Installed as the filesystem layer's caller-capability hook. A driver that
+/// needs Linux's `capable(CAP_X)` — one asked deep inside a driver rather
+/// than at the syscall boundary — gets exactly that and nothing else: no
+/// credential it could keep, no way to ask about a different task.
+///
+/// `task_capable` is host-scoped, which is what `capable()` means:
+/// `ns_capable(&init_user_ns, cap)`. A container root holding the capability
+/// only in its own user namespace answers false, so a namespaced process
+/// cannot use a driver to reach past its namespace.
+pub fn caller_capable(cap: u32) -> bool {
+    task_capable(current_task_id(), cap)
+}
+
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let task = pid_to_task_raw(pid).unwrap_or(pid);
     let process_root = root_dir_of(task).unwrap_or_else(|| alloc::string::String::from("/"));

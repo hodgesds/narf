@@ -2269,6 +2269,46 @@ fn alloc_mount_ns_id() -> u64 {
     f()
 }
 
+/// Hook answering "does the process on whose behalf we are running hold this
+/// capability?". Installed by userspace, which owns the task table and the
+/// capability sets; until then it answers **false** for everything.
+///
+/// Filesystem drivers deliberately have no access to the calling process —
+/// `FsOps` carries no credential, and that is what keeps a driver from
+/// growing its own idea of who is allowed to do what. A few Linux behaviours
+/// nevertheless turn on the caller's privilege deep inside a driver rather
+/// than at the syscall boundary; btrfs's `quota_override` is one
+/// (`qgroup_reserve` tests `capable(CAP_SYS_RESOURCE)` per reservation). This
+/// hook is how a driver asks that question without being handed a credential
+/// it could then use for anything else.
+///
+/// Failing closed is the whole design. An uninstalled hook — a driver under
+/// test, an early-boot path, a build without the syscall layer — must never
+/// read as "privileged", because every caller of this is deciding whether to
+/// SKIP an enforcement.
+static CALLER_CAPABLE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the caller-capability query (userspace `caller_capable`).
+pub fn install_caller_capable_hook(f: fn(u32) -> bool) {
+    CALLER_CAPABLE_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the process this work is being done for holds `cap`, in the
+/// INITIAL user namespace — the question Linux's `capable()` asks.
+///
+/// False when no hook is installed. See [`install_caller_capable_hook`].
+pub fn caller_capable(cap: u32) -> bool {
+    let v = CALLER_CAPABLE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return false;
+    }
+    // SAFETY: v was stored by install_caller_capable_hook as a `fn(u32) -> bool`
+    // pointer; non-zero confirms it was installed.
+    let f: fn(u32) -> bool = unsafe { core::mem::transmute::<usize, fn(u32) -> bool>(v) };
+    f(cap)
+}
+
 /// Hook exporting a DRM GEM handle as an mmap-able dma-buf `FileOps`.
 /// Installed by the gpu driver (which owns the card / dumb-buffer tables)
 /// so `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` in the syscall layer — the

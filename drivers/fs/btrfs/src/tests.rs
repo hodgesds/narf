@@ -9944,8 +9944,14 @@ fn smoke_btrfs_open_transaction_commits_on_interval() -> TestResult {
         return TestResult::Fail("a fresh transaction was committed by the interval check");
     }
 
-    // Age it past the interval and check again.
-    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
+    // Age it past the interval and check again. The result of the backdate is
+    // checked rather than discarded: it takes the transaction lock, and a
+    // `poll_once` that finds the lock held returns None having done nothing,
+    // which would otherwise leave the assertion below failing for a reason
+    // that looks like a broken interval check.
+    if poll_once(crate::write::__test_age_open_transaction(&vol, 60)).is_none() {
+        return TestResult::Fail("the backdate never completed a poll");
+    }
     if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
         return TestResult::Fail("the staleness check never completed a poll");
     }
@@ -10061,4 +10067,101 @@ fn smoke_btrfs_qgroup_ioctls_report_not_connected() -> TestResult {
 kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroup_ioctls_report_not_connected
+);
+
+/// `quota_override` needs the flag AND the caller's CAP_SYS_RESOURCE.
+///
+/// ```text
+/// if (test_bit(BTRFS_FS_QUOTA_OVERRIDE, &fs_info->flags) &&
+///     capable(CAP_SYS_RESOURCE))
+///         enforce = false;
+/// ```
+///
+/// Both halves, and the conjunction is the security property. The flag is an
+/// administrator's decision about the filesystem; the capability is a fact
+/// about the process doing the writing. A bypass on the flag alone would hand
+/// every unprivileged writer a way past a quota the moment an administrator
+/// enabled it — the opposite of what enabling it is for, which is to let a
+/// privileged process dig a filesystem out from under a limit nothing can
+/// write beneath.
+///
+/// The capability half is checked at the reservation, deep inside the driver,
+/// which is why it needs the filesystem layer's caller-capability hook: a
+/// driver has no credential of its own, and this is the only question it may
+/// ask about the caller.
+fn smoke_btrfs_quota_override_needs_flag_and_capability() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let file = match poll_once(root.create("override.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    // Both files are created BEFORE the limit goes on. Creating one costs a
+    // metadata reservation, and after the override has been used to write far
+    // past the limit there is no room left to create anything — so the file
+    // for the final arm has to exist already.
+    let after_clear = match poll_once(root.create("override-2.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("second create failed"),
+    };
+    let _ = poll_once(vol.sync_to_disk());
+
+    // A limit tight enough that the write below cannot fit under it.
+    let settled = qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if settled == 0 {
+        return TestResult::Fail("committed qgroup usage was unreadable");
+    }
+    let mut limit = [0u8; 48];
+    limit[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER
+    limit[16..24].copy_from_slice(&(settled + 4096).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("setting the qgroup limit failed");
+    }
+
+    let payload = alloc::vec![0x2bu8; 256 * 1024];
+    // Flag off: refused, whatever the caller holds.
+    if !matches!(
+        poll_once(file.write(0, &payload)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("the over-limit write was not refused with quotas enforced");
+    }
+
+    // Flag on. The kernel-test task runs privileged, so this is the arm where
+    // both halves hold and the write goes through.
+    vol.__test_set_quota_override(true);
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        Some(Err(FsError::QuotaExceeded)) => {
+            return TestResult::Fail("quota_override did not let a privileged write past the limit")
+        }
+        _ => return TestResult::Fail("the override write failed some other way"),
+    }
+
+    // Flag back off: enforcement returns, so this is a switch and not a
+    // one-way door.
+    vol.__test_set_quota_override(false);
+    match poll_once(after_clear.write(0, &payload)) {
+        Some(Err(FsError::QuotaExceeded)) => TestResult::Pass,
+        Some(Ok(_)) => TestResult::Fail("clearing quota_override left enforcement off"),
+        _ => TestResult::Fail("the post-clear write failed some other way"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_quota_override_needs_flag_and_capability
 );
