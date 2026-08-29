@@ -6553,6 +6553,115 @@ fn smoke_memory_anon_reclaim_clock_second_chance() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_anon_reclaim_clock_second_chance);
 
+// Demand-paged brk exercises the x86_64 demand-fault path (like the other
+// demand/reclaim tests here); gated to x86_64 accordingly.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_brk_grow_is_demand_paged() -> TestResult {
+    // brk grow extends the heap region's LENGTH without materializing a phys
+    // slot per page (O(1) grow, no eager zero-fill); each page installs its
+    // backing slot only on first fault (finish_demand_page resizes the prefix).
+    use crate::{AddressSpace, VirtAddr};
+
+    // SAFETY: paging + frame allocator live in the kernel suite.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    // Conventional brk base (BRK_DEFAULT_BASE); grow the heap by N pages.
+    let base = VirtAddr::new(0x0000_1000_0000_0000);
+    const N: usize = 64;
+    if a.brk_extend_region(base, base.as_u64(), N).is_err() {
+        return TestResult::Fail("brk_extend_region failed");
+    }
+    let r = a.lookup(base).expect("brk region present");
+    if r.len != (N as u64) * 0x1000 {
+        return TestResult::Fail("brk grow did not extend region length");
+    }
+    // The whole point: the grow materialized NO per-page phys slots.
+    if !r.phys.is_empty() {
+        return TestResult::Fail("brk grow materialized phys eagerly (not demand-paged)");
+    }
+
+    // Fault page 10 → the fault path extends the phys prefix to cover it and
+    // backs it, leaving pages 0..10 as demand-zero sentinels.
+    let page10 = VirtAddr::new(base.as_u64() + 10 * 0x1000);
+    // SAFETY: AS live; identity map present; page lies in the grown region.
+    if unsafe { a.demand_alloc_page(page10) }.is_err() {
+        return TestResult::Fail("demand fault of a grown brk page failed");
+    }
+    let r2 = a.lookup(base).expect("brk region present");
+    if r2.phys.len() < 11 {
+        return TestResult::Fail("fault did not extend the phys prefix to the faulted page");
+    }
+    if r2.phys[10].raw() == 0 {
+        return TestResult::Fail("faulted brk page has no backing frame");
+    }
+    if r2.phys[0].raw() != 0 {
+        return TestResult::Fail("an unfaulted brk page was unexpectedly backed");
+    }
+    // Pages past the faulted prefix are still unmaterialized (demand-zero).
+    if (r2.phys.len() as u64) >= (r2.len >> 12) {
+        return TestResult::Fail("phys prefix should be shorter than the region page count");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_brk_grow_is_demand_paged);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_brk_shrink_punches_demand_paged() -> TestResult {
+    // Shrinking a demand-paged brk (short phys) punches the tail. The punch path
+    // used to slice `phys[first..last]` assuming a full-length list and PANICKED
+    // on a short one (stress-ng --brk shrink). Regression: shrink after a sparse
+    // fault must free only the faulted frames and leave the heap consistent.
+    use crate::{AddressSpace, BrkUpdateResult, VirtAddr};
+
+    // SAFETY: paging + frame allocator live in the kernel suite.
+    let a = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = VirtAddr::new(0x0000_1000_0000_0000);
+    let arena_top = 0x0000_4000_0000_0000u64;
+    let grow = |req: u64| {
+        a.update_brk_limited(
+            base,
+            arena_top,
+            req,
+            alloc::vec::Vec::new(),
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            true,
+        )
+    };
+    // Grow to 32 pages (O(1), no phys materialized).
+    if !matches!(grow(base.as_u64() + 32 * 4096), BrkUpdateResult::Complete(v) if v == base.as_u64() + 32 * 4096)
+    {
+        return TestResult::Fail("brk grow failed");
+    }
+    // Fault two sparse pages (5 and 20) — materializes the prefix up to 20.
+    for p in [5u64, 20] {
+        // SAFETY: AS live; page lies in the grown region.
+        if unsafe { a.demand_alloc_page(VirtAddr::new(base.as_u64() + p * 4096)) }.is_err() {
+            return TestResult::Fail("fault of a grown brk page failed");
+        }
+    }
+    // Shrink to 3 pages → punches [3, 32), which spans faulted (5, 20) AND
+    // unmaterialized pages. Must not panic on the short phys list.
+    if !matches!(grow(base.as_u64() + 3 * 4096), BrkUpdateResult::Complete(v) if v == base.as_u64() + 3 * 4096)
+    {
+        return TestResult::Fail("brk shrink failed");
+    }
+    let r = a.lookup(base).expect("brk region present");
+    if r.len != 3 * 4096 {
+        return TestResult::Fail("shrink did not reduce the heap length");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_brk_shrink_punches_demand_paged);
+
 /// The rmap wiring must record a `(root, va) → phys` reverse mapping for every
 /// resident page when a region is materialized, and drop it on unmap.
 #[cfg(target_arch = "x86_64")]
@@ -14125,9 +14234,7 @@ fn smoke_memory_brk_growth_rejects_foreign_root() -> TestResult {
     {
         return TestResult::Fail("foreign brk-root setup failed");
     }
-    if a.brk_extend_region(base, base.as_u64() + 0x1000, alloc::vec![PhysAddr::new(0)])
-        != Err(AddressSpaceError::Overlap)
-    {
+    if a.brk_extend_region(base, base.as_u64() + 0x1000, 1) != Err(AddressSpaceError::Overlap) {
         return TestResult::Fail("brk annexed a root without BRK_HEAP provenance");
     }
     let unchanged = a.lookup(base).is_some_and(|region| {

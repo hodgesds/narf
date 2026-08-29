@@ -743,12 +743,14 @@ impl RegionTable {
             }
             let first = ((page - rb) >> 12) as usize;
             let count = ((re - page) >> 12) as usize;
-            if let Some(offset) = region.phys[first..]
-                .iter()
-                .take(count)
-                .position(|phys| phys.raw() == 0)
+            // A demand-paged region's phys list may be SHORTER than its page
+            // count; a page past the materialized prefix is unbacked (demand-zero)
+            // exactly like an in-range `phys[i] == 0`. `phys.get(i)` treats both
+            // uniformly (and can't panic on `first > phys.len()`).
+            if let Some(i) =
+                (first..first + count).find(|&i| region.phys.get(i).is_none_or(|p| p.raw() == 0))
             {
-                return Some(page + (offset as u64) * 4096);
+                return Some(page + ((i - first) as u64) * 4096);
             }
         }
         None
@@ -1679,7 +1681,7 @@ impl AddressSpace {
         heap_base: VirtAddr,
         arena_top: u64,
         requested: u64,
-        mut lazy_pages: Vec<PhysAddr>,
+        lazy_pages: Vec<PhysAddr>,
         data_limit_bytes: u64,
         address_space_limit_bytes: u64,
         memlock_limit_bytes: u64,
@@ -1748,10 +1750,11 @@ impl AddressSpace {
         let Ok(page_count) = usize::try_from(pages) else {
             return BrkUpdateResult::Complete(current);
         };
-        if lazy_pages.len() < page_count {
-            return BrkUpdateResult::NeedPages(page_count);
-        }
-        lazy_pages.truncate(page_count);
+        // Demand-paged grow: the region's length is extended without materializing
+        // any per-page phys slot, so the caller's `lazy_pages` pre-allocation is
+        // no longer needed (pages fault in individually). Kept in the signature
+        // for ABI stability with the fork/exec brk-inheritance paths.
+        let _ = lazy_pages;
 
         // Linux compares total_vm + requested pages against RLIMIT_AS in
         // pages, effectively rounding a non-page-aligned byte limit down.
@@ -1772,7 +1775,7 @@ impl AddressSpace {
         let Ok((grow_hi, tail_perms)) = self.brk_extend_region_limited_locked(
             heap_base,
             current_aligned,
-            lazy_pages,
+            page_count,
             memlock_limit_bytes,
             bypass_memlock_limit,
         ) else {
@@ -1790,16 +1793,18 @@ impl AddressSpace {
         BrkUpdateResult::Complete(requested)
     }
 
-    /// Extend the growable `brk(2)` heap at `heap_base` by appending `frames`
-    /// at `[grow_lo, grow_lo + frames.len() * 4096)`.
+    /// Extend the growable `brk(2)` heap at `heap_base` by `add_pages` pages at
+    /// `[grow_lo, grow_lo + add_pages * 4096)`.
+    ///
+    /// Demand-paged: only the region's LENGTH is extended (O(1)); the backing
+    /// `phys` list stays at its faulted prefix and each page materializes its
+    /// slot on first fault. Nothing is pre-allocated, so an unused grown range
+    /// costs nothing.
     ///
     /// Adjacent growth with identical permissions extends the last heap VMA in
     /// place. If `mlockall(MCL_FUTURE)` changed the inherited lock mode (or a
     /// fork left the old tail COW), a distinct tail VMA is required: extending
     /// the old one would retroactively change the status of earlier heap pages.
-    ///
-    /// `frames` are moved into the region's backing on success. On any error the
-    /// caller still owns them (they were not appended) and must free them.
     ///
     /// `grow_lo` must be page-aligned and equal to the current end of the heap
     /// VMA (`heap_base + len`) when a heap VMA exists, or `heap_base` for the
@@ -1808,17 +1813,19 @@ impl AddressSpace {
         &self,
         heap_base: VirtAddr,
         grow_lo: u64,
-        frames: Vec<PhysAddr>,
+        add_pages: usize,
     ) -> Result<(), AddressSpaceError> {
-        self.brk_extend_region_limited(heap_base, grow_lo, frames, u64::MAX, true)
+        self.brk_extend_region_limited(heap_base, grow_lo, add_pages, u64::MAX, true)
     }
 
     /// Limit-enforcing `brk` growth transaction used by the Linux syscall.
+    /// Demand-paged: extends the heap by `add_pages` pages of length; the pages
+    /// materialize their backing individually on first fault.
     pub fn brk_extend_region_limited(
         &self,
         heap_base: VirtAddr,
         grow_lo: u64,
-        frames: Vec<PhysAddr>,
+        add_pages: usize,
         limit_bytes: u64,
         bypass_limit: bool,
     ) -> Result<(), AddressSpaceError> {
@@ -1826,7 +1833,7 @@ impl AddressSpace {
         let (grow_hi, tail_perms) = self.brk_extend_region_limited_locked(
             heap_base,
             grow_lo,
-            frames,
+            add_pages,
             limit_bytes,
             bypass_limit,
         )?;
@@ -1845,14 +1852,14 @@ impl AddressSpace {
         &self,
         heap_base: VirtAddr,
         grow_lo: u64,
-        frames: Vec<PhysAddr>,
+        add_pages: usize,
         limit_bytes: u64,
         bypass_limit: bool,
     ) -> Result<(u64, RegionPerms), AddressSpaceError> {
-        if grow_lo & 0xFFF != 0 || frames.is_empty() {
+        if grow_lo & 0xFFF != 0 || add_pages == 0 {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
-        let add_len = (frames.len() as u64) * 0x1000;
+        let add_len = (add_pages as u64) * 0x1000;
         let grow_hi = grow_lo
             .checked_add(add_len)
             .filter(|end| *end <= Self::USER_HALF_END)
@@ -1891,12 +1898,16 @@ impl AddressSpace {
             {
                 return Err(AddressSpaceError::Overlap);
             }
+            // Demand-paged: grow the length only, with an EMPTY phys list. Each
+            // page materializes its slot on first fault (finish_demand_page), so
+            // the grow is O(1) instead of O(pages) (no per-page zero-fill up
+            // front), and pages the program never touches cost nothing.
             assert!(regions
                 .insert(Region {
                     base: heap_base,
                     len: add_len,
                     perms: tail_perms,
-                    phys: frames,
+                    phys: Vec::new(),
                 })?
                 .is_none());
         } else {
@@ -1926,7 +1937,8 @@ impl AddressSpace {
                 let heap_tail = regions
                     .get_mut(predecessor_base)
                     .ok_or(AddressSpaceError::Overlap)?;
-                heap_tail.phys.extend_from_slice(&frames);
+                // O(1) grow: extend the length only; phys stays at its faulted
+                // prefix and grows lazily on fault (see the first-grow comment).
                 heap_tail.len += add_len;
             } else {
                 assert!(regions
@@ -1934,7 +1946,7 @@ impl AddressSpace {
                         base: VirtAddr::new(grow_lo),
                         len: add_len,
                         perms: tail_perms,
-                        phys: frames,
+                        phys: Vec::new(),
                     })?
                     .is_none());
             }
@@ -2197,10 +2209,23 @@ impl AddressSpace {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         // Per-page scatter list must cover every page in the region —
-        // anything else means the caller computed `len` and `phys`
-        // out of sync, which would silently leave pages unbacked or
-        // leak frames during materialize.
-        if region.phys.len() as u64 != region.len >> 12 {
+        // anything else means the caller computed `len` and `phys` out of sync,
+        // which would silently leave pages unbacked or leak frames during
+        // materialize.
+        //
+        // EXCEPTION: a demand-paged BRK_HEAP region may carry a SHORTER phys list
+        // than its page count. brk grow extends only the region's length (O(1));
+        // each page materializes its phys slot on first fault (finish_demand_page
+        // resizes the prefix). The pages past the prefix are demand-zero, so no
+        // frame can leak (teardown iterates the materialized prefix) and none is
+        // under-mapped (the fault path installs them lazily).
+        let region_pages = region.len >> 12;
+        let phys_covers = if region.perms.contains(RegionPerms::BRK_HEAP) {
+            region.phys.len() as u64 <= region_pages
+        } else {
+            region.phys.len() as u64 == region_pages
+        };
+        if !phys_covers {
             return Err(AddressSpaceError::AlignmentMismatch);
         }
         let end = region
@@ -3788,10 +3813,15 @@ impl AddressSpace {
         let tail_pages = source_region.phys.len().saturating_sub(tail_first);
         let mut head_phys = Vec::new();
         if head_pages != 0 {
+            // Clamp to the materialized prefix — a demand-paged region's phys list
+            // may be shorter than its page count; the kept head keeps its faulted
+            // prefix and stays demand-paged (the tail below already derives its
+            // page count from `phys.len()`).
+            let head_mat = head_pages.min(source_region.phys.len());
             head_phys
-                .try_reserve_exact(head_pages)
+                .try_reserve_exact(head_mat)
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            head_phys.extend_from_slice(&source_region.phys[..head_pages]);
+            head_phys.extend_from_slice(&source_region.phys[..head_mat]);
         }
         let mut tail_phys = Vec::new();
         if tail_pages != 0 {
@@ -5224,7 +5254,13 @@ impl AddressSpace {
             punched_pages = punched_pages
                 .checked_add((last - first) as u64)
                 .ok_or(AddressSpaceError::OutOfRange)?;
-            let resident = old.phys[first..last]
+            // A demand-paged BRK_HEAP region carries a phys list SHORTER than its
+            // page count; pages past the materialized prefix are demand-zero with
+            // no frame. Clamp the range to the materialized prefix — the rest have
+            // nothing to release.
+            let p_last = last.min(old.phys.len());
+            let p_first = first.min(p_last);
+            let resident = old.phys[p_first..p_last]
                 .iter()
                 .filter(|phys| phys.raw() != 0)
                 .count();
@@ -5274,16 +5310,20 @@ impl AddressSpace {
             let total = (old.len >> 12) as usize;
             let first = ((lo.max(rb) - rb) >> 12) as usize;
             let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
+            // Clamp to the materialized phys prefix — a demand-paged BRK_HEAP
+            // region's unmaterialized tail is demand-zero (no frame to release).
+            let p_last = last.min(old.phys.len());
+            let p_first = first.min(p_last);
             if old.perms.contains(RegionPerms::SHARED) {
                 shared_to_release.extend(
-                    old.phys[first..last]
+                    old.phys[p_first..p_last]
                         .iter()
                         .copied()
                         .filter(|phys| phys.raw() != 0),
                 );
             } else {
                 to_free.extend(
-                    old.phys[first..last]
+                    old.phys[p_first..p_last]
                         .iter()
                         .copied()
                         .filter(|phys| phys.raw() != 0)
@@ -5292,11 +5332,14 @@ impl AddressSpace {
             }
             if rb < lo {
                 let n = ((lo - rb) >> 12) as usize;
+                // Kept head keeps its materialized prefix; the region stays
+                // demand-paged (its perms — BRK_HEAP for a heap split — permit a
+                // short phys list).
                 kept_regions.push(Region {
                     base: VirtAddr::new(rb),
                     len: (n as u64) * 4096,
                     perms: old.perms,
-                    phys: copy_backing(&old.phys[..n])?,
+                    phys: copy_backing(&old.phys[..n.min(old.phys.len())])?,
                 });
             }
             if re > hi {
@@ -5305,7 +5348,7 @@ impl AddressSpace {
                     base: VirtAddr::new(hi),
                     len: old.len - (start as u64) * 4096,
                     perms: old.perms,
-                    phys: copy_backing(&old.phys[start..])?,
+                    phys: copy_backing(&old.phys[start.min(old.phys.len())..])?,
                 });
             }
         }
@@ -6098,10 +6141,12 @@ impl AddressSpace {
             return Err(AddressSpaceError::Unmapped);
         }
         let index = ((v - rb) >> 12) as usize;
-        let phys = *region
-            .phys
-            .get(index)
-            .ok_or(AddressSpaceError::OutOfRange)?;
+        // `containing(v)` proved the page lies in this region, so `index` is a
+        // valid page. A demand-paged BRK_HEAP region grows its length without
+        // materializing per-page phys slots, so an index past the materialized
+        // prefix is simply an unfaulted (demand-zero) page — identical to an
+        // in-range `phys[i] == 0`.
+        let phys = region.phys.get(index).copied().unwrap_or(PhysAddr::new(0));
         let perms = region.perms;
         if phys.raw() != 0 {
             repair_backed(phys, perms)?;
@@ -6137,10 +6182,16 @@ impl AddressSpace {
         };
         let rb = region.base.as_u64();
         let index = ((v - rb) >> 12) as usize;
-        let Some(slot) = region.phys.get_mut(index) else {
-            regions.demand_pages.remove(v);
-            return Ok(false);
-        };
+        // Grow the materialized phys prefix to cover this page for a demand-paged
+        // region whose phys list is shorter than its length (BRK_HEAP): a grow
+        // only extended the region's length, so the first fault of each page
+        // installs its slot here. Intermediate pages fill with demand-zero
+        // sentinels, keeping every page independently faultable. Sequential brk
+        // touch makes this amortized O(1) per fault.
+        if index >= region.phys.len() {
+            region.phys.resize(index + 1, PhysAddr::new(0));
+        }
+        let slot = &mut region.phys[index];
         if slot.raw() != 0 {
             regions.demand_pages.remove(v);
             return Ok(false);
