@@ -3711,10 +3711,13 @@ async fn commit_txn<B: BlockDevice + 'static>(
         nodes.extend(pack_tree_at(vol, f, g, &fst_addrs, gen)?.0);
     }
     for (addr, buf) in &nodes {
+        // Cache each node as it is written: `total_block_group_used` below
+        // reads part of this very tree straight back, and without this every
+        // one of those reads is a miss the write itself created.
         if txn.root_flags.is_some() {
-            vol.write_logical_root_admin(*addr, buf).await?;
+            vol.write_node_root_admin(*addr, buf).await?;
         } else {
-            vol.write_logical(*addr, buf).await?;
+            vol.write_node(*addr, buf).await?;
         }
     }
 
