@@ -224,6 +224,11 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// (emulated) device read plus a full-node checksum verification, and both
     /// are pure repetition for a block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
+    /// Operations accumulated into the transaction that has not committed yet.
+    /// An async mutex rather than a spinlock: an operation holds it across its
+    /// tree reads and node writes, which is also what serialises the shared
+    /// allocator inside it.
+    fs_batch: Mutex<Option<crate::write::FsBatch>>,
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
@@ -839,6 +844,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// the root tree and cache its root directory inode. Subsequent `root()`
     /// calls start there.
     pub async fn switch_to_subvol(&self, sel: &Subvol) -> Result<(), FsError> {
+        // A batch belongs to one subvolume: its accumulated COW descends from
+        // that subvolume's tree, and the commit stamps the result into the
+        // ROOT_ITEM named by `fs_tree_id`. Re-rooting with one open would
+        // commit the previous subvolume's tree into the new subvolume's root
+        // item. Log replay walks several roots in a row and is the path that
+        // reaches this.
+        crate::write::flush_batch(self).await?;
         let (root_tree, _) = self.root_tree_root();
         let (subvol_id, subvol_root, subvol_level, subvol_flags) = match sel {
             Subvol::Id(n) => {
@@ -1106,6 +1118,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            fs_batch: Mutex::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -1340,17 +1353,40 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Make every write that has already returned durable on disk.
     ///
     /// This is `fsync`'s contract, stated as a requirement rather than as a
-    /// description of how commits happen to work. Today every write flips the
-    /// superblock before returning, so there is nothing outstanding and this
-    /// is just the device barrier. When commits are batched, the deferred
-    /// superblock write belongs HERE — `fsync` already routes through it, so
-    /// the durability contract does not depend on someone remembering to
-    /// revisit the read path's callers.
+    /// description of how commits happen to work. Two things can be
+    /// outstanding, and both are discharged here, in this order:
+    ///
+    ///  1. operations accumulated into a batch that has not committed — their
+    ///     tree blocks are on disk but no superblock names them yet;
+    ///  2. a committed transaction whose superblock is staged in memory.
+    ///
+    /// Both halves are needed and neither is sufficient. Writing the staged
+    /// superblock without committing the batch publishes a tree that predates
+    /// the writes this call was made for; committing the batch without writing
+    /// the superblock leaves the result in memory.
+    ///
+    /// Putting both here rather than at the call sites is what keeps the
+    /// contract from depending on someone remembering: every durability path
+    /// — `fsync`, unmount, a full staged-superblock quota — is this one
+    /// function.
     ///
     /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
     /// fsyncs, crashes the following commit, and requires the fsynced data
     /// back. Deferring commits without doing the work here turns that red.
     pub async fn sync_to_disk(&self) -> Result<(), FsError> {
+        crate::write::flush_batch(self).await?;
+        self.write_staged_super().await
+    }
+
+    /// Push the staged superblock, if any, through to the device — the second
+    /// half of [`Self::sync_to_disk`], on its own.
+    ///
+    /// A commit calls this rather than `sync_to_disk` when it has filled the
+    /// staged-superblock quota. It must not go the long way round: the batch
+    /// this commit came from was taken before it started, so there is nothing
+    /// of its own left to flush, and calling back into the batch machinery
+    /// from inside a commit makes the two mutually recursive for no gain.
+    pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
         let staged = self.staged_super.lock().take();
         let Some((raw, root_admin)) = staged else {
             // Nothing outstanding; the barrier is all that is owed.
@@ -1656,6 +1692,33 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut g = self.state.lock();
         g.superblock.log_root = 0;
         g.superblock.log_root_level = 0;
+    }
+
+    /// The transaction accumulating operations that have not committed yet.
+    pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
+        &self.fs_batch
+    }
+
+    /// Publish an fs-tree root produced *inside* an open batch.
+    ///
+    /// The batch's nodes are already on disk, so a read taken between two of
+    /// its operations must descend from the new root or it would miss the
+    /// first operation's result. Only the superblock still names the pre-batch
+    /// root, which is the ordinary COW invariant: a crash before the batch
+    /// commits falls back to that tree, and every block it references is still
+    /// there. What keeps them there is that a batch never returns anything it
+    /// frees — freed blocks go back to the free-space tree only at commit, so
+    /// until then the allocator, which reads that tree, cannot reach them.
+    /// (The pinned set covers the window after that: from commit until the
+    /// superblock naming the new tree is durable.)
+    ///
+    /// Deliberately narrower than [`Self::commit_roots`]: it must NOT advance
+    /// `superblock.generation`, because every operation of the batch derives
+    /// its generation from that field and they all have to agree.
+    pub(crate) fn advance_fs_root(&self, new_fs_root: u64, new_fs_level: u8) {
+        let mut g = self.state.lock();
+        g.fs_tree_root = new_fs_root;
+        g.fs_tree_level = new_fs_level;
     }
 
     /// After a COW commit, publish the new roots into the live volume so

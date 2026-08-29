@@ -2075,6 +2075,11 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     if !matches!(poll_once(big.write(100, b"QGROUP")), Some(Ok(6))) {
         return TestResult::Fail("quota-accounted COW write failed");
     }
+    // Qgroup usage is recounted during commit, not during the write, and the
+    // generation stamped into the info item is the committing transaction's.
+    // A batched write has done neither yet, so this asserts what the write
+    // makes true only once its transaction lands.
+    let _ = poll_once(vol.sync_to_disk());
     let after_write = match qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID) {
         Some(body) if body.len() == 40 => body,
         _ => return TestResult::Fail("qgroup info vanished after write"),
@@ -2613,6 +2618,9 @@ fn smoke_btrfs_linux_simple_quota_fixture() -> TestResult {
     ) {
         return TestResult::Fail("simple-quota data allocation failed");
     }
+    // Simple-quota charging happens in commit, so the batched write above has
+    // not moved it yet.
+    let _ = poll_once(vol.sync_to_disk());
     let charged = qgroup_item(&vol, format::QGROUP_INFO_KEY, 5).unwrap_or_default();
     let charged_usage = format::le64(&charged, 8).unwrap_or(0);
     if charged_usage <= initial_usage || format::le64(&charged, 24).ok() != Some(charged_usage) {
@@ -2730,6 +2738,9 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     ) {
         return TestResult::Fail("simple top-level allocation failed");
     }
+    // Simple-quota charging happens in commit, so the batched write above has
+    // not moved it yet.
+    let _ = poll_once(top.sync_to_disk());
     let top_usage = qgroup_item(&top, format::QGROUP_INFO_KEY, 5)
         .and_then(|body| format::le64(&body, 8).ok())
         .unwrap_or(0);
@@ -6433,6 +6444,14 @@ fn smoke_btrfs_incremental_extent_write() -> TestResult {
         return TestResult::Fail("small random write failed");
     }
 
+    // The assertions below read the EXTENT tree, which no write updates: it is
+    // built at commit, from the accumulated allocations and releases. Both
+    // writes above are still in an open batch, so without this the extent tree
+    // holds neither the extents `before` recorded nor the ones `after` did,
+    // and the test would be asking about records nothing has written yet.
+    // The fs-tree checks either side need no sync — those blocks are on disk
+    // as each operation stages.
+    let _ = poll_once(vol.sync_to_disk());
     let after = match regular_file_extents(&vol, ino) {
         Some(v) if v.len() == 4 => v,
         _ => return TestResult::Fail("incremental write changed extent count"),
@@ -7798,6 +7817,12 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
     if !matches!(poll_once(file.write(0, b"new subvolume\n")), Some(Ok(14))) {
         return TestResult::Fail("created subvolume rejected file write");
     }
+    // Sync the CHILD handle. This write went through `fresh`, which carries its
+    // own batched transaction; the `top.sync_to_disk()` further down commits
+    // `top`'s batch and knows nothing about this one. Syncing here also gets
+    // the child's transaction out before the next `mount_named` opens another
+    // handle on the same device, so the two never build on the same parent.
+    let _ = poll_once(fresh.sync_to_disk());
 
     let frozen = match mount_named("frozen") {
         Some(v) => v,
@@ -9229,3 +9254,210 @@ fn smoke_btrfs_laptop_image() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_laptop_image);
+
+// ── Batched transactions ───────────────────────────────────────────
+
+/// Many operations commit as ONE transaction.
+///
+/// This is the property the batch exists for. The superblock generation is
+/// bumped once per *transaction* by `commit_roots`, so counting generations
+/// across a run of operations counts transactions directly: eight creates that
+/// each commit advance it eight times, eight creates that accumulate advance it
+/// once. The saving is everything a commit does — the extent-tree fixed point
+/// and the writeout of the extent, csum, root and free-space trees — which is
+/// per transaction and not per operation.
+///
+/// The first operation is deliberately outside the measurement. It is the one
+/// that may still commit on its own: `ensure_private_subvol` runs against the
+/// committed tree and can rewrite it, which is a transaction of its own that
+/// says nothing about batching.
+fn smoke_btrfs_batch_commits_once_for_many_ops() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    // Warm-up: get any private-subvolume rewrite out of the way, and leave no
+    // batch open, so the count below sees only the batching behaviour.
+    if poll_once(root.create("batch-warmup.txt")).is_none() {
+        return TestResult::Fail("warm-up create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+
+    let before = vol.superblock().generation;
+    for i in 0..8 {
+        if !matches!(
+            poll_once(root.create(&format!("batch-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("a batched create failed");
+        }
+    }
+    // Eight operations, and the eighth fills the batch and commits it: exactly
+    // one transaction. Without accumulation this would be eight.
+    let after = vol.superblock().generation;
+    if after != before + 1 {
+        return TestResult::Fail("eight operations did not commit as one transaction");
+    }
+
+    // And the batch is not a cache trick: every one of them is really there.
+    let names = dir_names(&vol.root());
+    for i in 0..8 {
+        if !names.iter().any(|n| n == &format!("batch-{i}.txt")) {
+            return TestResult::Fail("a batched create was lost");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_batch_commits_once_for_many_ops
+);
+
+/// A read taken between two operations of one batch sees the earlier one.
+///
+/// The batch writes each operation's fs-tree nodes as it stages them and
+/// advances the in-memory root to match, so only the *superblock* lags. A
+/// lookup therefore descends the new tree and finds what was just written —
+/// without this, every operation after the first in a batch would be invisible
+/// to its own caller until the batch closed.
+///
+/// The second half is the other side of that bargain: nothing in the batch is
+/// durable. Crashing before the batch's superblock reaches the device must
+/// discard the whole batch and leave the previously committed tree intact,
+/// which is the ordinary COW invariant applied to a longer transaction.
+fn smoke_btrfs_batch_is_visible_before_commit_and_lost_on_crash() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.create("committed.txt")), Some(Ok(_))) {
+        return TestResult::Fail("the committed create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    let committed_gen = vol.superblock().generation;
+
+    // Three operations, none of them committed (the batch holds eight).
+    for i in 0..3 {
+        if !matches!(
+            poll_once(root.create(&format!("pending-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("a pending create failed");
+        }
+        // Visible immediately, to this handle, before any commit.
+        if poll_once(root.lookup_async(&format!("pending-{i}.txt"))).is_none() {
+            return TestResult::Fail("an uncommitted create was invisible to its own caller");
+        }
+    }
+    if vol.superblock().generation != committed_gen {
+        return TestResult::Fail("the pending operations committed after all");
+    }
+
+    // Lose the machine as the batch commits: nodes reach the device, the
+    // superblock never does.
+    vol.arm_crash_before_super();
+    if poll_once(vol.sync_to_disk()).is_none() {
+        return TestResult::Fail("the crashing sync never completed a poll");
+    }
+
+    let after = match mount_writable(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount after the crash failed"),
+    };
+    let names = dir_names(&after.root());
+    if !names.iter().any(|n| n == "committed.txt") {
+        return TestResult::Fail("the crash lost a transaction that had committed");
+    }
+    if names.iter().any(|n| n.starts_with("pending-")) {
+        return TestResult::Fail("an uncommitted batched operation survived the crash");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_batch_is_visible_before_commit_and_lost_on_crash
+);
+
+/// A data extent allocated and released inside one batch leaves no trace.
+///
+/// Overwriting the same file twice without a commit in between frees an extent
+/// that the extent tree has never heard of, because the allocation that made it
+/// is still sitting in the same uncommitted batch. Recording that release as a
+/// drop asks `commit_txn` to resolve a reference against a tree that does not
+/// contain it — which is why the pair is cancelled instead, exactly as
+/// `PathCow::retire` cancels a metadata block made and dropped in one
+/// transaction.
+///
+/// What the cancellation has to leave behind is checked on both sides: the
+/// intermediate extent must have no extent-tree record (it was never
+/// committed), and the surviving one must have exactly the record it needs.
+fn smoke_btrfs_batch_cancels_intra_batch_data_extents() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let file = match poll_once(vol.root().create("churn.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create failed"),
+    };
+    let ino = file.ino();
+    let first = alloc::vec![0xa1u8; 8192];
+    if !matches!(poll_once(file.write(0, &first)), Some(Ok(n)) if n == first.len()) {
+        return TestResult::Fail("first write failed");
+    }
+    let intermediate = match file_data_extent(&vol, ino) {
+        Some(e) => e,
+        None => return TestResult::Fail("first write produced no extent"),
+    };
+
+    // Second write, same batch: this frees `intermediate`, which no committed
+    // extent tree has ever recorded.
+    let second = alloc::vec![0xb2u8; 8192];
+    if !matches!(poll_once(file.write(0, &second)), Some(Ok(n)) if n == second.len()) {
+        return TestResult::Fail("second write in the same batch failed");
+    }
+    let surviving = match file_data_extent(&vol, ino) {
+        Some(e) => e,
+        None => return TestResult::Fail("second write produced no extent"),
+    };
+    if surviving.0 == intermediate.0 {
+        return TestResult::Fail("the second write did not allocate a fresh extent");
+    }
+
+    let _ = poll_once(vol.sync_to_disk());
+    if extent_item_present(&vol, intermediate.0, intermediate.1) {
+        return TestResult::Fail("an extent born and freed in one batch was recorded");
+    }
+    if !extent_item_present(&vol, surviving.0, surviving.1) {
+        return TestResult::Fail("the surviving extent has no extent-tree record");
+    }
+    // Re-look-up rather than reusing `file`: a handle caches the inode it was
+    // opened with, so the one created above still reports size 0. That is a
+    // property of the node handle, not of the batch.
+    let reread = match poll_once(vol.root().lookup_async("churn.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("churn.dat vanished"),
+    };
+    match read_all(&reread, second.len() + 16) {
+        Some(got) if got == second => TestResult::Pass,
+        _ => TestResult::Fail("the file does not read back the second write"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_batch_cancels_intra_batch_data_extents
+);

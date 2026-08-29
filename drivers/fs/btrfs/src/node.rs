@@ -620,14 +620,9 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
 
     /// `fsync` must leave every write that has already returned durable on
     /// disk. It delegates that to [`BtrfsVolume::sync_to_disk`], which is the
-    /// single place the requirement is implemented.
-    ///
-    /// Commits are synchronous today — a write flips the superblock before it
-    /// returns — so there is nothing outstanding and the call reduces to a
-    /// device barrier. That is an accident of the current commit policy, not
-    /// the contract, and writing it as a delegation rather than as a flush is
-    /// deliberate: when commits are batched, the deferred superblock write
-    /// goes into `sync_to_disk` and this path is already correct.
+    /// single place the requirement is implemented — it commits the open
+    /// batch and then writes the staged superblock, which together are what
+    /// "already returned" means once writes are batched.
     ///
     /// (The tree-log is only used to *replay* a crashed volume's log on mount,
     /// not to defer writes, so it plays no part here.)
