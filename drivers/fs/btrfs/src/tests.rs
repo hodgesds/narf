@@ -606,6 +606,59 @@ fn smoke_btrfs_superblock_decode() -> TestResult {
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_superblock_decode);
 
+/// Pinned extents are withheld from allocation until the superblock that
+/// stops referencing them is durable — Linux's `pin_down_extent` /
+/// `btrfs_finish_extent_commit` ordering.
+///
+/// The subtraction is the part with real logic: a pinned range can fall in the
+/// MIDDLE of a free one, so it has to split that range rather than discard it.
+/// Discarding the whole free extent would be safe but would leak space on every
+/// commit; keeping it whole would hand back a block the committed tree still
+/// references, which is the corruption pinning exists to prevent.
+fn smoke_btrfs_subtract_pinned_splits_free_ranges() -> TestResult {
+    use crate::allocator::subtract_pinned;
+
+    // Nothing pinned: the free list is returned untouched.
+    let free = alloc::vec![(0u64, 100u64), (200, 100)];
+    if subtract_pinned(free.clone(), &[]) != free {
+        return TestResult::Fail("an empty pin set altered the free list");
+    }
+    // A pin strictly inside a free range splits it in two.
+    if subtract_pinned(alloc::vec![(0, 100)], &[(40, 20)]) != alloc::vec![(0u64, 40u64), (60, 40)] {
+        return TestResult::Fail("an interior pin did not split the free range");
+    }
+    // Head, tail, and exact-cover cases.
+    if subtract_pinned(alloc::vec![(0, 100)], &[(0, 40)]) != alloc::vec![(40u64, 60u64)] {
+        return TestResult::Fail("a leading pin did not trim the head");
+    }
+    if subtract_pinned(alloc::vec![(0, 100)], &[(60, 40)]) != alloc::vec![(0u64, 60u64)] {
+        return TestResult::Fail("a trailing pin did not trim the tail");
+    }
+    if !subtract_pinned(alloc::vec![(0, 100)], &[(0, 100)]).is_empty() {
+        return TestResult::Fail("an exactly-covering pin left free space behind");
+    }
+    // A pin wider than the range removes it; a disjoint pin leaves it alone.
+    if !subtract_pinned(alloc::vec![(10, 10)], &[(0, 100)]).is_empty() {
+        return TestResult::Fail("an enclosing pin left free space behind");
+    }
+    if subtract_pinned(alloc::vec![(0, 10)], &[(50, 10)]) != alloc::vec![(0u64, 10u64)] {
+        return TestResult::Fail("a disjoint pin removed free space");
+    }
+    // Several pins across several ranges, including one that splits.
+    let got = subtract_pinned(
+        alloc::vec![(0, 100), (200, 100)],
+        &[(40, 20), (200, 50), (1000, 10)],
+    );
+    if got != alloc::vec![(0u64, 40u64), (60, 40), (250, 50)] {
+        return TestResult::Fail("multiple pins across multiple ranges went wrong");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_subtract_pinned_splits_free_ranges
+);
+
 // ── Phase 1: chunk map ─────────────────────────────────────────────
 
 /// Build a `sys_chunk_array` record: a 17-byte disk key (CHUNK_ITEM at

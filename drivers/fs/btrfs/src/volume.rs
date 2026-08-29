@@ -165,6 +165,29 @@ pub struct BtrfsVolume<B: BlockDevice> {
     degraded: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
+    /// Extents freed by the in-flight transaction, withheld from allocation
+    /// until a superblock that no longer references them is durable.
+    ///
+    /// This is Linux's `trans->transaction->pinned_extents`. Freeing a block
+    /// mid-transaction does NOT return it to the allocator
+    /// (`extent-tree.c::pin_down_extent`); `btrfs_commit_transaction` releases
+    /// the set only after `write_all_supers` succeeds, with the comment "the
+    /// super is written, we can safely allow the tree-loggers to go about
+    /// their business".
+    ///
+    /// The invariant that buys: a block a transaction freed cannot be
+    /// reallocated until a superblock referencing the tree that no longer uses
+    /// it is on disk. Without it, a crash between writing new nodes and
+    /// writing the superblock leaves the committed tree pointing at a block
+    /// that has already been overwritten — silent corruption, and invisible to
+    /// `btrfs check` until after the crash.
+    ///
+    /// NARF flips the superblock on every write, so today the set is emptied
+    /// before the next allocation and never withholds anything. It exists so
+    /// that stops being what makes the invariant hold. Linux keeps it on the
+    /// transaction; it sits here until NARF has a transaction object, which is
+    /// sound only while at most one commit is in flight.
+    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
     /// Metadata node cache, keyed by logical address.
     ///
     /// A commit path-COWs the extent tree once per fixed-point round, and a
@@ -1050,6 +1073,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             verify_checksums,
             degraded,
             devices: IrqSafeSpinLock::new(devices),
+            pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
@@ -1269,6 +1293,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             done += take;
         }
         Ok(self.invalidate_nodes(logical, src.len()))
+    }
+
+    /// Withhold `[start, start + len)` from allocation until [`Self::unpin_all`].
+    pub(crate) fn pin_extent(&self, start: u64, len: u64) {
+        if len != 0 {
+            self.pinned.lock().push((start, len));
+        }
+    }
+
+    /// The currently pinned ranges, for the allocator to subtract.
+    pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
+        self.pinned.lock().clone()
+    }
+
+    /// Release every pinned extent. The caller must have made a superblock
+    /// durable that no longer references any of them — that ordering is the
+    /// entire point of pinning, so calling this earlier reintroduces exactly
+    /// the corruption the set prevents.
+    pub(crate) fn unpin_all(&self) {
+        self.pinned.lock().clear();
     }
 
     /// Publish a node this volume has just written, so the read that follows

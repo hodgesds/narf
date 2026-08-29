@@ -3562,6 +3562,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // ── Mutual fixed point: whole-repack csum/root/fst, path-COW ext ────
     #[allow(clippy::type_complexity)]
     struct Done {
+        /// The converged round's freed set, so the pin below covers exactly
+        /// what this transaction actually released.
+        freed_meta: Vec<(u64, u8)>,
         csum_nodes: Vec<(u64, Vec<u8>, u8)>,
         root_addrs: Vec<u64>,
         fst_addrs: Vec<u64>,
@@ -3712,6 +3715,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 .as_ref()
                 .map_or((0, 0), |out| (out.root_addr, out.root_level));
             done = Some(Done {
+                freed_meta: freed_meta.clone(),
                 csum_nodes: csum_out.map(|out| out.nodes).unwrap_or_default(),
                 root_addrs,
                 fst_addrs,
@@ -3731,6 +3735,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         fst_leaves = fst_lv;
     }
     let Done {
+        freed_meta,
         csum_nodes,
         root_addrs,
         fst_addrs,
@@ -3771,6 +3776,18 @@ async fn commit_txn<B: BlockDevice + 'static>(
         leaf_replace_inplace(&mut root_logical, slot, &ri)?;
     }
     let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
+
+    // Pin everything this transaction freed BEFORE its replacement nodes go
+    // out. `pin_down_extent` does the same: a freed block stays unavailable
+    // until a superblock that no longer references it is durable, so a crash
+    // between here and the superblock write cannot find the committed tree
+    // pointing at reused space.
+    for &(addr, _) in &freed_meta {
+        vol.pin_extent(addr, nodesize);
+    }
+    for &(bytenr, len) in &data_changes.released {
+        vol.pin_extent(bytenr, len);
+    }
 
     // ── Write every new node (extent-tree path-COW nodes are stamped here) ─
     let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -3818,6 +3835,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
     } else {
         vol.write_superblock(&raw).await?;
     }
+    // `btrfs_commit_transaction` releases the pinned set only after
+    // `write_all_supers` returns — "the super is written, we can safely allow
+    // the tree-loggers to go about their business". Unpinning any earlier is
+    // exactly the corruption the set exists to prevent.
+    vol.unpin_all();
 
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);

@@ -118,6 +118,47 @@ async fn read_system_block_groups<B: BlockDevice + 'static>(
     Ok(out)
 }
 
+/// Remove every pinned byte from `free`, splitting a free range that a pinned
+/// range falls inside.
+///
+/// Both inputs may overlap arbitrarily; the result is sorted and disjoint over
+/// whatever survives. Pinned ranges are few (one transaction's frees) and free
+/// ranges are already sorted, so the quadratic shape is bounded by the pinned
+/// count, not by the size of the filesystem.
+pub(crate) fn subtract_pinned(free: Vec<(u64, u64)>, pinned: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    if pinned.is_empty() {
+        return free;
+    }
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(free.len());
+    for (fs_start, fs_len) in free {
+        // Fragments of this free range still available after every pin.
+        let mut parts = alloc::vec![(fs_start, fs_start.saturating_add(fs_len))];
+        for &(ps, plen) in pinned {
+            let (pstart, pend) = (ps, ps.saturating_add(plen));
+            let mut next = Vec::with_capacity(parts.len() + 1);
+            for (start, end) in parts {
+                if pend <= start || pstart >= end {
+                    next.push((start, end)); // disjoint
+                    continue;
+                }
+                if start < pstart {
+                    next.push((start, pstart)); // head survives
+                }
+                if pend < end {
+                    next.push((pend, end)); // tail survives
+                }
+            }
+            parts = next;
+            if parts.is_empty() {
+                break;
+            }
+        }
+        out.extend(parts.into_iter().map(|(s, e)| (s, e - s)));
+    }
+    out.sort_unstable();
+    out
+}
+
 /// A single mutation's space allocator: reclaiming from the free-space tree, or
 /// appending past the extent-tree high-water when there is none.
 #[derive(Clone, Debug)]
@@ -152,6 +193,11 @@ impl Allocator {
                 })
                 .collect();
             ranges.sort_unstable();
+            // Withhold anything the in-flight transaction freed. A pinned
+            // range can fall in the middle of a free one, so this subtracts
+            // rather than filters — keeping the surviving fragments usable
+            // instead of discarding a whole free extent.
+            let ranges = subtract_pinned(ranges, &vol.pinned_ranges());
             return Ok(Allocator::Reclaim { ranges });
         }
         let hw = extent_high_water(vol, ext).await?.max(vol.alloc_floor());
