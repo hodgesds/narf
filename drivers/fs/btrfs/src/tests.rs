@@ -1288,6 +1288,8 @@ fn smoke_btrfs_multidevice_write_roundtrip() -> TestResult {
             return TestResult::Fail("multi-device RAID write failed");
         }
 
+        // Batched commits: sync before reading this volume back from disk.
+        let _ = poll_once(vol.sync_to_disk());
         let remounted = match mount_writable_devices(&devices) {
             Ok(vol) => vol,
             Err(_) => return TestResult::Fail("written multi-device profile did not remount"),
@@ -1314,6 +1316,8 @@ fn smoke_btrfs_multidevice_write_roundtrip() -> TestResult {
                     .enumerate()
                     .filter_map(|(index, device)| (index != omitted).then_some(device.clone()))
                     .collect();
+                // Batched commits: sync before reading this volume back from disk.
+                let _ = poll_once(remounted.sync_to_disk());
                 let degraded = match mount_writable_devices(&remaining) {
                     Ok(vol) => vol,
                     Err(_) => return TestResult::Fail("written degraded RAID failed to mount"),
@@ -1429,6 +1433,8 @@ fn smoke_btrfs_multidevice_chunk_growth() -> TestResult {
         if !matches!(poll_once(file.write(0, b"grown\n")), Some(Ok(6))) {
             return TestResult::Fail("write after multi-device growth failed");
         }
+        // Batched commits: sync before reading this volume back from disk.
+        let _ = poll_once(vol.sync_to_disk());
         let remounted = match mount_writable_devices(&devices) {
             Ok(vol) => vol,
             Err(_) => return TestResult::Fail("grown multi-device array did not remount"),
@@ -1464,6 +1470,8 @@ fn smoke_btrfs_device_lifecycle() -> TestResult {
         return TestResult::Fail("device add failed");
     }
     let three = alloc::vec![devices[0].clone(), devices[1].clone(), added.clone()];
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol = match mount_writable_devices(&three) {
         Ok(vol) if vol.superblock().num_devices == 3 => vol,
         _ => return TestResult::Fail("added device did not survive remount"),
@@ -1505,6 +1513,8 @@ fn smoke_btrfs_device_lifecycle() -> TestResult {
         _ => return TestResult::Fail("evacuated device metadata removal failed"),
     }
     let active = alloc::vec![devices[1].clone(), added.clone()];
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol = match mount_writable_devices(&active) {
         Ok(vol) if vol.superblock().num_devices == 2 => vol,
         _ => return TestResult::Fail("evacuated device remained in volume metadata"),
@@ -1535,6 +1545,8 @@ fn smoke_btrfs_device_lifecycle() -> TestResult {
         return TestResult::Fail("device replace failed");
     }
     let replaced = alloc::vec![replacement, added];
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol = match mount_writable_devices(&replaced) {
         Ok(vol) => vol,
         Err(_) => return TestResult::Fail("replacement array did not remount"),
@@ -1578,6 +1590,8 @@ fn smoke_btrfs_balance_profile_conversion() -> TestResult {
     }
 
     let members = alloc::vec![devices[0].clone(), devices[1].clone(), third.clone()];
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let remounted = match mount_writable_devices(&members) {
         Ok(vol) => vol,
         Err(_) => return TestResult::Fail("balanced RAID1C3 volume did not remount"),
@@ -1626,6 +1640,8 @@ fn smoke_btrfs_balance_profile_conversion() -> TestResult {
             .filter(|(index, _)| *index != omitted)
             .map(|(_, member)| member.clone())
             .collect();
+        // Batched commits: sync before reading this volume back from disk.
+        let _ = poll_once(remounted.sync_to_disk());
         let degraded = match mount_writable_devices(&degraded_members) {
             Ok(vol) => vol,
             Err(_) => return TestResult::Fail("balanced RAID1C3 degraded mount failed"),
@@ -3575,6 +3591,10 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_write_extent_accounting);
 /// next mount and then cleared — btrfs crash recovery. Records a modified
 /// INODE_ITEM for a file into a log (leaving the fs tree untouched), then a
 /// remount must merge it (the file's mtime changes) and zero `super.log_root`.
+/// Deliberately does NOT sync before remounting: the tree log exists to
+/// replay work that never reached a committed superblock, so forcing a
+/// commit here would leave the log with nothing to do and the test would
+/// pass without exercising replay at all.
 fn smoke_btrfs_tree_log_replay() -> TestResult {
     use narf_filesystem::FsInstance;
 
@@ -3678,6 +3698,10 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_tree_log_replay);
 /// Tree-log mappings are keyed by subvolume id, not hard-coded to FS_TREE. A
 /// pending log emitted while a child is mounted must be replayed during the
 /// next ordinary top-level mount, before mount-option selection.
+/// Deliberately does NOT sync before remounting: the tree log exists to
+/// replay work that never reached a committed superblock, so forcing a
+/// commit here would leave the log with nothing to do and the test would
+/// pass without exercising replay at all.
 fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     use narf_filesystem::FsInstance;
 
@@ -3700,7 +3724,6 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     // Batched commits: a write is durable only once synced, exactly as a
     // real unmount would flush. Without this the check below would assert
     // that UNSYNCED data survives, which nothing promises.
-    let _ = poll_once(top.sync_to_disk());
     let child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device.clone() as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -3738,7 +3761,6 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     // Batched commits: a write is durable only once synced, exactly as a
     // real unmount would flush. Without this the check below would assert
     // that UNSYNCED data survives, which nothing promises.
-    let _ = poll_once(replayed_top.sync_to_disk());
     let replayed_child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -3765,6 +3787,10 @@ kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_subvolume_tree_log_replay);
 /// unlink a data-bearing file and rmdir an empty directory, preserve an entry
 /// present in the log, free the removed file's extent, and never copy the
 /// log-only range marker into the FS tree.
+/// Deliberately does NOT sync before remounting: the tree log exists to
+/// replay work that never reached a committed superblock, so forcing a
+/// commit here would leave the log with nothing to do and the test would
+/// pass without exercising replay at all.
 fn smoke_btrfs_tree_log_deletion_replay() -> TestResult {
     use narf_filesystem::FsInstance;
 
@@ -4060,6 +4086,8 @@ fn smoke_btrfs_bytes_used_matches_block_groups() -> TestResult {
         return TestResult::Fail("unlink failed");
     }
 
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match mount_writable(device.clone()) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("remount failed"),
@@ -5828,6 +5856,8 @@ fn smoke_btrfs_superblock_mirror() -> TestResult {
     }
 
     // Remount over the same device: the write is durable and readable.
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match mount_writable(dev) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("remount failed"),
@@ -5895,6 +5925,8 @@ fn smoke_btrfs_superblock_recovery() -> TestResult {
     {
         return TestResult::Fail("transaction did not heal the stale primary");
     }
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     match mount_writable(dev) {
         Ok(_) => TestResult::Pass,
         Err(_) => TestResult::Fail("healed volume did not remount"),
@@ -5940,6 +5972,8 @@ fn smoke_btrfs_dup_metadata_recovery() -> TestResult {
         return TestResult::Fail("failed to corrupt primary metadata stripe");
     }
 
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     match mount_writable(dev) {
         Ok(recovered) if recovered.root_inode().is_some() => TestResult::Pass,
         _ => TestResult::Fail("mount did not recover metadata from DUP mirror"),
@@ -6038,6 +6072,8 @@ fn smoke_btrfs_multileaf_trees() -> TestResult {
     }
 
     // Remount and read every file back through the now-split trees.
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match mount_writable(dev) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("remount failed"),
@@ -6117,6 +6153,8 @@ fn smoke_btrfs_tall_tree() -> TestResult {
     }
 
     // Remount and read every symlink target back through the three-level tree.
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match mount_writable(dev) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("remount failed"),
@@ -6201,6 +6239,8 @@ fn smoke_btrfs_free_space_bitmap() -> TestResult {
 
     // The final content is durable across a remount, read back through the FST.
     let want = alloc::vec![19u8 ^ 0xa5; 4096];
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match mount_writable(dev) {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("remount failed"),
@@ -7379,6 +7419,8 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
 
     // subvolid= reaching the same subvolume works too (snap's id resolved by
     // switching a default mount, then mounting by that id).
+    // Batched commits: sync before reading this volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let probe = match mount_fixture() {
         Ok(v) => v,
         Err(_) => return TestResult::Fail("probe mount failed"),
