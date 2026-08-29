@@ -5828,6 +5828,11 @@ fn smoke_btrfs_superblock_mirror() -> TestResult {
     }
 
     // Inspect both on-disk superblock copies directly.
+    // Batched commits: no superblock — primary or mirror — reaches the
+    // device until a sync, so read it back only after forcing one out.
+    // This test inspects the raw superblock rather than remounting, which
+    // is why the sync belongs here and not before a mount call.
+    let _ = poll_once(vol.sync_to_disk());
     let primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
     let mirror = read_super_at(&dev, 64 << 20);
     let field = |sb: &[u8], off: usize| u64::from_le_bytes(sb[off..off + 8].try_into().unwrap());
@@ -5917,6 +5922,11 @@ fn smoke_btrfs_superblock_recovery() -> TestResult {
         _ => return TestResult::Fail("healing transaction failed"),
     }
 
+    // Batched commits: no superblock — primary or mirror — reaches the
+    // device until a sync, so read it back only after forcing one out.
+    // This test inspects the raw superblock rather than remounting, which
+    // is why the sync belongs here and not before a mount call.
+    let _ = poll_once(vol.sync_to_disk());
     let healed_primary = read_super_at(&dev, format::SUPERBLOCK_OFFSET);
     let healed_mirror = read_super_at(&dev, 64 << 20);
     if field(&healed_primary, 72) <= mirror_gen
