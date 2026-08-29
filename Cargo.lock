@@ -982,6 +982,7 @@ dependencies = [
  "narf-lib",
  "narf-memory",
  "narf-scheduler",
+ "narf-time",
  "ruzstd",
  "sha2",
 ]

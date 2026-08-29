@@ -9906,3 +9906,77 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroup_limit_merges_and_clears
 );
+
+/// A transaction left open long enough commits on its own.
+///
+/// Without this a transaction closes only when it fills or when somebody
+/// syncs, so a workload that writes a few files and stops leaves them
+/// uncommitted for as long as the volume stays mounted — while on Linux they
+/// become durable within `BTRFS_DEFAULT_COMMIT_INTERVAL` seconds with no
+/// fsync from anyone. Batching made the exposure worse by letting a
+/// transaction hold more before it fills.
+///
+/// The age is injected rather than waited for: this asserts the decision
+/// `transaction_kthread` makes — "the running transaction is older than the
+/// interval, commit it" — not that the clock advances. The timer task around
+/// it is the thin part; what matters is that an aged transaction commits and
+/// that a young one does not.
+fn smoke_btrfs_open_transaction_commits_on_interval() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.create("interval.txt")), Some(Ok(_))) {
+        return TestResult::Fail("create failed");
+    }
+    let uncommitted = vol.superblock().generation;
+
+    // A young transaction is left alone: the interval is a bound on how long
+    // work may sit uncommitted, not an instruction to commit at every chance.
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != uncommitted {
+        return TestResult::Fail("a fresh transaction was committed by the interval check");
+    }
+
+    // Age it past the interval and check again.
+    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != uncommitted + 1 {
+        return TestResult::Fail("an aged-out transaction was not committed");
+    }
+
+    // Durable, not merely committed — the timer exists for durability, so it
+    // has to push the superblock out too. Read it back from the device.
+    let after = match mount_writable(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount after the interval commit failed"),
+    };
+    let names = dir_names(&after.root());
+    if !names.iter().any(|n| n == "interval.txt") {
+        return TestResult::Fail("the interval commit did not reach the device");
+    }
+
+    // And with nothing outstanding it is a no-op rather than a fresh commit.
+    let settled = vol.superblock().generation;
+    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != settled {
+        return TestResult::Fail("the interval committed an empty transaction");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_open_transaction_commits_on_interval
+);

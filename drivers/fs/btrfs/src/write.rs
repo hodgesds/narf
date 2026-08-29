@@ -1132,6 +1132,10 @@ pub(crate) struct FsBatch {
     dropped_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
     ops: usize,
+    /// Raw monotonic cycles at which this transaction opened, for the commit
+    /// interval below. Cycles rather than `Instant` because the test hook has
+    /// to move it backwards, and `Instant` only adds.
+    opened_at: u64,
     /// The fs-tree root as of the last commit, to restore if this batch's own
     /// commit fails. Staging publishes each operation's root so that reads
     /// inside the batch see it; a failed commit has to take that back.
@@ -1191,6 +1195,7 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             new_data: Vec::new(),
             ops: 0,
             base_root: (fs_root, fs_level),
+            opened_at: narf_time::now_cycles(),
             qgroup: None,
             reserved: BTreeMap::new(),
             op_reserved: BTreeMap::new(),
@@ -1271,6 +1276,92 @@ where
             op().await
         }
         other => other,
+    }
+}
+
+/// `BTRFS_DEFAULT_COMMIT_INTERVAL` (`fs/btrfs/fs.h`): seconds a transaction
+/// may stay open before it is committed regardless of what else happens.
+///
+/// Without this, a transaction closes only when it fills or when somebody
+/// syncs, so a workload that writes a few files and stops leaves them
+/// uncommitted indefinitely — on Linux they become durable within thirty
+/// seconds with no fsync. Batching made that worse by making transactions
+/// hold more, which is why it arrives with the batching rather than before it.
+const COMMIT_INTERVAL_SECS: u64 = 30;
+
+/// Commit the open transaction if it has been open for longer than
+/// [`COMMIT_INTERVAL_SECS`].
+///
+/// This is the body of Linux's `transaction_kthread`, which wakes on
+/// `fs_info->commit_interval`, compares the running transaction's age against
+/// it, and commits when it has aged out. Ageing is measured from when the
+/// transaction opened, not from the last operation, so a steady trickle of
+/// writes cannot hold one open forever.
+pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let stale = {
+        let guard = vol.fs_batch().lock().await;
+        match guard.as_ref() {
+            // An empty transaction has nothing to make durable; Linux likewise
+            // goes back to sleep when `fs_info->running_transaction` is NULL.
+            Some(batch) if batch.ops > 0 => {
+                let age = narf_time::now_cycles().saturating_sub(batch.opened_at);
+                age >= narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000)
+            }
+            _ => false,
+        }
+    };
+    if stale {
+        // Sync rather than merely commit: the point is durability, and a
+        // committed transaction whose superblock is still staged is not
+        // durable. This is the timer's whole purpose.
+        vol.sync_to_disk().await?;
+    }
+    Ok(())
+}
+
+/// Start the transaction timer for a freshly mounted volume.
+///
+/// Linux runs one `transaction_kthread` per filesystem, waking on
+/// `fs_info->commit_interval` to commit a transaction that has aged out. This
+/// is that thread: the scheduler is the only thing that can make a commit
+/// happen when nothing is asking the filesystem to do anything, which is
+/// exactly the case the interval exists for.
+///
+/// It holds a `Weak`, not an `Arc`. Holding a strong reference would keep
+/// every mounted volume alive for as long as the task existed, which is
+/// forever — unmount would never drop the last reference. Failing to upgrade
+/// is how the task learns the volume is gone, and it ends there.
+///
+/// A commit that fails is not reported anywhere, because there is nobody to
+/// report it to; it is retried on the next tick, and a failure serious enough
+/// to matter has already taken the filesystem read-only through
+/// `abort_transaction`.
+pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Arc<BtrfsVolume<B>>) {
+    let weak = alloc::sync::Arc::downgrade(vol);
+    narf_scheduler::spawn(async move {
+        let tick = narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000);
+        loop {
+            narf_time::sleep_cycles(tick).await;
+            let Some(vol) = weak.upgrade() else {
+                return;
+            };
+            let _ = commit_if_stale(&vol).await;
+        }
+    });
+}
+
+/// Test-only: backdate the open transaction so [`commit_if_stale`] sees it as
+/// aged out, without waiting the interval.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn __test_age_open_transaction<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    secs: u64,
+) {
+    if let Some(batch) = vol.fs_batch().lock().await.as_mut() {
+        let back = narf_time::wall::ns_to_cycles(secs * 1_000_000_000);
+        batch.opened_at = batch.opened_at.saturating_sub(back);
     }
 }
 

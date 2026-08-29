@@ -1180,6 +1180,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // Complete the chunk map and locate the FS tree now that the volume can
         // read nodes.
         volume.finish_mount().await?;
+        crate::write::spawn_commit_timer(&volume);
         Ok(volume)
     }
 
