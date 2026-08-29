@@ -3724,6 +3724,7 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     // Batched commits: a write is durable only once synced, exactly as a
     // real unmount would flush. Without this the check below would assert
     // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(top.sync_to_disk());
     let child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device.clone() as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -3758,9 +3759,8 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     if replayed_top.superblock().log_root != 0 {
         return TestResult::Fail("child log pointer survived replay");
     }
-    // Batched commits: a write is durable only once synced, exactly as a
-    // real unmount would flush. Without this the check below would assert
-    // that UNSYNCED data survives, which nothing promises.
+    // Deliberately NOT synced: this mount is what must replay the log, so
+    // forcing a commit here would leave the log with nothing to do.
     let replayed_child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -7579,6 +7579,9 @@ fn smoke_btrfs_subvolume_getflags_ioctl() -> TestResult {
         return TestResult::Fail("newly read-only subvolume accepted a mutation");
     }
 
+    // Batched commits: the ioctl above staged its superblock; force it out
+    // before mounting the device again, or this reads the pre-ioctl tree.
+    let _ = poll_once(writable.sync_to_disk());
     let remounted_readonly = match mount_selected() {
         Some(v) => v,
         None => return TestResult::Fail("read-only SETFLAGS remount failed"),
@@ -7602,6 +7605,9 @@ fn smoke_btrfs_subvolume_getflags_ioctl() -> TestResult {
         return TestResult::Fail("clearing SETFLAGS did not publish writable state");
     }
 
+    // Batched commits: the ioctl above staged its superblock; force it out
+    // before mounting the device again, or this reads the pre-ioctl tree.
+    let _ = poll_once(remounted_readonly.sync_to_disk());
     let remounted_writable = match mount_selected() {
         Some(v) => v,
         None => return TestResult::Fail("writable SETFLAGS remount failed"),
@@ -7617,6 +7623,9 @@ fn smoke_btrfs_subvolume_getflags_ioctl() -> TestResult {
         return TestResult::Fail("writable subvolume rejected mutation after clearing flags");
     }
 
+    // Batched commits: the ioctl above staged its superblock; force it out
+    // before mounting the device again, or this reads the pre-ioctl tree.
+    let _ = poll_once(remounted_writable.sync_to_disk());
     let readonly = match mount_fresh("container/outer/rochild") {
         Some(vol) => vol,
         None => return TestResult::Fail("read-only subvolume ioctl mount failed"),
