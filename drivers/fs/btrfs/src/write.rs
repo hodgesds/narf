@@ -3270,6 +3270,11 @@ fn apply_logical_edits(logical: &mut [u8], edits: &[Edit]) -> Result<(), FsError
     Ok(())
 }
 
+/// `CAP_SYS_RESOURCE` (`include/uapi/linux/capability.h`) — the capability
+/// `qgroup_reserve` consults when deciding whether a caller may bypass a
+/// qgroup limit on a filesystem with `quota_override` set.
+const CAP_SYS_RESOURCE: u32 = 24;
+
 /// `BTRFS_QGROUP_LIMIT_MAX_RFER` and `..._MAX_EXCL` (`uapi/linux/btrfs.h`).
 const QGROUP_LIMIT_MAX_RFER: u64 = 1 << 0;
 const QGROUP_LIMIT_MAX_EXCL: u64 = 1 << 1;
@@ -3460,6 +3465,22 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
     // `qgroup_reserve` returns 0 immediately for a zero-byte reservation, so
     // the namespace operations never touch the quota tree at all.
     if num_bytes == 0 {
+        return Ok(());
+    }
+    // `if (test_bit(BTRFS_FS_QUOTA_OVERRIDE, &fs_info->flags) &&
+    //      capable(CAP_SYS_RESOURCE))
+    //         enforce = false;`
+    //
+    // Both halves, in that order. The flag is an administrator's decision
+    // about this filesystem; the capability is a fact about the process doing
+    // the writing. Testing only the flag would hand every unprivileged writer
+    // a bypass the moment an administrator enabled it, which is the opposite
+    // of what enabling it is for — the point is to let a privileged process
+    // dig a filesystem out from under a limit nothing can write beneath.
+    //
+    // `caller_capable` fails closed: with no hook installed it is false, so a
+    // build without the syscall layer never skips enforcement.
+    if vol.quota_override() && narf_filesystem::caller_capable(CAP_SYS_RESOURCE) {
         return Ok(());
     }
     if batch.qgroup.is_none() {

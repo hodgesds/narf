@@ -3629,6 +3629,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     );
     narf_memory::install_address_space_drop_hook(narf_userspace::drop_mapped_file_address_space);
 
+    // Let a filesystem driver ask Linux's `capable()` about the calling
+    // process — the handful of checks Linux makes inside a driver rather than
+    // at the syscall boundary, such as btrfs's `quota_override`. Installed
+    // HERE, in the common path, and not in `install_all_hooks` below: that
+    // runs only on the boot-smoke path, because `run_all_and_exit` never
+    // returns, so a kernel test would see the query permanently uninstalled.
+    // It fails closed, so the symptom would not be a crash but an enforcement
+    // that silently never relaxes — exactly the kind of thing a test is
+    // supposed to catch and would instead have been asserting.
+    //
+    // Same reasoning as `install_shared_frame_hooks` above.
+    narf_filesystem::install_caller_capable_hook(narf_userspace::handlers::caller_capable);
+
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
     #[cfg(feature = "kernel-test")]

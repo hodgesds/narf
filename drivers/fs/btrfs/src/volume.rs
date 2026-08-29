@@ -239,11 +239,28 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// Set when a transaction was lost after its operations had already
     /// reported success. See [`Self::abort_transaction`].
     aborted: core::sync::atomic::AtomicBool,
+    /// `BTRFS_FS_QUOTA_OVERRIDE` — see [`Self::quota_override`].
+    quota_override: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
     /// An async mutex rather than a spinlock: an operation holds it across its
     /// tree reads and node writes, which is also what serialises the shared
     /// allocator inside it.
     fs_batch: Mutex<Option<crate::write::FsBatch>>,
+}
+
+/// `CAP_SYS_RESOURCE` — see [`BtrfsVolume::quota_override`].
+const CAP_SYS_RESOURCE: u32 = 24;
+
+/// Render a 16-byte fsid the way btrfs names its sysfs directory.
+fn format_fsid(fsid: &[u8; 16]) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(36);
+    for (i, byte) in fsid.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        out.push_str(&alloc::format!("{byte:02x}"));
+    }
+    out
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
@@ -299,6 +316,44 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     pub(crate) fn abort_transaction(&self) {
         self.aborted
             .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether `BTRFS_FS_QUOTA_OVERRIDE` is set on this filesystem.
+    ///
+    /// Half of the condition; the other half is the RESERVING caller holding
+    /// CAP_SYS_RESOURCE, which is checked at the reservation itself. Linux
+    /// requires both:
+    ///
+    /// ```text
+    /// if (test_bit(BTRFS_FS_QUOTA_OVERRIDE, &fs_info->flags) &&
+    ///     capable(CAP_SYS_RESOURCE))
+    ///         enforce = false;
+    /// ```
+    ///
+    /// The flag alone is not the bypass. An administrator turning it on does
+    /// not disable quota enforcement for everyone — unprivileged writers stay
+    /// enforced, and only a privileged one may dig the filesystem out from
+    /// under a limit it can no longer write beneath.
+    pub(crate) fn quota_override(&self) -> bool {
+        self.quota_override
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set or clear `BTRFS_FS_QUOTA_OVERRIDE`.
+    ///
+    /// Linux exposes this as `/sys/fs/btrfs/<uuid>/quota_override`, whose
+    /// store handler requires CAP_SYS_RESOURCE (`fs/btrfs/sysfs.c`); the
+    /// attribute registered at mount enforces that before calling here.
+    pub(crate) fn set_quota_override(&self, on: bool) {
+        self.quota_override
+            .store(on, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Test-only: set the flag without going through sysfs, so the bypass can
+    /// be exercised independently of the attribute that publishes it.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn __test_set_quota_override(&self, on: bool) {
+        self.set_quota_override(on);
     }
 
     /// Whether a transaction has been aborted on this volume.
@@ -1162,6 +1217,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             aborted: core::sync::atomic::AtomicBool::new(false),
+            quota_override: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
@@ -1181,7 +1237,69 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // read nodes.
         volume.finish_mount().await?;
         crate::write::spawn_commit_timer(&volume);
+        volume.register_sysfs();
         Ok(volume)
+    }
+
+    /// Publish `/sys/fs/btrfs/<uuid>/quota_override`, the control surface
+    /// Linux gives `BTRFS_FS_QUOTA_OVERRIDE` (`fs/btrfs/sysfs.c`).
+    ///
+    /// The store handler requires CAP_SYS_RESOURCE, as Linux's does:
+    ///
+    /// ```text
+    /// if (!capable(CAP_SYS_RESOURCE))
+    ///         return -EPERM;
+    /// ...
+    /// if (knob > 1)
+    ///         return -EINVAL;
+    /// ```
+    ///
+    /// Note this is a SECOND capability check, not the same one as the
+    /// bypass: turning the knob on is an administrative act, and using it is a
+    /// per-write one. A privileged administrator can enable it and
+    /// unprivileged writers still get no bypass.
+    ///
+    /// The closures hold a `Weak`. A strong reference here would make the
+    /// sysfs tree own every filesystem ever mounted, and unmount would never
+    /// release one; a dead `Weak` simply makes the attribute inert.
+    fn register_sysfs(self: &Arc<Self>) {
+        use narf_filesystem::sysfs::{get_or_create_child, kobject_add_writable_attr, sysfs_root};
+        let fsid = self.state.lock().superblock.fsid;
+        let dir = {
+            let root = sysfs_root();
+            let fs = get_or_create_child(&root, "fs");
+            let btrfs = get_or_create_child(&fs, "btrfs");
+            get_or_create_child(&btrfs, &format_fsid(&fsid))
+        };
+        let show_ref = Arc::downgrade(self);
+        let store_ref = Arc::downgrade(self);
+        kobject_add_writable_attr(
+            &dir,
+            "quota_override",
+            move || match show_ref.upgrade() {
+                Some(vol) => alloc::format!("{}\n", u8::from(vol.quota_override())),
+                None => alloc::string::String::from("0\n"),
+            },
+            move |data| {
+                // EPERM before EINVAL, as Linux checks in that order: whether
+                // you may set it does not depend on what you are setting.
+                if !narf_filesystem::caller_capable(CAP_SYS_RESOURCE) {
+                    return Err(FsError::OperationNotPermitted);
+                }
+                let text = core::str::from_utf8(data)
+                    .map_err(|_| FsError::InvalidData)?
+                    .trim();
+                // `kstrtoul` then `if (knob > 1) return -EINVAL;`.
+                let knob: u64 = text.parse().map_err(|_| FsError::InvalidData)?;
+                if knob > 1 {
+                    return Err(FsError::InvalidData);
+                }
+                if let Some(vol) = store_ref.upgrade() {
+                    vol.set_quota_override(knob != 0);
+                }
+                Ok(())
+            },
+        );
     }
 
     /// Walk the chunk tree to complete the logical→physical map, then read the
