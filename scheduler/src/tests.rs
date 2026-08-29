@@ -2670,6 +2670,68 @@ fn smoke_scheduler_honors_policy_pick_order() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_honors_policy_pick_order);
 
+// Wake-next ("next buddy"): when enabled, a just-woken task is dispatched
+// ahead of the tasks already queued in front of it (Linux `set_next_buddy` +
+// PICK_BUDDY). When disabled, the queue stays strict FIFO. Both phases enqueue
+// [1,2,3] front→back; the buddy hint points at tag 3 (the back). Phase A
+// (enabled) must run tag 3 first; phase B (disabled) must run tag 1 first.
+fn smoke_scheduler_wake_next_buddy_runs_first() -> TestResult {
+    use crate::{spawn, TaskId};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static ORDER: [AtomicUsize; 3] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    let run_phase = |wake_next_on: bool| -> [usize; 3] {
+        NEXT.store(0, Ordering::Relaxed);
+        for slot in &ORDER {
+            slot.store(0, Ordering::Relaxed);
+        }
+        crate::__reset_queues_for_test();
+        crate::disable_wake_next();
+        // Enqueue tags 1,2,3 in order (queue front→back = [1,2,3]).
+        let mut ids = [TaskId(0); 3];
+        for (i, id_slot) in ids.iter_mut().enumerate() {
+            let tag = i + 1;
+            *id_slot = spawn(async move {
+                let pos = NEXT.fetch_add(1, Ordering::Relaxed);
+                if pos < ORDER.len() {
+                    ORDER[pos].store(tag, Ordering::Relaxed);
+                }
+            });
+        }
+        if wake_next_on {
+            // Point the buddy at the BACK task (tag 3) on this CPU.
+            crate::enable_wake_next();
+            crate::__test_set_wake_next(narf_lib::percpu::current_cpu() as u32, ids[2].raw());
+        }
+        crate::run_until_empty();
+        crate::disable_wake_next();
+        [
+            ORDER[0].load(Ordering::Relaxed),
+            ORDER[1].load(Ordering::Relaxed),
+            ORDER[2].load(Ordering::Relaxed),
+        ]
+    };
+
+    // Phase A: buddy on → tag 3 (queue back) dispatched first.
+    let a = run_phase(true);
+    if a[0] != 3 {
+        return TestResult::Fail("wake-next buddy (tag 3) was not dispatched ahead of the queue");
+    }
+    // Phase B: buddy off → strict FIFO, tag 1 (queue front) first.
+    let b = run_phase(false);
+    if b[0] != 1 {
+        return TestResult::Fail("with wake-next off the queue was not strict FIFO");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_wake_next_buddy_runs_first);
+
 fn smoke_scheduler_select_wake_cpu_prefers_idle_sibling() -> TestResult {
     use crate::affinity::CpuId;
     use crate::steal::{NumaAwareSteal, StealStrategy};

@@ -12,6 +12,10 @@
 //!   `SCHED_FEAT(WAKE_AFFINE)`): whether the waker consults the loaded steal
 //!   strategy's `select_wake_cpu` to push a woken task onto an idle sibling.
 //!   Off by default (helps producer-consumer IPC, can thrash contended locks).
+//! - `wake_next` (rw) — a CORE executor feature flag (à la Linux
+//!   `SCHED_FEAT(NEXT_BUDDY)`): whether a just-woken task is dispatched ahead
+//!   of the tasks already queued in front of it (its home CPU's "next buddy").
+//!   Off by default (favors latency over strict-FIFO fairness).
 //! - `policy` (ro) — the installed [`Scheduler`] name. The `wake_placement`
 //!   flag's EFFECT depends on the loaded strategy (a strategy whose
 //!   `select_wake_cpu` returns `None` makes the flag a no-op), so an operator
@@ -52,6 +56,25 @@ static SCHED_KNOBS: &[SchedKnob] = &[
                 match b {
                     b'1' | b'y' | b'Y' | b't' | b'T' => narf_scheduler::enable_wake_placement(),
                     b'0' | b'n' | b'N' | b'f' | b'F' => narf_scheduler::disable_wake_placement(),
+                    _ => {}
+                }
+            }
+        }),
+    },
+    SchedKnob {
+        name: "wake_next",
+        read: || {
+            if narf_scheduler::wake_next_enabled() {
+                String::from("1\n")
+            } else {
+                String::from("0\n")
+            }
+        },
+        write: Some(|buf| {
+            if let Some(&b) = buf.iter().find(|b| !b.is_ascii_whitespace()) {
+                match b {
+                    b'1' | b'y' | b'Y' | b't' | b'T' => narf_scheduler::enable_wake_next(),
+                    b'0' | b'n' | b'N' | b'f' | b'F' => narf_scheduler::disable_wake_next(),
                     _ => {}
                 }
             }

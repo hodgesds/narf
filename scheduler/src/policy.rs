@@ -782,9 +782,14 @@ pub(crate) fn pick_next_slot(
     // the round was O(n^2) in queue length with a large constant (an atomic
     // load and a budget `view()` per slot per scan).
     let requested_id = requested.map(|h| h.task_id());
+    // Wake-next ("next buddy"): the id of the most recently woken task on this
+    // CPU, read-and-cleared here so the boost is one-shot (Linux clears
+    // `cfs_rq->next` on pick). 0 when the feature is off or nothing is queued.
+    let wake_next_id = crate::take_wake_next(cpu.0);
     let mut best_tier = 0u8;
     let mut best_pos: Option<usize> = None;
     let mut requested_hit: Option<(usize, u8)> = None;
+    let mut wake_next_hit: Option<(usize, u8)> = None;
     for (index, slot) in q.iter().enumerate() {
         let tier = dispatch_tier(slot);
         // `best_tier` only ever rises, so the index at which it reaches its
@@ -796,6 +801,9 @@ pub(crate) fn pick_next_slot(
         }
         if requested_id == Some(slot.id) {
             requested_hit = Some((index, tier));
+        }
+        if wake_next_id != 0 && wake_next_id == slot.id.raw() {
+            wake_next_hit = Some((index, tier));
         }
     }
     if best_tier == 0 {
@@ -815,12 +823,20 @@ pub(crate) fn pick_next_slot(
         }
         return Some((TaskHandle::from_id(slot.id), slot));
     }
-    // Honor the policy's pick only when it lands in the top eligibility tier;
-    // otherwise fall back to the earliest top-tier slot. Core validation thus
-    // still overrides a stale/foreign/wrong-tier policy handle.
-    let pos = match requested_hit {
-        Some((requested_pos, requested_tier)) if requested_tier == best_tier => requested_pos,
-        _ => best_pos.expect("best_tier > 0 guarantees a top-tier position"),
+    // Pick priority, each honored ONLY at the top eligibility tier so none can
+    // bypass a strict throttle (mirrors Linux `pick_next_entity` taking
+    // `cfs_rq->next` only `&& entity_eligible`):
+    //   1. the wake-next buddy — a just-woken task jumps ahead of the tasks
+    //      queued in front of it (latency, not fairness — the buddy is cleared
+    //      above so it is a single boost),
+    //   2. the policy's requested pick,
+    //   3. the earliest top-tier slot (the default FIFO order).
+    let pos = match wake_next_hit {
+        Some((wake_pos, wake_tier)) if wake_tier == best_tier => wake_pos,
+        _ => match requested_hit {
+            Some((requested_pos, requested_tier)) if requested_tier == best_tier => requested_pos,
+            _ => best_pos.expect("best_tier > 0 guarantees a top-tier position"),
+        },
     };
     let slot = q.remove(pos)?;
     let handle = TaskHandle::from_id(slot.id);
