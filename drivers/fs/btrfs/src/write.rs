@@ -3251,6 +3251,15 @@ async fn qgroup_charge_chain<B: BlockDevice + 'static>(
 /// batching would defer EDQUOT past the write that earned it and land it on
 /// whichever caller triggered the flush.
 ///
+/// That unblocking is worth more on a quota volume than anywhere else, because
+/// a commit costs more there: full-mode accounting re-walks every subvolume
+/// root's extents, so the recount is proportional to the whole tree and is
+/// paid once per transaction whatever the transaction contains. 4000 overwrites
+/// of one file on a quota fixture, with the build outside the timing and a
+/// zero-write baseline of 16.33s subtracted, take 54.4s at one operation per
+/// transaction and 12.9s at eight — 4.2x, against roughly 3.5x for the same
+/// change on a volume without quotas.
+///
 /// The reservation is deliberately pessimistic, as Linux's is: `num_bytes` is
 /// the uncompressed length, charged before the tiling loop knows what
 /// compression will save. Erring towards rejecting slightly early is the safe
