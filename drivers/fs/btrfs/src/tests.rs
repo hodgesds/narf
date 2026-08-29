@@ -9796,3 +9796,113 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroup_refused_write_releases_its_reservation
 );
+
+/// `btrfs_limit_qgroup` updates limits; it does not replace them.
+///
+/// Linux writes each field only when its own flag is present in the request
+/// and merges with `qgroup->lim_flags |= limit->flags`, so setting one limit
+/// leaves the others standing. `btrfs qgroup limit` sets one at a time, so
+/// replacing the whole item meant adjusting max_excl silently dropped an
+/// existing max_rfer.
+///
+/// And `CLEAR_VALUE` — a field of all-ones — clears that limit rather than
+/// installing one of U64_MAX: the flag is dropped and the value zeroed. Stored
+/// verbatim it would be a limit nothing could ever cross, indistinguishable
+/// from unlimited until something read the item, and with the flag still set
+/// it could never be cleared again.
+fn smoke_btrfs_qgroup_limit_merges_and_clears() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let set = |flags: u64, max_rfer: u64, max_excl: u64| {
+        let mut arg = [0u8; 48];
+        arg[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+        arg[8..16].copy_from_slice(&flags.to_ne_bytes());
+        arg[16..24].copy_from_slice(&max_rfer.to_ne_bytes());
+        arg[24..32].copy_from_slice(&max_excl.to_ne_bytes());
+        matches!(
+            poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &arg, 48)),
+            Some(Ok(_))
+        )
+    };
+    let stored = || {
+        qgroup_item(&vol, format::QGROUP_LIMIT_KEY, format::FS_TREE_OBJECTID).unwrap_or_default()
+    };
+
+    // MAX_RFER alone.
+    if !set(1, 900 << 10, 0) {
+        return TestResult::Fail("setting max_rfer failed");
+    }
+    let after_rfer = stored();
+    if format::le64(&after_rfer, 0).ok() != Some(1)
+        || format::le64(&after_rfer, 8).ok() != Some(900 << 10)
+    {
+        return TestResult::Fail("max_rfer was not stored");
+    }
+
+    // MAX_EXCL alone — max_rfer must survive.
+    if !set(2, 0, 700 << 10) {
+        return TestResult::Fail("setting max_excl failed");
+    }
+    let after_excl = stored();
+    if format::le64(&after_excl, 0).ok() != Some(3) {
+        return TestResult::Fail("limit flags were replaced instead of merged");
+    }
+    if format::le64(&after_excl, 8).ok() != Some(900 << 10) {
+        return TestResult::Fail("setting max_excl discarded max_rfer");
+    }
+    if format::le64(&after_excl, 16).ok() != Some(700 << 10) {
+        return TestResult::Fail("max_excl was not stored");
+    }
+
+    // CLEAR_VALUE on max_rfer: flag dropped, value zeroed, max_excl untouched.
+    if !set(1, u64::MAX, 0) {
+        return TestResult::Fail("clearing max_rfer failed");
+    }
+    let after_clear = stored();
+    if format::le64(&after_clear, 0).ok() != Some(2) {
+        return TestResult::Fail("CLEAR_VALUE did not drop the max_rfer flag");
+    }
+    if format::le64(&after_clear, 8).ok() != Some(0) {
+        return TestResult::Fail("CLEAR_VALUE stored ~0 instead of clearing");
+    }
+    if format::le64(&after_clear, 16).ok() != Some(700 << 10) {
+        return TestResult::Fail("clearing max_rfer disturbed max_excl");
+    }
+
+    // Clear max_excl as well, so no limit remains standing to refuse the
+    // write below for the wrong reason — the first version of this test left
+    // max_excl at 700 KiB and read its refusal as a failure to clear
+    // max_rfer.
+    if !set(2, 0, u64::MAX) {
+        return TestResult::Fail("clearing max_excl failed");
+    }
+    let after_both = stored();
+    if format::le64(&after_both, 0).ok() != Some(0) || format::le64(&after_both, 16).ok() != Some(0)
+    {
+        return TestResult::Fail("CLEAR_VALUE did not clear max_excl");
+    }
+
+    // A cleared limit really is not enforced: a write far past the old
+    // 900 KiB max_rfer now succeeds.
+    let file = match poll_once(vol.root().create("uncapped.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create after clearing failed"),
+    };
+    match poll_once(file.write(0, &alloc::vec![0x9au8; 2 * 1024 * 1024])) {
+        Some(Ok(n)) if n == 2 * 1024 * 1024 => TestResult::Pass,
+        Some(Err(FsError::QuotaExceeded)) => TestResult::Fail("a cleared limit was still enforced"),
+        _ => TestResult::Fail("the post-clear write failed some other way"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_limit_merges_and_clears
+);

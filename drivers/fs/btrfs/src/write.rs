@@ -1239,6 +1239,22 @@ async fn batch_gen<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64
 ///
 /// Once only: if a full sync did not free enough, the filesystem really is
 /// full and a third attempt would just be the second one again.
+///
+/// A qgroup refusal gets the same treatment, for the same reason at one
+/// remove. Linux's `__btrfs_qgroup_reserve_meta` does not return -EDQUOT on
+/// the first refusal either: it calls `try_flush_qgroup`, whose substance is
+/// `btrfs_commit_current_transaction`, and then retries. Committing is what
+/// makes a refusal wrong-in-hindsight collectible — usage is recounted at
+/// commit, so space this very transaction has freed is still charged to the
+/// qgroup until then. Refusing a write for space the same write's own
+/// truncation released is the case that motivates it.
+///
+/// Only worth doing when there is a transaction to commit. Linux guards the
+/// same way through `BTRFS_ROOT_QGROUP_FLUSHING`, which stops a second flush
+/// from being started while one is in flight; here the equivalent question is
+/// simply whether anything is staged, since a committed transaction has
+/// already had its recount applied and flushing again would recount the same
+/// numbers.
 async fn with_space_retry<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
 where
     B: BlockDevice + 'static,
@@ -1247,6 +1263,10 @@ where
 {
     match op().await {
         Err(FsError::NoSpace) => {
+            vol.sync_to_disk().await?;
+            op().await
+        }
+        Err(FsError::QuotaExceeded) if batch_owns_fs_tree(vol).await => {
             vol.sync_to_disk().await?;
             op().await
         }
@@ -4051,6 +4071,8 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
     mut id: u64,
     limit: [u64; 5],
 ) -> Result<(), FsError> {
+    // Six defined bits: MAX_RFER, MAX_EXCL, RSV_RFER, RSV_EXCL, RFER_CMPR,
+    // EXCL_CMPR (`uapi/linux/btrfs.h`).
     if limit[0] & !0x3f != 0 {
         return Err(FsError::InvalidData);
     }
@@ -4062,20 +4084,54 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
         .await?
         .is_none()
     {
+        // `btrfs_limit_qgroup`: `if (!qgroup) { ret = -ENOENT; goto out; }`.
         return Err(FsError::NotFound);
     }
+
+    // `btrfs_limit_qgroup` UPDATES the qgroup's limits, it does not replace
+    // them. Each field is written only when its own flag is present in the
+    // request, and the flags are merged with `qgroup->lim_flags |=
+    // limit->flags`. Overwriting the whole item meant setting a MAX_EXCL
+    // silently discarded an existing MAX_RFER, so a caller adjusting one limit
+    // removed the other — and `btrfs qgroup limit` sets one at a time.
+    let key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
+    let existing = btree::find_item(vol, root, &key).await?;
+    let mut fields = [0u64; 5];
+    if let Some(body) = existing.as_deref() {
+        if body.len() != 40 {
+            return Err(FsError::InvalidData);
+        }
+        for (idx, slot) in fields.iter_mut().enumerate() {
+            *slot = le64(body, idx * 8)?;
+        }
+    }
+
+    // `const u64 CLEAR_VALUE = -1;` — a field set to all-ones does not install
+    // a limit of U64_MAX, it CLEARS that limit: the flag is dropped and the
+    // value zeroed. Storing ~0 verbatim left a limit no write could ever
+    // cross, which looks identical to "unlimited" until something inspects the
+    // item, and left the flag set so it could never be cleared again.
+    const CLEAR_VALUE: u64 = u64::MAX;
+    let mut flags = fields[0] | limit[0];
+    for (bit, field) in (1..5).enumerate() {
+        let flag = 1u64 << bit;
+        if limit[0] & flag == 0 {
+            continue;
+        }
+        if limit[field] == CLEAR_VALUE {
+            flags &= !flag;
+            fields[field] = 0;
+        } else {
+            fields[field] = limit[field];
+        }
+    }
+    fields[0] = flags;
+
     let mut body = alloc::vec![0u8; 40];
-    for (idx, value) in limit.iter().enumerate() {
+    for (idx, value) in fields.iter().enumerate() {
         body[idx * 8..idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
-    commit_qgroup_edits(
-        vol,
-        alloc::vec![Edit::Upsert(
-            BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id),
-            body,
-        )],
-    )
-    .await
+    commit_qgroup_edits(vol, alloc::vec![Edit::Upsert(key, body)]).await
 }
 
 pub(crate) async fn quota_rescan<B: BlockDevice + 'static>(
