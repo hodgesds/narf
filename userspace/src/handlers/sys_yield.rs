@@ -17,7 +17,19 @@ pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
-                own_stack_block(ctx);
+                // sched_yield(2): hand the CPU to the executor ONCE so a ready
+                // sibling on this CPU runs, then resume and return 0. Routing
+                // through `own_stack_block` -> `own_stack_park` would break out
+                // WITHOUT ever yielding, because a bare yield sets no park
+                // condition (`park_should_block` returns false). `cooperative_yield`
+                // is the correct primitive: it re-arms this task's slot waker
+                // (so the executor keeps it Ready and re-polls it after the
+                // siblings run) and `kernel_switch`es to the executor, returning
+                // here once we are re-dispatched. If nothing else is runnable the
+                // re-armed awake bit makes the executor re-poll us immediately, so
+                // a lone yielder keeps running rather than stalling.
+                narf_scheduler::stackful::cooperative_yield();
+                ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
             hook(uctx);
