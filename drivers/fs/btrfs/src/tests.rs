@@ -9705,3 +9705,94 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroup_reservation_counts_outstanding
 );
+
+/// A refused operation does not leave its reservation behind.
+///
+/// Reservations are taken before the work they pay for, so that a refusal
+/// costs nothing. That timing means an operation can hold one and then fail —
+/// and `cow_write_file` reaches this in the ordinary way, by reserving for its
+/// data, then being refused for its metadata. If the data half stayed charged
+/// to the transaction, every later operation in it would be paying for a write
+/// that never happened.
+///
+/// The second write is sized to fit comfortably and is refused only if the
+/// first one's reservation is still there, so this fails loudly rather than
+/// silently under-counting.
+fn smoke_btrfs_qgroup_refused_write_releases_its_reservation() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let doomed = match poll_once(root.create("leak-big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the refused file failed"),
+    };
+    let small = match poll_once(root.create("leak-small.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the small file failed"),
+    };
+    let _ = poll_once(vol.sync_to_disk());
+
+    let settled = qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if settled == 0 {
+        return TestResult::Fail("committed qgroup usage was unreadable");
+    }
+    // Both writes below place one extent and touch the inode: two items, so
+    // `qgroup_reserve_meta` charges 2 * nodesize for each.
+    let node = vol.nodesize() as u64;
+    const BIG: usize = 8192;
+    let headroom = BIG as u64 + node;
+    let mut limit = [0u8; 48];
+    limit[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER
+    limit[16..24].copy_from_slice(&(settled + headroom).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("setting the qgroup limit failed");
+    }
+
+    // 8 KiB of data fits under the limit; 8 KiB plus two nodes of metadata does
+    // not. So this is refused AFTER its data reservation has been taken.
+    let gen_before = vol.superblock().generation;
+    match poll_once(doomed.write(0, &alloc::vec![0x5eu8; BIG])) {
+        Some(Err(FsError::QuotaExceeded)) => {}
+        Some(Err(_)) | None => return TestResult::Fail("the refused write failed some other way"),
+        Some(Ok(_)) => return TestResult::Fail("the write meant to be refused was admitted"),
+    }
+    if vol.superblock().generation != gen_before {
+        return TestResult::Fail("the refusal committed, so nothing is held over");
+    }
+
+    // A tiny write that fits with room to spare — unless the refused write is
+    // still being charged for its 8 KiB.
+    match poll_once(small.write(0, b"small enough")) {
+        Some(Ok(12)) => {}
+        Some(Err(FsError::QuotaExceeded)) => {
+            return TestResult::Fail("a refused write kept charging the transaction")
+        }
+        _ => return TestResult::Fail("the small write failed some other way"),
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    let kept = match poll_once(vol.root().lookup_async("leak-small.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("the admitted write's file vanished"),
+    };
+    match read_all(&kept, 32) {
+        Some(got) if got == b"small enough" => TestResult::Pass,
+        _ => TestResult::Fail("the admitted write did not land"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_refused_write_releases_its_reservation
+);

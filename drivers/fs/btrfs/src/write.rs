@@ -991,6 +991,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // and a rejection would strand them until the batch commits.
     let displaced = affected.iter().filter(|hit| **hit).count();
     let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
+    qgroup_begin_op(batch);
     qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
     qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
@@ -1139,10 +1140,26 @@ pub(crate) struct FsBatch {
     /// committed usage and limits. Read on the first reservation and reused:
     /// the quota tree does not move until this transaction commits.
     qgroup: Option<Vec<QgroupCharge>>,
-    /// Bytes reserved against each qgroup by this transaction and not yet
-    /// accounted, so two writes that each fit but do not fit together cannot
-    /// both be admitted.
+    /// Bytes reserved against each qgroup by operations of this transaction
+    /// that have been staged, so two writes that each fit but do not fit
+    /// together cannot both be admitted. Released when the transaction
+    /// commits: `BTRFS_QGROUP_RSV_META_PERTRANS`.
     reserved: BTreeMap<u64, u64>,
+    /// The reservation of the operation currently in flight, held apart until
+    /// it stages successfully.
+    ///
+    /// An operation reserves before it does anything, so that a refusal costs
+    /// nothing — but that means a reservation exists for work that may still
+    /// fail, and folding it in immediately would let a failed operation charge
+    /// the rest of the transaction for space nobody used. Linux keeps the same
+    /// separation with `BTRFS_QGROUP_RSV_META_PREALLOC`, taken per handle and
+    /// released by `btrfs_qgroup_free_meta_prealloc` on the error paths,
+    /// against `META_PERTRANS` which lives until commit.
+    ///
+    /// Discarded rather than unwound: [`qgroup_begin_op`] clears it as each
+    /// operation starts, so every failure path is covered without any of them
+    /// having to remember, including the ones that return before staging.
+    op_reserved: BTreeMap<u64, u64>,
 }
 
 /// Open the batch if none is open, and lock it for one operation.
@@ -1176,6 +1193,7 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             base_root: (fs_root, fs_level),
             qgroup: None,
             reserved: BTreeMap::new(),
+            op_reserved: BTreeMap::new(),
         });
     }
     Ok(guard)
@@ -1321,6 +1339,12 @@ async fn batch_stage<B: BlockDevice + 'static>(
         }
     }
     batch.new_data.extend(new_data);
+    // The operation is staged, so its reservation stops being provisional and
+    // joins the transaction's — Linux's PREALLOC-to-PERTRANS conversion.
+    for (id, bytes) in core::mem::take(&mut batch.op_reserved) {
+        let slot = batch.reserved.entry(id).or_insert(0);
+        *slot = slot.saturating_add(bytes);
+    }
     batch.ops += 1;
     Ok(())
 }
@@ -1494,6 +1518,7 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
         let mut guard = batch_begin(vol).await?;
         let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
         // Before staging, so a refusal leaves the transaction untouched.
+        qgroup_begin_op(batch);
         qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
         batch.ops >= MAX_BATCH_OPS
@@ -3270,6 +3295,18 @@ async fn qgroup_charge_chain<B: BlockDevice + 'static>(
 /// purely by metadata is caught by the next reservation against the recounted
 /// usage rather than by the operation that caused it. Usage stays exact
 /// either way, because the commit-time recount counts metadata.
+/// Begin one operation's reservations, discarding any left by an operation
+/// that did not complete.
+///
+/// A reservation is taken before the work it pays for, so an operation that
+/// fails afterwards has one outstanding for work that never happened. Clearing
+/// here rather than unwinding at each failure means no failure path has to
+/// remember — including the ones that return before reaching `batch_stage`,
+/// which is where the rest of an operation's rollback lives.
+fn qgroup_begin_op(batch: &mut FsBatch) {
+    batch.op_reserved.clear();
+}
+
 /// Charge the metadata a transaction is about to write against the same
 /// qgroups, sized the way Linux sizes it.
 ///
@@ -3327,6 +3364,7 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
             .get(&q.id)
             .copied()
             .unwrap_or(0)
+            .saturating_add(batch.op_reserved.get(&q.id).copied().unwrap_or(0))
             .saturating_add(num_bytes);
         if q.limit_flags & QGROUP_LIMIT_MAX_RFER != 0 && claimed.saturating_add(q.rfer) > q.max_rfer
         {
@@ -3340,7 +3378,7 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
     // Only once every qgroup in the chain has room, exactly as Linux records
     // the reservation only after the whole iterator passed its checks.
     for q in &chain {
-        let slot = batch.reserved.entry(q.id).or_insert(0);
+        let slot = batch.op_reserved.entry(q.id).or_insert(0);
         *slot = slot.saturating_add(num_bytes);
     }
     Ok(())
