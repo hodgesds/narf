@@ -3786,6 +3786,77 @@ impl Caps {
     }
 }
 
+/// `PR_SET_MDWE` bits, per task — Linux keeps them as `MMF_HAS_MDWE` /
+/// `MMF_HAS_MDWE_NO_INHERIT` on the mm.
+///
+/// Absent means MDWE is off, which is every task until one asks for it.
+static MDWE_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u64>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `PR_MDWE_REFUSE_EXEC_GAIN` — refuse mappings that gain execute.
+pub(crate) const PR_MDWE_REFUSE_EXEC_GAIN: u64 = 1;
+/// `PR_MDWE_NO_INHERIT` — do not carry the setting across execve.
+pub(crate) const PR_MDWE_NO_INHERIT: u64 = 2;
+
+/// `get_current_mdwe()` for an explicit task.
+pub(crate) fn task_mdwe(task: u64) -> u64 {
+    MDWE_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&process_state_key(task)).copied())
+        .unwrap_or(0)
+}
+
+/// Test hook — MDWE is one-way by design, so a test that sets it would
+/// otherwise leave every later mprotect in the shared kernel image refusing to
+/// grant execute. Same class of leak as the namespace tables reset alongside
+/// it, and the same fix: clear it in the harness rather than per test.
+#[doc(hidden)]
+pub fn __test_mdwe_reset() {
+    *MDWE_TABLE.lock() = Some(alloc::collections::BTreeMap::new());
+}
+
+pub(crate) fn set_task_mdwe(task: u64, bits: u64) {
+    let mut guard = MDWE_TABLE.lock();
+    let map = guard.get_or_insert_with(alloc::collections::BTreeMap::new);
+    map.insert(process_state_key(task), bits);
+}
+
+/// `include/linux/mman.h::map_deny_write_exec` — would this permission change
+/// gain execute in a way MDWE refuses?
+///
+/// ```text
+/// if (!mm_flags_test(MMF_HAS_MDWE, current->mm))  return false;
+/// if (!(new & VM_EXEC))                           return false;
+/// if (new & VM_WRITE)                             return true;
+/// if (!(old & VM_EXEC))                           return true;
+/// return false;
+/// ```
+///
+/// The two `true` arms are different attacks. The first is the obvious one —
+/// a mapping that is writable and executable at once. The second is the one
+/// that makes the feature worth having: a process may not take a page it
+/// already wrote and turn it executable afterwards, which is exactly the
+/// shape a JIT-spraying exploit needs. Denying only W+X would leave that
+/// path open while looking like it was closed.
+///
+/// A mapping that is already executable may stay executable — otherwise
+/// mprotect could never drop WRITE from a W+X region inherited from before
+/// MDWE was set, and a process could not even make itself safer.
+pub(crate) fn mdwe_denies(task: u64, old: narf_memory::RegionPerms, new: narf_memory::RegionPerms) -> bool {
+    if task_mdwe(task) & PR_MDWE_REFUSE_EXEC_GAIN == 0 {
+        return false;
+    }
+    if !new.contains(narf_memory::RegionPerms::EXEC) {
+        return false;
+    }
+    if new.contains(narf_memory::RegionPerms::WRITE) {
+        return true;
+    }
+    !old.contains(narf_memory::RegionPerms::EXEC)
+}
+
 /// Per-task capability credential.
 static CAP_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, Caps>>,
@@ -5958,8 +6029,37 @@ fn mprotect_core(
         // An empty set means nothing is mapped in the range; that is
         // `mprotect_range`'s error to report, and routing it there keeps the
         // pre-existing errno rather than inventing one here.
+        let intersecting = as_ref.perms_intersecting(base, len);
+        // `mm/mprotect.c`, inside the per-VMA loop and before any change is
+        // applied:
+        //
+        //     if (map_deny_write_exec(vma->vm_flags, newflags)) {
+        //             error = -EACCES;
+        //             break;
+        //     }
+        //
+        // MDWE sits ABOVE the W^X policy below rather than duplicating it.
+        // NARF already refuses a W|X end state outright, which is stricter
+        // than Linux, so the only thing MDWE adds here is the second denial
+        // arm: a mapping that is not currently executable may not BECOME
+        // executable, even via the CAP_JIT-gated RW->RX flip that policy
+        // otherwise permits. That is the arm the feature exists for — a
+        // process that can write a page and then mark it executable has the
+        // same power as one holding RWX, so a sandbox that asked for MDWE and
+        // still got the flip was told it was protected when it was not.
+        //
+        // Checked over every intersecting region, like the classification
+        // below, so a range crossing one already-executable and one
+        // non-executable mapping is refused rather than half-applied.
+        let task = current_task_id();
+        if intersecting
+            .iter()
+            .any(|old| mdwe_denies(task, *old, perms.prot_only()))
+        {
+            return Err(13); // EACCES
+        }
         let transition = narf_memory::wx::classify_mprotect_range(
-            as_ref.perms_intersecting(base, len).into_iter(),
+            intersecting.into_iter(),
             perms.prot_only(),
         );
         match transition {

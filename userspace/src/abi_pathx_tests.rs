@@ -1001,6 +1001,107 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
 // Resolves a symlink and copies its target into buf, returning the byte
 // count. Build the symlink first via symlinkat, then read it back.
 
+/// `chroot(2)` resolves with `LOOKUP_FOLLOW | LOOKUP_DIRECTORY`, so a name
+/// that does not exist is -ENOENT — even one whose PREFIX is served by a
+/// mount.
+///
+/// NARF only checked that some mount covered the path, which a nonexistent
+/// name under a mounted filesystem passes. The root then INSTALLED, after
+/// which every absolute path in that task resolved beneath a directory that
+/// is not there, and the first symptom was unrelated opens failing for
+/// reasons pointing nowhere near the chroot.
+///
+/// The succeeding arm is the control: the same mount, a name that does
+/// exist, still works — so this tightened the check without breaking chroot
+/// into a real directory.
+fn smoke_abi_pathx_chroot_missing_name_under_a_mount_is_enoent() -> TestResult {
+    with_memfs("/crfs", "crfs", &[("f", b"hi")], || {
+        // A name that does not exist inside the mounted filesystem.
+        let missing = b"/crfs/nope\0";
+        if call(Syscall::Chroot.raw(), a0(missing.as_ptr() as u64)) != Some(ENOENT_E) {
+            return Err("chroot to a missing name under a mount was not -ENOENT");
+        }
+        // A file, not a directory → -ENOTDIR, as LOOKUP_DIRECTORY requires.
+        let file = b"/crfs/f\0";
+        if call(Syscall::Chroot.raw(), a0(file.as_ptr() as u64)) != Some(-20) {
+            return Err("chroot to a file was not -ENOTDIR");
+        }
+        // Control: the mount root itself is a directory and still works.
+        let root = b"/crfs\0";
+        if call(Syscall::Chroot.raw(), a0(root.as_ptr() as u64)) != Some(0) {
+            return Err("chroot to a real directory stopped working");
+        }
+        // Put the root back so later tests see a normal view.
+        let slash = b"/\0";
+        let _ = call(Syscall::Chroot.raw(), a0(slash.as_ptr() as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_chroot_missing_name_under_a_mount_is_enoent
+);
+
+/// `fs/d_path.c::SYSCALL_DEFINE2(getcwd)` checks the working directory is
+/// still there BEFORE anything else:
+///
+///     if (unlikely(d_unlinked(pwd.dentry))) {
+///             rcu_read_unlock();
+///             error = -ENOENT;
+///     } else {
+///             ... ENAMETOOLONG / ERANGE / EFAULT / len
+///     }
+///
+/// A shell whose directory is removed under it uses that ENOENT to notice.
+/// Reporting the stale path instead tells it everything is fine, and it goes
+/// on resolving relative paths against a directory that no longer exists.
+///
+/// The ordering arm matters too: ENOENT wins over ERANGE, so a task with a
+/// removed cwd AND a too-small buffer learns which problem it actually has.
+fn smoke_abi_pathx_getcwd_removed_directory_is_enoent() -> TestResult {
+    with_memfs("/gcfs", "gcfs", &[("keep/f", b"hi")], || {
+        let dir = b"/gcfs/gone\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the cwd-to-be failed");
+        }
+        if call(Syscall::Chdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("chdir into the new directory failed");
+        }
+        let mut buf = [0u8; 128];
+        // While it exists, getcwd reports it (path + NUL).
+        match call(
+            Syscall::Getcwd.raw(),
+            a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(n) if n == b"/gcfs/gone".len() as i64 + 1 => {}
+            _ => return Err("getcwd did not report the directory it was in"),
+        }
+        // Remove it out from under the task.
+        if call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+            return Err("rmdir of the cwd failed");
+        }
+        if call(
+            Syscall::Getcwd.raw(),
+            a1(buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(ENOENT_E)
+        {
+            return Err("getcwd of a removed directory was not -ENOENT");
+        }
+        // ENOENT is decided first, so it wins over a too-small buffer.
+        if call(Syscall::Getcwd.raw(), a1(buf.as_mut_ptr() as u64, 1)) != Some(ENOENT_E) {
+            return Err("ERANGE was reported ahead of ENOENT for a removed cwd");
+        }
+        // Leave the task somewhere that exists.
+        let back = b"/\0";
+        let _ = call(Syscall::Chdir.raw(), a0(back.as_ptr() as u64));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_getcwd_removed_directory_is_enoent
+);
+
 /// `fs/namei.c` gives up on a symlink cycle with -ELOOP:
 ///
 ///     if (unlikely(nd->total_link_count++ >= MAXSYMLINKS))

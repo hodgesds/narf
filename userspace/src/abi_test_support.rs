@@ -116,6 +116,10 @@ pub fn setup() {
     // harness promises a fresh task view to every test.
     crate::handlers::__test_mount_namespaces_reset();
     crate::handlers::__test_root_dir_reset();
+    // PR_SET_MDWE is one-way (`if (current_bits && current_bits != bits)
+    // return -EPERM;`), so a test that sets it would leave every later
+    // mprotect in this shared kernel image refusing to grant execute.
+    crate::handlers::__test_mdwe_reset();
     #[cfg(feature = "container")]
     crate::pid_ns::__test_reset();
     // UTS / NET / IPC / USER namespaces were the hole in the fresh-view

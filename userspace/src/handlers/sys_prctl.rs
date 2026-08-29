@@ -400,14 +400,53 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // no-op and GET reports 0 (not disabled / not applicable).
             ctx.set_return(SyscallReturn::ok(0));
         }
-        65 /* PR_SET_MDWE */ | 66 /* PR_GET_MDWE */ => {
-            // NARF doesn't support PR_SET_MDWE (Linux 6.3+ W^X enforcement).
-            // Report EINVAL like a pre-6.3 kernel so systemd's
-            // apply_memory_deny_write_execute() falls back to its seccomp path
-            // (which NARF accepts) instead of treating it as fatal
-            // 228/EXIT_SECCOMP. Enforcing W^X in mmap/mprotect is a separate
-            // feature; until then "unsupported" is the honest, non-fatal answer.
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        65 /* PR_SET_MDWE */ => {
+            // `kernel/sys.c::prctl_set_mdwe`:
+            //
+            //     if (arg3 || arg4 || arg5)                         return -EINVAL;
+            //     if (bits & ~(PR_MDWE_REFUSE_EXEC_GAIN |
+            //                  PR_MDWE_NO_INHERIT))                 return -EINVAL;
+            //     /* NO_INHERIT only makes sense with REFUSE_EXEC_GAIN */
+            //     if (bits & PR_MDWE_NO_INHERIT &&
+            //         !(bits & PR_MDWE_REFUSE_EXEC_GAIN))           return -EINVAL;
+            //     ...
+            //     current_bits = get_current_mdwe();
+            //     if (current_bits && current_bits != bits)
+            //             return -EPERM; /* Cannot unset the flags */
+            //
+            // The trailing -EPERM is the whole point of the feature: MDWE is
+            // one-way. A process that has taken the restriction cannot drop
+            // it, so an attacker who gains control of it cannot simply turn
+            // W^X back off before mapping the page it wants.
+            if arg_b != 0 || args.arg3 != 0 || args.arg4 != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            if arg_a & !(PR_MDWE_REFUSE_EXEC_GAIN | PR_MDWE_NO_INHERIT) != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            if arg_a & PR_MDWE_NO_INHERIT != 0 && arg_a & PR_MDWE_REFUSE_EXEC_GAIN == 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            let task = current_task_id();
+            let current_bits = task_mdwe(task);
+            if current_bits != 0 && current_bits != arg_a {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
+            set_task_mdwe(task, arg_a);
+            ctx.set_return(SyscallReturn::ok(0));
+        }
+        66 /* PR_GET_MDWE */ => {
+            // `prctl_get_mdwe`: `if (arg2 || arg3 || arg4 || arg5) return
+            // -EINVAL; return get_current_mdwe();`
+            if arg_a != 0 || arg_b != 0 || args.arg3 != 0 || args.arg4 != 0 {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+            ctx.set_return(SyscallReturn::ok(task_mdwe(current_task_id())));
         }
         _ => {
             // `kernel/sys.c::SYSCALL_DEFINE5(prctl)` `default:` arm:

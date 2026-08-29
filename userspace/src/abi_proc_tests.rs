@@ -421,9 +421,78 @@ fn smoke_abi_proc_prctl_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_neg);
 
 // prctl feature-probe / no-op options systemd and glibc exercise during
-// service setup. PR_SET_MDWE must report EINVAL (unsupported, pre-6.3-style) so
-// systemd's MemoryDenyWriteExecute= falls back to seccomp instead of failing
-// 228/EXIT_SECCOMP; the rest are accepted no-ops with Linux-shaped returns.
+// service setup. PR_SET_MDWE is now implemented, so it SUCCEEDS and systemd's
+// MemoryDenyWriteExecute= gets the real W^X enforcement rather than falling
+// back to its seccomp path; the rest are accepted no-ops with Linux-shaped
+// returns.
+/// `kernel/sys.c::prctl_set_mdwe` is deliberately ONE-WAY:
+///
+///     current_bits = get_current_mdwe();
+///     if (current_bits && current_bits != bits)
+///             return -EPERM; /* Cannot unset the flags */
+///
+/// That -EPERM is the feature, not a detail. MDWE exists so a process cannot
+/// map or promote executable memory; if it could simply clear the bits first,
+/// an attacker who gained control of it would turn the protection off and
+/// then do exactly what it was meant to prevent. A W^X flag that can be
+/// unset protects nothing.
+///
+/// The argument validation around it matters too — `PR_MDWE_NO_INHERIT`
+/// alone is rejected, because inheriting a restriction that was never
+/// imposed is meaningless, and a caller that got 0 for it would believe it
+/// had asked for something.
+fn smoke_abi_proc_prctl_mdwe_cannot_be_unset() -> TestResult {
+    with_setup(|| {
+        const PR_SET_MDWE: u64 = 65;
+        const PR_GET_MDWE: u64 = 66;
+        const REFUSE_EXEC_GAIN: u64 = 1;
+        const NO_INHERIT: u64 = 2;
+
+        // Nothing set yet.
+        if call(Syscall::Prctl.raw(), a0(PR_GET_MDWE)) != Some(0) {
+            return Err("PR_GET_MDWE on a fresh task was not 0");
+        }
+        // `if (bits & ~(PR_MDWE_REFUSE_EXEC_GAIN | PR_MDWE_NO_INHERIT))`
+        if call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, 0x4)) != Some(-22) {
+            return Err("PR_SET_MDWE with an unknown bit was not -EINVAL");
+        }
+        // `NO_INHERIT` without `REFUSE_EXEC_GAIN` is meaningless → EINVAL.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, NO_INHERIT)) != Some(-22) {
+            return Err("PR_SET_MDWE(NO_INHERIT alone) was not -EINVAL");
+        }
+        // `if (arg3 || arg4 || arg5) return -EINVAL;`
+        if call(Syscall::Prctl.raw(), a2(PR_SET_MDWE, REFUSE_EXEC_GAIN, 1)) != Some(-22) {
+            return Err("PR_SET_MDWE with a non-zero arg3 was not -EINVAL");
+        }
+
+        if call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, REFUSE_EXEC_GAIN)) != Some(0) {
+            return Err("PR_SET_MDWE(REFUSE_EXEC_GAIN) failed");
+        }
+        // Setting the SAME bits again is idempotent, not an error.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, REFUSE_EXEC_GAIN)) != Some(0) {
+            return Err("re-setting the same MDWE bits was not idempotent");
+        }
+        // Clearing is refused — the whole point.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_MDWE, 0)) != Some(-1) {
+            return Err("MDWE could be cleared; the restriction is not one-way");
+        }
+        // So is changing to a different combination.
+        if call(
+            Syscall::Prctl.raw(),
+            a1(PR_SET_MDWE, REFUSE_EXEC_GAIN | NO_INHERIT),
+        ) != Some(-1)
+        {
+            return Err("MDWE bits could be changed after being set");
+        }
+        // And it is still set after all those refusals.
+        match call(Syscall::Prctl.raw(), a0(PR_GET_MDWE)) {
+            Some(v) if v as u64 == REFUSE_EXEC_GAIN => Ok(()),
+            _ => Err("MDWE bits did not survive the refused changes"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_mdwe_cannot_be_unset);
+
 fn smoke_abi_proc_prctl_feature_probes() -> TestResult {
     with_setup(|| {
         const PR_GET_TSC: u64 = 25;
@@ -434,13 +503,19 @@ fn smoke_abi_proc_prctl_feature_probes() -> TestResult {
         const PR_SET_MDWE: u64 = 65;
         const PR_MDWE_REFUSE_EXEC_GAIN: u64 = 1;
 
-        // MDWE is unsupported → EINVAL (drives systemd's seccomp fallback).
+        // MDWE is implemented: the request succeeds and PR_GET_MDWE reads it
+        // back. This arm asserted -EINVAL while the feature was unsupported.
+        const PR_GET_MDWE: u64 = 66;
         match call(
             Syscall::Prctl.raw(),
             a1(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN),
         ) {
-            Some(-22) => {}
-            _ => return Err("PR_SET_MDWE must return -EINVAL (unsupported)"),
+            Some(0) => {}
+            _ => return Err("PR_SET_MDWE must succeed"),
+        }
+        match call(Syscall::Prctl.raw(), a0(PR_GET_MDWE)) {
+            Some(v) if v as u64 == PR_MDWE_REFUSE_EXEC_GAIN => {}
+            _ => return Err("PR_GET_MDWE did not read back the bits that were set"),
         }
         // Timer slack: SET accepted, GET returns the default slack (ns).
         match call(Syscall::Prctl.raw(), a1(PR_SET_TIMERSLACK, 1000)) {

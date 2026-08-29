@@ -2240,11 +2240,30 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    let secs = std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
+    wait_for_boot_smoke(child, "boot-smoke", boot_smoke_timeout_secs(), args.arch)
+}
+
+/// How long to let a boot-smoke run take before calling it a hang.
+///
+/// This MUST stay above the largest per-initcall budget the kernel itself
+/// declares, or the harness kills a boot the kernel considers healthy and
+/// reports it as "possible kernel hang" — which is what the 90-second default
+/// did to `btrfs-write-smoke`. That initcall registers a 120 000 ms budget and
+/// measures 80–160 s depending on host load, so a 90-second cap could never
+/// pass it reliably: the failure looked like a hang in the btrfs write path
+/// and was really the harness being stricter than the workload it launched.
+///
+/// The headroom above 120 s is for host load, not for the workload growing
+/// into it. `btrfs-write-smoke` spends ~87% of its time in the 64-file split
+/// loop, and its per-file cost RISES with tree size (12.4e9 cycles for the
+/// first sixteen files, 29.9e9 for the next sixteen) because every write
+/// drives a full `commit_txn`. That is worth fixing on its own terms; until
+/// it is, this bound has to accommodate it rather than flag it as a hang.
+fn boot_smoke_timeout_secs() -> u64 {
+    std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(90);
-    wait_for_boot_smoke(child, "boot-smoke", secs, args.arch)
+        .unwrap_or(300)
 }
 
 /// Validate a QEMU boot that was built with the `boot-smoke` feature.
