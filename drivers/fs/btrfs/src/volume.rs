@@ -99,7 +99,7 @@ impl Drop for VolumeIo {
 /// answer.
 #[derive(Debug, Default)]
 struct NodeCache {
-    entries: BTreeMap<u64, alloc::vec::Vec<u8>>,
+    entries: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     epoch: u64,
 }
 
@@ -668,6 +668,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// validating its self-recorded `bytenr` and, when
     /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
+        self.read_node_shared(logical)
+            .await
+            .map(|arc| (*arc).clone())
+    }
+
+    /// [`Self::read_node`] without copying the node out of the cache.
+    ///
+    /// A cache hit here is an `Arc` bump rather than a `nodesize` memcpy. That
+    /// matters because the commit path's hottest reader — the extent tree's
+    /// path COW, re-run once per fixed-point round — descends the same
+    /// internal nodes for every edit, and each descent used to copy 16 KiB per
+    /// level. Callers that need to mutate a node still take `read_node` and
+    /// get their own copy.
+    pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
         // Serve from the node cache when nothing has written this address
         // since it was filled. A hit skips both the device read and the
         // full-node checksum verification; the clone is a memcpy against an
@@ -679,6 +693,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             cache.epoch
         };
+        let _ = epoch;
 
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
@@ -702,6 +717,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             {
                 continue;
             }
+            let shared = Arc::new(core::mem::take(&mut buf));
             // Only cache a node that passed BOTH checks above — a copy that
             // failed one is retried from another mirror, and caching it would
             // make a transient bad mirror permanent for this mount.
@@ -716,9 +732,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     // more here than the misses it saves.
                     cache.entries.clear();
                 }
-                cache.entries.insert(logical, buf.clone());
+                cache.entries.insert(logical, shared.clone());
             }
-            return Ok(buf);
+            return Ok(shared);
         }
         Err(FsError::InvalidData)
     }
@@ -1284,7 +1300,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if cache.entries.len() >= NODE_CACHE_MAX {
             cache.entries.clear();
         }
-        cache.entries.insert(logical, buf.to_vec());
+        cache.entries.insert(logical, Arc::new(buf.to_vec()));
     }
 
     /// Write one metadata node and keep it cached.

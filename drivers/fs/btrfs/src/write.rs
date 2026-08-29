@@ -1400,30 +1400,58 @@ fn leaf_items(leaf: &[u8]) -> Result<Vec<(BtrfsKey, Vec<u8>)>, FsError> {
 
 /// Upsert `(key, body)` into `leaf`, returning the re-tiled replacement leaves
 /// (one, or several if the edit overflowed the node).
+/// Upsert one key. Kept for the leaf-level unit tests, which exercise a
+/// single edit directly; the commit path goes through [`cow_leaf_apply`].
+#[cfg(feature = "kernel-test")]
 pub(crate) fn cow_leaf_upsert(
     leaf: &[u8],
     key: &BtrfsKey,
     body: &[u8],
     nodesize: usize,
 ) -> Result<Vec<Vec<u8>>, FsError> {
-    let mut items = leaf_items(leaf)?;
-    match items.binary_search_by(|(k, _)| k.cmp(key)) {
-        Ok(i) => items[i].1 = body.to_vec(),
-        Err(i) => items.insert(i, (*key, body.to_vec())),
-    }
-    regroup_leaves(leaf, &items, nodesize)
+    cow_leaf_apply(leaf, &[Edit::Upsert(*key, body.to_vec())], nodesize)
 }
 
-/// Delete `key` from `leaf` (if present), returning the re-tiled replacement
-/// leaves (always at least one, possibly empty).
+/// Delete one key. Same note as [`cow_leaf_upsert`].
+#[cfg(feature = "kernel-test")]
 pub(crate) fn cow_leaf_delete(
     leaf: &[u8],
     key: &BtrfsKey,
     nodesize: usize,
 ) -> Result<Vec<Vec<u8>>, FsError> {
+    cow_leaf_apply(leaf, &[Edit::Delete(*key)], nodesize)
+}
+
+/// Apply several edits to ONE leaf and re-tile it once.
+///
+/// `leaf_items` decodes every item in the leaf into an owned body, and
+/// `regroup_leaves` re-encodes all of them. Doing that per edit made the leaf
+/// rewrite the dominant cost of a path COW — 66% of `apply_one`, at ~256K
+/// cycles an edit — even though a commit's edits cluster heavily onto the same
+/// few leaves. Decoding once for the whole group and re-encoding once amortises
+/// it across the group instead.
+///
+/// Edits must already be in key order; equal keys must keep their original
+/// relative order, since an upsert followed by a delete of the same key is not
+/// the same as the reverse.
+pub(crate) fn cow_leaf_apply(
+    leaf: &[u8],
+    edits: &[Edit],
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
     let mut items = leaf_items(leaf)?;
-    if let Ok(i) = items.binary_search_by(|(k, _)| k.cmp(key)) {
-        items.remove(i);
+    for edit in edits {
+        match edit {
+            Edit::Upsert(key, body) => match items.binary_search_by(|(k, _)| k.cmp(key)) {
+                Ok(i) => items[i].1 = body.clone(),
+                Err(i) => items.insert(i, (*key, body.clone())),
+            },
+            Edit::Delete(key) => {
+                if let Ok(i) = items.binary_search_by(|(k, _)| k.cmp(key)) {
+                    items.remove(i);
+                }
+            }
+        }
     }
     regroup_leaves(leaf, &items, nodesize)
 }
@@ -1473,7 +1501,7 @@ pub(crate) struct PathCow<'a, B: BlockDevice + 'static> {
     nodesize: usize,
     header: Vec<u8>,
     /// New blocks made this txn (addr → (buf, level)); superseded by later edits.
-    pending: BTreeMap<u64, (Vec<u8>, u8)>,
+    pending: BTreeMap<u64, (alloc::sync::Arc<Vec<u8>>, u8)>,
     /// Committed (pre-txn) blocks this batch frees.
     freed: Vec<(u64, u8)>,
     root: u64,
@@ -1503,10 +1531,13 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     }
 
     /// Read a node — from this txn's cache if COWed, else from disk.
-    async fn read(&self, addr: u64) -> Result<Vec<u8>, FsError> {
+    /// Read a node for the descent. Both arms hand back a shared reference:
+    /// every edit re-walks the same internal nodes, so copying one per level
+    /// per edit was the bulk of the extent tree's path-COW cost.
+    async fn read(&self, addr: u64) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
         match self.pending.get(&addr) {
             Some((buf, _)) => Ok(buf.clone()),
-            None => self.vol.read_node(addr).await,
+            None => self.vol.read_node_shared(addr).await,
         }
     }
 
@@ -1521,7 +1552,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     /// Allocate + cache a new node, returning its address.
     fn store(&mut self, alloc: &mut Allocator, buf: Vec<u8>, level: u8) -> Result<u64, FsError> {
         let addr = alloc.alloc_node(self.vol)?;
-        self.pending.insert(addr, (buf, level));
+        self.pending
+            .insert(addr, (alloc::sync::Arc::new(buf), level));
         Ok(addr)
     }
 
@@ -1563,7 +1595,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         for (i, buf) in bufs.into_iter().enumerate() {
             let key = Self::first_key(&buf)?;
             let addr = if i == 0 && reuse {
-                self.pending.insert(old_addr, (buf, level)); // edit in place
+                self.pending
+                    .insert(old_addr, (alloc::sync::Arc::new(buf), level)); // edit in place
                 old_addr
             } else {
                 self.store(alloc, buf, level)?
@@ -1577,12 +1610,22 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
     }
 
     /// Apply one edit, updating the working root.
-    async fn apply_one(&mut self, alloc: &mut Allocator, edit: &Edit) -> Result<(), FsError> {
+    /// Apply every edit at the front of `pending_edits` that lands on one
+    /// leaf, and report how many were consumed. The descent that finds the
+    /// leaf also yields its upper bound, so the group is chosen without a
+    /// second walk.
+    async fn apply_one(
+        &mut self,
+        alloc: &mut Allocator,
+        pending_edits: &[Edit],
+    ) -> Result<usize, FsError> {
+        let edit = &pending_edits[0];
         // Descend to the target leaf, recording each internal node's pointer list
         // and the child slot taken.
         let target = *edit.key();
         // Each ancestor on the descent: (addr, level, its key-ptrs, child slot).
         let mut path: Vec<PathEntry> = Vec::new();
+        let mut upper: Option<BtrfsKey> = None;
         let mut addr = self.root;
         let leaf = loop {
             let buf = self.read(addr).await?;
@@ -1602,16 +1645,34 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 .collect::<Result<_, FsError>>()?;
             let lvl = level(&buf)?;
             let child = ptrs[slot].1;
+            // The next separator on this level bounds the leaf we are about to
+            // reach: any key below it descends here too.
+            if slot + 1 < ptrs.len() {
+                let sep = ptrs[slot + 1].0;
+                upper = Some(match upper {
+                    Some(u) if u < sep => u,
+                    _ => sep,
+                });
+            }
             path.push((addr, lvl, ptrs, slot));
             addr = child;
         };
+        // Every following edit below the leaf's upper bound reaches this same
+        // leaf, so they can share one decode/re-tile.
+        let taken = match upper {
+            Some(bound) => pending_edits
+                .iter()
+                .take_while(|candidate| *candidate.key() < bound)
+                .count()
+                .max(1),
+            // Rightmost leaf: nothing separates it from the remaining keys.
+            None => pending_edits.len(),
+        };
+        let group = &pending_edits[..taken];
 
         // Edit + re-tile the leaf.
         let leaf_addr = addr;
-        let new_leaves = match edit {
-            Edit::Upsert(k, body) => cow_leaf_upsert(&leaf, k, body, self.nodesize)?,
-            Edit::Delete(k) => cow_leaf_delete(&leaf, k, self.nodesize)?,
-        };
+        let new_leaves = cow_leaf_apply(&leaf, group, self.nodesize)?;
         let mut cur_ptrs = self.cow_node(alloc, leaf_addr, new_leaves, 0)?;
         let mut ptr_level = 0u8;
 
@@ -1659,7 +1720,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
 
         self.root = root;
         self.root_level = root_level;
-        Ok(())
+        Ok(taken)
     }
 
     /// Apply all `edits`, then finalize: returns the new root + the new/freed
@@ -1669,13 +1730,30 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         alloc: &mut Allocator,
         edits: &[Edit],
     ) -> Result<CowOut, FsError> {
-        for edit in edits {
-            self.apply_one(alloc, edit).await?;
+        // Sort so edits sharing a leaf are adjacent. The sort is STABLE, which
+        // matters: two edits to the same key must keep their original order,
+        // since an upsert followed by a delete is not the same as the reverse.
+        let mut ordered: Vec<Edit> = edits.to_vec();
+        ordered.sort_by(|a, b| a.key().cmp(b.key()));
+
+        let mut i = 0;
+        while i < ordered.len() {
+            i += self.apply_one(alloc, &ordered[i..]).await?;
         }
+        // Unwrap the shared buffers on the way out. By here the descent is
+        // finished and nothing else holds a reference, so this is a move in
+        // the ordinary case; the clone is only a fallback for safety, not an
+        // expected cost.
         let nodes: Vec<(u64, Vec<u8>, u8)> = self
             .pending
             .into_iter()
-            .map(|(a, (b, l))| (a, b, l))
+            .map(|(a, (b, l))| {
+                (
+                    a,
+                    alloc::sync::Arc::try_unwrap(b).unwrap_or_else(|shared| (*shared).clone()),
+                    l,
+                )
+            })
             .collect();
         Ok(CowOut {
             root_addr: self.root,
