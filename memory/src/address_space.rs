@@ -7738,7 +7738,7 @@ impl AddressSpace {
         // page (cheaper than adding a per-arch in-place mutate
         // helper, since map_4kb already handles the leaf rewrite).
         // SAFETY: Valid memory or trusted environment
-        unsafe { self.rewrite_perms_pages(&hits) };
+        unsafe { self.rewrite_perms_pages(&hits, false) };
         drop(g);
         Ok(())
     }
@@ -8077,7 +8077,7 @@ impl AddressSpace {
             // post-split phys slot (the Drop path consults the new
             // region table, not the old one) — and the regions lock is
             // still held, so no racing unmap can free them mid-rewrite.
-            unsafe { self.rewrite_perms_pages(&touched) };
+            unsafe { self.rewrite_perms_pages(&touched, false) };
         }
         drop(g);
         drop(huge);
@@ -8280,7 +8280,7 @@ impl AddressSpace {
     /// Region.phys must remain valid for the duration of the
     /// call; we only re-target the same phys.
     #[cfg(target_arch = "x86_64")]
-    unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
+    unsafe fn rewrite_perms_pages(&self, regions: &[Region], cow_readonly: bool) {
         use crate::x86_64::paging::{
             flush_user_tlb_local, rewrite_4kb_scatter_range, unmap_4kb_local_range, PtFlags,
         };
@@ -8305,6 +8305,12 @@ impl AddressSpace {
         let total_pages: u64 = regions.iter().map(|r| (r.len + 0xFFF) >> 12).sum();
         let use_full_flush = broadcast && total_pages > FULL_FLUSH_PAGE_CEILING;
         for r in regions {
+            // Fork rematerialize (`cow_readonly`) only re-marks the COW regions
+            // clone_for_fork touched; every other region's perms are unchanged,
+            // so its live PTEs are already correct — skip it entirely.
+            if cow_readonly && !r.perms.contains(RegionPerms::COW) {
+                continue;
+            }
             // PROT_NONE: tear down the leaf PTEs without freeing
             // the underlying frames (region.phys still owns them).
             // The next mprotect-back-to-RW just re-installs.
@@ -8313,18 +8319,30 @@ impl AddressSpace {
                 // the root lock once and completes local invalidation.
                 let _ = unsafe { unmap_4kb_local_range(self.root, r.base, r.phys.len() as u64) };
             } else {
-                let cow_counts = r
-                    .perms
-                    .contains(RegionPerms::COW)
-                    .then(|| crate::frame::cow::count_batch(&r.phys));
+                // Fork rematerialize: clone_for_fork inc_ref'd every private
+                // page, so ALL of them must become read-only — skip the O(pages)
+                // per-page COW refcount lookup and force RO. mprotect and the
+                // other callers keep the exact per-page writability decision.
+                let cow_counts = if cow_readonly {
+                    None
+                } else {
+                    r.perms
+                        .contains(RegionPerms::COW)
+                        .then(|| crate::frame::cow::count_batch(&r.phys))
+                };
                 // SAFETY: region ownership remains stable under the caller's
                 // region lock. The helper skips zero lazy sentinels, holds the
                 // page-table root lock once, and completes local invalidation.
                 let _ = unsafe {
                     rewrite_4kb_scatter_range(self.root, r.base, &r.phys, |i, p| {
                         let mut flags = PtFlags::USER;
-                        let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
-                        if user_page_writable_at_count(r.perms, p, cow_count) {
+                        let writable = if cow_readonly {
+                            false
+                        } else {
+                            let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                            user_page_writable_at_count(r.perms, p, cow_count)
+                        };
+                        if writable {
                             flags |= PtFlags::WRITABLE;
                         }
                         if !r.perms.contains(RegionPerms::EXEC) {
@@ -8354,29 +8372,44 @@ impl AddressSpace {
     }
 
     #[cfg(target_arch = "aarch64")]
-    unsafe fn rewrite_perms_pages(&self, regions: &[Region]) {
+    unsafe fn rewrite_perms_pages(&self, regions: &[Region], cow_readonly: bool) {
         use crate::aarch64::paging::{rewrite_4kb_scatter_range, unmap_4kb_range, PtFlags};
         if self.root.as_u64() == 0 {
             return;
         }
         for r in regions {
+            // Fork rematerialize (`cow_readonly`): only the COW regions
+            // clone_for_fork touched need re-marking; skip the rest.
+            if cow_readonly && !r.perms.contains(RegionPerms::COW) {
+                continue;
+            }
             if r.perms.prot_only().0 == 0 {
                 // SAFETY: see x86_64 variant. The helper clears every leaf
                 // under one root lock and one inner-shareable TLBI sequence.
                 let _ = unsafe { unmap_4kb_range(self.root, r.base, r.phys.len() as u64) };
                 continue;
             }
-            let cow_counts = r
-                .perms
-                .contains(RegionPerms::COW)
-                .then(|| crate::frame::cow::count_batch(&r.phys));
+            // Fork rematerialize: every private page was inc_ref'd, so all become
+            // read-only — skip the per-page COW refcount lookup and force RO.
+            let cow_counts = if cow_readonly {
+                None
+            } else {
+                r.perms
+                    .contains(RegionPerms::COW)
+                    .then(|| crate::frame::cow::count_batch(&r.phys))
+            };
             // SAFETY: region ownership stays stable under the caller's region
             // lock. The helper performs one complete break-before-make
             // transaction and leaves zero backing sentinels unmapped.
             let _ = unsafe {
                 rewrite_4kb_scatter_range(self.root, r.base, &r.phys, |i, p| {
-                    let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
-                    let mut flags = if user_page_writable_at_count(r.perms, p, cow_count) {
+                    let writable = if cow_readonly {
+                        false
+                    } else {
+                        let cow_count = cow_counts.as_ref().map_or(0, |counts| counts[i]);
+                        user_page_writable_at_count(r.perms, p, cow_count)
+                    };
+                    let mut flags = if writable {
                         PtFlags::AP_RW_EL0
                     } else {
                         PtFlags::AP_RO_EL0
@@ -8391,7 +8424,7 @@ impl AddressSpace {
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    unsafe fn rewrite_perms_pages(&self, _regions: &[Region]) {}
+    unsafe fn rewrite_perms_pages(&self, _regions: &[Region], _cow_readonly: bool) {}
 
     /// Snapshot of the region list — returns an owned `Vec<Region>`
     /// so callers can iterate without holding the lock.
@@ -8832,7 +8865,10 @@ impl AddressSpace {
         let g = self.regions.lock();
         let snapshot = g.snapshot();
         // SAFETY: identity-map live; `root` valid from `new_for_user`.
-        unsafe { self.rewrite_perms_pages(&snapshot) };
+        // `cow_readonly = true`: fork-COW WRITE-strip. Every private page was
+        // inc_ref'd by clone_for_fork so all become read-only; skip the per-page
+        // refcount lookup and leave non-COW (e.g. MAP_SHARED) regions untouched.
+        unsafe { self.rewrite_perms_pages(&snapshot, true) };
         drop(g);
         Ok(())
     }

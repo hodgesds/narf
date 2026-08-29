@@ -31,12 +31,23 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // SAFETY: child AS just constructed; no concurrent writers.
-    if unsafe { child_as.materialize() }.is_err() {
-        // Child page-table materialization failed → ENOMEM.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-        return;
-    }
+    // LAZY child materialize (Linux-style demand fork): do NOT eagerly install a
+    // leaf PTE for every inherited base page. Each base page the child actually
+    // touches demand-faults through `claim_demand_page`'s already-backed path,
+    // which installs a READ-ONLY COW leaf from the resident `region.phys[i]`
+    // (`user_page_writable` returns false while the frame is COW-shared) — the
+    // same PTE eager materialize would have written, but only for pages the child
+    // uses. A fork→exit child (the common case) installs a handful of pages
+    // instead of the whole address space, eliminating the ~8.7ms materialize
+    // pass measured in the fork profile.
+    //
+    // Correctness:
+    // - Huge regions have no demand-fault path, but `clone_for_fork` already maps
+    //   them eagerly (`map_huge_region`), so they are unaffected.
+    // - An un-faulted child still holds a COW reference (`inc_ref` in
+    //   `clone_for_fork`), so its `region.phys[i]` frame cannot be freed by
+    //   compaction/migration (free happens only at refcount 0); it stays valid to
+    //   fault in later even if the parent's copy is relocated.
     // Re-materialise the parent's PTEs. `clone_for_fork` stripped
     // WRITE from every region's metadata but the parent's live page
     // tables still carry the old WRITE-set PTEs. Without this, the
