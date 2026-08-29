@@ -99,6 +99,53 @@ fn smoke_debugfs_wake_placement_toggle() -> TestResult {
 }
 kernel_test_in!("filesystem/debugfs", smoke_debugfs_wake_placement_toggle);
 
+fn smoke_debugfs_wake_next_toggle() -> TestResult {
+    let file = match sched_knob("wake_next") {
+        Some(f) => f,
+        None => return TestResult::Fail("sched/wake_next knob missing"),
+    };
+    let initial = narf_scheduler::wake_next_enabled();
+    let restore = |on: bool| {
+        if on {
+            narf_scheduler::enable_wake_next();
+        } else {
+            narf_scheduler::disable_wake_next();
+        }
+    };
+
+    // `echo 1` enables; state + read reflect it.
+    if poll_once(file.write(0, b"1\n")).map(|r| r.is_ok()) != Some(true) {
+        restore(initial);
+        return TestResult::Fail("write '1' failed");
+    }
+    if !narf_scheduler::wake_next_enabled() {
+        restore(initial);
+        return TestResult::Fail("write '1' did not enable wake-next");
+    }
+    if read_str(&file) != "1\n" {
+        restore(initial);
+        return TestResult::Fail("read after enable did not return \"1\\n\"");
+    }
+
+    // `echo 0` disables.
+    if poll_once(file.write(0, b"0")).map(|r| r.is_ok()) != Some(true) {
+        restore(initial);
+        return TestResult::Fail("write '0' failed");
+    }
+    if narf_scheduler::wake_next_enabled() {
+        restore(initial);
+        return TestResult::Fail("write '0' did not disable wake-next");
+    }
+    if read_str(&file) != "0\n" {
+        restore(initial);
+        return TestResult::Fail("read after disable did not return \"0\\n\"");
+    }
+
+    restore(initial);
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/debugfs", smoke_debugfs_wake_next_toggle);
+
 fn smoke_debugfs_reflectors_are_read_only() -> TestResult {
     for name in ["policy", "steal_strategy"] {
         let file = match sched_knob(name) {

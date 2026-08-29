@@ -375,6 +375,79 @@ pub fn wake_placement_enabled() -> bool {
     WAKE_PLACEMENT_ENABLED.load(Ordering::Acquire)
 }
 
+/// Wake-next ("next buddy") dispatch. When a task is woken, record it as its
+/// home CPU's preferred next pick, so [`pick_next_slot`] runs it AHEAD of the
+/// other already-runnable tasks queued in front of it instead of at its FIFO
+/// position. This is the analogue of Linux CFS `set_next_buddy` on wakeup: a
+/// just-woken task is almost always latency-critical (it just received the
+/// event it was parked on — a network RX, an IPC reply), whereas the tasks
+/// ahead of it in the ready queue have merely been runnable. Cutting the
+/// "poll N others first" hop is the single biggest lever on a wake-bound
+/// request/response workload (redis PING is halted ~97% of the time; the RTT
+/// is dominated by the scheduling hop, not syscall bodies).
+///
+/// Off by default (opt-in via debugfs `sched/wake_next`): giving every wakeup
+/// head-of-line priority is a fairness/throughput tradeoff — it favors latency
+/// over the strict FIFO the default policy provides — so it stays a tunable,
+/// exactly as Linux gates the same behaviour behind the `NEXT_BUDDY` /
+/// `PICK_BUDDY` sched_feats (kernel/sched/fair.c).
+///
+/// It never overrides eligibility: the buddy is honored only when it is in the
+/// top dispatch tier (awake + not throttled), mirroring Linux `pick_next_entity`,
+/// which takes `cfs_rq->next` only `&& entity_eligible(cfs_rq, cfs_rq->next)`
+/// ("Picking the ->next buddy will affect latency but not fairness") — so a
+/// strict budget throttle still wins (see `pick_next_slot`).
+///
+/// Linux keeps a single `cfs_rq->next` per runqueue and, in `set_preempt_buddy`,
+/// KEEPS an existing buddy when its EEVDF deadline precedes the new wakee's.
+/// NARF's default policy is FIFO (no per-task deadline), so the natural analogue
+/// is most-recently-woken-wins: the latest wakeup is the freshest event, and a
+/// single-slot O(1) hint stays alloc-free on the IRQ waker path.
+static WAKE_NEXT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Per-CPU "next buddy" task id (0 = none). Set by the raw waker on the woken
+/// task's home CPU, consumed (cleared) by `pick_next_slot` when it honors the
+/// hint. A single slot — the most recently woken task wins — so this is O(1)
+/// and alloc-free, safe on the IRQ-context waker path.
+static WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Enable wake-next dispatch. Opt-in (see [`WAKE_NEXT_ENABLED`]).
+pub fn enable_wake_next() {
+    WAKE_NEXT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable wake-next dispatch.
+pub fn disable_wake_next() {
+    WAKE_NEXT_ENABLED.store(false, Ordering::Release);
+}
+
+/// Whether wake-next dispatch is currently enabled.
+pub fn wake_next_enabled() -> bool {
+    WAKE_NEXT_ENABLED.load(Ordering::Acquire)
+}
+
+/// Record `task` as `cpu`'s preferred next pick (no-op when disabled or the id
+/// is unset). Called from the raw waker after it flags the task awake.
+fn record_wake_next(cpu: u32, task: u64) {
+    if task == 0 || !WAKE_NEXT_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    if (cpu as usize) < WAKE_NEXT.len() {
+        WAKE_NEXT[cpu as usize].store(task, Ordering::Release);
+    }
+}
+
+/// Read-and-clear `cpu`'s next-buddy hint (0 = none). `pick_next_slot` calls
+/// this once per pick; clearing on read makes the boost a one-shot so a buddy
+/// that turns out not to be top-tier does not stick.
+pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+    if !WAKE_NEXT_ENABLED.load(Ordering::Acquire) || (cpu as usize) >= WAKE_NEXT.len() {
+        return 0;
+    }
+    WAKE_NEXT[cpu as usize].swap(0, Ordering::AcqRel)
+}
+
 /// Master switch for running *user* tasks on multiple CPUs. Off by
 /// default. Boot flips it on ONLY when cross-CPU TLB shootdown is
 /// wired (x2APIC active → the `invlpg_global` broadcast hook is
@@ -523,6 +596,9 @@ pub fn current_address_space() -> Option<Arc<AddressSpace>> {
 pub(crate) struct WakeCell {
     flag: AtomicBool,
     cpu: AtomicU32,
+    /// The owning task's id, so the raw waker can name it as its CPU's
+    /// wake-next buddy (see [`record_wake_next`]). Immutable after creation.
+    task: u64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -723,6 +799,16 @@ pub fn dbg_resched_counts() -> (u64, u64) {
 pub fn __test_set_cpu_halted(cpu: usize, halted: bool) {
     if cpu < narf_lib::percpu::MAX_CPUS {
         CPU_HALTED[cpu].store(halted, Ordering::SeqCst);
+    }
+}
+
+/// Seed a CPU's wake-next buddy directly (bypassing the enabled gate that
+/// `record_wake_next` applies) so a test can drive the honor path in
+/// `pick_next_slot` without racing the real IRQ waker.
+#[doc(hidden)]
+pub fn __test_set_wake_next(cpu: u32, task: u64) {
+    if (cpu as usize) < WAKE_NEXT.len() {
+        WAKE_NEXT[cpu as usize].store(task, Ordering::Release);
     }
 }
 
@@ -1806,6 +1892,7 @@ where
         awake: Arc::new(WakeCell {
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
+            task: id.raw(),
         }),
         id,
         spec,
@@ -1864,6 +1951,7 @@ where
         awake: Arc::new(WakeCell {
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(cpu as u32),
+            task: id.raw(),
         }),
         id,
         spec,
@@ -2084,6 +2172,7 @@ where
         awake: Arc::new(WakeCell {
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
+            task: id.raw(),
         }),
         id,
         spec,
@@ -2591,6 +2680,9 @@ unsafe fn wake_raw(data: *const ()) {
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
     let home = arc.cpu.load(Ordering::Acquire);
+    // Name this task its home CPU's next-buddy so the dispatch picks it ahead
+    // of the tasks already queued in front of it (Linux `set_next_buddy`).
+    record_wake_next(home, arc.task);
     resched_remote(home);
     wake_place_hint(home);
 }
@@ -2600,10 +2692,12 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let home = unsafe {
+    let (home, task) = unsafe {
         (*ptr).flag.store(true, Ordering::Release);
-        (*ptr).cpu.load(Ordering::Acquire)
+        ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task)
     };
+    // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
+    record_wake_next(home, task);
     resched_remote(home);
     wake_place_hint(home);
 }
@@ -4455,6 +4549,8 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
     let awake = Arc::new(WakeCell {
         flag: AtomicBool::new(true),
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
+        // Nested block_on future: not a ready-queue slot, so no wake-next id.
+        task: 0,
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);
