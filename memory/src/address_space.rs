@@ -5336,9 +5336,13 @@ impl AddressSpace {
                 // external registry and is not returned to the buddy here, but
                 // its per-AS (root, va) reverse-map entry must still be dropped —
                 // otherwise a later registry free finds a stale owner.
-                for (off, phys) in old.phys[first..last].iter().enumerate() {
+                // Clamp to the materialized phys prefix (like the release
+                // `extend`s below): a demand-paged BRK_HEAP region's unmaterialized
+                // tail has no frame and no rmap owner to retire, and slicing past
+                // its short phys list would panic.
+                for (off, phys) in old.phys[p_first..p_last].iter().enumerate() {
                     if phys.raw() != 0 {
-                        let va = VirtAddr::new(rb + ((first + off) as u64) * 4096);
+                        let va = VirtAddr::new(rb + ((p_first + off) as u64) * 4096);
                         crate::rmap::remove(*phys, self.root, va);
                     }
                 }
@@ -5354,9 +5358,13 @@ impl AddressSpace {
                 // punch / munmap that frees resident private backing must not
                 // leave a stale (root, va) owner on the reclaimed frame (Linux
                 // free_pages_prepare's "nonzero mapcount" invariant).
-                for (off, phys) in old.phys[first..last].iter().enumerate() {
+                // Clamp to the materialized phys prefix (like the release
+                // `extend`s below): a demand-paged BRK_HEAP region's unmaterialized
+                // tail has no frame and no rmap owner to retire, and slicing past
+                // its short phys list would panic.
+                for (off, phys) in old.phys[p_first..p_last].iter().enumerate() {
                     if phys.raw() != 0 {
-                        let va = VirtAddr::new(rb + ((first + off) as u64) * 4096);
+                        let va = VirtAddr::new(rb + ((p_first + off) as u64) * 4096);
                         crate::rmap::remove(*phys, self.root, va);
                     }
                 }
@@ -8725,6 +8733,11 @@ impl AddressSpace {
                 }
                 None => (0, r.phys.len()),
             };
+            // Clamp to the materialized phys prefix: a demand-paged region has no
+            // phys slot (and no PTE to install) for pages past it — they fault in
+            // individually. Keeps a windowed materialize from slicing a short list.
+            let last = last.min(r.phys.len());
+            let first = first.min(last);
 
             let cow_counts = r
                 .perms
@@ -8836,6 +8849,11 @@ impl AddressSpace {
                 }
                 None => (0, r.phys.len()),
             };
+            // Clamp to the materialized phys prefix: a demand-paged region has no
+            // phys slot (and no PTE to install) for pages past it — they fault in
+            // individually. Keeps a windowed materialize from slicing a short list.
+            let last = last.min(r.phys.len());
+            let first = first.min(last);
             let cow_counts = r
                 .perms
                 .contains(RegionPerms::COW)
