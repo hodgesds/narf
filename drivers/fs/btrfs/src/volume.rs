@@ -1201,25 +1201,14 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if !self.supports_writes() {
             return Err(FsError::ReadOnly);
         }
-        self.write_logical_unchecked(logical, src).await
+        self.write_logical_unchecked(logical, src).await.map(|_| ())
     }
 
     /// Root-tree transaction write used only to change the mounted subvolume's
     /// own read-only flag. Clearing that flag must be able to commit while the
     /// current live subvolume is still read-only; ordinary mutations continue
     /// to go through [`Self::write_logical`] and its writeability check.
-    pub(crate) async fn write_logical_root_admin(
-        &self,
-        logical: u64,
-        src: &[u8],
-    ) -> Result<(), FsError> {
-        if self.degraded {
-            return Err(FsError::ReadOnly);
-        }
-        self.write_logical_unchecked(logical, src).await
-    }
-
-    async fn write_logical_unchecked(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
+    async fn write_logical_unchecked(&self, logical: u64, src: &[u8]) -> Result<u64, FsError> {
         // Every node write funnels through here, so this is the one place the
         // node cache has to be invalidated.
         //
@@ -1229,7 +1218,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         // its device read while the write was still in flight may hold
         // pre-write bytes; without the second bump its epoch check would pass
         // and it would publish them as current.
-        self.invalidate_nodes(logical, src.len());
+        let _ = self.invalidate_nodes(logical, src.len());
         let mut done = 0usize;
         while done < src.len() {
             let at = logical
@@ -1263,7 +1252,62 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             done += take;
         }
-        self.invalidate_nodes(logical, src.len());
+        Ok(self.invalidate_nodes(logical, src.len()))
+    }
+
+    /// Publish a node this volume has just written, so the read that follows
+    /// it does not have to fetch back bytes we are already holding.
+    ///
+    /// A commit writes its new nodes and then immediately reads part of the
+    /// tree back — `total_block_group_used` re-reads the freshly written
+    /// extent tree so the superblock's `bytes_used` can never drift from the
+    /// block groups. Every one of those reads is a guaranteed MISS, because
+    /// the write that produced the node invalidated it moments earlier: the
+    /// cache is defeated precisely where it would help most.
+    ///
+    /// This is safe in a way a speculative fill is not — the bytes are what
+    /// was just written, not what was read from somewhere and might be stale.
+    /// It must still be called AFTER the write completes, so the write's own
+    /// trailing invalidation cannot remove the entry it just published.
+    fn cache_written_node(&self, logical: u64, buf: &[u8], epoch: u64) {
+        if buf.len() != self.nodesize() {
+            return; // not a metadata node
+        }
+        let mut cache = self.nodes.lock();
+        // `epoch` is what this write left behind. If it has moved, another
+        // write has touched the cache since — publishing now could put our
+        // bytes over newer ones, so decline. Same trade as a racing fill:
+        // a missed publish, never a wrong answer.
+        if cache.epoch != epoch {
+            return;
+        }
+        if cache.entries.len() >= NODE_CACHE_MAX {
+            cache.entries.clear();
+        }
+        cache.entries.insert(logical, buf.to_vec());
+    }
+
+    /// Write one metadata node and keep it cached.
+    pub async fn write_node(&self, logical: u64, buf: &[u8]) -> Result<(), FsError> {
+        if !self.supports_writes() {
+            return Err(FsError::ReadOnly);
+        }
+        let epoch = self.write_logical_unchecked(logical, buf).await?;
+        self.cache_written_node(logical, buf, epoch);
+        Ok(())
+    }
+
+    /// [`Self::write_node`] for the root-admin path.
+    pub(crate) async fn write_node_root_admin(
+        &self,
+        logical: u64,
+        buf: &[u8],
+    ) -> Result<(), FsError> {
+        if self.degraded {
+            return Err(FsError::ReadOnly);
+        }
+        let epoch = self.write_logical_unchecked(logical, buf).await?;
+        self.cache_written_node(logical, buf, epoch);
         Ok(())
     }
 
@@ -1279,7 +1323,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// here, and deliberately needs no invalidation — it copies each logical
     /// block's bytes unchanged to new backing, so cached contents stay
     /// correct. Superblock writes likewise: they are never read as nodes.
-    fn invalidate_nodes(&self, logical: u64, len: usize) {
+    fn invalidate_nodes(&self, logical: u64, len: usize) -> u64 {
         let node = self.nodesize() as u64;
         let end = logical.saturating_add(len as u64);
         let from = logical.saturating_sub(node.saturating_sub(1));
@@ -1293,6 +1337,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             cache.invalidate(addr);
         }
         cache.epoch = cache.epoch.wrapping_add(1);
+        cache.epoch
     }
 
     /// Read-modify-write one data slice and its P/Q parity. The caller splits
@@ -1360,7 +1405,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         self.write_superblock_unchecked(raw).await
     }
 
-    /// Superblock half of [`Self::write_logical_root_admin`].
+    /// Superblock half of [`Self::write_node_root_admin`].
     pub(crate) async fn write_superblock_root_admin(&self, raw: &[u8]) -> Result<(), FsError> {
         if self.degraded {
             return Err(FsError::ReadOnly);
