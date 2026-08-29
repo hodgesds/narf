@@ -2601,6 +2601,112 @@ kernel_test_in!(
     smoke_scheduler_faulty_policy_cannot_strand_work
 );
 
+fn smoke_scheduler_honors_policy_pick_order() -> TestResult {
+    use crate::{
+        install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
+        TaskHandle,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    // A policy that always requests the LAST runnable candidate. The core's
+    // single-pass pick_next_slot must honor that handle (it is in the top
+    // eligibility tier), so the most-recently-enqueued task is dispatched
+    // first — not the front of the queue. This pins the "honor the policy's
+    // requested slot when it is top-tier" branch of the fused selection.
+    #[derive(Copy, Clone, Debug)]
+    struct PicksLast;
+    impl Scheduler for PicksLast {
+        fn name(&self) -> &'static str {
+            "picks-last"
+        }
+
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            queue
+                .iter_meta()
+                .filter(|(_, meta)| meta.runnable)
+                .map(|(handle, _)| handle)
+                .last()
+        }
+    }
+
+    static ORDER: [AtomicUsize; 3] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    NEXT.store(0, Ordering::Relaxed);
+    for slot in &ORDER {
+        slot.store(0, Ordering::Relaxed);
+    }
+
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, PicksLast).is_err() {
+        return TestResult::Fail("install_scheduler(PicksLast) failed");
+    }
+    // Enqueue tags 1,2,3 in order (queue front→back = [1,2,3]).
+    for tag in 1usize..=3 {
+        spawn(async move {
+            let pos = NEXT.fetch_add(1, Ordering::Relaxed);
+            if pos < ORDER.len() {
+                ORDER[pos].store(tag, Ordering::Relaxed);
+            }
+        });
+    }
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if NEXT.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("not all tasks ran under the picks-last policy");
+    }
+    // The policy requested the last-enqueued task (tag 3) first; the fused
+    // selection must have dispatched it ahead of the queue front (tag 1).
+    if ORDER[0].load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("policy's non-front requested pick was not honored first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_honors_policy_pick_order);
+
+fn smoke_scheduler_select_wake_cpu_prefers_idle_sibling() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::steal::{NumaAwareSteal, StealStrategy};
+
+    let strat = NumaAwareSteal;
+    // CPUs 0..4 online; only cpu 2 idle. A task homed on the busy cpu 0 should
+    // be hinted to the idle sibling cpu 2 so it gets pulled there.
+    let online = |c: CpuId| c.0 < 4;
+    let only_2_idle = |c: CpuId| c.0 == 2;
+    match strat.select_wake_cpu(CpuId(0), &online, &only_2_idle) {
+        Some(t) if t.0 == 2 => {}
+        _ => return TestResult::Fail("expected the idle sibling cpu 2"),
+    }
+
+    // No idle sibling → None (leave the wake on home).
+    let none_idle = |_c: CpuId| false;
+    if strat
+        .select_wake_cpu(CpuId(0), &online, &none_idle)
+        .is_some()
+    {
+        return TestResult::Fail("expected None when no sibling is idle");
+    }
+
+    // Must never hint a CPU to pull the task onto its own home, and must skip
+    // offline CPUs even when they read "idle".
+    let all_idle = |_c: CpuId| true;
+    match strat.select_wake_cpu(CpuId(1), &online, &all_idle) {
+        Some(t) if t.0 != 1 && t.0 < 4 => {}
+        _ => return TestResult::Fail("must return an online sibling that is not home"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_select_wake_cpu_prefers_idle_sibling
+);
+
 fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
     use crate::{
         cpu_bring_up, cpu_take_offline, install_scheduler, spawn, ClassScheduler, CpuId,

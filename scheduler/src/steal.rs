@@ -97,6 +97,50 @@ pub trait StealStrategy: Send + Sync + 'static {
         }
         task.affinity.allowed.contains(thief)
     }
+
+    /// Wake-time placement — the push-side counterpart of stealing, and the
+    /// analogue of Linux's `select_task_rq`. When a task homed on `home` is
+    /// woken while `home` is BUSY, choose an idle sibling to kick so it PULLS
+    /// the freshly-woken task (via the normal steal path) instead of the task
+    /// waiting behind whatever `home` is currently running. Returning `None`
+    /// leaves the wake on `home` — the default, and correct when `home` is the
+    /// only sensible home or nothing is idle.
+    ///
+    /// `is_online` / `is_idle` probe live CPU state; the waker runs in hot,
+    /// possibly IRQ, context, so an impl MUST NOT allocate, block, or take a
+    /// lock an IRQ handler could hold, and MUST bound its scan.
+    ///
+    /// Affinity need not be honored here: the puller's [`Self::allow_steal`]
+    /// rejects a task that may not run on it (and the dispatcher re-checks hard
+    /// affinity before execution), so a mis-hinted kick costs at most one wasted
+    /// IPI — never a correctness violation. The task's `home` is always kicked
+    /// regardless of this hint, so returning a wrong/stale CPU cannot strand it.
+    fn select_wake_cpu(
+        &self,
+        home: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        let _ = (home, is_online, is_idle);
+        None
+    }
+}
+
+/// First online, idle CPU other than `home`, scanning round-robin from
+/// `home + 1`. Alloc-free and bounded by `MAX_CPUS` — safe from the wake path.
+fn first_idle_sibling(
+    home: CpuId,
+    is_online: &dyn Fn(CpuId) -> bool,
+    is_idle: &dyn Fn(CpuId) -> bool,
+) -> Option<CpuId> {
+    let max = narf_lib::percpu::MAX_CPUS as u32;
+    for i in 1..max {
+        let cpu = CpuId((home.0 + i) % max);
+        if is_online(cpu) && is_idle(cpu) {
+            return Some(cpu);
+        }
+    }
+    None
 }
 
 /// NUMA-aware steal — the pre-Wave-F default. Same-NUMA-node victims
@@ -155,6 +199,28 @@ impl StealStrategy for NumaAwareSteal {
 
         out
     }
+
+    fn select_wake_cpu(
+        &self,
+        home: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        // Prefer a cache-warm idle sibling on `home`'s own NUMA node, so the
+        // pulled task's working set stays node-local; fall back to any idle
+        // sibling if the node has none (or topology is unknown).
+        let my_node = narf_acpi::cpu_node(home.0);
+        if my_node.is_some() {
+            let max = narf_lib::percpu::MAX_CPUS as u32;
+            for i in 1..max {
+                let cpu = CpuId((home.0 + i) % max);
+                if is_online(cpu) && is_idle(cpu) && narf_acpi::cpu_node(cpu.0) == my_node {
+                    return Some(cpu);
+                }
+            }
+        }
+        first_idle_sibling(home, is_online, is_idle)
+    }
 }
 
 /// Random steal — uniform permutation of `online` using a tiny LCG
@@ -206,6 +272,16 @@ impl StealStrategy for RandomSteal {
             }
         }
         out
+    }
+
+    fn select_wake_cpu(
+        &self,
+        home: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        // Topology-agnostic strategy: any idle sibling will do.
+        first_idle_sibling(home, is_online, is_idle)
     }
 }
 

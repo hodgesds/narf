@@ -153,6 +153,8 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     }
     if total != 0 {
         crate::mqueue::notify_modify_fd(task, fd_num);
+        // Re-enqueue a FIFO reader parked on the empty buffer (see the helper).
+        wake_fifo_io_waiters(endpoint.ops.as_ref());
     }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

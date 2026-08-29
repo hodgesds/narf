@@ -256,5 +256,10 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     if !endpoint.ops.is_stream() {
         endpoint.description.set_offset(offset);
     }
+    // Mirror of the fifo wake in sys_write: draining a FIFO makes room, so a
+    // writer parked on a full buffer must be re-enqueued now (see the helper).
+    if total != 0 {
+        wake_fifo_io_waiters(endpoint.ops.as_ref());
+    }
     ctx.set_return(SyscallReturn::ok(total as u64));
 }

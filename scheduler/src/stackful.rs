@@ -2622,6 +2622,86 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// `cooperative_yield()` is the primitive `sched_yield(2)` routes through
+    /// under the own-stack model (`sys_yield`). Its Linux contract
+    /// (`do_sched_yield`: reschedule; the CPU runs a ready peer) is that a
+    /// yielding task hands the CPU to a runnable sibling. Two own-stack tasks
+    /// that each record their id then `cooperative_yield()` must therefore
+    /// INTERLEAVE — the first task's yield lets the second run before the first
+    /// runs again; a no-op yield (the pre-fix behaviour) would run one task to
+    /// completion first, giving `ORDER[0] == ORDER[1]`. Driven by the executor's
+    /// real poll rounds so cleanup is the executor's.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_stackful_cooperative_yield_interleaves_siblings() -> TestResult {
+        use core::future::Future;
+        use core::pin::Pin;
+        use core::sync::atomic::AtomicUsize;
+        use core::task::{Context, Poll};
+
+        const N: usize = 4;
+        static ORDER: [AtomicU32; 2 * N] = [const { AtomicU32::new(0xff) }; 2 * N];
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        static DONE: AtomicUsize = AtomicUsize::new(0);
+        SEQ.store(0, Ordering::Release);
+        DONE.store(0, Ordering::Release);
+        for slot in ORDER.iter() {
+            slot.store(0xff, Ordering::Release);
+        }
+
+        struct Yielder {
+            id: u32,
+            remaining: usize,
+        }
+        impl Future for Yielder {
+            type Output = ();
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                while self.remaining > 0 {
+                    let seq = SEQ.fetch_add(1, Ordering::AcqRel);
+                    if seq < ORDER.len() {
+                        ORDER[seq].store(self.id, Ordering::Release);
+                    }
+                    self.remaining -= 1;
+                    // Hands the CPU to the sibling; the executor re-polls us
+                    // (resume here) after the sibling runs.
+                    let _ = super::cooperative_yield();
+                }
+                DONE.fetch_add(1, Ordering::AcqRel);
+                Poll::Ready(())
+            }
+        }
+
+        crate::spawn_stackful(Yielder {
+            id: 0,
+            remaining: N,
+        });
+        crate::spawn_stackful(Yielder {
+            id: 1,
+            remaining: N,
+        });
+        // Drive BOTH tasks to actual completion so neither is left suspended
+        // mid-yield in the run queue.
+        for _ in 0..512 {
+            crate::poll_one_round();
+            if DONE.load(Ordering::Acquire) == 2 {
+                break;
+            }
+        }
+
+        if DONE.load(Ordering::Acquire) != 2 {
+            return TestResult::Fail("yielding tasks did not complete");
+        }
+        let first = ORDER[0].load(Ordering::Acquire);
+        let second = ORDER[1].load(Ordering::Acquire);
+        if first == 0xff || second == 0xff {
+            return TestResult::Fail("a yielding task never recorded");
+        }
+        // The first task's yield must have run the sibling before it ran again.
+        if first == second {
+            return TestResult::Fail("cooperative_yield did not hand off to the sibling");
+        }
+        TestResult::Pass
+    }
+
     /// Stack-overflow tripwire detector: a fresh task's low-end
     /// canary is intact; scribbling any canary word (what a stack
     /// overrunning its bottom does on its way into the heap below)
@@ -4278,6 +4358,18 @@ pub mod tests {
             r.store(0, Ordering::Release);
         }
 
+        // Start from a clean grace period. A prior smoke's scheduler activity
+        // (e.g. `cooperative_yield` kernel_switches) can leave this CPU's QSBR
+        // epoch mid-flight, which would stall THIS test's defer_drop reclamation
+        // and read as a false "leak". Report a quiescent state and advance the
+        // epoch a few times, then `sync()` to force any straggler grace period
+        // to completion, so the scenario below begins on a settled epoch.
+        for _ in 0..8 {
+            narf_rcu::report_quiescent();
+            narf_rcu::advance_epoch_if_pending();
+        }
+        narf_rcu::sync();
+
         struct Payload {
             magic: u64,
         }
@@ -5186,6 +5278,11 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_multi_yield_then_complete
+    );
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_stackful_cooperative_yield_interleaves_siblings
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
