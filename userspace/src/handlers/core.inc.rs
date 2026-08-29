@@ -7596,6 +7596,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
 // and restore WRITE on the faulting AS. Large brk heaps no
 // longer pay an up-front memcpy at fork time.
 
+/// FIFO wake bridge. A named-pipe read or write changes the buffer state, and
+/// a blocked peer — a reader on an empty buffer, a writer on a full one — may be
+/// own-stack parked on the io-waiter registry. `Readiness::set` already fired
+/// that peer's per-fd waker, but for a task switched out of the poll rotation
+/// that only stores an awake bit nothing re-scans, so without this the peer
+/// sleeps to the ~1 ms lost-wake backstop (an anonymous pipe self-notifies; a
+/// FIFO's `FileOps` live in the fs crate, which can't reach the net readiness
+/// layer). Bumping the io-waiter generation re-enqueues the parked peer now.
+///
+/// Downcast-gated to FIFOs, so sockets / pipes / regular files pay only a
+/// vtable type check.
+pub(crate) fn wake_fifo_io_waiters(ops: &dyn narf_filesystem::FileOps) {
+    if ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+        .is_some()
+    {
+        narf_net::readiness::notify(0);
+    }
+}
+
 // ── waitpid / wait4 — parent observes child exit status ────────────
 //
 // POSIX wait4(pid, &status, options, &rusage):

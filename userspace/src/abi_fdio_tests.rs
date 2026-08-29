@@ -71,6 +71,47 @@ fn smoke_abi_fdio_read_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_read_neg);
 
+// A FIFO read/write must re-enqueue an own-stack-parked peer by bumping the
+// io-waiter generation (the fix for named-pipe reads sleeping to the ~1 ms
+// lost-wake backstop instead of waking on the write — stress-ng --fifo 499 ->
+// 43405 bogo-ops). A non-FIFO fd must not, so the gate is free for other fds.
+fn smoke_fifo_read_write_bump_io_waiter_generation() -> TestResult {
+    use narf_filesystem::fifo::{FifoHandle, FifoNode};
+    use narf_filesystem::FileOps;
+
+    let node = FifoNode::new(0x9f10, 0o666);
+    let shared = match node.fifo_shared() {
+        Some(s) => s,
+        None => return TestResult::Fail("fifo node exposes no shared state"),
+    };
+    let writer = FifoHandle::open(shared.clone(), 0x9f10, 0o666, 0, 0, false, true);
+    let reader = FifoHandle::open(shared, 0x9f10, 0o666, 0, 0, true, false);
+
+    let g0 = narf_net::readiness::generation();
+    crate::handlers::wake_fifo_io_waiters(&writer);
+    let g1 = narf_net::readiness::generation();
+    if g1 == g0 {
+        return TestResult::Fail("fifo write did not bump the io-waiter generation");
+    }
+    crate::handlers::wake_fifo_io_waiters(&reader);
+    if narf_net::readiness::generation() == g1 {
+        return TestResult::Fail("fifo read did not bump the io-waiter generation");
+    }
+
+    // The downcast gate: a non-FIFO fd leaves the generation untouched.
+    let g2 = narf_net::readiness::generation();
+    let dev = narf_filesystem::devfs_misc::DevFull;
+    crate::handlers::wake_fifo_io_waiters(&dev);
+    if narf_net::readiness::generation() != g2 {
+        return TestResult::Fail("a non-fifo fd wrongly bumped the io-waiter generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_fifo_read_write_bump_io_waiter_generation
+);
+
 fn smoke_abi_fdio_write_pos() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"")], || {
         let fd = open_fd(b"/abi/f\0")?;
