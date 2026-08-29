@@ -249,6 +249,11 @@ impl UtsNamespace {
 #[derive(Debug)]
 pub struct NetNamespace {
     id: NsId,
+    /// The user namespace of the task that created this one — Linux's
+    /// `ns->user_ns`. `setns` into it is gated on CAP_SYS_ADMIN *here* as
+    /// well as in the caller's own namespace. `None` is the initial user
+    /// namespace.
+    owner: Option<Arc<UserNamespace>>,
     inner: IrqSafeSpinLock<NetInner>,
 }
 
@@ -270,6 +275,17 @@ impl NetNamespace {
     /// nothing else — matches Linux `unshare(CLONE_NEWNET)` shape
     /// where every other device must be moved in explicitly.
     pub fn new_with_loopback() -> Arc<Self> {
+        Self::new_with_loopback_in(None)
+    }
+
+    /// The user namespace this one belongs to (`net->user_ns`).
+    pub fn owner_user_ns(&self) -> Arc<UserNamespace> {
+        self.owner.clone().unwrap_or_else(global_user)
+    }
+
+    /// [`Self::new_with_loopback`] recording the creating task's user
+    /// namespace, per `copy_net_ns`'s `net->user_ns = get_user_ns(user_ns)`.
+    pub fn new_with_loopback_in(owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
         let lo = NetIfaceStub {
             name: String::from("lo"),
             mac: [0u8; 6],
@@ -278,6 +294,7 @@ impl NetNamespace {
         };
         Arc::new(Self {
             id: alloc_ns_id(),
+            owner,
             inner: IrqSafeSpinLock::new(NetInner {
                 ifaces: alloc::vec![lo],
             }),
@@ -329,6 +346,11 @@ impl Drop for NetNamespace {
 #[derive(Debug)]
 pub struct IpcNamespace {
     id: NsId,
+    /// The user namespace of the task that created this one — Linux's
+    /// `ns->user_ns`. `setns` into it is gated on CAP_SYS_ADMIN *here* as
+    /// well as in the caller's own namespace. `None` is the initial user
+    /// namespace.
+    owner: Option<Arc<UserNamespace>>,
     next_shm_id: AtomicU32,
     next_sem_id: AtomicU32,
     next_msg_id: AtomicU32,
@@ -346,12 +368,24 @@ impl IpcNamespace {
     /// Fresh namespace — id counter starts at 1 so `0` (IPC_PRIVATE
     /// in Linux) never collides with a real id.
     pub fn new() -> Arc<Self> {
-        Self::new_with_id(alloc_ns_id())
+        Self::new_with_id(alloc_ns_id(), None)
     }
 
-    fn new_with_id(id: NsId) -> Arc<Self> {
+    /// [`Self::new`] recording the creating task's user namespace, per
+    /// `copy_ipcs`'s `ns->user_ns = get_user_ns(user_ns)`.
+    pub fn new_in(owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
+        Self::new_with_id(alloc_ns_id(), owner)
+    }
+
+    /// The user namespace this one belongs to (`ipc_ns->user_ns`).
+    pub fn owner_user_ns(&self) -> Arc<UserNamespace> {
+        self.owner.clone().unwrap_or_else(global_user)
+    }
+
+    fn new_with_id(id: NsId, owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
         Arc::new(Self {
             id,
+            owner,
             next_shm_id: AtomicU32::new(1),
             next_sem_id: AtomicU32::new(1),
             next_msg_id: AtomicU32::new(1),
@@ -452,7 +486,10 @@ fn global_uts() -> Arc<UtsNamespace> {
 fn global_ipc() -> Arc<IpcNamespace> {
     let mut g = GLOBAL_IPC.lock();
     if g.is_none() {
-        *g = Some(IpcNamespace::new_with_id(initial_ns_id(&INITIAL_IPC_NS_ID)));
+        *g = Some(IpcNamespace::new_with_id(
+            initial_ns_id(&INITIAL_IPC_NS_ID),
+            None,
+        ));
     }
     g.as_ref().expect("just inserted").clone()
 }
@@ -548,7 +585,7 @@ pub fn unshare_uts(task: u64) {
 
 /// Install a fresh per-task net namespace (just `lo`).
 pub fn unshare_net(task: u64) {
-    let fresh = NetNamespace::new_with_loopback();
+    let fresh = NetNamespace::new_with_loopback_in(user_ns_of(task));
     ensure_net_table();
     let mut g = NET_BY_TASK.lock();
     if let Some(map) = g.as_mut() {
@@ -562,7 +599,7 @@ pub fn unshare_ipc(task: u64) {
         crate::handlers::task_to_pid_raw(task).unwrap_or(task),
         task,
     );
-    let fresh = IpcNamespace::new();
+    let fresh = IpcNamespace::new_in(user_ns_of(task));
     ensure_ipc_table();
     let mut g = IPC_BY_TASK.lock();
     if let Some(map) = g.as_mut() {
@@ -901,7 +938,7 @@ type UserTable = BTreeMap<u64, Arc<UserNamespace>>;
 static USER_BY_TASK: IrqSafeSpinLock<Option<UserTable>> = IrqSafeSpinLock::new(None);
 static GLOBAL_USER: IrqSafeSpinLock<Option<Arc<UserNamespace>>> = IrqSafeSpinLock::new(None);
 
-fn global_user() -> Arc<UserNamespace> {
+pub(crate) fn global_user() -> Arc<UserNamespace> {
     let mut g = GLOBAL_USER.lock();
     if g.is_none() {
         *g = Some(UserNamespace::new_initial());

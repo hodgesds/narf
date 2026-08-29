@@ -1749,6 +1749,101 @@ fn smoke_abi_caps_setns_ebadf_precedes_eperm() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_setns_ebadf_precedes_eperm);
 
+/// `SYSCALL_DEFINE2(setns)` settles both -EINVAL cases before any capability
+/// test runs:
+///
+///     if (proc_ns_file(fd_file(f))) {
+///             ns = get_proc_ns(file_inode(fd_file(f)));
+///             if (flags && (ns->ns_type != flags))
+///                     err = -EINVAL;
+///             ...
+///     } else {
+///             err = -EINVAL;
+///     }
+///     if (err)
+///             goto out;
+///     err = prepare_nsset(flags, &nsset);   /* ... then install() checks caps */
+///
+/// NARF tested CAP_SYS_ADMIN immediately after -EBADF, so an unprivileged
+/// caller passing an ordinary file descriptor was told its PRIVILEGES were
+/// wrong when its ARGUMENT was. A runtime probing whether a namespace type is
+/// supported reads EPERM as "retry as root" and EINVAL as "unsupported";
+/// swapping them sends it down the wrong path entirely.
+///
+/// The privileged arm is the control: it reaches the same -EINVAL, which is
+/// what shows the ordering — not the capability — is what changed.
+fn smoke_abi_caps_setns_einval_precedes_eperm() -> TestResult {
+    with_setup(|| {
+        // fd 1 is open but is not a namespace file, so it takes the `else`
+        // branch's -EINVAL.
+        drop_all_caps();
+        match call(Syscall::Setns.raw(), a1(1, 0)) {
+            Some(-22) => {}
+            Some(-1) => return Err("setns checked the capability before the descriptor kind"),
+            _ => return Err("setns(non-namespace fd, unprivileged): want -EINVAL"),
+        }
+        // Same answer with full privilege — the fd, not the credential, is
+        // what makes this EINVAL.
+        set_caps(!0, !0);
+        match call(Syscall::Setns.raw(), a1(1, 0)) {
+            Some(-22) => Ok(()),
+            _ => Err("setns(non-namespace fd, privileged): want -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_caps_setns_einval_precedes_eperm);
+
+/// `userns_install` refuses to re-enter the namespace the caller is already
+/// in, and the comment above it says why:
+///
+///     /* Don't allow gaining capabilities by reentering
+///      * the same user namespace.
+///      */
+///     if (user_ns == current_user_ns())
+///             return -EINVAL;
+///
+/// That is a security rule, not tidiness. The function ends in
+/// `set_cred_user_ns`, which grants a FULL capability set — so without this
+/// check a task that had dropped its capabilities could get every one of them
+/// back by re-entering its own user namespace, which it can always open a
+/// descriptor to.
+///
+/// The wrong-type arm below shares the fixture and pins the other -EINVAL:
+/// `flags && ns->ns_type != flags`, also decided before any capability test.
+fn smoke_abi_caps_setns_user_ns_reentry_is_einval() -> TestResult {
+    with_setup(|| {
+        const CLONE_NEWUSER: u64 = 0x1000_0000;
+        const CLONE_NEWUTS: u64 = 0x0400_0000;
+        narf_filesystem::procfs::install_proc_hooks(
+            crate::handlers::proc_current_pid,
+            crate::handlers::proc_list_pids,
+            crate::handlers::proc_task_info,
+        );
+        let path = b"/proc/self/ns/user\0";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open of /proc/self/ns/user failed"),
+        };
+        // Wrong type for this fd: -EINVAL, and reached without privilege.
+        drop_all_caps();
+        if call(Syscall::Setns.raw(), a1(fd, CLONE_NEWUTS)) != Some(-22) {
+            return Err("setns(user ns fd, CLONE_NEWUTS) was not -EINVAL");
+        }
+        // Right type, but it is the namespace the caller is already in.
+        // Privileged, so a surviving capability check cannot be what answers.
+        set_caps(!0, !0);
+        match call(Syscall::Setns.raw(), a1(fd, CLONE_NEWUSER)) {
+            Some(-22) => Ok(()),
+            Some(0) => Err("setns re-entered the caller's own user namespace"),
+            _ => Err("setns(own user ns): want -EINVAL"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_setns_user_ns_reentry_is_einval
+);
+
 fn smoke_abi_caps_setpriority_foreign_uid_is_eperm() -> TestResult {
     with_setup(|| {
         // `set_one_prio_perm`: the caller's EFFECTIVE uid must match the

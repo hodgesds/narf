@@ -3922,6 +3922,119 @@ pub(crate) fn uts_admin(task: u64) -> bool {
     }
 }
 
+/// What `setns(2)`'s per-flavour `install` hook decided.
+#[cfg(feature = "container")]
+pub(crate) enum SetnsVerdict {
+    Ok,
+    Einval,
+    Eperm,
+}
+
+/// The `install` preconditions for joining `held` — `kernel/nsproxy.c`'s
+/// `validate_ns` dispatching to `utsns_install`, `ipcns_install`,
+/// `netns_install`, `pidns_install`, `mntns_install` or `userns_install`.
+///
+/// Every flavour but user asks the SAME pair:
+///
+///     if (!ns_capable(ns->user_ns, CAP_SYS_ADMIN) ||
+///         !ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN))
+///             return -EPERM;
+///
+/// Both halves matter. The first is authority over the namespace being
+/// JOINED — without it any task could walk into a container by opening its
+/// /proc/<pid>/ns file. The second is authority in the caller's own
+/// namespace, which is what stops a task that has dropped into an
+/// unprivileged user namespace from using a namespace fd it still holds as a
+/// way back out.
+///
+/// Two flavours differ, and both differences are load-bearing:
+///
+/// - mount adds `!ns_capable(user_ns, CAP_SYS_CHROOT)`. Joining a mount
+///   namespace relocates the caller's root, so it demands the capability that
+///   governs exactly that, not just CAP_SYS_ADMIN.
+/// - user has no caller-namespace check at all, and instead rejects
+///   re-entering the namespace it is already in:
+///
+///       /* Don't allow gaining capabilities by reentering
+///        * the same user namespace.
+///        */
+///       if (user_ns == current_user_ns())
+///               return -EINVAL;
+///
+///   That EINVAL is a security rule, not a tidiness one. `userns_install`
+///   ends in `set_cred_user_ns`, which grants a FULL capability set; without
+///   this check a task that had dropped its capabilities could re-enter its
+///   own namespace to get them all back.
+#[cfg(feature = "container")]
+pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs) -> SetnsVerdict {
+    use crate::namespaces::HeldNs;
+    // `ns_capable(nsset->cred->user_ns, CAP_SYS_ADMIN)` — the caller's own.
+    let own_admin = task_capable_in_own_ns(caller, CAP_SYS_ADMIN);
+    // Authority over the namespace being joined. The `*Global` variants are
+    // the initial namespaces, owned by the initial user namespace, so the
+    // question there is the host one.
+    let target_admin = match held {
+        HeldNs::Uts(ns) => task_ns_capable(caller, &ns.owner_user_ns(), CAP_SYS_ADMIN),
+        HeldNs::Net(ns) => task_ns_capable(caller, &ns.owner_user_ns(), CAP_SYS_ADMIN),
+        HeldNs::Ipc(ns) => task_ns_capable(caller, &ns.owner_user_ns(), CAP_SYS_ADMIN),
+        HeldNs::Pid(ns) => task_ns_capable(caller, &ns.owner_user_ns(), CAP_SYS_ADMIN),
+        HeldNs::Mnt(ns) => match ns
+            .owner()
+            .and_then(|owner| {
+                owner
+                    .as_any()
+                    .downcast_ref::<crate::namespaces::UserNamespace>()
+            }) {
+            Some(user_ns) => task_ns_capable(caller, user_ns, CAP_SYS_ADMIN),
+            None => task_capable(caller, CAP_SYS_ADMIN),
+        },
+        HeldNs::User(ns) => task_ns_capable(caller, ns, CAP_SYS_ADMIN),
+        // LINUX-GAP: `CgroupNamespace` does not record its owning user
+        // namespace, so joining one is measured against the host. That is the
+        // restrictive direction — a container cannot join its own cgroup
+        // namespace where Linux would let it — and closing it means giving
+        // cgroupfs the same owner field the mount, uts, net, ipc and pid
+        // namespaces now carry.
+        #[cfg(feature = "cgroup")]
+        HeldNs::Cgroup(_) => task_capable(caller, CAP_SYS_ADMIN),
+        HeldNs::NetGlobal(_)
+        | HeldNs::IpcGlobal(_)
+        | HeldNs::PidGlobal(_)
+        | HeldNs::MntGlobal(_) => task_capable(caller, CAP_SYS_ADMIN),
+    };
+
+    if let HeldNs::User(ns) = held {
+        // `if (user_ns == current_user_ns()) return -EINVAL;`
+        if ns.id() == crate::namespaces::current_user_ns(caller).id() {
+            return SetnsVerdict::Einval;
+        }
+        // `if (!thread_group_empty(current)) return -EINVAL;` — a thread
+        // group must share one user namespace.
+        if !thread_group_empty(caller) {
+            return SetnsVerdict::Einval;
+        }
+        // No caller-namespace check for this flavour.
+        return if target_admin {
+            SetnsVerdict::Ok
+        } else {
+            SetnsVerdict::Eperm
+        };
+    }
+
+    let extra = match held {
+        // `!ns_capable(user_ns, CAP_SYS_CHROOT)` — mount only.
+        HeldNs::Mnt(_) | HeldNs::MntGlobal(_) => {
+            task_capable_in_own_ns(caller, CAP_SYS_CHROOT)
+        }
+        _ => true,
+    };
+    if target_admin && own_admin && extra {
+        SetnsVerdict::Ok
+    } else {
+        SetnsVerdict::Eperm
+    }
+}
+
 /// `ns_capable(__task_cred(p)->user_ns, cap)` — authority over ANOTHER task,
 /// measured in THAT task's user namespace.
 ///

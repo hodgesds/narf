@@ -41,6 +41,11 @@ pub struct PidNamespace {
     outer_to_inner: IrqSafeSpinLock<BTreeMap<u64, u64>>,
     /// Released inner ids available for re-use.
     free: IrqSafeSpinLock<BTreeSet<u64>>,
+    /// The user namespace of the task that created this one — Linux's
+    /// `pid_ns->user_ns`. `setns` into it is gated on CAP_SYS_ADMIN here as
+    /// well as in the caller's own namespace. `None` is the initial user
+    /// namespace.
+    owner: IrqSafeSpinLock<Option<Arc<crate::namespaces::UserNamespace>>>,
 }
 
 impl PidNamespace {
@@ -53,7 +58,24 @@ impl PidNamespace {
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
             free: IrqSafeSpinLock::new(BTreeSet::new()),
+            owner: IrqSafeSpinLock::new(None),
         })
+    }
+
+    /// [`Self::new`] recording the creating task's user namespace, per
+    /// `copy_pid_ns`'s `ns->user_ns = get_user_ns(user_ns)`.
+    pub fn new_in(owner: Option<Arc<crate::namespaces::UserNamespace>>) -> Arc<Self> {
+        let ns = Self::new();
+        *ns.owner.lock() = owner;
+        ns
+    }
+
+    /// The user namespace this one belongs to (`pid_ns->user_ns`).
+    pub fn owner_user_ns(&self) -> Arc<crate::namespaces::UserNamespace> {
+        self.owner
+            .lock()
+            .clone()
+            .unwrap_or_else(crate::namespaces::global_user)
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -226,7 +248,7 @@ pub fn fork_return_to_parent(parent_task: u64, child_outer: u64, child_self_inne
 /// Linux `unshare(CLONE_NEWPID)` semantics: creates a fresh PID namespace for
 /// future children of `task`. The calling task itself remains in its current namespace.
 pub fn unshare_pid_ns_for_children(task: u64) -> Arc<PidNamespace> {
-    let ns = PidNamespace::new();
+    let ns = PidNamespace::new_in(crate::namespaces::user_ns_of(task));
     let mut g = TASK_PID_NS_FOR_CHILDREN.lock();
     ns_table_init(&mut g);
     if let Some(m) = g.as_mut() {
