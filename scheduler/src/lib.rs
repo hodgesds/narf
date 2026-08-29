@@ -3470,8 +3470,8 @@ pub fn run_until_empty() {
                         // Window collapsed (idle CPU): one cheap probe before
                         // committing to the spin-grow cycle, so a lone wake
                         // that already landed skips the HLT.
-                        woke = narf_lib::deferred_wake::drain_and_wake() > 0
-                            || wake_list_pending(cpu);
+                        woke =
+                            narf_lib::deferred_wake::drain_and_wake() > 0 || wake_list_pending(cpu);
                     }
                     if woke {
                         // Hit: grow the window (seed if collapsed, else ×2).
@@ -4100,9 +4100,7 @@ pub fn run_forever() -> ! {
             // the published-HALTED fence, that wake is slept over indefinitely
             // (a tickless idle AP has no periodic IRQ to rescue it). Mirrors
             // Linux `current_clr_polling_and_test()` before HLT (idle.c).
-            nonempty
-                || narf_lib::deferred_wake::has_pending()
-                || wake_list_pending(cpu)
+            nonempty || narf_lib::deferred_wake::has_pending() || wake_list_pending(cpu)
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);

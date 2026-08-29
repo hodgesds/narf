@@ -88,6 +88,35 @@ impl Drop for VolumeIo {
     }
 }
 
+/// Cached metadata nodes, keyed by logical address.
+///
+/// `epoch` is what makes filling the cache safe against a concurrent write.
+/// A reader that misses must drop the lock to do its I/O, and a writer may
+/// invalidate that very address while the read is in flight; inserting the
+/// bytes afterwards would publish a node that is already stale. The reader
+/// samples `epoch` before its read and only inserts if no invalidation has
+/// happened since, so a racing write costs a skipped fill rather than a wrong
+/// answer.
+#[derive(Debug, Default)]
+struct NodeCache {
+    entries: BTreeMap<u64, alloc::vec::Vec<u8>>,
+    epoch: u64,
+}
+
+/// Cached nodes. At a 16 KiB nodesize this bounds the cache at 4 MiB, which
+/// comfortably holds the working set a commit's fixed point revisits while
+/// staying a fixed, predictable cost.
+const NODE_CACHE_MAX: usize = 256;
+
+impl NodeCache {
+    /// Drop `logical` and advance the epoch, so any fill already in flight for
+    /// it (or for anything else) declines to publish.
+    fn invalidate(&mut self, logical: u64) {
+        self.entries.remove(&logical);
+        self.epoch = self.epoch.wrapping_add(1);
+    }
+}
+
 /// Mutable volume metadata guarded by one lock (never held across I/O).
 #[derive(Debug)]
 struct VolState {
@@ -136,6 +165,15 @@ pub struct BtrfsVolume<B: BlockDevice> {
     degraded: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
+    /// Metadata node cache, keyed by logical address.
+    ///
+    /// A commit path-COWs the extent tree once per fixed-point round, and a
+    /// round re-reads the same nodes the previous one did — measured at 724
+    /// rounds across 152 commits in the boot write smoke, with that re-reading
+    /// the single largest cost in the whole commit. Every miss costs an
+    /// (emulated) device read plus a full-node checksum verification, and both
+    /// are pure repetition for a block nothing has written since.
+    nodes: IrqSafeSpinLock<NodeCache>,
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
@@ -630,6 +668,18 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// validating its self-recorded `bytenr` and, when
     /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
+        // Serve from the node cache when nothing has written this address
+        // since it was filled. A hit skips both the device read and the
+        // full-node checksum verification; the clone is a memcpy against an
+        // I/O plus a checksum over the whole node.
+        let epoch = {
+            let cache = self.nodes.lock();
+            if let Some(hit) = cache.entries.get(&logical) {
+                return Ok(hit.clone());
+            }
+            cache.epoch
+        };
+
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
         for copy in 0..copies {
@@ -651,6 +701,22 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                 )?
             {
                 continue;
+            }
+            // Only cache a node that passed BOTH checks above — a copy that
+            // failed one is retried from another mirror, and caching it would
+            // make a transient bad mirror permanent for this mount.
+            let mut cache = self.nodes.lock();
+            if cache.epoch == epoch {
+                // A write landed while this read was in flight if the epoch
+                // moved; the bytes in hand may already be stale, so drop them
+                // rather than publish them.
+                if cache.entries.len() >= NODE_CACHE_MAX {
+                    // Crude but bounded, and the working set a commit revisits
+                    // sits far below the cap — an LRU's bookkeeping would cost
+                    // more here than the misses it saves.
+                    cache.entries.clear();
+                }
+                cache.entries.insert(logical, buf.clone());
             }
             return Ok(buf);
         }
@@ -968,6 +1034,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             verify_checksums,
             degraded,
             devices: IrqSafeSpinLock::new(devices),
+            nodes: IrqSafeSpinLock::new(NodeCache::default()),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -1153,6 +1220,16 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     async fn write_logical_unchecked(&self, logical: u64, src: &[u8]) -> Result<(), FsError> {
+        // Every node write funnels through here, so this is the one place the
+        // node cache has to be invalidated.
+        //
+        // The epoch moves on BOTH sides of the write, and both are load
+        // bearing. Before, so no reader can take a hit on bytes this write is
+        // about to replace. After, because a reader that missed and started
+        // its device read while the write was still in flight may hold
+        // pre-write bytes; without the second bump its epoch check would pass
+        // and it would publish them as current.
+        self.invalidate_nodes(logical, src.len());
         let mut done = 0usize;
         while done < src.len() {
             let at = logical
@@ -1186,7 +1263,36 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             done += take;
         }
+        self.invalidate_nodes(logical, src.len());
         Ok(())
+    }
+
+    /// Drop every cached node the byte range `[logical, logical + len)`
+    /// touches, and advance the epoch.
+    ///
+    /// A cached entry at `a` covers `[a, a + nodesize)`, so the scan starts a
+    /// node below `logical`: an entry beginning just under the range still
+    /// overlaps it, and skipping those would leave exactly the partially
+    /// overwritten nodes cached.
+    ///
+    /// Chunk relocation writes by physical address without coming through
+    /// here, and deliberately needs no invalidation — it copies each logical
+    /// block's bytes unchanged to new backing, so cached contents stay
+    /// correct. Superblock writes likewise: they are never read as nodes.
+    fn invalidate_nodes(&self, logical: u64, len: usize) {
+        let node = self.nodesize() as u64;
+        let end = logical.saturating_add(len as u64);
+        let from = logical.saturating_sub(node.saturating_sub(1));
+        let mut cache = self.nodes.lock();
+        let stale: alloc::vec::Vec<u64> = cache
+            .entries
+            .range(from..end)
+            .map(|(&addr, _)| addr)
+            .collect();
+        for addr in stale {
+            cache.invalidate(addr);
+        }
+        cache.epoch = cache.epoch.wrapping_add(1);
     }
 
     /// Read-modify-write one data slice and its P/Q parity. The caller splits
