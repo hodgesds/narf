@@ -3518,10 +3518,11 @@ fn task_vm_bytes(pid: u64) -> u64 {
 /// latest wins, matching the collapsed pending bit). REALTIME signals
 /// (32..=64) DO queue: each sigqueue(2) is an independent delivery with
 /// its own `si_value`, delivered in FIFO order. The pending bitmask in
-/// `SIGNAL_PENDING` still carries one bit per signum; consumers re-arm
-/// the bit after draining one instance while more remain queued
-/// (`rearm_pending_if_queued`), so N queued RT signals produce N
-/// deliveries instead of collapsing to one.
+/// `SIGNAL_PENDING` still carries one bit per signum; consumers re-arm the
+/// bit after draining one instance while more remain queued (atomically, in
+/// the same bucket-locked step that pops the payload — see
+/// `sigqueue_take_and_clear` / `sigwait_take_locked`), so N queued RT signals
+/// produce N deliveries instead of collapsing to one.
 ///
 /// Drained on delivery (`default_signal_delivery`), by `rt_sigtimedwait`,
 /// or by a `signalfd` read so a stale payload never attaches to a later
@@ -3744,7 +3745,7 @@ pub(crate) const SIGQUEUE_BACKPRESSURE_DEPTH: usize = 4;
 /// Pop and return the OLDEST queued `(si_code, si_value, si_pid)` for
 /// `(task, signum)`, if any. FIFO order preserves rt_sigqueueinfo
 /// submission order for RT signals; standard signals hold at most one.
-pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64, u32)> {
+pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<SigqueuePayload> {
     let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
     let m = g.as_mut()?;
     let q = m.get_mut(&(task, signum))?;
@@ -3753,6 +3754,55 @@ pub(crate) fn take_sigqueue_info(task: u64, signum: u32) -> Option<(i32, u64, u3
         m.remove(&(task, signum));
     }
     v
+}
+
+/// Read (WITHOUT removing) the OLDEST queued payload for `(task, signum)`.
+/// The handler-delivery path builds the signal frame from this, then commits
+/// the dequeue via [`sigqueue_commit_delivery`] only AFTER the frame write
+/// succeeds — so a failed `deliver_signal` (bad user stack) leaves the payload
+/// AND the pending bit intact for a clean retry, instead of draining the
+/// siginfo before delivery is confirmed (which made the retry deliver a
+/// payload-less SI_USER sival=0).
+pub(crate) fn peek_sigqueue_info(task: u64, signum: u32) -> Option<SigqueuePayload> {
+    SIGQUEUE_INFO[sigqueue_bucket(task)]
+        .values
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&(task, signum)).and_then(|q| q.front().copied()))
+}
+
+/// Pop the oldest queued payload for `(task, signum)` AND clear (or re-arm, if
+/// more RT instances remain) its pending bit — BOTH under the sigqueue bucket
+/// lock, so the pop and the bit update are atomic against a racing
+/// `sigqueue_store_and_raise_bit` (the same invariant the sigwait consumer
+/// holds via [`sigwait_take_locked`]): a concurrent sender can never strand the
+/// bit over an emptied queue nor lose its payload behind a cleared bit. Used by
+/// both the handler-delivery commit and the signalfd read — the two consumers
+/// that already know which `signum` they are draining. Returns the popped
+/// payload (`None` for a bit set with no siginfo, i.e. a kill(2)-style
+/// SI_USER signal). Lock order: SIGQUEUE bucket (outer) → SIGNAL_PENDING
+/// (inner).
+pub(crate) fn sigqueue_take_and_clear(task: u64, signum: u32) -> Option<SigqueuePayload> {
+    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
+    let payload = g.as_mut().and_then(|m| {
+        let q = m.get_mut(&(task, signum))?;
+        let v = q.pop_front();
+        if q.is_empty() {
+            m.remove(&(task, signum));
+        }
+        v
+    });
+    let more = g
+        .as_ref()
+        .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()));
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        if more {
+            *slot |= sig_bit(signum);
+        } else {
+            *slot &= !(sig_bit(signum));
+        }
+    });
+    payload
 }
 
 /// True when more queued instances of `(task, signum)` remain after a
@@ -3765,18 +3815,6 @@ pub(crate) fn sigqueue_more_queued(task: u64, signum: u32) -> bool {
         .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()))
 }
 
-/// Re-set the pending bit for `signum` when more queued instances remain
-/// — the RT-queue drain step every consumer (handler delivery,
-/// rt_sigtimedwait, signalfd) runs after clearing the bit, so the NEXT
-/// return-to-user / wait delivers the next instance with its own payload.
-pub(crate) fn rearm_pending_if_queued(task: u64, signum: u32) {
-    if !sigqueue_more_queued(task, signum) {
-        return;
-    }
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
-        *slot |= sig_bit(signum);
-    });
-}
 
 /// Drop every queued payload for `(task, signum)` — used when the signal
 /// is consumed by an ignoring disposition (SIG_IGN / default-Ignore):
@@ -6620,8 +6658,11 @@ pub(crate) fn default_signal_delivery_restricted(
     }
     // Async signals: si_code = SI_USER (0), si_addr = 0 — unless this
     // instance was queued by rt_sigqueueinfo/sigqueue, in which case
-    // honour its si_code (SI_QUEUE) + si_value (the sigval payload).
-    let (si_code, si_value, si_pid) = take_sigqueue_info(task, signum).unwrap_or((0, 0, 0));
+    // honour its si_code (SI_QUEUE) + si_value (the sigval payload). PEEK the
+    // payload (don't dequeue yet): the commit below pops it only after the
+    // frame write succeeds, so a failed delivery retries with the payload
+    // still queued instead of draining it into a payload-less SI_USER retry.
+    let (si_code, si_value, si_pid) = peek_sigqueue_info(task, signum).unwrap_or((0, 0, 0));
     let params = build_delivery_params(
         task, action, signum, syscall_no, si_code, 0, si_value, si_pid,
     );
@@ -6655,16 +6696,14 @@ pub(crate) fn default_signal_delivery_restricted(
         params.restorer != 0,
         (params.flags & 0x4) != 0 || params.restorer != 0,
     );
-    // Clear only after the rewrite succeeded — a failed
-    // delivery (e.g. arch returns false) should leave pending
-    // alone so the next trap retries.
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
-        *slot &= !(sig_bit(signum));
-    });
-    // RT queueing: this delivery drained ONE queued instance (the take
-    // above); if more remain, re-arm the bit so the next return-to-user
-    // delivers the next instance with its own si_value.
-    rearm_pending_if_queued(task, signum);
+    // Commit only after the rewrite succeeded — a failed delivery (handled
+    // above) leaves the payload AND the pending bit intact so the next trap
+    // retries cleanly. Pop the delivered instance and clear (or re-arm, if
+    // more RT instances remain) the pending bit atomically under the sigqueue
+    // bucket lock, so a concurrent sender can neither strand the bit over an
+    // emptied queue nor lose its payload behind a cleared bit. (The peek above
+    // read this same front instance to build the frame.)
+    let _ = sigqueue_take_and_clear(task, signum);
     // Save the pre-handler mask so `sys_sigreturn` restores it (POSIX),
     // undoing the auto-block below. Captured BEFORE the SA_NODEFER OR so the
     // restored value is the mask in effect when the handler was entered.
