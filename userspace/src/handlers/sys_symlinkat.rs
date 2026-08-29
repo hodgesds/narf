@@ -19,21 +19,20 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
     let target_ptr = args.arg0;
     let newdirfd = args.arg1 as i64;
     let link_ptr = args.arg2;
-    let efault = SyscallReturn::ok((-14i64) as u64);
-    let target_str = match copy_user_cstr(target_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+    let target_str = match copy_user_cstr_checked(target_ptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
-    let link_str = match copy_user_cstr(link_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+            }
+        };
+    let link_str = match copy_user_cstr_checked(link_ptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     let task = current_task_id();
     let joined = match resolve_at_path(task, newdirfd, &link_str) {
         Ok(p) => p,

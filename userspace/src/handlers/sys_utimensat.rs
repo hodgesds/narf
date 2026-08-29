@@ -61,13 +61,13 @@ pub(crate) fn sys_utimensat(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let raw = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
             return;
-        }
-    };
+            }
+        };
     // Relative path against a real directory fd (AT_FDCWD / absolute
     // pass through) — same prepend as sys_readlinkat / sys_linkat.
     const AT_FDCWD: i64 = -100;

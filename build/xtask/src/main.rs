@@ -2157,10 +2157,8 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn {qemu}"))?;
 
-    let secs = std::env::var("XTASK_QEMU_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(600);
+    let secs = kernel_test_timeout_secs();
+    let started = std::time::Instant::now();
     let status = match child.wait_timeout(Duration::from_secs(secs))? {
         Some(status) => status,
         None => {
@@ -2169,7 +2167,13 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             bail!("xtask: {qemu} timed out after {secs}s (possible kernel hang)");
         }
     };
-    println!("xtask: {qemu} exited with {status}");
+    // Report the phase duration, not just the exit status. The timeout below
+    // is chosen from how long this actually takes, and the only way that stays
+    // true is if every run says what it took.
+    println!(
+        "xtask: {qemu} exited with {status} after {}s (cap {secs}s)",
+        started.elapsed().as_secs()
+    );
 
     if gate_exit {
         // All-pass status mirrors boot-smoke's clean-exit encoding:
@@ -2243,6 +2247,32 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
     wait_for_boot_smoke(child, "boot-smoke", boot_smoke_timeout_secs(), args.arch)
 }
 
+/// How long to let the kernel-test QEMU phase run before calling it a hang.
+///
+/// The whole suite is one boot: every subsystem's smokes run in a single
+/// kernel, so this bound has to cover all of them, not the slowest one. A
+/// measured full local run (`cargo xtask test` with no `--subsystem`, 8041
+/// smokes) spends 1228 s in this phase on this KVM host. The default is
+/// roughly double that, because what it has to survive is not the median run
+/// but the worst one on a loaded machine — and because being generous costs
+/// nothing: a healthy run exits on its own and never approaches the cap.
+///
+/// The previous 600 s could not pass a full local run at all — it killed the
+/// boot part-way through `syscall_abi` and reported "possible kernel hang"
+/// for a suite that was working correctly. CI never saw it, because the
+/// workflow already exports `XTASK_QEMU_TIMEOUT_SECS=2400`; only developers
+/// running everything locally hit it, and the failure looked like a kernel
+/// bug rather than a harness limit.
+///
+/// A scoped run (`--subsystem`) finishes in a fraction of this, so the cap
+/// costs nothing there: it bounds a hang, it does not pace a healthy run.
+fn kernel_test_timeout_secs() -> u64 {
+    std::env::var("XTASK_QEMU_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(2400)
+}
+
 /// How long to let a boot-smoke run take before calling it a hang.
 ///
 /// This MUST stay above the largest per-initcall budget the kernel itself
@@ -2254,11 +2284,17 @@ fn boot_smoke_cmd(args: &BuildArgs) -> Result<()> {
 /// and was really the harness being stricter than the workload it launched.
 ///
 /// The headroom above 120 s is for host load, not for the workload growing
-/// into it. `btrfs-write-smoke` spends ~87% of its time in the 64-file split
-/// loop, and its per-file cost RISES with tree size (12.4e9 cycles for the
-/// first sixteen files, 29.9e9 for the next sixteen) because every write
-/// drives a full `commit_txn`. That is worth fixing on its own terms; until
-/// it is, this bound has to accommodate it rather than flag it as a hang.
+/// into it.
+///
+/// This used to record that `btrfs-write-smoke`'s per-file cost ROSE with
+/// tree size — 12.4e9 cycles for the first sixteen files, 29.9e9 for the next
+/// sixteen — because every write drove a full `commit_txn`, and noted that as
+/// worth fixing. It was fixed: writes now accumulate into a batched
+/// transaction, so a commit is amortised across operations instead of paid
+/// per write, and the smoke measures around 2.9e9 cycles rather than the
+/// 19e9 it did. The bound is kept where it is anyway — it exists to catch a
+/// hang, and there is no reason to make it tighter than the kernel's own
+/// 120 000 ms initcall budget plus room for a loaded host.
 fn boot_smoke_timeout_secs() -> u64 {
     std::env::var("XTASK_BOOT_SMOKE_TIMEOUT_SECS")
         .ok()

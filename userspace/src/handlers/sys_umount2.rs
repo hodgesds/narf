@@ -4,7 +4,6 @@ use super::*;
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const EBUSY: i64 = 16;
-const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
 
 #[inline]
@@ -72,14 +71,14 @@ pub(crate) fn sys_umount2(ctx: &mut dyn TrapContext) {
     // Linux `umount2(2)`: (const char *target, int flags). `target` is a
     // NUL-terminated path; there is no length arg. (Was NARF-native
     // (ptr, len, flags), which mis-read a musl caller's flags as the length.)
-    let target_raw = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
+    let target_raw = match copy_user_cstr_checked(args.arg0, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
             // `user_path_at` on an unreadable name → -EFAULT.
-            ctx.set_return(fail(EFAULT));
+            ctx.set_return(fail(errno));
             return;
-        }
-    };
+            }
+        };
     // Resolve against the caller's cwd (and re-root under any chroot), like
     // sys_pivot_root / sys_mount. systemd's switch-root does
     // `fchdir(new_root_fd); pivot_root(".", "."); umount2(".", MNT_DETACH)` —

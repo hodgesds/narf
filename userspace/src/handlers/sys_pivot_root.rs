@@ -3,7 +3,6 @@ use super::*;
 
 const ENOENT: i64 = 2;
 const EBUSY: i64 = 16;
-const EFAULT: i64 = 14;
 const ENOTDIR: i64 = 20;
 
 #[inline]
@@ -43,21 +42,21 @@ pub(crate) fn sys_pivot_root(ctx: &mut dyn TrapContext) {
     // lengths. The old NARF-native four-argument decoder retained the
     // terminator in the stored root and consumed the put_old pointer as a
     // length, so successful calls installed a path such as "/new_root\0".
-    let new_root = match copy_user_cstr(args.arg0, 4096) {
-        Some(s) => s,
-        None => {
+    let new_root = match copy_user_cstr_checked(args.arg0, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
             // `user_path_at` on an unreadable name → -EFAULT.
-            ctx.set_return(fail(EFAULT));
+            ctx.set_return(fail(errno));
             return;
-        }
-    };
-    let put_old = match copy_user_cstr(args.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail(EFAULT));
+            }
+        };
+    let put_old = match copy_user_cstr_checked(args.arg1, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(fail(errno));
             return;
-        }
-    };
+            }
+        };
     // new_root / put_old are resolved against the caller's cwd like any path
     // argument. The canonical container idiom is
     // `fchdir(new_root_fd); pivot_root(".", ".")` — systemd's

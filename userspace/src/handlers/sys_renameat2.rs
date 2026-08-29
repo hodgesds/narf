@@ -19,26 +19,25 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     const RENAME_NOREPLACE: u32 = 1;
     // A bare -1 lands in glibc's [-4095,-1] errno window as EPERM, which
     // reads as a permission problem; return real errnos instead.
-    let efault = SyscallReturn::ok((-14i64) as u64);
     let einval = SyscallReturn::ok((-22i64) as u64);
     if flags & !RENAME_NOREPLACE != 0 {
         ctx.set_return(einval);
         return;
     }
-    let old_path = match copy_user_cstr(old_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+    let old_path = match copy_user_cstr_checked(old_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
-    let new_path = match copy_user_cstr(new_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+            }
+        };
+    let new_path = match copy_user_cstr_checked(new_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     // glibc implements plain `rename(2)` on top of renameat2, so this is
     // the path a distro's libc actually takes — it has to resolve
     // relative paths against the cwd exactly like `sys_rename` does.

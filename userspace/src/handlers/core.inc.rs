@@ -2579,17 +2579,38 @@ const SEEK_END: u64 = 2;
 // `FsError::Unsupported`, which we translate to `InvalidOp` on the
 // wire (no errno channel today).
 
-/// Map an `FsError` from a delete-family op to the Linux errno userspace
-/// expects. `NotFound` → ENOENT (the missing-name case), a directory
-/// target → EISDIR (MemFs flags that as `InvalidPath`), a read-only mount
-/// → EROFS; everything else keeps the generic -1 sentinel (musl EPERM).
+/// Map an `FsError` from a delete-family op to the errno `unlink(2)` reports.
+///
+/// The arms come from `fs/namei.c::vfs_unlink` and the `may_delete_dentry`
+/// it opens with. Everything the latter rejects has its own errno, and the
+/// filesystem's own `->unlink` supplies the rest — btrfs starts a transaction
+/// to unlink, so ENOSPC and EDQUOT are ordinary answers there, not exotic
+/// ones.
+///
+/// The catch-all stays EPERM because that is what `vfs_unlink` returns for
+/// the conditions it names last (a swapfile, a filesystem with no `->unlink`),
+/// but it is now a genuine default rather than somewhere unmapped errors go
+/// to be flattened. Every arm below used to land on it, which told a caller
+/// "you may not do this" when the truth was a full disk, a failing device, or
+/// a directory it lacked write permission on.
 fn unlink_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,     // -ENOENT
-        FsError::InvalidPath => -21, // -EISDIR
-        FsError::ReadOnly => -30,    // -EROFS
-        _ => -1,
+        FsError::NotFound => -2,     // -ENOENT  may_delete_dentry: d_is_negative
+        FsError::InvalidPath => -21, // -EISDIR  may_delete_dentry: d_is_dir(victim)
+        // `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)`, whose two
+        // failures are these: sb_permission gives EROFS, the mode check EACCES.
+        FsError::ReadOnly => -30,         // -EROFS
+        FsError::PermissionDenied => -13, // -EACCES
+        // may_delete_dentry: IS_APPEND / check_sticky / IS_IMMUTABLE.
+        FsError::OperationNotPermitted => -1, // -EPERM
+        FsError::Busy => -16,                 // -EBUSY   is_local_mountpoint
+        FsError::SymlinkLoop => -40,          // -ELOOP   path walk
+        // From `dir->i_op->unlink` itself.
+        FsError::NoSpace => -28,        // -ENOSPC
+        FsError::QuotaExceeded => -122, // -EDQUOT
+        FsError::Io(_) => -5,           // -EIO
+        _ => -1,                        // -EPERM  `if (!dir->i_op->unlink)`
     };
     code as u64
 }
@@ -2626,15 +2647,26 @@ fn bind_errno(e: narf_filesystem::FsError) -> u64 {
     code as u64
 }
 
+/// Map an `FsError` from `rmdir(2)`, per `fs/namei.c::vfs_rmdir` and the
+/// `may_delete_dentry(..., isdir = true)` it opens with.
 fn rmdir_errno(e: narf_filesystem::FsError) -> u64 {
     use narf_filesystem::FsError;
     let code: i64 = match e {
-        FsError::NotFound => -2,     // -ENOENT
-        FsError::Busy => -39,        // -ENOTEMPTY
-        FsError::InvalidPath => -20, // -ENOTDIR
-        FsError::ReadOnly => -30,    // -EROFS
-        FsError::Unsupported => -1,  // -EPERM (fs can't rmdir)
-        _ => -1,
+        FsError::NotFound => -2, // -ENOENT
+        // ENOTEMPTY rather than the EBUSY `vfs_rmdir` uses for a mountpoint:
+        // NARF's directory backends signal a non-empty victim as `Busy`, and
+        // that is overwhelmingly the case a caller of rmdir is in. The
+        // mountpoint case is caught before the filesystem is reached.
+        FsError::Busy => -39,        // -ENOTEMPTY  from ->rmdir
+        FsError::InvalidPath => -20, // -ENOTDIR    may_delete_dentry: !d_is_dir
+        FsError::ReadOnly => -30,    // -EROFS      inode_permission
+        FsError::PermissionDenied => -13, // -EACCES     inode_permission
+        FsError::OperationNotPermitted => -1, // -EPERM      sticky / immutable
+        FsError::NoSpace => -28,              // -ENOSPC     from ->rmdir
+        FsError::QuotaExceeded => -122,       // -EDQUOT     ditto
+        FsError::Io(_) => -5,                 // -EIO
+        FsError::Unsupported => -1,           // -EPERM      `if (!dir->i_op->rmdir)`
+        _ => -1,                              // -EPERM
     };
     code as u64
 }
@@ -2652,8 +2684,16 @@ fn rename_errno(e: narf_filesystem::FsError) -> u64 {
         FsError::Busy => -17,           // -EEXIST
         FsError::InvalidPath => -22,    // -EINVAL
         FsError::CrossDevice => -18,    // -EXDEV
-        FsError::ReadOnly => -30,       // -EROFS
+        FsError::ReadOnly => -30,       // -EROFS   inode_permission
         FsError::QuotaExceeded => -122, // -EDQUOT
+        // `vfs_rename` reaches both `may_delete_dentry` and
+        // `may_create_dentry`, so the same inode_permission failures apply,
+        // and the filesystem's own ->rename supplies the rest.
+        FsError::PermissionDenied => -13, // -EACCES
+        FsError::OperationNotPermitted => -1, // -EPERM
+        FsError::SymlinkLoop => -40,          // -ELOOP
+        FsError::NoSpace => -28,              // -ENOSPC
+        FsError::Io(_) => -5,                 // -EIO
         _ => -1,
     };
     code as u64
@@ -3023,12 +3063,25 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
             crate::mqueue::notify_create(new_path, false);
             0
         }
+        // `fs/namei.c::vfs_link`, and `may_create_dentry` before it.
         // Name already taken — linkat never replaces (EEXIST).
-        Some(Err(narf_filesystem::FsError::Busy)) => -17,
-        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122,
+        Some(Err(narf_filesystem::FsError::Busy)) => -17, // -EEXIST
+        Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122, // -EDQUOT
         // The FS can't hold an externally-minted node (link_node default).
         Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // -EOPNOTSUPP
-        _ => -1,
+        // NOTE: `vfs_link`'s `if (dir->i_sb != inode->i_sb) return -EXDEV;`
+        // has no counterpart on this path. `link_node` receives a bare
+        // `Arc<dyn FileOps>` and the backends store it verbatim, so there is
+        // nothing here to compare superblocks with — `Stat` carries no device
+        // identity. No EXDEV arm is mapped because nothing can produce one;
+        // adding the check is a change to the node interface, not to this
+        // table.
+        Some(Err(narf_filesystem::FsError::NotFound)) => -2, // -ENOENT
+        Some(Err(narf_filesystem::FsError::ReadOnly)) => -30,    // -EROFS
+        Some(Err(narf_filesystem::FsError::PermissionDenied)) => -13, // -EACCES
+        Some(Err(narf_filesystem::FsError::NoSpace)) => -28,     // -ENOSPC
+        Some(Err(narf_filesystem::FsError::Io(_))) => -5,        // -EIO
+        _ => -1,                                                 // -EPERM
     }
 }
 

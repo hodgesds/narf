@@ -6,21 +6,20 @@ pub(crate) fn sys_rename(ctx: &mut dyn TrapContext) {
     let old_ptr = args.arg0;
     let new_ptr = args.arg1;
     // An unreadable user path pointer is EFAULT, not a bare -1 → EPERM.
-    let efault = SyscallReturn::ok((-14i64) as u64);
-    let old_path = match copy_user_cstr(old_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+    let old_path = match copy_user_cstr_checked(old_ptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
-    let new_path = match copy_user_cstr(new_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+            }
+        };
+    let new_path = match copy_user_cstr_checked(new_ptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, &old_path);
     let new_path = resolve_cwd_path(task, &new_path);

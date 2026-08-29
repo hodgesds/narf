@@ -27,21 +27,20 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
     let new_dirfd = args.arg2 as i64;
     let new_uptr = args.arg3;
 
-    let efault = SyscallReturn::ok((-14i64) as u64);
-    let old_str = match copy_user_cstr(old_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+    let old_str = match copy_user_cstr_checked(old_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
-    let new_str = match copy_user_cstr(new_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+            }
+        };
+    let new_str = match copy_user_cstr_checked(new_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
 
     let task = current_task_id();
     let old_path = match resolve_at_path(task, old_dirfd, &old_str) {

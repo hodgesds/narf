@@ -2548,3 +2548,105 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin
 );
+
+/// A path pointer the kernel cannot read is EFAULT, not EPERM.
+///
+/// `getname_flags` (`fs/namei.c`) is the first thing every path syscall does,
+/// and it fails in exactly two ways: `strncpy_from_user` failing is -EFAULT,
+/// and a path that reaches PATH_MAX without a terminator is -ENAMETOOLONG.
+///
+/// `readlink`, `readlinkat` and `mkdirat` answered -1 instead, which reaches
+/// libc as EPERM — "operation not permitted" about a caller whose only
+/// mistake was a bad pointer. Every other path syscall in NARF already
+/// reported EFAULT here, so these three disagreed with their own siblings as
+/// well as with Linux.
+fn smoke_abi_ioerrno_path_syscalls_fault_not_eperm() -> TestResult {
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    with_setup(|| {
+        let mut buf = [0u8; 64];
+        expect(
+            call(
+                Syscall::Readlink.raw(),
+                a2(BAD_PTR, buf.as_mut_ptr() as u64, buf.len() as u64),
+            ),
+            EFAULT,
+            "readlink with an unreadable path was not EFAULT",
+        )?;
+        expect(
+            call(
+                Syscall::Readlinkat.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: BAD_PTR,
+                    arg2: buf.as_mut_ptr() as u64,
+                    arg3: buf.len() as u64,
+                    ..Default::default()
+                },
+            ),
+            EFAULT,
+            "readlinkat with an unreadable path was not EFAULT",
+        )?;
+        expect(
+            call(Syscall::Mkdirat.raw(), a2(AT_FDCWD, BAD_PTR, 0o755)),
+            EFAULT,
+            "mkdirat with an unreadable path was not EFAULT",
+        )?;
+
+        // The handlers migrated off the unchecked path copy in the same pass.
+        // Each answered EFAULT or the bare -1 sentinel before; all of them go
+        // through `getname_flags`' two failures now.
+        expect(
+            call(Syscall::Statfs.raw(), a2(BAD_PTR, 0, 0)),
+            EFAULT,
+            "statfs with an unreadable path was not EFAULT",
+        )?;
+        expect(
+            call(Syscall::Creat.raw(), a2(BAD_PTR, 0o644, 0)),
+            EFAULT,
+            "creat with an unreadable path was not EFAULT",
+        )?;
+        expect(
+            call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, BAD_PTR, 0)),
+            EFAULT,
+            "unlinkat with an unreadable path was not EFAULT",
+        )?;
+        expect(
+            call(Syscall::Symlinkat.raw(), a3(BAD_PTR, AT_FDCWD, BAD_PTR, 0)),
+            EFAULT,
+            "symlinkat with an unreadable target was not EFAULT",
+        )?;
+        expect(
+            call(Syscall::Truncate.raw(), a2(BAD_PTR, 0, 0)),
+            EFAULT,
+            "truncate with an unreadable path was not EFAULT",
+        )?;
+
+        // The other half of `getname_flags`: a readable pointer whose path
+        // never terminates is ENAMETOOLONG, and reporting EFAULT for it would
+        // send a caller looking at the wrong argument entirely.
+        let long = [b'a'; 5000];
+        expect(
+            call(
+                Syscall::Readlink.raw(),
+                a2(
+                    long.as_ptr() as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf.len() as u64,
+                ),
+            ),
+            ENAMETOOLONG,
+            "readlink with an unterminated path was not ENAMETOOLONG",
+        )?;
+        expect(
+            call(Syscall::Statfs.raw(), a2(long.as_ptr() as u64, 0, 0)),
+            ENAMETOOLONG,
+            "statfs with an unterminated path was not ENAMETOOLONG",
+        )?;
+        Ok(())
+    })
+}
+
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_path_syscalls_fault_not_eperm
+);
