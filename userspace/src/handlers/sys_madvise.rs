@@ -123,10 +123,21 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
         // KSM, THP promotion, or active LRU aging policy to tune yet, so a
         // successful no-op preserves their contract.
         //
-        // LINUX-GAP: madvise_walk_vmas applies to hints too, so Linux reports
-        // ENOMEM when the range is not fully mapped. NARF has no gap-aware
-        // VMA-coverage query cheap enough to run on this path, so a hint over
-        // an unmapped range succeeds here.
-        _ => ctx.set_return(SyscallReturn::ok(0)),
+        // `madvise_walk_vmas` runs for hints too, and reports a hole as
+        // -ENOMEM whether the range starts in one (`if (!vma) return
+        // -ENOMEM;`) or merely crosses one (`unmapped_error = -ENOMEM`, after
+        // which the walk carries on). The hint itself is a no-op here, so
+        // coverage is the only thing left to decide.
+        //
+        // Reporting 0 for an unmapped range is not a harmless lie: a caller
+        // that madvises a region it believes it owns uses ENOMEM to discover
+        // that it does not, and a success tells it the opposite.
+        _ => {
+            if as_ref.range_fully_mapped(base, len) {
+                ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+            }
+        }
     }
 }

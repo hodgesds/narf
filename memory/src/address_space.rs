@@ -7295,6 +7295,36 @@ impl AddressSpace {
         regions.covers_range(lo, hi)
     }
 
+    /// Is every byte of `[base, base + len)` backed by a mapping — ordinary
+    /// or hugetlb?
+    ///
+    /// `mm/madvise.c::madvise_walk_vmas` reports a hole two ways, and both
+    /// end in -ENOMEM:
+    ///
+    ///     if (!vma)
+    ///             return -ENOMEM;
+    ///     ...
+    ///     if (range->start < vma->vm_start) {
+    ///             /* This indicates a gap between VMAs ... */
+    ///             unmapped_error = -ENOMEM;
+    ///
+    /// Hugetlb VMAs count as coverage, so a range that straddles an ordinary
+    /// and a huge mapping is not a hole — checking only the base-page tree
+    /// would report ENOMEM for a perfectly well-formed range.
+    pub fn range_fully_mapped(&self, base: VirtAddr, len: u64) -> bool {
+        let lo = base.as_u64();
+        let Some(hi) = lo.checked_add(len) else {
+            return false;
+        };
+        if lo == hi {
+            return true;
+        }
+        // Huge before regular — the lock order every mixed walk here uses.
+        let huge = self.huge_regions.lock();
+        let regions = self.regions.lock();
+        Self::mappings_covered_prefix_end(&huge, &regions, lo, hi) >= hi
+    }
+
     /// End of the contiguous mapped prefix across ordinary and explicit
     /// hugetlb VMAs. Hugetlb is a successful no-op for mlock fixup, but still
     /// fills coverage so a mixed regular/huge range is not reported as a hole.

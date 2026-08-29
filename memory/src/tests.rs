@@ -12135,6 +12135,121 @@ fn smoke_memory_huge_intersects_sees_hugetlb_mappings() -> TestResult {
 ))]
 kernel_test_in!("memory", smoke_memory_huge_intersects_sees_hugetlb_mappings);
 
+/// `mm/madvise.c::madvise_walk_vmas` reports a hole as -ENOMEM whether the
+/// range starts in one (`if (!vma) return -ENOMEM;`) or merely crosses one
+/// (`unmapped_error = -ENOMEM`, after which the walk carries on). madvise
+/// hints are otherwise no-ops here, so this coverage query is the entire
+/// decision — a caller that madvises a region it believes it owns uses ENOMEM
+/// to discover it does not, and a success tells it the opposite.
+///
+/// The mixed regular/huge arm is the one worth pinning. A range spanning an
+/// ordinary and a hugetlb mapping is fully covered, and a query that walked
+/// only the base-page tree would call it a hole and report ENOMEM for a
+/// perfectly well-formed range.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_range_fully_mapped_spans_regular_and_huge() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, reserve_from_regions, HugeSize, HUGEPAGE_2M_BYTES,
+    };
+    use crate::{AddressSpace, HugeRegion, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    const SYNTH_BASE: u64 = 0x40_C000_0000;
+    const USER_VA: u64 = 0x0000_5000_A000_0000;
+    let source = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES,
+    };
+    // SAFETY: the synthetic frame backs mapping metadata only.
+    let excludes = unsafe { reserve_from_regions(&[source], &[], 1, 0) };
+    if excludes.len() != 1 {
+        return TestResult::Fail("coverage-query reservation failed");
+    }
+    // SAFETY: topology lookup does not dereference the synthetic frame.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+    let frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("coverage-query hugepage allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            crate::hugepage::free_hugepage(frame);
+            return TestResult::Fail("coverage-query address space creation failed");
+        }
+    };
+    // A huge mapping immediately followed by an ordinary one, no gap.
+    let huge_base = VirtAddr::new(USER_VA);
+    // SAFETY: fresh root, aligned VA, owned aligned frame.
+    if unsafe {
+        address_space.map_huge_region(HugeRegion {
+            base: huge_base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: HugeSize::M2,
+            frames: alloc::vec![frame],
+        })
+    }
+    .is_err()
+    {
+        crate::hugepage::free_hugepage(frame);
+        return TestResult::Fail("coverage-query huge mapping failed");
+    }
+    let regular_base = VirtAddr::new(USER_VA + HUGEPAGE_2M_BYTES);
+    if address_space
+        .map_region(Region {
+            base: regular_base,
+            len: 0x2000,
+            perms: RegionPerms::READ,
+            phys: alloc::vec![PhysAddr::new(0); 2],
+        })
+        .is_err()
+    {
+        let _ = address_space.unmap_huge_region(huge_base);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Fail("coverage-query regular mapping failed");
+    }
+
+    // Each alone, and the two together across the boundary.
+    let huge_only = address_space.range_fully_mapped(huge_base, HUGEPAGE_2M_BYTES);
+    let regular_only = address_space.range_fully_mapped(regular_base, 0x2000);
+    let spanning = address_space.range_fully_mapped(huge_base, HUGEPAGE_2M_BYTES + 0x2000);
+    // One byte past the end is a hole, and so is a range that starts in one.
+    let past_end = address_space.range_fully_mapped(huge_base, HUGEPAGE_2M_BYTES + 0x3000);
+    let starts_in_hole = address_space.range_fully_mapped(VirtAddr::new(USER_VA - 0x1000), 0x1000);
+    // Zero length covers nothing and must not be a hole; an overflowing
+    // range must not panic.
+    let empty = address_space.range_fully_mapped(huge_base, 0);
+    let overflow = address_space.range_fully_mapped(VirtAddr::new(u64::MAX - 1), 0x1000);
+
+    let unmapped = address_space.unmap_huge_region(huge_base).is_ok();
+    // Drain the reserved frame so the shared pool's free count is unchanged.
+    let _ = alloc_hugepage_2m_on(node);
+
+    if !(huge_only && regular_only && spanning && empty) {
+        return TestResult::Fail("range_fully_mapped reported a hole in a covered range");
+    }
+    if past_end || starts_in_hole || overflow {
+        return TestResult::Fail("range_fully_mapped missed a hole");
+    }
+    if !unmapped {
+        return TestResult::Fail("coverage-query test failed to unmap");
+    }
+    TestResult::Pass
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_range_fully_mapped_spans_regular_and_huge
+);
+
 /// `mm/msync.c` rejects MS_INVALIDATE over a `VM_LOCKED` VMA with -EBUSY.
 /// NARF's msync reads that state back through `perms_intersecting`, so the
 /// handler is only correct if LOCKED actually survives into the perms this

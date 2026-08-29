@@ -33,6 +33,23 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
     let len = args.arg1 as usize;
     let task = current_task_id();
     let cwd = task_map_get(&CWD_TABLE, task).unwrap_or_else(|| alloc::string::String::from("/"));
+    // `if (unlikely(d_unlinked(pwd.dentry))) { error = -ENOENT; }` — and it
+    // is the FIRST thing decided, ahead of the length and copy checks, so a
+    // task whose working directory was removed gets -ENOENT even when its
+    // buffer is also too small.
+    //
+    // NARF keeps the cwd as a string with no dentry to invalidate, so
+    // "removed" is tested by re-resolving it. The two agree on the case that
+    // matters — `rmdir` under a task's feet, which is how a shell discovers
+    // its cwd is gone — and differ only if the same path is RE-CREATED
+    // afterwards: Linux still reports ENOENT there, because the dentry the
+    // task holds stays unlinked, while this resolves the new directory and
+    // succeeds. That is a smaller divergence than answering a valid path for
+    // a directory that no longer exists.
+    if stat_ino_path_dir_aware_ext(&cwd, true).is_none() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     // The kernel's `len`: the path plus its NUL terminator. This is both the
     // ERANGE threshold and the value returned on success.
     let needed = cwd.len() + 1;
@@ -76,8 +93,5 @@ pub(crate) fn sys_getcwd(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
-    // LINUX-GAP: `d_unlinked(pwd.dentry)` -> -ENOENT has no counterpart —
-    // NARF stores the cwd as a string with no dentry to invalidate, so a
-    // directory removed out from under a task keeps working here.
     ctx.set_return(SyscallReturn::ok(needed as u64));
 }

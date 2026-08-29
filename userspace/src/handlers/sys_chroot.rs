@@ -65,16 +65,29 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
     // -ENOTDIR, not a successful root change. (A path that resolves to
     // nothing inside a covering mount stays -ENOENT — see the LINUX-GAP
     // below.)
-    if let Some((s, ..)) = stat_ino_path_dir_aware_ext(&resolved, true) {
-        if s.mode.file_type != narf_filesystem::FileType::Dir {
+    match stat_ino_path_dir_aware_ext(&resolved, true) {
+        Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => {
             ctx.set_return(SyscallReturn::ok((-20i64) as u64)); // -ENOTDIR
             return;
         }
+        Some(_) => {}
+        None => {
+            // The covering-mount test above only proves SOME mount serves
+            // this path's prefix, which is far weaker than `user_path_at(...,
+            // LOOKUP_FOLLOW | LOOKUP_DIRECTORY)`. A name that resolves to
+            // nothing inside a mounted filesystem passed it and then INSTALLED
+            // as the task's root — after which every absolute path in that
+            // task resolved beneath a directory that does not exist, and the
+            // first symptom was every subsequent open failing for reasons
+            // that pointed nowhere near the chroot.
+            //
+            // `path_lookup_errno` classifies the failure the way
+            // `link_path_walk` does, so the caller learns whether the name is
+            // missing, is not a directory, cannot be searched, or loops.
+            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&resolved)) as u64));
+            return;
+        }
     }
-    // LINUX-GAP: the "covering mount" test above is weaker than
-    // filename_lookup — a path under an existing mount that names no entry
-    // still installs as a root instead of reporting -ENOENT. Tightening it
-    // would change which chroots succeed, not just their errno.
     // `error = -EPERM; if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT))
     // goto dput_and_out;` — note the position: Linux runs the lookup and
     // `path_permission` FIRST, so an unprivileged caller naming a path that
