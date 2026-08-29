@@ -640,6 +640,66 @@ fn smoke_abi_signal_sigchld_signalfd_names_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigchld_signalfd_names_child);
 
+// A signalfd read of a sigqueue'd STANDARD signal (SIGUSR1, coalescing single
+// slot) must surface its SI_QUEUE payload (ssi_code=-1, ssi_int=value), never
+// degrade to a payload-less SI_USER, and must leave no stranded pending bit —
+// the signalfd consumer pops the payload and clears/re-arms the bit together
+// under the sigqueue bucket lock (sigqueue_take_and_clear), the same invariant
+// the sigwait and handler-delivery consumers hold. Back to back, so a
+// per-cycle strand would surface as a wrong ssi_code/ssi_int on the next read.
+fn smoke_abi_signal_signalfd_sigqueue_payload() -> TestResult {
+    with_setup(|| {
+        const SIGUSR1: u32 = 10;
+        let mask = (1u64 << (SIGUSR1 - 1)).to_le_bytes();
+        let sfd = match call(
+            Syscall::Signalfd.raw(),
+            a3((-1i64) as u64, mask.as_ptr() as u64, 8, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("signalfd(-1, &mask, 8, 0) did not return a fd"),
+        };
+        for value in [0xBEEFu64, 0x0102u64] {
+            let si = sigqueue_siginfo(SIGUSR1, -1, FAKE_TASK as u32, value);
+            if call(
+                Syscall::RtSigqueueinfo.raw(),
+                a2(FAKE_TASK, SIGUSR1 as u64, si.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("rt_sigqueueinfo(self, SIGUSR1, payload) should return 0");
+            }
+            let mut rec = [0u8; 128];
+            if call(
+                Syscall::Read.raw(),
+                a2(sfd, rec.as_mut_ptr() as u64, rec.len() as u64),
+            ) != Some(128)
+            {
+                return Err("signalfd read did not return one record");
+            }
+            if u32::from_le_bytes(rec[0..4].try_into().unwrap()) != SIGUSR1 {
+                return Err("signalfd record named the wrong signal");
+            }
+            // ssi_code @8 must be SI_QUEUE(-1), not SI_USER(0).
+            if i32::from_le_bytes(rec[8..12].try_into().unwrap()) != -1 {
+                return Err("signalfd ssi_code was not SI_QUEUE(-1) — payload lost");
+            }
+            // ssi_int @44 carries sival_int.
+            if u32::from_le_bytes(rec[44..48].try_into().unwrap()) as u64 != value {
+                return Err("signalfd ssi_int did not carry the queued sival");
+            }
+            if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(SIGUSR1)
+                != 0
+            {
+                return Err("signalfd read left the SIGUSR1 pending bit set");
+            }
+            if crate::handlers::take_sigqueue_info(FAKE_TASK, SIGUSR1).is_some() {
+                return Err("signalfd read left a stranded queued payload");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_sigqueue_payload);
+
 fn smoke_abi_signal_signalfd_neg() -> TestResult {
     with_setup(|| {
         // fd 0 is open (stdio) but is not a signalfd, so `do_signalfd4`'s

@@ -108,20 +108,20 @@ impl FileOps for SignalFdFile {
             buf[..4].copy_from_slice(&signum.to_le_bytes());
             // ssi_errno (offset 4) left 0. If this instance was queued via
             // rt_sigqueueinfo/sigqueue, surface its payload: ssi_code @8,
-            // ssi_int @44 (sival_int), ssi_ptr @48 (sival_ptr).
+            // ssi_int @44 (sival_int), ssi_ptr @48 (sival_ptr). Popping the
+            // payload and clearing/re-arming the pending bit happen together
+            // under the sigqueue bucket lock (atomic against a racing sender's
+            // store+set), so a queued standard signal is never read as a
+            // payload-less SI_USER nor left stranded — same invariant as the
+            // sigwait and handler-delivery consumers.
             if let Some((si_code, si_value, si_pid)) =
-                crate::handlers::take_sigqueue_info(self.owner_task, signum)
+                crate::handlers::sigqueue_take_and_clear(self.owner_task, signum)
             {
                 buf[8..12].copy_from_slice(&si_code.to_le_bytes());
                 buf[12..16].copy_from_slice(&si_pid.to_le_bytes()); // ssi_pid
                 buf[44..48].copy_from_slice(&(si_value as u32).to_le_bytes());
                 buf[48..56].copy_from_slice(&si_value.to_le_bytes());
             }
-            crate::handlers::clear_signal_pending(self.owner_task, signum);
-            // RT queueing: this read drained ONE queued instance; re-arm
-            // the pending bit when more remain so the next read (and the
-            // fd's readiness) sees them.
-            crate::handlers::rearm_pending_if_queued(self.owner_task, signum);
             Ok(SIGNALFD_SIGINFO_LEN)
         })
     }
