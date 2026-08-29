@@ -111,11 +111,23 @@ const NODE_CACHE_MAX: usize = 256;
 /// Commits allowed to stage before the superblock is forced out.
 ///
 /// Bounds two things: how much work a crash discards, and how long pinned
-/// extents withhold free space. Linux commits on a 30-second timer instead;
-/// a count is the equivalent NARF can express without a timer source in the
-/// driver, and a small one keeps both costs modest while still amortising the
-/// superblock write and its barrier across a batch.
-const MAX_STAGED_COMMITS: usize = 2;
+/// extents withhold free space.
+///
+/// One, because staging a second buys nothing measurable. Deferring the
+/// superblock was worth having when every operation committed — it was then
+/// the only thing amortising a write and a barrier across more than one
+/// mutation. Now that a transaction carries up to `MAX_BATCH_OPS`
+/// operations, that amortisation has already happened, and the superblock is
+/// one write per batch rather than one per operation. Interleaved paired runs
+/// of the write smoke put a depth of 1 at 2.51e9 cycles against 2.49e9 for a
+/// depth of 2 — a 0.7% difference on a host whose run-to-run spread is nearer
+/// 2x, which is to say no difference at all.
+///
+/// So the depth is spent on the other side of the trade instead: at 1, a
+/// crash can discard one batch rather than two, and freed space is withheld
+/// for one commit rather than two. Both are paid for in real failure
+/// behaviour; the throughput it would have bought is not there to lose.
+const MAX_STAGED_COMMITS: usize = 1;
 
 impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
@@ -224,6 +236,9 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// (emulated) device read plus a full-node checksum verification, and both
     /// are pure repetition for a block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
+    /// Set when a transaction was lost after its operations had already
+    /// reported success. See [`Self::abort_transaction`].
+    aborted: core::sync::atomic::AtomicBool,
     /// Operations accumulated into the transaction that has not committed yet.
     /// An async mutex rather than a spinlock: an operation holds it across its
     /// tree reads and node writes, which is also what serialises the shared
@@ -259,9 +274,37 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     }
 
     /// All checksum algorithms accepted at mount are emitted by the COW writer.
-    /// A subvolume marked read-only in its root item remains read-only.
+    /// A subvolume marked read-only in its root item remains read-only, and so
+    /// does one whose transaction was aborted.
     pub(crate) fn supports_writes(&self) -> bool {
-        self.state.lock().writable_fs_tree
+        !self.aborted.load(core::sync::atomic::Ordering::Acquire)
+            && self.state.lock().writable_fs_tree
+    }
+
+    /// Refuse all further writes, because a transaction was lost after its
+    /// operations had already reported success.
+    ///
+    /// This is `btrfs_abort_transaction`, whose comment states the same
+    /// reasoning: "We only mark the transaction aborted and then set the file
+    /// system read-only. This will prevent new transactions from starting."
+    /// There is nothing else honest to do. A batch commits many operations at
+    /// once; if it fails, the callers of the operations it held have already
+    /// been told those succeeded, and there is no one left to report the
+    /// failure to. Continuing to accept writes would build the next
+    /// transaction on a tree those callers believe contains their work and
+    /// which does not.
+    ///
+    /// Read paths keep working, and they show the last committed tree — the
+    /// lost operations are absent from it, which is the truth.
+    pub(crate) fn abort_transaction(&self) {
+        self.aborted
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether a transaction has been aborted on this volume.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn transaction_aborted(&self) -> bool {
+        self.aborted.load(core::sync::atomic::Ordering::Acquire)
     }
 
     /// `(devid, physical capacity)` for every assembled member.
@@ -1118,6 +1161,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            aborted: core::sync::atomic::AtomicBool::new(false),
             fs_batch: Mutex::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,

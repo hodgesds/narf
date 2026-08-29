@@ -2100,7 +2100,14 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     inherit[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SET_LIMITS
     inherit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // one parent
     inherit[32..40].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER flag
-    inherit[40..48].copy_from_slice(&(32u64 << 10).to_ne_bytes());
+                                                          // 512 KiB, not the 32 KiB this used to set. Limits are enforced when
+                                                          // space is RESERVED now, and a reservation covers the metadata an
+                                                          // operation will write as well as its data — `num_items * nodesize`, the
+                                                          // same arithmetic `btrfs_start_transaction` uses. Creating a file reserves
+                                                          // for every item it touches before a byte of data is written, so a limit
+                                                          // of a few nodes leaves no room to do anything at all. That is true of
+                                                          // Linux too; a 32 KiB qgroup limit is not a usable filesystem on either.
+    inherit[40..48].copy_from_slice(&(512u64 << 10).to_ne_bytes());
     inherit[72..80].copy_from_slice(&PARENT.to_ne_bytes());
     if !matches!(
         poll_once(
@@ -2137,7 +2144,7 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
         Some(body) if body.len() == 40 => body,
         _ => return TestResult::Fail("new child qgroup limit was missing"),
     };
-    if format::le64(&limit, 0).ok() != Some(1) || format::le64(&limit, 8).ok() != Some(32u64 << 10)
+    if format::le64(&limit, 0).ok() != Some(1) || format::le64(&limit, 8).ok() != Some(512u64 << 10)
     {
         return TestResult::Fail("inherited qgroup limit was wrong");
     }
@@ -2173,6 +2180,10 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     ) {
         return TestResult::Fail("qgroup child data write failed");
     }
+    // Quota volumes batch like any other now that limits are enforced when
+    // space is reserved rather than when the transaction commits. The recount
+    // this asserts on is still a commit-time product, so it needs the commit.
+    let _ = poll_once(child.sync_to_disk());
     let charged = match qgroup_item(&child, format::QGROUP_INFO_KEY, child_id) {
         Some(body) => format::le64(&body, 8).unwrap_or(0),
         None => 0,
@@ -2180,7 +2191,7 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     if charged <= format::le64(&child_info, 8).unwrap_or(0) {
         return TestResult::Fail("child qgroup did not charge new data/metadata");
     }
-    let over_limit = alloc::vec![0xa5u8; 40 * 1024];
+    let over_limit = alloc::vec![0xa5u8; 1024 * 1024];
     if !matches!(
         poll_once(child_file.write(0, &over_limit)),
         Some(Err(FsError::QuotaExceeded))
@@ -2193,6 +2204,17 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     };
     if read_all(&child_file_after, payload.len() + 8).as_deref() != Some(payload.as_slice()) {
         return TestResult::Fail("qgroup hard-limit rejection was not atomic");
+    }
+    // A reported rejection is not a transaction abort. The commit that refused
+    // this write was driven by the write itself, so the error reached the
+    // caller that caused it and nothing was silently lost — the boundary
+    // `FlushOrigin` draws. Aborting here would take a whole mount read-only
+    // every time anyone exceeded their quota.
+    if child.transaction_aborted() {
+        return TestResult::Fail("a reported quota rejection aborted the transaction");
+    }
+    if !child.supports_writes() {
+        return TestResult::Fail("a reported quota rejection took the subvolume read-only");
     }
 
     // Batched commits: durable only once synced, as a real unmount would
@@ -9460,4 +9482,226 @@ fn smoke_btrfs_batch_cancels_intra_batch_data_extents() -> TestResult {
 kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_batch_cancels_intra_batch_data_extents
+);
+
+/// A batch commit that fails takes the filesystem read-only.
+///
+/// The loss a batch can inflict is different in kind from the one a single
+/// transaction can. When every operation committed on its own, a failed commit
+/// was reported to the operation that caused it and nothing else was affected.
+/// A batch holds operations whose callers have already been told they
+/// succeeded; if its commit fails, those are gone and there is nobody left to
+/// tell. Linux answers this with `btrfs_abort_transaction` — mark it aborted
+/// and set the filesystem read-only — and so does this.
+///
+/// The crash injector is the failure: it returns an error from `commit_txn`
+/// after the nodes are out and before the superblock, which is exactly a
+/// commit that did not happen.
+fn smoke_btrfs_failed_batch_commit_aborts() -> TestResult {
+    use alloc::format;
+    use narf_filesystem::FsInstance;
+
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.create("survivor.txt")), Some(Ok(_))) {
+        return TestResult::Fail("the committed create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+
+    // Three operations, each told its caller it succeeded, none committed.
+    for i in 0..3 {
+        if !matches!(
+            poll_once(root.create(&format!("doomed-{i}.txt"))),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("a batched create failed");
+        }
+    }
+    if vol.transaction_aborted() {
+        return TestResult::Fail("staging operations aborted the transaction");
+    }
+
+    // Fail their commit. The sync is not one of the three, so all three are
+    // lost with no caller to report to.
+    vol.arm_crash_before_super();
+    if poll_once(vol.sync_to_disk()).is_none() {
+        return TestResult::Fail("the failing sync never completed a poll");
+    }
+    if !vol.transaction_aborted() {
+        return TestResult::Fail("a batch commit lost operations without aborting");
+    }
+    if vol.supports_writes() {
+        return TestResult::Fail("an aborted filesystem still accepts writes");
+    }
+    // EROFS, the errno Linux returns once the filesystem is in this state.
+    if !matches!(
+        poll_once(root.create("after-abort.txt")),
+        Some(Err(FsError::ReadOnly))
+    ) {
+        return TestResult::Fail("a write after the abort was not refused with ReadOnly");
+    }
+
+    // Reads still work, and show the last tree that really committed.
+    let names = dir_names(&vol.root());
+    if !names.iter().any(|n| n == "survivor.txt") {
+        return TestResult::Fail("the abort hid a committed file");
+    }
+    if names.iter().any(|n| n.starts_with("doomed-")) {
+        return TestResult::Fail("a lost operation is still visible after the abort");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_failed_batch_commit_aborts);
+
+/// A quota-enabled volume batches like any other.
+///
+/// It could not before, because NARF enforced qgroup limits inside
+/// `commit_txn`: a transaction was the finest granularity at which a limit
+/// could be refused, so batching would have deferred EDQUOT past the write
+/// that earned it. Moving enforcement to `qgroup_reserve` — where Linux has
+/// always had it, as the only site in `fs/btrfs` that returns -EDQUOT —
+/// decouples the two, and quota volumes get the same amortisation as the rest.
+///
+/// Counting generations counts transactions: `commit_roots` advances the
+/// superblock generation once per commit.
+fn smoke_btrfs_quota_volume_batches() -> TestResult {
+    use alloc::format;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    // Confirm the premise: without quotas on, this test proves nothing about
+    // quota volumes.
+    if qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).is_none() {
+        return TestResult::Fail("the quota fixture does not have quotas enabled");
+    }
+    let root = vol.root();
+    // Warm-up, so any private-subvolume rewrite is not counted below.
+    if poll_once(root.create("q-warmup.txt")).is_none() {
+        return TestResult::Fail("warm-up create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+
+    let before = vol.superblock().generation;
+    for i in 0..8 {
+        if !matches!(poll_once(root.create(&format!("q-{i}.txt"))), Some(Ok(_))) {
+            return TestResult::Fail("a batched create on a quota volume failed");
+        }
+    }
+    if vol.superblock().generation != before + 1 {
+        return TestResult::Fail("a quota volume did not batch eight operations into one commit");
+    }
+    let names = dir_names(&vol.root());
+    for i in 0..8 {
+        if !names.iter().any(|n| n == &format!("q-{i}.txt")) {
+            return TestResult::Fail("a batched create on a quota volume was lost");
+        }
+    }
+    // And the accounting still lands, once, when the transaction commits.
+    let _ = poll_once(vol.sync_to_disk());
+    let info =
+        qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
+    if format::le64(&info, 0).ok() != Some(vol.superblock().generation) {
+        return TestResult::Fail("qgroup accounting did not follow the batched commit");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_quota_volume_batches);
+
+/// A reservation counts against the limit before it has been accounted.
+///
+/// This is the half of `qgroup_check_limits` that only starts to matter once
+/// transactions batch. It compares the limit against
+/// `qgroup_rsv_total(qg) + qg->rfer + num_bytes` — outstanding reservations
+/// included — because `qg->rfer` moves only at commit. Two writes inside one
+/// uncommitted transaction both see the same committed usage, so without the
+/// reservation term each would be measured as if it were the only one, and two
+/// writes that do not fit together would both be admitted.
+///
+/// The generation check is what makes this a real test rather than a
+/// coincidence: it confirms no commit happened between the two writes, so the
+/// second really was judged against a `rfer` that had not moved.
+fn smoke_btrfs_qgroup_reservation_counts_outstanding() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let first = match poll_once(root.create("rsv-a.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the first file failed"),
+    };
+    let second = match poll_once(root.create("rsv-b.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the second file failed"),
+    };
+    // Commit the creates so the limit below is set against settled usage.
+    let _ = poll_once(vol.sync_to_disk());
+
+    let settled = qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if settled == 0 {
+        return TestResult::Fail("committed qgroup usage was unreadable");
+    }
+    // Room for one 80 KiB write and its metadata, but not for two.
+    const WRITE: usize = 80 * 1024;
+    let headroom = 160u64 * 1024;
+    let mut limit = [0u8; 48];
+    limit[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER
+    limit[16..24].copy_from_slice(&(settled + headroom).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("setting the qgroup limit failed");
+    }
+
+    let payload = alloc::vec![0x3cu8; WRITE];
+    let gen_before = vol.superblock().generation;
+    match poll_once(first.write(0, &payload)) {
+        Some(Ok(n)) if n == WRITE => {}
+        _ => return TestResult::Fail("the first write did not fit its own limit"),
+    }
+    // Nothing has committed, so the committed usage the second write is judged
+    // against is byte-for-byte the one the first was judged against.
+    if vol.superblock().generation != gen_before {
+        return TestResult::Fail("the first write committed, so this proves nothing");
+    }
+    match poll_once(second.write(0, &payload)) {
+        Some(Err(FsError::QuotaExceeded)) => {}
+        Some(Err(_)) | None => return TestResult::Fail("the second write failed some other way"),
+        Some(Ok(_)) => {
+            return TestResult::Fail("two writes that do not fit together were both admitted")
+        }
+    }
+    // The refusal cost nothing: the first write is still there and intact.
+    let _ = poll_once(vol.sync_to_disk());
+    let kept = match poll_once(vol.root().lookup_async("rsv-a.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("the admitted write's file vanished"),
+    };
+    match read_all(&kept, WRITE + 16) {
+        Some(got) if got == payload => TestResult::Pass,
+        _ => TestResult::Fail("the admitted write did not survive the refusal of the second"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_reservation_counts_outstanding
 );

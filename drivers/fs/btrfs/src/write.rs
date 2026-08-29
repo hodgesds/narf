@@ -979,6 +979,20 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     let mut guard = batch_begin(vol).await?;
     let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
     let gen = batch.gen;
+    // Reserve before allocating. A write that would cross a hard limit is
+    // refused here, having written no data, allocated nothing and staged
+    // nothing — which is what makes the rejection atomic without any unwinding.
+    //
+    // Both halves are reserved up front, which means counting this write's
+    // edits before building them: one delete per extent the rewrite displaces,
+    // one insert per extent it lays down, and the inode. Doing it here rather
+    // than beside `batch_stage` below is what keeps the refusal free of
+    // consequences — by then the data extents have been allocated and written,
+    // and a rejection would strand them until the batch commits.
+    let displaced = affected.iter().filter(|hit| **hit).count();
+    let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
+    qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
+    qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
     // ── Tile the content into fresh extents; write each + its checksums ─
     let mut new_data: Vec<DataRef> = Vec::new();
@@ -1055,10 +1069,10 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     edits.push(Edit::Upsert(inode_key, new_inode));
 
     batch_stage(vol, batch, &edits, dropped_data, new_data).await?;
-    let full = batch.ops >= batch.max_ops;
+    let full = batch.ops >= MAX_BATCH_OPS;
     drop(guard);
     if full {
-        flush_batch(vol).await?;
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
     Ok(data.len())
 }
@@ -1121,10 +1135,14 @@ pub(crate) struct FsBatch {
     /// commit fails. Staging publishes each operation's root so that reads
     /// inside the batch see it; a failed commit has to take that back.
     base_root: (u64, u8),
-    /// Operations this batch may hold — [`MAX_BATCH_OPS`], or 1 when quotas
-    /// are on. Fixed when the batch opens, so the question is asked once per
-    /// transaction rather than once per operation.
-    max_ops: usize,
+    /// The qgroups this transaction's subvolume charges against, with their
+    /// committed usage and limits. Read on the first reservation and reused:
+    /// the quota tree does not move until this transaction commits.
+    qgroup: Option<Vec<QgroupCharge>>,
+    /// Bytes reserved against each qgroup by this transaction and not yet
+    /// accounted, so two writes that each fit but do not fit together cannot
+    /// both be admitted.
+    reserved: BTreeMap<u64, u64>,
 }
 
 /// Open the batch if none is open, and lock it for one operation.
@@ -1148,21 +1166,6 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             .ok_or(FsError::InvalidData)?;
         let (fs_root, fs_level) = vol.fs_tree_root();
         let cow = PathCow::new(vol, gen, fs_root, fs_level).await?.suspend().0;
-        // Quota-enabled volumes do not batch. NARF recounts qgroup usage and
-        // enforces `max_rfer`/`max_excl` inside `commit_txn`, so a transaction
-        // is the finest granularity at which a limit can be checked at all.
-        // Batching would let a write that exceeds a hard limit return success
-        // and surface EDQUOT later, against whichever caller happened to
-        // trigger the flush — reporting the error to the wrong writer, or to
-        // no writer at all. Committing per operation keeps the limit attached
-        // to the write that broke it.
-        //
-        // (Linux does not face this: it reserves and charges quota up front in
-        // `btrfs_qgroup_reserve_data`, so its limits are enforced before the
-        // write is accepted and are unaffected by when the transaction
-        // commits.)
-        let (root_tree, _) = vol.root_tree_root();
-        let quota_on = !matches!(quota_mode_at(vol, root_tree).await?, QuotaMode::Disabled);
         *guard = Some(FsBatch {
             gen,
             alloc: Allocator::build(vol).await?,
@@ -1171,7 +1174,8 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             new_data: Vec::new(),
             ops: 0,
             base_root: (fs_root, fs_level),
-            max_ops: if quota_on { 1 } else { MAX_BATCH_OPS },
+            qgroup: None,
+            reserved: BTreeMap::new(),
         });
     }
     Ok(guard)
@@ -1321,10 +1325,39 @@ async fn batch_stage<B: BlockDevice + 'static>(
     Ok(())
 }
 
+/// Who asked for the batch to be committed, which decides what a failed commit
+/// costs.
+///
+/// A failed commit loses every operation the batch held. That is only an
+/// abort-worthy loss for operations whose callers were already told they
+/// succeeded — an operation still on the stack receives the error itself and
+/// is reported honestly.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FlushOrigin {
+    /// The operation that filled the batch, still on the stack. It will get
+    /// the error as its own return value, so it is not among the losses.
+    StagingOperation,
+    /// Anything else — a sync, a non-batchable transaction, a re-root. Every
+    /// operation in the batch has already returned success to its caller.
+    Elsewhere,
+}
+
+impl FlushOrigin {
+    /// How many operations of a batch of `ops` would be silently lost if its
+    /// commit failed.
+    fn silent_losses(self, ops: usize) -> usize {
+        match self {
+            FlushOrigin::StagingOperation => ops.saturating_sub(1),
+            FlushOrigin::Elsewhere => ops,
+        }
+    }
+}
+
 /// Commit one closed batch as a single transaction.
 async fn commit_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     batch: FsBatch,
+    origin: FlushOrigin,
 ) -> Result<(), FsError> {
     if batch.ops == 0 {
         // Nothing staged. `batch_gen` opens a batch before its caller has
@@ -1334,8 +1367,21 @@ async fn commit_batch<B: BlockDevice + 'static>(
         return Ok(());
     }
     let base_root = batch.base_root;
+    let silent_losses = origin.silent_losses(batch.ops);
     let result = commit_batch_inner(vol, batch).await;
     if result.is_err() {
+        if silent_losses > 0 {
+            // Operations in this batch were reported successful and are now
+            // gone, with no caller left to tell. `abort_transaction` explains
+            // why the only honest response is to stop accepting writes.
+            //
+            // The single-operation case does NOT come through here: when the
+            // operation that filled the batch is the one on the stack, it
+            // receives this error as its own return value, which is an
+            // accurate report and not a loss. That is the path a quota hard
+            // limit takes.
+            vol.abort_transaction();
+        }
         // Put the in-memory root back where the last successful commit left
         // it. Staging advanced it so that reads within the batch could see the
         // operations as they landed, but a commit that fails publishes
@@ -1387,7 +1433,6 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
@@ -1407,9 +1452,16 @@ async fn commit_batch_inner<B: BlockDevice + 'static>(
 pub(crate) async fn flush_batch<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    flush_batch_from(vol, FlushOrigin::Elsewhere).await
+}
+
+async fn flush_batch_from<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    origin: FlushOrigin,
+) -> Result<(), FsError> {
     let batch = vol.fs_batch().lock().await.take();
     match batch {
-        Some(batch) => commit_batch(vol, batch).await,
+        Some(batch) => commit_batch(vol, batch, origin).await,
         None => Ok(()),
     }
 }
@@ -1441,11 +1493,13 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
     let full = {
         let mut guard = batch_begin(vol).await?;
         let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+        // Before staging, so a refusal leaves the transaction untouched.
+        qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
-        batch.ops >= batch.max_ops
+        batch.ops >= MAX_BATCH_OPS
     };
     if full {
-        flush_batch(vol).await?;
+        flush_batch_from(vol, FlushOrigin::StagingOperation).await?;
     }
     Ok(())
 }
@@ -1537,9 +1591,6 @@ struct Txn {
     /// Quota disable removes the quota root itself, so no recount may be
     /// attempted against that transaction's root-tree image.
     skip_qgroup_recount: bool,
-    /// Ordinary mutations enforce hard limits; quota administration/rescan
-    /// must be able to install or recount an already-exceeded limit.
-    enforce_qgroup_limits: bool,
     /// Incompatibility bits made durable by this transaction. Bits are
     /// monotonic; in particular SIMPLE_QUOTA survives quota disable.
     incompat_flags_add: u64,
@@ -1590,7 +1641,6 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
@@ -2608,7 +2658,6 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
@@ -3085,13 +3134,224 @@ fn apply_logical_edits(logical: &mut [u8], edits: &[Edit]) -> Result<(), FsError
     Ok(())
 }
 
+/// `BTRFS_QGROUP_LIMIT_MAX_RFER` and `..._MAX_EXCL` (`uapi/linux/btrfs.h`).
+const QGROUP_LIMIT_MAX_RFER: u64 = 1 << 0;
+const QGROUP_LIMIT_MAX_EXCL: u64 = 1 << 1;
+
+/// One qgroup a write is charged against: the four numbers Linux's
+/// `qgroup_check_limits` compares — committed usage and the hard limits.
+#[derive(Clone, Debug)]
+struct QgroupCharge {
+    id: u64,
+    limit_flags: u64,
+    max_rfer: u64,
+    max_excl: u64,
+    rfer: u64,
+    excl: u64,
+}
+
+/// Read one qgroup's committed usage and limits out of the quota tree.
+/// A qgroup with no `QGROUP_LIMIT` item is unlimited, not malformed.
+fn read_qgroup_charge(quota: &[u8], id: u64) -> Result<Option<QgroupCharge>, FsError> {
+    let Some(info_slot) = leaf_find(quota, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))? else {
+        return Ok(None);
+    };
+    let info = leaf_item_data(quota, info_slot)?;
+    if info.len() != 40 {
+        return Err(FsError::InvalidData);
+    }
+    let (rfer, excl) = (le64(info, 8)?, le64(info, 24)?);
+    let (mut limit_flags, mut max_rfer, mut max_excl) = (0u64, 0u64, 0u64);
+    if let Some(slot) = leaf_find(quota, &BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id))? {
+        let limit = leaf_item_data(quota, slot)?;
+        if limit.len() != 40 {
+            return Err(FsError::InvalidData);
+        }
+        limit_flags = le64(limit, 0)?;
+        max_rfer = le64(limit, 8)?;
+        max_excl = le64(limit, 16)?;
+    }
+    Ok(Some(QgroupCharge {
+        id,
+        limit_flags,
+        max_rfer,
+        max_excl,
+        rfer,
+        excl,
+    }))
+}
+
+/// The qgroup owning `root_id` and every ancestor it rolls up into.
+///
+/// Empty when quotas are off, which makes reserving a no-op. Read once per
+/// transaction and cached in the batch: the quota tree changes only at commit,
+/// so within one transaction these numbers are fixed. Linux keeps the same
+/// state resident in `fs_info->qgroup_tree`; NARF has no such cache and reads
+/// the tree, which is small and whose nodes the node cache holds.
+async fn qgroup_charge_chain<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root_id: u64,
+) -> Result<Vec<QgroupCharge>, FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    let quota_root = match roots::find_root(vol, root_tree, format::QUOTA_TREE_OBJECTID).await {
+        Ok((root, _)) => root,
+        Err(FsError::NotFound) => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+    let (quota, _) = read_fs_oversized(vol, quota_root).await?;
+    let status_key = BtrfsKey::new(0, format::QGROUP_STATUS_KEY, 0);
+    let Some(status_slot) = leaf_find(&quota, &status_key)? else {
+        return Ok(Vec::new());
+    };
+    let status = leaf_item_data(&quota, status_slot)?;
+    if status.len() < 32 || le64(status, 16)? & QGROUP_STATUS_ON == 0 {
+        return Ok(Vec::new());
+    }
+
+    // Walk `QGROUP_RELATION` upward from the level-0 qgroup whose id is the
+    // subvolume id. Relations are stored both ways round, so the child->parent
+    // direction is the one whose level (the key's top 16 bits) increases.
+    let mut parents: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for slot in 0..nritems(&quota)? as usize {
+        let key = leaf_item_key(&quota, slot)?;
+        if key.item_type == format::QGROUP_RELATION_KEY && key.objectid >> 48 < key.offset >> 48 {
+            parents.entry(key.objectid).or_default().push(key.offset);
+        }
+    }
+    let mut chain = Vec::new();
+    let mut todo = alloc::vec![root_id];
+    let mut seen = BTreeSet::new();
+    while let Some(id) = todo.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(charge) = read_qgroup_charge(&quota, id)? {
+            chain.push(charge);
+        }
+        if let Some(next) = parents.get(&id) {
+            todo.extend(next.iter().copied());
+        }
+    }
+    Ok(chain)
+}
+
+/// Charge `num_bytes` of about-to-be-written data against every qgroup the
+/// write rolls up into, refusing it if that would cross a hard limit.
+///
+/// This is `qgroup_reserve` plus `qgroup_check_limits`, and it is the ONLY
+/// place a quota limit is enforced — which is also true of Linux, where
+/// `-EDQUOT` is returned from `qgroup_reserve` and nowhere else in
+/// `fs/btrfs`. Accounting at commit records what happened; it does not judge
+/// it. A limit lowered below current usage has to be recordable, and a
+/// transaction that has already been promised to its callers has to be
+/// committable.
+///
+/// Enforcing here rather than at commit is also what lets quota volumes batch
+/// at all. A commit-time refusal can only reject a whole transaction, so
+/// batching would defer EDQUOT past the write that earned it and land it on
+/// whichever caller triggered the flush.
+///
+/// That unblocking is worth more on a quota volume than anywhere else, because
+/// a commit costs more there: full-mode accounting re-walks every subvolume
+/// root's extents, so the recount is proportional to the whole tree and is
+/// paid once per transaction whatever the transaction contains. 4000 overwrites
+/// of one file on a quota fixture, with the build outside the timing and a
+/// zero-write baseline of 16.33s subtracted, take 54.4s at one operation per
+/// transaction and 12.9s at eight — 4.2x, against roughly 3.5x for the same
+/// change on a volume without quotas.
+///
+/// The reservation is deliberately pessimistic, as Linux's is: `num_bytes` is
+/// the uncompressed length, charged before the tiling loop knows what
+/// compression will save. Erring towards rejecting slightly early is the safe
+/// direction — the alternative is admitting a write that crosses the limit.
+///
+/// Metadata is NOT reserved. Linux reserves it separately
+/// (`btrfs_qgroup_reserve_meta`); NARF has no equivalent, so growth driven
+/// purely by metadata is caught by the next reservation against the recounted
+/// usage rather than by the operation that caused it. Usage stays exact
+/// either way, because the commit-time recount counts metadata.
+/// Charge the metadata a transaction is about to write against the same
+/// qgroups, sized the way Linux sizes it.
+///
+/// `btrfs_start_transaction` reserves `num_items * nodesize` for the qgroup
+/// (`transaction.c`), where `num_items` is how many btree items the handle
+/// expects to insert, update or delete. Note it is NOT
+/// `btrfs_calc_insert_metadata_size`, which is several times larger and feeds
+/// the block reserve rather than the qgroup — reserving that here would refuse
+/// writes a real kernel accepts.
+///
+/// Linux has to predict `num_items` when the handle opens. NARF does not:
+/// every batchable operation hands its complete edit list to the transaction,
+/// so the count is exact rather than an upper bound.
+///
+/// Held for the whole transaction and released when it commits, which is
+/// `BTRFS_QGROUP_RSV_META_PERTRANS`. Dropping the batch drops the
+/// reservations with it.
+///
+/// A consequence worth stating plainly, because it is shared with Linux and
+/// surprises people: a qgroup limit smaller than a few times `nodesize` makes
+/// the subvolume unusable. Creating a file reserves for every item it touches
+/// — inode, ref, dir item, dir index, parent inode — before writing a single
+/// byte of data, and if that reservation does not fit, the create is refused.
+async fn qgroup_reserve_meta<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
+    root_id: u64,
+    num_items: usize,
+) -> Result<(), FsError> {
+    let num_bytes = (num_items as u64).saturating_mul(vol.nodesize() as u64);
+    qgroup_reserve(vol, batch, root_id, num_bytes).await
+}
+
+async fn qgroup_reserve<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
+    root_id: u64,
+    num_bytes: u64,
+) -> Result<(), FsError> {
+    // `qgroup_reserve` returns 0 immediately for a zero-byte reservation, so
+    // the namespace operations never touch the quota tree at all.
+    if num_bytes == 0 {
+        return Ok(());
+    }
+    if batch.qgroup.is_none() {
+        batch.qgroup = Some(qgroup_charge_chain(vol, root_id).await?);
+    }
+    let chain = batch.qgroup.clone().unwrap_or_default();
+    for q in &chain {
+        // Outstanding reservations count against the limit alongside committed
+        // usage: two writes that each fit but do not fit together must not
+        // both be admitted just because neither has been accounted yet.
+        let claimed = batch
+            .reserved
+            .get(&q.id)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(num_bytes);
+        if q.limit_flags & QGROUP_LIMIT_MAX_RFER != 0 && claimed.saturating_add(q.rfer) > q.max_rfer
+        {
+            return Err(FsError::QuotaExceeded);
+        }
+        if q.limit_flags & QGROUP_LIMIT_MAX_EXCL != 0 && claimed.saturating_add(q.excl) > q.max_excl
+        {
+            return Err(FsError::QuotaExceeded);
+        }
+    }
+    // Only once every qgroup in the chain has room, exactly as Linux records
+    // the reservation only after the whole iterator passed its checks.
+    for q in &chain {
+        let slot = batch.reserved.entry(q.id).or_insert(0);
+        *slot = slot.saturating_add(num_bytes);
+    }
+    Ok(())
+}
+
 struct QuotaChange<'a> {
     root_logical: &'a [u8],
     pending: &'a BTreeMap<u64, Vec<u8>>,
     create: Option<&'a QgroupCreate>,
     delete: Option<u64>,
     edits: &'a [Edit],
-    enforce_limits: bool,
     simple_deltas: &'a BTreeMap<u64, i128>,
 }
 
@@ -3314,19 +3574,21 @@ async fn prepare_quota_tree<B: BlockDevice + 'static>(
     let mut info_edits = Vec::new();
     for id in qgroup_ids {
         let (referenced, exclusive) = usage.get(&id).copied().ok_or(FsError::InvalidData)?;
+        // The limit item is not consulted here — enforcement lives in
+        // `qgroup_reserve` — but its presence and shape are still an invariant
+        // of a well-formed quota tree, and this recount rewrites the tree that
+        // btrfs-progs will check.
         let limit_key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
         let limit_slot = leaf_find(&quota, &limit_key)?.ok_or(FsError::InvalidData)?;
-        let limit = leaf_item_data(&quota, limit_slot)?;
-        if limit.len() != 40 {
+        if leaf_item_data(&quota, limit_slot)?.len() != 40 {
             return Err(FsError::InvalidData);
         }
-        let limit_flags = le64(limit, 0)?;
-        if change.enforce_limits
-            && ((limit_flags & 1 != 0 && referenced > le64(limit, 8)?)
-                || (limit_flags & 2 != 0 && exclusive > le64(limit, 16)?))
-        {
-            return Err(FsError::QuotaExceeded);
-        }
+        // Record the usage; do not judge it. Limits are enforced when space is
+        // reserved (`qgroup_reserve`), which is the only place Linux returns
+        // -EDQUOT from either. A commit that refused a limit could only refuse
+        // the whole transaction, which would make an over-quota write take
+        // down every operation batched with it, and would make a limit set
+        // below current usage impossible to record at all.
         let mut info = alloc::vec![0u8; 40];
         info[0..8].copy_from_slice(&gen.to_le_bytes());
         info[8..16].copy_from_slice(&referenced.to_le_bytes());
@@ -3428,7 +3690,6 @@ async fn commit_qgroup_edits<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: edits,
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: false,
             incompat_flags_add: 0,
         },
     )
@@ -3567,7 +3828,6 @@ async fn quota_enable_mode<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: false,
             incompat_flags_add: if simple {
                 format::INCOMPAT_SIMPLE_QUOTA
             } else {
@@ -3641,7 +3901,6 @@ pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: true,
-            enforce_qgroup_limits: false,
             incompat_flags_add: 0,
         },
     )
@@ -3985,7 +4244,6 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 create: txn.qgroup_create.as_ref(),
                 delete: txn.qgroup_delete,
                 edits: &txn.qgroup_edits,
-                enforce_limits: txn.enforce_qgroup_limits,
                 simple_deltas: &simple_deltas,
             },
         )
@@ -4746,7 +5004,6 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
@@ -4999,7 +5256,6 @@ pub(crate) async fn create_snapshot_with_qgroup<B: BlockDevice + 'static>(
             qgroup_delete: None,
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
@@ -5267,7 +5523,6 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
             qgroup_delete: Some(child_id),
             qgroup_edits: Vec::new(),
             skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
             incompat_flags_add: 0,
         },
     )
