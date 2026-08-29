@@ -111,11 +111,23 @@ const NODE_CACHE_MAX: usize = 256;
 /// Commits allowed to stage before the superblock is forced out.
 ///
 /// Bounds two things: how much work a crash discards, and how long pinned
-/// extents withhold free space. Linux commits on a 30-second timer instead;
-/// a count is the equivalent NARF can express without a timer source in the
-/// driver, and a small one keeps both costs modest while still amortising the
-/// superblock write and its barrier across a batch.
-const MAX_STAGED_COMMITS: usize = 2;
+/// extents withhold free space.
+///
+/// One, because staging a second buys nothing measurable. Deferring the
+/// superblock was worth having when every operation committed — it was then
+/// the only thing amortising a write and a barrier across more than one
+/// mutation. Now that a transaction carries up to `MAX_BATCH_OPS`
+/// operations, that amortisation has already happened, and the superblock is
+/// one write per batch rather than one per operation. Interleaved paired runs
+/// of the write smoke put a depth of 1 at 2.51e9 cycles against 2.49e9 for a
+/// depth of 2 — a 0.7% difference on a host whose run-to-run spread is nearer
+/// 2x, which is to say no difference at all.
+///
+/// So the depth is spent on the other side of the trade instead: at 1, a
+/// crash can discard one batch rather than two, and freed space is withheld
+/// for one commit rather than two. Both are paid for in real failure
+/// behaviour; the throughput it would have bought is not there to lose.
+const MAX_STAGED_COMMITS: usize = 1;
 
 impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
