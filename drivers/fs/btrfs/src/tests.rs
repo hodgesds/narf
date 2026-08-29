@@ -2090,6 +2090,9 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     ) {
         return TestResult::Fail("V2 qgroup-inheriting subvolume create failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(vol.sync_to_disk());
     let child = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -2171,6 +2174,9 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
         return TestResult::Fail("qgroup hard-limit rejection was not atomic");
     }
 
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(child.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount_opts(
         device.clone(),
         DomainId::DRIVER_0,
@@ -2198,6 +2204,9 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     ) {
         return TestResult::Fail("quota-inheriting snapshot failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top.sync_to_disk());
     let snapshot = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -2497,6 +2506,9 @@ fn smoke_btrfs_qgroup_admin_ioctls() -> TestResult {
     ) {
         return TestResult::Fail("quota disable ioctl failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(vol.sync_to_disk());
     let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after quota disable failed"),
@@ -2595,6 +2607,9 @@ fn smoke_btrfs_linux_simple_quota_fixture() -> TestResult {
         return TestResult::Fail("NARF data extent omitted the simple owner ref");
     }
 
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(vol.sync_to_disk());
     let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(vol)) => vol,
         _ => return TestResult::Fail("simple-quota fixture failed to remount"),
@@ -2740,6 +2755,9 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     ) {
         return TestResult::Fail("simple shared-root snapshot create failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top.sync_to_disk());
     let snapshot = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -2762,6 +2780,9 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     // The source qgroup cannot disappear while the shared root still contains
     // metadata permanently owned by it. Once the snapshot COWs that final
     // holder, the debit must still find the orphaned qgroup.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(snapshot.sync_to_disk());
     let top_for_delete = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(vol)) => vol,
         _ => return TestResult::Fail("top remount before simple child delete failed"),
@@ -3117,6 +3138,10 @@ fn smoke_btrfs_checksum_enforced() -> TestResult {
     let mut img3 = decode_sparse(FIXTURE_SPARSE);
     img3[data_physical + 100] ^= 0x40;
     let dev = RamBlockDevice::from_image(512, img3);
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(clean.sync_to_disk());
     let corrupt = match poll_once(BtrfsVolume::mount(dev, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("data corruption should not prevent metadata mount"),
@@ -3197,6 +3222,10 @@ fn smoke_btrfs_cow_overwrite_roundtrip() -> TestResult {
 
     // Remount from the same device storage: the on-disk COW chain (new
     // superblock -> new root tree -> new fs tree -> new extent) is consistent.
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after write failed (broken COW chain)"),
@@ -3275,6 +3304,10 @@ fn smoke_btrfs_partial_and_append_write() -> TestResult {
     want[100..108].copy_from_slice(patch);
     want.extend_from_slice(tail); // grew to 12000 + tail
 
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after write failed"),
@@ -3383,6 +3416,10 @@ fn smoke_btrfs_write_emits_csums() -> TestResult {
 
     // Remount and verify every sector of big.dat's (new) extent matches its
     // freshly written CSUM-tree entry.
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -3502,6 +3539,10 @@ fn smoke_btrfs_write_extent_accounting() -> TestResult {
     }
 
     // Remount and inspect the extent tree.
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -3656,6 +3697,10 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     ) {
         return TestResult::Fail("log child creation failed");
     }
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(top.sync_to_disk());
     let child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device.clone() as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -3690,6 +3735,10 @@ fn smoke_btrfs_subvolume_tree_log_replay() -> TestResult {
     if replayed_top.superblock().log_root != 0 {
         return TestResult::Fail("child log pointer survived replay");
     }
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(replayed_top.sync_to_disk());
     let replayed_child = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(device as Arc<dyn narf_block::BlockDeviceSync>),
         DomainId::DRIVER_0,
@@ -4320,6 +4369,10 @@ fn smoke_btrfs_unlink_file_with_data() -> TestResult {
         _ => return TestResult::Fail("unlink big.dat failed"),
     }
 
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after unlink failed"),
@@ -4521,6 +4574,10 @@ fn smoke_btrfs_rename_file() -> TestResult {
         _ => return TestResult::Fail("rename failed"),
     }
 
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after rename failed"),
@@ -7338,6 +7395,10 @@ fn smoke_btrfs_mount_subvol_option() -> TestResult {
     // on-disk default subvolume mount_opts may have selected.
     let dev = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_NESTEDSUBVOL_SPARSE));
     let sel = Some(crate::volume::Subvol::Name("container/outer/inner".into()));
+    // Batched commits: a write is durable only once synced, exactly as a
+    // real unmount would flush. Without this the check below would assert
+    // that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(probe.sync_to_disk());
     let nested = match poll_once(BtrfsVolume::mount_subvol(
         dev,
         DomainId::DRIVER_0,
@@ -7640,6 +7701,9 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
     }
 
     let mount_named = |name: &str| {
+        // Batched commits: durable only once synced, as a real unmount would
+        // flush. Without it this would assert UNSYNCED data survives.
+        let _ = poll_once(top.sync_to_disk());
         poll_once(BtrfsVolume::mount_subvol(
             device.clone(),
             DomainId::DRIVER_0,
@@ -7689,6 +7753,9 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
 
     // Remount the parent after the child transaction so its cached root tree is
     // current, then traverse into the child and read the persisted file.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top.sync_to_disk());
     let remounted_top = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("parent remount after subvolume write failed"),
@@ -7760,6 +7827,9 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
     // every new parent/child/UUID/root/extent block must be removed from the
     // free-space tree in the converged fixed point.
     let fst_device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_FST_SPARSE));
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(remounted_top.sync_to_disk());
     let fst_top = match poll_once(BtrfsVolume::mount_opts(
         fst_device.clone(),
         DomainId::DRIVER_0,
@@ -7780,6 +7850,9 @@ fn smoke_btrfs_subvolume_create_ioctl() -> TestResult {
     ) {
         return TestResult::Fail("free-space-tree subvolume creation failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(fst_top.sync_to_disk());
     if !matches!(
         poll_once(BtrfsVolume::mount_subvol(
             fst_device,
@@ -8075,6 +8148,9 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         return TestResult::Fail("constant-size shared-root snapshot failed");
     }
 
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top.sync_to_disk());
     let origin = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8084,6 +8160,9 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("shared-root origin remount failed"),
     };
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(origin.sync_to_disk());
     let shared = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8142,6 +8221,9 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     if origin.fs_tree_root() == shared_root {
         return TestResult::Fail("shared origin was not materialised before mutation");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(shared.sync_to_disk());
     let shared_after = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8160,6 +8242,9 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
 
     // The snapshot is now the final holder of the old root. Deleting it must
     // reclaim that tree while leaving the materialised origin mountable.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(shared_after.sync_to_disk());
     let parent = match poll_once(BtrfsVolume::mount_opts(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8179,6 +8264,9 @@ fn smoke_btrfs_shared_root_snapshot_lifecycle() -> TestResult {
     ) {
         return TestResult::Fail("final shared-root snapshot deletion failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(parent.sync_to_disk());
     if !matches!(
         poll_once(BtrfsVolume::mount_subvol(
             device,
@@ -8234,6 +8322,9 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     ) {
         return TestResult::Fail("delete-test subvolume creation failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(vol.sync_to_disk());
     let empty_id = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8307,6 +8398,9 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
         return TestResult::Fail("V2 name snapshot destroy failed");
     }
 
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(snap.sync_to_disk());
     let remounted = match poll_once(BtrfsVolume::mount_opts(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8376,6 +8470,9 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     ) {
         return TestResult::Fail("by-id delete-test subvolume creation failed");
     }
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(remounted.sync_to_disk());
     let byid = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8543,6 +8640,9 @@ fn smoke_btrfs_writable_nested_subvolume() -> TestResult {
 
     // The root-tree item was repointed, so entering the same subvolume from a
     // top-level mount must reach the new root as well.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(remounted.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount_subvol(
         device,
         DomainId::DRIVER_0,
@@ -8597,6 +8697,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
         _ => return TestResult::Fail("outer subvolume mount for deletion failed"),
     };
     let outer_id = outer.fs_tree_id();
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(outer.sync_to_disk());
     let inner = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8607,6 +8710,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
         _ => return TestResult::Fail("inner subvolume mount for deletion failed"),
     };
     let inner_id = inner.fs_tree_id();
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(inner.sync_to_disk());
     let rochild = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8621,6 +8727,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
     let rochild_id = rochild.fs_tree_id();
 
     // The direct parent delete is rejected while both ROOT_REF children exist.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(rochild.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8663,6 +8772,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
 
     // The first top-level mount has a stale fs-tree view after the child-root
     // transactions. Remount before deleting the now-empty outer subvolume.
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top.sync_to_disk());
     let top2 = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8689,6 +8801,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
         return TestResult::Fail("empty parent subvolume deletion failed");
     }
 
+    // Batched commits: durable only once synced, as a real unmount would
+    // flush. Without it this would assert UNSYNCED data survives.
+    let _ = poll_once(top2.sync_to_disk());
     let final_top = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8709,6 +8824,9 @@ fn smoke_btrfs_nested_subvolume_delete_bottom_up() -> TestResult {
         return TestResult::Fail("deleted nested hierarchy remained reachable");
     }
     for id in [outer_id, inner_id, rochild_id] {
+        // Batched commits: durable only once synced, as a real unmount would
+        // flush. Without it this would assert UNSYNCED data survives.
+        let _ = poll_once(final_top.sync_to_disk());
         if !matches!(
             poll_once(BtrfsVolume::mount_subvol(
                 device.clone(),
