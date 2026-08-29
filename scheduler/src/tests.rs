@@ -2670,6 +2670,43 @@ fn smoke_scheduler_honors_policy_pick_order() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_honors_policy_pick_order);
 
+fn smoke_scheduler_select_wake_cpu_prefers_idle_sibling() -> TestResult {
+    use crate::affinity::CpuId;
+    use crate::steal::{NumaAwareSteal, StealStrategy};
+
+    let strat = NumaAwareSteal;
+    // CPUs 0..4 online; only cpu 2 idle. A task homed on the busy cpu 0 should
+    // be hinted to the idle sibling cpu 2 so it gets pulled there.
+    let online = |c: CpuId| c.0 < 4;
+    let only_2_idle = |c: CpuId| c.0 == 2;
+    match strat.select_wake_cpu(CpuId(0), &online, &only_2_idle) {
+        Some(t) if t.0 == 2 => {}
+        _ => return TestResult::Fail("expected the idle sibling cpu 2"),
+    }
+
+    // No idle sibling → None (leave the wake on home).
+    let none_idle = |_c: CpuId| false;
+    if strat
+        .select_wake_cpu(CpuId(0), &online, &none_idle)
+        .is_some()
+    {
+        return TestResult::Fail("expected None when no sibling is idle");
+    }
+
+    // Must never hint a CPU to pull the task onto its own home, and must skip
+    // offline CPUs even when they read "idle".
+    let all_idle = |_c: CpuId| true;
+    match strat.select_wake_cpu(CpuId(1), &online, &all_idle) {
+        Some(t) if t.0 != 1 && t.0 < 4 => {}
+        _ => return TestResult::Fail("must return an online sibling that is not home"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_select_wake_cpu_prefers_idle_sibling
+);
+
 fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {
     use crate::{
         cpu_bring_up, cpu_take_offline, install_scheduler, spawn, ClassScheduler, CpuId,

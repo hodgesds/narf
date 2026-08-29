@@ -348,6 +348,33 @@ pub fn disable_work_stealing() {
     STEAL_ENABLED.store(false, Ordering::Release);
 }
 
+/// Master switch for wake-time placement (`wake_place_hint` — the push-side
+/// analogue of Linux `select_task_rq`). OFF by default and independent of
+/// `STEAL_ENABLED`: pulling idle CPUs toward work (stealing) is always safe,
+/// but *pushing* a freshly-woken task onto an idle sibling is a policy that
+/// helps producer-consumer IPC (a woken consumer runs on an idle core instead
+/// of queuing behind a busy home) yet can HURT heavily-contended
+/// synchronization — scattering many waiters of one lock across CPUs multiplies
+/// contention + cache-line bouncing (measured: SysV `sem` under oversubscription
+/// stalls/regresses). So it is opt-in, gated behind a boot cmdline flag. A
+/// future debugfs `sched/features` surface can expose this same atomic.
+static WAKE_PLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable wake-time placement. Opt-in (see [`WAKE_PLACEMENT_ENABLED`]).
+pub fn enable_wake_placement() {
+    WAKE_PLACEMENT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable wake-time placement.
+pub fn disable_wake_placement() {
+    WAKE_PLACEMENT_ENABLED.store(false, Ordering::Release);
+}
+
+/// Whether wake-time placement is currently enabled.
+pub fn wake_placement_enabled() -> bool {
+    WAKE_PLACEMENT_ENABLED.load(Ordering::Acquire)
+}
+
 /// Master switch for running *user* tasks on multiple CPUs. Off by
 /// default. Boot flips it on ONLY when cross-CPU TLB shootdown is
 /// wired (x2APIC active → the `invlpg_global` broadcast hook is
@@ -2563,7 +2590,9 @@ unsafe fn wake_raw(data: *const ()) {
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
-    resched_remote(arc.cpu.load(Ordering::Acquire));
+    let home = arc.cpu.load(Ordering::Acquire);
+    resched_remote(home);
+    wake_place_hint(home);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -2571,11 +2600,56 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let cpu = unsafe {
+    let home = unsafe {
         (*ptr).flag.store(true, Ordering::Release);
         (*ptr).cpu.load(Ordering::Acquire)
     };
-    resched_remote(cpu);
+    resched_remote(home);
+    wake_place_hint(home);
+}
+
+/// Wake-time placement hint — the push-side counterpart of work-stealing and
+/// the analogue of Linux's `select_task_rq`. After a woken task's `home` CPU
+/// has been kicked, if `home` is BUSY, ask the installed balance strategy for
+/// an idle sibling and kick it too, so that sibling PULLS the freshly-woken
+/// task via `try_steal_one` instead of the task waiting behind `home`'s current
+/// slice. `home` is always kicked first (above), so a stale/wrong hint can only
+/// waste one IPI — never strand the wake.
+///
+/// No-op when `home` is idle (it wakes and runs the task itself — the common
+/// latency-critical ping-pong case, kept scan-free), when stealing is disabled
+/// (a kicked sibling could not pull), or when no strategy is installed.
+///
+/// Runs in the raw-waker path, which can be IRQ context: it must not allocate
+/// or block. `steal::snapshot()` is an `Arc` clone under an `IrqSafeSpinLock`,
+/// the strategy's `select_wake_cpu` is a bounded alloc-free CPU scan, and
+/// `resched_remote` only IPIs a target that has published `CPU_HALTED`.
+fn wake_place_hint(home: u32) {
+    // Opt-in (see WAKE_PLACEMENT_ENABLED) and only meaningful with stealing on
+    // (the kicked sibling pulls the task via try_steal_one).
+    if !WAKE_PLACEMENT_ENABLED.load(Ordering::Acquire) || !STEAL_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    // Home idle → `resched_remote(home)` above already woke it and it will run
+    // the task itself; no offload needed, and skipping the scan keeps the hot
+    // latency path (a peer waking a parked task on an idle CPU) free.
+    if CPU_HALTED[home as usize].load(Ordering::SeqCst) {
+        return;
+    }
+    let Some(strategy) = crate::steal::snapshot() else {
+        return;
+    };
+    let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
+    let is_idle = |c: crate::affinity::CpuId| {
+        (c.0 as usize) < CPU_HALTED.len() && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
+    };
+    if let Some(target) =
+        strategy.select_wake_cpu(crate::affinity::CpuId(home), &is_online, &is_idle)
+    {
+        if target.0 != home {
+            resched_remote(target.0);
+        }
+    }
 }
 
 unsafe fn drop_raw(data: *const ()) {
@@ -3470,8 +3544,8 @@ pub fn run_until_empty() {
                         // Window collapsed (idle CPU): one cheap probe before
                         // committing to the spin-grow cycle, so a lone wake
                         // that already landed skips the HLT.
-                        woke = narf_lib::deferred_wake::drain_and_wake() > 0
-                            || wake_list_pending(cpu);
+                        woke =
+                            narf_lib::deferred_wake::drain_and_wake() > 0 || wake_list_pending(cpu);
                     }
                     if woke {
                         // Hit: grow the window (seed if collapsed, else ×2).
@@ -4100,9 +4174,7 @@ pub fn run_forever() -> ! {
             // the published-HALTED fence, that wake is slept over indefinitely
             // (a tickless idle AP has no periodic IRQ to rescue it). Mirrors
             // Linux `current_clr_polling_and_test()` before HLT (idle.c).
-            nonempty
-                || narf_lib::deferred_wake::has_pending()
-                || wake_list_pending(cpu)
+            nonempty || narf_lib::deferred_wake::has_pending() || wake_list_pending(cpu)
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);

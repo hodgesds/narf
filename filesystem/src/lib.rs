@@ -65,6 +65,7 @@ pub mod bpffs;
 pub mod cgroupfs;
 pub mod console_tty;
 pub mod csprng;
+pub mod debugfs;
 pub mod devfs;
 pub mod devfs_block;
 pub mod devfs_input;
@@ -89,6 +90,7 @@ pub mod sysfs;
 pub mod uevent;
 
 mod cgroupfs_tests;
+mod debugfs_tests;
 mod devfs_block_tests;
 mod devfs_pty_tests;
 mod e2e_tests;
