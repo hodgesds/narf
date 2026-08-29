@@ -3312,11 +3312,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
     .await?;
     let touch_csum = !txn.new_data.is_empty() || !data_changes.released.is_empty();
     let old_csum = match touch_csum {
-        true => Some(
-            roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID)
-                .await?
-                .0,
-        ),
+        true => Some(roots::find_root(vol, root_tree, format::CSUM_TREE_OBJECTID).await?),
         false => None,
     };
     let old_fst = roots::find_root(vol, root_tree, format::FREE_SPACE_TREE_OBJECTID)
@@ -3351,13 +3347,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
             }
         }
     }
-    let (csum_logical, csum_old) = match old_csum {
-        Some(c) => {
-            let (l, o) = read_fs_oversized(vol, c).await?;
-            (Some(l), o)
-        }
-        None => (None, Vec::new()),
-    };
+
     let (fst_base, fst_old) = match old_fst {
         Some(f) => {
             let (l, o) = read_fs_oversized(vol, f).await?;
@@ -3369,30 +3359,35 @@ async fn commit_txn<B: BlockDevice + 'static>(
     let bgs = read_block_groups(vol, old_ext).await?;
 
     // csum tree: drop freed extents' csums, add new extents' csums.
-    let csum_logical = match csum_logical {
-        Some(mut cl) => {
-            for &(bytenr, _) in &data_changes.released {
-                let k = BtrfsKey::new(
-                    format::EXTENT_CSUM_OBJECTID,
-                    format::EXTENT_CSUM_KEY,
-                    bytenr,
-                );
-                if let Some(s) = leaf_find(&cl, &k)? {
-                    leaf_delete(&mut cl, s)?;
-                }
-            }
-            for d in &txn.new_data {
-                let k = BtrfsKey::new(
+    // Csum-tree edits, as a list rather than a whole-tree rewrite.
+    //
+    // This tree grows with every 4 KiB of data ever written, and repacking it
+    // whole meant every commit REWROTE all of it — the blocks written per
+    // commit rose with the amount of data already on the filesystem. Reading
+    // it back was cheap once nodes were cached; writing it never was.
+    // Path-COW touches only the root-to-leaf paths the edits reach, which is
+    // what the fs and extent trees beside it already do.
+    let csum_edits: Vec<Edit> = data_changes
+        .released
+        .iter()
+        .map(|&(bytenr, _)| {
+            Edit::Delete(BtrfsKey::new(
+                format::EXTENT_CSUM_OBJECTID,
+                format::EXTENT_CSUM_KEY,
+                bytenr,
+            ))
+        })
+        .chain(txn.new_data.iter().map(|d| {
+            Edit::Upsert(
+                BtrfsKey::new(
                     format::EXTENT_CSUM_OBJECTID,
                     format::EXTENT_CSUM_KEY,
                     d.id.bytenr,
-                );
-                leaf_insert_sorted(&mut cl, &k, &d.csums)?;
-            }
-            Some(cl)
-        }
-        None => None,
-    };
+                ),
+                d.csums.clone(),
+            )
+        }))
+        .collect();
 
     // The fs tree arrives already path-COWed (nodes allocated from `alloc`).
     let c = &txn.fs;
@@ -3482,21 +3477,14 @@ async fn commit_txn<B: BlockDevice + 'static>(
         stamp_root_item_fields(&mut root_logical, quota_owner, quota_root, quota_level, gen)?;
         extra_roots.push((quota_owner, quota_root, quota_level));
     }
-    let csum_groups = csum_logical
-        .as_ref()
-        .map(|c| group_items(vol, c))
-        .transpose()?;
     let root_groups = group_items(vol, &root_logical)?;
-    let csum_nc = csum_groups
-        .as_ref()
-        .map_or(0, |g| tree_block_count(g.len(), ns));
     let root_nc = tree_block_count(root_groups.len(), ns);
     let base = alloc.snapshot();
 
     // ── Mutual fixed point: whole-repack csum/root/fst, path-COW ext ────
     #[allow(clippy::type_complexity)]
     struct Done {
-        csum_addrs: Vec<u64>,
+        csum_nodes: Vec<(u64, Vec<u8>, u8)>,
         root_addrs: Vec<u64>,
         fst_addrs: Vec<u64>,
         fst_final: Option<Vec<u8>>,
@@ -3521,7 +3509,18 @@ async fn commit_txn<B: BlockDevice + 'static>(
     const MAX_FIXED_POINT_ROUNDS: usize = 64;
     for _ in 0..MAX_FIXED_POINT_ROUNDS {
         alloc.restore(&base);
-        let csum_addrs = alloc_nodes(&mut alloc, vol, csum_nc)?;
+        // Path-COW the csum tree BEFORE the allocations below: its new blocks
+        // are metadata this round must account for, exactly as the extent
+        // tree's are.
+        let csum_out = match old_csum {
+            Some((c, lvl)) => Some(
+                PathCow::new(vol, gen, c, lvl)
+                    .await?
+                    .apply(&mut alloc, &csum_edits)
+                    .await?,
+            ),
+            None => None,
+        };
         let root_addrs = alloc_nodes(&mut alloc, vol, root_nc)?;
         let fst_addrs = alloc_nodes(
             &mut alloc,
@@ -3536,13 +3535,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
         // Every new metadata block: fs (fixed) + this round's csum/root/fst +
         // last round's extent-tree blocks (the self-reference).
         let mut new_meta: Vec<(u64, u64, u8)> = fs_new_meta.clone();
-        if let Some(g) = &csum_groups {
-            collect_tree_meta(
-                &csum_addrs,
-                g.len(),
-                ns,
-                format::CSUM_TREE_OBJECTID,
-                &mut new_meta,
+        if let Some(out) = &csum_out {
+            new_meta.extend(
+                out.nodes
+                    .iter()
+                    .map(|&(a, _, l)| (a, format::CSUM_TREE_OBJECTID, l)),
             );
         }
         collect_tree_meta(
@@ -3567,7 +3564,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
 
         let mut freed_meta: Vec<(u64, u8)> = fs_freed.clone();
         freed_meta.extend(root_old.iter().copied());
-        freed_meta.extend(csum_old.iter().copied());
+        if let Some(out) = &csum_out {
+            freed_meta.extend(out.freed.iter().copied());
+        }
         freed_meta.extend(fst_old.iter().copied());
         freed_meta.extend(prev_ext_freed.iter().copied());
 
@@ -3631,11 +3630,11 @@ async fn commit_txn<B: BlockDevice + 'static>(
             && ext_out.root_addr == prev_ext_root
             && fst_lv == fst_leaves;
         if converged {
-            let csum_root = csum_groups
+            let csum_root = csum_out
                 .as_ref()
-                .map_or((0, 0), |g| tree_root_addr(&csum_addrs, g.len(), ns));
+                .map_or((0, 0), |out| (out.root_addr, out.root_level));
             done = Some(Done {
-                csum_addrs,
+                csum_nodes: csum_out.map(|out| out.nodes).unwrap_or_default(),
                 root_addrs,
                 fst_addrs,
                 fst_final,
@@ -3654,7 +3653,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         fst_leaves = fst_lv;
     }
     let Done {
-        csum_addrs,
+        csum_nodes,
         root_addrs,
         fst_addrs,
         fst_final,
@@ -3680,7 +3679,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         root_updates.push((vol.fs_tree_id(), fs_root_addr, fs_level));
     }
     root_updates.extend(extra_roots);
-    if csum_logical.is_some() {
+    if old_csum.is_some() {
         root_updates.push((format::CSUM_TREE_OBJECTID, csum_root.0, csum_root.1));
     }
     if fst_final.is_some() {
@@ -3698,8 +3697,10 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // ── Write every new node (extent-tree path-COW nodes are stamped here) ─
     let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
     nodes.extend(fs_nodes);
-    if let (Some(c), Some(g)) = (&csum_logical, &csum_groups) {
-        nodes.extend(pack_tree_at(vol, c, g, &csum_addrs, gen)?.0);
+    // Path-COW nodes arrive unstamped, like the extent tree's below.
+    for (addr, mut buf, _lvl) in csum_nodes {
+        stamp_node(&mut buf, addr, gen, vol.csum_type())?;
+        nodes.push((addr, buf));
     }
     for (addr, mut buf, _lvl) in ext_nodes {
         stamp_node(&mut buf, addr, gen, vol.csum_type())?;
