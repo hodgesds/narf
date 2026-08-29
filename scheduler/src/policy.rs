@@ -770,7 +770,31 @@ pub(crate) fn pick_next_slot(
             BudgetEligibility::Throttled => 0,
         }
     };
-    let best_tier = q.iter().map(dispatch_tier).max().unwrap_or(0);
+    // Single pass over the queue: evaluate each slot's dispatch tier exactly
+    // once while tracking the best tier seen, the earliest slot that reaches
+    // it, and the policy's requested slot (if present) with its tier. This
+    // fuses what were three separate O(n) scans plus per-slot re-evaluation
+    // (max-tier, first-dispatchable, requested-position) into one. It matters
+    // because the executor calls this once per queued task per poll round, so
+    // the round was O(n^2) in queue length with a large constant (an atomic
+    // load and a budget `view()` per slot per scan).
+    let requested_id = requested.map(|h| h.task_id());
+    let mut best_tier = 0u8;
+    let mut best_pos: Option<usize> = None;
+    let mut requested_hit: Option<(usize, u8)> = None;
+    for (index, slot) in q.iter().enumerate() {
+        let tier = dispatch_tier(slot);
+        // `best_tier` only ever rises, so the index at which it reaches its
+        // final value is the earliest top-tier slot — identical to the old
+        // `position(tier == best_tier)` scan.
+        if tier > best_tier {
+            best_tier = tier;
+            best_pos = Some(index);
+        }
+        if requested_id == Some(slot.id) {
+            requested_hit = Some((index, tier));
+        }
+    }
     if best_tier == 0 {
         // No dispatchable work. Detach one slot for core maintenance so cap
         // revocation and affinity cleanup remain observable even while every
@@ -788,17 +812,15 @@ pub(crate) fn pick_next_slot(
         }
         return Some((TaskHandle::from_id(slot.id), slot));
     }
-    let first_dispatchable = q.iter().position(|slot| dispatch_tier(slot) == best_tier);
-    let requested_pos = requested.and_then(|h| {
-        q.iter()
-            .position(|slot| slot.id == h.task_id())
-            .and_then(|pos| (dispatch_tier(&q[pos]) == best_tier).then_some((h, pos)))
-    });
-    let (handle, pos) = requested_pos.or_else(|| {
-        let pos = first_dispatchable?;
-        q.get(pos).map(|slot| (TaskHandle::from_id(slot.id), pos))
-    })?;
+    // Honor the policy's pick only when it lands in the top eligibility tier;
+    // otherwise fall back to the earliest top-tier slot. Core validation thus
+    // still overrides a stale/foreign/wrong-tier policy handle.
+    let pos = match requested_hit {
+        Some((requested_pos, requested_tier)) if requested_tier == best_tier => requested_pos,
+        _ => best_pos.expect("best_tier > 0 guarantees a top-tier position"),
+    };
     let slot = q.remove(pos)?;
+    let handle = TaskHandle::from_id(slot.id);
     if let Some(scheduler) = scheduler {
         scheduler.on_task_queue_event(
             cpu,
