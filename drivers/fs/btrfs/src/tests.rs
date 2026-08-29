@@ -7968,6 +7968,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         ) {
             return TestResult::Fail("duplicate snapshot name was accepted");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(vol.sync_to_disk());
     }
 
     let snapshot_id;
@@ -8045,6 +8049,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         if !matches!(poll_once(big.write(100, b"SNAP")), Some(Ok(4))) {
             return TestResult::Fail("shared snapshot data write failed");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(snap.sync_to_disk());
     }
 
     // Mutating the source after snapshot creation must not alter the snapshot.
@@ -8064,6 +8072,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         if !matches!(poll_once(hello.write(0, b"source\n")), Some(Ok(7))) {
             return TestResult::Fail("source mutation after snapshot failed");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(source.sync_to_disk());
     }
     {
         let snap = match poll_once(BtrfsVolume::mount_subvol(
@@ -8094,6 +8106,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         if !matches!(poll_once(hello.write(0, b"snapshot\n")), Some(Ok(9))) {
             return TestResult::Fail("snapshot mutation failed");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(snap.sync_to_disk());
     }
     {
         let source = match poll_once(BtrfsVolume::mount_opts(
@@ -8139,6 +8155,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         if snapshot_item[263..279] != source_item[247..263] {
             return TestResult::Fail("snapshot parent UUID did not name the source");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(source.sync_to_disk());
     }
 
     // Read-only creation uses the same transaction but persists the root flag.
@@ -8159,6 +8179,10 @@ fn smoke_btrfs_snapshot_create_and_isolate() -> TestResult {
         ) {
             return TestResult::Fail("read-only snapshot creation failed");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(vol.sync_to_disk());
     }
     if !matches!(
         poll_once(BtrfsVolume::mount_subvol(
@@ -8402,6 +8426,11 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     ) {
         return TestResult::Fail("legacy subvolume destroy failed");
     }
+    // Batched commits: the destroy above only staged its superblock, so the
+    // mount below would still find the subvolume on disk. The sync belongs
+    // here rather than beside the mount, which sits inside a `matches!`
+    // argument where a statement cannot go.
+    let _ = poll_once(vol.sync_to_disk());
     if !matches!(
         poll_once(root.lookup_dir_async("empty")),
         Some(Err(FsError::NotFound))
@@ -8424,6 +8453,9 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
     ) {
         return TestResult::Fail("delete-test snapshot creation failed");
     }
+    // Batched commits: the snapshot creation above is staged, so mounting it
+    // as its own volume would read a device that does not have it yet.
+    let _ = poll_once(vol.sync_to_disk());
     let snap = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8459,9 +8491,11 @@ fn smoke_btrfs_subvolume_destroy_ioctl() -> TestResult {
         return TestResult::Fail("V2 name snapshot destroy failed");
     }
 
-    // Batched commits: durable only once synced, as a real unmount would
-    // flush. Without it this would assert UNSYNCED data survives.
+    // Batched commits: the destroy was performed through `vol`, so it is
+    // `vol` that holds the staged superblock — syncing only the snapshot
+    // volume flushes the wrong one and the space still looks unreclaimed.
     let _ = poll_once(snap.sync_to_disk());
+    let _ = poll_once(vol.sync_to_disk());
     let remounted = match poll_once(BtrfsVolume::mount_opts(
         device.clone(),
         DomainId::DRIVER_0,
@@ -8662,6 +8696,10 @@ fn smoke_btrfs_writable_nested_subvolume() -> TestResult {
         if !matches!(poll_once(inside.write(0, b"inside\n")), Some(Ok(7))) {
             return TestResult::Fail("nested directory write failed");
         }
+        // Batched commits: this scope is about to drop the volume, taking its
+        // staged superblock with it. Force it out first, or everything done
+        // here is lost to the next mount of the same device.
+        let _ = poll_once(vol.sync_to_disk());
     }
 
     let remounted = match poll_once(BtrfsVolume::mount_subvol(

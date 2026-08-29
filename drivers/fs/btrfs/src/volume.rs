@@ -115,7 +115,7 @@ const NODE_CACHE_MAX: usize = 256;
 /// a count is the equivalent NARF can express without a timer source in the
 /// driver, and a small one keeps both costs modest while still amortising the
 /// superblock write and its barrier across a batch.
-const MAX_STAGED_COMMITS: usize = 1;
+const MAX_STAGED_COMMITS: usize = 2;
 
 impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
