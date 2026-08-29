@@ -9980,3 +9980,85 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_open_transaction_commits_on_interval
 );
+
+/// Qgroup ioctls report ENOTCONN when quotas are off, not ENOENT.
+///
+/// `fs/btrfs/ioctl.c` opens qgroup_assign, qgroup_create, qgroup_limit and
+/// quota_rescan with `if (!btrfs_qgroup_enabled(fs_info)) return -ENOTCONN;`.
+/// The distinction is the point: ENOENT says the qgroup asked about does not
+/// exist, which invites the caller to create it, when the truth is that the
+/// machinery which would answer is switched off. `btrfs qgroup show` prints
+/// "quotas not enabled" off exactly this.
+///
+/// quota_ctl is deliberately excluded — it is the ioctl that turns quotas on,
+/// so gating it on quotas being on would make it unreachable.
+fn smoke_btrfs_qgroup_ioctls_report_not_connected() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    // A fixture with no quota tree at all.
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    if qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).is_some() {
+        return TestResult::Fail("the fixture unexpectedly has quotas enabled");
+    }
+    let root = vol.root();
+
+    let limit = [0u8; 48];
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_LIMIT did not report ENOTCONN");
+    }
+    let mut create = [0u8; 16];
+    create[0..8].copy_from_slice(&1u64.to_ne_bytes()); // create
+    create[8..16].copy_from_slice(&((1u64 << 48) | 7).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_CREATE did not report ENOTCONN");
+    }
+    let mut assign = [0u8; 24];
+    assign[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    assign[8..16].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    assign[16..24].copy_from_slice(&((1u64 << 48) | 7).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_ASSIGN, 0, &assign, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_ASSIGN did not report ENOTCONN");
+    }
+    let rescan = [0u8; 64];
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QUOTA_RESCAN, 0, &rescan, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QUOTA_RESCAN did not report ENOTCONN");
+    }
+
+    // QUOTA_CTL is the way OUT of this state, so it must not be gated: enable
+    // quotas and the same limit call stops reporting ENOTCONN.
+    let mut ctl = [0u8; 16];
+    ctl[0..8].copy_from_slice(&1u64.to_ne_bytes()); // BTRFS_QUOTA_CTL_ENABLE
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("QUOTA_CTL enable was refused");
+    }
+    match poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)) {
+        Some(Err(FsError::NotConnected)) => {
+            TestResult::Fail("QGROUP_LIMIT still reported ENOTCONN after enabling quotas")
+        }
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("QGROUP_LIMIT never completed a poll"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_ioctls_report_not_connected
+);

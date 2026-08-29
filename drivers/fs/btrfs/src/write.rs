@@ -3797,6 +3797,41 @@ fn unchanged_fs_commit<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> FsComm
     }
 }
 
+/// Refuse an operation that needs quotas, when quotas are off.
+///
+/// `fs/btrfs/ioctl.c` opens `qgroup_assign`, `qgroup_create`, `qgroup_limit`
+/// and `quota_rescan` with
+///
+/// ```text
+/// if (!btrfs_qgroup_enabled(fs_info))
+///         return -ENOTCONN;
+/// ```
+///
+/// and the errno is the point: ENOENT would say the qgroup being asked about
+/// does not exist, inviting the caller to create it, when the truth is that
+/// the machinery which would answer is switched off.
+///
+/// The predicate is `btrfs_qgroup_enabled`, which is the QGROUP_STATUS `ON`
+/// flag rather than the presence of a quota tree — a filesystem whose quota
+/// tree survives a disable is still disabled. `quota_mode_at` reads exactly
+/// that, so a missing tree and a cleared flag both come back Disabled.
+///
+/// `quota_ctl` deliberately does NOT get this check: it is the ioctl that
+/// turns quotas on, so requiring them already on would make it unreachable.
+async fn require_qgroups_enabled<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    match quota_mode_at(vol, root_tree).await {
+        Ok(QuotaMode::Disabled) => Err(FsError::NotConnected),
+        // A quota tree too damaged to read its own status is not the same as
+        // one that is switched off; let the real error through.
+        Ok(_) => Ok(()),
+        Err(FsError::NotFound) => Err(FsError::NotConnected),
+        Err(err) => Err(err),
+    }
+}
+
 async fn quota_root<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64, FsError> {
     roots::find_root(vol, vol.root_tree_root().0, format::QUOTA_TREE_OBJECTID)
         .await
@@ -4063,6 +4098,7 @@ pub(crate) async fn qgroup_create_admin<B: BlockDevice + 'static>(
     if id >> 48 == 0 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
         .await?
@@ -4093,6 +4129,9 @@ pub(crate) async fn qgroup_destroy_admin<B: BlockDevice + 'static>(
     if id >> 48 == 0 {
         return Err(FsError::InvalidData);
     }
+    // Destroy arrives through BTRFS_IOC_QGROUP_CREATE with `create == 0`, so
+    // it is behind the same -ENOTCONN gate as create.
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
         .await?
@@ -4127,6 +4166,7 @@ pub(crate) async fn qgroup_assign_admin<B: BlockDevice + 'static>(
     if dst >> 48 <= src >> 48 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     for id in [src, dst] {
         if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
@@ -4167,6 +4207,7 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
     if limit[0] & !0x3f != 0 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     if id == 0 {
         id = vol.fs_tree_id();
     }
@@ -4228,6 +4269,7 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
 pub(crate) async fn quota_rescan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    require_qgroups_enabled(vol).await?;
     if matches!(
         quota_mode_at(vol, vol.root_tree_root().0).await?,
         QuotaMode::Simple { .. }

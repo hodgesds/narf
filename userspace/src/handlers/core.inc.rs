@@ -1258,6 +1258,11 @@ fn open_impl(
                         narf_filesystem::FsError::WouldBlock => 11,       // EAGAIN
                         narf_filesystem::FsError::NoSpace => 28,
                         narf_filesystem::FsError::QuotaExceeded => 122,
+                        // ENOTCONN. No `open` path produces it today — it is
+                        // the qgroup ioctls' answer for "quotas are off" — but
+                        // translating it truthfully costs nothing and is
+                        // better than folding it into EINVAL if one ever does.
+                        narf_filesystem::FsError::NotConnected => 107,
                     };
                     ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
                     return;
@@ -3320,6 +3325,8 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::ReadOnly => 30,
         narf_filesystem::FsError::NoSpace => 28,
         narf_filesystem::FsError::QuotaExceeded => 122,
+        // ENOTCONN — see `FsError::NotConnected`.
+        narf_filesystem::FsError::NotConnected => 107,
         narf_filesystem::FsError::BrokenPipe => 32,
         narf_filesystem::FsError::BadFd => 9,
         narf_filesystem::FsError::WouldBlock => EAGAIN_CODE as i64,
