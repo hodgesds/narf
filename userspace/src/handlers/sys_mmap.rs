@@ -149,13 +149,6 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Semantic failures must precede MAP_FIXED replacement: an invalid new
     // mapping never destroys the old one on Linux.
     //
-    // LINUX-GAP: Linux serves MAP_SHARED|MAP_HUGETLB from hugetlbfs and
-    // succeeds; NARF has no shared huge backing, so it refuses explicitly.
-    if huge_size.is_some() && flags & MAP_SHARED != 0 {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // EOPNOTSUPP
-        return;
-    }
-
     // __get_unmapped_area, in this order:
     //
     //     if (addr > TASK_SIZE - len)  return -ENOMEM;
@@ -291,6 +284,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     }
 
     if let Some(size) = huge_size {
+        // `MAP_SHARED | MAP_HUGETLB` is served from hugetlbfs on Linux, and
+        // MAP_SHARED on an anonymous mapping means one object mapped twice:
+        // fork must alias the frames rather than copy them, and the last
+        // address space to drop them is what returns them to the pool. Both
+        // are keyed off this bit — see `clone_for_fork`'s huge arm and the
+        // hugepage refcount. Without it a forked child got a private snapshot
+        // that diverged from the parent on the first write.
+        let perms = if flags & MAP_SHARED != 0 {
+            perms | narf_memory::RegionPerms::SHARED
+        } else {
+            perms
+        };
         let task = current_task_id();
         let stored = resolve_policy(task, base);
         let allowed = narf_scheduler::task_mems_allowed(task);

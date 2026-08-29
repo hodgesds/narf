@@ -3989,14 +3989,15 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
             None => task_capable(caller, CAP_SYS_ADMIN),
         },
         HeldNs::User(ns) => task_ns_capable(caller, ns, CAP_SYS_ADMIN),
-        // LINUX-GAP: `CgroupNamespace` does not record its owning user
-        // namespace, so joining one is measured against the host. That is the
-        // restrictive direction — a container cannot join its own cgroup
-        // namespace where Linux would let it — and closing it means giving
-        // cgroupfs the same owner field the mount, uts, net, ipc and pid
-        // namespaces now carry.
         #[cfg(feature = "cgroup")]
-        HeldNs::Cgroup(_) => task_capable(caller, CAP_SYS_ADMIN),
+        HeldNs::Cgroup(ns) => match ns.owner().and_then(|owner| {
+            owner
+                .as_any()
+                .downcast_ref::<crate::namespaces::UserNamespace>()
+        }) {
+            Some(user_ns) => task_ns_capable(caller, user_ns, CAP_SYS_ADMIN),
+            None => task_capable(caller, CAP_SYS_ADMIN),
+        },
         HeldNs::NetGlobal(_)
         | HeldNs::IpcGlobal(_)
         | HeldNs::PidGlobal(_)
@@ -7118,7 +7119,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             const CLONE_NEWCGROUP: u64 = 0x0200_0000;
             narf_filesystem::cgroupfs::fork_inherit_ns(parent_pid, child_visible_pid);
             if flags & CLONE_NEWCGROUP != 0 {
-                narf_filesystem::cgroupfs::unshare_cgroup_ns(child_visible_pid);
+                // The owner is the CREATING task's user namespace — the
+                // parent's, since `copy_cgroup_ns` runs with the parent's
+                // credentials before the child is running.
+                narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(
+                    child_visible_pid,
+                    ns_owner_for(current_task_id()),
+                );
             }
         }
     }

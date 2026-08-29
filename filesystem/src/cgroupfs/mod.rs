@@ -841,18 +841,34 @@ pub fn memory_limit_read_charge_reentry_for_test(pid: u64, file: &str, delta_byt
 pub struct CgroupNamespace {
     id: u64,
     root: Arc<Cgroup>,
+    /// `cgroup_ns->user_ns`: the user namespace of the task that created this
+    /// one, per `copy_cgroup_ns`'s `new_ns->user_ns = get_user_ns(user_ns)`.
+    /// `setns` into it is gated on CAP_SYS_ADMIN here as well as in the
+    /// caller's own namespace. `None` is the initial user namespace.
+    owner: Option<Arc<dyn crate::NsOwner>>,
 }
 
 impl CgroupNamespace {
     fn new(root: Arc<Cgroup>) -> Arc<Self> {
+        Self::new_owned_by(root, None)
+    }
+
+    fn new_owned_by(root: Arc<Cgroup>, owner: Option<Arc<dyn crate::NsOwner>>) -> Arc<Self> {
         Arc::new(Self {
             id: crate::alloc_mount_ns_id(),
             root,
+            owner,
         })
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The user namespace this one belongs to. The caller downcasts through
+    /// [`crate::NsOwner::as_any`]; `None` is the initial user namespace.
+    pub fn owner(&self) -> Option<&Arc<dyn crate::NsOwner>> {
+        self.owner.as_ref()
     }
 }
 
@@ -873,8 +889,16 @@ static TASK_NS_ROOT: IrqSafeSpinLock<BTreeMap<u64, Arc<CgroupNamespace>>> =
 /// cgroup-namespace root, so subsequent `/proc/[pid]/cgroup` paths
 /// render relative to it (the v2 cgroup-namespace contract).
 pub fn unshare_cgroup_ns(pid: u64) {
+    unshare_cgroup_ns_owned_by(pid, None)
+}
+
+/// [`unshare_cgroup_ns`] recording the creating task's user namespace, which
+/// is what a later `setns` into this namespace is measured against.
+pub fn unshare_cgroup_ns_owned_by(pid: u64, owner: Option<Arc<dyn crate::NsOwner>>) {
     let cur = cgroup_of(pid);
-    TASK_NS_ROOT.lock().insert(pid, CgroupNamespace::new(cur));
+    TASK_NS_ROOT
+        .lock()
+        .insert(pid, CgroupNamespace::new_owned_by(cur, owner));
 }
 
 /// Namespace object named by `/proc/<pid>/ns/cgroup`.
