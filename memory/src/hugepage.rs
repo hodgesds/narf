@@ -135,6 +135,33 @@ impl HugePool {
 
 static POOL: IrqSafeSpinLock<HugePool> = IrqSafeSpinLock::new(HugePool::new());
 
+/// References to a hugepage BEYOND the one its allocation created.
+///
+/// Linux refcounts the hugetlb folio, so a `MAP_SHARED | MAP_HUGETLB` mapping
+/// inherited across fork maps the same pages in both processes: the child must
+/// not copy them, and the parent's exit must not free them while the child
+/// still has them mapped.
+///
+/// Only the EXCESS is stored. A frame absent from this map has exactly one
+/// owner, which is every private mapping — so the ordinary alloc/free path
+/// stays a plain pool operation with no map traffic, and the table only ever
+/// holds entries for genuinely shared frames.
+static EXTRA_REFS: IrqSafeSpinLock<alloc_crate::collections::BTreeMap<u64, u32>> =
+    IrqSafeSpinLock::new(alloc_crate::collections::BTreeMap::new());
+
+/// Take another reference to `frame`, so the next [`free_hugepage`] returns it
+/// to a sharer rather than to the pool.
+pub fn retain_hugepage(frame: HugeFrame) {
+    *EXTRA_REFS.lock().entry(frame.phys).or_insert(0) += 1;
+}
+
+/// How many owners `frame` has. 1 unless it is shared; used by tests to prove
+/// a fork aliased rather than copied, and that an exit released rather than
+/// freed.
+pub fn hugepage_refs(frame: HugeFrame) -> u32 {
+    1 + EXTRA_REFS.lock().get(&frame.phys).copied().unwrap_or(0)
+}
+
 /// Carve naturally-aligned hugepages out of `usable` regions, up to the
 /// requested counts, and stash them in the pool. `protected` contains
 /// half-open byte ranges which may be inside otherwise-usable memory but must
@@ -493,6 +520,19 @@ pub(crate) fn alloc_hugepage_on(size: HugeSize, node: usize) -> Result<HugeFrame
 /// Return a hugepage to the pool. Caller asserts the frame came
 /// from a prior `alloc_hugepage_*` of the matching size.
 pub fn free_hugepage(frame: HugeFrame) {
+    // Drop a shared reference rather than the frame itself. The guard is
+    // released before POOL is taken so the two locks are never held together
+    // — every other path takes POOL alone, so there is one order, not two.
+    {
+        let mut refs = EXTRA_REFS.lock();
+        if let Some(remaining) = refs.get_mut(&frame.phys) {
+            *remaining -= 1;
+            if *remaining == 0 {
+                refs.remove(&frame.phys);
+            }
+            return;
+        }
+    }
     let node = frame.node().min(MAX_NUMA_NODES - 1);
     let mut pool = POOL.lock();
     pool.free_mut(frame.size, node).push(frame.phys);

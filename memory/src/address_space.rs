@@ -8946,7 +8946,40 @@ impl AddressSpace {
         // Private hugetlb mappings are copied eagerly. The hugepage pool has
         // no sub-page COW metadata, so sharing a writable hardware block leaf
         // would violate fork isolation. Preserve each frame's NUMA placement.
+        //
+        // SHARED ones are the opposite case and must NOT be copied: a
+        // `MAP_SHARED | MAP_HUGETLB` region is one object mapped twice, and
+        // copying it would silently give parent and child private snapshots
+        // that diverge on the first write — the failure would surface as lost
+        // updates in whatever data structure the region holds, arbitrarily far
+        // from the fork. Alias the frames and take a reference to each, so the
+        // first address space to exit releases rather than frees them.
         for region in &parent_huge {
+            if region.perms.contains(RegionPerms::SHARED) {
+                for frame in &region.frames {
+                    crate::hugepage::retain_hugepage(*frame);
+                }
+                // SAFETY: the child root is fresh and the region is aligned
+                // and non-overlapping by construction; the frames are now
+                // owned by both address spaces and the refcount says so.
+                unsafe {
+                    let mut child_perms = region.perms;
+                    child_perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
+                    if let Err(error) = child.map_huge_region(HugeRegion {
+                        base: region.base,
+                        len: region.len,
+                        perms: child_perms,
+                        size: region.size,
+                        frames: region.frames.clone(),
+                    }) {
+                        for frame in &region.frames {
+                            crate::hugepage::free_hugepage(*frame);
+                        }
+                        return Err(error);
+                    }
+                }
+                continue;
+            }
             let mut frames = Vec::with_capacity(region.frames.len());
             for source in &region.frames {
                 let replacement_result = match source.size() {

@@ -220,7 +220,12 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     if flags & CLONE_NEWCGROUP != 0 {
         let task = current_task_id();
         let pid = task_to_pid_raw(task).unwrap_or(task);
-        narf_filesystem::cgroupfs::unshare_cgroup_ns(pid);
+        // `copy_cgroup_ns` stamps the creating task's user namespace onto the
+        // new cgroup namespace; `setns` into it is measured against that.
+        narf_filesystem::cgroupfs::unshare_cgroup_ns_owned_by(
+            pid,
+            ns_owner_for(current_task_id()),
+        );
         any = true;
     }
 

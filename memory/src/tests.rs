@@ -11635,6 +11635,171 @@ kernel_test_in!(
     smoke_memory_mprotect_mixed_huge_index_oom_is_preflight
 );
 
+/// `MAP_SHARED | MAP_HUGETLB` is one object mapped twice, so fork must ALIAS
+/// its huge frames, not copy them. Copying gives parent and child private
+/// snapshots that diverge on the first write — and because nothing faults or
+/// errors, that surfaces as lost updates in whatever the region holds,
+/// arbitrarily far from the fork.
+///
+/// The private control arm is the point of the test. Private hugetlb mappings
+/// must still be copied eagerly: the pool has no sub-page COW metadata, so
+/// sharing a writable block leaf there would break fork isolation. One bit
+/// selects between two opposite behaviours, and both have to be pinned or a
+/// later change can quietly swap them.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_shared_hugetlb_fork_aliases_frames() -> TestResult {
+    use crate::frame::UsableRegion;
+    use crate::hugepage::{
+        alloc_hugepage_2m_on, free_hugepage, hugepage_refs, reserve_from_regions, HugeSize,
+        HUGEPAGE_2M_BYTES,
+    };
+    use crate::{AddressSpace, HugeRegion, PhysAddr, RegionPerms, VirtAddr};
+
+    const SYNTH_BASE: u64 = 0x40_8000_0000;
+    const USER_VA: u64 = 0x0000_5000_9000_0000;
+    // Two frames: one for the shared arm, one for the private arm's source.
+    // The private arm's fork also needs a third to copy INTO.
+    let source = UsableRegion {
+        start: PhysAddr::new(SYNTH_BASE),
+        len: HUGEPAGE_2M_BYTES * 3,
+    };
+    // SAFETY: the synthetic frames back mapping metadata only and are returned
+    // to the test reservation before this test exits.
+    let excludes = unsafe { reserve_from_regions(&[source], &[], 3, 0) };
+    if excludes.len() != 3 {
+        return TestResult::Fail("shared-hugetlb reservation failed");
+    }
+    // SAFETY: topology lookup does not dereference the synthetic frames.
+    let node = unsafe { crate::frame::narf_phys_node(excludes[0].0) };
+
+    let shared_frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("shared-hugetlb allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            free_hugepage(shared_frame);
+            return TestResult::Fail("shared-hugetlb address space creation failed");
+        }
+    };
+    let base = VirtAddr::new(USER_VA);
+    // SAFETY: fresh root, aligned VA, owned aligned frame.
+    if unsafe {
+        parent.map_huge_region(HugeRegion {
+            base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::SHARED,
+            size: HugeSize::M2,
+            frames: alloc::vec![shared_frame],
+        })
+    }
+    .is_err()
+    {
+        free_hugepage(shared_frame);
+        return TestResult::Fail("shared huge mapping failed");
+    }
+    if hugepage_refs(shared_frame) != 1 {
+        return TestResult::Fail("a freshly mapped huge frame was not singly owned");
+    }
+
+    // SAFETY: paging is live; the parent is a well-formed user address space.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("fork of a shared huge mapping failed"),
+    };
+    // Aliased, not copied: one more owner of the SAME frame.
+    let aliased = hugepage_refs(shared_frame) == 2;
+    // The child sees the mapping with the same permissions.
+    let child_mapped = child
+        .__test_huge_region_perms(base)
+        .is_some_and(|perms| perms.contains(RegionPerms::SHARED));
+
+    // Dropping one address space releases a reference; the frame stays live
+    // for the other. Freeing it outright here would be a use-after-free in
+    // whichever process still had it mapped.
+    drop(child);
+    let survives_first_exit = hugepage_refs(shared_frame) == 1;
+    drop(parent);
+
+    // Now unreferenced, so it is back in the pool and allocatable again.
+    // Deliberately NOT freed again: this test must leave the pool's free
+    // count exactly as it found it. Frames left in the free list are visible
+    // to every later test through the shared pool, and the first symptom is
+    // some unrelated case whose "this allocation must fail" assertion
+    // silently starts succeeding.
+    let reclaimed = alloc_hugepage_2m_on(node);
+    let returned = reclaimed
+        .as_ref()
+        .is_ok_and(|f| f.phys() == shared_frame.phys());
+
+    if !aliased {
+        return TestResult::Fail("fork copied a shared huge mapping instead of aliasing it");
+    }
+    if !child_mapped {
+        return TestResult::Fail("the forked child lost its shared huge mapping");
+    }
+    if !survives_first_exit {
+        return TestResult::Fail("one address space exiting freed a still-shared huge frame");
+    }
+    if !returned {
+        return TestResult::Fail("the last reference did not return the huge frame to the pool");
+    }
+
+    // ── Control: a PRIVATE huge mapping still forks by copy ───────────
+    let private_frame = match alloc_hugepage_2m_on(node) {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("private-hugetlb allocation failed"),
+    };
+    // SAFETY: paging is live and the test exclusively owns this root.
+    let owner = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => {
+            free_hugepage(private_frame);
+            return TestResult::Fail("private-hugetlb address space creation failed");
+        }
+    };
+    // SAFETY: fresh root, aligned VA, owned aligned frame.
+    if unsafe {
+        owner.map_huge_region(HugeRegion {
+            base,
+            len: HUGEPAGE_2M_BYTES,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            size: HugeSize::M2,
+            frames: alloc::vec![private_frame],
+        })
+    }
+    .is_err()
+    {
+        free_hugepage(private_frame);
+        return TestResult::Fail("private huge mapping failed");
+    }
+    // SAFETY: same contract as the shared fork above.
+    let private_child = unsafe { owner.clone_for_fork() };
+    let copied = private_child.is_ok() && hugepage_refs(private_frame) == 1;
+    drop(private_child);
+    drop(owner);
+
+    // Drain the private arm's two frames — the original and the copy fork
+    // made — for the same reason. Three reserved, three drained.
+    let _ = alloc_hugepage_2m_on(node);
+    let _ = alloc_hugepage_2m_on(node);
+
+    if !copied {
+        return TestResult::Fail("fork aliased a PRIVATE huge mapping instead of copying it");
+    }
+    TestResult::Pass
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_shared_hugetlb_fork_aliases_frames);
+
 /// Huge mappings are held in `huge_regions`, a vector entirely separate from
 /// the `regions` tree that [`AddressSpace::perms_intersecting`] walks. A
 /// caller asking "is anything mapped here?" through `perms_intersecting`
