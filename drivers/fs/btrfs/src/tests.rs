@@ -2173,6 +2173,10 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     ) {
         return TestResult::Fail("qgroup child data write failed");
     }
+    // Quota volumes batch like any other now that limits are enforced when
+    // space is reserved rather than when the transaction commits. The recount
+    // this asserts on is still a commit-time product, so it needs the commit.
+    let _ = poll_once(child.sync_to_disk());
     let charged = match qgroup_item(&child, format::QGROUP_INFO_KEY, child_id) {
         Some(body) => format::le64(&body, 8).unwrap_or(0),
         None => 0,
@@ -9545,3 +9549,63 @@ fn smoke_btrfs_failed_batch_commit_aborts() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_failed_batch_commit_aborts);
+
+/// A quota-enabled volume batches like any other.
+///
+/// It could not before, because NARF enforced qgroup limits inside
+/// `commit_txn`: a transaction was the finest granularity at which a limit
+/// could be refused, so batching would have deferred EDQUOT past the write
+/// that earned it. Moving enforcement to `qgroup_reserve` — where Linux has
+/// always had it, as the only site in `fs/btrfs` that returns -EDQUOT —
+/// decouples the two, and quota volumes get the same amortisation as the rest.
+///
+/// Counting generations counts transactions: `commit_roots` advances the
+/// superblock generation once per commit.
+fn smoke_btrfs_quota_volume_batches() -> TestResult {
+    use alloc::format;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    // Confirm the premise: without quotas on, this test proves nothing about
+    // quota volumes.
+    if qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).is_none() {
+        return TestResult::Fail("the quota fixture does not have quotas enabled");
+    }
+    let root = vol.root();
+    // Warm-up, so any private-subvolume rewrite is not counted below.
+    if poll_once(root.create("q-warmup.txt")).is_none() {
+        return TestResult::Fail("warm-up create failed");
+    }
+    let _ = poll_once(vol.sync_to_disk());
+
+    let before = vol.superblock().generation;
+    for i in 0..8 {
+        if !matches!(poll_once(root.create(&format!("q-{i}.txt"))), Some(Ok(_))) {
+            return TestResult::Fail("a batched create on a quota volume failed");
+        }
+    }
+    if vol.superblock().generation != before + 1 {
+        return TestResult::Fail("a quota volume did not batch eight operations into one commit");
+    }
+    let names = dir_names(&vol.root());
+    for i in 0..8 {
+        if !names.iter().any(|n| n == &format!("q-{i}.txt")) {
+            return TestResult::Fail("a batched create on a quota volume was lost");
+        }
+    }
+    // And the accounting still lands, once, when the transaction commits.
+    let _ = poll_once(vol.sync_to_disk());
+    let info =
+        qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).unwrap_or_default();
+    if format::le64(&info, 0).ok() != Some(vol.superblock().generation) {
+        return TestResult::Fail("qgroup accounting did not follow the batched commit");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_quota_volume_batches);
