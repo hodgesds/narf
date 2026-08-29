@@ -991,6 +991,7 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // and a rejection would strand them until the batch commits.
     let displaced = affected.iter().filter(|hit| **hit).count();
     let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
+    qgroup_begin_op(batch);
     qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
     qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
@@ -1131,6 +1132,10 @@ pub(crate) struct FsBatch {
     dropped_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
     ops: usize,
+    /// Raw monotonic cycles at which this transaction opened, for the commit
+    /// interval below. Cycles rather than `Instant` because the test hook has
+    /// to move it backwards, and `Instant` only adds.
+    opened_at: u64,
     /// The fs-tree root as of the last commit, to restore if this batch's own
     /// commit fails. Staging publishes each operation's root so that reads
     /// inside the batch see it; a failed commit has to take that back.
@@ -1139,10 +1144,26 @@ pub(crate) struct FsBatch {
     /// committed usage and limits. Read on the first reservation and reused:
     /// the quota tree does not move until this transaction commits.
     qgroup: Option<Vec<QgroupCharge>>,
-    /// Bytes reserved against each qgroup by this transaction and not yet
-    /// accounted, so two writes that each fit but do not fit together cannot
-    /// both be admitted.
+    /// Bytes reserved against each qgroup by operations of this transaction
+    /// that have been staged, so two writes that each fit but do not fit
+    /// together cannot both be admitted. Released when the transaction
+    /// commits: `BTRFS_QGROUP_RSV_META_PERTRANS`.
     reserved: BTreeMap<u64, u64>,
+    /// The reservation of the operation currently in flight, held apart until
+    /// it stages successfully.
+    ///
+    /// An operation reserves before it does anything, so that a refusal costs
+    /// nothing — but that means a reservation exists for work that may still
+    /// fail, and folding it in immediately would let a failed operation charge
+    /// the rest of the transaction for space nobody used. Linux keeps the same
+    /// separation with `BTRFS_QGROUP_RSV_META_PREALLOC`, taken per handle and
+    /// released by `btrfs_qgroup_free_meta_prealloc` on the error paths,
+    /// against `META_PERTRANS` which lives until commit.
+    ///
+    /// Discarded rather than unwound: [`qgroup_begin_op`] clears it as each
+    /// operation starts, so every failure path is covered without any of them
+    /// having to remember, including the ones that return before staging.
+    op_reserved: BTreeMap<u64, u64>,
 }
 
 /// Open the batch if none is open, and lock it for one operation.
@@ -1174,8 +1195,10 @@ async fn batch_begin<'a, B: BlockDevice + 'static>(
             new_data: Vec::new(),
             ops: 0,
             base_root: (fs_root, fs_level),
+            opened_at: narf_time::now_cycles(),
             qgroup: None,
             reserved: BTreeMap::new(),
+            op_reserved: BTreeMap::new(),
         });
     }
     Ok(guard)
@@ -1221,6 +1244,22 @@ async fn batch_gen<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64
 ///
 /// Once only: if a full sync did not free enough, the filesystem really is
 /// full and a third attempt would just be the second one again.
+///
+/// A qgroup refusal gets the same treatment, for the same reason at one
+/// remove. Linux's `__btrfs_qgroup_reserve_meta` does not return -EDQUOT on
+/// the first refusal either: it calls `try_flush_qgroup`, whose substance is
+/// `btrfs_commit_current_transaction`, and then retries. Committing is what
+/// makes a refusal wrong-in-hindsight collectible — usage is recounted at
+/// commit, so space this very transaction has freed is still charged to the
+/// qgroup until then. Refusing a write for space the same write's own
+/// truncation released is the case that motivates it.
+///
+/// Only worth doing when there is a transaction to commit. Linux guards the
+/// same way through `BTRFS_ROOT_QGROUP_FLUSHING`, which stops a second flush
+/// from being started while one is in flight; here the equivalent question is
+/// simply whether anything is staged, since a committed transaction has
+/// already had its recount applied and flushing again would recount the same
+/// numbers.
 async fn with_space_retry<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
 where
     B: BlockDevice + 'static,
@@ -1232,7 +1271,97 @@ where
             vol.sync_to_disk().await?;
             op().await
         }
+        Err(FsError::QuotaExceeded) if batch_owns_fs_tree(vol).await => {
+            vol.sync_to_disk().await?;
+            op().await
+        }
         other => other,
+    }
+}
+
+/// `BTRFS_DEFAULT_COMMIT_INTERVAL` (`fs/btrfs/fs.h`): seconds a transaction
+/// may stay open before it is committed regardless of what else happens.
+///
+/// Without this, a transaction closes only when it fills or when somebody
+/// syncs, so a workload that writes a few files and stops leaves them
+/// uncommitted indefinitely — on Linux they become durable within thirty
+/// seconds with no fsync. Batching made that worse by making transactions
+/// hold more, which is why it arrives with the batching rather than before it.
+const COMMIT_INTERVAL_SECS: u64 = 30;
+
+/// Commit the open transaction if it has been open for longer than
+/// [`COMMIT_INTERVAL_SECS`].
+///
+/// This is the body of Linux's `transaction_kthread`, which wakes on
+/// `fs_info->commit_interval`, compares the running transaction's age against
+/// it, and commits when it has aged out. Ageing is measured from when the
+/// transaction opened, not from the last operation, so a steady trickle of
+/// writes cannot hold one open forever.
+pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let stale = {
+        let guard = vol.fs_batch().lock().await;
+        match guard.as_ref() {
+            // An empty transaction has nothing to make durable; Linux likewise
+            // goes back to sleep when `fs_info->running_transaction` is NULL.
+            Some(batch) if batch.ops > 0 => {
+                let age = narf_time::now_cycles().saturating_sub(batch.opened_at);
+                age >= narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000)
+            }
+            _ => false,
+        }
+    };
+    if stale {
+        // Sync rather than merely commit: the point is durability, and a
+        // committed transaction whose superblock is still staged is not
+        // durable. This is the timer's whole purpose.
+        vol.sync_to_disk().await?;
+    }
+    Ok(())
+}
+
+/// Start the transaction timer for a freshly mounted volume.
+///
+/// Linux runs one `transaction_kthread` per filesystem, waking on
+/// `fs_info->commit_interval` to commit a transaction that has aged out. This
+/// is that thread: the scheduler is the only thing that can make a commit
+/// happen when nothing is asking the filesystem to do anything, which is
+/// exactly the case the interval exists for.
+///
+/// It holds a `Weak`, not an `Arc`. Holding a strong reference would keep
+/// every mounted volume alive for as long as the task existed, which is
+/// forever — unmount would never drop the last reference. Failing to upgrade
+/// is how the task learns the volume is gone, and it ends there.
+///
+/// A commit that fails is not reported anywhere, because there is nobody to
+/// report it to; it is retried on the next tick, and a failure serious enough
+/// to matter has already taken the filesystem read-only through
+/// `abort_transaction`.
+pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Arc<BtrfsVolume<B>>) {
+    let weak = alloc::sync::Arc::downgrade(vol);
+    narf_scheduler::spawn(async move {
+        let tick = narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000);
+        loop {
+            narf_time::sleep_cycles(tick).await;
+            let Some(vol) = weak.upgrade() else {
+                return;
+            };
+            let _ = commit_if_stale(&vol).await;
+        }
+    });
+}
+
+/// Test-only: backdate the open transaction so [`commit_if_stale`] sees it as
+/// aged out, without waiting the interval.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn __test_age_open_transaction<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    secs: u64,
+) {
+    if let Some(batch) = vol.fs_batch().lock().await.as_mut() {
+        let back = narf_time::wall::ns_to_cycles(secs * 1_000_000_000);
+        batch.opened_at = batch.opened_at.saturating_sub(back);
     }
 }
 
@@ -1321,6 +1450,12 @@ async fn batch_stage<B: BlockDevice + 'static>(
         }
     }
     batch.new_data.extend(new_data);
+    // The operation is staged, so its reservation stops being provisional and
+    // joins the transaction's — Linux's PREALLOC-to-PERTRANS conversion.
+    for (id, bytes) in core::mem::take(&mut batch.op_reserved) {
+        let slot = batch.reserved.entry(id).or_insert(0);
+        *slot = slot.saturating_add(bytes);
+    }
     batch.ops += 1;
     Ok(())
 }
@@ -1494,6 +1629,7 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
         let mut guard = batch_begin(vol).await?;
         let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
         // Before staging, so a refusal leaves the transaction untouched.
+        qgroup_begin_op(batch);
         qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
         batch.ops >= MAX_BATCH_OPS
@@ -3270,6 +3406,18 @@ async fn qgroup_charge_chain<B: BlockDevice + 'static>(
 /// purely by metadata is caught by the next reservation against the recounted
 /// usage rather than by the operation that caused it. Usage stays exact
 /// either way, because the commit-time recount counts metadata.
+/// Begin one operation's reservations, discarding any left by an operation
+/// that did not complete.
+///
+/// A reservation is taken before the work it pays for, so an operation that
+/// fails afterwards has one outstanding for work that never happened. Clearing
+/// here rather than unwinding at each failure means no failure path has to
+/// remember — including the ones that return before reaching `batch_stage`,
+/// which is where the rest of an operation's rollback lives.
+fn qgroup_begin_op(batch: &mut FsBatch) {
+    batch.op_reserved.clear();
+}
+
 /// Charge the metadata a transaction is about to write against the same
 /// qgroups, sized the way Linux sizes it.
 ///
@@ -3327,6 +3475,7 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
             .get(&q.id)
             .copied()
             .unwrap_or(0)
+            .saturating_add(batch.op_reserved.get(&q.id).copied().unwrap_or(0))
             .saturating_add(num_bytes);
         if q.limit_flags & QGROUP_LIMIT_MAX_RFER != 0 && claimed.saturating_add(q.rfer) > q.max_rfer
         {
@@ -3340,7 +3489,7 @@ async fn qgroup_reserve<B: BlockDevice + 'static>(
     // Only once every qgroup in the chain has room, exactly as Linux records
     // the reservation only after the whole iterator passed its checks.
     for q in &chain {
-        let slot = batch.reserved.entry(q.id).or_insert(0);
+        let slot = batch.op_reserved.entry(q.id).or_insert(0);
         *slot = slot.saturating_add(num_bytes);
     }
     Ok(())
@@ -3648,6 +3797,41 @@ fn unchanged_fs_commit<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> FsComm
     }
 }
 
+/// Refuse an operation that needs quotas, when quotas are off.
+///
+/// `fs/btrfs/ioctl.c` opens `qgroup_assign`, `qgroup_create`, `qgroup_limit`
+/// and `quota_rescan` with
+///
+/// ```text
+/// if (!btrfs_qgroup_enabled(fs_info))
+///         return -ENOTCONN;
+/// ```
+///
+/// and the errno is the point: ENOENT would say the qgroup being asked about
+/// does not exist, inviting the caller to create it, when the truth is that
+/// the machinery which would answer is switched off.
+///
+/// The predicate is `btrfs_qgroup_enabled`, which is the QGROUP_STATUS `ON`
+/// flag rather than the presence of a quota tree — a filesystem whose quota
+/// tree survives a disable is still disabled. `quota_mode_at` reads exactly
+/// that, so a missing tree and a cleared flag both come back Disabled.
+///
+/// `quota_ctl` deliberately does NOT get this check: it is the ioctl that
+/// turns quotas on, so requiring them already on would make it unreachable.
+async fn require_qgroups_enabled<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let (root_tree, _) = vol.root_tree_root();
+    match quota_mode_at(vol, root_tree).await {
+        Ok(QuotaMode::Disabled) => Err(FsError::NotConnected),
+        // A quota tree too damaged to read its own status is not the same as
+        // one that is switched off; let the real error through.
+        Ok(_) => Ok(()),
+        Err(FsError::NotFound) => Err(FsError::NotConnected),
+        Err(err) => Err(err),
+    }
+}
+
 async fn quota_root<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64, FsError> {
     roots::find_root(vol, vol.root_tree_root().0, format::QUOTA_TREE_OBJECTID)
         .await
@@ -3914,6 +4098,7 @@ pub(crate) async fn qgroup_create_admin<B: BlockDevice + 'static>(
     if id >> 48 == 0 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
         .await?
@@ -3944,6 +4129,9 @@ pub(crate) async fn qgroup_destroy_admin<B: BlockDevice + 'static>(
     if id >> 48 == 0 {
         return Err(FsError::InvalidData);
     }
+    // Destroy arrives through BTRFS_IOC_QGROUP_CREATE with `create == 0`, so
+    // it is behind the same -ENOTCONN gate as create.
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
         .await?
@@ -3978,6 +4166,7 @@ pub(crate) async fn qgroup_assign_admin<B: BlockDevice + 'static>(
     if dst >> 48 <= src >> 48 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     let root = quota_root(vol).await?;
     for id in [src, dst] {
         if btree::find_item(vol, root, &BtrfsKey::new(0, format::QGROUP_INFO_KEY, id))
@@ -4013,9 +4202,12 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
     mut id: u64,
     limit: [u64; 5],
 ) -> Result<(), FsError> {
+    // Six defined bits: MAX_RFER, MAX_EXCL, RSV_RFER, RSV_EXCL, RFER_CMPR,
+    // EXCL_CMPR (`uapi/linux/btrfs.h`).
     if limit[0] & !0x3f != 0 {
         return Err(FsError::InvalidData);
     }
+    require_qgroups_enabled(vol).await?;
     if id == 0 {
         id = vol.fs_tree_id();
     }
@@ -4024,25 +4216,60 @@ pub(crate) async fn qgroup_limit_admin<B: BlockDevice + 'static>(
         .await?
         .is_none()
     {
+        // `btrfs_limit_qgroup`: `if (!qgroup) { ret = -ENOENT; goto out; }`.
         return Err(FsError::NotFound);
     }
+
+    // `btrfs_limit_qgroup` UPDATES the qgroup's limits, it does not replace
+    // them. Each field is written only when its own flag is present in the
+    // request, and the flags are merged with `qgroup->lim_flags |=
+    // limit->flags`. Overwriting the whole item meant setting a MAX_EXCL
+    // silently discarded an existing MAX_RFER, so a caller adjusting one limit
+    // removed the other — and `btrfs qgroup limit` sets one at a time.
+    let key = BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id);
+    let existing = btree::find_item(vol, root, &key).await?;
+    let mut fields = [0u64; 5];
+    if let Some(body) = existing.as_deref() {
+        if body.len() != 40 {
+            return Err(FsError::InvalidData);
+        }
+        for (idx, slot) in fields.iter_mut().enumerate() {
+            *slot = le64(body, idx * 8)?;
+        }
+    }
+
+    // `const u64 CLEAR_VALUE = -1;` — a field set to all-ones does not install
+    // a limit of U64_MAX, it CLEARS that limit: the flag is dropped and the
+    // value zeroed. Storing ~0 verbatim left a limit no write could ever
+    // cross, which looks identical to "unlimited" until something inspects the
+    // item, and left the flag set so it could never be cleared again.
+    const CLEAR_VALUE: u64 = u64::MAX;
+    let mut flags = fields[0] | limit[0];
+    for (bit, field) in (1..5).enumerate() {
+        let flag = 1u64 << bit;
+        if limit[0] & flag == 0 {
+            continue;
+        }
+        if limit[field] == CLEAR_VALUE {
+            flags &= !flag;
+            fields[field] = 0;
+        } else {
+            fields[field] = limit[field];
+        }
+    }
+    fields[0] = flags;
+
     let mut body = alloc::vec![0u8; 40];
-    for (idx, value) in limit.iter().enumerate() {
+    for (idx, value) in fields.iter().enumerate() {
         body[idx * 8..idx * 8 + 8].copy_from_slice(&value.to_le_bytes());
     }
-    commit_qgroup_edits(
-        vol,
-        alloc::vec![Edit::Upsert(
-            BtrfsKey::new(0, format::QGROUP_LIMIT_KEY, id),
-            body,
-        )],
-    )
-    .await
+    commit_qgroup_edits(vol, alloc::vec![Edit::Upsert(key, body)]).await
 }
 
 pub(crate) async fn quota_rescan<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    require_qgroups_enabled(vol).await?;
     if matches!(
         quota_mode_at(vol, vol.root_tree_root().0).await?,
         QuotaMode::Simple { .. }

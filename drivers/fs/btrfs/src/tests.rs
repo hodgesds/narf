@@ -9705,3 +9705,360 @@ kernel_test_in!(
     "drivers/fs/btrfs",
     smoke_btrfs_qgroup_reservation_counts_outstanding
 );
+
+/// A refused operation does not leave its reservation behind.
+///
+/// Reservations are taken before the work they pay for, so that a refusal
+/// costs nothing. That timing means an operation can hold one and then fail —
+/// and `cow_write_file` reaches this in the ordinary way, by reserving for its
+/// data, then being refused for its metadata. If the data half stayed charged
+/// to the transaction, every later operation in it would be paying for a write
+/// that never happened.
+///
+/// The second write is sized to fit comfortably and is refused only if the
+/// first one's reservation is still there, so this fails loudly rather than
+/// silently under-counting.
+fn smoke_btrfs_qgroup_refused_write_releases_its_reservation() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let doomed = match poll_once(root.create("leak-big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the refused file failed"),
+    };
+    let small = match poll_once(root.create("leak-small.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the small file failed"),
+    };
+    let _ = poll_once(vol.sync_to_disk());
+
+    let settled = qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if settled == 0 {
+        return TestResult::Fail("committed qgroup usage was unreadable");
+    }
+    // Both writes below place one extent and touch the inode: two items, so
+    // `qgroup_reserve_meta` charges 2 * nodesize for each.
+    let node = vol.nodesize() as u64;
+    const BIG: usize = 8192;
+    let headroom = BIG as u64 + node;
+    let mut limit = [0u8; 48];
+    limit[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER
+    limit[16..24].copy_from_slice(&(settled + headroom).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("setting the qgroup limit failed");
+    }
+
+    // 8 KiB of data fits under the limit; 8 KiB plus two nodes of metadata does
+    // not. So this is refused AFTER its data reservation has been taken.
+    let gen_before = vol.superblock().generation;
+    match poll_once(doomed.write(0, &alloc::vec![0x5eu8; BIG])) {
+        Some(Err(FsError::QuotaExceeded)) => {}
+        Some(Err(_)) | None => return TestResult::Fail("the refused write failed some other way"),
+        Some(Ok(_)) => return TestResult::Fail("the write meant to be refused was admitted"),
+    }
+    if vol.superblock().generation != gen_before {
+        return TestResult::Fail("the refusal committed, so nothing is held over");
+    }
+
+    // A tiny write that fits with room to spare — unless the refused write is
+    // still being charged for its 8 KiB.
+    match poll_once(small.write(0, b"small enough")) {
+        Some(Ok(12)) => {}
+        Some(Err(FsError::QuotaExceeded)) => {
+            return TestResult::Fail("a refused write kept charging the transaction")
+        }
+        _ => return TestResult::Fail("the small write failed some other way"),
+    }
+    let _ = poll_once(vol.sync_to_disk());
+    let kept = match poll_once(vol.root().lookup_async("leak-small.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("the admitted write's file vanished"),
+    };
+    match read_all(&kept, 32) {
+        Some(got) if got == b"small enough" => TestResult::Pass,
+        _ => TestResult::Fail("the admitted write did not land"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_refused_write_releases_its_reservation
+);
+
+/// `btrfs_limit_qgroup` updates limits; it does not replace them.
+///
+/// Linux writes each field only when its own flag is present in the request
+/// and merges with `qgroup->lim_flags |= limit->flags`, so setting one limit
+/// leaves the others standing. `btrfs qgroup limit` sets one at a time, so
+/// replacing the whole item meant adjusting max_excl silently dropped an
+/// existing max_rfer.
+///
+/// And `CLEAR_VALUE` — a field of all-ones — clears that limit rather than
+/// installing one of U64_MAX: the flag is dropped and the value zeroed. Stored
+/// verbatim it would be a limit nothing could ever cross, indistinguishable
+/// from unlimited until something read the item, and with the flag still set
+/// it could never be cleared again.
+fn smoke_btrfs_qgroup_limit_merges_and_clears() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let set = |flags: u64, max_rfer: u64, max_excl: u64| {
+        let mut arg = [0u8; 48];
+        arg[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+        arg[8..16].copy_from_slice(&flags.to_ne_bytes());
+        arg[16..24].copy_from_slice(&max_rfer.to_ne_bytes());
+        arg[24..32].copy_from_slice(&max_excl.to_ne_bytes());
+        matches!(
+            poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &arg, 48)),
+            Some(Ok(_))
+        )
+    };
+    let stored = || {
+        qgroup_item(&vol, format::QGROUP_LIMIT_KEY, format::FS_TREE_OBJECTID).unwrap_or_default()
+    };
+
+    // MAX_RFER alone.
+    if !set(1, 900 << 10, 0) {
+        return TestResult::Fail("setting max_rfer failed");
+    }
+    let after_rfer = stored();
+    if format::le64(&after_rfer, 0).ok() != Some(1)
+        || format::le64(&after_rfer, 8).ok() != Some(900 << 10)
+    {
+        return TestResult::Fail("max_rfer was not stored");
+    }
+
+    // MAX_EXCL alone — max_rfer must survive.
+    if !set(2, 0, 700 << 10) {
+        return TestResult::Fail("setting max_excl failed");
+    }
+    let after_excl = stored();
+    if format::le64(&after_excl, 0).ok() != Some(3) {
+        return TestResult::Fail("limit flags were replaced instead of merged");
+    }
+    if format::le64(&after_excl, 8).ok() != Some(900 << 10) {
+        return TestResult::Fail("setting max_excl discarded max_rfer");
+    }
+    if format::le64(&after_excl, 16).ok() != Some(700 << 10) {
+        return TestResult::Fail("max_excl was not stored");
+    }
+
+    // CLEAR_VALUE on max_rfer: flag dropped, value zeroed, max_excl untouched.
+    if !set(1, u64::MAX, 0) {
+        return TestResult::Fail("clearing max_rfer failed");
+    }
+    let after_clear = stored();
+    if format::le64(&after_clear, 0).ok() != Some(2) {
+        return TestResult::Fail("CLEAR_VALUE did not drop the max_rfer flag");
+    }
+    if format::le64(&after_clear, 8).ok() != Some(0) {
+        return TestResult::Fail("CLEAR_VALUE stored ~0 instead of clearing");
+    }
+    if format::le64(&after_clear, 16).ok() != Some(700 << 10) {
+        return TestResult::Fail("clearing max_rfer disturbed max_excl");
+    }
+
+    // Clear max_excl as well, so no limit remains standing to refuse the
+    // write below for the wrong reason — the first version of this test left
+    // max_excl at 700 KiB and read its refusal as a failure to clear
+    // max_rfer.
+    if !set(2, 0, u64::MAX) {
+        return TestResult::Fail("clearing max_excl failed");
+    }
+    let after_both = stored();
+    if format::le64(&after_both, 0).ok() != Some(0) || format::le64(&after_both, 16).ok() != Some(0)
+    {
+        return TestResult::Fail("CLEAR_VALUE did not clear max_excl");
+    }
+
+    // A cleared limit really is not enforced: a write far past the old
+    // 900 KiB max_rfer now succeeds.
+    let file = match poll_once(vol.root().create("uncapped.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create after clearing failed"),
+    };
+    match poll_once(file.write(0, &alloc::vec![0x9au8; 2 * 1024 * 1024])) {
+        Some(Ok(n)) if n == 2 * 1024 * 1024 => TestResult::Pass,
+        Some(Err(FsError::QuotaExceeded)) => TestResult::Fail("a cleared limit was still enforced"),
+        _ => TestResult::Fail("the post-clear write failed some other way"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_limit_merges_and_clears
+);
+
+/// A transaction left open long enough commits on its own.
+///
+/// Without this a transaction closes only when it fills or when somebody
+/// syncs, so a workload that writes a few files and stops leaves them
+/// uncommitted for as long as the volume stays mounted — while on Linux they
+/// become durable within `BTRFS_DEFAULT_COMMIT_INTERVAL` seconds with no
+/// fsync from anyone. Batching made the exposure worse by letting a
+/// transaction hold more before it fills.
+///
+/// The age is injected rather than waited for: this asserts the decision
+/// `transaction_kthread` makes — "the running transaction is older than the
+/// interval, commit it" — not that the clock advances. The timer task around
+/// it is the thin part; what matters is that an aged transaction commits and
+/// that a young one does not.
+fn smoke_btrfs_open_transaction_commits_on_interval() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    let device = writable_sparse(FIXTURE_FST_SPARSE);
+    let vol = match mount_writable(device.clone()) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    let root = vol.root();
+    if !matches!(poll_once(root.create("interval.txt")), Some(Ok(_))) {
+        return TestResult::Fail("create failed");
+    }
+    let uncommitted = vol.superblock().generation;
+
+    // A young transaction is left alone: the interval is a bound on how long
+    // work may sit uncommitted, not an instruction to commit at every chance.
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != uncommitted {
+        return TestResult::Fail("a fresh transaction was committed by the interval check");
+    }
+
+    // Age it past the interval and check again.
+    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != uncommitted + 1 {
+        return TestResult::Fail("an aged-out transaction was not committed");
+    }
+
+    // Durable, not merely committed — the timer exists for durability, so it
+    // has to push the superblock out too. Read it back from the device.
+    let after = match mount_writable(device) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("remount after the interval commit failed"),
+    };
+    let names = dir_names(&after.root());
+    if !names.iter().any(|n| n == "interval.txt") {
+        return TestResult::Fail("the interval commit did not reach the device");
+    }
+
+    // And with nothing outstanding it is a no-op rather than a fresh commit.
+    let settled = vol.superblock().generation;
+    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
+    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+        return TestResult::Fail("the staleness check never completed a poll");
+    }
+    if vol.superblock().generation != settled {
+        return TestResult::Fail("the interval committed an empty transaction");
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_open_transaction_commits_on_interval
+);
+
+/// Qgroup ioctls report ENOTCONN when quotas are off, not ENOENT.
+///
+/// `fs/btrfs/ioctl.c` opens qgroup_assign, qgroup_create, qgroup_limit and
+/// quota_rescan with `if (!btrfs_qgroup_enabled(fs_info)) return -ENOTCONN;`.
+/// The distinction is the point: ENOENT says the qgroup asked about does not
+/// exist, which invites the caller to create it, when the truth is that the
+/// machinery which would answer is switched off. `btrfs qgroup show` prints
+/// "quotas not enabled" off exactly this.
+///
+/// quota_ctl is deliberately excluded — it is the ioctl that turns quotas on,
+/// so gating it on quotas being on would make it unreachable.
+fn smoke_btrfs_qgroup_ioctls_report_not_connected() -> TestResult {
+    use narf_filesystem::FsInstance;
+
+    // A fixture with no quota tree at all.
+    let vol = match mount_sparse(FIXTURE_FST_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fst fixture failed to mount"),
+    };
+    if qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID).is_some() {
+        return TestResult::Fail("the fixture unexpectedly has quotas enabled");
+    }
+    let root = vol.root();
+
+    let limit = [0u8; 48];
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_LIMIT did not report ENOTCONN");
+    }
+    let mut create = [0u8; 16];
+    create[0..8].copy_from_slice(&1u64.to_ne_bytes()); // create
+    create[8..16].copy_from_slice(&((1u64 << 48) | 7).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_CREATE, 0, &create, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_CREATE did not report ENOTCONN");
+    }
+    let mut assign = [0u8; 24];
+    assign[0..8].copy_from_slice(&1u64.to_ne_bytes());
+    assign[8..16].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    assign[16..24].copy_from_slice(&((1u64 << 48) | 7).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_ASSIGN, 0, &assign, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QGROUP_ASSIGN did not report ENOTCONN");
+    }
+    let rescan = [0u8; 64];
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QUOTA_RESCAN, 0, &rescan, 0)),
+        Some(Err(FsError::NotConnected))
+    ) {
+        return TestResult::Fail("QUOTA_RESCAN did not report ENOTCONN");
+    }
+
+    // QUOTA_CTL is the way OUT of this state, so it must not be gated: enable
+    // quotas and the same limit call stops reporting ENOTCONN.
+    let mut ctl = [0u8; 16];
+    ctl[0..8].copy_from_slice(&1u64.to_ne_bytes()); // BTRFS_QUOTA_CTL_ENABLE
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QUOTA_CTL, 0, &ctl, 16)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("QUOTA_CTL enable was refused");
+    }
+    match poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)) {
+        Some(Err(FsError::NotConnected)) => {
+            TestResult::Fail("QGROUP_LIMIT still reported ENOTCONN after enabling quotas")
+        }
+        Some(_) => TestResult::Pass,
+        None => TestResult::Fail("QGROUP_LIMIT never completed a poll"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_ioctls_report_not_connected
+);

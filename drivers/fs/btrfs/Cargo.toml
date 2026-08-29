@@ -26,6 +26,7 @@ narf-kernel-test = { path = "../../../verification/kernel-test", optional = true
 narf-lib = { path = "../../../lib" }
 narf-memory = { path = "../../../memory" }
 narf-scheduler = { path = "../../../scheduler" }
+narf-time = { path = "../../../time" }
 
 [features]
 kernel-test = ["dep:narf-kernel-test"]

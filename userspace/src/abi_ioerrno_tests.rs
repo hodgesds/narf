@@ -2473,3 +2473,78 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_epoll_pwait2_faulting_timespec
 );
+
+/// `ioctl(BTRFS_IOC_QGROUP_LIMIT)` and its six siblings are EPERM without
+/// CAP_SYS_ADMIN.
+///
+/// Every quota and qgroup ioctl in `fs/btrfs/ioctl.c` opens with
+///
+/// ```text
+/// if (!capable(CAP_SYS_ADMIN))
+///         return -EPERM;
+/// ```
+///
+/// NARF had none of them, so any process could reconfigure a filesystem's
+/// quotas. The check lives at the syscall boundary rather than in the driver
+/// because `FsOps::ioctl_async` carries no credential — the filesystem layer
+/// never inspects the calling process — so this is where the caller's
+/// capabilities are still in scope, and this is where it has to be tested.
+///
+/// A pipe stands in for the target: the gate is decided from the command
+/// number before dispatch, so what the fd refers to is irrelevant, and the
+/// privileged arm proving a NON-EPERM answer is what shows this is a
+/// privilege gate rather than a blanket refusal.
+fn smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin() -> TestResult {
+    const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
+    // The seven commands Linux gates, by number.
+    const QUOTA_IOCTLS: [u64; 7] = [
+        0xc010_9428, // QUOTA_CTL
+        0x4018_9429, // QGROUP_ASSIGN
+        0x4010_942a, // QGROUP_CREATE
+        0x8030_942b, // QGROUP_LIMIT
+        0x4040_942c, // QUOTA_RESCAN
+        0x8040_942d, // QUOTA_RESCAN_STATUS
+        0x0000_942e, // QUOTA_RESCAN_WAIT
+    ];
+
+    with_setup(|| {
+        let (read_fd, write_fd) = make_pipe()?;
+        let mut buf = [0u8; 64];
+
+        // Unprivileged: every one of them is refused, and refused with EPERM
+        // specifically — not the EINVAL or ENOTTY an unrecognised ioctl gets,
+        // which is what userspace would see if the gate were missing.
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        for cmd in QUOTA_IOCTLS {
+            if call(
+                Syscall::Ioctl.raw(),
+                a2(read_fd as u64, cmd, buf.as_mut_ptr() as u64),
+            ) != Some(EPERM)
+            {
+                crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+                return Err("an unprivileged btrfs quota ioctl was not refused with EPERM");
+            }
+        }
+
+        // Privileged: the gate opens. A pipe implements none of these, so the
+        // answer is whatever an unrecognised ioctl gets — the point is only
+        // that it is no longer EPERM.
+        crate::handlers::__test_set_caps(FAKE_TASK, CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        let privileged = call(
+            Syscall::Ioctl.raw(),
+            a2(read_fd as u64, QUOTA_IOCTLS[3], buf.as_mut_ptr() as u64),
+        );
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+        let _ = call(Syscall::Close.raw(), a0(read_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(write_fd as u64));
+        if privileged == Some(EPERM) {
+            return Err("CAP_SYS_ADMIN did not open the gate");
+        }
+        Ok(())
+    })
+}
+
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin
+);

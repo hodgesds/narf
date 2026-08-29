@@ -624,6 +624,35 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
             }
             let out_size = if dir & IOC_READ != 0 { size } else { 0 };
+            // btrfs opens every quota and qgroup ioctl with
+            //
+            //     if (!capable(CAP_SYS_ADMIN))
+            //             return -EPERM;
+            //
+            // (`fs/btrfs/ioctl.c`, all seven of them). The check has to live
+            // here rather than in the driver: `FsOps::ioctl_async` carries no
+            // credential, by design — the filesystem layer never inspects the
+            // calling process — so the syscall boundary is the only place the
+            // caller's capabilities are still in scope.
+            //
+            // `task_capable` is host-scoped, which is what `capable()` means:
+            // `ns_capable(&init_user_ns, cap)`. A container root holding
+            // CAP_SYS_ADMIN only in its own user namespace does NOT get to
+            // reconfigure the host's quotas, and unprivileged callers got to
+            // set qgroup limits until this existed.
+            const BTRFS_QUOTA_IOCTLS: [u32; 7] = [
+                0xc010_9428, // QUOTA_CTL
+                0x4018_9429, // QGROUP_ASSIGN
+                0x4010_942a, // QGROUP_CREATE
+                0x8030_942b, // QGROUP_LIMIT
+                0x4040_942c, // QUOTA_RESCAN
+                0x8040_942d, // QUOTA_RESCAN_STATUS
+                0x0000_942e, // QUOTA_RESCAN_WAIT
+            ];
+            if BTRFS_QUOTA_IOCTLS.contains(&cmd) && !task_capable(task, CAP_SYS_ADMIN) {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
             match poll_blocking(ops.ioctl_async(cmd, arg as u64, &input, out_size)) {
                 Some(Ok(reply)) => {
                     if !reply.output.is_empty() {
@@ -661,6 +690,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 }
                 Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
                     ctx.set_return(SyscallReturn::ok((-122i64) as u64));
+                }
+                Some(Err(narf_filesystem::FsError::NotConnected)) => {
+                    // ENOTCONN. btrfs answers every qgroup ioctl this way when
+                    // quotas are off, rather than ENOENT, so `btrfs qgroup
+                    // show` can say "quotas are not enabled" instead of
+                    // reporting a missing qgroup.
+                    ctx.set_return(SyscallReturn::ok((-107i64) as u64));
                 }
                 _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
             }

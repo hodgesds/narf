@@ -638,6 +638,17 @@ pub enum FsError {
     /// A filesystem quota or qgroup hard limit would be exceeded. Maps to
     /// Linux `EDQUOT`, distinct from exhausted backing storage (`ENOSPC`).
     QuotaExceeded,
+    /// A subsystem the operation depends on is not switched on for this
+    /// filesystem. Maps to Linux `ENOTCONN`, which btrfs returns from every
+    /// qgroup ioctl when quotas are disabled (`fs/btrfs/ioctl.c`:
+    /// `if (!btrfs_qgroup_enabled(fs_info)) return -ENOTCONN;`).
+    ///
+    /// Distinct from [`FsError::NotFound`] on purpose. ENOENT says the object
+    /// asked about does not exist, which invites a caller to create it;
+    /// ENOTCONN says the machinery that would answer the question is off, and
+    /// the fix is to enable it. `btrfs qgroup show` on a filesystem without
+    /// quotas relies on telling those apart.
+    NotConnected,
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,
