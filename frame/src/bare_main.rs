@@ -3185,6 +3185,14 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // The extent tree is now multi-leaf; grow the filesystem once
                         // more to exercise chunk growth on a multi-leaf filesystem
                         // (validated on-disk by the post-boot host `btrfs check`).
+                        //
+                        // Sync FIRST. The block below mounts a SECOND volume over
+                        // the same device, and a second mount reads the on-disk
+                        // superblock — it cannot see writes this handle has
+                        // accumulated but not committed. Growing from that stale
+                        // image and then committing this handle's batch on top of
+                        // it leaves two transactions built from the same parent.
+                        file.fsync(false).await.map_err(|_| ())?;
                         {
                             let gvol = narf_drivers_fs_btrfs::volume::BtrfsVolume::mount(
                                 narf_block::SyncBlock::new(dev.clone()),
@@ -3196,6 +3204,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 .await
                                 .map_err(|_| ())?;
                         }
+                        // Commits are batched, so the tree is durable only once
+                        // synced — a real unmount would flush here. fsync commits
+                        // the open batch and pushes the staged superblock out;
+                        // without it the remount below reads the last synced
+                        // state and every check that follows is testing the
+                        // wrong image.
+                        file.fsync(false).await.map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink

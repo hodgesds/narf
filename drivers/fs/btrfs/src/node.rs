@@ -618,16 +618,16 @@ impl<B: BlockDevice + 'static> FileOps for BtrfsNode<B> {
         })
     }
 
-    /// btrfs commits synchronously here — every `write` already flips the
-    /// superblock to a new generation and flushes the device, so a file's data is
-    /// durable before `write` returns. `fsync` re-issues a device flush as a
-    /// barrier; there is no uncommitted transaction to force out (the tree-log is
-    /// only used to *replay* a crashed volume's log on mount, not to defer writes).
+    /// `fsync` must leave every write that has already returned durable on
+    /// disk. It delegates that to [`BtrfsVolume::sync_to_disk`], which is the
+    /// single place the requirement is implemented — it commits the open
+    /// batch and then writes the staged superblock, which together are what
+    /// "already returned" means once writes are batched.
+    ///
+    /// (The tree-log is only used to *replay* a crashed volume's log on mount,
+    /// not to defer writes, so it plays no part here.)
     fn fsync<'a>(&'a self, _data_only: bool) -> FsFuture<'a, ()> {
-        Box::pin(async move {
-            self.volume()?.flush().await;
-            Ok(())
-        })
+        Box::pin(async move { self.volume()?.sync_to_disk().await })
     }
 
     fn stat(&self) -> Stat {

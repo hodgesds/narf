@@ -99,7 +99,7 @@ impl Drop for VolumeIo {
 /// answer.
 #[derive(Debug, Default)]
 struct NodeCache {
-    entries: BTreeMap<u64, alloc::vec::Vec<u8>>,
+    entries: BTreeMap<u64, Arc<alloc::vec::Vec<u8>>>,
     epoch: u64,
 }
 
@@ -107,6 +107,15 @@ struct NodeCache {
 /// comfortably holds the working set a commit's fixed point revisits while
 /// staying a fixed, predictable cost.
 const NODE_CACHE_MAX: usize = 256;
+
+/// Commits allowed to stage before the superblock is forced out.
+///
+/// Bounds two things: how much work a crash discards, and how long pinned
+/// extents withhold free space. Linux commits on a 30-second timer instead;
+/// a count is the equivalent NARF can express without a timer source in the
+/// driver, and a small one keeps both costs modest while still amortising the
+/// superblock write and its barrier across a batch.
+const MAX_STAGED_COMMITS: usize = 2;
 
 impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
@@ -165,6 +174,47 @@ pub struct BtrfsVolume<B: BlockDevice> {
     degraded: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
+    /// A stamped superblock image whose commit has completed in memory but
+    /// which is not yet on disk, plus whether it must go through the
+    /// root-admin write path.
+    ///
+    /// Batching commits means the superblock stops flipping per write. The
+    /// tree blocks are already out and `commit_roots` has advanced the
+    /// in-memory roots, so readers follow the new tree; only durability lags.
+    /// A crash here loses every staged commit and the filesystem falls back to
+    /// the last superblock on disk — which is intact precisely because the
+    /// blocks it references are pinned until this image lands.
+    staged_super: IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+    /// Commits staged since the superblock last reached disk.
+    staged_count: core::sync::atomic::AtomicUsize,
+    /// Test-only: abort the next commit after its nodes are written but before
+    /// the superblock, standing in for a crash at the one instant the COW
+    /// invariant is load-bearing.
+    #[cfg(feature = "kernel-test")]
+    crash_before_super: core::sync::atomic::AtomicBool,
+    /// Extents freed by the in-flight transaction, withheld from allocation
+    /// until a superblock that no longer references them is durable.
+    ///
+    /// This is Linux's `trans->transaction->pinned_extents`. Freeing a block
+    /// mid-transaction does NOT return it to the allocator
+    /// (`extent-tree.c::pin_down_extent`); `btrfs_commit_transaction` releases
+    /// the set only after `write_all_supers` succeeds, with the comment "the
+    /// super is written, we can safely allow the tree-loggers to go about
+    /// their business".
+    ///
+    /// The invariant that buys: a block a transaction freed cannot be
+    /// reallocated until a superblock referencing the tree that no longer uses
+    /// it is on disk. Without it, a crash between writing new nodes and
+    /// writing the superblock leaves the committed tree pointing at a block
+    /// that has already been overwritten — silent corruption, and invisible to
+    /// `btrfs check` until after the crash.
+    ///
+    /// NARF flips the superblock on every write, so today the set is emptied
+    /// before the next allocation and never withholds anything. It exists so
+    /// that stops being what makes the invariant hold. Linux keeps it on the
+    /// transaction; it sits here until NARF has a transaction object, which is
+    /// sound only while at most one commit is in flight.
+    pinned: IrqSafeSpinLock<alloc::vec::Vec<(u64, u64)>>,
     /// Metadata node cache, keyed by logical address.
     ///
     /// A commit path-COWs the extent tree once per fixed-point round, and a
@@ -174,6 +224,11 @@ pub struct BtrfsVolume<B: BlockDevice> {
     /// (emulated) device read plus a full-node checksum verification, and both
     /// are pure repetition for a block nothing has written since.
     nodes: IrqSafeSpinLock<NodeCache>,
+    /// Operations accumulated into the transaction that has not committed yet.
+    /// An async mutex rather than a spinlock: an operation holds it across its
+    /// tree reads and node writes, which is also what serialises the shared
+    /// allocator inside it.
+    fs_batch: Mutex<Option<crate::write::FsBatch>>,
 }
 
 impl<B: BlockDevice + 'static> BtrfsVolume<B> {
@@ -668,6 +723,20 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// validating its self-recorded `bytenr` and, when
     /// [`verify_checksums`](Self::verify_checksums) is set, its checksum.
     pub async fn read_node(&self, logical: u64) -> Result<Vec<u8>, FsError> {
+        self.read_node_shared(logical)
+            .await
+            .map(|arc| (*arc).clone())
+    }
+
+    /// [`Self::read_node`] without copying the node out of the cache.
+    ///
+    /// A cache hit here is an `Arc` bump rather than a `nodesize` memcpy. That
+    /// matters because the commit path's hottest reader — the extent tree's
+    /// path COW, re-run once per fixed-point round — descends the same
+    /// internal nodes for every edit, and each descent used to copy 16 KiB per
+    /// level. Callers that need to mutate a node still take `read_node` and
+    /// get their own copy.
+    pub async fn read_node_shared(&self, logical: u64) -> Result<Arc<Vec<u8>>, FsError> {
         // Serve from the node cache when nothing has written this address
         // since it was filled. A hit skips both the device read and the
         // full-node checksum verification; the clone is a memcpy against an
@@ -679,6 +748,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             }
             cache.epoch
         };
+        let _ = epoch;
 
         let mut buf = vec![0u8; self.nodesize()];
         let copies = self.logical_read_copies(logical)?;
@@ -702,6 +772,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             {
                 continue;
             }
+            let shared = Arc::new(core::mem::take(&mut buf));
             // Only cache a node that passed BOTH checks above — a copy that
             // failed one is retried from another mirror, and caching it would
             // make a transient bad mirror permanent for this mount.
@@ -716,9 +787,9 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
                     // more here than the misses it saves.
                     cache.entries.clear();
                 }
-                cache.entries.insert(logical, buf.clone());
+                cache.entries.insert(logical, shared.clone());
             }
-            return Ok(buf);
+            return Ok(shared);
         }
         Err(FsError::InvalidData)
     }
@@ -773,6 +844,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// the root tree and cache its root directory inode. Subsequent `root()`
     /// calls start there.
     pub async fn switch_to_subvol(&self, sel: &Subvol) -> Result<(), FsError> {
+        // A batch belongs to one subvolume: its accumulated COW descends from
+        // that subvolume's tree, and the commit stamps the result into the
+        // ROOT_ITEM named by `fs_tree_id`. Re-rooting with one open would
+        // commit the previous subvolume's tree into the new subvolume's root
+        // item. Log replay walks several roots in a row and is the path that
+        // reaches this.
+        crate::write::flush_batch(self).await?;
         let (root_tree, _) = self.root_tree_root();
         let (subvol_id, subvol_root, subvol_level, subvol_flags) = match sel {
             Subvol::Id(n) => {
@@ -1034,7 +1112,13 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             verify_checksums,
             degraded,
             devices: IrqSafeSpinLock::new(devices),
+            staged_super: IrqSafeSpinLock::new(None),
+            staged_count: core::sync::atomic::AtomicUsize::new(0),
+            #[cfg(feature = "kernel-test")]
+            crash_before_super: core::sync::atomic::AtomicBool::new(false),
+            pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
+            fs_batch: Mutex::new(None),
             state: IrqSafeSpinLock::new(VolState {
                 superblock,
                 superblock_source: (source_devid, source_offset),
@@ -1255,6 +1339,113 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Ok(self.invalidate_nodes(logical, src.len()))
     }
 
+    /// Hold a completed commit's superblock image in memory instead of writing
+    /// it, and report whether the batch is now long enough to force out.
+    pub(crate) fn stage_superblock(&self, raw: alloc::vec::Vec<u8>, root_admin: bool) -> bool {
+        *self.staged_super.lock() = Some((raw, root_admin));
+        let staged = self
+            .staged_count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel)
+            + 1;
+        staged >= MAX_STAGED_COMMITS
+    }
+
+    /// Make every write that has already returned durable on disk.
+    ///
+    /// This is `fsync`'s contract, stated as a requirement rather than as a
+    /// description of how commits happen to work. Two things can be
+    /// outstanding, and both are discharged here, in this order:
+    ///
+    ///  1. operations accumulated into a batch that has not committed — their
+    ///     tree blocks are on disk but no superblock names them yet;
+    ///  2. a committed transaction whose superblock is staged in memory.
+    ///
+    /// Both halves are needed and neither is sufficient. Writing the staged
+    /// superblock without committing the batch publishes a tree that predates
+    /// the writes this call was made for; committing the batch without writing
+    /// the superblock leaves the result in memory.
+    ///
+    /// Putting both here rather than at the call sites is what keeps the
+    /// contract from depending on someone remembering: every durability path
+    /// — `fsync`, unmount, a full staged-superblock quota — is this one
+    /// function.
+    ///
+    /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
+    /// fsyncs, crashes the following commit, and requires the fsynced data
+    /// back. Deferring commits without doing the work here turns that red.
+    pub async fn sync_to_disk(&self) -> Result<(), FsError> {
+        crate::write::flush_batch(self).await?;
+        self.write_staged_super().await
+    }
+
+    /// Push the staged superblock, if any, through to the device — the second
+    /// half of [`Self::sync_to_disk`], on its own.
+    ///
+    /// A commit calls this rather than `sync_to_disk` when it has filled the
+    /// staged-superblock quota. It must not go the long way round: the batch
+    /// this commit came from was taken before it started, so there is nothing
+    /// of its own left to flush, and calling back into the batch machinery
+    /// from inside a commit makes the two mutually recursive for no gain.
+    pub(crate) async fn write_staged_super(&self) -> Result<(), FsError> {
+        let staged = self.staged_super.lock().take();
+        let Some((raw, root_admin)) = staged else {
+            // Nothing outstanding; the barrier is all that is owed.
+            self.flush().await;
+            return Ok(());
+        };
+        // Every staged commit's nodes were written before this point, so one
+        // barrier covers all of them — the ordering the superblock relies on
+        // is "all tree blocks durable first", not "one flush per commit".
+        self.flush().await;
+        if root_admin {
+            self.write_superblock_root_admin(&raw).await?;
+        } else {
+            self.write_superblock(&raw).await?;
+        }
+        self.staged_count
+            .store(0, core::sync::atomic::Ordering::Release);
+        // Only now, exactly as `btrfs_finish_extent_commit` runs only after
+        // `write_all_supers`.
+        self.unpin_all();
+        Ok(())
+    }
+
+    /// Test-only: make the next commit stop after writing its nodes, leaving
+    /// the superblock pointing at the previous tree — the state a crash mid
+    /// commit produces.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn arm_crash_before_super(&self) {
+        self.crash_before_super
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the armed crash, if any.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn take_crash_before_super(&self) -> bool {
+        self.crash_before_super
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
+    }
+
+    /// Withhold `[start, start + len)` from allocation until [`Self::unpin_all`].
+    pub(crate) fn pin_extent(&self, start: u64, len: u64) {
+        if len != 0 {
+            self.pinned.lock().push((start, len));
+        }
+    }
+
+    /// The currently pinned ranges, for the allocator to subtract.
+    pub(crate) fn pinned_ranges(&self) -> alloc::vec::Vec<(u64, u64)> {
+        self.pinned.lock().clone()
+    }
+
+    /// Release every pinned extent. The caller must have made a superblock
+    /// durable that no longer references any of them — that ordering is the
+    /// entire point of pinning, so calling this earlier reintroduces exactly
+    /// the corruption the set prevents.
+    pub(crate) fn unpin_all(&self) {
+        self.pinned.lock().clear();
+    }
+
     /// Publish a node this volume has just written, so the read that follows
     /// it does not have to fetch back bytes we are already holding.
     ///
@@ -1284,7 +1475,7 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         if cache.entries.len() >= NODE_CACHE_MAX {
             cache.entries.clear();
         }
-        cache.entries.insert(logical, buf.to_vec());
+        cache.entries.insert(logical, Arc::new(buf.to_vec()));
     }
 
     /// Write one metadata node and keep it cached.
@@ -1462,6 +1653,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Transaction code can therefore heal a damaged primary without knowing
     /// which mirror supplied the mounted generation.
     pub async fn read_raw_superblock(&self) -> Result<Vec<u8>, FsError> {
+        // A staged image is newer than anything on disk, and the next commit
+        // must build on it — reading the stale on-disk copy would roll the
+        // generation and root pointers backwards.
+        if let Some((raw, _)) = self.staged_super.lock().as_ref() {
+            return Ok(raw.clone());
+        }
         let (devid, source) = self.state.lock().superblock_source;
         let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
         self.read_physical_on(devid, source, &mut raw).await?;
@@ -1495,6 +1692,33 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         let mut g = self.state.lock();
         g.superblock.log_root = 0;
         g.superblock.log_root_level = 0;
+    }
+
+    /// The transaction accumulating operations that have not committed yet.
+    pub(crate) fn fs_batch(&self) -> &Mutex<Option<crate::write::FsBatch>> {
+        &self.fs_batch
+    }
+
+    /// Publish an fs-tree root produced *inside* an open batch.
+    ///
+    /// The batch's nodes are already on disk, so a read taken between two of
+    /// its operations must descend from the new root or it would miss the
+    /// first operation's result. Only the superblock still names the pre-batch
+    /// root, which is the ordinary COW invariant: a crash before the batch
+    /// commits falls back to that tree, and every block it references is still
+    /// there. What keeps them there is that a batch never returns anything it
+    /// frees — freed blocks go back to the free-space tree only at commit, so
+    /// until then the allocator, which reads that tree, cannot reach them.
+    /// (The pinned set covers the window after that: from commit until the
+    /// superblock naming the new tree is durable.)
+    ///
+    /// Deliberately narrower than [`Self::commit_roots`]: it must NOT advance
+    /// `superblock.generation`, because every operation of the batch derives
+    /// its generation from that field and they all have to agree.
+    pub(crate) fn advance_fs_root(&self, new_fs_root: u64, new_fs_level: u8) {
+        let mut g = self.state.lock();
+        g.fs_tree_root = new_fs_root;
+        g.fs_tree_level = new_fs_level;
     }
 
     /// After a COW commit, publish the new roots into the live volume so

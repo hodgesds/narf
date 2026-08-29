@@ -253,7 +253,7 @@ fn ext_item_data(gen: u64, root: u64, objectid: u64, offset: u64, simple_quota: 
 /// inodes may name the same `(bytenr, len)`; the extent item's aggregate `refs`
 /// is the sum of their individual `count` fields.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct DataRefId {
+pub(crate) struct DataRefId {
     bytenr: u64,
     len: u64,
     ref_root: u64,
@@ -817,6 +817,16 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     offset: u64,
     data: &[u8],
 ) -> Result<usize, FsError> {
+    with_space_retry(vol, || cow_write_file_once(vol, ino, inode, offset, data)).await
+}
+
+async fn cow_write_file_once<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    ino: u64,
+    inode: &InodeItem,
+    offset: u64,
+    data: &[u8],
+) -> Result<usize, FsError> {
     if !inode.is_regular() {
         return Err(FsError::Unsupported);
     }
@@ -824,7 +834,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
         return Ok(0);
     }
     ensure_private_subvol(vol).await?;
-    let (fs_root, fs_level) = vol.fs_tree_root();
+    let (fs_root, _) = vol.fs_tree_root();
 
     let old_size = inode.size;
     let end = offset
@@ -961,8 +971,14 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     let o = usize::try_from(offset - rewrite_start).map_err(|_| FsError::InvalidData)?;
     buf[o..o + data.len()].copy_from_slice(data);
 
-    let gen = vol.superblock().generation + 1;
-    let mut alloc = Allocator::build(vol).await?;
+    // Join the open transaction (opening one if this is the first operation).
+    // The data extents tiled below are carved from the batch's allocator, not
+    // a fresh one: a fresh allocator reads the on-disk free-space tree, which
+    // the batch has not updated yet, so it would hand out space the batch has
+    // already given to an earlier operation.
+    let mut guard = batch_begin(vol).await?;
+    let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+    let gen = batch.gen;
 
     // ── Tile the content into fresh extents; write each + its checksums ─
     let mut new_data: Vec<DataRef> = Vec::new();
@@ -990,7 +1006,7 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
             None => (plain, format::COMPRESS_NONE),
         };
         let disk_len = payload.len() as u64;
-        let e_data = alloc.alloc_data(vol, disk_len)?;
+        let e_data = batch.alloc.alloc_data(vol, disk_len)?;
         vol.write_logical(e_data, payload).await?;
         let csums = crate::csum::compute_csums(vol.csum_type(), payload, sectorsize as usize)?;
         let file_off = rewrite_start + window_off;
@@ -1038,36 +1054,12 @@ pub async fn cow_write_file<B: BlockDevice + 'static>(
     new_inode[24..32].copy_from_slice(&new_nbytes.to_le_bytes()); // nbytes
     edits.push(Edit::Upsert(inode_key, new_inode));
 
-    let out = PathCow::new(vol, gen, fs_root, fs_level)
-        .await?
-        .apply(&mut alloc, &edits)
-        .await?;
-    let fs = fs_commit_from(out, gen, vol.csum_type())?;
-
-    commit_txn(
-        vol,
-        gen,
-        alloc,
-        Txn {
-            fs,
-            dropped_data,
-            added_data: Vec::new(),
-            added_meta: Vec::new(),
-            dropped_meta: Vec::new(),
-            new_data,
-            root_flags: None,
-            extra_trees: Vec::new(),
-            root_edits: Vec::new(),
-            retired_meta: Vec::new(),
-            qgroup_create: None,
-            qgroup_delete: None,
-            qgroup_edits: Vec::new(),
-            skip_qgroup_recount: false,
-            enforce_qgroup_limits: true,
-            incompat_flags_add: 0,
-        },
-    )
-    .await?;
+    batch_stage(vol, batch, &edits, dropped_data, new_data).await?;
+    let full = batch.ops >= batch.max_ops;
+    drop(guard);
+    if full {
+        flush_batch(vol).await?;
+    }
     Ok(data.len())
 }
 
@@ -1088,36 +1080,305 @@ fn fs_commit_from(out: CowOut, gen: u64, csum_type: u16) -> Result<FsCommit, FsE
     })
 }
 
-// ── Shared COW mini-transaction ────────────────────────────────────
+// ── Batched transaction ────────────────────────────────────────────
 
-/// Path-COW the fs tree with `edits` and commit, moving data-ref deltas
-/// through the extent + csum trees. The namespace mutations funnel through here:
-/// each touches only a handful of keys, so only their root-to-leaf paths are
-/// rewritten (`O(log N)`), never the whole tree.
-async fn commit_fs_edits<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
+/// How many operations accumulate into one on-disk transaction.
+///
+/// Every operation used to be its own transaction, which meant every single
+/// `create`/`unlink`/`write` paid a full commit: the extent-tree fixed point,
+/// then a writeout of the whole extent + csum + root + free-space set. Those
+/// costs are per *transaction*, not per operation, so batching amortises them.
+///
+/// The bound is what a crash may discard and how long the pinned set withholds
+/// freed space, so it cannot simply grow: this is the same trade-off Linux
+/// makes with its 30-second commit interval, expressed in operations because
+/// NARF has no wall clock in the commit path.
+const MAX_BATCH_OPS: usize = 8;
+
+/// Operations accumulated into one not-yet-committed transaction.
+///
+/// The batch owns the three things that must be shared across its operations
+/// rather than rebuilt per operation:
+///
+///  * `alloc` — one allocator, so a block handed to operation 1 is not handed
+///    out again to operation 2. A rebuilt allocator would read the *on-disk*
+///    free-space tree, which the batch has not updated yet, and hand out the
+///    same blocks twice.
+///  * `cow` — one live path-COW, so operation 2 edits operation 1's new blocks
+///    in place instead of treating them as committed blocks to free (see
+///    [`CowState`]).
+///  * `gen` — one generation for every node the batch stamps, matching the one
+///    superblock it eventually writes.
+#[derive(Debug)]
+pub(crate) struct FsBatch {
     gen: u64,
-    mut alloc: Allocator,
+    alloc: Allocator,
+    cow: CowState,
+    dropped_data: Vec<DataRefId>,
+    new_data: Vec<DataRef>,
+    ops: usize,
+    /// The fs-tree root as of the last commit, to restore if this batch's own
+    /// commit fails. Staging publishes each operation's root so that reads
+    /// inside the batch see it; a failed commit has to take that back.
+    base_root: (u64, u8),
+    /// Operations this batch may hold — [`MAX_BATCH_OPS`], or 1 when quotas
+    /// are on. Fixed when the batch opens, so the question is asked once per
+    /// transaction rather than once per operation.
+    max_ops: usize,
+}
+
+/// Open the batch if none is open, and lock it for one operation.
+///
+/// Holding the lock for the whole operation serialises commits against each
+/// other, which the single shared allocator requires: two operations carving
+/// blocks from one allocator concurrently would interleave into the same
+/// ranges.
+async fn batch_begin<'a, B: BlockDevice + 'static>(
+    vol: &'a BtrfsVolume<B>,
+) -> Result<narf_lib::mutex::MutexGuard<'a, Option<FsBatch>>, FsError> {
+    let mut guard = vol.fs_batch().lock().await;
+    if guard.is_none() {
+        // The generation the batch commits at. `commit_roots` does not run
+        // until the batch closes, so every operation inside it derives the
+        // same generation from the same unchanged superblock.
+        let gen = vol
+            .superblock()
+            .generation
+            .checked_add(1)
+            .ok_or(FsError::InvalidData)?;
+        let (fs_root, fs_level) = vol.fs_tree_root();
+        let cow = PathCow::new(vol, gen, fs_root, fs_level).await?.suspend().0;
+        // Quota-enabled volumes do not batch. NARF recounts qgroup usage and
+        // enforces `max_rfer`/`max_excl` inside `commit_txn`, so a transaction
+        // is the finest granularity at which a limit can be checked at all.
+        // Batching would let a write that exceeds a hard limit return success
+        // and surface EDQUOT later, against whichever caller happened to
+        // trigger the flush — reporting the error to the wrong writer, or to
+        // no writer at all. Committing per operation keeps the limit attached
+        // to the write that broke it.
+        //
+        // (Linux does not face this: it reserves and charges quota up front in
+        // `btrfs_qgroup_reserve_data`, so its limits are enforced before the
+        // write is accepted and are unaffected by when the transaction
+        // commits.)
+        let (root_tree, _) = vol.root_tree_root();
+        let quota_on = !matches!(quota_mode_at(vol, root_tree).await?, QuotaMode::Disabled);
+        *guard = Some(FsBatch {
+            gen,
+            alloc: Allocator::build(vol).await?,
+            cow,
+            dropped_data: Vec::new(),
+            new_data: Vec::new(),
+            ops: 0,
+            base_root: (fs_root, fs_level),
+            max_ops: if quota_on { 1 } else { MAX_BATCH_OPS },
+        });
+    }
+    Ok(guard)
+}
+
+/// The generation the open batch will commit at, opening one if needed.
+///
+/// Callers stamp this into the items they build (inode `generation`/`transid`,
+/// file-extent items), so it has to be the same generation the batch stamps
+/// into the nodes carrying those items. It equals `superblock().generation + 1`
+/// for as long as the batch stays open — `commit_roots`, the only thing that
+/// advances that field, does not run until the batch closes — but taking it
+/// from the batch keeps the two from being able to disagree.
+async fn batch_gen<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Result<u64, FsError> {
+    let guard = batch_begin(vol).await?;
+    let gen = guard.as_ref().ok_or(FsError::InvalidData)?.gen;
+    Ok(gen)
+}
+
+/// Retry `op` once with the batch committed, if it ran out of space.
+///
+/// A batch holds every block it has allocated and returns nothing it has
+/// freed — freed space goes back to the free-space tree only at commit, and
+/// even then stays *pinned* until a superblock that no longer references it is
+/// durable. So an operation can hit `NoSpace` inside a batch on a filesystem
+/// with ample reclaimable space, purely because the batch and the staged
+/// superblock are between that space and the allocator.
+///
+/// Both have to be cleared, which is why this syncs rather than merely
+/// committing: `unpin_all` runs only after the superblock reaches the device,
+/// so a commit alone hands back nothing the previous transaction freed. That
+/// ordering is not incidental — it is the whole point of the pinned set — so
+/// the way to get the space is to complete it, not to skip it.
+///
+/// Linux hits the same wall and answers it the same way. `COMMIT_TRANS` is a
+/// step on its data-ENOSPC reclaim ladder (`space-info.c::data_flush_states`),
+/// described there in exactly these terms — "this is where we reclaim all of
+/// the pinned space" — after which the reservation is retried. Retrying is
+/// safe because a failed operation leaves the batch exactly as it found it —
+/// `batch_stage` rolls back both the COW and the allocator, and nothing has
+/// advanced the in-memory fs root — so the second attempt starts from the same
+/// filesystem state, with the space the first attempt was denied.
+///
+/// Once only: if a full sync did not free enough, the filesystem really is
+/// full and a third attempt would just be the second one again.
+async fn with_space_retry<B, F, Fut, T>(vol: &BtrfsVolume<B>, mut op: F) -> Result<T, FsError>
+where
+    B: BlockDevice + 'static,
+    F: FnMut() -> Fut,
+    Fut: core::future::Future<Output = Result<T, FsError>>,
+{
+    match op().await {
+        Err(FsError::NoSpace) => {
+            vol.sync_to_disk().await?;
+            op().await
+        }
+        other => other,
+    }
+}
+
+/// Whether the open batch, if any, has already COWed the fs tree.
+async fn batch_owns_fs_tree<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> bool {
+    matches!(vol.fs_batch().lock().await.as_ref(), Some(b) if b.ops > 0)
+}
+
+/// Add one operation's fs-tree edits and data-ref deltas to the open batch.
+///
+/// The new fs-tree nodes are written out here rather than at commit, and the
+/// in-memory fs root is advanced to match, so a read taken between two
+/// operations of the same batch sees the first one's result. Only the
+/// *superblock* still points at the pre-batch tree — which is exactly the COW
+/// invariant the pinned set already protects, so a crash mid-batch falls back
+/// to the last committed tree with every block it references intact.
+async fn batch_stage<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
     edits: &[Edit],
     dropped_data: Vec<DataRefId>,
     new_data: Vec<DataRef>,
 ) -> Result<(), FsError> {
-    let (fs_root, fs_level) = vol.fs_tree_root();
-    let out = PathCow::new(vol, gen, fs_root, fs_level)
-        .await?
-        .apply(&mut alloc, edits)
-        .await?;
+    // Roll-back point. A failure part-way through `apply_edits` leaves the tree
+    // torn: some of this operation's edits applied, the rest not. When every
+    // operation was its own transaction that did not matter, because the torn
+    // COW was dropped uncommitted. Inside a batch it would be committed along
+    // with the operations either side of it, so the batch has to be able to
+    // undo it. Linux's answer to the same problem is
+    // `btrfs_abort_transaction`, which forces the whole filesystem read-only;
+    // undoing a single operation is affordable here only because `pending`
+    // holds `Arc`s, so the snapshot shares every node buffer rather than
+    // copying it.
+    //
+    // The COW snapshot is parked *in* the batch while the working copy is
+    // edited, so the error paths below have nothing to restore for it. The
+    // allocator cannot be handled that way — `apply_edits` needs it by mutable
+    // reference and carves from it in place — so those paths do put it back.
+    let snapshot_alloc = batch.alloc.clone();
+    let snapshot_cow = batch.cow.clone();
+    let mut cow = PathCow::resume(
+        vol,
+        batch.gen,
+        core::mem::replace(&mut batch.cow, snapshot_cow),
+    );
+    if let Err(e) = cow.apply_edits(&mut batch.alloc, edits).await {
+        batch.alloc = snapshot_alloc;
+        return Err(e);
+    }
+    let (state, dirty) = cow.suspend();
+    for (addr, mut buf, _lvl) in dirty {
+        let written = match stamp_node(&mut buf, addr, batch.gen, vol.csum_type()) {
+            Ok(()) => vol.write_node(addr, &buf).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = written {
+            batch.alloc = snapshot_alloc;
+            return Err(e);
+        }
+    }
+    batch.cow = state;
+    let (root, level) = batch.cow.root();
+    vol.advance_fs_root(root, level);
+    // A data extent this batch allocated and has now released never reached
+    // the extent tree, so it must not be recorded as a drop: `commit_txn`
+    // resolves every dropped reference against the *committed* extent tree,
+    // where an extent born in this batch does not appear. Overwriting the same
+    // file twice inside one batch does exactly that.
+    //
+    // Cancelling the pair is also what leaves the accounting right. Neither
+    // half runs: no `EXTENT_ITEM`, no delete, no csums, and the free-space tree
+    // is never told the range was used, so it stays free — which it is, since
+    // nothing references it. The allocator has already handed the range out
+    // and will not reuse it before the batch commits, so the bytes written
+    // into it cannot be mistaken for anything.
+    //
+    // This is the data-side twin of what `PathCow::retire` does for metadata:
+    // a block made this transaction and then dropped is removed from `pending`
+    // rather than pushed onto `freed`.
+    for id in dropped_data {
+        match batch.new_data.iter().position(|d| d.id.bytenr == id.bytenr) {
+            Some(born_here) => {
+                batch.new_data.remove(born_here);
+            }
+            None => batch.dropped_data.push(id),
+        }
+    }
+    batch.new_data.extend(new_data);
+    batch.ops += 1;
+    Ok(())
+}
+
+/// Commit one closed batch as a single transaction.
+async fn commit_batch<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: FsBatch,
+) -> Result<(), FsError> {
+    if batch.ops == 0 {
+        // Nothing staged. `batch_gen` opens a batch before its caller has
+        // built anything, so an operation that fails between the two leaves an
+        // empty one behind. Committing it would burn a generation and a
+        // superblock write to publish a tree identical to the committed one.
+        return Ok(());
+    }
+    let base_root = batch.base_root;
+    let result = commit_batch_inner(vol, batch).await;
+    if result.is_err() {
+        // Put the in-memory root back where the last successful commit left
+        // it. Staging advanced it so that reads within the batch could see the
+        // operations as they landed, but a commit that fails publishes
+        // nothing: the superblock still names `base_root`, and leaving the
+        // volume pointing past it would show a rejected write as if it had
+        // been accepted. A quota hard limit is the ordinary way to get here —
+        // `commit_txn` refuses the transaction, and the write that provoked it
+        // must be as absent from memory as it is from disk.
+        //
+        // The blocks the batch wrote stay on disk, unreferenced by any tree
+        // and unrecorded in the extent tree, which is the same state a crash
+        // between the node writes and the superblock write leaves behind.
+        vol.advance_fs_root(base_root.0, base_root.1);
+    }
+    result
+}
+
+async fn commit_batch_inner<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: FsBatch,
+) -> Result<(), FsError> {
+    let out = batch.cow.into_cow_out();
     commit_txn(
         vol,
-        gen,
-        alloc,
+        batch.gen,
+        batch.alloc,
         Txn {
-            fs: fs_commit_from(out, gen, vol.csum_type())?,
-            dropped_data,
+            fs: FsCommit {
+                // Empty, not missing: every one of these nodes was written by
+                // `batch_stage`. `new_blocks` below is what the commit needs —
+                // the extent-tree records and free-space accounting — and
+                // re-writing the bytes would just repeat I/O already done.
+                nodes: Vec::new(),
+                new_blocks: out.nodes.iter().map(|&(a, _, l)| (a, l)).collect(),
+                freed: out.freed,
+                root: out.root_addr,
+                level: out.root_level,
+            },
+            dropped_data: batch.dropped_data,
             added_data: Vec::new(),
             added_meta: Vec::new(),
             dropped_meta: Vec::new(),
-            new_data,
+            new_data: batch.new_data,
             root_flags: None,
             extra_trees: Vec::new(),
             root_edits: Vec::new(),
@@ -1133,6 +1394,62 @@ async fn commit_fs_edits<B: BlockDevice + 'static>(
     .await
 }
 
+/// Commit the open batch, if any. Every transaction that is *not* batchable
+/// calls this before it reads the extent/csum/root/free-space trees or builds
+/// an allocator, because the batch has left all four at their pre-batch state
+/// while holding space and fs-tree blocks that only the batch knows about.
+///
+/// The batch is taken out from under the lock and committed with the lock
+/// released. Holding it across the commit would deadlock: a commit that fills
+/// the staged-superblock quota calls `sync_to_disk`, which comes straight back
+/// here. Releasing first also lets a concurrent operation open the next batch
+/// instead of blocking behind this one's I/O.
+pub(crate) async fn flush_batch<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+) -> Result<(), FsError> {
+    let batch = vol.fs_batch().lock().await.take();
+    match batch {
+        Some(batch) => commit_batch(vol, batch).await,
+        None => Ok(()),
+    }
+}
+
+// ── Shared COW mini-transaction ────────────────────────────────────
+
+/// Path-COW the fs tree with `edits` and commit, moving data-ref deltas
+/// through the extent + csum trees. The namespace mutations funnel through here:
+/// each touches only a handful of keys, so only their root-to-leaf paths are
+/// rewritten (`O(log N)`), never the whole tree.
+async fn commit_fs_edits<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    edits: &[Edit],
+    dropped_data: Vec<DataRefId>,
+    new_data: Vec<DataRef>,
+) -> Result<(), FsError> {
+    with_space_retry(vol, || {
+        commit_fs_edits_once(vol, edits, dropped_data.clone(), new_data.clone())
+    })
+    .await
+}
+
+async fn commit_fs_edits_once<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    edits: &[Edit],
+    dropped_data: Vec<DataRefId>,
+    new_data: Vec<DataRef>,
+) -> Result<(), FsError> {
+    let full = {
+        let mut guard = batch_begin(vol).await?;
+        let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+        batch_stage(vol, batch, edits, dropped_data, new_data).await?;
+        batch.ops >= batch.max_ops
+    };
+    if full {
+        flush_batch(vol).await?;
+    }
+    Ok(())
+}
+
 /// On-disk size of one internal `struct btrfs_key_ptr` (key + blockptr + gen).
 const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
 
@@ -1140,7 +1457,8 @@ const KEY_PTR_SIZE: usize = format::DISK_KEY_SIZE + 16;
 /// `EXTENT_DATA_REF{root, objectid, offset, count=1}`, with the per-sector
 /// selected-algorithm `csums` the csum tree records for it. `offset` is the
 /// extent's position in the file (its `EXTENT_DATA` key offset).
-struct DataRef {
+#[derive(Clone, Debug)]
+pub(crate) struct DataRef {
     id: DataRefId,
     csums: Vec<u8>,
 }
@@ -1234,6 +1552,12 @@ pub(crate) async fn set_subvol_flags<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     flags: u64,
 ) -> Result<(), FsError> {
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     let gen = vol
         .superblock()
         .generation
@@ -1400,30 +1724,58 @@ fn leaf_items(leaf: &[u8]) -> Result<Vec<(BtrfsKey, Vec<u8>)>, FsError> {
 
 /// Upsert `(key, body)` into `leaf`, returning the re-tiled replacement leaves
 /// (one, or several if the edit overflowed the node).
+/// Upsert one key. Kept for the leaf-level unit tests, which exercise a
+/// single edit directly; the commit path goes through [`cow_leaf_apply`].
+#[cfg(feature = "kernel-test")]
 pub(crate) fn cow_leaf_upsert(
     leaf: &[u8],
     key: &BtrfsKey,
     body: &[u8],
     nodesize: usize,
 ) -> Result<Vec<Vec<u8>>, FsError> {
-    let mut items = leaf_items(leaf)?;
-    match items.binary_search_by(|(k, _)| k.cmp(key)) {
-        Ok(i) => items[i].1 = body.to_vec(),
-        Err(i) => items.insert(i, (*key, body.to_vec())),
-    }
-    regroup_leaves(leaf, &items, nodesize)
+    cow_leaf_apply(leaf, &[Edit::Upsert(*key, body.to_vec())], nodesize)
 }
 
-/// Delete `key` from `leaf` (if present), returning the re-tiled replacement
-/// leaves (always at least one, possibly empty).
+/// Delete one key. Same note as [`cow_leaf_upsert`].
+#[cfg(feature = "kernel-test")]
 pub(crate) fn cow_leaf_delete(
     leaf: &[u8],
     key: &BtrfsKey,
     nodesize: usize,
 ) -> Result<Vec<Vec<u8>>, FsError> {
+    cow_leaf_apply(leaf, &[Edit::Delete(*key)], nodesize)
+}
+
+/// Apply several edits to ONE leaf and re-tile it once.
+///
+/// `leaf_items` decodes every item in the leaf into an owned body, and
+/// `regroup_leaves` re-encodes all of them. Doing that per edit made the leaf
+/// rewrite the dominant cost of a path COW — 66% of `apply_one`, at ~256K
+/// cycles an edit — even though a commit's edits cluster heavily onto the same
+/// few leaves. Decoding once for the whole group and re-encoding once amortises
+/// it across the group instead.
+///
+/// Edits must already be in key order; equal keys must keep their original
+/// relative order, since an upsert followed by a delete of the same key is not
+/// the same as the reverse.
+pub(crate) fn cow_leaf_apply(
+    leaf: &[u8],
+    edits: &[Edit],
+    nodesize: usize,
+) -> Result<Vec<Vec<u8>>, FsError> {
     let mut items = leaf_items(leaf)?;
-    if let Ok(i) = items.binary_search_by(|(k, _)| k.cmp(key)) {
-        items.remove(i);
+    for edit in edits {
+        match edit {
+            Edit::Upsert(key, body) => match items.binary_search_by(|(k, _)| k.cmp(key)) {
+                Ok(i) => items[i].1 = body.clone(),
+                Err(i) => items.insert(i, (*key, body.clone())),
+            },
+            Edit::Delete(key) => {
+                if let Ok(i) = items.binary_search_by(|(k, _)| k.cmp(key)) {
+                    items.remove(i);
+                }
+            }
+        }
     }
     regroup_leaves(leaf, &items, nodesize)
 }
@@ -1466,18 +1818,70 @@ pub(crate) struct CowOut {
     pub freed: Vec<(u64, u8)>,          // (addr, level) — committed blocks only
 }
 
+/// A path-COW suspended between the operations of one batched transaction.
+///
+/// Everything in [`PathCow`] except its borrow of the volume. A batch runs many
+/// operations against one COW, so the state has to outlive each individual
+/// operation's borrow; splitting it out is what lets the batch own the state
+/// and hand out a fresh `PathCow` per operation.
+///
+/// Retaining `pending` across operations is not an optimisation, it is the
+/// correctness requirement: `cow_node` edits a block in place only when it
+/// finds that block in `pending`. Starting each operation from an empty map
+/// would make the second operation treat the first's brand-new blocks as
+/// *committed* ones — freeing them into `freed`, from which the commit emits
+/// extent-tree deletes for extent items that were never written.
+#[derive(Clone, Debug)]
+pub(crate) struct CowState {
+    header: Vec<u8>,
+    pending: BTreeMap<u64, (alloc::sync::Arc<Vec<u8>>, u8)>,
+    /// Blocks in `pending` whose bytes have changed since the last writeout.
+    /// In-place editing means one block can be rewritten by many operations;
+    /// this keeps the batch from re-writing the whole path every time.
+    dirty: BTreeSet<u64>,
+    freed: Vec<(u64, u8)>,
+    root: u64,
+    root_level: u8,
+}
+
+impl CowState {
+    /// The tree this COW currently roots.
+    pub(crate) fn root(&self) -> (u64, u8) {
+        (self.root, self.root_level)
+    }
+
+    /// Finalize: the new root, every new block, and the committed blocks freed.
+    fn into_cow_out(self) -> CowOut {
+        // Unwrap the shared buffers on the way out. By here the descent is
+        // finished and nothing else holds a reference, so this is a move in
+        // the ordinary case; the clone is only a fallback for safety, not an
+        // expected cost.
+        let nodes: Vec<(u64, Vec<u8>, u8)> = self
+            .pending
+            .into_iter()
+            .map(|(a, (b, l))| {
+                (
+                    a,
+                    alloc::sync::Arc::try_unwrap(b).unwrap_or_else(|shared| (*shared).clone()),
+                    l,
+                )
+            })
+            .collect();
+        CowOut {
+            root_addr: self.root,
+            root_level: self.root_level,
+            nodes,
+            freed: self.freed,
+        }
+    }
+}
+
 /// Path-COW working state for one tree within one transaction.
 pub(crate) struct PathCow<'a, B: BlockDevice + 'static> {
     vol: &'a BtrfsVolume<B>,
     gen: u64,
     nodesize: usize,
-    header: Vec<u8>,
-    /// New blocks made this txn (addr → (buf, level)); superseded by later edits.
-    pending: BTreeMap<u64, (Vec<u8>, u8)>,
-    /// Committed (pre-txn) blocks this batch frees.
-    freed: Vec<(u64, u8)>,
-    root: u64,
-    root_level: u8,
+    state: CowState,
 }
 
 impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
@@ -1494,34 +1898,77 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             vol,
             gen,
             nodesize: vol.nodesize(),
-            header,
-            pending: BTreeMap::new(),
-            freed: Vec::new(),
-            root,
-            root_level,
+            state: CowState {
+                header,
+                pending: BTreeMap::new(),
+                dirty: BTreeSet::new(),
+                freed: Vec::new(),
+                root,
+                root_level,
+            },
         })
     }
 
+    /// Continue a COW suspended by [`Self::suspend`], against the same volume
+    /// and generation it was started with.
+    pub(crate) fn resume(vol: &'a BtrfsVolume<B>, gen: u64, state: CowState) -> Self {
+        PathCow {
+            vol,
+            gen,
+            nodesize: vol.nodesize(),
+            state,
+        }
+    }
+
+    /// Drop the volume borrow and hand back the working state, together with
+    /// the blocks whose bytes changed since the last suspend. The caller writes
+    /// those out; `dirty` is cleared, so the next suspend reports only what the
+    /// next operation touched rather than the whole accumulated path.
+    pub(crate) fn suspend(mut self) -> (CowState, Vec<(u64, Vec<u8>, u8)>) {
+        let dirty = core::mem::take(&mut self.state.dirty);
+        let out: Vec<(u64, Vec<u8>, u8)> = dirty
+            .into_iter()
+            .filter_map(|addr| {
+                self.state
+                    .pending
+                    .get(&addr)
+                    .map(|(buf, lvl)| (addr, (**buf).clone(), *lvl))
+            })
+            .collect();
+        (self.state, out)
+    }
+
     /// Read a node — from this txn's cache if COWed, else from disk.
-    async fn read(&self, addr: u64) -> Result<Vec<u8>, FsError> {
-        match self.pending.get(&addr) {
+    /// Read a node for the descent. Both arms hand back a shared reference:
+    /// every edit re-walks the same internal nodes, so copying one per level
+    /// per edit was the bulk of the extent tree's path-COW cost.
+    async fn read(&self, addr: u64) -> Result<alloc::sync::Arc<Vec<u8>>, FsError> {
+        match self.state.pending.get(&addr) {
             Some((buf, _)) => Ok(buf.clone()),
-            None => self.vol.read_node(addr).await,
+            None => self.vol.read_node_shared(addr).await,
         }
     }
 
     /// Retire the block at `addr`: if it was made this txn, drop it (never
     /// committed); otherwise record it as a freed committed block.
     fn retire(&mut self, addr: u64, level: u8) {
-        if self.pending.remove(&addr).is_none() {
-            self.freed.push((addr, level));
+        if self.state.pending.remove(&addr).is_none() {
+            self.state.freed.push((addr, level));
+        } else {
+            // Made this txn and now dropped. It must not be written out, and if
+            // an earlier operation of the batch already wrote it, those bytes
+            // are unreferenced garbage no committed tree points at.
+            self.state.dirty.remove(&addr);
         }
     }
 
     /// Allocate + cache a new node, returning its address.
     fn store(&mut self, alloc: &mut Allocator, buf: Vec<u8>, level: u8) -> Result<u64, FsError> {
         let addr = alloc.alloc_node(self.vol)?;
-        self.pending.insert(addr, (buf, level));
+        self.state
+            .pending
+            .insert(addr, (alloc::sync::Arc::new(buf), level));
+        self.state.dirty.insert(addr);
         Ok(addr)
     }
 
@@ -1554,16 +2001,19 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         bufs: Vec<Vec<u8>>,
         level: u8,
     ) -> Result<Vec<(BtrfsKey, u64, u64)>, FsError> {
-        if bufs.len() == 1 && nritems(&bufs[0])? == 0 && (self.root_level > 0 || level > 0) {
+        if bufs.len() == 1 && nritems(&bufs[0])? == 0 && (self.state.root_level > 0 || level > 0) {
             self.retire(old_addr, level); // an emptied non-root node: drop it
             return Ok(Vec::new());
         }
-        let reuse = self.pending.contains_key(&old_addr);
+        let reuse = self.state.pending.contains_key(&old_addr);
         let mut ptrs = Vec::with_capacity(bufs.len());
         for (i, buf) in bufs.into_iter().enumerate() {
             let key = Self::first_key(&buf)?;
             let addr = if i == 0 && reuse {
-                self.pending.insert(old_addr, (buf, level)); // edit in place
+                self.state
+                    .pending
+                    .insert(old_addr, (alloc::sync::Arc::new(buf), level)); // edit in place
+                self.state.dirty.insert(old_addr);
                 old_addr
             } else {
                 self.store(alloc, buf, level)?
@@ -1571,19 +2021,29 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             ptrs.push((key, addr, self.gen));
         }
         if !reuse {
-            self.freed.push((old_addr, level)); // a committed block is replaced
+            self.state.freed.push((old_addr, level)); // a committed block is replaced
         }
         Ok(ptrs)
     }
 
     /// Apply one edit, updating the working root.
-    async fn apply_one(&mut self, alloc: &mut Allocator, edit: &Edit) -> Result<(), FsError> {
+    /// Apply every edit at the front of `pending_edits` that lands on one
+    /// leaf, and report how many were consumed. The descent that finds the
+    /// leaf also yields its upper bound, so the group is chosen without a
+    /// second walk.
+    async fn apply_one(
+        &mut self,
+        alloc: &mut Allocator,
+        pending_edits: &[Edit],
+    ) -> Result<usize, FsError> {
+        let edit = &pending_edits[0];
         // Descend to the target leaf, recording each internal node's pointer list
         // and the child slot taken.
         let target = *edit.key();
         // Each ancestor on the descent: (addr, level, its key-ptrs, child slot).
         let mut path: Vec<PathEntry> = Vec::new();
-        let mut addr = self.root;
+        let mut upper: Option<BtrfsKey> = None;
+        let mut addr = self.state.root;
         let leaf = loop {
             let buf = self.read(addr).await?;
             if level(&buf)? == 0 {
@@ -1602,16 +2062,34 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 .collect::<Result<_, FsError>>()?;
             let lvl = level(&buf)?;
             let child = ptrs[slot].1;
+            // The next separator on this level bounds the leaf we are about to
+            // reach: any key below it descends here too.
+            if slot + 1 < ptrs.len() {
+                let sep = ptrs[slot + 1].0;
+                upper = Some(match upper {
+                    Some(u) if u < sep => u,
+                    _ => sep,
+                });
+            }
             path.push((addr, lvl, ptrs, slot));
             addr = child;
         };
+        // Every following edit below the leaf's upper bound reaches this same
+        // leaf, so they can share one decode/re-tile.
+        let taken = match upper {
+            Some(bound) => pending_edits
+                .iter()
+                .take_while(|candidate| *candidate.key() < bound)
+                .count()
+                .max(1),
+            // Rightmost leaf: nothing separates it from the remaining keys.
+            None => pending_edits.len(),
+        };
+        let group = &pending_edits[..taken];
 
         // Edit + re-tile the leaf.
         let leaf_addr = addr;
-        let new_leaves = match edit {
-            Edit::Upsert(k, body) => cow_leaf_upsert(&leaf, k, body, self.nodesize)?,
-            Edit::Delete(k) => cow_leaf_delete(&leaf, k, self.nodesize)?,
-        };
+        let new_leaves = cow_leaf_apply(&leaf, group, self.nodesize)?;
         let mut cur_ptrs = self.cow_node(alloc, leaf_addr, new_leaves, 0)?;
         let mut ptr_level = 0u8;
 
@@ -1623,7 +2101,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 cur_ptrs = Vec::new();
                 continue;
             }
-            let bufs = regroup_internal(&self.header, &ptrs, self.nodesize, plevel);
+            let bufs = regroup_internal(&self.state.header, &ptrs, self.nodesize, plevel);
             cur_ptrs = self.cow_node(alloc, paddr, bufs, plevel)?;
             ptr_level = plevel;
         }
@@ -1632,7 +2110,7 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         // above them (height grows); none means the tree emptied.
         let (mut root, mut root_level) = match cur_ptrs.len() {
             0 => {
-                let empty = pack_leaf(&self.header, &[], self.nodesize);
+                let empty = pack_leaf(&self.state.header, &[], self.nodesize);
                 (self.store(alloc, empty, 0)?, 0)
             }
             1 => (cur_ptrs[0].1, ptr_level),
@@ -1640,7 +2118,8 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
                 if usize::from(ptr_level) + 1 > MAX_TREE_LEVEL {
                     return Err(FsError::NoSpace);
                 }
-                let buf = pack_internal(&self.header, &cur_ptrs, self.nodesize, ptr_level + 1);
+                let buf =
+                    pack_internal(&self.state.header, &cur_ptrs, self.nodesize, ptr_level + 1);
                 (self.store(alloc, buf, ptr_level + 1)?, ptr_level + 1)
             }
         };
@@ -1657,9 +2136,9 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
             root_level -= 1;
         }
 
-        self.root = root;
-        self.root_level = root_level;
-        Ok(())
+        self.state.root = root;
+        self.state.root_level = root_level;
+        Ok(taken)
     }
 
     /// Apply all `edits`, then finalize: returns the new root + the new/freed
@@ -1669,26 +2148,43 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
         alloc: &mut Allocator,
         edits: &[Edit],
     ) -> Result<CowOut, FsError> {
-        for edit in edits {
-            self.apply_one(alloc, edit).await?;
+        self.apply_edits(alloc, edits).await?;
+        Ok(self.state.into_cow_out())
+    }
+
+    /// Apply `edits` into the working state, leaving the COW resumable.
+    pub(crate) async fn apply_edits(
+        &mut self,
+        alloc: &mut Allocator,
+        edits: &[Edit],
+    ) -> Result<(), FsError> {
+        // Sort so edits sharing a leaf are adjacent. The sort is STABLE, which
+        // matters: two edits to the same key must keep their original order,
+        // since an upsert followed by a delete is not the same as the reverse.
+        let mut ordered: Vec<Edit> = edits.to_vec();
+        ordered.sort_by(|a, b| a.key().cmp(b.key()));
+
+        let mut i = 0;
+        while i < ordered.len() {
+            i += self.apply_one(alloc, &ordered[i..]).await?;
         }
-        let nodes: Vec<(u64, Vec<u8>, u8)> = self
-            .pending
-            .into_iter()
-            .map(|(a, (b, l))| (a, b, l))
-            .collect();
-        Ok(CowOut {
-            root_addr: self.root,
-            root_level: self.root_level,
-            nodes,
-            freed: self.freed,
-        })
+        Ok(())
     }
 }
 
 /// Read every item of the fs tree rooted at `fs_root` (any height) into one
 /// oversized logical leaf (with headroom for a mutation's inserts) plus the list
 /// of every block the tree currently occupies (all freed on rewrite).
+/// Test-only: every block a tree currently occupies, for asserting that a
+/// committed tree's blocks are untouched after a crash.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn tree_blocks<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+) -> Result<Vec<(u64, u8)>, FsError> {
+    read_fs_oversized(vol, root).await.map(|(_, blocks)| blocks)
+}
+
 async fn read_fs_oversized<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     fs_root: u64,
@@ -1999,6 +2495,20 @@ async fn metadata_root_refcount<B: BlockDevice + 'static>(
 async fn ensure_private_subvol<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
 ) -> Result<(), FsError> {
+    // An open batch that has already COWed the fs tree has made it private,
+    // and asking again would get the wrong answer. The check below reads the
+    // root block's refcount out of the EXTENT tree, which the batch does not
+    // update until it commits: every block the batch has written is absent
+    // from it, so the refcount comes back 0 and this reads an already-private
+    // tree as shared, rewriting it whole on every operation after the first.
+    //
+    // Skipping is sound rather than merely expedient. The batch's first
+    // operation ran this function in full against the committed tree, so by
+    // the time any block bears the batch's mark the tree is owned by
+    // `fs_tree_id()` and referenced once.
+    if batch_owns_fs_tree(vol).await {
+        return Ok(());
+    }
     let root_id = vol.fs_tree_id();
     let (old_root, old_level) = vol.fs_tree_root();
     let old_node = vol.read_node(old_root).await?;
@@ -2007,6 +2517,13 @@ async fn ensure_private_subvol<B: BlockDevice + 'static>(
     if old_owner == root_id && root_refs == 1 {
         return Ok(());
     }
+
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
 
     let gen = vol
         .superblock()
@@ -2879,6 +3396,12 @@ async fn commit_qgroup_edits<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     edits: Vec<Edit>,
 ) -> Result<(), FsError> {
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     quota_root(vol).await?;
     let gen = vol
         .superblock()
@@ -2921,6 +3444,12 @@ async fn quota_enable_mode<B: BlockDevice + 'static>(
         Err(FsError::NotFound) => {}
         Err(err) => return Err(err),
     }
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     let gen = vol
         .superblock()
         .generation
@@ -3081,6 +3610,7 @@ pub(crate) async fn quota_disable<B: BlockDevice + 'static>(
         Err(FsError::NotFound) => return Ok(()),
         Err(err) => return Err(err),
     };
+    flush_batch(vol).await?;
     let (_logical, old_blocks) = read_fs_oversized(vol, quota).await?;
     let gen = vol
         .superblock()
@@ -3484,6 +4014,9 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // ── Mutual fixed point: whole-repack csum/root/fst, path-COW ext ────
     #[allow(clippy::type_complexity)]
     struct Done {
+        /// The converged round's freed set, so the pin below covers exactly
+        /// what this transaction actually released.
+        freed_meta: Vec<(u64, u8)>,
         csum_nodes: Vec<(u64, Vec<u8>, u8)>,
         root_addrs: Vec<u64>,
         fst_addrs: Vec<u64>,
@@ -3634,6 +4167,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
                 .as_ref()
                 .map_or((0, 0), |out| (out.root_addr, out.root_level));
             done = Some(Done {
+                freed_meta: freed_meta.clone(),
                 csum_nodes: csum_out.map(|out| out.nodes).unwrap_or_default(),
                 root_addrs,
                 fst_addrs,
@@ -3653,6 +4187,7 @@ async fn commit_txn<B: BlockDevice + 'static>(
         fst_leaves = fst_lv;
     }
     let Done {
+        freed_meta,
         csum_nodes,
         root_addrs,
         fst_addrs,
@@ -3694,6 +4229,18 @@ async fn commit_txn<B: BlockDevice + 'static>(
     }
     let (root_root_addr, _) = tree_root_addr(&root_addrs, root_groups.len(), ns);
 
+    // Pin everything this transaction freed BEFORE its replacement nodes go
+    // out. `pin_down_extent` does the same: a freed block stays unavailable
+    // until a superblock that no longer references it is durable, so a crash
+    // between here and the superblock write cannot find the committed tree
+    // pointing at reused space.
+    for &(addr, _) in &freed_meta {
+        vol.pin_extent(addr, nodesize);
+    }
+    for &(bytenr, len) in &data_changes.released {
+        vol.pin_extent(bytenr, len);
+    }
+
     // ── Write every new node (extent-tree path-COW nodes are stamped here) ─
     let mut nodes: Vec<(u64, Vec<u8>)> = Vec::new();
     nodes.extend(fs_nodes);
@@ -3724,6 +4271,16 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // Superblock `bytes_used` is the sum of every block group's `used`, read back
     // from the freshly-written extent tree so it can never drift from the block
     // groups (`build_ext_edits` already committed each group's net).
+    // Stand in for a crash at the one instant the COW invariant is load
+    // bearing: nodes written, superblock still pointing at the previous tree.
+    #[cfg(feature = "kernel-test")]
+    if vol.take_crash_before_super() {
+        // The errno is irrelevant — what matters is returning without ever
+        // reaching the superblock write, leaving the on-disk state exactly as
+        // a crash here would.
+        return Err(FsError::Unsupported);
+    }
+
     let bytes_used = total_block_group_used(vol, ext_root).await?;
 
     let mut raw = vol.read_raw_superblock().await?;
@@ -3734,12 +4291,17 @@ async fn commit_txn<B: BlockDevice + 'static>(
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
         .copy_from_slice(&incompat.to_le_bytes());
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
-    if txn.root_flags.is_some() {
-        vol.write_superblock_root_admin(&raw).await?;
-    } else {
-        vol.write_superblock(&raw).await?;
-    }
+    // Stage rather than write. The tree blocks are already out and
+    // `commit_roots` below advances the in-memory roots, so readers see this
+    // commit immediately; only durability is deferred. A crash before the
+    // staged image lands discards it and every commit batched with it, and the
+    // filesystem falls back to the last superblock on disk — intact because
+    // the blocks it references stay pinned until this image is written.
+    //
+    // The pins are NOT released here. They drop in `sync_to_disk`, after the
+    // superblock reaches the device, mirroring `btrfs_finish_extent_commit`
+    // running only after `write_all_supers`.
+    let staged_full = vol.stage_superblock(raw, txn.root_flags.is_some());
 
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);
@@ -3752,6 +4314,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
         txn.root_flags,
         txn.incompat_flags_add,
     );
+    // Bound how much a crash discards and how long pinned extents withhold
+    // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
+    // forced out by exactly one mechanism.
+    if staged_full {
+        vol.write_staged_super().await?;
+    }
     Ok(())
 }
 
@@ -3996,7 +4564,19 @@ pub(crate) async fn create_subvolume_with_qgroup<B: BlockDevice + 'static>(
     if name.is_empty() || name_bytes.len() > 255 || name.contains('/') {
         return Err(FsError::InvalidData);
     }
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     ensure_private_subvol(vol).await?;
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     let (fs_root, fs_level) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
     let dir_item_key = BtrfsKey::new(
@@ -4477,6 +5057,12 @@ pub(crate) async fn destroy_subvolume<B: BlockDevice + 'static>(
     {
         return Err(FsError::InvalidData);
     }
+    // Not a batchable operation: it reads the extent/csum/root/free-space
+    // trees and builds its own allocator, all of which an open batch has left
+    // at their pre-batch state while holding space and fs-tree blocks only the
+    // batch knows about. Close it first so this transaction starts from a
+    // filesystem that agrees with itself.
+    flush_batch(vol).await?;
     ensure_private_subvol(vol).await?;
     let (fs_root, fs_level) = vol.fs_tree_root();
     let (root_tree, _) = vol.root_tree_root();
@@ -4835,8 +5421,7 @@ async fn create_node<B: BlockDevice + 'static>(
 
     let new_ino = next_inode_number(vol, fs_root).await?;
     let new_index = next_dir_index(vol, fs_root, parent_ino).await?;
-    let gen = vol.superblock().generation + 1;
-    let alloc = Allocator::build(vol).await?;
+    let gen = batch_gen(vol).await?;
 
     // Update the parent dir inode: btrfs directory `i_size` is the sum of entry
     // name lengths, so grow it by this name; bump transid + sequence. Borrow the
@@ -4889,7 +5474,7 @@ async fn create_node<B: BlockDevice + 'static>(
         ));
     }
 
-    commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
+    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
 
     let inode = InodeItem {
         size,
@@ -5067,8 +5652,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
             .collect();
     }
 
-    let gen = vol.superblock().generation + 1;
-    let alloc = Allocator::build(vol).await?;
+    let gen = batch_gen(vol).await?;
 
     let mut edits = Vec::new();
 
@@ -5140,7 +5724,7 @@ pub async fn unlink_file<B: BlockDevice + 'static>(
         edits.extend(xattr_keys.into_iter().map(Edit::Delete));
     }
 
-    commit_fs_edits(vol, gen, alloc, &edits, dropped_data, Vec::new()).await?;
+    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
     Ok(())
 }
 
@@ -5359,8 +5943,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
         return Err(FsError::Unsupported);
     }
 
-    let gen = vol.superblock().generation + 1;
-    let alloc = Allocator::build(vol).await?;
+    let gen = batch_gen(vol).await?;
 
     // Shrink the parent dir inode by this entry's name (counted twice); bump
     // transid + sequence. The parent's nlink is unchanged (btrfs dirs, nlink 1).
@@ -5396,7 +5979,7 @@ pub async fn rmdir_dir<B: BlockDevice + 'static>(
     ];
     edits.extend(xattr_keys.into_iter().map(Edit::Delete));
 
-    commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
+    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
     Ok(())
 }
 
@@ -5448,7 +6031,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let child_ino = entry.location.objectid;
     let ftype = entry.ftype;
     let source_is_dir = ftype == format::FT_DIR;
-    let gen = vol.superblock().generation + 1;
+    let gen = batch_gen(vol).await?;
 
     // Resolve the destination. If it already exists, gather what removing it
     // entails (an empty directory, or a file whose data + checksums we free).
@@ -5489,8 +6072,6 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
     let (old_index, mut ref_remaining) = inode_ref_remove(&ref_body, old_bytes)?;
     let new_index = next_dir_index(vol, fs_root, parent_ino).await?;
     ref_remaining.extend_from_slice(&inode_ref(new_index, new_bytes));
-
-    let alloc = Allocator::build(vol).await?;
 
     // Adjust the parent dir `i_size` (each name counts twice: DIR_ITEM +
     // DIR_INDEX); bump transid + sequence. A plain rename swaps old→new name; an
@@ -5551,7 +6132,7 @@ pub async fn rename_same_dir<B: BlockDevice + 'static>(
         target.append_edits(&mut edits);
     }
 
-    commit_fs_edits(vol, gen, alloc, &edits, dropped_data, Vec::new()).await?;
+    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
     Ok(())
 }
 
@@ -5637,7 +6218,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
     let child_ino = entry.location.objectid;
     let ftype = entry.ftype;
     let source_is_dir = ftype == format::FT_DIR;
-    let gen = vol.superblock().generation + 1;
+    let gen = batch_gen(vol).await?;
 
     // A directory must not move into itself or a descendant (would orphan a loop).
     if source_is_dir && is_ancestor_or_self(vol, fs_root, child_ino, new_parent).await? {
@@ -5686,8 +6267,6 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         .await?
         .unwrap_or_default();
     new_ref_body.extend_from_slice(&inode_ref(new_index, new_bytes));
-
-    let alloc = Allocator::build(vol).await?;
 
     // Both parents' `i_size` change: the old parent loses the source name; the new
     // parent gains it (net zero on an overwrite, whose equal-length target name is
@@ -5764,7 +6343,7 @@ pub async fn rename_cross_dir<B: BlockDevice + 'static>(
         target.append_edits(&mut edits);
     }
 
-    commit_fs_edits(vol, gen, alloc, &edits, dropped_data, Vec::new()).await?;
+    commit_fs_edits(vol, &edits, dropped_data, Vec::new()).await?;
     Ok(())
 }
 
@@ -5830,8 +6409,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
     }
 
     let new_index = next_dir_index(vol, fs_root, target_parent).await?;
-    let gen = vol.superblock().generation + 1;
-    let alloc = Allocator::build(vol).await?;
+    let gen = batch_gen(vol).await?;
 
     // Bump the linked inode's nlink; stamp its transid.
     let mut cinode = btree::find_item(
@@ -5884,7 +6462,7 @@ pub async fn link_node<B: BlockDevice + 'static>(
         ),
     ];
 
-    commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
+    commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
     Ok(())
 }
 
@@ -5928,7 +6506,7 @@ pub async fn set_xattr_item<B: BlockDevice + 'static>(
     );
 
     let (fs_root, _) = vol.fs_tree_root();
-    let gen = vol.superblock().generation + 1;
+    let gen = batch_gen(vol).await?;
     let existing = btree::find_item(vol, fs_root, &key).await?;
 
     // Rebuild the (possibly shared) item body, dropping this name if present so it
@@ -5952,16 +6530,7 @@ pub async fn set_xattr_item<B: BlockDevice + 'static>(
     }
     body.extend_from_slice(&xattr_entry(gen, name_bytes, value));
 
-    let alloc = Allocator::build(vol).await?;
-    commit_fs_edits(
-        vol,
-        gen,
-        alloc,
-        &[Edit::Upsert(key, body)],
-        Vec::new(),
-        Vec::new(),
-    )
-    .await
+    commit_fs_edits(vol, &[Edit::Upsert(key, body)], Vec::new(), Vec::new()).await
 }
 
 /// Remove extended attribute `name` from inode `ino` (mounted subvolume). Deletes
@@ -5983,7 +6552,7 @@ pub async fn remove_xattr_item<B: BlockDevice + 'static>(
     );
 
     let (fs_root, _) = vol.fs_tree_root();
-    let gen = vol.superblock().generation + 1;
+    let gen = batch_gen(vol).await?;
     let body_in = btree::find_item(vol, fs_root, &key)
         .await?
         .ok_or(FsError::NotFound)?;
@@ -6004,8 +6573,7 @@ pub async fn remove_xattr_item<B: BlockDevice + 'static>(
         Edit::Upsert(key, body)
     };
 
-    let alloc = Allocator::build(vol).await?;
-    commit_fs_edits(vol, gen, alloc, &[edit], Vec::new(), Vec::new()).await
+    commit_fs_edits(vol, &[edit], Vec::new(), Vec::new()).await
 }
 
 // ── Tree-log (fsync) ───────────────────────────────────────────────
@@ -6065,6 +6633,13 @@ pub async fn write_log<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     items: &[(BtrfsKey, Vec<u8>)],
 ) -> Result<(), FsError> {
+    // Sync, not merely flush. Besides the usual reason a non-batchable
+    // transaction closes the batch first — it builds its own allocator over
+    // trees the batch has left at their pre-batch state — this one ends by
+    // writing the superblock DIRECTLY rather than staging it. A staged image
+    // left behind would be older than the one written here and would overwrite
+    // it at the next sync, taking the log pointer with it.
+    vol.sync_to_disk().await?;
     let gen = vol.superblock().generation + 1;
     let mut alloc = Allocator::build(vol).await?;
 
@@ -6225,9 +6800,7 @@ async fn replay_log_items<B: BlockDevice + 'static>(
         }
     }
     if !edits.is_empty() {
-        let gen = vol.superblock().generation + 1;
-        let alloc = Allocator::build(vol).await?;
-        commit_fs_edits(vol, gen, alloc, &edits, Vec::new(), Vec::new()).await?;
+        commit_fs_edits(vol, &edits, Vec::new(), Vec::new()).await?;
     }
 
     Ok(())
@@ -6281,7 +6854,13 @@ pub async fn replay_log<B: BlockDevice + 'static>(vol: &BtrfsVolume<B>) -> Resul
             .await?;
     }
 
-    // Clear the log pointer only after every mapped root is authoritative.
+    // Clear the log pointer only after every mapped root is authoritative —
+    // which means committed and durable, not merely applied. The replay above
+    // goes through the ordinary batched write path, so its edits sit in an
+    // open batch whose superblock has not been written. Clearing the pointer
+    // without this sync destroys the log while what it described is still only
+    // in memory, and a crash in that window loses the replay outright.
+    vol.sync_to_disk().await?;
     let mut raw = vol.read_raw_superblock().await?;
     raw[format::OFF_LOG_ROOT..format::OFF_LOG_ROOT + 8].copy_from_slice(&0u64.to_le_bytes());
     raw[format::OFF_LOG_ROOT_TRANSID..format::OFF_LOG_ROOT_TRANSID + 8]
