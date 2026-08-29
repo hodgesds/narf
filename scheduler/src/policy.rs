@@ -122,6 +122,17 @@ pub struct TaskMeta {
 
 impl TaskMeta {
     pub(crate) fn from_slot(slot: &crate::TaskSlot) -> Self {
+        Self::from_slot_at(slot, narf_time::now_cycles())
+    }
+
+    /// Like [`from_slot`](Self::from_slot) but reuses a caller-supplied
+    /// timestamp instead of reading the cycle counter. `pick_next` projects
+    /// EVERY queued slot on each dispatch, so calling `now_cycles()` inside the
+    /// per-slot projection cost one rdtsc per queued task per pick (a top
+    /// dispatch hotspot under a deep run queue). Hoisting it to one read per
+    /// scan also evaluates every slot's budget eligibility at the SAME instant,
+    /// which is more consistent than staggering it across the walk.
+    pub(crate) fn from_slot_at(slot: &crate::TaskSlot, now: u64) -> Self {
         Self {
             id: slot.id,
             work_kind: slot.spec.work_kind,
@@ -130,9 +141,7 @@ impl TaskMeta {
             deadline_cycles: slot.spec.budget.deadline_cycles,
             budget: slot.spec.budget,
             account: slot.account,
-            budget_state: slot
-                .account
-                .view(narf_time::now_cycles(), &slot.spec.budget),
+            budget_state: slot.account.view(now, &slot.spec.budget),
             runnable: slot.awake.flag.load(Ordering::Acquire),
             affinity: slot.spec.affinity,
             addr_space: slot.addr_space.is_some(),
@@ -260,9 +269,13 @@ impl<'a> RunQueue<'a> {
     /// Iterate metadata for every queued slot in queue order. Does
     /// not allocate.
     pub fn iter_meta(&self) -> impl Iterator<Item = (TaskHandle, TaskMeta)> + '_ {
+        // One cycle-counter read for the whole scan, not one per slot: a policy
+        // `pick_next` walks every queued slot, so this turns N rdtsc reads per
+        // dispatch into one and evaluates all slots at a single instant.
+        let now = narf_time::now_cycles();
         self.inner
             .iter()
-            .map(|slot| (TaskHandle::from_id(slot.id), TaskMeta::from_slot(slot)))
+            .map(move |slot| (TaskHandle::from_id(slot.id), TaskMeta::from_slot_at(slot, now)))
     }
 
     /// Handle for the front-most candidate, without detaching it.
