@@ -757,6 +757,74 @@ kernel_test_in!(
     smoke_btrfs_crash_before_super_preserves_committed_tree
 );
 
+/// `fsync` must make everything already written durable, and this holds that
+/// to account across a real crash rather than by inspecting what `fsync` does.
+///
+/// The sequence is the one a database or a journal actually performs: write,
+/// fsync, then lose the machine during whatever came next. The fsynced data
+/// must be there on remount; the write that was still in flight must not be
+/// required to be.
+///
+/// Today this passes for a reason that is incidental — commits are
+/// synchronous, so the data was durable before `fsync` was even called. That
+/// is exactly why the test is worth having now. Batching commits without
+/// implementing the deferred superblock write in `sync_to_disk` would leave
+/// `fsync` returning while the data is still only in memory, and this turns
+/// red the moment that happens instead of a user discovering it after a power
+/// cut.
+fn smoke_btrfs_fsync_survives_a_later_crash() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("fsync fixture failed to mount"),
+    };
+    if !vol.supports_writes() {
+        return TestResult::Fail("fsync fixture mounted read-only");
+    }
+    let device = vol.device.clone();
+    let root = vol.root();
+
+    let durable = match poll_once(root.lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of big.dat failed"),
+    };
+    let payload = replacement_big();
+    match poll_once(durable.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("the write to be fsynced failed"),
+    }
+    // The promise under test.
+    match poll_once(durable.fsync(false)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("fsync did not report success"),
+    }
+
+    // Now lose the machine during the NEXT commit.
+    vol.arm_crash_before_super();
+    let lost = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of hello.txt failed"),
+    };
+    if poll_once(lost.write(0, b"never fsynced")).is_none() {
+        return TestResult::Fail("the crashing write never completed a poll");
+    }
+
+    let after = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after the crash failed"),
+    };
+    let big = match poll_once(after.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lost big.dat entirely"),
+    };
+    match read_all(&big, payload.len() + 16) {
+        Some(got) if got == payload => TestResult::Pass,
+        Some(_) => TestResult::Fail("fsynced data did not survive the crash"),
+        None => TestResult::Fail("fsynced data could not be read after the crash"),
+    }
+}
+kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_fsync_survives_a_later_crash);
+
 // ── Phase 1: chunk map ─────────────────────────────────────────────
 
 /// Build a `sys_chunk_array` record: a 17-byte disk key (CHUNK_ITEM at

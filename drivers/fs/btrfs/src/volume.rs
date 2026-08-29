@@ -1302,6 +1302,24 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Ok(self.invalidate_nodes(logical, src.len()))
     }
 
+    /// Make every write that has already returned durable on disk.
+    ///
+    /// This is `fsync`'s contract, stated as a requirement rather than as a
+    /// description of how commits happen to work. Today every write flips the
+    /// superblock before returning, so there is nothing outstanding and this
+    /// is just the device barrier. When commits are batched, the deferred
+    /// superblock write belongs HERE — `fsync` already routes through it, so
+    /// the durability contract does not depend on someone remembering to
+    /// revisit the read path's callers.
+    ///
+    /// `smoke_btrfs_fsync_survives_a_later_crash` holds this to account: it
+    /// fsyncs, crashes the following commit, and requires the fsynced data
+    /// back. Deferring commits without doing the work here turns that red.
+    pub async fn sync_to_disk(&self) -> Result<(), FsError> {
+        self.flush().await;
+        Ok(())
+    }
+
     /// Test-only: make the next commit stop after writing its nodes, leaving
     /// the superblock pointing at the previous tree — the state a crash mid
     /// commit produces.
