@@ -982,7 +982,17 @@ async fn cow_write_file_once<B: BlockDevice + 'static>(
     // Reserve before allocating. A write that would cross a hard limit is
     // refused here, having written no data, allocated nothing and staged
     // nothing — which is what makes the rejection atomic without any unwinding.
+    //
+    // Both halves are reserved up front, which means counting this write's
+    // edits before building them: one delete per extent the rewrite displaces,
+    // one insert per extent it lays down, and the inode. Doing it here rather
+    // than beside `batch_stage` below is what keeps the refusal free of
+    // consequences — by then the data extents have been allocated and written,
+    // and a rejection would strand them until the batch commits.
+    let displaced = affected.iter().filter(|hit| **hit).count();
+    let laid_down = rewrite_len.div_ceil(MAX_WRITE_EXTENT) as usize;
     qgroup_reserve(vol, batch, vol.fs_tree_id(), rewrite_len).await?;
+    qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), displaced + laid_down + 1).await?;
 
     // ── Tile the content into fresh extents; write each + its checksums ─
     let mut new_data: Vec<DataRef> = Vec::new();
@@ -1483,6 +1493,8 @@ async fn commit_fs_edits_once<B: BlockDevice + 'static>(
     let full = {
         let mut guard = batch_begin(vol).await?;
         let batch = guard.as_mut().ok_or(FsError::InvalidData)?;
+        // Before staging, so a refusal leaves the transaction untouched.
+        qgroup_reserve_meta(vol, batch, vol.fs_tree_id(), edits.len()).await?;
         batch_stage(vol, batch, edits, dropped_data, new_data).await?;
         batch.ops >= MAX_BATCH_OPS
     };
@@ -3249,6 +3261,39 @@ async fn qgroup_charge_chain<B: BlockDevice + 'static>(
 /// purely by metadata is caught by the next reservation against the recounted
 /// usage rather than by the operation that caused it. Usage stays exact
 /// either way, because the commit-time recount counts metadata.
+/// Charge the metadata a transaction is about to write against the same
+/// qgroups, sized the way Linux sizes it.
+///
+/// `btrfs_start_transaction` reserves `num_items * nodesize` for the qgroup
+/// (`transaction.c`), where `num_items` is how many btree items the handle
+/// expects to insert, update or delete. Note it is NOT
+/// `btrfs_calc_insert_metadata_size`, which is several times larger and feeds
+/// the block reserve rather than the qgroup — reserving that here would refuse
+/// writes a real kernel accepts.
+///
+/// Linux has to predict `num_items` when the handle opens. NARF does not:
+/// every batchable operation hands its complete edit list to the transaction,
+/// so the count is exact rather than an upper bound.
+///
+/// Held for the whole transaction and released when it commits, which is
+/// `BTRFS_QGROUP_RSV_META_PERTRANS`. Dropping the batch drops the
+/// reservations with it.
+///
+/// A consequence worth stating plainly, because it is shared with Linux and
+/// surprises people: a qgroup limit smaller than a few times `nodesize` makes
+/// the subvolume unusable. Creating a file reserves for every item it touches
+/// — inode, ref, dir item, dir index, parent inode — before writing a single
+/// byte of data, and if that reservation does not fit, the create is refused.
+async fn qgroup_reserve_meta<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    batch: &mut FsBatch,
+    root_id: u64,
+    num_items: usize,
+) -> Result<(), FsError> {
+    let num_bytes = (num_items as u64).saturating_mul(vol.nodesize() as u64);
+    qgroup_reserve(vol, batch, root_id, num_bytes).await
+}
+
 async fn qgroup_reserve<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     batch: &mut FsBatch,

@@ -2100,7 +2100,14 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     inherit[0..8].copy_from_slice(&1u64.to_ne_bytes()); // SET_LIMITS
     inherit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // one parent
     inherit[32..40].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER flag
-    inherit[40..48].copy_from_slice(&(32u64 << 10).to_ne_bytes());
+                                                          // 512 KiB, not the 32 KiB this used to set. Limits are enforced when
+                                                          // space is RESERVED now, and a reservation covers the metadata an
+                                                          // operation will write as well as its data — `num_items * nodesize`, the
+                                                          // same arithmetic `btrfs_start_transaction` uses. Creating a file reserves
+                                                          // for every item it touches before a byte of data is written, so a limit
+                                                          // of a few nodes leaves no room to do anything at all. That is true of
+                                                          // Linux too; a 32 KiB qgroup limit is not a usable filesystem on either.
+    inherit[40..48].copy_from_slice(&(512u64 << 10).to_ne_bytes());
     inherit[72..80].copy_from_slice(&PARENT.to_ne_bytes());
     if !matches!(
         poll_once(
@@ -2137,7 +2144,7 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
         Some(body) if body.len() == 40 => body,
         _ => return TestResult::Fail("new child qgroup limit was missing"),
     };
-    if format::le64(&limit, 0).ok() != Some(1) || format::le64(&limit, 8).ok() != Some(32u64 << 10)
+    if format::le64(&limit, 0).ok() != Some(1) || format::le64(&limit, 8).ok() != Some(512u64 << 10)
     {
         return TestResult::Fail("inherited qgroup limit was wrong");
     }
@@ -2184,7 +2191,7 @@ fn smoke_btrfs_qgroup_accounting_and_inheritance() -> TestResult {
     if charged <= format::le64(&child_info, 8).unwrap_or(0) {
         return TestResult::Fail("child qgroup did not charge new data/metadata");
     }
-    let over_limit = alloc::vec![0xa5u8; 40 * 1024];
+    let over_limit = alloc::vec![0xa5u8; 1024 * 1024];
     if !matches!(
         poll_once(child_file.write(0, &over_limit)),
         Some(Err(FsError::QuotaExceeded))
@@ -9609,3 +9616,92 @@ fn smoke_btrfs_quota_volume_batches() -> TestResult {
 }
 
 kernel_test_in!("drivers/fs/btrfs", smoke_btrfs_quota_volume_batches);
+
+/// A reservation counts against the limit before it has been accounted.
+///
+/// This is the half of `qgroup_check_limits` that only starts to matter once
+/// transactions batch. It compares the limit against
+/// `qgroup_rsv_total(qg) + qg->rfer + num_bytes` — outstanding reservations
+/// included — because `qg->rfer` moves only at commit. Two writes inside one
+/// uncommitted transaction both see the same committed usage, so without the
+/// reservation term each would be measured as if it were the only one, and two
+/// writes that do not fit together would both be admitted.
+///
+/// The generation check is what makes this a real test rather than a
+/// coincidence: it confirms no commit happened between the two writes, so the
+/// second really was judged against a `rfer` that had not moved.
+fn smoke_btrfs_qgroup_reservation_counts_outstanding() -> TestResult {
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+
+    let device = RamBlockDevice::from_image(512, decode_sparse(FIXTURE_QUOTA_SPARSE));
+    let vol = match poll_once(BtrfsVolume::mount_opts(device, DomainId::DRIVER_0, true)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("quota fixture failed to mount"),
+    };
+    let root = vol.root();
+    let first = match poll_once(root.create("rsv-a.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the first file failed"),
+    };
+    let second = match poll_once(root.create("rsv-b.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("create of the second file failed"),
+    };
+    // Commit the creates so the limit below is set against settled usage.
+    let _ = poll_once(vol.sync_to_disk());
+
+    let settled = qgroup_item(&vol, format::QGROUP_INFO_KEY, format::FS_TREE_OBJECTID)
+        .and_then(|body| format::le64(&body, 8).ok())
+        .unwrap_or(0);
+    if settled == 0 {
+        return TestResult::Fail("committed qgroup usage was unreadable");
+    }
+    // Room for one 80 KiB write and its metadata, but not for two.
+    const WRITE: usize = 80 * 1024;
+    let headroom = 160u64 * 1024;
+    let mut limit = [0u8; 48];
+    limit[0..8].copy_from_slice(&format::FS_TREE_OBJECTID.to_ne_bytes());
+    limit[8..16].copy_from_slice(&1u64.to_ne_bytes()); // MAX_RFER
+    limit[16..24].copy_from_slice(&(settled + headroom).to_ne_bytes());
+    if !matches!(
+        poll_once(root.ioctl_async(crate::node::BTRFS_IOC_QGROUP_LIMIT, 0, &limit, 48)),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("setting the qgroup limit failed");
+    }
+
+    let payload = alloc::vec![0x3cu8; WRITE];
+    let gen_before = vol.superblock().generation;
+    match poll_once(first.write(0, &payload)) {
+        Some(Ok(n)) if n == WRITE => {}
+        _ => return TestResult::Fail("the first write did not fit its own limit"),
+    }
+    // Nothing has committed, so the committed usage the second write is judged
+    // against is byte-for-byte the one the first was judged against.
+    if vol.superblock().generation != gen_before {
+        return TestResult::Fail("the first write committed, so this proves nothing");
+    }
+    match poll_once(second.write(0, &payload)) {
+        Some(Err(FsError::QuotaExceeded)) => {}
+        Some(Err(_)) | None => return TestResult::Fail("the second write failed some other way"),
+        Some(Ok(_)) => {
+            return TestResult::Fail("two writes that do not fit together were both admitted")
+        }
+    }
+    // The refusal cost nothing: the first write is still there and intact.
+    let _ = poll_once(vol.sync_to_disk());
+    let kept = match poll_once(vol.root().lookup_async("rsv-a.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("the admitted write's file vanished"),
+    };
+    match read_all(&kept, WRITE + 16) {
+        Some(got) if got == payload => TestResult::Pass,
+        _ => TestResult::Fail("the admitted write did not survive the refusal of the second"),
+    }
+}
+
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_qgroup_reservation_counts_outstanding
+);
