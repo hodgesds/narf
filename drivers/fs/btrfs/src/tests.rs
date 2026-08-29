@@ -695,8 +695,16 @@ fn smoke_btrfs_crash_before_super_preserves_committed_tree() -> TestResult {
         Some(Ok(n)) if n == payload.len() => {}
         _ => return TestResult::Fail("committed write failed"),
     }
+    // Commits are batched, so "committed" means fsynced — a write that has
+    // only staged its superblock is not yet the tree a crash falls back to.
+    // This is what makes the snapshot below the durable tree rather than an
+    // in-memory one.
+    match poll_once(survivor.fsync(false)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("fsync of the committed write failed"),
+    }
 
-    // Snapshot every block the now-committed fs tree occupies.
+    // Snapshot every block the now-durable fs tree occupies.
     let (fs_root, _) = vol.fs_tree_root();
     let blocks = match poll_once(crate::write::tree_blocks(&vol, fs_root)) {
         Some(Ok(b)) => b,
@@ -725,6 +733,10 @@ fn smoke_btrfs_crash_before_super_preserves_committed_tree() -> TestResult {
     }
 
     // Remount from the same device: the state a reboot would see.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let after = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after a mid-commit crash failed"),
@@ -809,6 +821,10 @@ fn smoke_btrfs_fsync_survives_a_later_crash() -> TestResult {
         return TestResult::Fail("the crashing write never completed a poll");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let after = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after the crash failed"),
@@ -1975,6 +1991,10 @@ fn smoke_btrfs_sector8k_read_write() -> TestResult {
     let mut expected = original;
     expected[8188..8188 + patch.len()].copy_from_slice(patch);
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("8K-sector remount failed"),
@@ -2763,6 +2783,8 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     if orphan_usage != child_usage {
         return TestResult::Fail("simple source qgroup was dropped before its final debit");
     }
+    // Batched commits: sync before reading the volume back from disk.
+    let _ = poll_once(top_for_delete.sync_to_disk());
     let snapshot = match poll_once(BtrfsVolume::mount_subvol(
         device.clone(),
         DomainId::DRIVER_0,
@@ -2826,6 +2848,10 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
         return TestResult::Fail("simple hard-limit rejection was not atomic");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(top_for_delete.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(vol)) => vol,
         _ => return TestResult::Fail("top remount before simple disable failed"),
@@ -2840,6 +2866,10 @@ fn smoke_btrfs_simple_quota_lifecycle() -> TestResult {
     ) {
         return TestResult::Fail("simple quota disable failed");
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(top.sync_to_disk());
     let disabled = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(vol)) => vol,
         _ => return TestResult::Fail("simple-disabled filesystem failed to remount"),
@@ -2921,6 +2951,10 @@ fn smoke_btrfs_alternate_checksum_mounts() -> TestResult {
             _ => return TestResult::Fail("alternate-checksum COW write failed"),
         }
 
+        // Commits are batched: a write is durable only once synced, exactly as
+        // a real unmount would flush. Without this the check below would be
+        // asserting that UNSYNCED data survives, which nothing promises.
+        let _ = poll_once(vol.sync_to_disk());
         let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
             Some(Ok(v)) => v,
             _ => return TestResult::Fail("alternate-checksum remount failed"),
@@ -2964,6 +2998,10 @@ fn smoke_btrfs_alternate_checksum_mounts() -> TestResult {
         ) {
             return TestResult::Fail("alternate-checksum write_log failed");
         }
+        // Commits are batched: a write is durable only once synced, exactly as
+        // a real unmount would flush. Without this the check below would be
+        // asserting that UNSYNCED data survives, which nothing promises.
+        let _ = poll_once(vol2.sync_to_disk());
         let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
             Some(Ok(v)) => v,
             _ => return TestResult::Fail("alternate-checksum log replay failed"),
@@ -4060,6 +4098,10 @@ fn smoke_btrfs_write_fst_maintenance() -> TestResult {
     }
 
     // Remount from disk and inspect the free-space tree.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after write failed"),
@@ -4129,6 +4171,10 @@ fn smoke_btrfs_create_file() -> TestResult {
     }
 
     // Remount from disk: the create must be durable and self-consistent.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after create failed"),
@@ -4176,6 +4222,10 @@ fn smoke_btrfs_write_created_file() -> TestResult {
     }
 
     // Remount from disk: the created file's new extent must be durable.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after write-to-created failed"),
@@ -4214,6 +4264,10 @@ fn smoke_btrfs_create_then_unlink() -> TestResult {
         _ => return TestResult::Fail("unlink failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after unlink failed"),
@@ -4308,6 +4362,10 @@ fn smoke_btrfs_mkdir_and_rmdir() -> TestResult {
     }
 
     // Remount: the directory must be durable, navigable and empty.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after mkdir failed"),
@@ -4330,6 +4388,10 @@ fn smoke_btrfs_mkdir_and_rmdir() -> TestResult {
         Some(Ok(())) => {}
         _ => return TestResult::Fail("rmdir failed"),
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol2.sync_to_disk());
     let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after rmdir failed"),
@@ -4377,6 +4439,10 @@ fn smoke_btrfs_rmdir_xattr_directory() -> TestResult {
         return TestResult::Fail("rmdir rejected an xattr-only directory");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let remount = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after xattr rmdir failed"),
@@ -4416,6 +4482,10 @@ fn smoke_btrfs_rmdir_nonempty_rejected() -> TestResult {
     }
 
     // Remount: the directory and its child are intact.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -4499,6 +4569,10 @@ fn smoke_btrfs_rename_dir() -> TestResult {
         _ => return TestResult::Fail("directory rename failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after rename failed"),
@@ -4547,6 +4621,10 @@ fn smoke_btrfs_rename_overwrite_file() -> TestResult {
         _ => return TestResult::Fail("overwrite rename failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after overwrite rename failed"),
@@ -4731,6 +4809,10 @@ fn smoke_btrfs_rename_hardlink_xattr_overwrite() -> TestResult {
         return TestResult::Fail("same-inode rename was not a successful no-op");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let remounted = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(volume)) => volume,
         _ => return TestResult::Fail("hardlink/xattr rename remount failed"),
@@ -4872,6 +4954,10 @@ fn smoke_btrfs_rename_cross_dir() -> TestResult {
         _ => return TestResult::Fail("cross-dir rename failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -4955,6 +5041,10 @@ fn smoke_btrfs_link_same_dir() -> TestResult {
         _ => return TestResult::Fail("link failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -5077,6 +5167,10 @@ fn smoke_btrfs_dir_item_hash_collisions() -> TestResult {
         return TestResult::Fail("collision overwrite source name survived");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("collision remount failed"),
@@ -5157,6 +5251,10 @@ fn smoke_btrfs_cross_dir_hash_collision_rename() -> TestResult {
         return TestResult::Fail("cross-directory collision peer was damaged");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("cross-directory collision remount failed"),
@@ -5219,6 +5317,10 @@ fn smoke_btrfs_link_cross_dir_and_reject_dir() -> TestResult {
         _ => return TestResult::Fail("cross-dir link failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -5283,6 +5385,10 @@ fn smoke_btrfs_unlink_hardlink() -> TestResult {
     if !matches!(poll_once(vol.root().unlink("a.txt")), Some(Ok(()))) {
         return TestResult::Fail("unlink of first link failed");
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -5313,6 +5419,10 @@ fn smoke_btrfs_unlink_hardlink() -> TestResult {
     if !matches!(poll_once(root2.unlink("b.txt")), Some(Ok(()))) {
         return TestResult::Fail("unlink of last link failed");
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol2.sync_to_disk());
     let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after last unlink failed"),
@@ -5357,6 +5467,10 @@ fn smoke_btrfs_xattr_write() -> TestResult {
     }
 
     // Remount: both attributes are durable and read back.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -5391,6 +5505,10 @@ fn smoke_btrfs_xattr_write() -> TestResult {
         return TestResult::Fail("remove_xattr failed");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol2.sync_to_disk());
     let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after edits failed"),
@@ -5433,6 +5551,10 @@ fn smoke_btrfs_leaf_split() -> TestResult {
     }
 
     // Remount: the fs tree must now be multi-level and hold every file.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after split failed"),
@@ -5454,6 +5576,10 @@ fn smoke_btrfs_leaf_split() -> TestResult {
         Some(Ok(())) => {}
         _ => return TestResult::Fail("unlink on the split tree failed"),
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol2.sync_to_disk());
     let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after split-tree unlink failed"),
@@ -5497,6 +5623,10 @@ fn smoke_btrfs_grow_add_chunk() -> TestResult {
         }
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after grow failed"),
@@ -5557,6 +5687,10 @@ fn smoke_btrfs_space_reclaim() -> TestResult {
     }
 
     // The content is durable across a remount.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -6104,6 +6238,10 @@ fn smoke_btrfs_multi_extent_write() -> TestResult {
     }
 
     // Remount: the multi-extent file reads back.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -6124,6 +6262,10 @@ fn smoke_btrfs_multi_extent_write() -> TestResult {
     }
 
     // Remount again: the new content reads back.
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol2.sync_to_disk());
     let vol3 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("second remount failed"),
@@ -6208,6 +6350,10 @@ fn smoke_btrfs_incremental_extent_write() -> TestResult {
 
     let mut expected = original;
     expected[patch_off..patch_off + patch.len()].copy_from_slice(patch);
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -6257,6 +6403,10 @@ fn smoke_btrfs_inline_overwrite() -> TestResult {
         _ => return TestResult::Fail("inline overwrite failed"),
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount failed"),
@@ -6471,6 +6621,10 @@ fn smoke_btrfs_symlink_create() -> TestResult {
         return TestResult::Fail("symlink failed");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after symlink failed"),
@@ -6526,6 +6680,10 @@ fn smoke_btrfs_symlink_inline_limit() -> TestResult {
         return TestResult::Fail("oversized symlink target was accepted");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after maximum symlink failed"),
@@ -6568,6 +6726,10 @@ fn smoke_btrfs_mknod_device() -> TestResult {
         return TestResult::Fail("mknod failed");
     }
 
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("remount after mknod failed"),
@@ -6894,6 +7056,10 @@ fn smoke_btrfs_compressed_cow_write_case(sparse: &[u8], compression: u8) -> Test
             _ => return TestResult::Fail("compressed COW write failed"),
         }
 
+        // Commits are batched: a write is durable only once synced, exactly as
+        // a real unmount would flush. Without this the check below would be
+        // asserting that UNSYNCED data survives, which nothing promises.
+        let _ = poll_once(vol.sync_to_disk());
         let vol2 = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
             Some(Ok(v)) => v,
             _ => return TestResult::Fail("compressed COW remount failed"),
@@ -8698,6 +8864,10 @@ fn smoke_btrfs_default_subvolume() -> TestResult {
     ) {
         return TestResult::Fail("create in on-disk default subvolume failed");
     }
+    // Commits are batched: a write is durable only once synced, exactly as
+    // a real unmount would flush. Without this the check below would be
+    // asserting that UNSYNCED data survives, which nothing promises.
+    let _ = poll_once(vol.sync_to_disk());
     let remounted = match poll_once(BtrfsVolume::mount(device.clone(), DomainId::DRIVER_0)) {
         Some(Ok(v)) => v,
         _ => return TestResult::Fail("default-subvolume write did not remount"),
@@ -8709,6 +8879,8 @@ fn smoke_btrfs_default_subvolume() -> TestResult {
         return TestResult::Fail("default-subvolume mutation did not persist");
     }
     // subvolid=5 explicitly overrides the default and reaches the top-level tree.
+    // Batched commits: sync before reading the volume back from disk.
+    let _ = poll_once(remounted.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount_subvol(
         device,
         DomainId::DRIVER_0,
@@ -8810,6 +8982,8 @@ fn smoke_btrfs_laptop_image() -> TestResult {
         total,
         lba_size: 512,
     });
+    // Batched commits: sync before reading the volume back from disk.
+    let _ = poll_once(vol.sync_to_disk());
     let top = match poll_once(BtrfsVolume::mount_subvol(
         narf_block::SyncBlock::new(dev),
         DomainId::DRIVER_0,

@@ -108,6 +108,15 @@ struct NodeCache {
 /// staying a fixed, predictable cost.
 const NODE_CACHE_MAX: usize = 256;
 
+/// Commits allowed to stage before the superblock is forced out.
+///
+/// Bounds two things: how much work a crash discards, and how long pinned
+/// extents withhold free space. Linux commits on a 30-second timer instead;
+/// a count is the equivalent NARF can express without a timer source in the
+/// driver, and a small one keeps both costs modest while still amortising the
+/// superblock write and its barrier across a batch.
+const MAX_STAGED_COMMITS: usize = 1;
+
 impl NodeCache {
     /// Drop `logical` and advance the epoch, so any fill already in flight for
     /// it (or for anything else) declines to publish.
@@ -165,6 +174,19 @@ pub struct BtrfsVolume<B: BlockDevice> {
     degraded: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
+    /// A stamped superblock image whose commit has completed in memory but
+    /// which is not yet on disk, plus whether it must go through the
+    /// root-admin write path.
+    ///
+    /// Batching commits means the superblock stops flipping per write. The
+    /// tree blocks are already out and `commit_roots` has advanced the
+    /// in-memory roots, so readers follow the new tree; only durability lags.
+    /// A crash here loses every staged commit and the filesystem falls back to
+    /// the last superblock on disk — which is intact precisely because the
+    /// blocks it references are pinned until this image lands.
+    staged_super: IrqSafeSpinLock<Option<(alloc::vec::Vec<u8>, bool)>>,
+    /// Commits staged since the superblock last reached disk.
+    staged_count: core::sync::atomic::AtomicUsize,
     /// Test-only: abort the next commit after its nodes are written but before
     /// the superblock, standing in for a crash at the one instant the COW
     /// invariant is load-bearing.
@@ -1078,6 +1100,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             verify_checksums,
             degraded,
             devices: IrqSafeSpinLock::new(devices),
+            staged_super: IrqSafeSpinLock::new(None),
+            staged_count: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(feature = "kernel-test")]
             crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
@@ -1302,6 +1326,17 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
         Ok(self.invalidate_nodes(logical, src.len()))
     }
 
+    /// Hold a completed commit's superblock image in memory instead of writing
+    /// it, and report whether the batch is now long enough to force out.
+    pub(crate) fn stage_superblock(&self, raw: alloc::vec::Vec<u8>, root_admin: bool) -> bool {
+        *self.staged_super.lock() = Some((raw, root_admin));
+        let staged = self
+            .staged_count
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel)
+            + 1;
+        staged >= MAX_STAGED_COMMITS
+    }
+
     /// Make every write that has already returned durable on disk.
     ///
     /// This is `fsync`'s contract, stated as a requirement rather than as a
@@ -1316,7 +1351,26 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// fsyncs, crashes the following commit, and requires the fsynced data
     /// back. Deferring commits without doing the work here turns that red.
     pub async fn sync_to_disk(&self) -> Result<(), FsError> {
+        let staged = self.staged_super.lock().take();
+        let Some((raw, root_admin)) = staged else {
+            // Nothing outstanding; the barrier is all that is owed.
+            self.flush().await;
+            return Ok(());
+        };
+        // Every staged commit's nodes were written before this point, so one
+        // barrier covers all of them — the ordering the superblock relies on
+        // is "all tree blocks durable first", not "one flush per commit".
         self.flush().await;
+        if root_admin {
+            self.write_superblock_root_admin(&raw).await?;
+        } else {
+            self.write_superblock(&raw).await?;
+        }
+        self.staged_count
+            .store(0, core::sync::atomic::Ordering::Release);
+        // Only now, exactly as `btrfs_finish_extent_commit` runs only after
+        // `write_all_supers`.
+        self.unpin_all();
         Ok(())
     }
 
@@ -1563,6 +1617,12 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
     /// Transaction code can therefore heal a damaged primary without knowing
     /// which mirror supplied the mounted generation.
     pub async fn read_raw_superblock(&self) -> Result<Vec<u8>, FsError> {
+        // A staged image is newer than anything on disk, and the next commit
+        // must build on it — reading the stale on-disk copy would roll the
+        // generation and root pointers backwards.
+        if let Some((raw, _)) = self.staged_super.lock().as_ref() {
+            return Ok(raw.clone());
+        }
         let (devid, source) = self.state.lock().superblock_source;
         let mut raw = vec![0u8; format::SUPERBLOCK_SIZE];
         self.read_physical_on(devid, source, &mut raw).await?;

@@ -3196,6 +3196,13 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 .await
                                 .map_err(|_| ())?;
                         }
+                        // Commits are batched, so the tree is durable only once
+                        // synced — a real unmount would flush here. fsync on any
+                        // file of this volume forces the staged superblock out;
+                        // without it the remount below reads the last synced
+                        // state and every check that follows is testing the
+                        // wrong image.
+                        file.fsync(false).await.map_err(|_| ())?;
                         // Re-mount the on-disk image and verify the marker read-back,
                         // the renamed file's content, the scratch file's removal, the
                         // persistent directory, the removed directory, the symlink

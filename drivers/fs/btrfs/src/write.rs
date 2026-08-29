@@ -3849,17 +3849,17 @@ async fn commit_txn<B: BlockDevice + 'static>(
     raw[format::OFF_INCOMPAT_FLAGS..format::OFF_INCOMPAT_FLAGS + 8]
         .copy_from_slice(&incompat.to_le_bytes());
     crate::checksum::stamp_block(vol.csum_type(), &mut raw)?;
-    vol.flush().await;
-    if txn.root_flags.is_some() {
-        vol.write_superblock_root_admin(&raw).await?;
-    } else {
-        vol.write_superblock(&raw).await?;
-    }
-    // `btrfs_commit_transaction` releases the pinned set only after
-    // `write_all_supers` returns — "the super is written, we can safely allow
-    // the tree-loggers to go about their business". Unpinning any earlier is
-    // exactly the corruption the set exists to prevent.
-    vol.unpin_all();
+    // Stage rather than write. The tree blocks are already out and
+    // `commit_roots` below advances the in-memory roots, so readers see this
+    // commit immediately; only durability is deferred. A crash before the
+    // staged image lands discards it and every commit batched with it, and the
+    // filesystem falls back to the last superblock on disk — intact because
+    // the blocks it references stay pinned until this image is written.
+    //
+    // The pins are NOT released here. They drop in `sync_to_disk`, after the
+    // superblock reaches the device, mirroring `btrfs_finish_extent_commit`
+    // running only after `write_all_supers`.
+    let batch_full = vol.stage_superblock(raw, txn.root_flags.is_some());
 
     if let Some(f) = alloc.floor() {
         vol.set_alloc_floor(f);
@@ -3872,6 +3872,12 @@ async fn commit_txn<B: BlockDevice + 'static>(
         txn.root_flags,
         txn.incompat_flags_add,
     );
+    // Bound how much a crash discards and how long pinned extents withhold
+    // space. `sync_to_disk` is the same path `fsync` takes, so the batch is
+    // forced out by exactly one mechanism.
+    if batch_full {
+        vol.sync_to_disk().await?;
+    }
     Ok(())
 }
 
