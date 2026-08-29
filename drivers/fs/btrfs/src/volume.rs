@@ -165,6 +165,11 @@ pub struct BtrfsVolume<B: BlockDevice> {
     degraded: bool,
     devices: IrqSafeSpinLock<BTreeMap<u64, Arc<VolumeDevice<B>>>>,
     state: IrqSafeSpinLock<VolState>,
+    /// Test-only: abort the next commit after its nodes are written but before
+    /// the superblock, standing in for a crash at the one instant the COW
+    /// invariant is load-bearing.
+    #[cfg(feature = "kernel-test")]
+    crash_before_super: core::sync::atomic::AtomicBool,
     /// Extents freed by the in-flight transaction, withheld from allocation
     /// until a superblock that no longer references them is durable.
     ///
@@ -1073,6 +1078,8 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             verify_checksums,
             degraded,
             devices: IrqSafeSpinLock::new(devices),
+            #[cfg(feature = "kernel-test")]
+            crash_before_super: core::sync::atomic::AtomicBool::new(false),
             pinned: IrqSafeSpinLock::new(alloc::vec::Vec::new()),
             nodes: IrqSafeSpinLock::new(NodeCache::default()),
             state: IrqSafeSpinLock::new(VolState {
@@ -1293,6 +1300,22 @@ impl<B: BlockDevice + 'static> BtrfsVolume<B> {
             done += take;
         }
         Ok(self.invalidate_nodes(logical, src.len()))
+    }
+
+    /// Test-only: make the next commit stop after writing its nodes, leaving
+    /// the superblock pointing at the previous tree — the state a crash mid
+    /// commit produces.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn arm_crash_before_super(&self) {
+        self.crash_before_super
+            .store(true, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Consume the armed crash, if any.
+    #[cfg(feature = "kernel-test")]
+    pub(crate) fn take_crash_before_super(&self) -> bool {
+        self.crash_before_super
+            .swap(false, core::sync::atomic::Ordering::AcqRel)
     }
 
     /// Withhold `[start, start + len)` from allocation until [`Self::unpin_all`].

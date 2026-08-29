@@ -659,6 +659,104 @@ kernel_test_in!(
     smoke_btrfs_subtract_pinned_splits_free_ranges
 );
 
+/// Crash between writing a transaction's nodes and writing the superblock —
+/// the one instant where btrfs's COW invariant is load-bearing.
+///
+/// `btrfs_commit_transaction` orders this deliberately: tree blocks out,
+/// `write_all_supers`, and only then `btrfs_finish_extent_commit` releases the
+/// pinned extents. A crash in that window must leave the last committed tree
+/// entirely intact, because the superblock still points at it. If any block it
+/// references were reallocated and overwritten, the filesystem is silently
+/// corrupt and nothing notices until the next mount.
+///
+/// So this asserts the invariant directly rather than settling for "it still
+/// mounts": every block of the committed fs tree is byte-identical afterwards.
+/// A remount check alone would pass even if a block had been rewritten with
+/// plausible data, which is exactly the failure mode that matters.
+fn smoke_btrfs_crash_before_super_preserves_committed_tree() -> TestResult {
+    use narf_filesystem::FsInstance;
+    let vol = match mount_sparse(FIXTURE_SPARSE) {
+        Ok(v) => v,
+        Err(_) => return TestResult::Fail("crash fixture failed to mount"),
+    };
+    if !vol.supports_writes() {
+        return TestResult::Fail("crash fixture mounted read-only");
+    }
+    let device = vol.device.clone();
+    let root = vol.root();
+
+    // A committed write, so there is a real tree to protect.
+    let survivor = match poll_once(root.lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of big.dat failed"),
+    };
+    let payload = replacement_big();
+    match poll_once(survivor.write(0, &payload)) {
+        Some(Ok(n)) if n == payload.len() => {}
+        _ => return TestResult::Fail("committed write failed"),
+    }
+
+    // Snapshot every block the now-committed fs tree occupies.
+    let (fs_root, _) = vol.fs_tree_root();
+    let blocks = match poll_once(crate::write::tree_blocks(&vol, fs_root)) {
+        Some(Ok(b)) => b,
+        _ => return TestResult::Fail("could not enumerate the committed tree"),
+    };
+    if blocks.is_empty() {
+        return TestResult::Fail("committed tree reported no blocks");
+    }
+    let mut before: Vec<(u64, Vec<u8>)> = Vec::with_capacity(blocks.len());
+    for &(addr, _) in &blocks {
+        match poll_once(vol.read_node(addr)) {
+            Some(Ok(buf)) => before.push((addr, buf)),
+            _ => return TestResult::Fail("could not snapshot a committed block"),
+        }
+    }
+    let generation = vol.superblock().generation;
+
+    // Crash the next commit after its nodes are out, before the superblock.
+    vol.arm_crash_before_super();
+    let victim = match poll_once(root.lookup_async("hello.txt")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lookup of hello.txt failed"),
+    };
+    if poll_once(victim.write(0, b"this write is meant to be lost")).is_none() {
+        return TestResult::Fail("the crashing write never completed a poll");
+    }
+
+    // Remount from the same device: the state a reboot would see.
+    let after = match poll_once(BtrfsVolume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("remount after a mid-commit crash failed"),
+    };
+    if after.superblock().generation != generation {
+        return TestResult::Fail("the superblock advanced despite the crash");
+    }
+    // The invariant: not one committed block was reused and overwritten.
+    for (addr, expected) in &before {
+        match poll_once(after.read_node(*addr)) {
+            Some(Ok(buf)) if buf == *expected => {}
+            Some(Ok(_)) => {
+                return TestResult::Fail("a committed tree block was overwritten by the crash")
+            }
+            _ => return TestResult::Fail("a committed tree block became unreadable"),
+        }
+    }
+    // And the committed data still reads back through the remounted tree.
+    let big2 = match poll_once(after.root().lookup_async("big.dat")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("remount lost big.dat"),
+    };
+    if read_all(&big2, payload.len() + 16) != Some(payload) {
+        return TestResult::Fail("committed data did not survive the crash");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/fs/btrfs",
+    smoke_btrfs_crash_before_super_preserves_committed_tree
+);
+
 // ── Phase 1: chunk map ─────────────────────────────────────────────
 
 /// Build a `sys_chunk_array` record: a 17-byte disk key (CHUNK_ITEM at

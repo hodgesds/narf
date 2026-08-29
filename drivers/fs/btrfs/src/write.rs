@@ -1767,6 +1767,16 @@ impl<'a, B: BlockDevice + 'static> PathCow<'a, B> {
 /// Read every item of the fs tree rooted at `fs_root` (any height) into one
 /// oversized logical leaf (with headroom for a mutation's inserts) plus the list
 /// of every block the tree currently occupies (all freed on rewrite).
+/// Test-only: every block a tree currently occupies, for asserting that a
+/// committed tree's blocks are untouched after a crash.
+#[cfg(feature = "kernel-test")]
+pub(crate) async fn tree_blocks<B: BlockDevice + 'static>(
+    vol: &BtrfsVolume<B>,
+    root: u64,
+) -> Result<Vec<(u64, u8)>, FsError> {
+    read_fs_oversized(vol, root).await.map(|(_, blocks)| blocks)
+}
+
 async fn read_fs_oversized<B: BlockDevice + 'static>(
     vol: &BtrfsVolume<B>,
     fs_root: u64,
@@ -3819,6 +3829,16 @@ async fn commit_txn<B: BlockDevice + 'static>(
     // Superblock `bytes_used` is the sum of every block group's `used`, read back
     // from the freshly-written extent tree so it can never drift from the block
     // groups (`build_ext_edits` already committed each group's net).
+    // Stand in for a crash at the one instant the COW invariant is load
+    // bearing: nodes written, superblock still pointing at the previous tree.
+    #[cfg(feature = "kernel-test")]
+    if vol.take_crash_before_super() {
+        // The errno is irrelevant — what matters is returning without ever
+        // reaching the superblock write, leaving the on-disk state exactly as
+        // a crash here would.
+        return Err(FsError::Unsupported);
+    }
+
     let bytes_used = total_block_group_used(vol, ext_root).await?;
 
     let mut raw = vol.read_raw_superblock().await?;
