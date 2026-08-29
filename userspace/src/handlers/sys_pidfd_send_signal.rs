@@ -79,9 +79,10 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         return;
     }
     if let Some(info) = imported {
-        if enqueue_imported_siginfo(target, signum, info).is_none() {
-            // The payload is stashed before the pending bit becomes visible.
-            // A full queue is EAGAIN with nothing delivered.
+        // Store the payload and set the pending bit atomically so a racing
+        // sigwait consumer can't strand the bit over an emptied queue (the sigq
+        // spurious-sival=0 bug). A full queue is EAGAIN with nothing delivered.
+        if sigqueue_deliver_imported(target, signum, info).is_none() {
             ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
             return;
         }
@@ -91,7 +92,7 @@ pub(crate) fn sys_pidfd_send_signal(ctx: &mut dyn TrapContext) {
         // (do_pidfd_send_signal). Record it so the receiver's signalfd names
         // the sender, matching kill/tkill/tgkill.
         queue_sender_siginfo(target, signum);
+        raise_signal_pending(target, signum);
     }
-    raise_signal_pending(target, signum);
     ctx.set_return(SyscallReturn::ok(0));
 }

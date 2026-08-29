@@ -1206,3 +1206,57 @@ fn smoke_abi_signal_rt_sigtimedwait_rt() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigtimedwait_rt);
+
+// A STANDARD signal (SIGUSR1, coalescing single-slot payload) queued via
+// sigqueue must reach rt_sigtimedwait with its SI_QUEUE payload intact —
+// never degrade to a spurious SI_USER sival=0. That degradation is what
+// stress-ng --sigq's child reads as its termination sentinel; it arose
+// from rt_sigtimedwait clearing the pending bit BEFORE dequeuing the
+// payload, so a racing coalescing sender on another CPU could strand the
+// bit over an emptied queue. Consume must dequeue the payload first, then
+// clear the bit. This drives the stress-ng loop shape single-threaded:
+// each sigqueue/consume cycle must carry its own sival, back to back.
+fn smoke_abi_signal_rt_sigtimedwait_std_payload() -> TestResult {
+    with_setup(|| {
+        let set: u64 = 1u64 << (10 - 1); // SIGUSR1 at bit 9
+        let sp = &set as *const u64 as u64;
+        for value in [0xABCDu64, 0x1234u64] {
+            // sigqueue(self, SIGUSR1, {sival = value}) with SI_QUEUE(-1).
+            let si = sigqueue_siginfo(10, -1, FAKE_TASK as u32, value);
+            if call(
+                Syscall::RtSigqueueinfo.raw(),
+                a2(FAKE_TASK, 10, si.as_ptr() as u64),
+            ) != Some(0)
+            {
+                return Err("rt_sigqueueinfo(self, SIGUSR1, payload) should return 0");
+            }
+            // Consume it, capturing the delivered siginfo_t.
+            let mut info = [0u8; 128];
+            let r = call(
+                Syscall::RtSigtimedwait.raw(),
+                a3(sp, info.as_mut_ptr() as u64, 0, 8),
+            );
+            if r != Some(10) {
+                return Err("rt_sigtimedwait must return the pending SIGUSR1 (10)");
+            }
+            let si_code = i32::from_ne_bytes(info[8..12].try_into().unwrap());
+            let sival = u64::from_ne_bytes(info[24..32].try_into().unwrap());
+            if si_code != -1 {
+                return Err("delivered si_code must stay SI_QUEUE(-1), not SI_USER(0)");
+            }
+            if sival != value {
+                return Err("delivered si_value must carry the queued payload, not 0");
+            }
+            // The consume must clear the bit AND leave no stranded payload:
+            // bit set ⟺ payload queued is the invariant the fix preserves.
+            if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(10) != 0 {
+                return Err("rt_sigtimedwait must clear the drained SIGUSR1 bit");
+            }
+            if crate::handlers::take_sigqueue_info(FAKE_TASK, 10).is_some() {
+                return Err("rt_sigtimedwait left a stranded queued payload");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigtimedwait_std_payload);

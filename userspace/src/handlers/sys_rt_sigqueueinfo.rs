@@ -67,7 +67,10 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let depth = match enqueue_imported_siginfo(target, sig, info) {
+    // Store the payload and set the pending bit atomically (bucket lock across
+    // both), so a sigwait consumer can't pop the coalesced payload between the
+    // store and the raise and strand the bit → spurious SI_USER sival=0.
+    let depth = match sigqueue_deliver_imported(target, sig, info) {
         Some(d) => d,
         None => {
             // Target's queued-signal budget exhausted (RLIMIT_SIGPENDING
@@ -76,11 +79,10 @@ pub(crate) fn sys_rt_sigqueueinfo(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    raise_signal_pending(target, sig); // ORs the pending bit + wakes
-                                       // Producer/consumer back-pressure: the target is falling behind —
-                                       // yield this sender at syscall exit so the consumer(s) drain (see
-                                       // SIGQUEUE_BACKPRESSURE_DEPTH). `depth` is the post-enqueue queue
-                                       // depth returned by enqueue_imported_siginfo, so no second scan/lock.
+    // Producer/consumer back-pressure: the target is falling behind — yield
+    // this sender at syscall exit so the consumer(s) drain (see
+    // SIGQUEUE_BACKPRESSURE_DEPTH). `depth` is the post-enqueue queue depth
+    // returned by the atomic deliver, so no second scan/lock.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     if depth > SIGQUEUE_BACKPRESSURE_DEPTH {
         narf_scheduler::stackful::request_syscall_backpressure_yield();

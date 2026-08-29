@@ -99,11 +99,13 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
     };
 
     // A signal in `set` is pending → consume ONE instance and return it.
-    if let Some(signum) = sigwait_consume(task, set) {
-        // Attach the oldest queued payload (rt_sigqueueinfo/sigqueue), and
-        // re-arm the bit when more instances remain queued behind it.
-        let queued = take_sigqueue_info(task, signum);
-        rearm_pending_if_queued(task, signum);
+    // Popping the payload and clearing/re-arming the pending bit happen
+    // together under the sigqueue bucket lock (sigwait_take_locked), atomic
+    // against a racing sender's store+set (sigqueue_store_and_raise_bit) — so
+    // a coalescing standard signal under a sigqueue flood can never be
+    // observed as a bit set over an emptied queue (which delivered a spurious
+    // SI_USER sival=0 that stress-ng --sigq read as its termination sentinel).
+    if let Some((signum, queued)) = sigwait_take_locked(task, set) {
         clear_routing(uctx_opt);
         if info_out != 0 {
             // Build the 128-byte siginfo_t in kernel memory, then copy it
