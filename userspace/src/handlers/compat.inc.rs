@@ -3526,7 +3526,12 @@ fn task_vm_bytes(pid: u64) -> u64 {
 /// Drained on delivery (`default_signal_delivery`), by `rt_sigtimedwait`,
 /// or by a `signalfd` read so a stale payload never attaches to a later
 /// instance.
-type SigqueueMap = BTreeMap<(u64, u32), alloc::collections::VecDeque<(i32, u64, u32)>>;
+/// A queued signal's carried fields: `(si_code, si_value, si_pid)`.
+type SigqueuePayload = (i32, u64, u32);
+/// What a sigwait consume yields: the delivered signum plus its queued payload
+/// (`None` = a bit set with no siginfo, i.e. a kill(2)-style SI_USER signal).
+type SigwaitTaken = (u32, Option<SigqueuePayload>);
+type SigqueueMap = BTreeMap<(u64, u32), alloc::collections::VecDeque<SigqueuePayload>>;
 const SIGQUEUE_BUCKETS: usize = 64;
 
 #[repr(align(64))]
@@ -3624,6 +3629,105 @@ pub(crate) fn store_sigqueue_info_depth(
     }
     q.push_back((si_code, si_value, si_pid));
     Some(queued + 1)
+}
+
+/// Atomically store `signum`'s payload for `task` AND set its
+/// `SIGNAL_PENDING` bit, holding the sigqueue bucket lock across BOTH so a
+/// concurrent sigwait consumer (which pops the payload and clears/re-arms the
+/// bit under the same bucket lock — see [`sigwait_take_locked`]) can never
+/// observe the pending bit set over an already-emptied queue.
+///
+/// Why this matters: the store and the pending-bit set live in two different
+/// sharded structures with independent locks. When they were updated in
+/// sequence (store, then a separate `raise_signal_pending`), a coalescing
+/// standard signal under a sigqueue flood could have its single slot popped by
+/// the consumer BETWEEN the store and the raise (the consumer was still awake
+/// on a prior send's bit); the trailing raise then stranded the bit over an
+/// empty queue, and the next `rt_sigtimedwait` delivered a spurious SI_USER
+/// `si_value=0` — which stress-ng --sigq reads as its termination sentinel and
+/// exits early. Linux avoids this because the whole send/dequeue runs under one
+/// `siglock`; this restores the same atomicity for the bit↔payload pair.
+///
+/// Lock order: SIGQUEUE bucket (outer) → SIGNAL_PENDING (inner). Every site
+/// that holds both nests this way; no path takes them in the reverse order.
+/// Returns `(post-insert depth, pending-was-empty)`, or `None` when the RT
+/// per-task cap is hit (caller surfaces -EAGAIN; the bit is NOT set).
+pub(crate) fn sigqueue_store_and_raise_bit(
+    task: u64,
+    signum: u32,
+    si_code: i32,
+    si_value: u64,
+    si_pid: u32,
+) -> Option<(usize, bool)> {
+    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    let queued: usize = m.range((task, 0)..=(task, 64)).map(|(_, q)| q.len()).sum();
+    if signum >= SIGRT_QUEUE_MIN && queued >= SIGQUEUE_MAX_PER_TASK {
+        return None;
+    }
+    let q = m.entry((task, signum)).or_default();
+    let depth = if signum < SIGRT_QUEUE_MIN {
+        // Standard signals coalesce: replace the single slot (see
+        // store_sigqueue_info_depth for the depth accounting).
+        let existed = !q.is_empty();
+        q.clear();
+        q.push_back((si_code, si_value, si_pid));
+        if existed {
+            queued
+        } else {
+            queued + 1
+        }
+    } else {
+        q.push_back((si_code, si_value, si_pid));
+        queued + 1
+    };
+    // Set the pending bit while STILL holding the bucket lock (nested).
+    let was_empty = signal_bits_update_or_init(&SIGNAL_PENDING, task, |slot| {
+        let was_empty = *slot == 0;
+        *slot |= sig_bit(signum);
+        was_empty
+    });
+    Some((depth, was_empty))
+}
+
+/// Consume one in-`set` pending signal for `task`, popping its queued payload
+/// and clearing (or re-arming, for a remaining RT instance) its pending bit —
+/// ALL under the sigqueue bucket lock, so the pop+bit-update is atomic against
+/// a racing [`sigqueue_store_and_raise_bit`]. Returns `(signum, payload)` where
+/// `payload` is `None` for a bit set with no queued siginfo (a kill(2)-style
+/// SI_USER standard signal); `None` overall when nothing in `set` is pending.
+///
+/// Lock order matches the sender: SIGQUEUE bucket (outer) → SIGNAL_PENDING
+/// (inner).
+pub(crate) fn sigwait_take_locked(task: u64, set: u64) -> Option<SigwaitTaken> {
+    let mut g = SIGQUEUE_INFO[sigqueue_bucket(task)].values.lock();
+    let candidates = signal_bits_get(&SIGNAL_PENDING, task) & set;
+    if candidates == 0 {
+        return None;
+    }
+    let signum = sig_from_bit(candidates);
+    let payload = g.as_mut().and_then(|m| {
+        let q = m.get_mut(&(task, signum))?;
+        let v = q.pop_front();
+        if q.is_empty() {
+            m.remove(&(task, signum));
+        }
+        v
+    });
+    // More queued instances (only RT signals append) → keep the bit set so the
+    // next wait delivers the next payload; otherwise clear it. Under the bucket
+    // lock, so a concurrent sender's store+set is fully ordered against this.
+    let more = g
+        .as_ref()
+        .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()));
+    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        if more {
+            *slot |= sig_bit(signum);
+        } else {
+            *slot &= !(sig_bit(signum));
+        }
+    });
+    Some((signum, payload))
 }
 
 /// Threshold above which a signal sender is asked to yield at syscall exit:
@@ -4824,21 +4928,28 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     }) else {
         return;
     };
+    signal_raise_notify(task, was_empty);
+}
+
+/// The post-bit-set bookkeeping every raise path performs: bump the
+/// readable-edge generation (only on the empty→non-empty transition, which
+/// also feeds the signalfd EPOLLET token), bump the per-raise generation
+/// (every raise, so a poll/epoll parked on a signalfd sees a second signal
+/// arrive while a first is still pending), and wake a parked task so an
+/// asynchronously raised signal (e.g. SIGALRM) is taken promptly rather than
+/// on the ~10 ms lost-wake backstop. Factored out so the atomic sigqueue send
+/// path ([`sigqueue_store_and_raise_bit`]) can set the pending bit UNDER the
+/// sigqueue bucket lock and then run this notify OUTSIDE that lock (wakes and
+/// generation shards must not nest beneath it).
+fn signal_raise_notify(task: u64, was_empty: bool) {
     if was_empty {
         signal_bits_update_or_init(&SIGNAL_READABLE_GEN, task, |generation| {
             *generation = generation.wrapping_add(1);
         });
     }
-    // Bump the raise generation on EVERY raise (not just was_empty): the
-    // signalfd park guard needs to see a second signal arriving while a first
-    // is still pending, so a poll/epoll parked on a signalfd whose mask matches
-    // the SECOND signal is not stranded on the backstop. See [`SIGNAL_RAISE_GEN`].
     signal_bits_update_or_init(&SIGNAL_RAISE_GEN, task, |generation| {
         *generation = generation.wrapping_add(1);
     });
-    // Wake the task if it is parked (sleep/pause) so an asynchronously
-    // raised signal — e.g. SIGALRM from an interval timer — is taken
-    // promptly rather than only at the next self-driven re-poll.
     wake_signal(task);
 }
 
@@ -5283,10 +5394,26 @@ fn import_queued_siginfo(info_ptr: u64) -> Result<ImportedSiginfo, u64> {
     })
 }
 
-/// Store an already-imported payload. `None` is the queued-signal budget's
-/// `EAGAIN`; user-copy failures cannot reach this function.
-fn enqueue_imported_siginfo(target: u64, sig: u32, info: ImportedSiginfo) -> Option<usize> {
-    store_sigqueue_info_depth(target, sig, info.code, info.value, info.pid)
+/// Deliver an imported siginfo (sigqueue/rt_sigqueueinfo/rt_tgsigqueueinfo/
+/// pidfd_send_signal) to `target`: run the stop/cont bookkeeping, then
+/// atomically store the payload AND set the pending bit (so a racing sigwait
+/// consumer can never strand the bit over an emptied queue — see
+/// [`sigqueue_store_and_raise_bit`]), then run the raise notify (generation
+/// bumps + wake) outside the bucket lock. Returns the post-enqueue queue depth
+/// for sender back-pressure, or `None` when the RT per-task cap is hit (caller
+/// surfaces -EAGAIN; nothing was queued or raised).
+///
+/// Replaces the former `enqueue_imported_siginfo` + `raise_signal_pending`
+/// two-step, whose non-atomic gap between the store and the raise was the sigq
+/// spurious-`sival=0` bug.
+fn sigqueue_deliver_imported(target: u64, sig: u32, info: ImportedSiginfo) -> Option<usize> {
+    // Stop/cont mutual cancellation runs before the pending bit is set, exactly
+    // as in `raise_signal_pending` (a sigqueue may carry SIGSTOP/SIGCONT).
+    signal_stopcont_interaction(target, sig);
+    let (depth, was_empty) =
+        sigqueue_store_and_raise_bit(target, sig, info.code, info.value, info.pid)?;
+    signal_raise_notify(target, was_empty);
+    Some(depth)
 }
 
 #[inline]
@@ -6191,19 +6318,6 @@ pub fn sigaltstack_of(task: u64) -> SigAltStack {
 /// check-and-clear is what makes two racing consumers (e.g. the
 /// return-to-user delivery hook vs a re-executed `rt_sigtimedwait`)
 /// unable to both take the same instance.
-fn sigwait_consume(task: u64, set: u64) -> Option<u32> {
-    signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
-        let candidates = *slot & set;
-        if candidates == 0 {
-            return None;
-        }
-        let signum = sig_from_bit(candidates);
-        *slot &= !(sig_bit(signum));
-        Some(signum)
-    })
-    .flatten()
-}
-
 // Function-pointer hook: arch trap dispatcher invokes this on
 // every int-0x80 / syscall trap-return that's heading back to
 // user mode, just before the asm tail iretq's. The arch passes
@@ -6407,8 +6521,8 @@ pub(crate) fn default_signal_delivery_restricted(
     // so no `& !1` guard is needed — every set bit is a real signal.
     // Linux `do_sigtimedwait` `real_blocked` semantics: while this task is
     // parked in / re-executing `rt_sigtimedwait` (`sigwait_set` armed), signals
-    // in the waited set belong to the WAITER — `sigwait_consume` dequeues them
-    // on the re-execution — and must NOT be delivered to a handler here even
+    // in the waited set belong to the WAITER — `sigwait_take_locked`
+    // dequeues them on the re-execution — and must NOT be delivered to a handler here even
     // when they are unblocked. stress-ng --sigrt waits on RT signals it leaves
     // UNBLOCKED with nop handlers installed; without this reservation the nop
     // handler steals the graceful-shutdown `sigqueue(sival=0)` and the child
@@ -6516,7 +6630,7 @@ pub(crate) fn default_signal_delivery_restricted(
     }
     // If this task is parked in rt_sigtimedwait, this handler-bound signal
     // (necessarily OUT of the sigwait set — in-set signals are blocked and
-    // consumed by sigwait_consume, never delivered here) is interrupting
+    // consumed by the rt_sigtimedwait peek/take path, never delivered here) is interrupting
     // the wait. Mark it so the re-executed rt_sigtimedwait returns -EINTR
     // even though this delivery is about to clear the pending bit before
     // the re-execution can observe it. Without this a SIGALRM (stress-ng

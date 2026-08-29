@@ -47,9 +47,19 @@ pub fn wake_signal(task_id: u64) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
     crate::user_task::with_user_task_ctx(task_id, |uctx| {
-        // If the task is blocked in an infinite wait (pause, epoll_wait),
-        // clear the deadline to wake it.
-        if uctx.sleep_deadline_ns.load(Ordering::Acquire) == u64::MAX {
+        // Clear the park deadline so the woken task re-executes its syscall (and
+        // re-checks the signal) NOW instead of sleeping to the ~1-tick wheel
+        // backstop. Two cases, mirroring the io-waiter wake `wake_one`:
+        //   * an infinite wait (pause / sigwaitinfo(NULL) / epoll_wait) — always;
+        //   * a task parked in sigwait with a FINITE timeout (rt_sigtimedwait,
+        //     sigwait_set != 0) — a just-queued in-set signal must complete the
+        //     wait immediately (Linux signal_wake_up), not at the timeout.
+        // A finite deadline on a NON-sigwait sleeper (nanosleep) is left intact:
+        // a blocked/ignored signal must not cut a timed sleep short (Linux only
+        // interrupts on a *deliverable* signal, handled on the re-executed
+        // syscall's return, not here).
+        let deadline = uctx.sleep_deadline_ns.load(Ordering::Acquire);
+        if deadline == u64::MAX || uctx.sigwait_set.load(Ordering::Acquire) != 0 {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
     });

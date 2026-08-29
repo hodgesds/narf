@@ -63,14 +63,14 @@ pub(crate) fn sys_rt_tgsigqueueinfo(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
         return;
     }
-    let depth = match enqueue_imported_siginfo(target, sig, info) {
+    // Atomic store + pending-bit set — see sys_rt_sigqueueinfo.
+    let depth = match sigqueue_deliver_imported(target, sig, info) {
         Some(d) => d,
         None => {
             ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // -EAGAIN (see rt_sigqueueinfo)
             return;
         }
     };
-    raise_signal_pending(target, sig);
     // Back-pressure — see sys_rt_sigqueueinfo. `depth` comes from the enqueue,
     // so there is no second sigqueue-bucket lock/scan on this send path.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
