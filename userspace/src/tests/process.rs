@@ -836,9 +836,22 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
         return TestResult::Fail("Brk(grow) returned wrong value");
     }
 
-    // The heap reservation must exist as exactly one unbacked slot. A zero
-    // physical address is the AddressSpace contract for a demand-populated
-    // page; it contributes virtual bytes but no resident-page charge.
+    // The heap reservation must exist, one page long, with NO resident frame
+    // charged to it — `brk(2)` reserves address space and nothing else; first
+    // touch owns demand population.
+    //
+    // This used to require exactly one `PhysAddr::new(0)` slot, which was the
+    // contract when a grow materialised a placeholder per page. It is not any
+    // more: `brk_extend_region_limited` extends only the region's LENGTH, so
+    // the `phys` list stays at its faulted prefix — empty until something
+    // touches the page — which is what makes growth O(1) and an unused grown
+    // range free. `smoke_brk_single_growable_vma` asserts that property
+    // directly, and was updated when it changed; this test was not, and had
+    // been failing on main ever since.
+    //
+    // Asserting "no slot carries a resident frame" instead of "exactly one
+    // zero slot" states the invariant that actually matters and holds under
+    // either representation.
     let region = match addr_space.lookup(VirtAddr::new(initial)) {
         Some(region) => region,
         None => {
@@ -849,11 +862,11 @@ fn smoke_userspace_brk_grows_heap() -> TestResult {
     };
     if region.base != VirtAddr::new(initial)
         || region.len != 0x1000
-        || region.phys.as_slice() != [PhysAddr::new(0)]
+        || region.phys.iter().any(|slot| *slot != PhysAddr::new(0))
     {
         *USER_AS_BRK.lock() = None;
         __test_clear_global();
-        return TestResult::Fail("Brk(grow) did not add one lazy physical slot");
+        return TestResult::Fail("Brk(grow) did not reserve exactly one unbacked page");
     }
     let after_stats = addr_space.memory_stats();
     if after_stats.resident_pages != before_stats.resident_pages
