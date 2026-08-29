@@ -25,9 +25,12 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
-    let Some(path) = copy_user_cstr(ptr, 4096) else {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
-        return;
+    let path = match copy_user_cstr_checked(ptr, 4096) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
     };
     let path = apply_chroot(&path);
     let ops = narf_filesystem::registry()

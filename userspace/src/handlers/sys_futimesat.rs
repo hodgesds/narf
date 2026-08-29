@@ -6,13 +6,13 @@ use super::*;
 /// dirfd's recorded open path, same prepend as sys_readlinkat/linkat.
 pub(crate) fn sys_futimesat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let raw = match copy_user_cstr(a.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     const AT_FDCWD: i64 = -100;
     let dirfd = a.arg0 as i64;
     let eff = if raw.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {

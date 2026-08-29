@@ -116,7 +116,7 @@ fn quota_kind(type_: u32) -> Option<QuotaKind> {
 fn fs_for_special(
     special_ptr: u64,
 ) -> Result<alloc::sync::Arc<dyn narf_filesystem::FsInstance>, i64> {
-    let raw = copy_user_cstr(special_ptr, 4096).ok_or(EFAULT)?;
+    let raw = copy_user_cstr_checked(special_ptr, 4096)?;
     let path = resolve_cwd_path(current_task_id(), &raw);
     current_fs_arc_at(&path).ok_or(ENOENT)
 }

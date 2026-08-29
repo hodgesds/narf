@@ -76,7 +76,6 @@ const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const EBADF_: i64 = 9;
 const EACCES: i64 = 13;
-const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
@@ -161,7 +160,7 @@ fn common_path(attr: &[u8; ATTR_BUF], size: usize, allowed_flags: u32) -> Result
     // `copy_user_cstr` walks user memory a page at a time looking for the NUL;
     // bulk-reading `PATH_MAX` would fault on a path that ends near the end of
     // a mapping. A null pointer, a fault, or a missing NUL all land here.
-    let raw = copy_user_cstr(path_uptr, PATH_MAX).ok_or(-EFAULT)?;
+    let raw = copy_user_cstr_checked(path_uptr, PATH_MAX).map_err(|e| -e)?;
     // `path_fd` is signed in the UAPI. With the flag clear Linux substitutes
     // AT_FDCWD; with it set, ordinary openat(2) rules apply. In particular an
     // absolute path ignores even an invalid fd, while a relative path returns

@@ -10,14 +10,13 @@ pub(crate) fn sys_open_linux(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg0;
     let flags = args.arg1;
     let _mode = args.arg2;
-    let fail = SyscallReturn::ok(!0u64);
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(fail);
+    let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,

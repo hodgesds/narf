@@ -37,13 +37,13 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     }
 
     let args = *ctx.args();
-    let raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(path) => path,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    let raw = match copy_user_cstr_checked(args.arg1, 4096) {
+            Ok(path) => path,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
             return;
-        }
-    };
+            }
+        };
 
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH != 0 {

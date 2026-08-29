@@ -8,13 +8,13 @@ pub(crate) fn sys_access(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
-    let raw = match copy_user_cstr(args.arg0, 4096) {
-        Some(path) => path,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+    let raw = match copy_user_cstr_checked(args.arg0, 4096) {
+            Ok(path) => path,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     let path = resolve_cwd_path(current_task_id(), &raw);
     access_path(ctx, &path, mode);
 }
@@ -26,13 +26,13 @@ pub(crate) fn sys_faccessat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
-    let raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(path) => path,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+    let raw = match copy_user_cstr_checked(args.arg1, 4096) {
+            Ok(path) => path,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     const AT_FDCWD: i64 = -100;
     let dirfd = args.arg0 as i64;
     // AT_EMPTY_PATH (faccessat2 flags = arg3): an empty path names the fd
@@ -198,14 +198,14 @@ fn chown_legacy(ctx: &mut dyn TrapContext, flags: u64) {
     // All take an absolute path as a NUL-terminated cstr; the body
     // Forward legacy chown(path, uid, gid) to the fchownat ABI.
     let path_uptr = args.arg0;
-    let _path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
+    let _path_str = match copy_user_cstr_checked(path_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
             // Unreadable user path pointer → EFAULT, not a bare -1 → EPERM.
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,
         args: SyscallArgs,

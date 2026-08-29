@@ -20,13 +20,13 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
     let dirfd = args.arg0 as i64;
     let path_uptr = args.arg1;
     let flags = args.arg2;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+    let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // EFAULT
             return;
-        }
-    };
+            }
+        };
     let task = current_task_id();
     let joined = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,

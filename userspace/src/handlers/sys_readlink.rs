@@ -13,10 +13,15 @@ pub(crate) fn sys_readlink(ctx: &mut dyn TrapContext) {
     // it and a negative value must stay negative for the -EINVAL gate in
     // `do_readlinkat`.
     let buf_len = args.arg2 as u32 as i32 as i64;
-    let raw = match copy_user_cstr(path_ptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+    // `getname_flags` is the first thing every path syscall does, and it has
+    // exactly two failures: a pointer it cannot read is -EFAULT, and a path
+    // that reaches PATH_MAX with no terminator is -ENAMETOOLONG. This used to
+    // answer -1, which reaches libc as EPERM — "operation not permitted" about
+    // a caller whose only mistake was a bad pointer.
+    let raw = match copy_user_cstr_checked(path_ptr, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

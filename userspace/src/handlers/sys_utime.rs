@@ -5,13 +5,13 @@ use super::*;
 /// in SECONDS; NULL times = both now.
 pub(crate) fn sys_utime(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let raw = match copy_user_cstr(a.arg0, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    let raw = match copy_user_cstr_checked(a.arg0, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
             return;
-        }
-    };
+            }
+        };
     let (at, mt) = if a.arg1 == 0 {
         let now = wall_now_ns();
         (now, now)

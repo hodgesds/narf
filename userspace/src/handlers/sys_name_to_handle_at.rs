@@ -9,7 +9,17 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     const EOVERFLOW: i64 = 75;
     const AT_EMPTY_PATH: u64 = 0x1000;
     let a = *ctx.args();
-    let raw = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
+    // As in execveat: a faulting pointer is -EFAULT, not an empty path. Folded
+    // together, an unreadable pointer took the AT_EMPTY_PATH branch below and
+    // returned a handle for the fd, or EINVAL without it — either way an
+    // answer about the wrong thing.
+    let raw = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     // AT_EMPTY_PATH form: name_to_handle_at(fd, "", &handle, &mnt_id,
     // AT_EMPTY_PATH) requests a handle for the fd itself. Callers such as
     // systemd's cg_fd_get_cgroupid read this to obtain a cgroup's id — an

@@ -7,13 +7,13 @@ use super::*;
 pub(crate) fn sys_creat(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let path_uptr = a.arg0;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok(!0u64));
+    let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
     struct Reshape<'a> {
         inner: &'a mut dyn TrapContext,

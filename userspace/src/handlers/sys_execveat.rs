@@ -16,7 +16,19 @@ pub(crate) fn sys_execveat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
-    let path_str = copy_user_cstr(a.arg1, 4096).unwrap_or_default();
+    // A pointer that FAULTS is not an empty path. `unwrap_or_default()` made
+    // the two indistinguishable, and the AT_EMPTY_PATH branch below then read
+    // an unreadable pointer as the fexecve form and executed the dirfd's
+    // binary — a silent substitution where Linux's `getname_flags` returns
+    // -EFAULT. An empty STRING still arrives as `Ok("")` and keeps its
+    // meaning.
+    let path_str = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     let path_empty = path_str.is_empty();
     const AT_EMPTY_PATH: u64 = 0x1000;
     let task = current_task_id();

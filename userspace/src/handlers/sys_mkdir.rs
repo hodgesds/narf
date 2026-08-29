@@ -128,6 +128,18 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
             ctx.set_return(SyscallReturn::ok((-122i64) as u64)) // -EDQUOT
         }
+        // `vfs_mkdir` opens with `may_create_dentry`, whose permission check
+        // is `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)` — EACCES,
+        // not EPERM, for a parent directory the caller may not write.
+        Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64)) // -EACCES
+        }
+        Some(Err(narf_filesystem::FsError::NotFound)) => {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)) // -ENOENT
+        }
+        Some(Err(narf_filesystem::FsError::Io(_))) => {
+            ctx.set_return(SyscallReturn::ok((-5i64) as u64)) // -EIO
+        }
         _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
     }
 }

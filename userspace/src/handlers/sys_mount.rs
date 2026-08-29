@@ -122,7 +122,6 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let enodev = SyscallReturn::ok((-19i64) as u64); // ENODEV — unknown fstype
     let ebusy = SyscallReturn::ok((-16i64) as u64); // EBUSY — target in use
     let enoent = SyscallReturn::ok((-2i64) as u64); // ENOENT — missing source
-    let efault = SyscallReturn::ok((-14i64) as u64); // EFAULT — bad user pointer
 
     // Linux `mount(2)`: (const char *source, const char *target,
     // const char *filesystemtype, unsigned long mountflags, const void *data).
@@ -152,45 +151,45 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let fstype = if args.arg2 == 0 {
         alloc::string::String::new()
     } else {
-        match copy_user_cstr(args.arg2, 4096) {
-            Some(s) => s,
-            None => {
-                ctx.set_return(efault);
+        match copy_user_cstr_checked(args.arg2, 4096) {
+                Ok(s) => s,
+                Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
                 return;
+                }
             }
-        }
     };
     // A NULL source is legal (MS_REMOUNT / propagation changes pass one).
     let source = if args.arg0 == 0 {
         alloc::string::String::new()
     } else {
-        match copy_user_cstr(args.arg0, 4096) {
-            Some(s) => s,
-            None => {
-                ctx.set_return(efault);
+        match copy_user_cstr_checked(args.arg0, 4096) {
+                Ok(s) => s,
+                Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
                 return;
+                }
             }
-        }
     };
     // arg4 = fs-specific `data` (e.g. tmpfs "mode=0700,size=64M").
     let data = if args.arg4 == 0 {
         alloc::string::String::new()
     } else {
-        match copy_user_cstr(args.arg4, 4096) {
-            Some(data) => data,
-            None => {
-                ctx.set_return(efault);
+        match copy_user_cstr_checked(args.arg4, 4096) {
+                Ok(data) => data,
+                Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
                 return;
+                }
             }
-        }
     };
-    let target_raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(efault);
+    let target_raw = match copy_user_cstr_checked(args.arg1, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
     // `path_mount` runs after `do_mount` has resolved the target: it discards
     // the legacy mount magic before any flag is read, then rejects MS_NOUSER —
     // the in-kernel-only bit that marks a mount userspace may not request.

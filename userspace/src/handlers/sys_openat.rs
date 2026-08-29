@@ -13,13 +13,13 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let path_uptr = args.arg1;
     let flags = args.arg2;
     let mode = args.arg3 as u32;
-    let path_str = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+    let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
+            Ok(s) => s,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
             return;
-        }
-    };
+            }
+        };
     // Honour a real directory fd: `openat(dirfd, relpath)` resolves `relpath`
     // against the directory backing `dirfd`. Absolute paths and AT_FDCWD
     // resolve as before. sd-device's `chase_symlinks` (behind libudev and

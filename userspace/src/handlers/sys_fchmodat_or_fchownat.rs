@@ -25,13 +25,13 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
-    let raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(path) => path,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+    let raw = match copy_user_cstr_checked(args.arg1, 4096) {
+            Ok(path) => path,
+            Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-        }
-    };
+            }
+        };
 
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
