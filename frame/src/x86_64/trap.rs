@@ -727,7 +727,13 @@ mod perf_dump {
 
     static PMUC: narf_lib::sync::IrqSafeSpinLock<Option<[pmu::PmuCounter; 4]>> =
         narf_lib::sync::IrqSafeSpinLock::new(None);
-    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
+    /// Monotonic-ns timestamp of the last PERF/PCORE dump. `total_ticks()` sums
+    /// every CPU's ticks, so a `% N`-tick gate races past its boundary ~cpu_count
+    /// times faster than intended and floods the serial console — and each dump's
+    /// per-CPU `writeln!`s run in the tick IRQ, so over-printing skews the very
+    /// profile it feeds. Throttle the DUMP to wall-clock (~1/s); the per-tick RIP
+    /// recording above stays cheap and unthrottled.
+    static LAST_DUMP_NS: AtomicU64 = AtomicU64::new(0);
     // Last interrupted RIP / CPL per CPU, recorded every tick — shows WHERE a
     // busy core is spinning (addr2line the printed rip against narf-frame).
     const MAXC: usize = 16;
@@ -746,7 +752,18 @@ mod perf_dump {
             narf_lib::perf::set_enabled(true);
         }
         let t = narf_lib::perf::total_ticks();
-        if t == 0 || t % 3000 != 0 || LAST.swap(t, Ordering::Relaxed) == t {
+        if t == 0 {
+            return;
+        }
+        // Dump at most ~once per wall-clock second (see LAST_DUMP_NS). The first
+        // CPU to cross the interval claims it via CAS; the rest return.
+        let now_ns = narf_scheduler::narf_time::monotonic_ns();
+        let last = LAST_DUMP_NS.load(Ordering::Relaxed);
+        if now_ns.saturating_sub(last) < 1_000_000_000
+            || LAST_DUMP_NS
+                .compare_exchange(last, now_ns, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
             return;
         }
         let mut g = PMUC.lock();
