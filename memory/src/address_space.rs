@@ -2650,6 +2650,11 @@ impl AddressSpace {
                         .get_mut(rollback_base)
                         .expect("shared alias region disappeared under lock")
                         .phys[rollback_page] = old_phys;
+                    // Undo the rmap owner move this alias's successful
+                    // replacement performed (new → back to old), mirroring the
+                    // PTE/`phys` rollback above.
+                    crate::rmap::remove(new_phys, self.root, rollback_va);
+                    crate::rmap::add(old_phys, self.root, rollback_va);
                     self.flush_region_broadcast(rollback_va, 1);
                 }
                 return Err(AddressSpaceError::NotImplemented);
@@ -2658,6 +2663,15 @@ impl AddressSpace {
                 .get_mut(region_base)
                 .expect("shared alias region disappeared under lock")
                 .phys[page_idx] = new_phys;
+            // Transfer the reverse-map owner from the old frame to the new one,
+            // exactly as Linux page migration moves a folio's mapping
+            // (mm/migrate.c `folio_migrate_mapping` / `remove_migration_ptes`)
+            // so the OLD page's mapcount reaches 0 before it can be freed.
+            // Without this, `old_phys` keeps a stale (root, va) owner pointing at
+            // a frame whose leaf now maps `new_phys`, and freeing `old_phys`
+            // later trips the nonzero-mapcount invariant.
+            crate::rmap::remove(old_phys, self.root, page_va);
+            crate::rmap::add(new_phys, self.root, page_va);
             self.flush_region_broadcast(page_va, 1);
             replaced += 1;
         }
@@ -5315,6 +5329,19 @@ impl AddressSpace {
             let p_last = last.min(old.phys.len());
             let p_first = first.min(p_last);
             if old.perms.contains(RegionPerms::SHARED) {
+                // Retire each punched page's rmap owner before releasing the
+                // borrowed frame, exactly as `free_region_frames` does for
+                // SHARED regions (rmap::remove runs there before
+                // `release_shared_phys`). The frame itself belongs to an
+                // external registry and is not returned to the buddy here, but
+                // its per-AS (root, va) reverse-map entry must still be dropped —
+                // otherwise a later registry free finds a stale owner.
+                for (off, phys) in old.phys[first..last].iter().enumerate() {
+                    if phys.raw() != 0 {
+                        let va = VirtAddr::new(rb + ((first + off) as u64) * 4096);
+                        crate::rmap::remove(*phys, self.root, va);
+                    }
+                }
                 shared_to_release.extend(
                     old.phys[p_first..p_last]
                         .iter()
@@ -5322,6 +5349,17 @@ impl AddressSpace {
                         .filter(|phys| phys.raw() != 0),
                 );
             } else {
+                // Drop each punched page's rmap entry before its frame returns
+                // to the buddy, mirroring `free_region_frames`: a MAP_FIXED
+                // punch / munmap that frees resident private backing must not
+                // leave a stale (root, va) owner on the reclaimed frame (Linux
+                // free_pages_prepare's "nonzero mapcount" invariant).
+                for (off, phys) in old.phys[first..last].iter().enumerate() {
+                    if phys.raw() != 0 {
+                        let va = VirtAddr::new(rb + ((first + off) as u64) * 4096);
+                        crate::rmap::remove(*phys, self.root, va);
+                    }
+                }
                 to_free.extend(
                     old.phys[p_first..p_last]
                         .iter()
@@ -8245,6 +8283,15 @@ impl AddressSpace {
                     if p.raw() == 0 {
                         continue;
                     }
+                    // Retire the reverse-map entry before the frame returns to
+                    // the buddy, exactly as `free_region_frames` does on the
+                    // ordinary unmap path. Zeroing `phys[i]` makes the later
+                    // teardown skip this page, so MADV_DONTNEED/FREE is the only
+                    // place to drop its rmap owner; omitting it leaked a stale
+                    // (root, va) onto every reclaimed frame (Linux
+                    // free_pages_prepare's "nonzero mapcount" invariant).
+                    let va = VirtAddr::new(rb + (i as u64) * 4096);
+                    crate::rmap::remove(p, self.root, va);
                     to_release.push(crate::frame::PhysFrame::new(p));
                     r.phys[i] = PhysAddr::new(0);
                 }

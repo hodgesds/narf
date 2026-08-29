@@ -3088,3 +3088,90 @@ kernel_test_in!(
     "scheduler",
     smoke_realtime_admission_is_bounded_and_released
 );
+
+/// The cross-core wake list (Linux `ttwu_queue_wakelist`) stages a task off to
+/// the side and the target folds it into its OWN run queue on drain (Linux
+/// `sched_ttwu_pending`) — the task is not visible in `READY` until then, and
+/// the `Enqueued` policy event fires on the target. Exercised on a single CPU:
+/// the primitives take an explicit `cpu`, independent of SMP onlineness.
+fn smoke_scheduler_wake_list_transfers_to_ready() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    RAN.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+
+    // Spawn one task; the local enqueue path lands it in READY[0].
+    crate::spawn(async {
+        RAN.fetch_add(1, Ordering::Relaxed);
+    });
+    let slot = match crate::READY[0].lock().as_mut().and_then(|d| d.pop_front()) {
+        Some(s) => s,
+        None => return TestResult::Fail("spawned task not found in READY[0]"),
+    };
+
+    if crate::wake_list_pending(0) {
+        return TestResult::Fail("wake list unexpectedly non-empty before push");
+    }
+    // Stage it as a cross-core waker would (llist_add).
+    crate::wake_list_push(0, slot, crate::policy::TaskEnqueueReason::Admitted);
+    if !crate::wake_list_pending(0) {
+        return TestResult::Fail("push did not register on the wake list");
+    }
+    // Still off-queue: the target folds it in only on drain.
+    if crate::READY[0]
+        .lock()
+        .as_ref()
+        .map(|d| d.len())
+        .unwrap_or(0)
+        != 0
+    {
+        return TestResult::Fail("task reached READY before drain");
+    }
+
+    // Target-side fold (llist_del_all + sched_ttwu_pending).
+    crate::drain_wake_list(0);
+    if crate::wake_list_pending(0) {
+        return TestResult::Fail("wake list not emptied by drain");
+    }
+    if crate::READY[0]
+        .lock()
+        .as_ref()
+        .map(|d| d.len())
+        .unwrap_or(0)
+        != 1
+    {
+        return TestResult::Fail("drain did not move the task into READY");
+    }
+
+    crate::run_until_empty();
+    if RAN.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("drained task did not run to completion");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_wake_list_transfers_to_ready);
+
+/// Steal-path contention fix: a remote best-effort caller must SKIP a contended
+/// victim policy slot, never spin on it. A blocking acquire in the steal path
+/// let a herd of idle thieves pile onto a queue-rich victim's slot and starve
+/// its own dispatch (the SPIN-NOT-POLLING stall). The probe holds the slot and
+/// confirms the non-blocking accessor returns `None` (skip) rather than
+/// blocking, and succeeds once the slot is free.
+fn smoke_scheduler_try_with_scheduler_is_non_blocking() -> TestResult {
+    // A high slot index, least likely to collide with an actively-dispatching
+    // online CPU; the assertion holds regardless since we hold the guard.
+    let cpu = crate::CpuId((narf_lib::percpu::MAX_CPUS - 1) as u32);
+    let (skipped_while_held, ran_when_free) =
+        crate::policy::__try_with_scheduler_contention_probe(cpu);
+    if !skipped_while_held {
+        return TestResult::Fail("try_with_scheduler acquired a held slot (would block)");
+    }
+    if !ran_when_free {
+        return TestResult::Fail("try_with_scheduler failed to run on a free slot");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_try_with_scheduler_is_non_blocking
+);

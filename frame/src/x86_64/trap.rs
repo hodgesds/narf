@@ -424,11 +424,18 @@ mod stall_wd {
         // Idle-stall wedge census. The `runnable > 0` panic below cannot see a
         // lost wakeup that leaves every task parked (runnable == 0) — precisely
         // the SMP signal-wake strand (all workers/parent parked, CPU idle-halts,
-        // syscall rate collapses). Trigger on the collapsed rate ALONE, dump the
-        // per-task census (which now carries has_sigwaker + strand) so the
-        // waker-less park is named. Spaced (streak resets each fire) and capped
-        // so a genuinely slow-but-progressing run isn't flooded.
-        if wc > 20 && delta < 5_000 {
+        // syscall rate collapses). Dump the per-task census (which now carries
+        // has_sigwaker + strand) so the waker-less park is named. Spaced (streak
+        // resets each fire) and capped so a genuinely slow-but-progressing run
+        // isn't flooded.
+        //
+        // Gate on `runnable == 0`, the all-parked scenario this census exists
+        // for. A syscall-free but HEALTHY CPU-bound phase (stress-ng --cpu /
+        // --matrix: every CPU running a user task, few syscalls) also collapses
+        // `delta`, but has runnable work — it is not a wedge and previously
+        // spammed this census on clean runs. A real stall with runnable work is
+        // the panic path's job, not this diagnostic's.
+        if wc > 20 && delta < 5_000 && runnable == 0 {
             let n = WEDGE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
             if n >= 3 {
                 WEDGE_STREAK.store(0, Ordering::Relaxed);
