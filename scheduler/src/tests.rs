@@ -673,6 +673,65 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_spawn_kicks_halted_remote_cpu);
 
+/// The hardened wake path publishes a per-CPU `NEED_RESCHED` request on EVERY
+/// cross-core wake, independent of the IPI decision. This is the authoritative
+/// second Dekker channel: even when the target is running (IPI correctly
+/// skipped), the request is durable so the target catches it via the O(1)
+/// check at its next halt commit instead of relying on a bounded idle spin.
+/// Asserted through the test accessors on the same commandeered-CPU-1 harness
+/// as the kick test (SMP=1 only, or a real AP owns CPU 1's resched state).
+fn smoke_scheduler_wake_publishes_need_resched() -> TestResult {
+    use crate::{spawn_with_spec, Affinity, CpuId, TaskSpec};
+
+    if narf_lib::smp::online_count() > 1 {
+        return TestResult::Skip("needs SMP=1 — a live AP owns CPU 1's NEED_RESCHED");
+    }
+    if narf_lib::smp::ever_online_bitmap() != 1 {
+        return TestResult::Skip(
+            "an AP really came up this boot — CPU 1's resched state isn't ours",
+        );
+    }
+
+    crate::__reset_queues_for_test();
+    narf_lib::smp::__test_fake_online(1);
+
+    let spec = || TaskSpec {
+        affinity: Affinity {
+            allowed: crate::affinity::CpuSet::ALL,
+            preferred: Some(CpuId(1)),
+        },
+        ..TaskSpec::unthrottled()
+    };
+
+    // Case A: target halted → request published AND IPI sent.
+    crate::__test_set_cpu_halted(1, true);
+    crate::__test_clear_need_resched(1);
+    let _ = spawn_with_spec(async {}, spec());
+    let need_when_halted = crate::__test_need_resched(1);
+
+    // Case B: target running → IPI skipped, but the request is STILL published
+    // (the durable channel is what hardens the halt-poll-window race).
+    crate::__test_set_cpu_halted(1, false);
+    crate::__test_clear_need_resched(1);
+    let _ = spawn_with_spec(async {}, spec());
+    let need_when_running = crate::__test_need_resched(1);
+
+    narf_lib::smp::mark_offline(1);
+    crate::__test_clear_need_resched(1);
+    crate::__reset_queues_for_test();
+
+    if !need_when_halted {
+        return TestResult::Fail("wake to a halted remote CPU did not publish NEED_RESCHED");
+    }
+    if !need_when_running {
+        return TestResult::Fail(
+            "wake to a running remote CPU did not publish NEED_RESCHED (authoritative channel lost)",
+        );
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_wake_publishes_need_resched);
+
 fn smoke_scheduler_numa_steal_prefers_same_node() -> TestResult {
     // With work-stealing on and per-CPU queues seeded across two
     // NUMA nodes, a steal should pull from a same-node victim first.
