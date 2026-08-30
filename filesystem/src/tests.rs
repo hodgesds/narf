@@ -5896,3 +5896,45 @@ fn smoke_dev_uinput_empty_read_is_not_eof() -> TestResult {
     }
 }
 kernel_test_in!("filesystem", smoke_dev_uinput_empty_read_is_not_eof);
+
+/// `fs_inode_can_poll` follows the inode's type, not the filesystem.
+///
+/// Linux installs `file_operations` at open time, and which set it picks
+/// depends on what the inode IS. `ext4_file_operations` and
+/// `ext4_dir_operations` set no `.poll`, so stored data and directories are
+/// unpollable; a FIFO in that same filesystem is opened through
+/// `pipefifo_fops`, a device node through its driver, and a socket inode
+/// through the socket — all of which have one. The filesystem the inode
+/// happens to live in never gets a say.
+///
+/// This is the rule every on-disk backend's `can_poll` defers to, and it is
+/// pinned here because the syscall-level epoll test cannot reach it: MemFs
+/// uses a separate type per kind, so its FIFO exercises a plain default
+/// rather than this. A blanket "this backend is unpollable" passes that test
+/// and fails this one — which is exactly the mistake it exists to catch,
+/// because it would refuse an epoll on a FIFO that Linux polls happily.
+fn smoke_filesystem_fs_inode_can_poll() -> TestResult {
+    use crate::{fs_inode_can_poll, FileType};
+
+    // No `.poll` in the filesystem's own file/dir operations.
+    for ty in [FileType::File, FileType::Dir] {
+        if fs_inode_can_poll(ty) {
+            return TestResult::Fail("stored file data and directories must not be pollable");
+        }
+    }
+    // Everything else dispatches away from the filesystem on open, to
+    // something that does have `.poll`.
+    for ty in [
+        FileType::Fifo,
+        FileType::Special,
+        FileType::Block,
+        FileType::Socket,
+    ] {
+        if !fs_inode_can_poll(ty) {
+            return TestResult::Fail("a FIFO, device or socket inode must stay pollable");
+        }
+    }
+    TestResult::Pass
+}
+
+kernel_test_in!("filesystem", smoke_filesystem_fs_inode_can_poll);

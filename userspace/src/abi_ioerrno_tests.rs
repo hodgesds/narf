@@ -2841,3 +2841,89 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_epoll_ctl_unpollable_target_is_eperm
 );
+
+/// A tmpfs regular file is unpollable; a FIFO beside it is not.
+///
+/// Linux decides `file_can_poll` by which `file_operations` the open
+/// installed. `shmem_file_operations` sets no `.poll`, so stored file data is
+/// unpollable — but a FIFO is opened through `pipefifo_fops`, which has one.
+///
+/// Scope, so this is not read as more than it is: MemFs uses a distinct type
+/// per kind, so the FIFO half here exercises `MemFifo` keeping the pollable
+/// DEFAULT — not the per-inode `fs_inode_can_poll` rule, which only runs in
+/// the on-disk backends this suite never mounts. That rule is pinned
+/// directly by `smoke_filesystem_fs_inode_can_poll` instead. Verified by
+/// making `fs_inode_can_poll` return a blanket false: this test still
+/// passed, which is what showed it was not covering it.
+fn smoke_abi_ioerrno_epoll_ctl_pollability_follows_the_inode() -> TestResult {
+    const EPOLL_CTL_ADD: u64 = 1;
+    const S_IFIFO: u64 = 0o010000;
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    const O_RDWR: u64 = 2;
+    const O_NONBLOCK: u64 = 0o4000;
+
+    with_memfs("/abi-pollkind", "pollkind", &[("data", b"x")], || {
+        let ep = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create failed"),
+        };
+        let mut ev = [0u8; 12];
+        ev[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+
+        // Regular file in this filesystem: no poll, EPERM.
+        let reg = b"/abi-pollkind/data\0";
+        let rfd = match call_open(reg.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the regular file"),
+        };
+        let rc = call(
+            Syscall::EpollCtl.raw(),
+            a3(ep, EPOLL_CTL_ADD, rfd, ev.as_mut_ptr() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(rfd));
+        if rc != Some(EPERM) {
+            let _ = call(Syscall::Close.raw(), a0(ep));
+            return Err("a regular file should not be pollable");
+        }
+
+        // A FIFO in the SAME filesystem: opened through the pipe path, so it
+        // keeps its poll and stays addable.
+        let fifo = b"/abi-pollkind/pipe\0";
+        if call(
+            Syscall::Mknod.raw(),
+            a3(fifo.as_ptr() as u64, S_IFIFO | 0o644, 0, 0),
+        ) != Some(0)
+        {
+            // Not tolerated: without a FIFO this test proves only the
+            // regular-file half, which is the half a blanket "this backend is
+            // unpollable" would also satisfy.
+            let _ = call(Syscall::Close.raw(), a0(ep));
+            return Err("mknod(FIFO) failed, so the inode-type half never ran");
+        }
+        let ffd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, fifo.as_ptr() as u64, O_RDWR | O_NONBLOCK, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => {
+                let _ = call(Syscall::Close.raw(), a0(ep));
+                return Err("could not open the FIFO");
+            }
+        };
+        let rc = call(
+            Syscall::EpollCtl.raw(),
+            a3(ep, EPOLL_CTL_ADD, ffd, ev.as_mut_ptr() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(ffd));
+        let _ = call(Syscall::Close.raw(), a0(ep));
+        if rc != Some(0) {
+            return Err("a FIFO must stay pollable even in a filesystem whose files are not");
+        }
+        Ok(())
+    })
+}
+
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_ctl_pollability_follows_the_inode
+);

@@ -913,6 +913,13 @@ impl OverlayFile {
 }
 
 impl FileOps for OverlayFile {
+    /// `ovl_file_operations` sets no `.poll`, so an overlaid regular file is
+    /// not pollable — the overlay does not change what the inode is. Decided
+    /// per inode, so a special file showing through stays pollable.
+    fn can_poll(&self) -> bool {
+        crate::fs_inode_can_poll(self.stat().mode.file_type)
+    }
+
     fn read<'a>(&'a self, offset: u64, buffer: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move { self.active().read(offset, buffer).await })
     }

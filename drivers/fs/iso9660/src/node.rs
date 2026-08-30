@@ -76,6 +76,13 @@ impl<B: BlockDevice + 'static> Iso9660Node<B> {
 // ── FileOps ─────────────────────────────────────────────────────────
 
 impl<B: BlockDevice + 'static> FileOps for Iso9660Node<B> {
+    /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
+    /// inode — a FIFO or device node living in this filesystem dispatches
+    /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
+    fn can_poll(&self) -> bool {
+        narf_filesystem::fs_inode_can_poll(self.stat().mode.file_type)
+    }
+
     /// Read up to `buf.len()` bytes starting at `offset`. ISO 9660
     /// extents are contiguous on the medium (ECMA-119 §6.5.1), so
     /// the byte-to-LBA mapping is trivially:
