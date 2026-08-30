@@ -3067,8 +3067,12 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
         // Name already taken — linkat never replaces (EEXIST).
         Some(Err(narf_filesystem::FsError::Busy)) => -17, // -EEXIST
         Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122, // -EDQUOT
-        // The FS can't hold an externally-minted node (link_node default).
-        Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // -EOPNOTSUPP
+        // `vfs_link`: `if (!dir->i_op->link) return -EPERM;`. A filesystem
+        // with no link operation is EPERM, not EOPNOTSUPP — `link(2)` lists
+        // EPERM for exactly this ("the filesystem does not support the
+        // creation of hard links") and does not list EOPNOTSUPP at all, so a
+        // caller matching the documented set never saw this answer.
+        Some(Err(narf_filesystem::FsError::Unsupported)) => -1, // -EPERM
         // `vfs_link`'s `if (dir->i_sb != inode->i_sb) return -EXDEV;`. The
         // comparison happens in the backend, which is the only place that
         // knows which filesystem an `Arc<dyn FileOps>` belongs to; it reports

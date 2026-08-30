@@ -1237,6 +1237,15 @@ impl FileOps for MemFile {
         self.ino
     }
 
+    /// Plain file data has no `poll` operation, so `epoll_ctl` refuses it —
+    /// see [`FileOps::can_poll`]. This is the tmpfs regular file and the
+    /// O_TMPFILE inode; the FIFO, symlink and special-file types beside it
+    /// keep the pollable default, as do the on-disk backends, which have not
+    /// been audited one by one.
+    fn can_poll(&self) -> bool {
+        false
+    }
+
     /// Needed so a destination directory can recognise one of its own inodes.
     /// `MemDir::link_node` downcasts here to compare superblocks, and the
     /// default `None` would make every node — including this filesystem's own

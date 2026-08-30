@@ -812,6 +812,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
     const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
     const EEXIST: SyscallReturn = SyscallReturn::ok((-17i64) as u64);
     const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
+    const EPERM: SyscallReturn = SyscallReturn::ok((-1i64) as u64);
     const ENOENT: SyscallReturn = SyscallReturn::ok((-2i64) as u64);
     const ELOOP: SyscallReturn = SyscallReturn::ok((-40i64) as u64);
     let task = current_task_id();
@@ -857,14 +858,22 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // LINUX-GAP: `do_epoll_ctl` rejects a target with no `.poll` operation —
-    // `if (!file_can_poll(fd_file(tf))) return -EPERM;` — which on Linux
-    // covers regular files and directories. NARF has no equivalent marker on
-    // `FileOps`, and file type is NOT a usable proxy for one: inotify
-    // descriptors and the pollable procfs files (`/proc/self/mountinfo`,
-    // whose whole point is change notification) are `FileType::File` here and
-    // must stay addable. Expressing this faithfully needs a `can_poll` on the
-    // trait, audited per implementation.
+    // `if (!file_can_poll(fd_file(tf))) return -EPERM;`
+    //
+    // Position matters: this sits after BOTH descriptors resolve and before
+    // the -EINVAL arms below, so a call that is wrong in two ways at once —
+    // an epfd that is not an epoll AND a target that cannot be polled —
+    // reports EPERM, not EINVAL. Moving it after the EINVAL checks would
+    // report the wrong one of the two.
+    //
+    // `FileOps::can_poll` carries the answer because file TYPE cannot: an
+    // inotify descriptor and `/proc/self/mountinfo` are both `FileType::File`
+    // here and both must stay addable. It defaults to true, so only backends
+    // that positively declare themselves unpollable are refused.
+    if !target_ops.can_poll() {
+        ctx.set_return(EPERM);
+        return;
+    }
     // Both "epfd names itself" and "epfd is not an epoll" are -EINVAL, and
     // Linux checks them only after both descriptors resolve. The comparison
     // is on the open file description (`fd_file(f) == fd_file(tf)`), not the

@@ -469,10 +469,23 @@ const FAULTING: u64 = u64::MAX;
 
 /// Build the 16 bytes of `struct sigevent` the handler reads:
 /// `sigev_value` (8 B) then `sigev_signo` (4 B) then `sigev_notify` (4 B).
-fn sigevent(signo: i32, notify: i32) -> [u8; 16] {
-    let mut b = [0u8; 16];
+/// A `sigevent_t` as the ABI defines it — SIGEV_MAX_SIZE, 64 bytes.
+///
+/// `SYSCALL_DEFINE3(timer_create)` does `copy_from_user(&event,
+/// timer_event_spec, sizeof (event))` and faults on ANY of those bytes, so a
+/// 16-byte fixture is not a valid argument: it happened to work only while
+/// the handler read the leading 16.
+fn sigevent(signo: i32, notify: i32) -> [u8; 64] {
+    sigevent_tid(signo, notify, 0)
+}
+
+/// A `sigevent_t` with `_sigev_un._tid` set — the union's first member, at
+/// offset 16, which the `SIGEV_*|SIGEV_THREAD_ID` forms name.
+fn sigevent_tid(signo: i32, notify: i32, tid: i32) -> [u8; 64] {
+    let mut b = [0u8; 64];
     b[8..12].copy_from_slice(&signo.to_le_bytes());
     b[12..16].copy_from_slice(&notify.to_le_bytes());
+    b[16..20].copy_from_slice(&tid.to_le_bytes());
     b
 }
 
@@ -503,10 +516,18 @@ fn smoke_abi_time_timer_create_pos() -> TestResult {
         // Explicit sigevents. SIGRTMIN matters: glibc's SIGEV_THREAD
         // rewrites to SIGEV_SIGNAL|SIGEV_THREAD_ID with signo=SIGRTMIN,
         // and the old `signum >= 32` cap rejected every one of them.
+        // The THREAD_ID form needs a real thread to name. `good_sigevent`
+        // resolves `sigev_notify_thread_id` with `find_vpid()` and requires
+        // `same_thread_group`, so the caller's own tid is the one value
+        // guaranteed to satisfy it.
+        let self_tid = match call(Syscall::Gettid.raw(), a0(0)) {
+            Some(t) if t > 0 => t as i32,
+            _ => return Err("gettid should report a live tid"),
+        };
         for ev in [
             sigevent(SIGALRM_SIGNO, SIGEV_SIGNAL),
             sigevent(SIGRTMIN, SIGEV_SIGNAL),
-            sigevent(SIGRTMIN, SIGEV_SIGNAL | SIGEV_THREAD_ID),
+            sigevent_tid(SIGRTMIN, SIGEV_SIGNAL | SIGEV_THREAD_ID, self_tid),
             sigevent(0, SIGEV_NONE),
         ] {
             if call(
@@ -521,6 +542,113 @@ fn smoke_abi_time_timer_create_pos() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timer_create_pos);
+
+/// `good_sigevent()` resolves `SIGEV_THREAD_ID` and rejects a bad thread.
+///
+/// ```text
+/// case SIGEV_SIGNAL | SIGEV_THREAD_ID:
+///         pid = find_vpid(event->sigev_notify_thread_id);
+///         rtn = pid_task(pid, PIDTYPE_PID);
+///         if (!rtn || !same_thread_group(rtn, current))
+///                 return NULL;          /* -> -EINVAL */
+///         fallthrough;
+/// case SIGEV_SIGNAL:
+///         if (event->sigev_signo <= 0 || ... > SIGRTMAX)
+///                 return NULL;
+/// ```
+///
+/// The thread lookup comes FIRST and falls through into the signo bound, so
+/// a sigevent that is wrong in both ways reports the thread failure. Both are
+/// EINVAL, so the ordering is not observable through the errno — but the
+/// arms are pinned here anyway, because the code has to check them in this
+/// order to match, and a future split of the two errnos would expose it.
+///
+/// `find_vpid(0)` is `idr_find(&ns->idr, 0)`, and a pid namespace's idr
+/// starts at 1 — so tid 0 names nothing and is EINVAL, not "unspecified".
+fn smoke_abi_time_timer_create_thread_id() -> TestResult {
+    with_setup(|| {
+        let mut id = [0u64; 1];
+        let out = id.as_mut_ptr() as u64;
+        const SIGEV_SIGNAL_THREAD_ID: i32 = SIGEV_SIGNAL | SIGEV_THREAD_ID;
+
+        let self_tid = match call(Syscall::Gettid.raw(), a0(0)) {
+            Some(t) if t > 0 => t as i32,
+            _ => return Err("gettid should report a live tid"),
+        };
+        // Names this thread: accepted.
+        let ok = sigevent_tid(SIGRTMIN, SIGEV_SIGNAL_THREAD_ID, self_tid);
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2(CLOCK_MONOTONIC, ok.as_ptr() as u64, out),
+        ) != Some(0)
+        {
+            return Err("SIGEV_THREAD_ID naming the caller's own thread should be accepted");
+        }
+
+        // Names nothing: EINVAL. Zero is the case a caller falls into by
+        // leaving the field unset, which used to be silently accepted.
+        for bad_tid in [0i32, -1, 0x7fff_0000] {
+            let ev = sigevent_tid(SIGRTMIN, SIGEV_SIGNAL_THREAD_ID, bad_tid);
+            if call(
+                Syscall::TimerCreate.raw(),
+                a2(CLOCK_MONOTONIC, ev.as_ptr() as u64, out),
+            ) != Some(EINVAL)
+            {
+                return Err("SIGEV_THREAD_ID naming no live thread should be EINVAL");
+            }
+        }
+
+        // Thread lookup precedes the signo bound: a sigevent wrong in both
+        // ways still takes the thread arm.
+        let both = sigevent_tid(0, SIGEV_SIGNAL_THREAD_ID, 0);
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2(CLOCK_MONOTONIC, both.as_ptr() as u64, out),
+        ) != Some(EINVAL)
+        {
+            return Err("a doubly-invalid THREAD_ID sigevent should be EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timer_create_thread_id);
+
+/// The sigevent copy is `sizeof(sigevent_t)` — 64 bytes, not 16.
+///
+/// `SYSCALL_DEFINE3(timer_create)` faults on any of the 64, so a pointer that
+/// is readable for 16 bytes and unmapped beyond is -EFAULT. Reading only the
+/// leading 16 accepted it, and also put `sigev_notify_thread_id` out of
+/// reach.
+fn smoke_abi_time_timer_create_sigevent_is_64_bytes() -> TestResult {
+    with_setup(|| {
+        let mut id = [0u64; 1];
+        let out = id.as_mut_ptr() as u64;
+        // A whole sigevent that IS mapped: accepted, so the size itself is
+        // not what makes the next case fail.
+        let good = sigevent(SIGRTMIN, SIGEV_SIGNAL);
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2(CLOCK_MONOTONIC, good.as_ptr() as u64, out),
+        ) != Some(0)
+        {
+            return Err("a fully mapped 64-byte sigevent should be accepted");
+        }
+        // Readable for its first bytes, faulting before 64 are up. BAD_PTR is
+        // canonical and user-half, so `access_ok` passes and the copy faults.
+        if call(
+            Syscall::TimerCreate.raw(),
+            a2(CLOCK_MONOTONIC, BAD_PTR, out),
+        ) != Some(EFAULT)
+        {
+            return Err("a faulting sigevent pointer should be EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_create_sigevent_is_64_bytes
+);
 
 /// `do_timer_create`: `if (!kc) return -EINVAL;` for a clockid that is not
 /// in `posix_clocks[]` at all.
