@@ -6,7 +6,20 @@
 //! hazard the spec names.
 
 use core::arch::asm;
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+
+/// Cached copy of CR4, maintained by [`write_cr4`]. The trap/syscall entry
+/// prologue reads this from MEMORY instead of executing `mov rax, cr4` to test
+/// CR4.PKS (bit 24) / CR4.PCIDE (bit 17) and decide whether to enter a FRAME
+/// isolation domain. Under KVM/SVM a `mov from CR4` VMEXITs, so reading the
+/// register on every syscall + trap cost ~248k VMEXITs/sec under a redis load
+/// (the dominant exit reason, ~half of all exit time). Those two bits are set
+/// once at boot and never change (the domain switch writes CR3, never CR4), so
+/// the cached value is always correct for the branch. `#[no_mangle]` because
+/// the entry assembly references it by symbol via RIP (a linker-private
+/// architecture ABI, like `NARF_X86_FRAME_PML4`).
+#[unsafe(no_mangle)]
+pub static NARF_X86_CACHED_CR4: AtomicU64 = AtomicU64::new(0);
 
 /// CR4 bit: PKS (bit 24). Enables supervisor protection keys
 /// (IA32_PKRS-based domain rights).
@@ -50,6 +63,11 @@ pub unsafe fn write_cr4(value: u64) {
         asm!("mov cr4, {v}", v = in(reg) value,
              options(nomem, nostack, preserves_flags));
     }
+    // Keep the entry-prologue's cached copy in step with the register so the
+    // trap/syscall path can test CR4.PKS/PCIDE from memory (no VMEXIT). Stored
+    // AFTER the write so a concurrent entry reads either the old or new value,
+    // never a torn one; feature bits change only during boot/AP bringup.
+    NARF_X86_CACHED_CR4.store(value, Ordering::Release);
     compiler_fence(Ordering::SeqCst);
 }
 

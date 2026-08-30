@@ -177,7 +177,10 @@ pub unsafe extern "C" fn syscall_entry_x86_64() {
 
         // User GPRs are now safe in UserState. Capture the live task-domain
         // state and enter neutral FRAME before the first Rust instruction.
-        "mov rax, cr4",
+        // Read CR4 from its cached copy (write_cr4 maintains it): the live
+        // `mov rax, cr4` VMEXITs under KVM/SVM on every syscall, and this only
+        // needs the boot-stable PKS(24)/PCIDE(17) bits.
+        "mov rax, qword ptr [rip + NARF_X86_CACHED_CR4]",
         "bt rax, 24",
         "jc 7f",
         "bt rax, 17",
