@@ -609,6 +609,22 @@ pub(crate) struct WakeCell {
 static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
 
+/// Per-CPU reschedule request (Linux `TIF_NEED_RESCHED`). A waker publishes
+/// this for the target CPU as a SECOND, AUTHORITATIVE Dekker channel paired
+/// with `CPU_HALTED`: the waker stores it before the `resched_remote` SeqCst
+/// fence, the idle side stores `CPU_HALTED` then fences then loads it, so by
+/// the SeqCst-fence theorem a wake racing a halt is never both un-IPI'd AND
+/// unobserved. This hardens the wake path over `CPU_HALTED` alone: a wake that
+/// lands while the target is mid halt-poll (`CPU_HALTED` still false, so the
+/// IPI is correctly skipped) is nonetheless durable here and is caught by the
+/// halt commit's O(1) `swap(false)` — no reliance on a bounded idle spin to
+/// re-notice it. The idle path consumes (clears) it at each halt commit; a
+/// running CPU picks work up through the normal ready-queue awake scan and
+/// clears any stale request the next time it idles (one spurious poll, never a
+/// lost wake).
+static NEED_RESCHED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
 /// Per-CPU periodic-budget boundaries for the currently polling slot. Zero
 /// means no period budget. The timer trap reads these without touching the
 /// private task slot or accounting object.
@@ -802,6 +818,22 @@ pub fn __test_set_cpu_halted(cpu: usize, halted: bool) {
     }
 }
 
+/// Test-only: read a CPU's published reschedule request (`NEED_RESCHED`).
+#[doc(hidden)]
+pub fn __test_need_resched(cpu: usize) -> bool {
+    cpu < narf_lib::percpu::MAX_CPUS && NEED_RESCHED[cpu].load(Ordering::SeqCst)
+}
+
+/// Test-only: clear a CPU's reschedule request so a wake's publish is
+/// observable from a known-zero baseline (the idle commit clears it in the
+/// live path).
+#[doc(hidden)]
+pub fn __test_clear_need_resched(cpu: usize) {
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        NEED_RESCHED[cpu].store(false, Ordering::SeqCst);
+    }
+}
+
 /// Seed a CPU's wake-next buddy directly (bypassing the enabled gate that
 /// `record_wake_next` applies) so a test can drive the honor path in
 /// `pick_next_slot` without racing the real IRQ waker.
@@ -818,6 +850,10 @@ fn resched_remote(target_cpu: u32) {
     if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
         return;
     }
+    // Publish the reschedule request BEFORE the Dekker fence so a target that
+    // commits to halt after this point observes it in its halt-commit check
+    // (see NEED_RESCHED). Authoritative even when the IPI below is skipped.
+    NEED_RESCHED[target_cpu as usize].store(true, Ordering::Release);
     // Pair with the idle side's `mark_halted(true); fence; final-scan`.
     core::sync::atomic::fence(Ordering::SeqCst);
     if !CPU_HALTED[target_cpu as usize].load(Ordering::SeqCst) {
@@ -847,6 +883,11 @@ fn resched_remote_force(target_cpu: u32) {
     if target_cpu == me || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
         return;
     }
+    // Publish the reschedule request before the fence (authoritative even
+    // though this path always IPIs) so a target committing to halt in the same
+    // window catches it via NEED_RESCHED rather than sleeping over the staged
+    // slot.
+    NEED_RESCHED[target_cpu as usize].store(true, Ordering::Release);
     // Pair the push (release) with the target's drain (acquire): the staged slot
     // must be visible before the IPI lands and the handler drains.
     core::sync::atomic::fence(Ordering::SeqCst);
@@ -3717,13 +3758,20 @@ pub fn run_until_empty() {
             narf_memory::tlb_shootdown::mark_idle(cpu as u32);
             CPU_HALTED[cpu].store(true, Ordering::SeqCst);
             core::sync::atomic::fence(Ordering::SeqCst);
-            let woke_late = wake_list_pending(cpu) || {
-                let now = narf_time::now_cycles();
-                let q = READY[cpu].lock();
-                q.as_ref()
-                    .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
-                    .unwrap_or(false)
-            };
+            // Authoritative O(1) resched check first (Linux `need_resched()`):
+            // a waker published NEED_RESCHED before its Dekker fence, so under
+            // the paired store+fence here we observe it iff the wake preceded
+            // our commit. `swap(false)` consumes it. The wake-list + ready-queue
+            // scan remain the backstop for wake sources not routed through the
+            // resched signal.
+            let woke_late =
+                NEED_RESCHED[cpu].swap(false, Ordering::SeqCst) || wake_list_pending(cpu) || {
+                    let now = narf_time::now_cycles();
+                    let q = READY[cpu].lock();
+                    q.as_ref()
+                        .map(|d| d.iter().any(|s| slot_is_dispatchable(s, now)))
+                        .unwrap_or(false)
+                };
             if woke_late {
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
@@ -4256,6 +4304,10 @@ pub fn run_forever() -> ! {
         CPU_HALTED[cpu].store(true, Ordering::SeqCst);
         core::sync::atomic::fence(Ordering::SeqCst);
         let work_arrived = {
+            // Authoritative O(1) resched check first (Linux `need_resched()`),
+            // consumed via swap; the queue / deferred-wake / wake-list checks
+            // below remain the backstop.
+            let need = NEED_RESCHED[cpu].swap(false, Ordering::SeqCst);
             let nonempty = READY[cpu]
                 .lock()
                 .as_ref()
@@ -4268,7 +4320,7 @@ pub fn run_forever() -> ! {
             // the published-HALTED fence, that wake is slept over indefinitely
             // (a tickless idle AP has no periodic IRQ to rescue it). Mirrors
             // Linux `current_clr_polling_and_test()` before HLT (idle.c).
-            nonempty || narf_lib::deferred_wake::has_pending() || wake_list_pending(cpu)
+            need || nonempty || narf_lib::deferred_wake::has_pending() || wake_list_pending(cpu)
         };
         if work_arrived {
             CPU_HALTED[cpu].store(false, Ordering::SeqCst);
