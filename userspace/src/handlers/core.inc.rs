@@ -3069,14 +3069,13 @@ fn link_fd_node_impl(task: u64, src_fd: u32, new_path: &str) -> i64 {
         Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -122, // -EDQUOT
         // The FS can't hold an externally-minted node (link_node default).
         Some(Err(narf_filesystem::FsError::Unsupported)) => -95, // -EOPNOTSUPP
-        // NOTE: `vfs_link`'s `if (dir->i_sb != inode->i_sb) return -EXDEV;`
-        // has no counterpart on this path. `link_node` receives a bare
-        // `Arc<dyn FileOps>` and the backends store it verbatim, so there is
-        // nothing here to compare superblocks with — `Stat` carries no device
-        // identity. No EXDEV arm is mapped because nothing can produce one;
-        // adding the check is a change to the node interface, not to this
-        // table.
-        Some(Err(narf_filesystem::FsError::NotFound)) => -2, // -ENOENT
+        // `vfs_link`'s `if (dir->i_sb != inode->i_sb) return -EXDEV;`. The
+        // comparison happens in the backend, which is the only place that
+        // knows which filesystem an `Arc<dyn FileOps>` belongs to; it reports
+        // the mismatch as `CrossDevice` and this turns it into the errno `cp`
+        // and `mv` look for before falling back to a copy.
+        Some(Err(narf_filesystem::FsError::CrossDevice)) => -18, // -EXDEV
+        Some(Err(narf_filesystem::FsError::NotFound)) => -2,     // -ENOENT
         Some(Err(narf_filesystem::FsError::ReadOnly)) => -30,    // -EROFS
         Some(Err(narf_filesystem::FsError::PermissionDenied)) => -13, // -EACCES
         Some(Err(narf_filesystem::FsError::NoSpace)) => -28,     // -ENOSPC
