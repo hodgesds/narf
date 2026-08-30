@@ -2650,3 +2650,110 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_path_syscalls_fault_not_eperm
 );
+
+/// A hard link cannot span filesystems: EXDEV, and it must not be made.
+///
+/// `fs/namei.c::vfs_link` opens with `if (dir->i_sb != inode->i_sb) return
+/// -EXDEV;`. NARF's `linkat`-by-fd forms — `AT_EMPTY_PATH` on an O_TMPFILE
+/// fd, and `/proc/self/fd/N` — hand the destination directory a bare
+/// `Arc<dyn FileOps>`, and MemFs stored it verbatim. So the link SUCCEEDED,
+/// leaving a name in one filesystem backed by an inode another one owns:
+/// its quota, its link count and its lifetime all accounted somewhere else.
+/// The errno was the smaller half of that bug.
+///
+/// Both directions are checked. The refusal alone would also be satisfied by
+/// a `linkat` that had simply stopped working, so the same-filesystem link
+/// has to keep succeeding for the refusal to mean anything.
+fn smoke_abi_ioerrno_linkat_across_filesystems_is_exdev() -> TestResult {
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    const O_RDWR: u64 = 2;
+    const EXDEV: i64 = -18;
+
+    // Filesystem A is the harness's mount; B is a SECOND, independent MemFs
+    // mounted inside it. Two instances, so their superblocks differ — which is
+    // the thing being tested. A same-type check alone would let them cross.
+    with_memfs("/abi-xdev-a", "xdev-a", &[], || {
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        let fs_b = narf_filesystem::MemFs::with_seeds("xdev-b", &[]);
+        let mnt_b = match narf_filesystem::registry().mount(&auth, "/abi-xdev-b", fs_b) {
+            Ok(h) => h,
+            Err(_) => return Err("mount of the second filesystem failed"),
+        };
+        let result = (|| -> Result<(), &'static str> {
+            // An O_TMPFILE inode in A — the form linkat-by-fd exists for.
+            let dir_a = b"/abi-xdev-a\0";
+            let fd = match call(
+                Syscall::Openat.raw(),
+                a3(
+                    AT_FDCWD,
+                    dir_a.as_ptr() as u64,
+                    O_TMPFILE_BIT | O_RDWR,
+                    0o600,
+                ),
+            ) {
+                Some(fd) if fd >= 0 => fd as u64,
+                _ => return Err("openat(O_TMPFILE) on filesystem A failed"),
+            };
+
+            // Into B: refused, and with EXDEV specifically — not the
+            // EOPNOTSUPP a backend that simply cannot link would report.
+            let empty = b"\0";
+            let cross = b"/abi-xdev-b/linked\0";
+            let rc = call(
+                Syscall::Linkat.raw(),
+                a4(
+                    fd,
+                    empty.as_ptr() as u64,
+                    AT_FDCWD,
+                    cross.as_ptr() as u64,
+                    AT_EMPTY_PATH,
+                ),
+            );
+            if rc != Some(EXDEV) {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return Err("a cross-filesystem linkat was not refused with EXDEV");
+            }
+            // And the refusal left nothing behind. Before the check existed
+            // the link was MADE, so this is the half that matters: a name in
+            // B backed by an inode A owns.
+            if call_open(cross.as_ptr() as u64, 0).is_some_and(|r| r >= 0) {
+                let _ = call(Syscall::Close.raw(), a0(fd));
+                return Err("the refused cross-filesystem link was created anyway");
+            }
+
+            // Into A: still works. Without this the test would also pass if
+            // linkat-by-fd had simply stopped working altogether.
+            let same = b"/abi-xdev-a/linked\0";
+            let rc = call(
+                Syscall::Linkat.raw(),
+                a4(
+                    fd,
+                    empty.as_ptr() as u64,
+                    AT_FDCWD,
+                    same.as_ptr() as u64,
+                    AT_EMPTY_PATH,
+                ),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd));
+            if rc != Some(0) {
+                return Err("a same-filesystem linkat stopped working");
+            }
+            match call_open(same.as_ptr() as u64, 0) {
+                Some(f) if f >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(f as u64));
+                    Ok(())
+                }
+                _ => Err("the same-filesystem link is not readable"),
+            }
+        })();
+        let _ = narf_filesystem::registry().unmount(&mnt_b, "/abi-xdev-b");
+        result
+    })
+}
+
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_linkat_across_filesystems_is_exdev
+);

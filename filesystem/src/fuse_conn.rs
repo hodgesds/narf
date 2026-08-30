@@ -2370,12 +2370,19 @@ impl DirOps for FuseDir {
 
     fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // Both rejections are `vfs_link`'s `dir->i_sb != inode->i_sb`:
+            // a node that is not a `FuseFile`, and one from a different FUSE
+            // connection, are each an inode from another filesystem. Reported
+            // as `Unsupported` this reached userspace as EOPNOTSUPP, which
+            // says the operation is not available here — when the truth is
+            // that it is not available across THESE TWO endpoints, and `cp`
+            // and `mv` branch on EXDEV to fall back to a copy.
             let source = node
                 .as_any()
                 .and_then(|any| any.downcast_ref::<FuseFile>())
-                .ok_or(FsError::Unsupported)?;
+                .ok_or(FsError::CrossDevice)?;
             if !Arc::ptr_eq(&self.conn, &source.conn) {
-                return Err(FsError::Unsupported);
+                return Err(FsError::CrossDevice);
             }
             let reply = self
                 .named_request(

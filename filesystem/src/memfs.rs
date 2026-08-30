@@ -440,11 +440,40 @@ impl SuperState {
 struct MemSuper {
     kind: MemFsKind,
     state: IrqSafeSpinLock<SuperState>,
+    /// True for a superblock minted by [`new_anon_file`] — an inode that
+    /// belongs to no MOUNTED filesystem.
+    ///
+    /// It exists because NARF lets `O_TMPFILE` succeed on a directory whose
+    /// filesystem has no native `tmpfile()`, by minting a standalone inode and
+    /// materialising it later with `link_node`. Linux has no equivalent: its
+    /// O_TMPFILE inode is created BY the target filesystem, so it can never be
+    /// a stranger to the directory it lands in.
+    ///
+    /// Which means the cross-filesystem check has to tell "unowned" apart from
+    /// "owned by someone else". Filing an unowned inode is an adoption, not a
+    /// link across a boundary; there is no second filesystem for it to cross
+    /// from. Refusing it would break every O_TMPFILE on a backend without
+    /// native support.
+    anonymous: core::sync::atomic::AtomicBool,
 }
 
 impl MemSuper {
     fn new(kind: MemFsKind, max_blocks: Option<u64>, max_inodes: Option<u64>) -> Arc<Self> {
         Self::with_quota(kind, max_blocks, max_inodes, false, false)
+    }
+
+    /// A superblock for a standalone inode that belongs to no mount.
+    /// Set before the `Arc` is shared, and never cleared.
+    fn new_anonymous() -> Arc<Self> {
+        let sb = Self::new(MemFsKind::Generic, None, None);
+        sb.anonymous
+            .store(true, core::sync::atomic::Ordering::Release);
+        sb
+    }
+
+    /// Whether this superblock backs a standalone inode with no mount.
+    fn is_anonymous(&self) -> bool {
+        self.anonymous.load(core::sync::atomic::Ordering::Acquire)
     }
 
     fn with_quota(
@@ -459,6 +488,7 @@ impl MemSuper {
         let mut grp = QuotaTable::new();
         grp.on = grpquota;
         Arc::new(Self {
+            anonymous: core::sync::atomic::AtomicBool::new(false),
             kind,
             state: IrqSafeSpinLock::new(SuperState {
                 max_blocks,
@@ -916,6 +946,12 @@ struct MemFile {
 
 impl MemFile {
     /// Mint a `MemFile` with default perms (0o666) and owner (0, 0).
+    /// The filesystem instance this inode belongs to — NARF's `inode->i_sb`.
+    /// Compared by `Arc` identity, never dereferenced for the comparison.
+    fn superblock(&self) -> &Arc<MemSuper> {
+        &self._inode_lease.superblock
+    }
+
     fn new(superblock: &Arc<MemSuper>, bytes: &[u8]) -> Result<Self, FsError> {
         let inode_lease = superblock.reserve_inode(0, 0)?;
         let file = MemFile {
@@ -1170,7 +1206,7 @@ impl Drop for MemFile {
 /// anonymous fd can back a real `MemFile` without occupying a
 /// VFS path.
 pub fn new_anon_file() -> Arc<dyn FileOps> {
-    let superblock = MemSuper::new(MemFsKind::Generic, None, None);
+    let superblock = MemSuper::new_anonymous();
     Arc::new(MemFile::new(&superblock, &[]).expect("unlimited anonymous memfile"))
 }
 
@@ -1199,6 +1235,14 @@ impl fmt::Debug for MemFile {
 impl FileOps for MemFile {
     fn ino(&self) -> u64 {
         self.ino
+    }
+
+    /// Needed so a destination directory can recognise one of its own inodes.
+    /// `MemDir::link_node` downcasts here to compare superblocks, and the
+    /// default `None` would make every node — including this filesystem's own
+    /// — look like it came from somewhere else.
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -2244,6 +2288,32 @@ impl DirOps for MemDir {
 
     fn link_node<'a>(&'a self, name: &'a str, node: Arc<dyn FileOps>) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // `fs/namei.c::vfs_link`: `if (dir->i_sb != inode->i_sb) return
+            // -EXDEV;`. A hard link cannot span filesystems, and this is the
+            // only place that can tell — by the time the node arrives it is a
+            // bare `Arc<dyn FileOps>` with nothing on it naming an owner.
+            //
+            // Without this the node was stored verbatim, so `linkat` by fd
+            // from another mount SUCCEEDED, leaving a name in this directory
+            // backed by an inode this filesystem does not own: its quota, its
+            // link count and its lifetime all belong somewhere else. That is
+            // worse than the wrong errno it was previously reported as.
+            //
+            // Two ways to fail it, both EXDEV: a node that is not a `MemFile`
+            // at all came from a different filesystem, and a `MemFile` whose
+            // superblock is not ours came from a different MOUNT of this one.
+            // The second matters because every kernel-test MemFs is a separate
+            // instance, so a same-type check alone would let them cross.
+            let source = node
+                .as_any()
+                .and_then(|any| any.downcast_ref::<MemFile>())
+                .ok_or(FsError::CrossDevice)?;
+            // An anonymous inode belongs to no mount, so filing it here is an
+            // adoption rather than a crossing — see `MemSuper::anonymous`.
+            let source_sb = source.superblock();
+            if !source_sb.is_anonymous() && !Arc::ptr_eq(&self.superblock, source_sb) {
+                return Err(FsError::CrossDevice);
+            }
             let mut g = self.entries.lock();
             // linkat NEVER replaces an existing name (like `link` above).
             if g.contains_key(name) {
