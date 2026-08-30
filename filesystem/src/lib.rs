@@ -1421,6 +1421,32 @@ pub trait FileOps: Send + Sync {
     }
 }
 
+/// [`FileOps::can_poll`] for an inode belonging to a REAL filesystem — one
+/// whose files are stored data rather than a synthetic view.
+///
+/// Linux decides this by which `file_operations` an open installs:
+///
+///   * `ext4_file_operations`, `btrfs_file_operations`, `fat_file_operations`
+///     and `shmem_file_operations` set no `.poll`, and neither does
+///     `ext4_dir_operations`. Stored bytes are always "ready", so there is
+///     nothing to wait for and `epoll_ctl` says EPERM.
+///   * Everything else stored in such a filesystem dispatches AWAY from it on
+///     open — a FIFO to `pipefifo_fops`, a device node to the driver's ops, a
+///     socket inode to the socket — all of which do have `.poll`. The
+///     filesystem the inode lives in is irrelevant to those.
+///
+/// So the test is on the inode's own type, not on the filesystem. A blanket
+/// `false` for a backend that can hold a FIFO — btrfs can, via `mknod` —
+/// would refuse an epoll on something Linux polls happily.
+///
+/// Synthetic filesystems must NOT use this. procfs sets `.poll = proc_reg_poll`
+/// on every file it serves, whether or not the file implements one, and kernfs
+/// does the same for sysfs and cgroupfs; their files report `FileType::File`
+/// and are pollable regardless. They keep the permissive default.
+pub fn fs_inode_can_poll(file_type: FileType) -> bool {
+    !matches!(file_type, FileType::File | FileType::Dir)
+}
+
 // ── Controlling-tty ids ─────────────────────────────────────────
 
 /// Stable [`FileOps::tty_id`] for the boot console (`/dev/console`,

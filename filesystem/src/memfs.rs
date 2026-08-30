@@ -1237,11 +1237,11 @@ impl FileOps for MemFile {
         self.ino
     }
 
-    /// Plain file data has no `poll` operation, so `epoll_ctl` refuses it —
-    /// see [`FileOps::can_poll`]. This is the tmpfs regular file and the
-    /// O_TMPFILE inode; the FIFO, symlink and special-file types beside it
-    /// keep the pollable default, as do the on-disk backends, which have not
-    /// been audited one by one.
+    /// `shmem_file_operations` sets no `.poll`, so a tmpfs regular file is
+    /// not pollable — see `fs_inode_can_poll`. Constant rather than a type
+    /// test because this type is only ever a regular file: MemFs has
+    /// `MemFifo` and `MemSpecial` for the kinds that dispatch elsewhere, and
+    /// both keep the pollable default.
     fn can_poll(&self) -> bool {
         false
     }

@@ -149,6 +149,13 @@ impl<B: BlockDevice + 'static> MinixNode<B> {
 }
 
 impl<B: BlockDevice + 'static> FileOps for MinixNode<B> {
+    /// Stored file data: no `.poll`, so `epoll_ctl` refuses it. Decided per
+    /// inode — a FIFO or device node living in this filesystem dispatches
+    /// elsewhere on open and stays pollable. See `fs_inode_can_poll`.
+    fn can_poll(&self) -> bool {
+        narf_filesystem::fs_inode_can_poll(self.stat().mode.file_type)
+    }
+
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
         Box::pin(async move {
             let inode = self.ensure_inode().await?;
