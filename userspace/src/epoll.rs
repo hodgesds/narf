@@ -386,12 +386,24 @@ impl EpollInstance {
             // Snapshot the source token before readiness. If I/O races this
             // poll, the token remains pending for the re-poll forced by the
             // global readiness-generation park guard.
-            let cur_token = item
-                .file
-                .upgrade()
-                .map(|o| o.poll_edge_token())
-                .unwrap_or((0, 0));
-            let cur_mask: u32 = poll_item_readiness(item);
+            // Single Weak→Arc upgrade per interest fd, reused for the token,
+            // readiness, and acknowledge below. Previously each of those did its
+            // own `item.file.upgrade()` (2–3 refcount round-trips) plus separate
+            // socket-lock acquisitions — the collect_ready O(N) hot path under a
+            // large interest set (200-conn redis: poll_readiness + poll_edge_token
+            // + Weak::upgrade + irq_restore dominated the kernel profile).
+            let file = match item.file.upgrade() {
+                Some(f) => f,
+                None => {
+                    // Backing open file dropped → not ready; record a zero
+                    // observation so the write-back clears any stale readiness,
+                    // exactly as the previous per-call upgrades did.
+                    observed.push((*fd, 0, (0, 0)));
+                    continue;
+                }
+            };
+            let cur_token = file.poll_edge_token();
+            let cur_mask: u32 = file.poll_readiness_at(item.offset);
             observed.push((*fd, cur_mask, cur_token));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
@@ -424,9 +436,7 @@ impl EpollInstance {
             // passive query for nested epolls and therefore never performs
             // this acknowledgement; otherwise systemd's manager epoll can
             // steal libmount's mountinfo event before libmount drains it.
-            if let Some(file) = item.file.upgrade() {
-                file.acknowledge_poll_readiness(cur_mask);
-            }
+            file.acknowledge_poll_readiness(cur_mask);
             results.push((ready, item.data));
             delivered_fds.push(*fd);
         }
