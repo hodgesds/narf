@@ -164,7 +164,10 @@ common_trap:
     mov qword ptr [rsp], 0
     mov qword ptr [rsp + 8], 0
 
-    mov rax, cr4
+    /* Read CR4 from its cached copy (write_cr4 maintains it): a live
+     * `mov rax, cr4` VMEXITs under KVM/SVM on every trap, and this only needs
+     * the boot-stable PKS(24)/PCIDE(17) bits. */
+    mov rax, qword ptr [rip + NARF_X86_CACHED_CR4]
     bt rax, 24                         /* CR4.PKS */
     jc .Ldomain_enter_pks
     bt rax, 17                         /* CR4.PCIDE */
