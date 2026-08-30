@@ -9944,16 +9944,18 @@ fn smoke_btrfs_open_transaction_commits_on_interval() -> TestResult {
         return TestResult::Fail("a fresh transaction was committed by the interval check");
     }
 
-    // Age it past the interval and check again. The result of the backdate is
-    // checked rather than discarded: it takes the transaction lock, and a
-    // `poll_once` that finds the lock held returns None having done nothing,
-    // which would otherwise leave the assertion below failing for a reason
-    // that looks like a broken interval check.
-    if poll_once(crate::write::__test_age_open_transaction(&vol, 60)).is_none() {
-        return TestResult::Fail("the backdate never completed a poll");
-    }
-    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
-        return TestResult::Fail("the staleness check never completed a poll");
+    // Now make the interval zero, so the transaction the check just left alone
+    // is unambiguously past it. Moving the threshold rather than backdating
+    // the transaction is deliberate — see `commit_interval_cycles`: the stamp
+    // is a raw TSC, and "thirty seconds ago" is not a representable instant
+    // early in a boot.
+    crate::write::__test_set_commit_interval_cycles(0);
+    let committed = poll_once(crate::write::commit_if_stale(&vol));
+    crate::write::__test_set_commit_interval_cycles(u64::MAX);
+    match committed {
+        Some(Ok(())) => {}
+        Some(Err(_)) => return TestResult::Fail("the interval commit reported an error"),
+        None => return TestResult::Fail("the staleness check never completed a poll"),
     }
     if vol.superblock().generation != uncommitted + 1 {
         return TestResult::Fail("an aged-out transaction was not committed");
@@ -9972,8 +9974,10 @@ fn smoke_btrfs_open_transaction_commits_on_interval() -> TestResult {
 
     // And with nothing outstanding it is a no-op rather than a fresh commit.
     let settled = vol.superblock().generation;
-    poll_once(crate::write::__test_age_open_transaction(&vol, 60));
-    if poll_once(crate::write::commit_if_stale(&vol)).is_none() {
+    crate::write::__test_set_commit_interval_cycles(0);
+    let again = poll_once(crate::write::commit_if_stale(&vol));
+    crate::write::__test_set_commit_interval_cycles(u64::MAX);
+    if again.is_none() {
         return TestResult::Fail("the staleness check never completed a poll");
     }
     if vol.superblock().generation != settled {

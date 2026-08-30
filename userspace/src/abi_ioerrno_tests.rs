@@ -2757,3 +2757,87 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_ioerrno_linkat_across_filesystems_is_exdev
 );
+
+/// `epoll_ctl` refuses a target that cannot be polled, with EPERM.
+///
+/// ```text
+/// if (!file_can_poll(fd_file(tf)))
+///         return -EPERM;
+/// ```
+///
+/// `file_can_poll` is `f->f_op->poll != NULL`, which regular files and
+/// directories do not have — a poll on file data is always "ready", so
+/// registering one is a caller error rather than a no-op, and Linux says so.
+///
+/// The ordering is pinned too. This check sits after BOTH descriptors resolve
+/// and BEFORE the -EINVAL arms for "epfd names itself" and "epfd is not an
+/// epoll", so a call that is wrong in both ways reports EPERM. Getting that
+/// backwards would report EINVAL and send a caller to inspect the wrong
+/// argument.
+fn smoke_abi_ioerrno_epoll_ctl_unpollable_target_is_eperm() -> TestResult {
+    const EPOLL_CTL_ADD: u64 = 1;
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+
+    with_memfs("/abi-epollp", "epollp", &[("data", b"x")], || {
+        let path = b"/abi-epollp/data\0";
+        let file = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the regular file"),
+        };
+        let ep = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("epoll_create1 failed"),
+        };
+        let mut ev = [0u8; 12];
+        ev[..4].copy_from_slice(&1u32.to_ne_bytes()); // EPOLLIN
+
+        // A regular file has no poll: EPERM.
+        let rc = call(
+            Syscall::EpollCtl.raw(),
+            a3(ep, EPOLL_CTL_ADD, file, ev.as_mut_ptr() as u64),
+        );
+        if rc != Some(EPERM) {
+            let _ = call(Syscall::Close.raw(), a0(ep));
+            let _ = call(Syscall::Close.raw(), a0(file));
+            return Err("epoll_ctl on a regular file was not EPERM");
+        }
+
+        // Wrong in two ways at once — the epfd is a regular file too, so it is
+        // both "not an epoll" (EINVAL) and the target is unpollable (EPERM).
+        // Linux checks the target's pollability first.
+        let rc = call(
+            Syscall::EpollCtl.raw(),
+            a3(file, EPOLL_CTL_ADD, file, ev.as_mut_ptr() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(ep));
+        let _ = call(Syscall::Close.raw(), a0(file));
+        if rc != Some(EPERM) {
+            return Err("an unpollable target must outrank a non-epoll epfd");
+        }
+
+        // A pollable target still works, so this is a poll check and not a
+        // blanket refusal. A pipe read end has a poll operation.
+        let (r, w) = make_pipe()?;
+        let ep2 = match call(Syscall::EpollCreate.raw(), a0(0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("second epoll_create1 failed"),
+        };
+        let rc = call(
+            Syscall::EpollCtl.raw(),
+            a3(ep2, EPOLL_CTL_ADD, r as u64, ev.as_mut_ptr() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(ep2));
+        let _ = call(Syscall::Close.raw(), a0(r as u64));
+        let _ = call(Syscall::Close.raw(), a0(w as u64));
+        let _ = AT_FDCWD;
+        if rc != Some(0) {
+            return Err("epoll_ctl on a pipe should still succeed");
+        }
+        Ok(())
+    })
+}
+
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_epoll_ctl_unpollable_target_is_eperm
+);

@@ -1289,6 +1289,41 @@ where
 /// hold more, which is why it arrives with the batching rather than before it.
 const COMMIT_INTERVAL_SECS: u64 = 30;
 
+/// The interval as a cycle count, overridable by tests.
+///
+/// Tests cannot get at this decision by BACKDATING a transaction. The stored
+/// stamp is a raw TSC, and early in a boot the counter itself can be smaller
+/// than thirty seconds' worth of cycles — so "thirty seconds ago" is not a
+/// representable instant, the subtraction clamps at zero, and the age comes
+/// out as the machine's whole uptime instead. Which side of the interval that
+/// lands on moves with boot timing, which made the test sensitive to
+/// unrelated changes elsewhere in the image.
+///
+/// Moving the threshold instead asks exactly the same question — is this
+/// transaction older than the interval — without needing an instant that may
+/// not exist.
+#[cfg(feature = "kernel-test")]
+static COMMIT_INTERVAL_OVERRIDE: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn commit_interval_cycles() -> u64 {
+    #[cfg(feature = "kernel-test")]
+    {
+        let over = COMMIT_INTERVAL_OVERRIDE.load(core::sync::atomic::Ordering::Acquire);
+        if over != u64::MAX {
+            return over;
+        }
+    }
+    narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000)
+}
+
+/// Test-only: run the interval check against `cycles` instead of thirty
+/// seconds. `u64::MAX` restores the real interval.
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_set_commit_interval_cycles(cycles: u64) {
+    COMMIT_INTERVAL_OVERRIDE.store(cycles, core::sync::atomic::Ordering::Release);
+}
+
 /// Commit the open transaction if it has been open for longer than
 /// [`COMMIT_INTERVAL_SECS`].
 ///
@@ -1307,7 +1342,7 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
             // goes back to sleep when `fs_info->running_transaction` is NULL.
             Some(batch) if batch.ops > 0 => {
                 let age = narf_time::now_cycles().saturating_sub(batch.opened_at);
-                age >= narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000)
+                age >= commit_interval_cycles()
             }
             _ => false,
         }
@@ -1341,7 +1376,7 @@ pub(crate) async fn commit_if_stale<B: BlockDevice + 'static>(
 pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Arc<BtrfsVolume<B>>) {
     let weak = alloc::sync::Arc::downgrade(vol);
     narf_scheduler::spawn(async move {
-        let tick = narf_time::wall::ns_to_cycles(COMMIT_INTERVAL_SECS * 1_000_000_000);
+        let tick = commit_interval_cycles();
         loop {
             narf_time::sleep_cycles(tick).await;
             let Some(vol) = weak.upgrade() else {
@@ -1350,19 +1385,6 @@ pub(crate) fn spawn_commit_timer<B: BlockDevice + 'static>(vol: &alloc::sync::Ar
             let _ = commit_if_stale(&vol).await;
         }
     });
-}
-
-/// Test-only: backdate the open transaction so [`commit_if_stale`] sees it as
-/// aged out, without waiting the interval.
-#[cfg(feature = "kernel-test")]
-pub(crate) async fn __test_age_open_transaction<B: BlockDevice + 'static>(
-    vol: &BtrfsVolume<B>,
-    secs: u64,
-) {
-    if let Some(batch) = vol.fs_batch().lock().await.as_mut() {
-        let back = narf_time::wall::ns_to_cycles(secs * 1_000_000_000);
-        batch.opened_at = batch.opened_at.saturating_sub(back);
-    }
 }
 
 /// Whether the open batch, if any, has already COWed the fs tree.

@@ -1392,6 +1392,33 @@ pub trait FileOps: Send + Sync {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         None
     }
+
+    /// Whether this file can be waited on — Linux's `file_can_poll(f)`,
+    /// i.e. `f->f_op->poll != NULL`.
+    ///
+    /// `do_epoll_ctl` refuses a target without it:
+    ///
+    /// ```text
+    /// if (!file_can_poll(fd_file(tf)))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// which on Linux covers regular files and directories — a poll on those
+    /// is always "ready", so registering one is a caller error rather than a
+    /// no-op, and `epoll_ctl` says so.
+    ///
+    /// Defaults to TRUE, deliberately. File TYPE is not a usable proxy for
+    /// this: inotify descriptors and the pollable procfs files
+    /// (`/proc/self/mountinfo`, whose entire purpose is change notification)
+    /// are `FileType::File` here and must stay addable. Defaulting to false
+    /// and opting in would silently refuse every backend nobody remembered to
+    /// audit, turning a missing override into an EPERM on something that
+    /// works. Defaulting to true means a missed override leaves today's
+    /// behaviour, and only the backends positively known to be unpollable —
+    /// plain on-disk and in-memory file data — say so.
+    fn can_poll(&self) -> bool {
+        true
+    }
 }
 
 // ── Controlling-tty ids ─────────────────────────────────────────

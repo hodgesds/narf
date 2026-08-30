@@ -113,8 +113,18 @@ fn timer_id_arg(raw: u64) -> Option<u32> {
 /// One armed POSIX timer.
 #[derive(Debug, Clone, Copy)]
 struct PosixTimer {
-    /// Owning task.
-    task: u64,
+    /// Task the expiry signal is delivered to.
+    ///
+    /// There is no separate "owner" field: the table is keyed by the creating
+    /// task, so ownership is the key and this is the destination.
+    ///
+    /// `good_sigevent()` returns the pid the signal is queued against, and
+    /// that is `task_tgid(current)` for every form EXCEPT `SIGEV_SIGNAL |
+    /// SIGEV_THREAD_ID`, which resolves `sigev_notify_thread_id` and targets
+    /// THAT thread. Same as `task` in every other case; separate from it
+    /// because ownership and destination genuinely differ for that one form,
+    /// and folding them delivered a sibling's timer to the creator.
+    target: u64,
     /// One of CLOCK_REALTIME / CLOCK_MONOTONIC / CLOCK_BOOTTIME, as the
     /// 32-bit `clockid_t` the ABI delivers. Realtime currently shares the
     /// monotonic source — no NTP yet.
@@ -245,10 +255,39 @@ fn ns_to_timespec(ns: u64) -> (i64, i64) {
 //
 // 16 bytes is enough to decide SIGEV_SIGNAL vs SIGEV_NONE/THREAD and
 // pick the signum.
-fn parse_sigevent(buf: &[u8; 16]) -> (i32, i32) {
+/// `good_sigevent()`'s thread lookup: resolve `tid` in the CALLER's pid
+/// namespace and require it to name a live thread of the caller's own thread
+/// group.
+///
+/// ```text
+/// pid = find_vpid(event->sigev_notify_thread_id);
+/// rtn = pid_task(pid, PIDTYPE_PID);
+/// if (!rtn || !same_thread_group(rtn, current))
+///         return NULL;
+/// ```
+///
+/// `Task::pid` IS the thread-group id here, so "same thread group" is an
+/// equality on it — a timer may target a sibling thread, never a stranger.
+fn resolve_thread_in_group(caller: u64, tid: i32) -> Option<u64> {
+    if tid <= 0 {
+        return None;
+    }
+    let outer = crate::handlers::accept_pid_from(caller, tid as u64)?;
+    let thread = crate::handlers::proc_pid_to_tid(outer);
+    let group = crate::handlers::task_to_pid_raw(caller)?;
+    if crate::handlers::task_to_pid_raw(thread)? != group {
+        return None;
+    }
+    Some(thread)
+}
+
+fn parse_sigevent(buf: &[u8; 64]) -> (i32, i32, i32) {
     let signo = i32::from_le_bytes(buf[8..12].try_into().unwrap());
     let notify = i32::from_le_bytes(buf[12..16].try_into().unwrap());
-    (notify, signo)
+    // `_sigev_un._tid`, the first member of the union at offset 16. Only
+    // meaningful for the SIGEV_*|SIGEV_THREAD_ID forms.
+    let tid = i32::from_le_bytes(buf[16..20].try_into().unwrap());
+    (notify, signo, tid)
 }
 
 /// Classify a `clockid_t` the way `clockid_to_kclock()` +
@@ -354,14 +393,19 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
 
     // Step 1 — the sigevent copy, ahead of every other check (above).
     //
-    // LINUX-GAP: Linux copies `sizeof(sigevent_t)` = 64 bytes here and
-    // faults on any of them; NARF reads the 16 that carry sigev_value /
-    // sigev_signo / sigev_notify, so a pointer that is valid for 16
-    // bytes and faulting for 64 is EFAULT there and accepted here.
+    //     if (copy_from_user(&event, timer_event_spec, sizeof (event)))
+    //             return -EFAULT;
+    //
+    // `sizeof(sigevent_t)` is 64 (SIGEV_MAX_SIZE), and Linux faults on ANY
+    // of those bytes. Reading only the leading 16 accepted a pointer that is
+    // valid for 16 bytes and faulting beyond, which is EFAULT on Linux — and
+    // it also put `sigev_notify_thread_id` at offset 16 out of reach, so the
+    // THREAD_ID forms below could not be honoured at all.
+    const SIGEV_SIZE: usize = 64;
     let parsed = if evp == 0 {
         None
     } else {
-        let mut kbuf = [0u8; 16];
+        let mut kbuf = [0u8; SIGEV_SIZE];
         // SAFETY: handler runs in the calling task's address space;
         // `copy_from_user` validates the user pointer + SMAP brackets.
         // SAFETY: Valid memory or trusted environment
@@ -381,9 +425,14 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
 
     // Step 3 — `good_sigevent()`. Default when evp == NULL is
     // SIGEV_SIGNAL + SIGALRM, which the kernel builds without validating.
+    // Who the timer's signal goes to. `good_sigevent()` returns the pid the
+    // signal is queued against: `task_tgid(current)` for every form EXCEPT
+    // `SIGEV_SIGNAL | SIGEV_THREAD_ID`, which resolves
+    // `sigev_notify_thread_id` and targets that thread.
+    let mut target_task = current_task_id();
     let effective_signum = match parsed {
         None => SIGALRM,
-        Some((notify, signo)) => {
+        Some((notify, signo, tid)) => {
             // `good_sigevent()`'s switch, arm for arm. Note it switches
             // on the RAW `sigev_notify`: `SIGEV_SIGNAL | SIGEV_THREAD_ID`
             // (4) is a listed case that falls through into SIGEV_SIGNAL,
@@ -401,16 +450,30 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
             // `raise_signal_pending` already accepts 1..=64, so widening
             // to Linux's bound costs nothing and unblocks that path.
             //
-            // LINUX-GAP: for the THREAD_ID forms Linux additionally
-            // requires `sigev_notify_thread_id` to name a live thread in
-            // the caller's thread group (EINVAL otherwise) and queues the
-            // signal to that thread. The field sits at offset 16, past
-            // the 16 bytes NARF reads, and NARF's pending mask is
-            // per-task — so the tid is neither validated nor honoured and
-            // the signal goes to the calling task.
             const SIGEV_SIGNAL_THREAD_ID: i32 = SIGEV_SIGNAL | SIGEV_THREAD_ID;
             match notify {
                 SIGEV_SIGNAL | SIGEV_SIGNAL_THREAD_ID => {
+                    // `case SIGEV_SIGNAL | SIGEV_THREAD_ID:` resolves the
+                    // thread FIRST, before the signo bound it falls through
+                    // to:
+                    //
+                    //     pid = find_vpid(event->sigev_notify_thread_id);
+                    //     rtn = pid_task(pid, PIDTYPE_PID);
+                    //     if (!rtn || !same_thread_group(rtn, current))
+                    //             return NULL;      /* -> -EINVAL */
+                    //
+                    // so a bad tid is EINVAL even when the signo is also
+                    // invalid. Ordering matters: reversing it would report
+                    // the wrong one of two simultaneous errors.
+                    if notify == SIGEV_SIGNAL_THREAD_ID {
+                        match resolve_thread_in_group(target_task, tid) {
+                            Some(thread) => target_task = thread,
+                            None => {
+                                ctx.set_return(err(EINVAL));
+                                return;
+                            }
+                        }
+                    }
                     if signo <= 0 || signo > SIGRTMAX {
                         ctx.set_return(err(EINVAL));
                         return;
@@ -452,7 +515,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
         t.by_id.insert(
             id,
             PosixTimer {
-                task,
+                target: target_task,
                 clockid,
                 signum: effective_signum,
                 next_fire_ns: 0,
@@ -1356,7 +1419,7 @@ fn posix_timer_pump() {
                     if t.signum != 0 {
                         // Queue one signal — POSIX collapses missed
                         // expiries into a single signal + overrun count.
-                        deliveries.push((t.task, t.signum));
+                        deliveries.push((t.target, t.signum));
                     }
                     if t.interval_ns == 0 {
                         t.next_fire_ns = 0;
