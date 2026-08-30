@@ -2291,6 +2291,17 @@ impl FileOps for SocketFile {
                 if narf_net::tcp_stack::readable(*tcb_id) {
                     bits |= narf_filesystem::POLL_IN;
                 }
+                // Reconcile the durable cell against this level so a socket the
+                // app just drained stops reporting readable in the cell (else a
+                // re-arm spuriously returns Ready and a level poll spins); the
+                // RX wake set the rising edge. Only touch an existing cell — do
+                // not create one here (poll may run on a never-armed fd).
+                if let Some(cell) = crate::handlers::tcb_cell_lookup(*tcb_id) {
+                    cell.set(
+                        bits & narf_filesystem::POLL_IN,
+                        narf_filesystem::POLL_IN & !bits,
+                    );
+                }
                 bits
             }
             SocketState::InetRaw { inbox, .. } => {
@@ -2454,6 +2465,7 @@ impl FileOps for SocketFile {
         // Classify the socket under one short lock, cloning any rings needed.
         enum Arm {
             Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Wired(u32),
             Dgram,
             Listener,
             Uevent,
@@ -2463,6 +2475,10 @@ impl FileOps for SocketFile {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => Arm::Connected(rx.clone(), tx.clone()),
+            // Kernel-TCP-over-NIC (off-box redis/servers): a durable per-TCB
+            // cell, fed POLL_IN by the stack's RX wake and reconciled to the
+            // live level below. Off the state lock (the cell is keyed by id).
+            SocketState::InetWired { tcb_id, .. } => Arm::Wired(*tcb_id),
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -2504,6 +2520,32 @@ impl FileOps for SocketFile {
                 } else {
                     Some(Poll::Pending)
                 }
+            }
+            // Kernel-TCP: reconcile the durable cell to the live level (so a
+            // drained socket doesn't report a stale POLL_IN and a re-arm
+            // doesn't spuriously return Ready), then arm. POLL_OUT stays set —
+            // a kernel-TCP socket is always sendable. The RX wake path
+            // (`wake_io_waiters` → cell.set POLL_IN) drives the readable edge.
+            Arm::Wired(tcb_id) => {
+                let readable = narf_net::tcp_stack::readable(tcb_id);
+                let cell = crate::handlers::tcb_cell(tcb_id);
+                cell.set(
+                    if readable {
+                        narf_filesystem::POLL_IN
+                    } else {
+                        0
+                    },
+                    if readable {
+                        0
+                    } else {
+                        narf_filesystem::POLL_IN
+                    },
+                );
+                Some(cell.arm(
+                    task_id,
+                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                    waker,
+                ))
             }
             // Connectionless datagram: one SocketFile-level cell carrying
             // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
@@ -2550,6 +2592,7 @@ impl FileOps for SocketFile {
     fn disarm_readiness(&self, task_id: u64) -> bool {
         enum D {
             Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Wired(u32),
             Dgram,
             Listener,
             Uevent,
@@ -2559,6 +2602,7 @@ impl FileOps for SocketFile {
             SocketState::UnixConnected { rx, tx, .. }
             | SocketState::InetConnected { rx, tx, .. }
             | SocketState::Inet6Connected { rx, tx, .. } => D::Connected(rx.clone(), tx.clone()),
+            SocketState::InetWired { tcb_id, .. } => D::Wired(*tcb_id),
             SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => D::Dgram,
             SocketState::UnixListener { .. }
             | SocketState::InetListener { .. }
@@ -2571,6 +2615,10 @@ impl FileOps for SocketFile {
             D::Connected(rx, tx) => {
                 rx.readiness().disarm(task_id);
                 tx.readiness().disarm(task_id);
+                true
+            }
+            D::Wired(tcb_id) => {
+                crate::handlers::tcb_cell_disarm(tcb_id, task_id);
                 true
             }
             D::Dgram => {
