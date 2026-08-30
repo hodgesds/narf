@@ -402,7 +402,17 @@ impl EpollInstance {
                     continue;
                 }
             };
-            let cur_token = file.poll_edge_token();
+            // `poll_edge_token` is a second socket-lock acquisition per fd, and
+            // its value is consumed ONLY by the EPOLLET rising-edge check below
+            // (and its write-back). A level-triggered item — the common case:
+            // redis, systemd, dbus all use level-triggered epoll — never reads
+            // it, so skip that lock entirely for those, halving the per-fd lock
+            // traffic on the O(N) collect_ready hot path.
+            let cur_token = if (item.events & EPOLLET) != 0 {
+                file.poll_edge_token()
+            } else {
+                (0, 0)
+            };
             let cur_mask: u32 = file.poll_readiness_at(item.offset);
             observed.push((*fd, cur_mask, cur_token));
             // Only report events the caller asked for.
