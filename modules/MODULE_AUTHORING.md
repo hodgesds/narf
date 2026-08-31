@@ -7,12 +7,24 @@ architecture-comparison overview, see the workspace-root
 
 ## Project layout
 
-> **Status note.** The loader is complete and tested, but there is no
-> `.ko` build step yet: `crate-type = "staticlib"` produces an *archive*,
-> and nothing currently runs `ld -r` to extract the single relocatable
-> object the loader wants. Until that lands, the guide below describes
-> the intended shape rather than a pipeline you can run end to end. See
-> the "open questions" section of [DESIGN.md](./DESIGN.md).
+> **Status note.** Build your module with:
+>
+> ```sh
+> cargo xtask build-module --package <your-crate> --arch x86_64
+> ```
+>
+> which compiles the crate, takes its own object members out of the
+> `staticlib` archive, and `ld -r`s them into a single relocatable
+> object — merging the per-static `.modinfo` sections in the process.
+> Works for `aarch64` too; it links with `rust-lld` rather than the host
+> `ld`, which refuses foreign-architecture objects.
+>
+> Two things still to know. Your `kernel_abi=` has to match the running
+> kernel (`cat /sys/kernel/abi_hash`) — the reference module's
+> `0x00000000` is a placeholder and will be refused. And a module that
+> uses `core` beyond what the compiler inlines will come out with
+> undefined references that nothing can satisfy; keep to the exported
+> ABI and your own code for now. See [DESIGN.md](./DESIGN.md).
 
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal

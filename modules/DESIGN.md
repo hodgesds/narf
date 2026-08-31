@@ -23,11 +23,17 @@ three syscalls.
 
 Known gaps, each expanded where it belongs below:
 
-  * **No `.ko` build pipeline.** `modules/test-module` is a `staticlib`
-    archive; nothing yet runs `ld -r` to produce the single relocatable
-    object a real module is, and no test loads a rustc-emitted module.
-    Every smoke synthesizes its ELF in memory. This is the largest gap
-    between "the loader is correct" and "modules work".
+  * **No test loads a real `.ko` yet.** `cargo xtask build-module` now
+    produces one for either architecture — extracting the crate's own
+    members from the `staticlib` archive and `ld -r`-ing them into a
+    single relocatable object with merged sections. What is still
+    missing is the last link: the reference module hardcodes
+    `kernel_abi=0x00000000`, and the running kernel's hash is derived
+    from its export table, so the load is correctly refused. Closing it
+    needs the build to learn the hash — either computed from the `kabi`
+    source at build time, or read from `/sys/kernel/abi_hash` on a
+    running kernel, which is the workflow a real out-of-tree module
+    uses. Until then every smoke still synthesizes its ELF.
   * **Driver domains are named but not enforced.** See §2.
   * **Per-action caps on the three syscalls are not wired.** See the
     trust model, tier 3.
@@ -450,12 +456,17 @@ asserts:
 
   * **Ed25519 signature verification.** The hook is in place; the
     implementation slots into `sign::install_verifier(...)`.
-  * **A real `.ko` build.** `modules/test-module` builds as a
-    `staticlib`, which is an archive; a module is a single relocatable
-    object, as `ld -r` produces. Until an xtask step emits one and a
-    smoke loads it, every test here runs on a synthesized ELF — which
-    exercises the loader but not rustc's actual relocation output.
+  * **Loading a real `.ko` in a test.** The build exists
+    (`cargo xtask build-module`); what is missing is making the
+    module's `kernel_abi=` match the running kernel, and a smoke that
+    reads the object and calls `sys_finit_module` on it. Until then,
+    tests exercise the loader but not rustc's actual relocation output.
     This should be the next thing done.
+
+    Note also that a module using anything from `core` the compiler
+    does not inline will come out with undefined references that
+    neither KSYMTAB nor the object satisfies. Linux links the needed
+    `core` objects into each Rust module; `build_module` does not yet.
 
   * **modprobe userspace daemon.** A userspace tool that walks
     `/lib/modules/`, resolves `depends=`, and submits modules in
