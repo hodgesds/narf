@@ -55,6 +55,7 @@ mod epoll_poll;
 mod fd_io;
 mod mem_uaccess;
 mod misc;
+mod module_load;
 mod namespaces;
 mod process;
 mod signals;

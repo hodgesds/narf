@@ -1079,6 +1079,12 @@ impl Arch {
                         args.push(append);
                     }
                 }
+                if let Some(ird) = TEST_INITRD.lock().ok().and_then(|g| g.clone()) {
+                    // x86_64 needs no device-tree dance: the blob arrives as a
+                    // multiboot2 module, which `bare_main` already stages.
+                    args.push("-initrd".into());
+                    args.push(ird.display().to_string());
+                }
                 args.push("-kernel".into());
                 args.push(kernel);
                 args
@@ -1242,14 +1248,41 @@ impl Arch {
                 // into `/chosen/bootargs` when it generates the blob, which is
                 // where `boot/src/aarch64` already parses it from.
                 let append = std::env::var("XTASK_QEMU_APPEND").unwrap_or_default();
+                let initrd = TEST_INITRD.lock().ok().and_then(|g| g.clone());
+                let dtb = qemu_virt_dtb_path_with_cmdline(&append, initrd.as_deref());
                 args.extend_from_slice(&[
                     "-device".into(),
                     format!(
                         "loader,file={},addr={:#x},force-raw=on",
-                        qemu_virt_dtb_path_with_cmdline(&append).display(),
+                        dtb.display(),
                         DTB_LOAD_ADDR
                     ),
                 ]);
+
+                // The initramfs goes in the same way the device tree does, at
+                // the address the tree itself declares. `-initrd` alone is not
+                // enough here: QEMU writes `/chosen` into the tree IT builds,
+                // and this guest reads a pre-built blob handed to it as opaque
+                // bytes, so the properties never reach it. Loading the blob at
+                // the address read back out of that tree makes the two agree
+                // by construction rather than by a hardcoded constant that
+                // could drift from QEMU's placement.
+                if let Some(ref ird) = initrd {
+                    match dtb_initrd_start(&dtb) {
+                        Some(addr) => args.extend_from_slice(&[
+                            "-device".into(),
+                            format!(
+                                "loader,file={},addr={:#x},force-raw=on",
+                                ird.display(),
+                                addr
+                            ),
+                        ]),
+                        None => println!(
+                            "xtask: device tree carries no linux,initrd-start; \
+                             initramfs not delivered"
+                        ),
+                    }
+                }
 
                 // Passed as well, harmlessly: it is what a `-dtb`-style boot
                 // would use, and keeping it means a future switch away from the
@@ -1269,6 +1302,77 @@ impl Arch {
 
 const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 
+/// Initramfs to hand the guest, if any.
+///
+/// A static for the same reason `KERNEL_TEST_DISK` is one: `qemu_args`
+/// resolves it in-process, and on aarch64 it has to reach the device-tree
+/// generation — the guest finds its initramfs through `/chosen`, so the DTB
+/// must declare where the blob lands before the args naming that blob exist.
+static TEST_INITRD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Read `/chosen/linux,initrd-start` out of a flattened device tree.
+///
+/// On aarch64 the guest is handed a pre-built DTB as opaque bytes, so QEMU
+/// never injects `/chosen` into the tree the kernel actually reads (the same
+/// reason `-append` had to be baked in — see
+/// `qemu_virt_dtb_path_with_cmdline`). The blob is generated WITH `-initrd`
+/// so QEMU writes the properties itself; this reads the address back so the
+/// initramfs can be loaded exactly where the tree says it is. Deriving the
+/// address rather than picking one keeps the two from disagreeing.
+fn dtb_initrd_start(path: &Path) -> Option<u64> {
+    let b = std::fs::read(path).ok()?;
+    let u32at = |o: usize| -> Option<u32> {
+        b.get(o..o + 4)
+            .map(|w| u32::from_be_bytes([w[0], w[1], w[2], w[3]]))
+    };
+    if u32at(0)? != 0xd00d_feed {
+        return None;
+    }
+    let off_struct = u32at(8)? as usize;
+    let off_strings = u32at(12)? as usize;
+    let size_struct = u32at(36)? as usize;
+    let st = b.get(off_struct..off_struct + size_struct)?;
+
+    let mut i = 0usize;
+    while i + 4 <= st.len() {
+        let tok = u32::from_be_bytes([st[i], st[i + 1], st[i + 2], st[i + 3]]);
+        i += 4;
+        match tok {
+            // FDT_BEGIN_NODE: NUL-terminated name, padded to 4.
+            1 => {
+                let end = st[i..].iter().position(|c| *c == 0)? + i;
+                i = (end + 4) & !3;
+            }
+            // FDT_PROP: len, name-offset, then value padded to 4.
+            3 => {
+                let len = u32::from_be_bytes([st[i], st[i + 1], st[i + 2], st[i + 3]]) as usize;
+                let noff =
+                    u32::from_be_bytes([st[i + 4], st[i + 5], st[i + 6], st[i + 7]]) as usize;
+                i += 8;
+                let name_start = off_strings + noff;
+                let name_end = b[name_start..].iter().position(|c| *c == 0)? + name_start;
+                if &b[name_start..name_end] == b"linux,initrd-start" {
+                    let v = st.get(i..i + len)?;
+                    return match len {
+                        4 => Some(u32::from_be_bytes([v[0], v[1], v[2], v[3]]) as u64),
+                        8 => Some(u64::from_be_bytes([
+                            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7],
+                        ])),
+                        _ => None,
+                    };
+                }
+                i = (i + len + 3) & !3;
+            }
+            // FDT_END_NODE (2) / FDT_NOP (4) carry no payload; FDT_END (9)
+            // terminates.
+            2 | 4 => {}
+            9 => break,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Path to a cached QEMU `virt` device tree, optionally carrying a kernel
 /// command line in `/chosen/bootargs`.
 ///
@@ -1286,16 +1390,27 @@ const DTB_LOAD_ADDR: u64 = 0x4F00_0000;
 /// QEMU write `/chosen/bootargs` into the dump. Blobs are cached per command
 /// line (hashed into the filename) because the cmdline varies per run and a
 /// single cached path would serve a stale one.
-fn qemu_virt_dtb_path_with_cmdline(cmdline: &str) -> PathBuf {
+fn qemu_virt_dtb_path_with_cmdline(cmdline: &str, initrd: Option<&Path>) -> PathBuf {
     let root = workspace_root().unwrap_or_else(|_| PathBuf::from("."));
     // Distinct file per command line. An empty cmdline keeps the historical
     // name so existing callers and any cached artifact stay valid.
-    let path = if cmdline.is_empty() {
+    // The initramfs is part of the key: QEMU writes `linux,initrd-end` from
+    // the blob's SIZE, so two runs with different modules must not share a
+    // cached tree that points at the wrong end address.
+    let initrd_len = initrd
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let path = if cmdline.is_empty() && initrd_len == 0 {
         root.join("target").join("qemu-virt.dtb")
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in cmdline.as_bytes() {
             h ^= u64::from(*b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        for b in initrd_len.to_le_bytes() {
+            h ^= u64::from(b);
             h = h.wrapping_mul(0x1000_0000_01b3);
         }
         root.join("target").join(format!("qemu-virt-{h:016x}.dtb"))
@@ -1310,7 +1425,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str) -> PathBuf {
                 "virt,gic-version=3,mte=on,highmem-ecam=off,dumpdtb={}",
                 path.display()
             ))
-            .args(if cmdline.is_empty() {
+            .args(if cmdline.is_empty() && initrd.is_none() {
                 // `-append ""` is not the same as omitting it: QEMU still
                 // creates an empty `/chosen/bootargs`, which is harmless but
                 // makes the two cache entries differ for no reason.
@@ -1333,12 +1448,21 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str) -> PathBuf {
                 if !stub.exists() {
                     let _ = std::fs::write(&stub, [0u8; 4096]);
                 }
-                vec![
-                    "-append".to_string(),
-                    cmdline.to_string(),
-                    "-kernel".to_string(),
-                    stub.display().to_string(),
-                ]
+                let mut v = vec!["-kernel".to_string(), stub.display().to_string()];
+                if !cmdline.is_empty() {
+                    v.push("-append".to_string());
+                    v.push(cmdline.to_string());
+                }
+                // Passing the real initramfs here is what makes QEMU write
+                // `/chosen/linux,initrd-{start,end}` into the dumped tree.
+                // The guest then finds the blob exactly where `dtb_initrd_start`
+                // reads it back and the generic loader puts it — one address,
+                // chosen by QEMU, agreed on by both sides.
+                if let Some(ird) = initrd {
+                    v.push("-initrd".to_string());
+                    v.push(ird.display().to_string());
+                }
+                v
             })
             .arg("-cpu")
             .arg("max")
@@ -1382,7 +1506,7 @@ fn qemu_virt_dtb_path_with_cmdline(cmdline: &str) -> PathBuf {
 
 /// The plain device tree, with no kernel command line.
 fn qemu_virt_dtb_path() -> PathBuf {
-    qemu_virt_dtb_path_with_cmdline("")
+    qemu_virt_dtb_path_with_cmdline("", None)
 }
 
 fn ahci_image_path() -> PathBuf {
@@ -2429,6 +2553,43 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
         args.features.contains("kernel-test"),
         std::sync::atomic::Ordering::Relaxed,
     );
+
+    // Ship the reference kernel module to the guest, so the in-kernel suite
+    // can load a REAL rustc-built `.ko` instead of an ELF synthesized in
+    // memory — the only way to exercise the compiler's actual relocation
+    // output. Set before `qemu_args` for the same reason KERNEL_TEST_DISK is:
+    // aarch64 needs it while generating the device tree, which has to declare
+    // where the blob lands.
+    //
+    // Best-effort throughout. A failure here leaves the guest without the file
+    // and its smokes skip, exactly as on an image built without it.
+    if args.features.contains("kernel-test") {
+        let ko_args = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-test-module".into(),
+            out: None,
+            kernel_abi: None,
+        };
+        match build_module(&ko_args, &root).and_then(|ko| Ok(std::fs::read(&ko)?)) {
+            Ok(bytes) => {
+                let cpio = encode_cpio_newc(&[("lib/modules/narf_test_module.ko", &bytes)]);
+                let p = out_dir.join("initramfs-kernel-test.cpio");
+                match std::fs::write(&p, &cpio) {
+                    Ok(()) => {
+                        println!(
+                            "xtask: staged test module ({} bytes) -> guest /lib/modules/narf_test_module.ko",
+                            bytes.len()
+                        );
+                        if let Ok(mut g) = TEST_INITRD.lock() {
+                            *g = Some(p);
+                        }
+                    }
+                    Err(e) => println!("xtask: could not write test-module initramfs ({e})"),
+                }
+            }
+            Err(e) => println!("xtask: test module unavailable ({e}); its smokes will skip"),
+        }
+    }
 
     let qemu = args.arch.qemu_bin();
     let mut cmd = Command::new(qemu);
@@ -7110,9 +7271,52 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         }
     };
 
+    // The reference kernel module, staged at the Linux-conventional
+    // `/lib/modules/` path so an in-kernel test can load a REAL,
+    // rustc-built `.ko` — with genuine relocations against a kernel export
+    // (`R_X86_64_PLT32` on x86_64, `R_AARCH64_CALL26` needing a veneer on
+    // aarch64) — instead of an ELF synthesized in memory. Synthesized images
+    // exercise the loader's parsing and layout but never the compiler's
+    // actual relocation output, which is where the two can disagree.
+    //
+    // Built here rather than as a separate step so `cargo xtask test` needs
+    // no extra invocation. A failure to build it is NOT fatal: the module is
+    // a test fixture, not part of the kernel, and the smoke that loads it
+    // skips cleanly when the file is absent.
+    let test_module_bytes: Option<Vec<u8>> = {
+        let ko_args = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-test-module".into(),
+            out: None,
+            kernel_abi: None,
+        };
+        match build_module(&ko_args, &root) {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(b) => {
+                    println!(
+                        "xtask image: test module staged ({} bytes) → lib/modules/narf_test_module.ko",
+                        b.len()
+                    );
+                    Some(b)
+                }
+                Err(e) => {
+                    println!("xtask image: test module unreadable ({e}); skipping");
+                    None
+                }
+            },
+            Err(e) => {
+                println!("xtask image: test module build failed ({e}); skipping");
+                None
+            }
+        }
+    };
+
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
     cpio_entries.push(("shell", &shell_bytes));
+    if let Some(ref b) = test_module_bytes {
+        cpio_entries.push(("lib/modules/narf_test_module.ko", b.as_slice()));
+    }
     // Stage coreutils at bin/<name> so the shell's /bin/<name>
     // PATH resolution resolves them after the initramfs is mounted.
     for (path, bytes) in &coreutil_bytes {
