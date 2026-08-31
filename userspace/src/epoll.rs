@@ -571,12 +571,15 @@ impl EpollInstance {
             // redis, systemd, dbus all use level-triggered epoll — never reads
             // it, so skip that lock entirely for those, halving the per-fd lock
             // traffic on the O(N) collect_ready hot path.
-            let cur_token = if (item.events & EPOLLET) != 0 {
-                file.poll_edge_token()
+            // EPOLLET needs both the mask AND the edge token; fetch them under a
+            // SINGLE provider-lock acquisition (step 3) via the fused method
+            // instead of two separate locks. Level-triggered never reads the
+            // token, so it takes only the one readiness lock.
+            let (cur_mask, cur_token): (u32, (u64, u64)) = if (item.events & EPOLLET) != 0 {
+                file.poll_readiness_and_token_at(item.offset)
             } else {
-                (0, 0)
+                (file.poll_readiness_at(item.offset), (0, 0))
             };
-            let cur_mask: u32 = file.poll_readiness_at(item.offset);
             observed.push((*fd, cur_mask, cur_token));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);

@@ -1016,6 +1016,16 @@ pub trait FileOps: Send + Sync {
         (0, 0)
     }
 
+    /// Fused readiness level + edge token under a SINGLE provider-lock
+    /// acquisition, for the epoll confirm step of an edge-triggered fd (which
+    /// needs both). The default composes the two separate methods; providers
+    /// whose `poll_readiness_at` and `poll_edge_token` share one internal lock
+    /// (sockets) override this to acquire it once, halving the per-fd lock
+    /// traffic on the collect_ready hot path. Returns `(mask, (read_tok, write_tok))`.
+    fn poll_readiness_and_token_at(&self, offset: u64) -> (u32, (u64, u64)) {
+        (self.poll_readiness_at(offset), self.poll_edge_token())
+    }
+
     /// Acknowledge readiness after an event multiplexer has actually delivered
     /// it to its caller. Passive readiness probes (notably a nested epoll's
     /// poll method) must not call this: some procfs sources expose a

@@ -2202,182 +2202,7 @@ impl FileOps for SocketFile {
         if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
             return narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT;
         }
-        let state = self.state.lock();
-        match &*state {
-            SocketState::Fresh | SocketState::UnixBound { .. } => 0,
-            // An AF_INET listener is accept-ready (POLL_IN) when its
-            // loopback `pending` queue OR — for a wired (off-box) listen
-            // — the kernel-stack accept-queue has a completed connection.
-            // Without the kernel-queue check, an epoll-driven server like
-            // redis never sees an incoming off-box connection.
-            SocketState::InetListener {
-                pending, listen_id, ..
-            } => {
-                let ready = !pending.is_empty()
-                    || listen_id
-                        .map(narf_net::tcp_stack::listen_has_pending)
-                        .unwrap_or(false);
-                // Reconcile the durable accept cell against this level so it
-                // clears once accept drains the queue (else a re-arm spuriously
-                // returns Ready and a timed poll spins). The connect enqueue set
-                // the rising POLL_IN edge that fired the parked acceptor.
-                self.listener_readiness.set(
-                    if ready { narf_filesystem::POLL_IN } else { 0 },
-                    if ready { 0 } else { narf_filesystem::POLL_IN },
-                );
-                if ready {
-                    narf_filesystem::POLL_IN
-                } else {
-                    0
-                }
-            }
-            SocketState::UnixListener { pending, .. }
-            | SocketState::Inet6Listener { pending, .. } => {
-                let ready = !pending.is_empty();
-                self.listener_readiness.set(
-                    if ready { narf_filesystem::POLL_IN } else { 0 },
-                    if ready { 0 } else { narf_filesystem::POLL_IN },
-                );
-                if ready {
-                    narf_filesystem::POLL_IN
-                } else {
-                    0
-                }
-            }
-            SocketState::UnixConnected { rx, tx, .. }
-            | SocketState::InetConnected { rx, tx, .. }
-            | SocketState::Inet6Connected { rx, tx, .. } => {
-                let mut bits = 0;
-                // Linux reports POLLIN on a peer-closed stream socket too, so
-                // the reader's normal readable path runs, read() returns 0
-                // (EOF), and it tears the connection down. Reporting only
-                // POLLHUP (no POLLIN) here made dbus-daemon busy-spin on a
-                // hung-up client fd — epoll kept returning it ready, but with
-                // no POLLIN dbus never entered its read/disconnect path and
-                // looped forever, wedging the whole session bus (Plasma stall).
-                if rx.has_data() || rx.is_closed() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                if tx.has_space() {
-                    bits |= narf_filesystem::POLL_OUT;
-                }
-                if rx.is_closed() {
-                    bits |= narf_filesystem::POLL_HUP;
-                }
-                bits
-            }
-            SocketState::InetDgram { inbox, .. } | SocketState::UnixDgram { inbox, .. } => {
-                let mut bits = narf_filesystem::POLL_OUT; // always sendable
-                if !inbox.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                // Reconcile the durable datagram cell's POLL_IN against this
-                // level so a recv that drained the inbox stops reporting
-                // readable in the cell (POLL_OUT stays — always sendable). The
-                // send enqueue set the rising POLL_IN edge that fired the reader.
-                self.dgram_readiness.set(
-                    bits & narf_filesystem::POLL_IN,
-                    narf_filesystem::POLL_IN & !bits,
-                );
-                bits
-            }
-            SocketState::InetWired { tcb_id, .. } => {
-                // Kernel-TCP-over-NIC: always writable (the stack
-                // queues + flow-controls send), and POLL_IN when the
-                // TCB has buffered RX data or the peer has closed
-                // (read returns EOF). This is what makes epoll/poll/
-                // select on a kernel-TCP socket wake on inbound data.
-                let mut bits = narf_filesystem::POLL_OUT;
-                if narf_net::tcp_stack::readable(*tcb_id) {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                // Reconcile the durable cell against this level so a socket the
-                // app just drained stops reporting readable in the cell (else a
-                // re-arm spuriously returns Ready and a level poll spins); the
-                // RX wake set the rising edge. Only touch an existing cell — do
-                // not create one here (poll may run on a never-armed fd).
-                if let Some(cell) = crate::handlers::tcb_cell_lookup(*tcb_id) {
-                    cell.set(
-                        bits & narf_filesystem::POLL_IN,
-                        narf_filesystem::POLL_IN & !bits,
-                    );
-                }
-                bits
-            }
-            SocketState::InetRaw { inbox, .. } => {
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !inbox.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            SocketState::Bypass { .. } => {
-                // Kernel-bypass path: readiness is managed by the XDP
-                // layer directly; report both directions so callers can
-                // always proceed and let the XDP ring buffer throttle.
-                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
-            }
-            SocketState::NetlinkUevent { reader } => {
-                // Readable when an unread uevent is waiting AND this socket
-                // joined the kernel uevent group; always writable (the udev
-                // monitor is read-only but POLL_OUT is harmless). A
-                // non-member must never be reported readable: recv would
-                // answer EAGAIN and a level-triggered poller would spin.
-                let mut bits = narf_filesystem::POLL_OUT;
-                if self.netlink_uevent_subscribed.load(Ordering::Acquire) && reader.has_pending() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                // Reconcile the durable cell against this level so a monitor that
-                // drained its reader stops reporting POLL_IN in the cell (else a
-                // re-arm spuriously returns Ready and a timed poll spins). The
-                // emit set the rising edge that fired the parked monitor.
-                self.uevent_readiness.set(
-                    bits & narf_filesystem::POLL_IN,
-                    narf_filesystem::POLL_IN & !bits,
-                );
-                bits
-            }
-            SocketState::NetlinkRoute { replies } => {
-                // Always writable (a dump request is sendable); readable when
-                // a built dump has queued reply messages waiting.
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !replies.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            SocketState::NetlinkGeneric { replies } => {
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !replies.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            SocketState::NetlinkSockDiag { replies } => {
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !replies.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            SocketState::NetlinkNetfilter { replies } => {
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !replies.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            SocketState::NetlinkAudit { replies } => {
-                let mut bits = narf_filesystem::POLL_OUT;
-                if !replies.is_empty() {
-                    bits |= narf_filesystem::POLL_IN;
-                }
-                bits
-            }
-            // No-op sink (audit/netfilter/etc.): always writable (sends are
-            // accepted + dropped), never readable (nothing is ever queued).
-            SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
-        }
+        self.readiness_bits_for_state(&self.state.lock())
     }
 
     fn poll_edge_token(&self) -> (u64, u64) {
@@ -2396,44 +2221,22 @@ impl FileOps for SocketFile {
         if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
             return (self.netlink_readable_token.load(Ordering::Acquire), 0);
         }
-        match &*self.state.lock() {
-            SocketState::UnixConnected { rx, tx, .. }
-            | SocketState::InetConnected { rx, tx, .. }
-            | SocketState::Inet6Connected { rx, tx, .. } => {
-                (rx.readable_token(), tx.writable_token())
-            }
-            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
-                (self.dgram_readable_token.load(Ordering::Acquire), 0)
-            }
-            SocketState::UnixListener { .. } => {
-                (self.listener_readable_token.load(Ordering::Acquire), 0)
-            }
-            SocketState::NetlinkUevent { reader } => {
-                // No membership, no edge: an unsubscribed monitor must not
-                // advance its EPOLLET token on traffic it cannot receive.
-                let rx_tok = if self.netlink_uevent_subscribed.load(Ordering::Acquire)
-                    && reader.has_pending()
-                {
-                    narf_filesystem::uevent_current_seqnum()
-                } else {
-                    0
-                };
-                (rx_tok, 0)
-            }
-            SocketState::NetlinkRoute { replies }
-            | SocketState::NetlinkGeneric { replies }
-            | SocketState::NetlinkSockDiag { replies }
-            | SocketState::NetlinkNetfilter { replies }
-            | SocketState::NetlinkAudit { replies } => {
-                let rx_tok = if !replies.is_empty() {
-                    self.netlink_readable_token.load(Ordering::Acquire)
-                } else {
-                    0
-                };
-                (rx_tok, 0)
-            }
-            _ => (0, 0),
+        self.edge_token_for_state(&self.state.lock())
+    }
+
+    /// Fused mask + token under ONE `state` lock (epoll EPOLLET confirm step).
+    fn poll_readiness_and_token_at(&self, _offset: u64) -> (u32, (u64, u64)) {
+        if self.domain == AF_NETLINK && !self.netlink_user_inbox.lock().is_empty() {
+            return (
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT,
+                (self.netlink_readable_token.load(Ordering::Acquire), 0),
+            );
         }
+        let state = self.state.lock();
+        (
+            self.readiness_bits_for_state(&state),
+            self.edge_token_for_state(&state),
+        )
     }
 
     /// Durable arm for a connected AF_UNIX/AF_INET stream socket. Both rings of
@@ -2638,6 +2441,231 @@ impl FileOps for SocketFile {
 }
 
 impl SocketFile {
+    /// Per-state readiness bits (with durable-cell reconcile side-effects),
+    /// factored out so the fused poll_readiness_and_token_at computes mask +
+    /// token under a single `state` lock. Behaviourally identical to the old
+    /// inline `poll_readiness` match.
+    fn readiness_bits_for_state(&self, state: &SocketState) -> u32 {
+        match state {
+            SocketState::Fresh | SocketState::UnixBound { .. } => 0,
+            // An AF_INET listener is accept-ready (POLL_IN) when its
+            // loopback `pending` queue OR — for a wired (off-box) listen
+            // — the kernel-stack accept-queue has a completed connection.
+            // Without the kernel-queue check, an epoll-driven server like
+            // redis never sees an incoming off-box connection.
+            SocketState::InetListener {
+                pending, listen_id, ..
+            } => {
+                let ready = !pending.is_empty()
+                    || listen_id
+                        .map(narf_net::tcp_stack::listen_has_pending)
+                        .unwrap_or(false);
+                // Reconcile the durable accept cell against this level so it
+                // clears once accept drains the queue (else a re-arm spuriously
+                // returns Ready and a timed poll spins). The connect enqueue set
+                // the rising POLL_IN edge that fired the parked acceptor.
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
+            SocketState::UnixListener { pending, .. }
+            | SocketState::Inet6Listener { pending, .. } => {
+                let ready = !pending.is_empty();
+                self.listener_readiness.set(
+                    if ready { narf_filesystem::POLL_IN } else { 0 },
+                    if ready { 0 } else { narf_filesystem::POLL_IN },
+                );
+                if ready {
+                    narf_filesystem::POLL_IN
+                } else {
+                    0
+                }
+            }
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => {
+                let mut bits = 0;
+                // Linux reports POLLIN on a peer-closed stream socket too, so
+                // the reader's normal readable path runs, read() returns 0
+                // (EOF), and it tears the connection down. Reporting only
+                // POLLHUP (no POLLIN) here made dbus-daemon busy-spin on a
+                // hung-up client fd — epoll kept returning it ready, but with
+                // no POLLIN dbus never entered its read/disconnect path and
+                // looped forever, wedging the whole session bus (Plasma stall).
+                if rx.has_data() || rx.is_closed() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                if tx.has_space() {
+                    bits |= narf_filesystem::POLL_OUT;
+                }
+                if rx.is_closed() {
+                    bits |= narf_filesystem::POLL_HUP;
+                }
+                bits
+            }
+            SocketState::InetDgram { inbox, .. } | SocketState::UnixDgram { inbox, .. } => {
+                let mut bits = narf_filesystem::POLL_OUT; // always sendable
+                if !inbox.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                // Reconcile the durable datagram cell's POLL_IN against this
+                // level so a recv that drained the inbox stops reporting
+                // readable in the cell (POLL_OUT stays — always sendable). The
+                // send enqueue set the rising POLL_IN edge that fired the reader.
+                self.dgram_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
+                bits
+            }
+            SocketState::InetWired { tcb_id, .. } => {
+                // Kernel-TCP-over-NIC: always writable (the stack
+                // queues + flow-controls send), and POLL_IN when the
+                // TCB has buffered RX data or the peer has closed
+                // (read returns EOF). This is what makes epoll/poll/
+                // select on a kernel-TCP socket wake on inbound data.
+                let mut bits = narf_filesystem::POLL_OUT;
+                if narf_net::tcp_stack::readable(*tcb_id) {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                // Reconcile the durable cell against this level so a socket the
+                // app just drained stops reporting readable in the cell (else a
+                // re-arm spuriously returns Ready and a level poll spins); the
+                // RX wake set the rising edge. Only touch an existing cell — do
+                // not create one here (poll may run on a never-armed fd).
+                if let Some(cell) = crate::handlers::tcb_cell_lookup(*tcb_id) {
+                    cell.set(
+                        bits & narf_filesystem::POLL_IN,
+                        narf_filesystem::POLL_IN & !bits,
+                    );
+                }
+                bits
+            }
+            SocketState::InetRaw { inbox, .. } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !inbox.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::Bypass { .. } => {
+                // Kernel-bypass path: readiness is managed by the XDP
+                // layer directly; report both directions so callers can
+                // always proceed and let the XDP ring buffer throttle.
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT
+            }
+            SocketState::NetlinkUevent { reader } => {
+                // Readable when an unread uevent is waiting AND this socket
+                // joined the kernel uevent group; always writable (the udev
+                // monitor is read-only but POLL_OUT is harmless). A
+                // non-member must never be reported readable: recv would
+                // answer EAGAIN and a level-triggered poller would spin.
+                let mut bits = narf_filesystem::POLL_OUT;
+                if self.netlink_uevent_subscribed.load(Ordering::Acquire) && reader.has_pending() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                // Reconcile the durable cell against this level so a monitor that
+                // drained its reader stops reporting POLL_IN in the cell (else a
+                // re-arm spuriously returns Ready and a timed poll spins). The
+                // emit set the rising edge that fired the parked monitor.
+                self.uevent_readiness.set(
+                    bits & narf_filesystem::POLL_IN,
+                    narf_filesystem::POLL_IN & !bits,
+                );
+                bits
+            }
+            SocketState::NetlinkRoute { replies } => {
+                // Always writable (a dump request is sendable); readable when
+                // a built dump has queued reply messages waiting.
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::NetlinkGeneric { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::NetlinkSockDiag { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::NetlinkNetfilter { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            SocketState::NetlinkAudit { replies } => {
+                let mut bits = narf_filesystem::POLL_OUT;
+                if !replies.is_empty() {
+                    bits |= narf_filesystem::POLL_IN;
+                }
+                bits
+            }
+            // No-op sink (audit/netfilter/etc.): always writable (sends are
+            // accepted + dropped), never readable (nothing is ever queued).
+            SocketState::NetlinkSink => narf_filesystem::POLL_OUT,
+        }
+    }
+
+    /// Per-state EPOLLET edge token (passive — no side-effects), the twin of
+    /// [`Self::readiness_bits_for_state`].
+    fn edge_token_for_state(&self, state: &SocketState) -> (u64, u64) {
+        match state {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => {
+                (rx.readable_token(), tx.writable_token())
+            }
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => {
+                (self.dgram_readable_token.load(Ordering::Acquire), 0)
+            }
+            SocketState::UnixListener { .. } => {
+                (self.listener_readable_token.load(Ordering::Acquire), 0)
+            }
+            SocketState::NetlinkUevent { reader } => {
+                // No membership, no edge: an unsubscribed monitor must not
+                // advance its EPOLLET token on traffic it cannot receive.
+                let rx_tok = if self.netlink_uevent_subscribed.load(Ordering::Acquire)
+                    && reader.has_pending()
+                {
+                    narf_filesystem::uevent_current_seqnum()
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
+            SocketState::NetlinkRoute { replies }
+            | SocketState::NetlinkGeneric { replies }
+            | SocketState::NetlinkSockDiag { replies }
+            | SocketState::NetlinkNetfilter { replies }
+            | SocketState::NetlinkAudit { replies } => {
+                let rx_tok = if !replies.is_empty() {
+                    self.netlink_readable_token.load(Ordering::Acquire)
+                } else {
+                    0
+                };
+                (rx_tok, 0)
+            }
+            _ => (0, 0),
+        }
+    }
+
     /// Bytes immediately readable — the value the `SIOCINQ`/`FIONREAD` ioctl
     /// reports. For a datagram socket this is the size of the *next* queued
     /// datagram (0 when the queue is empty); for a connected stream socket
