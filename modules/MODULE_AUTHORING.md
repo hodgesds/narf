@@ -7,6 +7,13 @@ architecture-comparison overview, see the workspace-root
 
 ## Project layout
 
+> **Status note.** The loader is complete and tested, but there is no
+> `.ko` build step yet: `crate-type = "staticlib"` produces an *archive*,
+> and nothing currently runs `ld -r` to extract the single relocatable
+> object the loader wants. Until that lands, the guide below describes
+> the intended shape rather than a pipeline you can run end to end. See
+> the "open questions" section of [DESIGN.md](./DESIGN.md).
+
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal
 `Cargo.toml`:
@@ -91,8 +98,52 @@ The format is one `key=value` per line. Recognised keys:
   * `depends=` — comma-separated list of module names this module
     needs loaded first. Phase 1 doesn't auto-load deps; modprobe
     is expected to.
-  * `kernel_abi=` — 32-bit hex hash of the running kernel build.
-    Get it from `cat /sys/kernel/abi_hash` after boot.
+  * `kernel_abi=` — 32-bit hex hash of the kernel's exported ABI
+    surface. Get it from `cat /sys/kernel/abi_hash` after boot. It is
+    derived from the export table, so it changes when the symbols you
+    can call change — not on every kernel rebuild.
+
+## What you can call
+
+A module may call the kernel only through the exported ABI in
+`modules/src/kabi.rs`. This is a hand-written surface, not a projection
+of the kernel's internal APIs, and the reason is that **Rust has no
+stable ABI**: the layout of `&dyn Trait`, of any `repr(Rust)` struct,
+and the calling convention itself may all change between compilations
+with nothing in the toolchain reporting it. Only `extern "C"` over
+primitives and `repr(C)` types can safely cross into a separately
+compiled module.
+
+So the surface is small and grows deliberately. Today:
+
+| Symbol | Signature | Notes |
+|---|---|---|
+| `narf_printk` | `(*const u8, usize) -> i32` | UTF-8 bytes to the console; `-22` on null / empty / invalid UTF-8 |
+| `narf_kmalloc` | `(usize, usize) -> *mut u8` | size, align; null on failure or invalid layout |
+| `narf_kfree` | `(*mut u8, usize, usize) -> ()` | must repeat the exact size and align |
+| `narf_monotonic_ns` | `() -> u64` | monotonic clock |
+
+Declare them as you would any foreign function:
+
+```rust
+unsafe extern "C" {
+    fn narf_printk(ptr: *const u8, len: usize) -> i32;
+    fn narf_monotonic_ns() -> u64;
+}
+```
+
+Every export is `unsafe`, including the ones taking no pointers — the
+boundary is unsafe as a whole, because nothing has verified your
+arguments.
+
+Each export carries a CRC computed from its signature. If the kernel's
+signature changes, your module is refused at load with a CRC mismatch
+rather than being called with the wrong stack layout. You do not have
+to do anything to opt into that.
+
+Referencing a symbol that is *not* exported is a load-time failure, not
+a link-time one: the relocator reports `SymbolNotFound` naming the
+symbol.
 
 ## The `narf_module!` macro
 

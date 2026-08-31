@@ -57,10 +57,20 @@ pub fn install_module(module: &Arc<Module>) -> Arc<Kobject> {
         format!("{}\n", m_for_size.total_size())
     });
 
-    // ── Holders directory (placeholder; populated when dep graph wired) ──
-    // Linux: `/sys/module/<name>/holders/` is a directory of symlinks.
-    // We register an empty `holders` placeholder for now.
-    kobject_add_attr(&kobj, "holders", || "\n".to_string());
+    // ── Holders ─────────────────────────────────────────────────────
+    // Linux makes this a directory of symlinks
+    // (`/sys/module/<name>/holders/`); we surface the same information as a
+    // newline-separated attribute, now that the loader records real
+    // dependency edges rather than the empty placeholder this was.
+    let id_for_holders = module.id;
+    kobject_add_attr(&kobj, "holders", move || {
+        let mut out = alloc::string::String::new();
+        for n in crate::registry::holders_of(id_for_holders) {
+            out.push_str(&n);
+            out.push('\n');
+        }
+        out
+    });
 
     // ── Parameters ──────────────────────────────────────────────────
     let params_kobj = narf_filesystem::sysfs::class_device_register(kobj.clone(), "parameters");
@@ -118,3 +128,19 @@ pub fn install_module(module: &Arc<Module>) -> Arc<Kobject> {
 
 // re-export Box so the macro-free path above compiles cleanly.
 use alloc::boxed::Box;
+
+/// Install `/sys/kernel/abi_hash`.
+///
+/// `MODULE_AUTHORING.md` tells authors to read this file to get the value for
+/// their `kernel_abi=` line. It did not exist, so the instruction could not
+/// be followed and the only way to learn the hash was to read kernel source.
+///
+/// Printed as the same `0x%08x` form the manifest parser expects, so the
+/// value can be copied straight across.
+pub fn install_abi_hash() {
+    let root = narf_filesystem::sysfs::get_root();
+    let kernel = narf_filesystem::sysfs::get_or_create_child(&root, "kernel");
+    kobject_add_attr(&kernel, "abi_hash", || {
+        format!("0x{:08x}\n", crate::symbols::kernel_abi())
+    });
+}

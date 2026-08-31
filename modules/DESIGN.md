@@ -13,6 +13,29 @@ kernel supports runtime-loadable modules so:
 The implementation lives in `narf-modules/`. This document explains
 the architecture choices.
 
+## What works, and what does not
+
+Working end to end: parse, manifest, layout, mapping into an executable
+module VA window with per-region W^X, in-place relocation (with aarch64
+veneers), symbol resolution against a real KSYMTAB, link-time provider
+pinning, init/exit, `/proc/modules`, `/sys/module/<name>/`, and the
+three syscalls.
+
+Known gaps, each expanded where it belongs below:
+
+  * **No `.ko` build pipeline.** `modules/test-module` is a `staticlib`
+    archive; nothing yet runs `ld -r` to produce the single relocatable
+    object a real module is, and no test loads a rustc-emitted module.
+    Every smoke synthesizes its ELF in memory. This is the largest gap
+    between "the loader is correct" and "modules work".
+  * **Driver domains are named but not enforced.** See §2.
+  * **Per-action caps on the three syscalls are not wired.** See the
+    trust model, tier 3.
+  * **Signatures are accepted unconditionally.** The hook is real, the
+    verifier is `AcceptAll`.
+  * **A task preempted inside module code can resume on unmapped
+    text.** See §6.
+
 ## Where NARF deviates from Linux
 
 The Linux `.ko` mechanism (in `kernel/module/*.c`) is the closest
@@ -42,15 +65,29 @@ PKS-isolated region for that domain (read-execute from in-domain,
 no-access from out-of-domain) and the data + bss into the same
 domain's RW region.
 
-The runtime side (PKS PKey assignment, MTE tag, PCID-tagged page
-table) is the responsibility of the per-arch HAL — `narf-modules`
-allocates with the right `DomainId` and trusts the HAL to enforce
-the boundary. On hardware without PKS/MTE, the allocator simply
-draws from a domain-tagged frame pool that the scheduler can
-honour during context switches.
+**Status: the name resolves, the isolation does not exist yet.**
+`domain::resolve` maps `target_domain=` to a `DomainId` and the loader
+stores it on the `Module`, and nothing reads it. `module_text::alloc`
+draws ordinary buddy frames; it does not consult the domain.
 
-A buggy module can scribble only its own domain. Linux has no
-equivalent; a misbehaving driver can corrupt anything.
+What *is* enforced today is W^X (see below), which is a different and
+weaker property: a module cannot manufacture executable memory, but it
+can still scribble any kernel memory it can address. Getting from here
+to the paragraph above needs two things, in order:
+
+  1. A domain-tagged frame pool behind `module_text::alloc`, so a
+     module's pages carry its `DomainId`. Cheap, and the enforcement
+     machinery (`arch/src/x86_64/pks.rs`,
+     `memory/src/domain_state.rs`) already exists.
+  2. Call gates. `invoke_init` calls module code directly on the
+     kernel stack, so enforcing a PKS domain means switching PKRS in
+     *both* directions — kernel→module on entry and module→kernel on
+     every export call. That puts a WRMSR on every crossing, which is
+     worth building and worth measuring before it is turned on by
+     default.
+
+The claim "a buggy module can scribble only its own domain" belongs to
+step 2 and should not be read as describing the current kernel.
 
 ### 3. Versioned ABI
 
@@ -59,16 +96,92 @@ function signature. NARF preserves that idea (the per-export `crc`
 field) and adds a coarser whole-kernel `kernel_abi=` hash carried
 in every module's manifest.
 
-`kernel_abi` is a 32-bit hash of the running kernel's build
-(currently a simple version string; LTO-image hashing is on the
-near roadmap). The manifest parser refuses to load a module whose
-`kernel_abi` doesn't match. This catches the "wrong kernel
-version" case without needing per-symbol CRC bookkeeping for the
-common case.
+`kernel_abi` is a 32-bit hash **derived from the export table**:
+`symbols::compute_abi_hash` folds every registered `(name, crc)` pair,
+order-independently. The manifest parser refuses to load a module whose
+`kernel_abi` doesn't match. This catches the "wrong kernel" case
+without needing per-symbol CRC bookkeeping for the common case.
+
+Earlier drafts of this document planned to hash the LTO image instead.
+Hashing the export table is better on the axis that matters: it changes
+exactly when the thing modules depend on changes, and not when an
+unrelated subsystem is recompiled. An image hash would reject every
+module on every kernel rebuild, which trains people to ignore it.
+
+Because the hash is derived, registration has to come first — see the
+ordering note on `register_initcalls`. The hash cannot drift from the
+surface it describes, because there is nowhere for it to drift to.
 
 Per-symbol CRCs still apply — they catch the harder case where the
 kernel ABI hash matches but a single subsystem's signature
 changed.
+
+## Where module memory lives
+
+Physical provenance is irrelevant — `module_text::alloc` takes ordinary
+buddy frames, no contiguity, no zone. Everything load-bearing is about
+the virtual address and the permissions, which is also how Linux does
+it (`execmem_alloc_rw` hands back vmalloc'd, scattered frames). Neither
+the heap nor the module window is swappable: NARF's `SwapVictim` is
+keyed on a user `pml4_phys` plus VA, and nothing enumerates kernel
+frames as candidates.
+
+The window placement is the load-bearing choice, and it is forced by
+relocation range:
+
+```text
+  x86_64   PML4[511] PDPT[510]  0xFFFF_FFFF_8000_0000  kernel image
+           PML4[511] PDPT[511]  0xFFFF_FFFF_C000_0000  module images
+```
+
+rustc emits calls to exported kernel symbols as `R_X86_64_PLT32` — a
+signed 32-bit displacement. A module more than 2 GiB from the kernel
+cannot be relocated at all, only rejected. Sitting the window directly
+above the kernel image keeps every module within ~1.25 GiB, so PC32 and
+PLT32 resolve directly and no GOT or PLT is needed. Linux places
+`MODULES_VADDR` the same way for the same reason.
+
+The BPF text window (slot 273, ~131 TiB away) would overflow every such
+relocation. `bpf_text` gets away with that placement because the JIT
+emits absolute `mov rax, imm64` + `call rax` and does not care about
+distance; a module compiled by LLVM as an ordinary relocatable object
+does.
+
+PML4[511] already exists in every address space and `new_user_pml4_on`
+snapshot-copies PML4[256..512] **by value**, so every root holds the
+same PDPT frame by pointer. Populating PDPT[511] inside it propagates
+with no reservation step and none of `bpf_text`'s §4.1 boot-ordering
+hazard.
+
+Module mappings are deliberately **not** GLOBAL. They are unmapped at
+`rmmod`, and several TLB-flush paths retain global entries, which would
+leave a stale executable translation on an idle peer. `bpf_text` does
+set GLOBAL, and may, because its VA is never recycled.
+
+### aarch64 needs veneers
+
+```text
+  aarch64  L0[511] L1[0]  0xFFFF_FF80_0000_0000  low-PA device window
+           L0[511] L1[1]  0xFFFF_FF80_4000_0000  RAM linear map + kernel
+           L0[511] L1[2]  0xFFFF_FF80_8000_0000  module images
+```
+
+There is no equivalent free lunch. `frame/src/aarch64/boot.S` already
+owns hi_L1[0] and hi_L1[1], so the first free slot is 1 GiB out, while
+`R_AARCH64_CALL26` reaches only ±128 MiB. Moving closer is not an
+option — the intervening GiB *is* the linear map.
+
+So `src/plt.rs` emits `adrp x16 / add x16 / br x16` trampolines into an
+arena at the end of the module's own text, within branch range of every
+call site. x16 is free to clobber: AAPCS64 requires a conforming
+program to assume a veneer altering IP0/IP1 may be inserted at any
+branch exposed to a long-branch relocation. The arena is sized from a
+per-relocation over-count and folded by target at emit time, as Linux's
+`count_plts` does.
+
+ADRP reaches ±4 GiB, so with the window 1 GiB out no second-order
+veneer is needed. If the window ever moves further, Linux's
+`module_emit_veneer_for_adrp` is the piece to add.
 
 ## Pipeline
 
@@ -100,12 +213,21 @@ changed.
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
-                │ alloc placements│  one Vec<u8> per loadable section
+                │ plan_layout     │  group by permission, page-align each
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
-                │ relocator       │  walk .rela.* + apply
+                │ module_text::   │  map RW+NX at the module VA window
+                │ alloc           │
                 └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ copy sections   │  to their final addresses; zero .bss
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ relocator       │  walk .rela.* + apply IN PLACE
+                └────────┬────────┘  (+ aarch64 PLT veneers)
                          ▼
                 ┌─────────────────┐
                 │ find init/exit  │  narf_module_init + _exit symbols
@@ -116,13 +238,26 @@ changed.
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
-                │ registry::insert│  + install /sys/module/<name>/
+                │ module_text::   │  text → RX, rodata → RO, aliases closed
+                │ protect         │
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ insert_unique   │  + install /sys/module/<name>/
+                └────────┬────────┘
+                         ▼
+                ┌─────────────────┐
+                │ pin providers   │  refcount each module linked against
                 └────────┬────────┘
                          ▼
                 ┌─────────────────┐
                 │ invoke_init     │  state Loading → Live
                 └─────────────────┘
 ```
+
+Every failure after `module_text::alloc` unmaps the image before
+propagating — `build_image` exists to funnel them through one
+`module_text::free`.
 
 The pipeline is hard-cutover: every error along the way aborts the
 load without leaving partial state. We don't support "load with
@@ -145,13 +280,12 @@ There are three trust tiers:
      `required_caps=BlockDevice:Write` in its manifest. The kernel
      enforces this at link time.
 
-  3. **Admin-only.** `init_module`, `finit_module`, and
-     `delete_module` are themselves cap-gated (caller must hold a
-     `Cap<Process, Invoke>` with elevated privileges — wired into
-     the syscall trap once the syscall plumbing in
-     `narf-userspace/handlers` lands). The current Phase 1 wiring
-     uses the userspace process's existing privilege model; richer
-     per-action caps come later.
+  3. **Admin-only.** The syscall plumbing exists
+     (`userspace/src/handlers/sys_{init,finit,delete}_module.rs`) and
+     routes through the process's existing privilege model. The
+     per-action `Cap<Process, Invoke>` gate described here is **not**
+     wired yet — that is still to do, and is the single largest gap in
+     this tier.
 
 ## W^X enforcement
 
@@ -160,20 +294,47 @@ A section with both is rejected on principle — kernel-mode JIT is
 out of scope and a module that wants both is more likely buggy
 than principled.
 
-When the PKS HAL hookup lands, text + rodata sections will be
-mapped RX-from-domain / no-access-out-of-domain. Data + bss will
-be mapped RW-from-domain. The two regions live in distinct PKey
-slots so a runtime W^X violation also requires a PKEY-RU MSR
-manipulation that the executor refuses.
+That check is about the *ELF*. The mapping is enforced separately, by
+`narf_memory::module_text`:
+
+  * Sections are grouped by permission and each region page-aligned, so
+    text, rodata and data can be sealed independently. Linux splits the
+    same space seven ways (`enum mod_mem_type`), separating
+    `ro_after_init` and giving `.init.*` its own trio so the init region
+    can be **freed** once init returns. We have three regions and do not
+    reclaim init yet; the layout is a loop over `REGION_ORDER` so both
+    are additions rather than a rewrite.
+  * Pages are mapped RW+NX, relocated in place, then flipped — text to
+    RX, rodata to RO.
+  * **The alias matters as much as the mapping.** The frames backing
+    module text are also visible through the kernel's linear map, which
+    is RW. `protect` closes that via `text_poke::protect_ro` *before*
+    publishing the executable mapping, so a failure leaves nothing
+    executable. `free` restores it before the frames go back to the
+    buddy — skipping that hands the next owner memory it cannot write.
+  * On aarch64 `text_poke::can_protect` refuses sub-2-MiB ranges:
+    making one 4 KiB frame of a live 2 MiB linear-map block read-only
+    needs break-before-make on the kernel's own map. The alias stays
+    writable there, which is the same fallback `bpf_text` takes and the
+    same refusal Linux arm64 makes.
+
+Prior to this, the loader relocated each section into a `Vec<u8>` on
+the kernel heap and used the buffer's own address as the runtime
+target. Every kernel window is NX, so a real module faulted on its
+first instruction; nothing caught it because the end-to-end smokes
+pointed their `SHN_ABS` lifecycle symbols at in-kernel functions and
+never executed a relocated byte.
 
 ## Per-export CRC versioning
 
-Each `KernelExport` carries a `crc: u32`. The intent is for the
-build system to compute the CRC from the function's signature
-(types of args + return) — the same scheme Linux uses for
-`MODVERSIONS`. Phase 1 leaves the CRC up to the caller of
-`narf_export!(name, addr, crc)`; the build-system integration
-that auto-generates CRCs from rustc's type info is deferred.
+Each `KernelExport` carries a `crc: u32`, computed from the function's
+signature — the same scheme Linux uses for `MODVERSIONS`.
+
+This was deferred to "build-system integration"; it turns out none is
+needed. The `kernel_abi!` macro in `src/kabi.rs` sees the argument and
+return type tokens, so it hashes them at compile time with
+`crc_for_signature`. Change a parameter and the CRC changes. This is
+MODVERSIONS without genksyms.
 
 When a kernel build changes a signature, the export's CRC
 changes. A module compiled against the old signature carries the
@@ -264,11 +425,21 @@ asserts:
 
 ### Deferred items
 
-  * **Per-symbol export reference counting.** If module B holds a function
-    pointer resolved from module A's export, module A's `unregister_exports_of`
-    removes the KSYMTAB entry but doesn't prevent B from calling through the
-    stale pointer. Full safety requires refcount-guarded inter-module
-    dependencies (like Linux's `try_module_get`/`module_put` pair).
+  * ~~**Per-symbol export reference counting.**~~ **Done.** `Resolution`
+    carries the owning `ModuleId`, the relocator records every non-kernel
+    owner it resolves against, and `sys_init_module` takes a reference on
+    each provider before calling init. A provider with a live consumer
+    answers EBUSY. This is `try_module_get` moved from per-call to link
+    time, which matches how NARF already handles cap requirements (§1).
+
+  * **A task preempted inside module code.** Still open, and distinct
+    from the above. `delete_module` unmaps the image once the refcount is
+    zero and the exports are swept, but a task that entered the module
+    before `invoke_exit` and was preempted inside it would resume on
+    unmapped text. Closing this needs a real grace period between the
+    sweep and the free. `rcu::sync()` is *not* it: `qsbr::sync_blocking`
+    drives quiescence locally and gives up after 8 rounds, so on SMP it
+    would supply the appearance of a grace period without the guarantee.
   * **Livepatch.** Symbol ownership interacts with livepatch if a patched
     symbol is later unregistered; deferred until livepatch lands.
   * **`__reset_for_test` resets the MODULE_ID_ALLOC counter.** Tests that
@@ -279,6 +450,13 @@ asserts:
 
   * **Ed25519 signature verification.** The hook is in place; the
     implementation slots into `sign::install_verifier(...)`.
+  * **A real `.ko` build.** `modules/test-module` builds as a
+    `staticlib`, which is an archive; a module is a single relocatable
+    object, as `ld -r` produces. Until an xtask step emits one and a
+    smoke loads it, every test here runs on a synthesized ELF — which
+    exercises the loader but not rustc's actual relocation output.
+    This should be the next thing done.
+
   * **modprobe userspace daemon.** A userspace tool that walks
     `/lib/modules/`, resolves `depends=`, and submits modules in
     the right order. Currently the kernel exposes the syscalls
@@ -291,9 +469,12 @@ asserts:
   * **Livepatch.** Linux's livepatch model leans heavily on the
     module loader. A future NARF livepatch system would reuse
     the relocator + cap-typed exports machinery.
-  * **Module dependency graph.** The `depends=` field is parsed
-    but not yet enforced — modprobe is expected to order the
-    submissions correctly.
+  * ~~**Module dependency graph.**~~ **Enforced**, though not via
+    `depends=`. Edges come from the relocations actually made, which is
+    strictly better than a manifest claim: a module cannot outlive
+    something it links against regardless of what its `depends=` says.
+    `/proc/modules` reports real holders. What modprobe still owns is
+    load *ordering* — nothing yet loads a missing provider on demand.
   * **Notes / build-id.** Module ELF notes (`.note.gnu.build-id`)
     are present but `/sys/module/<name>/notes/` is a placeholder.
 
@@ -313,8 +494,10 @@ narf-modules/
       sections.rs
       symbols.rs
     manifest.rs          ← .modinfo parser + Manifest struct
-    loader.rs            ← top-level pipeline
+    loader.rs            ← top-level pipeline + image layout
     relocator.rs         ← per-section .rela.* walker
+    plt.rs               ← aarch64 long-branch veneers
+    kabi.rs              ← the C ABI surface modules may call
     symbols.rs           ← KSYMTAB + cap-typed exports
     lifecycle.rs         ← state machine + init/exit ABI
     refcount.rs          ← per-module refcount

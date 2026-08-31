@@ -176,8 +176,12 @@ pub fn register_initcalls() {
         InitResult::Ok
     });
 
-    narf_init::register(Stage::Fs, "modules-procfs", || {
+    narf_init::register(Stage::Fs, "modules-sysfs", || {
         proc_modules::install_proc_modules();
+        // `/sys/kernel/abi_hash` — the value a module author has to put in
+        // their `kernel_abi=` line. Registered here rather than with the ABI
+        // surface at `Subsys` because it needs `/sys` to exist.
+        sysfs_module::install_abi_hash();
         InitResult::Ok
     });
 }
