@@ -49,6 +49,11 @@ struct ElfBuilder {
     // (target_section_idx, r_offset, sym_idx, ty, addend)
     relas: Vec<(u32, u64, u32, u32, i64)>,
     kparams: Vec<u8>,
+    /// A SECOND `.modinfo` section. rustc emits one section per
+    /// `#[link_section = ".modinfo"]` static — seven for the reference
+    /// module — and they are merged only by `ld -r`. This lets a smoke
+    /// build the un-merged shape.
+    modinfo2: Vec<u8>,
 }
 
 impl ElfBuilder {
@@ -110,6 +115,11 @@ impl ElfBuilder {
     }
     fn kparams(mut self, raw: &[u8]) -> Self {
         self.kparams = raw.to_vec();
+        self
+    }
+    /// Split the manifest across a second `.modinfo` section.
+    fn modinfo2(mut self, raw: &[u8]) -> Self {
+        self.modinfo2 = raw.to_vec();
         self
     }
 
@@ -197,6 +207,8 @@ impl ElfBuilder {
         out.extend_from_slice(&rela);
         let off_kparams = out.len();
         out.extend_from_slice(&self.kparams);
+        let off_modinfo2 = out.len();
+        out.extend_from_slice(&self.modinfo2);
 
         // Align to 8 before section header table.
         while out.len() % 8 != 0 {
@@ -306,7 +318,22 @@ impl ElfBuilder {
             0,
         );
 
-        let shnum: u16 = 8;
+        // sec 8: a second `.modinfo`, sharing the first's name string.
+        push_shdr(
+            &mut out,
+            off_name_modinfo as u32,
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            0,
+            off_modinfo2 as u64,
+            self.modinfo2.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        let shnum: u16 = 9;
         let shentsize: u16 = 64;
         let shstrndx: u16 = 1;
 
@@ -1124,4 +1151,54 @@ fn smoke_proc_modules_holders_reflect_dependencies() -> TestResult {
 kernel_test_in!(
     "modules/deps",
     smoke_proc_modules_holders_reflect_dependencies
+);
+
+/// rustc emits one `.modinfo` section per `#[link_section]` static — the
+/// reference module produces seven — and they are merged into one only when
+/// the object is passed through `ld -r`. The loader must not depend on that
+/// having happened.
+///
+/// Reading only the first section meant a real module's manifest was whatever
+/// its first `MODULE_INFO` line happened to be, so `kernel_abi=` and
+/// `target_domain=` went missing and the load failed with a manifest error
+/// pointing nowhere near the cause.
+fn smoke_manifest_spans_multiple_modinfo_sections() -> TestResult {
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    let abi = crate::symbols::kernel_abi();
+
+    // Split exactly where rustc would: one static per line, NUL-terminated,
+    // with the fields the parser needs spread across both sections.
+    let first = b"name=split\0version=0.1.0\0license=GPL-2.0-or-later\0";
+    let second = format!(
+        "author=test\0description=d\0target_domain=scratch\0kernel_abi=0x{:08x}\0",
+        abi
+    );
+
+    let bytes = ElfBuilder::new_native()
+        .modinfo(first)
+        .modinfo2(second.as_bytes())
+        .text(&[0u8; 16])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .build();
+
+    match crate::loader::load_image(&bytes) {
+        Ok(m) => {
+            let name_ok = m.name() == "split";
+            // SAFETY: never registered, never initialised.
+            unsafe { crate::loader::release_image(&m) };
+            if name_ok {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("manifest parsed but carries the wrong name")
+            }
+        }
+        Err(_) => TestResult::Fail("load_image could not read a manifest split across sections"),
+    }
+}
+kernel_test_in!(
+    "modules/manifest",
+    smoke_manifest_spans_multiple_modinfo_sections
 );

@@ -172,12 +172,13 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         });
     }
 
-    // 3. Find `.modinfo` and parse the manifest.
-    let modinfo_section = find_section_by_name(image, &hdr, SECT_MODINFO)
-        .ok_or(LoadError::Manifest(ManifestError::Missing))?;
-    let modinfo_bytes = section_data(image, &modinfo_section);
+    // 3. Collect `.modinfo` and parse the manifest.
+    let modinfo_bytes = collect_modinfo(image, &hdr);
+    if modinfo_bytes.is_empty() {
+        return Err(LoadError::Manifest(ManifestError::Missing));
+    }
     let abi = kernel_abi();
-    let manifest = Manifest::parse(modinfo_bytes, abi)?;
+    let manifest = Manifest::parse(&modinfo_bytes, abi)?;
 
     // 4. Resolve target domain.
     let domain_id = domain::resolve(&manifest.target_domain)?;
@@ -531,6 +532,43 @@ fn build_image(
         params,
         deps: ctx.deps,
     })
+}
+
+/// Concatenate every `.modinfo` section in the image.
+///
+/// There is usually more than one. Each `#[link_section = ".modinfo"]`
+/// static becomes its own section in rustc's output — the reference module
+/// emits seven — and they are only merged into a single `.modinfo` when the
+/// object is passed through `ld -r`, which is how a `.ko` is built.
+///
+/// Reading only the first section, as this used to, meant a real module's
+/// manifest was whatever its first `MODULE_INFO` line happened to be. For the
+/// reference module that is `name=`, so `kernel_abi=`, `license=` and
+/// `target_domain=` all went missing and the load failed with a manifest
+/// error that pointed nowhere near the cause.
+///
+/// Depending on `ld -r` to have merged them would work, but only for images
+/// built exactly that way; concatenating here costs one pass over the section
+/// table and makes the loader indifferent to it.
+fn collect_modinfo(bytes: &[u8], hdr: &Elf64Header) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_i, shdr, name) in enumerate_sections(bytes, hdr) {
+        if name != SECT_MODINFO {
+            continue;
+        }
+        let data = section_data(bytes, &shdr);
+        if data.is_empty() {
+            continue;
+        }
+        // The entries are NUL-separated `key=value` strings and each static
+        // normally carries its own terminator. Supply one if a section does
+        // not end with it, so two sections cannot fuse into one bogus key.
+        if !out.is_empty() && out.last() != Some(&0) {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+    }
+    out
 }
 
 /// Helper: find a section by exact name.
