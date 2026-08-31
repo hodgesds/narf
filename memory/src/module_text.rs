@@ -101,6 +101,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
+use narf_lib::id::DomainId;
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::{PhysAddr, PhysFrame, VirtAddr};
@@ -199,19 +200,26 @@ impl Prot {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn leaf_flags(self) -> crate::paging::PtFlags {
+    fn leaf_flags(self, domain: DomainId) -> crate::paging::PtFlags {
         use crate::paging::PtFlags;
         // No GLOBAL — see the module docs.
-        match self {
+        let base = match self {
             Prot::Rx => PtFlags::PRESENT,
             Prot::Ro => PtFlags::PRESENT | PtFlags::NO_EXEC,
             Prot::Rw => PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_EXEC,
-        }
+        };
+        base | protection_key(domain)
     }
 
     #[cfg(target_arch = "aarch64")]
-    fn leaf_flags(self) -> crate::paging::PtFlags {
+    fn leaf_flags(self, domain: DomainId) -> crate::paging::PtFlags {
         use crate::paging::PtFlags;
+        // aarch64 carries no per-page domain key. Its `DomainPrimitive`
+        // backend is MTE, which tags by allocation rather than by page-table
+        // field, so the domain does not travel in the leaf here. The loader
+        // still records the module's DomainId; what is missing is the
+        // enforcement side, not the bookkeeping.
+        let _ = domain;
         // UXN on every class: module text executes at EL1 only. Clearing PXN
         // is what makes it fetchable there.
         match self {
@@ -222,9 +230,29 @@ impl Prot {
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    fn leaf_flags(self) -> crate::paging::PtFlags {
+    fn leaf_flags(self, _domain: DomainId) -> crate::paging::PtFlags {
         crate::paging::PtFlags::PRESENT
     }
+}
+
+/// The protection-key field for `domain`, as it sits in a leaf PTE.
+///
+/// x86_64 PTE bits 59..=62 hold a 4-bit key selecting which of the 16 PKS
+/// domains a page belongs to (SDM Vol 3 §4.6.2). `IA32_PKRS` carries two
+/// rights bits per domain, so `pks::enter_domain` can deny fourteen of them
+/// in a single MSR write while leaving the kernel's domain and the running
+/// module's reachable.
+///
+/// Until this, `PtFlags::PK_MASK` existed and nothing ever set it: every
+/// module page carried key 0, so all sixteen domains were the same domain
+/// and `target_domain=` selected nothing. DESIGN.md described the isolation
+/// as real; it was bookkeeping.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn protection_key(domain: DomainId) -> crate::paging::PtFlags {
+    // `PtFlags::pk` masks to the low 4 bits, so a `DomainId` outside 0..=15
+    // cannot spill into the NX bit at 63.
+    crate::paging::PtFlags::pk(domain.raw())
 }
 
 // ── VA bitmap ──────────────────────────────────────────────────────────
@@ -295,6 +323,10 @@ pub struct ModuleImage {
     pub pages: usize,
     /// First page index in the window bitmap, including the guard page.
     va_page: usize,
+    /// Isolation domain every page of this image is tagged with. Fixed at
+    /// allocation: re-tagging a live image would need every mapping rewritten
+    /// and a shootdown, and nothing wants to.
+    pub domain: DomainId,
     /// Current protection of each mapped page.
     prot: Vec<Prot>,
     /// Whether each page's linear-map alias was successfully made read-only.
@@ -459,7 +491,7 @@ unsafe fn reserve_top_slot(_root: PhysAddr, _slot: usize) -> Result<(), ModuleTe
 /// The guard page costs one VA slot and turns a module that runs off the end of
 /// its own image into a page fault with a diagnosable address, rather than a
 /// silent walk into the next module's text.
-pub fn alloc(pages: usize) -> Result<ModuleImage, ModuleTextError> {
+pub fn alloc(pages: usize, domain: DomainId) -> Result<ModuleImage, ModuleTextError> {
     if pages == 0 || pages >= MODULE_VA_PAGES {
         return Err(ModuleTextError::BadLen);
     }
@@ -489,7 +521,7 @@ pub fn alloc(pages: usize) -> Result<ModuleImage, ModuleTextError> {
         // PML4[511]/L0[511] entry, and `frame` is a fresh, exclusively-owned
         // frame. `root` is the recorded live kernel root.
         let r = unsafe {
-            crate::paging::map_4kb(root, va, frame.start_address(), Prot::Rw.leaf_flags())
+            crate::paging::map_4kb(root, va, frame.start_address(), Prot::Rw.leaf_flags(domain))
         };
         if r.is_err() {
             crate::frame::free_frame(frame);
@@ -530,6 +562,7 @@ pub fn alloc(pages: usize) -> Result<ModuleImage, ModuleTextError> {
         base,
         pages,
         va_page,
+        domain,
         prot: vec![Prot::Rw; pages],
         alias_ro: vec![false; pages],
     })
@@ -590,7 +623,7 @@ pub fn protect(
         let va = VirtAddr::new(image.page_va(i));
         // SAFETY: `va` is a page this module mapped through `root`; changing
         // its permissions preserves the translation.
-        if unsafe { crate::paging::protect_4kb(root, va, prot.leaf_flags()) }.is_err() {
+        if unsafe { crate::paging::protect_4kb(root, va, prot.leaf_flags(image.domain)) }.is_err() {
             return Err(ModuleTextError::MapFailed);
         }
         image.prot[i] = prot;
@@ -791,7 +824,7 @@ kernel_test_in!("memory/module_text", smoke_module_text_window_placement);
 /// into a `Vec<u8>` on the NX heap, and this is the test that would have
 /// caught it.
 fn smoke_module_text_alloc_seal_execute() -> TestResult {
-    let mut img = match alloc(1) {
+    let mut img = match alloc(1, DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };
@@ -828,7 +861,7 @@ kernel_test_in!("memory/module_text", smoke_module_text_alloc_seal_execute);
 /// at its module VA, no kernel window may still offer a writable alias of the
 /// frame behind it.
 fn smoke_module_text_alias_closed_after_seal() -> TestResult {
-    let mut img = match alloc(1) {
+    let mut img = match alloc(1, DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };
@@ -870,7 +903,7 @@ kernel_test_in!(
 /// fault in whatever allocates it next, arbitrarily far from here.
 fn smoke_module_text_free_restores_va_and_alias() -> TestResult {
     let before = pages_used();
-    let mut img = match alloc(2) {
+    let mut img = match alloc(2, DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(2) failed"),
     };
@@ -903,6 +936,72 @@ kernel_test_in!(
     smoke_module_text_free_restores_va_and_alias
 );
 
+/// A module image's pages must carry its domain's protection key.
+///
+/// This is the half of driver isolation that lives in the page tables. PKS
+/// selects a domain from PTE bits 59..=62 and `IA32_PKRS` holds two rights
+/// bits per domain; if every module page carries key 0 then all sixteen
+/// domains ARE one domain, `target_domain=` selects nothing, and
+/// `enter_domain` narrows rights around pages it cannot distinguish.
+///
+/// That was the state before: `PtFlags::pk` existed and no caller ever used
+/// it, while DESIGN.md described the isolation as real.
+#[cfg(target_arch = "x86_64")]
+fn smoke_module_text_pages_carry_their_domain_key() -> TestResult {
+    use crate::x86_64::paging::{PageTable, PtFlags, WalkIndices};
+
+    // Two different domains, so a pass cannot come from every page happening
+    // to carry the same key.
+    for domain in [DomainId::SCRATCH, DomainId::DRIVER_2] {
+        let mut img = match alloc(2, domain) {
+            Ok(i) => i,
+            Err(_) => return TestResult::Fail("module_text::alloc failed"),
+        };
+        // Seal one page so the check also covers `protect`, which rewrites
+        // the leaf and could drop the key on the way through.
+        let sealed = protect(&mut img, 0, 1, Prot::Rx).is_ok();
+        let Ok(root) = kernel_root() else {
+            // SAFETY: never executed.
+            unsafe { free(img) };
+            return TestResult::Fail("kernel root unavailable");
+        };
+
+        let mut wrong = None;
+        for i in 0..img.pages {
+            let va = VirtAddr::new(img.page_va(i));
+            let idx = WalkIndices::from_virt(va);
+            // SAFETY: read-only walk of the live kernel root; every level was
+            // installed by `alloc` through this same root.
+            let key = unsafe {
+                let pml4 = &*root.as_ptr::<PageTable>();
+                let pdpt = &*pml4.entries[idx.pml4].addr().as_ptr::<PageTable>();
+                let pd = &*pdpt.entries[idx.pdpt].addr().as_ptr::<PageTable>();
+                let pt = &*pd.entries[idx.pd].addr().as_ptr::<PageTable>();
+                PtFlags::pk_of(pt.entries[idx.pt].flags())
+            };
+            if key != domain.raw() {
+                wrong = Some(i);
+                break;
+            }
+        }
+        // SAFETY: never executed.
+        unsafe { free(img) };
+
+        if !sealed {
+            return TestResult::Fail("protect(.., Rx) failed");
+        }
+        if wrong.is_some() {
+            return TestResult::Fail("a module page does not carry its domain's protection key");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_pages_carry_their_domain_key
+);
+
 /// An alloc/free cycle must return exactly the frames it took — no more.
 ///
 /// A page-table reclaim that frees a table twice pushes frames onto the
@@ -926,7 +1025,7 @@ fn smoke_module_text_alloc_free_conserves_frames() -> TestResult {
     // Two warm-up cycles: the first builds the window's intermediate page
     // tables and the bookkeeping Vecs, and neither cost repeats.
     for _ in 0..2 {
-        match alloc(2) {
+        match alloc(2, DomainId::SCRATCH) {
             // SAFETY: nothing was executed from the image.
             Ok(img) => unsafe { free(img) },
             Err(_) => return TestResult::Fail("module_text::alloc(2) failed"),
@@ -935,7 +1034,7 @@ fn smoke_module_text_alloc_free_conserves_frames() -> TestResult {
 
     let before = accounted();
     for _ in 0..8 {
-        match alloc(2) {
+        match alloc(2, DomainId::SCRATCH) {
             // SAFETY: nothing was executed from the image.
             Ok(img) => unsafe { free(img) },
             Err(_) => return TestResult::Fail("module_text::alloc(2) failed"),
@@ -962,7 +1061,7 @@ kernel_test_in!(
 /// bitmap — a module running off the end of its own text should fault with a
 /// diagnosable address rather than walk into the next module.
 fn smoke_module_text_guard_page_unmapped() -> TestResult {
-    let img = match alloc(1) {
+    let img = match alloc(1, DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };

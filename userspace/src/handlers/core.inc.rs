@@ -3812,6 +3812,7 @@ pub(crate) const CAP_DAC_OVERRIDE: u32 = 1;
 pub(crate) const CAP_DAC_READ_SEARCH: u32 = 2;
 pub(crate) const CAP_SETGID: u32 = 6;
 pub(crate) const CAP_SETUID: u32 = 7;
+pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;

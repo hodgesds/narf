@@ -202,7 +202,10 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
     //    permission they will end up with so each region is page-aligned and
     //    can be sealed with a single `protect` call.
     let layout = plan_layout(image, &hdr)?;
-    let mut mem = module_text::alloc(layout.total_pages).map_err(LoadError::Image)?;
+    // The image is tagged with the domain its manifest asked for, so PKS can
+    // tell this module's pages from every other domain's. `domain::resolve`
+    // has always produced this id; nothing consumed it until now.
+    let mut mem = module_text::alloc(layout.total_pages, domain_id).map_err(LoadError::Image)?;
 
     // 8. Everything past this point can fail with the image already mapped,
     //    so it runs in a helper whose `Err` unmaps before propagating —
@@ -686,6 +689,19 @@ pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::Lifec
     // Arm the init-attribution context so exports registered during
     // init are tagged with this module's id.
     crate::symbols::set_init_context(module.id);
+
+    // Run the module's code inside its own isolation domain. `enter_domain`
+    // denies every PKS domain except two: the kernel's, so the module can
+    // still call exported functions and touch kernel globals, and its own,
+    // so its image is reachable. The other fourteen fault.
+    //
+    // That is the property DESIGN.md §2 claimed and did not have — a module
+    // cannot reach another driver domain's memory, deliberately or by
+    // accident. It does NOT wall the module off from kernel core: domain 0
+    // stays open, because a module that cannot call the kernel cannot do
+    // anything, and gating every export instead would put an MSR write on
+    // each crossing.
+    let domain_scope = crate::domain::enter(module.domain);
     // SAFETY: `module.init_addr` is the runtime address of the module's
     // `init_module` symbol, resolved from the relocated image by
     // `find_lifecycle_symbols` during `load_image`. The caller's contract
@@ -703,7 +719,9 @@ pub unsafe fn invoke_init(module: &Module) -> Result<(), crate::lifecycle::Lifec
     // SAFETY: Valid memory or trusted environment
     let rc = unsafe { init() };
     // Restore unconditionally — even on failure the next init call
-    // must start clean.
+    // must start clean. Same for the domain scope: leaving PKRS narrowed
+    // would deny the rest of the kernel access to every other domain.
+    crate::domain::exit(domain_scope);
     crate::symbols::set_init_context(crate::symbols::KERNEL_MODULE_ID);
     if rc != 0 {
         return Err(crate::lifecycle::LifecycleError::InitFailed(rc));
@@ -735,12 +753,15 @@ pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::Lifec
         // single code pointers is layout-compatible.
         // SAFETY: Valid memory or trusted environment
         let exit: ModuleExitFn = unsafe { core::mem::transmute(exit_addr) };
+        // Same domain scope as init: the exit handler is module code and
+        // runs under the module's own rights.
+        let domain_scope = crate::domain::enter(module.domain);
         // SAFETY: `exit` points at the module's relocated cleanup routine
         // (see above). The module is Live/Going with refcount zero, so no
         // other code holds references into it; calling its documented exit
         // entry point here is sound.
-        // SAFETY: Valid memory or trusted environment
         unsafe { exit() };
+        crate::domain::exit(domain_scope);
     }
     *module.state.lock() = ModuleState::Dead;
     Ok(())

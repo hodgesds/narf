@@ -188,7 +188,7 @@ kernel_test_in!("modules/plt", smoke_plt_veneer_rejects_out_of_adrp_range);
 /// calls to the same function would exhaust it.
 fn smoke_plt_veneer_dedups_by_target() -> TestResult {
     // Back the arena with a real image: `veneer_for` writes through the VA.
-    let img = match narf_memory::module_text::alloc(1) {
+    let img = match narf_memory::module_text::alloc(1, narf_lib::id::DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };
@@ -216,7 +216,7 @@ kernel_test_in!("modules/plt", smoke_plt_veneer_dedups_by_target);
 /// A veneer must be exhausted rather than overrun: the slot after the last
 /// one belongs to whatever the layout put next.
 fn smoke_plt_veneer_respects_capacity() -> TestResult {
-    let img = match narf_memory::module_text::alloc(1) {
+    let img = match narf_memory::module_text::alloc(1, narf_lib::id::DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };
@@ -249,7 +249,7 @@ fn smoke_plt_veneer_executes() -> TestResult {
         0xA64
     }
 
-    let mut img = match module_text::alloc(1) {
+    let mut img = match module_text::alloc(1, narf_lib::id::DomainId::SCRATCH) {
         Ok(i) => i,
         Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
     };

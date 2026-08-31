@@ -33,11 +33,10 @@ Known gaps, each expanded where it belongs below:
     kernel under test — either in the initramfs for a smoke to
     `finit_module`, or embedded at build time. Until then every smoke
     still synthesizes its ELF.
-  * **Driver domains are named but not enforced.** See §2.
-  * **Per-action caps on the three syscalls are not wired.** See the
-    trust model, tier 3.
-  * **Signatures are accepted unconditionally.** The hook is real, the
-    verifier is `AcceptAll`.
+  * **Driver domains isolate modules from each other, not from kernel
+    core**, and only on x86_64. See §2.
+  * **Signature verification accepts everything.** The hook is real; the
+    installed verifier is `AcceptAll`.
   * **A task preempted inside module code can resume on unmapped
     text.** See §6.
 
@@ -70,29 +69,44 @@ PKS-isolated region for that domain (read-execute from in-domain,
 no-access from out-of-domain) and the data + bss into the same
 domain's RW region.
 
-**Status: the name resolves, the isolation does not exist yet.**
-`domain::resolve` maps `target_domain=` to a `DomainId` and the loader
-stores it on the `Module`, and nothing reads it. `module_text::alloc`
-draws ordinary buddy frames; it does not consult the domain.
+**Status on x86_64: enforced, in one direction.** Every page of a
+module's image carries its `DomainId` in the PTE protection-key field
+(bits 59..=62), and `invoke_init` / `invoke_exit` bracket the module's
+own code with `pks::enter_domain`, which narrows `IA32_PKRS` so only two
+of the sixteen domains are reachable: the kernel's, and the module's.
+The other fourteen fault.
 
-What *is* enforced today is W^X (see below), which is a different and
-weaker property: a module cannot manufacture executable memory, but it
-can still scribble any kernel memory it can address. Getting from here
-to the paragraph above needs two things, in order:
+So a module cannot reach another driver domain's memory — deliberately
+or by accident. Linux has no equivalent; a misbehaving driver there can
+corrupt anything.
 
-  1. A domain-tagged frame pool behind `module_text::alloc`, so a
-     module's pages carry its `DomainId`. Cheap, and the enforcement
-     machinery (`arch/src/x86_64/pks.rs`,
-     `memory/src/domain_state.rs`) already exists.
-  2. Call gates. `invoke_init` calls module code directly on the
-     kernel stack, so enforcing a PKS domain means switching PKRS in
-     *both* directions — kernel→module on entry and module→kernel on
-     every export call. That puts a WRMSR on every crossing, which is
-     worth building and worth measuring before it is turned on by
-     default.
+**What this does NOT do is wall a module off from kernel core.** Domain
+0 stays reachable for the duration, because a module that cannot call an
+exported function or read a kernel global cannot do anything. Closing
+that direction means a gate on every export — an MSR write on each
+kernel call a module makes — and the cost has to be measured before it
+is anyone's default. It is the remaining half of this section, not a
+detail.
 
-The claim "a buggy module can scribble only its own domain" belongs to
-step 2 and should not be read as describing the current kernel.
+The scope is entered per module ENTRY (init, exit), not per call, which
+is what makes the price two MSR writes per entry rather than two per
+crossing. It restores unconditionally: a narrowed PKRS left behind would
+deny the rest of the kernel fourteen domains, and the resulting fault
+would land nowhere near the module that caused it.
+
+**aarch64 enforces none of this.** Its `DomainPrimitive` backend is MTE,
+which tags by allocation rather than by a page-table field, so there is
+no leaf for the key to travel in. The loader still resolves and records
+the domain; only the enforcement is absent, and the smoke covering it is
+`cfg`-gated to x86_64 rather than pretending otherwise.
+
+Two prior claims in this file were wrong and are worth naming, because
+both read as descriptions of working code. `PtFlags::pk` and `pk_of` had
+existed with **no callers at all**, so every module page carried key 0 —
+all sixteen domains were one domain and `target_domain=` selected
+nothing. And the enforcement was described as needing a domain-tagged
+*frame pool*; it does not. Frames are ordinary buddy frames. What
+carries the domain is the page-table entry.
 
 ### 3. Versioned ABI
 
@@ -302,12 +316,16 @@ There are three trust tiers:
      `required_caps=BlockDevice:Write` in its manifest. The kernel
      enforces this at link time.
 
-  3. **Admin-only.** The syscall plumbing exists
-     (`userspace/src/handlers/sys_{init,finit,delete}_module.rs`) and
-     routes through the process's existing privilege model. The
-     per-action `Cap<Process, Invoke>` gate described here is **not**
-     wired yet — that is still to do, and is the single largest gap in
-     this tier.
+  3. **Admin-only.** All three syscalls are gated on `CAP_SYS_MODULE`,
+     matching Linux (`kernel/module/main.c::may_init_module`, and the
+     inline test in `delete_module`). The check runs BEFORE any argument
+     validation, so an unprivileged caller cannot use these calls to
+     learn which addresses are mapped or which descriptors are open.
+
+     The richer per-action object-capability (`Cap<Process, Invoke>`)
+     this section once described is not wired, and is a smaller gap than
+     it sounds: Linux draws the line at CAP_SYS_MODULE too, so nothing
+     about module loading is currently *less* gated than Linux.
 
 ## W^X enforcement
 

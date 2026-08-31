@@ -695,11 +695,14 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_lsm_set_self_attr_neg);
 
 fn smoke_abi_misc_init_module_neg() -> TestResult {
     with_setup(|| {
-        // Null image / zero length → -EINVAL. (A success needs a valid signed
-        // NARF module ELF the harness can't synthesize cheaply.)
+        // `copy_module_from_user`: `if (info->len < sizeof(*(info->hdr)))
+        // return -ENOEXEC;`. Anything too short to hold an Elf64 header is a
+        // malformed IMAGE, not a malformed argument — this answered -EINVAL,
+        // which tells a caller to look at its arguments when the problem is
+        // what it handed over.
         match call(Syscall::InitModule.raw(), a3(0, 0, 0, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("init_module with a null image should return -EINVAL"),
+            Some(v) if v == AI_ENOEXEC => Ok(()),
+            _ => Err("init_module with a too-short image should return -ENOEXEC"),
         }
     })
 }
@@ -724,7 +727,11 @@ fn smoke_abi_misc_init_module_foreign_noop() -> TestResult {
         // answer these with a success no-op (0) — this is what stops
         // `systemd-modules-load` / `modprobe@.service` from hanging the
         // boot on a driver that is built in or genuinely absent.
-        let img = [0x7Fu8, b'E', b'L', b'F', 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        //
+        // At least an Elf64 header's worth of bytes, so the length check
+        // ahead of it (which is -ENOEXEC, see above) is not what answers.
+        let mut img = [0u8; 128];
+        img[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
         match call(
             Syscall::InitModule.raw(),
             a3(img.as_ptr() as u64, img.len() as u64, 0, 0),
@@ -738,10 +745,12 @@ kernel_test_in!("syscall_abi", smoke_abi_misc_init_module_foreign_noop);
 
 fn smoke_abi_misc_delete_module_neg() -> TestResult {
     with_setup(|| {
-        // Null name / zero length → -EINVAL.
+        // `strncpy_from_user(name, name_user, MODULE_NAME_LEN)` on a null
+        // pointer is -EFAULT. This answered -EINVAL because it read arg1 as
+        // a length and short-circuited on zero — but arg1 is `flags`.
         match call(Syscall::DeleteModule.raw(), a1(0, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("delete_module with a null name should return -EINVAL"),
+            Some(v) if v == AI_EFAULT => Ok(()),
+            _ => Err("delete_module with a null name should return -EFAULT"),
         }
     })
 }
@@ -762,6 +771,71 @@ fn smoke_abi_misc_delete_module_absent() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_misc_delete_module_absent);
+
+/// `SYSCALL_DEFINE2(delete_module, const char __user *name_user, unsigned
+/// int flags)` — the second argument is FLAGS. This handler read it as the
+/// name's length, so `rmmod`, which passes `O_NONBLOCK`, had its flag word
+/// used as a string size.
+///
+/// The name is NUL-terminated and found by `strncpy_from_user`; flags only
+/// choose whether to block, and NARF never blocks on unload. So a wildly
+/// wrong flags value must not change the answer for a given name.
+fn smoke_abi_misc_delete_module_arg1_is_flags() -> TestResult {
+    with_setup(|| {
+        let name = b"no_such_module_flags\0";
+        let p = name.as_ptr() as u64;
+        // O_NONBLOCK|O_TRUNC, what rmmod actually sends, and a value far
+        // larger than the name — as a length either would truncate or
+        // overrun.
+        let with_flags = call(Syscall::DeleteModule.raw(), a1(p, 0o4000 | 0o1000));
+        let no_flags = call(Syscall::DeleteModule.raw(), a1(p, 0));
+        match (with_flags, no_flags) {
+            (Some(a), Some(b)) if a == b && a < 0 => Ok(()),
+            (Some(_), Some(_)) => {
+                Err("delete_module's answer changed with flags — arg1 read as a length?")
+            }
+            _ => Err("delete_module did not return an errno"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_misc_delete_module_arg1_is_flags);
+
+/// All three module syscalls are CAP_SYS_MODULE-gated, and the test comes
+/// FIRST — ahead of the pointer, length and descriptor checks.
+///
+/// Before this they consulted no capability at all: any task could load or
+/// unload a kernel module. Ordering matters as much as the check: Linux tests
+/// `capable()` before `strncpy_from_user`/`copy_module_from_user`, so an
+/// unprivileged caller cannot use these calls to learn which addresses are
+/// mapped or which descriptors are open.
+fn smoke_abi_misc_module_syscalls_need_cap_sys_module() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+
+        // Arguments that would otherwise answer something ELSE, so a pass
+        // cannot come from the argument checks: a null image is -ENOEXEC, a
+        // closed fd is -EBADF, a null name is -EFAULT. All three must be
+        // -EPERM instead.
+        let init = call(Syscall::InitModule.raw(), a3(0, 0, 0, 0));
+        let finit = call(Syscall::FinitModule.raw(), a3(99, 0, 0, 0));
+        let del = call(Syscall::DeleteModule.raw(), a1(0, 0));
+
+        if init != Some(AI_EPERM) {
+            return Err("init_module without CAP_SYS_MODULE must be -EPERM");
+        }
+        if finit != Some(AI_EPERM) {
+            return Err("finit_module without CAP_SYS_MODULE must be -EPERM");
+        }
+        if del != Some(AI_EPERM) {
+            return Err("delete_module without CAP_SYS_MODULE must be -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_module_syscalls_need_cap_sys_module
+);
 
 // ── reboot(2): magic validation only ──
 //
@@ -843,6 +917,8 @@ kernel_test_in!(
 // ─────────────────────────────────────────────────────────────────────
 
 const AI_EFAULT: i64 = -14;
+const AI_EPERM: i64 = -1;
+const AI_ENOEXEC: i64 = -8;
 const AI_EINVAL: i64 = -22;
 const AI_EINTR: i64 = -4;
 const AI_ESRCH: i64 = -3;
