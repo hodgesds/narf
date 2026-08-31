@@ -105,8 +105,6 @@ struct Message {
 struct QueueState {
     messages: Vec<Message>,
     queued_bytes: usize,
-    readable_token: u64,
-    writable_token: u64,
     notification: Option<MqueueNotification>,
 }
 
@@ -125,10 +123,10 @@ struct Queue {
     /// message, POLL_OUT when it has room below `maxmsg` — exactly what
     /// `poll_readiness` reports. Lives on the shared `Arc<Queue>`, so
     /// `MqueueFile::readiness()` reaches it directly and the default
-    /// `arm_readiness`/`disarm_readiness` serve it. `send` sets the rising
-    /// POLL_IN edge; `receive` republishes the level. The legacy edge tokens +
-    /// the `notify(0)` fired by the mqueue syscall handlers stay
-    /// belt-and-suspenders during the migration.
+    /// `arm_readiness`/`disarm_readiness` serve it — the SOLE readiness mechanism
+    /// (there is no edge token). `send` publishes and `notify`s POLL_IN; `receive`
+    /// publishes and `notify`s POLL_OUT. `notify` fires the wait-queue
+    /// unconditionally so an EPOLLET consumer re-fires even at the same level.
     readiness: narf_lib::readiness::Readiness,
 }
 
@@ -144,8 +142,6 @@ impl Queue {
             state: IrqSafeSpinLock::new(QueueState {
                 messages: Vec::new(),
                 queued_bytes: 0,
-                readable_token: 0,
-                writable_token: 0,
                 notification: None,
             }),
             // A fresh queue is empty: has room (writable), no message (not
@@ -157,8 +153,9 @@ impl Queue {
     /// Recompute the durable readiness cell from the current message count:
     /// POLL_IN iff non-empty, POLL_OUT iff below `maxmsg`. Reads the state under
     /// its lock, then RELEASES it before `set` (the cell has its own lock; the
-    /// two are never held together). Called after every `send`/`receive`.
-    fn sync_readiness(&self) {
+    /// two are never held together). Called after every `send`/`receive`;
+    /// `event` is the just-changed direction (POLL_IN on send, POLL_OUT on recv).
+    fn sync_readiness(&self, event: u32) {
         let (readable, writable) = {
             let state = self.state.lock();
             (
@@ -169,6 +166,8 @@ impl Queue {
         let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
         let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
         self.readiness.set(add, clear);
+        // Fire the wait-queue for the just-changed direction, masked to ready.
+        self.readiness.notify(event & add);
     }
 }
 
@@ -266,11 +265,6 @@ impl FileOps for MqueueFile {
             ready |= POLL_OUT;
         }
         ready
-    }
-
-    fn poll_edge_token(&self) -> (u64, u64) {
-        let state = self.queue.state.lock();
-        (state.readable_token, state.writable_token)
     }
 
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
@@ -515,9 +509,6 @@ pub fn send(
     let was_empty = state.messages.is_empty();
     state.queued_bytes += bytes.len();
     state.messages.push(Message { priority, bytes });
-    if was_empty {
-        state.readable_token = state.readable_token.wrapping_add(1);
-    }
     let notification = if was_empty {
         state.notification.take()
     } else {
@@ -525,8 +516,9 @@ pub fn send(
     };
     drop(state);
     // Durable per-fd wake: a send makes the queue readable (and possibly fills
-    // it); republish so a reader parked on this mqd's cell wakes directly.
-    file.queue.sync_readiness();
+    // it); republish + fire the wait-queue so a reader parked on this mqd's cell
+    // wakes directly, even on a same-level second message.
+    file.queue.sync_readiness(POLL_IN);
     Ok(notification)
 }
 
@@ -575,7 +567,6 @@ pub fn receive(handle_id: u64, buffer_len: usize) -> Result<(Vec<u8>, u32), Mque
     if state.messages.is_empty() {
         return Err(MqueueError::WouldBlock);
     }
-    let was_full = state.messages.len() == file.queue.maxmsg as usize;
     let mut best = 0;
     for index in 1..state.messages.len() {
         if state.messages[index].priority > state.messages[best].priority {
@@ -584,13 +575,11 @@ pub fn receive(handle_id: u64, buffer_len: usize) -> Result<(Vec<u8>, u32), Mque
     }
     let message = state.messages.remove(best);
     state.queued_bytes -= message.bytes.len();
-    if was_full {
-        state.writable_token = state.writable_token.wrapping_add(1);
-    }
     drop(state);
     // Draining a message makes the queue writable (and possibly empties it);
-    // republish so a writer parked on this mqd's cell wakes directly.
-    file.queue.sync_readiness();
+    // republish + fire the wait-queue so a writer parked on this mqd's cell wakes
+    // directly, even on a same-level free.
+    file.queue.sync_readiness(POLL_OUT);
     Ok((message.bytes, message.priority))
 }
 

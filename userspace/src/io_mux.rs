@@ -24,15 +24,12 @@ use narf_lib::sync::IrqSafeSpinLock;
 pub struct EventFd {
     counter: AtomicU64,
     semaphore: bool,
-    /// Advances on each 0 → non-zero transition so EPOLLET can observe a
-    /// drain/refill edge even when both epoll scans see POLLIN set.
-    readable_token: AtomicU64,
-    /// Advances when a saturated counter becomes writable again.
-    writable_token: AtomicU64,
-    /// Durable per-fd readiness cell — the migration target that will replace
-    /// the two edge tokens + the free-function `notify`. Mirrors POLL_IN
-    /// (counter > 0) and POLL_OUT (counter < MAX-1); every counter change
-    /// publishes the new level via `set`, which wakes armed poll/epoll waiters.
+    /// Durable per-fd readiness cell — the SOLE readiness mechanism (there is no
+    /// edge token). Mirrors POLL_IN (counter > 0) and POLL_OUT (counter < MAX-1);
+    /// every counter change publishes the new level via `set` and fires the
+    /// wait-queue via `notify` (see [`EventFd::sync_readiness`]), which wakes
+    /// armed poll/epoll waiters — including an EPOLLET consumer on a same-level
+    /// write.
     readiness: narf_lib::readiness::Readiness,
 }
 
@@ -43,26 +40,26 @@ impl EventFd {
         Arc::new(Self {
             counter: AtomicU64::new(initval),
             semaphore: (flags & EFD_SEMAPHORE) != 0,
-            readable_token: AtomicU64::new(u64::from(initval != 0)),
-            writable_token: AtomicU64::new(0),
             readiness: narf_lib::readiness::Readiness::new(
                 POLL_OUT | if initval != 0 { POLL_IN } else { 0 },
             ),
         })
     }
 
-    /// Recompute the durable readiness cell from the current counter and
-    /// publish the transition (POLL_IN = counter > 0, POLL_OUT = counter <
-    /// MAX-1). Called after every counter change; `set` bumps its edge sequence
-    /// and wakes armed waiters only on a rising edge. Kept alongside the legacy
-    /// edge tokens + `notify` during the migration.
-    fn sync_readiness(&self) {
+    /// Recompute the durable readiness cell from the current counter and publish
+    /// the transition. `set` publishes the level and wakes waiters on a rising
+    /// edge; `notify(event & add)` then fires the wait-queue for the just-changed
+    /// direction UNCONDITIONALLY so an EPOLLET consumer re-fires even when a write
+    /// lands on an already-readable counter. `event` is the direction the caller
+    /// changed: POLL_IN on a write, POLL_OUT on a read.
+    fn sync_readiness(&self, event: u32) {
         let c = self.counter.load(Ordering::Acquire);
         let readable = c > 0;
         let writable = c < u64::MAX - 1;
         let add = (if readable { POLL_IN } else { 0 }) | (if writable { POLL_OUT } else { 0 });
         let clear = (if readable { 0 } else { POLL_IN }) | (if writable { 0 } else { POLL_OUT });
         self.readiness.set(add, clear);
+        self.readiness.notify(event & add);
     }
 }
 
@@ -72,7 +69,7 @@ impl FileOps for EventFd {
             if buf.len() < 8 {
                 return Err(FsError::InvalidPath);
             }
-            let (v, was_saturated) = if self.semaphore {
+            let (v, _was_saturated) = if self.semaphore {
                 let mut cur = self.counter.load(Ordering::Acquire);
                 loop {
                     if cur == 0 {
@@ -98,10 +95,7 @@ impl FileOps for EventFd {
                 }
                 (cur, cur >= u64::MAX - 1)
             };
-            if was_saturated {
-                self.writable_token.fetch_add(1, Ordering::Release);
-            }
-            self.sync_readiness();
+            self.sync_readiness(POLL_OUT);
             buf[..8].copy_from_slice(&v.to_le_bytes());
             Ok(8)
         })
@@ -133,12 +127,7 @@ impl FileOps for EventFd {
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 ) {
-                    Ok(_) => {
-                        if cur == 0 && next != 0 {
-                            self.readable_token.fetch_add(1, Ordering::Release);
-                        }
-                        break;
-                    }
+                    Ok(_) => break,
                     Err(observed) => cur = observed,
                 }
             }
@@ -154,7 +143,7 @@ impl FileOps for EventFd {
             // this notify the eventfd is parkable, so the poll parks and this
             // write wakes it promptly. notify(0) = wake-all (an eventfd carries
             // no kernel TCB key); best-effort, mirrors the AF_UNIX send path.
-            self.sync_readiness();
+            self.sync_readiness(POLL_IN);
             narf_net::readiness::notify(0);
             Ok(8)
         })
@@ -204,13 +193,6 @@ impl FileOps for EventFd {
         bits
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (
-            self.readable_token.load(Ordering::Acquire),
-            self.writable_token.load(Ordering::Acquire),
-        )
-    }
-
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         Some(&self.readiness)
     }
@@ -224,7 +206,6 @@ impl FileOps for EventFd {
 #[derive(Debug)]
 pub struct TimerFd {
     state: IrqSafeSpinLock<TimerState>,
-    readable_token: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -245,7 +226,6 @@ impl TimerFd {
                 interval_ns: 0,
                 expirations: 0,
             }),
-            readable_token: AtomicU64::new(0),
         })
     }
 
@@ -285,7 +265,6 @@ impl TimerFd {
         if s.next_fire_ns == 0 || now < s.next_fire_ns {
             return;
         }
-        let was_readable = s.expirations != 0;
         if s.interval_ns == 0 {
             s.expirations += 1;
             s.next_fire_ns = 0;
@@ -297,11 +276,7 @@ impl TimerFd {
                 .next_fire_ns
                 .saturating_add(s.interval_ns.saturating_mul(missed));
         }
-        let became_readable = !was_readable && s.expirations != 0;
         drop(s);
-        if became_readable {
-            self.readable_token.fetch_add(1, Ordering::Release);
-        }
     }
 }
 
@@ -376,13 +351,56 @@ impl FileOps for TimerFd {
             Some(s.next_fire_ns)
         }
     }
-
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (self.readable_token.load(Ordering::Acquire), 0)
-    }
 }
 
 // ── signalfd ────────────────────────────────────────────────────
+
+/// Per-owner-task registry of live signalfd readiness cells. A signal raised
+/// for a task fires every signalfd cell registered here (Linux wakes the
+/// signalfd wait queue on delivery), so an EPOLLET consumer re-fires even on a
+/// drain→re-raise refill where the readiness mask stays POLL_IN. Keyed by owner
+/// task; multiple signalfds per task are held as `Weak` and reaped lazily.
+static SIGNALFD_CELLS: IrqSafeSpinLock<
+    alloc::collections::BTreeMap<
+        u64,
+        alloc::vec::Vec<alloc::sync::Weak<narf_lib::readiness::Readiness>>,
+    >,
+> = IrqSafeSpinLock::new(alloc::collections::BTreeMap::new());
+
+/// Register a signalfd's readiness cell for `task` so [`wake_signalfds`] fires it
+/// on every signal raised for that task. Used by both the io_mux `SignalFd` and
+/// the linux-compat `SignalFdFile`.
+pub fn register_signalfd_cell(task: u64, cell: &Arc<narf_lib::readiness::Readiness>) {
+    SIGNALFD_CELLS
+        .lock()
+        .entry(task)
+        .or_default()
+        .push(Arc::downgrade(cell));
+}
+
+/// Fire the readiness wait-queue of every signalfd owned by `task` — called from
+/// the signal-raise path. `set`+`notify` POLL_IN so an armed poll/epoll waiter
+/// (including an EPOLLET consumer between non-parking waits) wakes; the fd's
+/// `poll_readiness` still gates actual delivery on `pending_in_mask`, so firing
+/// on a signal outside the fd's mask is a harmless spurious wake.
+pub fn wake_signalfds(task: u64) {
+    let cells: alloc::vec::Vec<Arc<narf_lib::readiness::Readiness>> = {
+        let mut map = SIGNALFD_CELLS.lock();
+        let Some(list) = map.get_mut(&task) else {
+            return;
+        };
+        list.retain(|w| w.strong_count() != 0);
+        if list.is_empty() {
+            map.remove(&task);
+            return;
+        }
+        list.iter().filter_map(alloc::sync::Weak::upgrade).collect()
+    };
+    for cell in cells {
+        cell.set(POLL_IN, 0);
+        cell.notify(POLL_IN);
+    }
+}
 
 /// `signalfd(2)` — receive signals as a `read` instead of as an
 /// async handler delivery. `read` returns one or more `signalfd_siginfo`
@@ -395,13 +413,24 @@ pub struct SignalFd {
     /// Owning task id — only signals queued to this task are
     /// reported. Multi-process signalfd is a Stage-2 follow-up.
     pub owner_task: u64,
+    /// Durable readiness cell (Linux signalfd wait queue). POLL_IN when a
+    /// masked signal is pending; fired by [`wake_signalfds`] on every raise for
+    /// `owner_task` so an EPOLLET consumer re-fires on a drain→re-raise refill.
+    readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
 impl SignalFd {
     pub fn new(mask: u64, owner: u64) -> Arc<Self> {
+        let readiness = Arc::new(narf_lib::readiness::Readiness::new(0));
+        SIGNALFD_CELLS
+            .lock()
+            .entry(owner)
+            .or_default()
+            .push(Arc::downgrade(&readiness));
         Arc::new(Self {
             mask: AtomicU64::new(mask),
             owner_task: owner,
+            readiness,
         })
     }
 
@@ -477,10 +506,38 @@ impl FileOps for SignalFd {
         }
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (
-            crate::handlers::signal_readable_generation(self.owner_task),
-            0,
-        )
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
+    }
+
+    /// Reconcile the cell to the live pending level before arming so a stale
+    /// latched POLL_IN (a signal drained since the last wake) can't spuriously
+    /// return Ready. `wake_signalfds` re-latches + notifies on the next raise.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        let readable = self.pending_in_mask() != 0;
+        self.readiness.set(
+            if readable { POLL_IN } else { 0 },
+            if readable { 0 } else { POLL_IN },
+        );
+        Some(self.readiness.arm(task_id, interest, waker))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        let readable = self.pending_in_mask() != 0;
+        self.readiness.set(
+            if readable { POLL_IN } else { 0 },
+            if readable { 0 } else { POLL_IN },
+        );
+        Some(self.readiness.arm_persistent(id, interest, waker))
     }
 }

@@ -1642,7 +1642,8 @@ kernel_test_in!(
 ///       connection until an unrelated wake), and
 ///   (b) the re-reported ACCEPT EDGE on the re-scan — the listener's POLLIN
 ///       mask never dropped across accept→reconnect, so only the
-///       `listener_readable_token` advance distinguishes the new edge.
+///       ready-list membership (fired by the `listener_readiness`
+///       wait-queue) distinguishes the new edge.
 /// The two existing tests cover these halves separately (edge via timeout=0,
 /// wake via a level poll on the first connect); neither covers them TOGETHER
 /// under EPOLLET after a drain-to-empty, which is precisely the strand.
@@ -1782,7 +1783,8 @@ fn smoke_epoll_epollet_listener_wake_and_edge_after_drain_to_empty() -> TestResu
         );
     }
     // (b) edge: the re-scan MUST re-report POLLIN even though the mask never
-    // dropped — only listener_readable_token distinguishes this accept edge.
+    // dropped — only ready-list membership (fired by the listener_readiness
+    // wait-queue on the connect) distinguishes this accept edge.
     if wait0(&mut out) != 1 {
         return TestResult::Fail("post-drain connect did not re-report the EPOLLET accept edge");
     }
@@ -1808,10 +1810,11 @@ kernel_test_in!(
 );
 
 /// EPOLLET must re-fire POLLIN when more data is appended to a still-unread
-/// stream ring. NARF keys the EPOLLET readable edge on `readable_token`; the
-/// old RingBuf::write bumped it only on the empty->non-empty transition, so a
-/// second write to a non-empty ring produced NO new edge and an edge-triggered
-/// reader that had not yet drained never re-polled POLLIN. That stranded
+/// stream ring. NARF keys the EPOLLET readable edge on ready-list membership,
+/// which `RingBuf::write` fires on EVERY data-bearing write via `sync_readiness`'s
+/// `notify` — not only the empty->non-empty transition — so a second write to a
+/// non-empty ring still produces a fresh edge. Firing only on became-readable
+/// would strand
 /// dbus-broker on an accepted system-bus connection: the client's AUTH then its
 /// Hello arrive back-to-back and the second lands on the unread ring, so the
 /// broker never reads either and never replies (the mode-1 desktop gate). Linux
@@ -2384,9 +2387,17 @@ kernel_test_in!(
     smoke_epoll_epollet_read_does_not_retrigger_writable
 );
 
-/// Data that arrives and is fully drained between epoll scans changes only
-/// the readable-edge token. It must not be misreported as a new EPOLLOUT edge
-/// just because the socket remains writable.
+/// Linux-parity coalescing: data that arrives and is drained BEFORE the epoll
+/// scan that would have consumed its EPOLLIN edge leaves the fd on the ready
+/// list (Linux `ep_poll_callback` added it; `recv` removes nothing). The next
+/// `epoll_wait` therefore re-polls it via `ep_item_poll` and reports the fd's
+/// CURRENT interested readiness — here EPOLLOUT, since the drained stream is
+/// writable. NARF used to be stricter than Linux (a directional edge token
+/// suppressed the EPOLLOUT); with the token retired it now matches Linux exactly
+/// — a listed fd reports its live interested mask, never a phantom EPOLLIN for
+/// the already-drained bytes. (Contrast `read_does_not_retrigger_writable`,
+/// where an intervening wait first CONSUMES the EPOLLIN edge and unlists the fd,
+/// so the post-drain scan correctly returns 0.)
 fn smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user
@@ -2479,8 +2490,18 @@ fn smoke_epoll_epollet_hidden_read_edge_does_not_retrigger_out() -> TestResult {
     {
         return TestResult::Fail("drain failed");
     }
-    if wait(&mut out).value != 0 {
-        return TestResult::Fail("hidden readable edge manufactured EPOLLOUT");
+    // Linux parity: the still-listed fd is re-polled and reports its current
+    // interested readiness — EPOLLOUT (writable), NOT a phantom EPOLLIN for the
+    // bytes already drained.
+    if wait(&mut out).value != 1 {
+        return TestResult::Fail("listed writable fd not re-reported (ep_item_poll coalescing)");
+    }
+    let revents = u32::from_ne_bytes(out[..4].try_into().unwrap());
+    if revents & crate::epoll::EPOLLOUT == 0 {
+        return TestResult::Fail("re-polled edge missing EPOLLOUT on a writable stream");
+    }
+    if revents & crate::epoll::EPOLLIN != 0 {
+        return TestResult::Fail("phantom EPOLLIN reported for already-drained bytes");
     }
 
     crate::syscall::__test_clear_global();

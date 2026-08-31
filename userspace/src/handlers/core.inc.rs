@@ -155,15 +155,70 @@ pub fn set_tcb_owner(tcb_id: u32, task_id: u64) {
 
 /// Drop the ownership record for `tcb_id` (socket closed / TCB gone).
 pub fn clear_tcb_owner(tcb_id: u32) {
-    let mut g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
+    {
+        let mut g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
+        if let Some(m) = g.as_mut() {
+            m.remove(&tcb_id);
+        }
+    }
+    // Tear down the durable readiness cell too. Latch POLL_IN|POLL_HUP first so
+    // any waiter still armed on it wakes (a closed socket is readable → EOF).
+    let mut g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();
     if let Some(m) = g.as_mut() {
-        m.remove(&tcb_id);
+        if let Some(cell) = m.remove(&tcb_id) {
+            cell.set(
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                0,
+            );
+            // Linux wait-queue: fire the close/EOF edge unconditionally.
+            cell.notify(narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP);
+        }
     }
 }
 
 fn tcb_owner(tcb_id: u32) -> Option<u64> {
     let g = TCB_OWNER[tcb_owner_shard(tcb_id)].lock();
     g.as_ref().and_then(|m| m.get(&tcb_id).copied())
+}
+
+/// tcb_id → durable readiness cell for `InetWired` (kernel-TCP-over-NIC)
+/// sockets. Parallels [`TCB_OWNER`]: the TCP RX / close wake path sets edges
+/// here so an epoll/poll waiter armed on the cell wakes event-driven (Linux
+/// wait-queue + `ep_poll_callback`) instead of forcing an O(N) interest rescan.
+/// Populated lazily by [`tcb_cell`] the first time a socket arms/polls; dropped
+/// by [`clear_tcb_owner`].
+#[allow(clippy::type_complexity)]
+static TCB_CELL: [narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u32, alloc::sync::Arc<narf_lib::readiness::Readiness>>>,
+>; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
+
+/// Get-or-create the durable readiness cell for `tcb_id`. A fresh cell starts
+/// `POLL_OUT` (a kernel-TCP socket is always sendable — the stack queues and
+/// flow-controls the send side), matching `poll_readiness`'s `InetWired` level.
+pub fn tcb_cell(tcb_id: u32) -> alloc::sync::Arc<narf_lib::readiness::Readiness> {
+    let mut g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();
+    g.get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(tcb_id)
+        .or_insert_with(|| {
+            alloc::sync::Arc::new(narf_lib::readiness::Readiness::new(
+                narf_filesystem::POLL_OUT,
+            ))
+        })
+        .clone()
+}
+
+/// Look up an existing cell without creating one (the wake / poll hot path).
+pub fn tcb_cell_lookup(tcb_id: u32) -> Option<alloc::sync::Arc<narf_lib::readiness::Readiness>> {
+    let g = TCB_CELL[tcb_owner_shard(tcb_id)].lock();
+    g.as_ref().and_then(|m| m.get(&tcb_id).cloned())
+}
+
+/// Remove `task_id`'s waiter from `tcb_id`'s cell, if the cell exists. No-op
+/// otherwise. Called by the socket's `disarm_readiness` for `InetWired`.
+pub fn tcb_cell_disarm(tcb_id: u32, task_id: u64) {
+    if let Some(cell) = tcb_cell_lookup(tcb_id) {
+        cell.disarm(task_id);
+    }
 }
 
 /// Register `task_id`'s waker as parked on net I/O readiness. Called
@@ -209,6 +264,17 @@ pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
 /// covers the race). Untracked keys fall back to waking everyone.
 pub fn wake_io_waiters(key: u64) {
     if key != 0 {
+        // Event-driven edge: mark this socket's durable cell readable so a
+        // waiter armed on the cell (epoll's per-fd ready-list linkage) wakes
+        // carrying the fd, rather than rescanning the whole interest set. The
+        // cell's own `set` fires its armed wakers; the owner wake below remains
+        // for the legacy (non-cell-armed) path and is harmless otherwise.
+        if let Some(cell) = tcb_cell_lookup(key as u32) {
+            cell.set(narf_filesystem::POLL_IN, 0);
+            // Linux wait-queue: fire on every RX event, even more data at the
+            // same readable level (the token used to cover this edge).
+            cell.notify(narf_filesystem::POLL_IN);
+        }
         if let Some(owner) = tcb_owner(key as u32) {
             // Owner known: targeted wake iff it's parked.
             wake_io_owner(owner);

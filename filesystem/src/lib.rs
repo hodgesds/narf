@@ -962,9 +962,10 @@ pub trait FileOps: Send + Sync {
     /// ([`narf_lib::readiness::Readiness`]): a parked waiter registers in the
     /// cell and is woken the instant `set` records a matching readiness edge —
     /// a durable, per-fd, IRQ-safe wake with no reliance on a fallback re-scan,
-    /// and it subsumes `poll_readiness` (the cell's level `mask`),
-    /// `poll_edge_token` (its `seq`), and `readiness_notifies` (waking is
-    /// intrinsic to every `set`). `None` (the default) keeps the legacy
+    /// and it subsumes `poll_readiness` (the cell's level `mask`), the epoll
+    /// edge (ready-list membership fed by `set`/`notify`), and
+    /// `readiness_notifies` (waking is intrinsic to every `set`). `None` (the
+    /// default) keeps the legacy
     /// level-scan + generation-guard path, so descriptors migrate one at a
     /// time. Sockets, pipes, eventfds, mqueues, ttys — anything whose readiness
     /// transitions asynchronously — override this as they migrate; always-ready
@@ -992,6 +993,25 @@ pub trait FileOps: Send + Sync {
         self.readiness().map(|r| r.arm(task_id, interest, waker))
     }
 
+    /// Register a PERSISTENT readiness waiter — the Linux `eppoll_entry` model,
+    /// used by epoll to arm a per-fd ready-list waker at `EPOLL_CTL_ADD` that
+    /// stays live for the fd's whole membership in the set (never consumed on
+    /// readiness). Returns `Some(current_ready_bits)` if the file is on the
+    /// durable readiness path (so the caller can seed an initial ready-list
+    /// edge), `None` if it has no cell (timerfd / raw netlink / nested epoll —
+    /// those fall back to the full-scan + rising-mask path). The default arms the
+    /// single directly-owned cell; composite / behind-a-lock files (sockets)
+    /// override to reconcile then persistently arm each of their cells.
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.readiness()
+            .map(|r| r.arm_persistent(id, interest, waker))
+    }
+
     /// Remove `task_id`'s registration from this file's durable readiness.
     /// Returns whether the file is on the durable path at all. Default via
     /// [`Self::readiness`]; composite / behind-a-lock files override.
@@ -1002,18 +1022,6 @@ pub trait FileOps: Send + Sync {
         } else {
             false
         }
-    }
-
-    /// Monotonic source-local tokens for edge-triggered readiness.
-    ///
-    /// A readiness provider that can transition away from and back to the
-    /// same readiness mask between two polls should advance one of these
-    /// tokens on every state-changing I/O operation. Epoll uses the tokens
-    /// to distinguish a new edge from a continuously-ready file. The default
-    /// is stable for providers whose readiness is adequately represented by
-    /// the current mask alone.
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (0, 0)
     }
 
     /// Acknowledge readiness after an event multiplexer has actually delivered

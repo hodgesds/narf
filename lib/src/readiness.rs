@@ -6,8 +6,8 @@
 //! arrives here) → register waker → sleep forever*. NARF historically closed
 //! it only by convention (a global generation counter re-checked after
 //! registering) backed by a ~10 ms fallback tick, and it split a file's
-//! readiness across three separate, drift-prone `FileOps` methods
-//! (`poll_readiness` level, `poll_edge_token` edge, `readiness_notifies` a
+//! readiness across separate, drift-prone `FileOps` methods (`poll_readiness`
+//! level plus a per-provider edge token, and `readiness_notifies` a
 //! hand-maintained "do I even wake anyone" boolean). Any one of them getting
 //! out of sync is a lost wake or a busy-spin.
 //!
@@ -179,6 +179,53 @@ impl Readiness {
             },
         );
         Poll::Pending
+    }
+
+    /// Register a PERSISTENT waiter — the Linux `eppoll_entry` model: the waker
+    /// stays in the wait queue for the fd's whole lifetime in the poll set and
+    /// is NEVER removed on readiness. Unlike [`arm`](Self::arm), a satisfied
+    /// level does not consume the registration: the same waker keeps firing on
+    /// every future [`set`](Self::set)/[`notify`](Self::notify) until an explicit
+    /// [`disarm`](Self::disarm). Returns the currently-satisfied bits
+    /// (`mask & interest`) so the caller can seed an initial edge WITHOUT
+    /// dropping the registration. This is what lets epoll's per-fd ready-list
+    /// waker capture events between `epoll_wait` calls (including non-parking
+    /// `timeout==0` polls) — a one-shot [`arm`](Self::arm) would be gone by the
+    /// time the next event fired.
+    pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
+        let mut g = self.inner.lock();
+        g.waiters.insert(
+            id,
+            Waiter {
+                interest,
+                waker: waker.clone(),
+            },
+        );
+        g.mask & interest
+    }
+
+    /// Signal an EVENT on `bits` — a Linux wait-queue wakeup. Bumps `seq` and
+    /// wakes every waiter whose interest intersects `bits`, UNCONDITIONALLY:
+    /// unlike [`set`](Self::set), it does not gate on a rising level edge and
+    /// does not touch `mask`. This is what makes the epoll ready-list capture
+    /// events the level cannot represent — a follow-up write on an already
+    /// `POLL_IN` ring, or a new connection on an already-pending listener —
+    /// exactly as Linux wakes its wait queue on every such event. Used at the
+    /// real I/O event sites; the level-reconcile path stays on `set` (rising-
+    /// edge-gated) so a passive re-sync never spuriously fires. `bits == 0` is
+    /// a no-op. Retires the per-provider edge token, whose only job was to
+    /// carry these same-level events.
+    pub fn notify(&self, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        g.seq = g.seq.wrapping_add(1);
+        for w in g.waiters.values() {
+            if w.interest & bits != 0 {
+                w.waker.wake_by_ref();
+            }
+        }
     }
 
     /// Remove any waiter registered under `id`. Called when a wait ends for a

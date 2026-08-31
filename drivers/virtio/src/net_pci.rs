@@ -63,6 +63,13 @@ const VIRTIO_NET_F_CTRL_MAC_ADDR: u64 = 23;
 /// VirtIO 1.2 §5.1.3.1 — VIRTIO_NET_F_MQ (bit 22). Device supports
 /// multi-queue with auto receive-steering across `max_virtqueue_pairs`.
 const VIRTIO_NET_F_MQ: u64 = 22;
+/// VIRTIO_RING_F_EVENT_IDX (bit 29, transport). Enables the fine-grained
+/// avail_event/used_event notification protocol — the driver suppresses a
+/// TX-notify VM-exit unless the device's published `avail_event` says it wants
+/// one. Under the SLIRP backend (single-threaded host NAT) each guest→host
+/// notify crossing dominates the concurrent feed cost, so suppressing the
+/// unnecessary ones is the lever.
+const VIRTIO_RING_F_EVENT_IDX: u64 = 29;
 
 // virtio-net control-queue command classes + sub-commands
 // (VirtIO 1.2 §5.1.6.5). One class per logical operation group
@@ -384,15 +391,17 @@ impl VirtioNetPci {
         // Same dependency as F_MQ: needs F_CTRL_VQ first.
         let want_ctrl_mac_addr =
             (feats & (1u64 << VIRTIO_NET_F_CTRL_MAC_ADDR) != 0) && want_ctrl_vq;
+        let want_event_idx = feats & (1u64 << VIRTIO_RING_F_EVENT_IDX) != 0;
         // virtio-net F_* bits we care about live in the low 32
-        // (max is F_CTRL_MAC_ADDR = 23); only F_VERSION_1 = 32 is in
-        // the high half.
+        // (max is F_CTRL_MAC_ADDR = 23; RING_F_EVENT_IDX = 29); only
+        // F_VERSION_1 = 32 is in the high half.
         let drv_lo = ((1u32 << VIRTIO_NET_F_MAC) * (want_mac as u32))
             | ((1u32 << VIRTIO_NET_F_MTU) * (want_mtu as u32))
             | ((1u32 << VIRTIO_NET_F_CSUM) * (want_csum as u32))
             | ((1u32 << VIRTIO_NET_F_STATUS) * (want_status as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_VQ) * (want_ctrl_vq as u32))
             | ((1u32 << VIRTIO_NET_F_MQ) * (want_mq as u32))
+            | ((1u32 << VIRTIO_RING_F_EVENT_IDX) * (want_event_idx as u32))
             | ((1u32 << VIRTIO_NET_F_CTRL_MAC_ADDR) * (want_ctrl_mac_addr as u32));
         let drv_hi = 1u32 << (VIRTIO_F_VERSION_1 - 32);
         // SAFETY: same.
@@ -551,7 +560,12 @@ impl VirtioNetPci {
             // SAFETY: Valid MMIO bounds or trusted driver environment
             let mut rx_q = unsafe { Virtqueue::new(rx_layout) };
             // SAFETY: same.
-            let tx_q = unsafe { Virtqueue::new(tx_layout) };
+            let mut tx_q = unsafe { Virtqueue::new(tx_layout) };
+            // Enable the EVENT_IDX notification protocol if negotiated (both
+            // rings): TX gets avail_event-gated kick suppression, RX publishes
+            // used_event so the device still interrupts on new frames.
+            rx_q.set_event_idx(want_event_idx);
+            tx_q.set_event_idx(want_event_idx);
 
             let mut rx_buffers: Vec<Option<DmaBuffer>> = (0..rx_qsize).map(|_| None).collect();
             let posted = RX_POOL_LEN.min(rx_qsize as usize);
@@ -607,7 +621,8 @@ impl VirtioNetPci {
                 let ctrl_buf = alloc_coherent(4096, DomainId::DRIVER_0)
                     .map_err(|_| VirtioPciError::BarMapFailed)?;
                 // SAFETY: Virtqueue::new zeros the layout regions.
-                let q = unsafe { Virtqueue::new(c_layout) };
+                let mut q = unsafe { Virtqueue::new(c_layout) };
+                q.set_event_idx(want_event_idx);
                 Some(IrqSafeSpinLock::new(CtrlQueue {
                     q,
                     buf: ctrl_buf,
@@ -1330,7 +1345,7 @@ impl VirtioNetPci {
             let needs_kick = {
                 pair.rx_queue
                     .lock()
-                    .as_ref()
+                    .as_mut()
                     .is_some_and(|q| q.needs_kick())
             };
             if needs_kick {

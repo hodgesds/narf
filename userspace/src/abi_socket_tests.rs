@@ -1165,10 +1165,10 @@ kernel_test_in!(
 ///
 /// Covers both trigger modes deliberately. Level-triggered is a plain
 /// "is the ready list non-empty" query; EPOLLET adds the edge bookkeeping
-/// (`last_mask` / `poll_edge_token`) that `EpollInstance::poll_readiness`
-/// has to mirror from `collect_ready`, and a listener's edge comes from
-/// `listener_readable_token`, which only the enqueue in `connect()`
-/// advances.
+/// (`last_mask` rising bits plus ready-list membership) that
+/// `EpollInstance::poll_readiness` has to mirror from `collect_ready`, and a
+/// listener's edge comes from the `listener_readiness` wait-queue, which the
+/// enqueue in `connect()` fires.
 fn smoke_abi_socket_listener_readable_through_nested_epoll() -> TestResult {
     with_setup(|| {
         for (label, et) in [("level", 0u32), ("edge", crate::epoll::EPOLLET)] {
@@ -3823,7 +3823,7 @@ kernel_test_in!(
 
 /// Same two halves for the AF_INET SOCK_DGRAM (UDP loopback) sibling path.
 /// `dispatch_inet_dgram`'s Send enqueues into the destination inbox and
-/// advances `dgram_readable_token`, but — unlike the AF_UNIX dgram path —
+/// fires the `dgram_readiness` wait-queue, but — unlike the AF_UNIX dgram path —
 /// never calls `narf_net::readiness::notify`, so a reader parked in an
 /// infinite-timeout `epoll_wait`/`poll` on a bound UDP socket is never woken
 /// by a loopback datagram (the epoll park backstop re-checks the park
