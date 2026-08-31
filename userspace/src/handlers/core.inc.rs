@@ -170,6 +170,8 @@ pub fn clear_tcb_owner(tcb_id: u32) {
                 narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
                 0,
             );
+            // Linux wait-queue: fire the close/EOF edge unconditionally.
+            cell.notify(narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP);
         }
     }
 }
@@ -269,6 +271,9 @@ pub fn wake_io_waiters(key: u64) {
         // for the legacy (non-cell-armed) path and is harmless otherwise.
         if let Some(cell) = tcb_cell_lookup(key as u32) {
             cell.set(narf_filesystem::POLL_IN, 0);
+            // Linux wait-queue: fire on every RX event, even more data at the
+            // same readable level (the token used to cover this edge).
+            cell.notify(narf_filesystem::POLL_IN);
         }
         if let Some(owner) = tcb_owner(key as u32) {
             // Owner known: targeted wake iff it's parked.

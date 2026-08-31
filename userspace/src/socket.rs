@@ -1459,6 +1459,8 @@ impl SocketFile {
         // armed `uevent_readiness` cell so an epoll consumer cannot miss this
         // unicast delivery; `notify(0)` remains the non-epoll fallback.
         target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
+        // Linux wait-queue: fire on every event even at the same level.
+        target.uevent_readiness.notify(narf_filesystem::POLL_IN);
         drop(sockets);
         narf_net::readiness::notify(0);
         Some(SocketOpResult::Ok(buf.len() as u64))
@@ -1523,6 +1525,8 @@ impl SocketFile {
             // guard, not this cell) and for non-uevent netlink families whose
             // cell this is not.
             target.uevent_readiness.set(narf_filesystem::POLL_IN, 0);
+            // Linux wait-queue: fire on every event even at the same level.
+            target.uevent_readiness.notify(narf_filesystem::POLL_IN);
             delivered += 1;
         }
         if delivered > 0 {
@@ -4122,6 +4126,8 @@ impl SocketFile {
                         // listener's cell directly. poll_readiness clears it when
                         // accept drains the queue.
                         listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
+                        // Linux wait-queue: fire on every event even at the same level.
+                        listener.listener_readiness.notify(narf_filesystem::POLL_IN);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -4463,6 +4469,8 @@ impl SocketFile {
                         pending.push_back(server_end);
                         // Durable accept wake; poll_readiness clears on accept.
                         listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
+                        // Linux wait-queue: fire on every event even at the same level.
+                        listener.listener_readiness.notify(narf_filesystem::POLL_IN);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
@@ -4674,6 +4682,8 @@ impl SocketFile {
                     // does not depend on the notify(0) herd + backstop below.
                     // poll_readiness reconciles the cell on the consume side.
                     dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
+                    // Linux wait-queue: fire on every event even at the same level.
+                    dest_sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
                     // Wake a reader parked in poll/epoll on the destination.
                     // Without this a peer blocked in epoll_wait(-1)/poll(-1) on
                     // a bound UDP socket never wakes for a loopback datagram —
@@ -4896,6 +4906,8 @@ impl SocketFile {
                     // datagram cell directly (state->cell lock order; the cell
                     // has its own lock). poll_readiness clears it on consume.
                     dest_sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
+                    // Linux wait-queue: fire on every event even at the same level.
+                    dest_sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
                 }
                 drop(ds);
                 // Wake a receiver parked in recv/recvmsg/poll on the dest —
@@ -5116,6 +5128,8 @@ impl SocketFile {
                         pending.push_back(server_end);
                         // Durable accept wake; poll_readiness clears on accept.
                         listener.listener_readiness.set(narf_filesystem::POLL_IN, 0);
+                        // Linux wait-queue: fire on every event even at the same level.
+                        listener.listener_readiness.notify(narf_filesystem::POLL_IN);
                     } else {
                         return SocketOpResult::Err(SockError::ConnectionRefused);
                     }
