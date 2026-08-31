@@ -9187,12 +9187,20 @@ impl AddressSpace {
                         return Err(AddressSpaceError::OutOfRange);
                     }
                 };
-                // SAFETY: both huge frames are exclusively owned and
-                // identity-reachable; their equal size bounds the copy.
+                // SAFETY: both huge frames are exclusively owned and their
+                // equal size bounds the copy. Addressed through
+                // `kernel_ptr` / `kernel_mut_ptr`, NOT as raw physical
+                // addresses: a bare `phys as *const u8` is only dereferenceable
+                // where the identity map makes physical equal virtual, which is
+                // x86_64 (and only below `LOW_IDENTITY_LIMIT`). On aarch64 a
+                // physical address resolves through TTBR0 — user space — so
+                // every private huge fork faulted. The 4 KiB COW path below
+                // already resolves this correctly and says so; this one was
+                // missed.
                 unsafe {
                     core::ptr::copy_nonoverlapping(
-                        source.phys() as *const u8,
-                        replacement.phys() as *mut u8,
+                        crate::PhysAddr::new(source.phys()).kernel_ptr::<u8>(),
+                        crate::PhysAddr::new(replacement.phys()).kernel_mut_ptr::<u8>(),
                         source.size_bytes() as usize,
                     );
                 }
