@@ -1024,6 +1024,18 @@ impl FileOps for InotifyFile {
         Some(cell.arm(task_id, interest, waker))
     }
 
+    /// Persistent arm (epoll `eppoll_entry`): register a never-consumed waiter on
+    /// the instance cell so an EPOLLET consumer re-fires on every queued event.
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        let cell = with_inotify(|m| m.get(&self.id).map(|st| st.readiness.clone()))?;
+        Some(cell.arm_persistent(id, interest, waker))
+    }
+
     /// Remove this task's waiter from the instance cell; `false` if the instance
     /// is gone (the caller then runs its legacy disarm path).
     fn disarm_readiness(&self, task_id: u64) -> bool {
@@ -1335,6 +1347,18 @@ impl FileOps for FanotifyFile {
     ) -> Option<core::task::Poll<u32>> {
         let cell = with_fanotify(|m| m.get(&self.id).map(|g| g.readiness.clone()))?;
         Some(cell.arm(task_id, interest, waker))
+    }
+
+    /// Persistent arm (epoll `eppoll_entry`): register a never-consumed waiter on
+    /// the group cell so an EPOLLET consumer re-fires on every queued event.
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        let cell = with_fanotify(|m| m.get(&self.id).map(|g| g.readiness.clone()))?;
+        Some(cell.arm_persistent(id, interest, waker))
     }
 
     /// Remove this task's waiter from the group cell; `false` if the group is

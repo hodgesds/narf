@@ -2243,20 +2243,6 @@ impl FileOps for SocketFile {
         )
     }
 
-    /// Durable arm for a connected AF_UNIX/AF_INET stream socket. Both rings of
-    /// a connected pair carry a [`RingBuf::readiness`] cell, so we arm the SAME
-    /// task on whichever cell(s) the caller's interest touches: the rx ring for
-    /// POLL_IN (data arrival / EOF) and the tx ring for POLL_OUT (space frees).
-    /// POLL_HUP is folded into both interests so a peer close — which closes the
-    /// peer's rings, i.e. OUR rx (via its tx) and OUR tx (via its rx) — wakes a
-    /// reader AND a writer, even one blocked on a full ring. `arm` is fused with
-    /// the ring's `set` under one lock, so the classic "check-then-park" lost
-    /// wakeup is unrepresentable: any state the ring reaches before we insert
-    /// the waiter is already visible to this `arm`.
-    ///
-    /// Returns `None` for states not yet migrated (dgram/listener/netlink/…) or
-    /// an interest that touches neither direction, so the caller keeps the
-    /// legacy edge-token + 10 ms backstop path for those.
     fn arm_readiness(
         &self,
         task_id: u64,
@@ -2264,132 +2250,34 @@ impl FileOps for SocketFile {
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
         use core::task::Poll;
-        let want_in = interest & narf_filesystem::POLL_IN != 0;
-        let want_out = interest & narf_filesystem::POLL_OUT != 0;
-        if !want_in && !want_out {
-            return None;
-        }
-        // Classify the socket under one short lock, cloning any rings needed.
-        enum Arm {
-            Connected(Arc<RingBuf>, Arc<RingBuf>),
-            Wired(u32),
-            Dgram,
-            Listener,
-            Uevent,
-            Legacy,
-        }
-        let arm = match &*self.state.lock() {
-            SocketState::UnixConnected { rx, tx, .. }
-            | SocketState::InetConnected { rx, tx, .. }
-            | SocketState::Inet6Connected { rx, tx, .. } => Arm::Connected(rx.clone(), tx.clone()),
-            // Kernel-TCP-over-NIC (off-box redis/servers): a durable per-TCB
-            // cell, fed POLL_IN by the stack's RX wake and reconciled to the
-            // live level below. Off the state lock (the cell is keyed by id).
-            SocketState::InetWired { tcb_id, .. } => Arm::Wired(*tcb_id),
-            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
-            SocketState::UnixListener { .. }
-            | SocketState::InetListener { .. }
-            | SocketState::Inet6Listener { .. } => Arm::Listener,
-            SocketState::NetlinkUevent { .. } => Arm::Uevent,
-            _ => Arm::Legacy,
-        };
-        match arm {
-            // Unmigrated states (raw / netlink / kernel-TCP / bypass): the
-            // caller keeps the legacy edge-token + backstop path.
-            Arm::Legacy => None,
-            // Connected stream: dual rx/tx ring cells. Arm off the state lock —
-            // the cloned Arcs keep the rings alive, and a concurrent close
-            // latches POLL_IN|POLL_HUP into the cell, so `arm` still observes
-            // readiness rather than parking on a dead ring. POLL_HUP is folded
-            // into both so a peer close wakes a reader AND a writer.
-            Arm::Connected(rx, tx) => {
-                let mut ready = 0u32;
-                if want_in {
-                    if let core::task::Poll::Ready(bits) = rx.readiness().arm(
-                        task_id,
-                        narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
-                        waker,
-                    ) {
-                        ready |= bits;
-                    }
-                }
-                if want_out {
-                    if let core::task::Poll::Ready(bits) = tx.readiness().arm(
-                        task_id,
-                        narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
-                        waker,
-                    ) {
-                        ready |= bits;
-                    }
-                }
-                if ready != 0 {
-                    Some(Poll::Ready(ready))
-                } else {
-                    Some(Poll::Pending)
-                }
+        // One-shot arm: each cell's `arm` registers-or-returns-ready. Collect the
+        // satisfied bits; `Some(0)` means "cell-backed but nothing ready yet" →
+        // Pending (waiters registered), non-zero → Ready.
+        self.arm_cells(interest, |cell, bits| match cell.arm(task_id, bits, waker) {
+            Poll::Ready(b) => b,
+            Poll::Pending => 0,
+        })
+        .map(|ready| {
+            if ready != 0 {
+                Poll::Ready(ready)
+            } else {
+                Poll::Pending
             }
-            // Kernel-TCP: reconcile the durable cell to the live level (so a
-            // drained socket doesn't report a stale POLL_IN and a re-arm
-            // doesn't spuriously return Ready), then arm. POLL_OUT stays set —
-            // a kernel-TCP socket is always sendable. The RX wake path
-            // (`wake_io_waiters` → cell.set POLL_IN) drives the readable edge.
-            Arm::Wired(tcb_id) => {
-                let readable = narf_net::tcp_stack::readable(tcb_id);
-                let cell = crate::handlers::tcb_cell(tcb_id);
-                cell.set(
-                    if readable {
-                        narf_filesystem::POLL_IN
-                    } else {
-                        0
-                    },
-                    if readable {
-                        0
-                    } else {
-                        narf_filesystem::POLL_IN
-                    },
-                );
-                Some(cell.arm(
-                    task_id,
-                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-                    waker,
-                ))
-            }
-            // Connectionless datagram: one SocketFile-level cell carrying
-            // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
-            // inbox is non-empty. Arming with the caller's interest returns
-            // Ready immediately for the always-writable case.
-            Arm::Dgram => Some(self.dgram_readiness.arm(
-                task_id,
-                interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
-                waker,
-            )),
-            // Listener: only ever POLL_IN-ready (a pending connection to
-            // accept). A POLL_OUT-only interest has nothing durable to wait for,
-            // so fall back to the legacy path.
-            Arm::Listener => {
-                if want_in {
-                    Some(
-                        self.listener_readiness
-                            .arm(task_id, narf_filesystem::POLL_IN, waker),
-                    )
-                } else {
-                    None
-                }
-            }
-            // uevent monitor: only POLL_IN-ready (a queued event). poll_readiness
-            // reconciled the cell against subscribed && reader.has_pending, and
-            // uevent_wake_hook sets its rising edge on an emit.
-            Arm::Uevent => {
-                if want_in {
-                    Some(
-                        self.uevent_readiness
-                            .arm(task_id, narf_filesystem::POLL_IN, waker),
-                    )
-                } else {
-                    None
-                }
-            }
-        }
+        })
+    }
+
+    /// Persistent arm (Linux `eppoll_entry`): register each cell's waiter WITHOUT
+    /// consuming it on readiness, so epoll's per-fd ready-list waker stays live
+    /// for the fd's whole membership and fires on every future event. Returns the
+    /// currently-satisfied bits so the caller can seed an initial ready-list
+    /// edge; `None` for unmigrated states (raw/netlink/kernel-TCP-only-out/…).
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.arm_cells(interest, |cell, bits| cell.arm_persistent(id, bits, waker))
     }
 
     /// Remove this task's waiter from both rings of a connected pair. Safe to
@@ -2445,6 +2333,133 @@ impl FileOps for SocketFile {
 }
 
 impl SocketFile {
+    /// Shared arm dispatch for a socket's durable readiness cell(s), used by both
+    /// the one-shot [`arm_readiness`](Self::arm_readiness) (poll/blocking) and the
+    /// persistent [`arm_readiness_persistent`](Self::arm_readiness_persistent)
+    /// (epoll `eppoll_entry`). Classifies the socket under one short state lock,
+    /// then invokes `arm_one(cell, interest_bits)` for each cell the caller's
+    /// interest touches, ORing the satisfied bits it returns. `arm_one` performs
+    /// the actual registration (`arm` vs `arm_persistent`) and returns the bits
+    /// that cell reports ready (0 = registered-and-pending).
+    ///
+    /// A connected stream folds POLL_HUP into both rx (POLL_IN) and tx (POLL_OUT)
+    /// so a peer close — which closes the peer's rings, i.e. OUR rx (via its tx)
+    /// and OUR tx (via its rx) — wakes a reader AND a writer. Returns `None` for
+    /// states with no cell (raw netlink / bypass) or an interest touching neither
+    /// direction, so the caller keeps the legacy full-scan + backstop path.
+    fn arm_cells<F: FnMut(&narf_lib::readiness::Readiness, u32) -> u32>(
+        &self,
+        interest: u32,
+        mut arm_one: F,
+    ) -> Option<u32> {
+        let want_in = interest & narf_filesystem::POLL_IN != 0;
+        let want_out = interest & narf_filesystem::POLL_OUT != 0;
+        if !want_in && !want_out {
+            return None;
+        }
+        // Classify the socket under one short lock, cloning any rings needed.
+        enum Arm {
+            Connected(Arc<RingBuf>, Arc<RingBuf>),
+            Wired(u32),
+            Dgram,
+            Listener,
+            Uevent,
+            Legacy,
+        }
+        let arm = match &*self.state.lock() {
+            SocketState::UnixConnected { rx, tx, .. }
+            | SocketState::InetConnected { rx, tx, .. }
+            | SocketState::Inet6Connected { rx, tx, .. } => Arm::Connected(rx.clone(), tx.clone()),
+            // Kernel-TCP-over-NIC (off-box redis/servers): a durable per-TCB
+            // cell, fed POLL_IN by the stack's RX wake and reconciled to the
+            // live level below. Off the state lock (the cell is keyed by id).
+            SocketState::InetWired { tcb_id, .. } => Arm::Wired(*tcb_id),
+            SocketState::UnixDgram { .. } | SocketState::InetDgram { .. } => Arm::Dgram,
+            SocketState::UnixListener { .. }
+            | SocketState::InetListener { .. }
+            | SocketState::Inet6Listener { .. } => Arm::Listener,
+            SocketState::NetlinkUevent { .. } => Arm::Uevent,
+            _ => Arm::Legacy,
+        };
+        match arm {
+            // Unmigrated states (raw / netlink / bypass): the caller keeps the
+            // legacy full-scan + backstop path.
+            Arm::Legacy => None,
+            // Connected stream: dual rx/tx ring cells. Arm off the state lock —
+            // the cloned Arcs keep the rings alive, and a concurrent close
+            // latches POLL_IN|POLL_HUP into the cell, so the arm still observes
+            // readiness rather than parking on a dead ring.
+            Arm::Connected(rx, tx) => {
+                let mut ready = 0u32;
+                if want_in {
+                    ready |= arm_one(
+                        rx.readiness(),
+                        narf_filesystem::POLL_IN | narf_filesystem::POLL_HUP,
+                    );
+                }
+                if want_out {
+                    ready |= arm_one(
+                        tx.readiness(),
+                        narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+                    );
+                }
+                Some(ready)
+            }
+            // Kernel-TCP: reconcile the durable cell to the live level (so a
+            // drained socket doesn't report a stale POLL_IN and a re-arm doesn't
+            // spuriously return Ready), then arm. POLL_OUT stays set — a
+            // kernel-TCP socket is always sendable. The RX wake path
+            // (`wake_io_waiters` → cell.set POLL_IN) drives the readable edge.
+            Arm::Wired(tcb_id) => {
+                let readable = narf_net::tcp_stack::readable(tcb_id);
+                let cell = crate::handlers::tcb_cell(tcb_id);
+                cell.set(
+                    if readable {
+                        narf_filesystem::POLL_IN
+                    } else {
+                        0
+                    },
+                    if readable {
+                        0
+                    } else {
+                        narf_filesystem::POLL_IN
+                    },
+                );
+                Some(arm_one(
+                    &cell,
+                    interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+                ))
+            }
+            // Connectionless datagram: one SocketFile-level cell carrying
+            // POLL_OUT always (a dgram is always sendable) + POLL_IN when the
+            // inbox is non-empty.
+            Arm::Dgram => Some(arm_one(
+                &self.dgram_readiness,
+                interest & (narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT),
+            )),
+            // Listener: only ever POLL_IN-ready (a pending connection to accept).
+            // A POLL_OUT-only interest has nothing durable to wait for.
+            Arm::Listener => {
+                if want_in {
+                    Some(arm_one(&self.listener_readiness, narf_filesystem::POLL_IN))
+                } else {
+                    None
+                }
+            }
+            // uevent monitor: only POLL_IN-ready (a queued event). poll_readiness
+            // reconciled the cell against subscribed && reader.has_pending, and
+            // the emit path sets its rising edge.
+            Arm::Uevent => {
+                if want_in {
+                    Some(arm_one(&self.uevent_readiness, narf_filesystem::POLL_IN))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+
     /// Per-state readiness bits (with durable-cell reconcile side-effects),
     /// factored out so the fused poll_readiness_and_token_at computes mask +
     /// token under a single `state` lock. Behaviourally identical to the old

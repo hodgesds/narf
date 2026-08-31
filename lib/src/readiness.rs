@@ -181,6 +181,29 @@ impl Readiness {
         Poll::Pending
     }
 
+    /// Register a PERSISTENT waiter — the Linux `eppoll_entry` model: the waker
+    /// stays in the wait queue for the fd's whole lifetime in the poll set and
+    /// is NEVER removed on readiness. Unlike [`arm`](Self::arm), a satisfied
+    /// level does not consume the registration: the same waker keeps firing on
+    /// every future [`set`](Self::set)/[`notify`](Self::notify) until an explicit
+    /// [`disarm`](Self::disarm). Returns the currently-satisfied bits
+    /// (`mask & interest`) so the caller can seed an initial edge WITHOUT
+    /// dropping the registration. This is what lets epoll's per-fd ready-list
+    /// waker capture events between `epoll_wait` calls (including non-parking
+    /// `timeout==0` polls) — a one-shot [`arm`](Self::arm) would be gone by the
+    /// time the next event fired.
+    pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32 {
+        let mut g = self.inner.lock();
+        g.waiters.insert(
+            id,
+            Waiter {
+                interest,
+                waker: waker.clone(),
+            },
+        );
+        g.mask & interest
+    }
+
     /// Signal an EVENT on `bits` — a Linux wait-queue wakeup. Bumps `seq` and
     /// wakes every waiter whose interest intersects `bits`, UNCONDITIONALLY:
     /// unlike [`set`](Self::set), it does not gate on a rising level edge and

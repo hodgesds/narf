@@ -992,6 +992,25 @@ pub trait FileOps: Send + Sync {
         self.readiness().map(|r| r.arm(task_id, interest, waker))
     }
 
+    /// Register a PERSISTENT readiness waiter — the Linux `eppoll_entry` model,
+    /// used by epoll to arm a per-fd ready-list waker at `EPOLL_CTL_ADD` that
+    /// stays live for the fd's whole membership in the set (never consumed on
+    /// readiness). Returns `Some(current_ready_bits)` if the file is on the
+    /// durable readiness path (so the caller can seed an initial ready-list
+    /// edge), `None` if it has no cell (timerfd / raw netlink / nested epoll —
+    /// those fall back to the full-scan + rising-mask path). The default arms the
+    /// single directly-owned cell; composite / behind-a-lock files (sockets)
+    /// override to reconcile then persistently arm each of their cells.
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.readiness()
+            .map(|r| r.arm_persistent(id, interest, waker))
+    }
+
     /// Remove `task_id`'s registration from this file's durable readiness.
     /// Returns whether the file is on the durable path at all. Default via
     /// [`Self::readiness`]; composite / behind-a-lock files override.

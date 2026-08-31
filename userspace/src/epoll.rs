@@ -104,11 +104,18 @@ struct EpollItem {
     /// both before and after a real edge.
     last_token: (u64, u64),
     /// True once this fd was armed on a durable Readiness cell (its
-    /// `arm_readiness` returned `Some`). Cell-backed fds report readiness by
-    /// pushing themselves onto the ready-list via their per-fd waker, so the
-    /// fast path polls them only when listed. Non-cell-backed fds (timerfd /
-    /// nested epoll / raw / legacy netlink) have no edge and are always polled.
+    /// `arm_readiness_persistent` returned `Some`). Cell-backed fds report
+    /// readiness by pushing themselves onto the ready-list via their PERSISTENT
+    /// per-fd waker (Linux `eppoll_entry`), armed at `EPOLL_CTL_ADD` and live for
+    /// the fd's whole membership, so the fast path polls them only when listed.
+    /// Non-cell-backed fds (timerfd / nested epoll / raw / legacy netlink) have
+    /// no cell and are always polled (rising-mask edge only).
     cell_backed: bool,
+    /// Globally-unique key of this subscription's persistent waiter in the fd's
+    /// Readiness cell (top bit set to never collide with a task-id-keyed poll(2)
+    /// waiter). Used to `disarm` exactly this epoll's waker on CTL_MOD/DEL/close
+    /// without disturbing another epoll or a blocking poll on the same fd.
+    sub_id: u64,
 }
 
 impl core::fmt::Debug for EpollItem {
@@ -123,6 +130,16 @@ impl core::fmt::Debug for EpollItem {
             .field("last_token", &self.last_token)
             .finish()
     }
+}
+
+/// Monotonic key source for persistent per-fd epoll waiters (Linux
+/// `eppoll_entry`). The top bit is forced set so an epoll subscription key can
+/// never collide with a task-id-keyed `poll(2)`/blocking waiter sharing the same
+/// Readiness cell's waiter map (task ids are small counters, never near 2^63).
+static EPOLL_SUB_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn next_sub_id() -> u64 {
+    (EPOLL_SUB_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & (u64::MAX >> 1)) | (1u64 << 63)
 }
 
 // ── EpollInstance — the core object ──────────────────────────────────
@@ -267,7 +284,9 @@ impl EpollInstance {
         })
     }
 
-    /// `EPOLL_CTL_ADD` logic.
+    /// `EPOLL_CTL_ADD` logic. `epfd_file` is this epoll's OWN open file (the
+    /// per-fd waker holds a `Weak` to it), needed to arm the persistent
+    /// `eppoll_entry` waker.
     fn ctl_add(
         &self,
         fd: i32,
@@ -275,53 +294,118 @@ impl EpollInstance {
         offset: u64,
         events: u32,
         data: u64,
+        epfd_file: &Arc<dyn FileOps>,
     ) -> bool {
-        let mut g = self.inner.lock();
-        if let Some(existing) = g.interest.get(&fd) {
-            if existing.file.upgrade().is_some() {
-                return false; // EEXIST
+        {
+            let mut g = self.inner.lock();
+            if let Some(existing) = g.interest.get(&fd) {
+                if existing.file.upgrade().is_some() {
+                    return false; // EEXIST
+                }
+                // Linux removes an epoll interest when the watched open file's
+                // last descriptor closes. Lazily reap the equivalent dead Weak
+                // entry so a subsequently reused fd number can be added. Its
+                // cell (if any) died with the file, so its waiter is already gone.
+                g.interest.remove(&fd);
             }
-            // Linux removes an epoll interest when the watched open file's
-            // last descriptor closes. Lazily reap the equivalent dead Weak
-            // entry so a subsequently reused fd number can be added.
-            g.interest.remove(&fd);
-        }
-        g.interest.insert(
-            fd,
-            EpollItem {
+            g.interest.insert(
                 fd,
-                file: Arc::downgrade(file),
-                offset,
-                events,
-                data,
-                last_mask: 0,
-                last_token: (0, 0),
-                cell_backed: false,
-            },
-        );
+                EpollItem {
+                    fd,
+                    file: Arc::downgrade(file),
+                    offset,
+                    events,
+                    data,
+                    last_mask: 0,
+                    last_token: (0, 0),
+                    cell_backed: false,
+                    sub_id: next_sub_id(),
+                },
+            );
+        }
+        // Arm the persistent per-fd waker OUTSIDE the instance lock (arming a
+        // socket takes its state lock; the cell has its own lock) and seed the
+        // ready-list if the fd is already ready (Linux ep_insert's initial poll).
+        self.arm_item_persistent(fd, file, epfd_file);
         true
     }
 
-    /// `EPOLL_CTL_DEL` logic.
-    fn ctl_del(&self, fd: i32, file: &Arc<dyn FileOps>, owner_id: u64) -> bool {
-        let mut g = self.inner.lock();
-        let matches = g
-            .interest
-            .get(&fd)
-            .and_then(|item| item.file.upgrade())
-            .is_some_and(|watched| Arc::ptr_eq(&watched, file));
-        let removed = matches && g.interest.remove(&fd).is_some();
-        if removed {
-            g.ready.remove(&fd);
-            exclusive_release(fd, owner_id);
+    /// Arm (or re-arm) the persistent per-fd ready-list waker for `fd` on its
+    /// Readiness cell, keyed by the item's `sub_id`. Records `cell_backed` and
+    /// seeds the ready-list from the returned currently-ready bits. Must be
+    /// called with the instance lock NOT held.
+    fn arm_item_persistent(&self, fd: i32, file: &Arc<dyn FileOps>, epfd_file: &Arc<dyn FileOps>) {
+        let (sub_id, events) = {
+            let g = self.inner.lock();
+            match g.interest.get(&fd) {
+                Some(it) => (it.sub_id, it.events),
+                None => return,
+            }
+        };
+        // A disarmed EPOLLONESHOT (interest bits cleared) has nothing to wait on.
+        if (events & EPOLLONESHOT) != 0
+            && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
+        {
+            return;
         }
+        let want = events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+        let interest = want | EPOLLERR | EPOLLHUP;
+        let fd_waker = epoll_fd_waker(epfd_file, fd);
+        let armed = file.arm_readiness_persistent(sub_id, interest, &fd_waker);
+        let mut g = self.inner.lock();
+        let mut seed = false;
+        if let Some(it) = g.interest.get_mut(&fd) {
+            match armed {
+                Some(ready_bits) => {
+                    it.cell_backed = true;
+                    seed = ready_bits != 0;
+                }
+                None => it.cell_backed = false,
+            }
+        }
+        if seed {
+            g.ready.insert(fd);
+        }
+    }
+
+    /// `EPOLL_CTL_DEL` logic. Disarms the persistent per-fd waker so no stale
+    /// entry lingers in the fd's Readiness cell after removal.
+    fn ctl_del(&self, fd: i32, file: &Arc<dyn FileOps>, owner_id: u64) -> bool {
+        let removed = {
+            let mut g = self.inner.lock();
+            let matches = g
+                .interest
+                .get(&fd)
+                .and_then(|item| item.file.upgrade())
+                .is_some_and(|watched| Arc::ptr_eq(&watched, file));
+            let removed = if matches { g.interest.remove(&fd) } else { None };
+            if let Some(item) = &removed {
+                g.ready.remove(&fd);
+                exclusive_release(fd, owner_id);
+                let sub = item.sub_id;
+                drop(g);
+                // Disarm the persistent waiter outside the instance lock.
+                file.disarm_readiness(sub);
+            }
+            removed.is_some()
+        };
         removed
     }
 
     /// `EPOLL_CTL_MOD` logic.
-    fn ctl_mod(&self, fd: i32, file: &Arc<dyn FileOps>, events: u32, data: u64) -> bool {
-        let mut g = self.inner.lock();
-        if let Some(item) = g.interest.get_mut(&fd) {
+    fn ctl_mod(
+        &self,
+        fd: i32,
+        file: &Arc<dyn FileOps>,
+        events: u32,
+        data: u64,
+        epfd_file: &Arc<dyn FileOps>,
+    ) -> bool {
+        {
+            let mut g = self.inner.lock();
+            let Some(item) = g.interest.get_mut(&fd) else {
+                return false; // ENOENT
+            };
             let same_file = item
                 .file
                 .upgrade()
@@ -334,18 +418,16 @@ impl EpollInstance {
             // Linux re-evaluates the fd against its new mask on every MOD and
             // re-adds it to the ready list if currently ready — so a MOD acts as
             // a fresh edge for EPOLLET (and re-arms EPOLLONESHOT). Reset the
-            // edge state, exactly as `ctl_add` initializes it, so the next scan
-            // treats current readiness as a rising edge. Without this, re-arming
-            // EPOLLOUT|EPOLLET on a still-writable fd whose `last_mask` already
-            // held POLLOUT gave `new_bits == 0` with no token change and the
-            // readiness was swallowed — dbus-broker's queued-reply flush
-            // stranded, hanging the greeter's D-Bus round-trip on CachyOS boot.
+            // rising-mask edge state, exactly as `ctl_add` initializes it, so the
+            // next scan treats current readiness as a rising edge.
             item.last_mask = 0;
             item.last_token = (0, 0);
-            true
-        } else {
-            false // ENOENT
         }
+        // Re-arm the persistent waker with the new interest (replaces by sub_id)
+        // and re-seed the ready-list, so a still-ready fd fires a fresh edge —
+        // dbus-broker's queued-reply flush depends on this MOD-rearm.
+        self.arm_item_persistent(fd, file, epfd_file);
+        true
     }
 
     /// Per-interest-fd EPOLLET edge state for the unbounded-park diagnostic.
@@ -394,72 +476,20 @@ impl EpollInstance {
             .collect()
     }
 
-    /// Arm every interest fd that owns a durable
-    /// [`Readiness`](narf_lib::readiness::Readiness) cell so a `set` edge on it
-    /// wakes THIS `epoll_wait` directly via the cell, keyed by `task_id`.
-    /// Registration ONLY — the edge/level DELIVERY decision stays with
-    /// [`Self::collect_ready`], so an EPOLLET fd that is level-ready with no new
-    /// edge is never spuriously delivered (which is why this does not use the
-    /// `arm` Ready result to abort the park). A no-op for interest fds still on
-    /// the legacy path (`readiness() == None`); those keep waking through the
-    /// legacy `readiness::notify` + `epoll_park_gen` guard. Idempotent: `arm`
-    /// replaces this task's registration by id on every re-execution.
-    fn arm_readiness_cells(
-        &self,
-        epfd_file: &Arc<dyn FileOps>,
-        task_id: u64,
-        waker: &core::task::Waker,
-    ) {
-        // Publish the poller's waker so a per-fd waker firing can wake this park.
+    /// Publish this `epoll_wait`'s task waker so a per-fd ready-list waker firing
+    /// (via [`Self::push_ready`]) can unpark it. The per-fd cell wakers
+    /// themselves are armed ONCE at `EPOLL_CTL_ADD` (Linux `eppoll_entry`,
+    /// [`Self::arm_item_persistent`]) and live for the fd's whole membership —
+    /// NOT per-wait — so an event listing a fd on the ready-list is captured even
+    /// between non-parking (`timeout==0`) waits, and there is no per-wait O(n)
+    /// re-arm on the hot path.
+    fn set_parked_waker(&self, waker: &core::task::Waker) {
         self.inner.lock().parked_waker = Some(waker.clone());
-        let snapshot: alloc::vec::Vec<EpollItem> =
-            self.inner.lock().interest.values().cloned().collect();
-        // (fd, cell_backed, ready_now) folded back under one lock afterwards.
-        let mut results: alloc::vec::Vec<(i32, bool, bool)> = alloc::vec::Vec::new();
-        for item in &snapshot {
-            // Disarmed EPOLLONESHOT (no interest bits) has nothing to wait for.
-            if (item.events & EPOLLONESHOT) != 0
-                && (item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
-            {
-                continue;
-            }
-            if let Some(ops) = item.file.upgrade() {
-                let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
-                let interest = want | EPOLLERR | EPOLLHUP;
-                // Per-fd waker (Linux ep_poll_callback): a `set` edge on this
-                // fd's cell lists it on the ready-list. The fused arm/set means
-                // a fd already ready at arm time returns Ready here — SEED it
-                // onto the ready-list so the post-arm re-poll delivers it rather
-                // than stranding (arm→set race). Delivery/edge filtering still
-                // belongs to collect_ready; seeding only makes it a CANDIDATE.
-                let fd_waker = epoll_fd_waker(epfd_file, item.fd);
-                match ops.arm_readiness(task_id, interest, &fd_waker) {
-                    Some(core::task::Poll::Ready(_)) => results.push((item.fd, true, true)),
-                    Some(core::task::Poll::Pending) => results.push((item.fd, true, false)),
-                    None => results.push((item.fd, false, false)),
-                }
-            }
-        }
-        let mut g = self.inner.lock();
-        for (fd, cell, ready_now) in results {
-            if let Some(it) = g.interest.get_mut(&fd) {
-                it.cell_backed = cell;
-            }
-            if ready_now {
-                g.ready.insert(fd);
-            }
-        }
     }
 
-    /// End-of-wait cleanup: drop the parked-waker publication. The per-fd
-    /// Readiness-cell wakers are deliberately LEFT ARMED across waits (Linux
-    /// `eppoll_entry` persists on the wait queue from `epoll_ctl` ADD, not
-    /// per-wait): under concurrent load the poller rarely parks, so an fd that
-    /// becomes ready WHILE the poller is processing must still push itself onto
-    /// the ready-list — a per-wait disarm would drop that edge and strand the
-    /// connection (the -c50 starvation). A lingering waker is harmless: it
-    /// pushes to the ready-list (a no-op if the fd left the set) and re-arm
-    /// replaces it by task id. `_task_id` retained for signature stability.
+    /// End-of-wait cleanup: drop the parked-waker publication. The persistent
+    /// per-fd cell wakers stay armed (Linux `eppoll_entry`), disarmed only by
+    /// CTL_MOD/DEL or this instance's drop.
     fn disarm_readiness_cells(&self, _task_id: u64) {
         self.inner.lock().parked_waker = None;
     }
@@ -787,6 +817,23 @@ impl FileOps for EpollInstance {
     }
 }
 
+impl Drop for EpollInstance {
+    /// Disarm every interest fd's persistent `eppoll_entry` waker so no stale
+    /// entry lingers in a still-live shared Readiness cell after the epoll fd
+    /// closes (Linux `ep_free` walks the rbtree calling `ep_remove` →
+    /// `ep_unregister_pollwait`). A fired stale waker would already be a no-op
+    /// (its `Weak<epoll file>` no longer upgrades), but leaving the map entry
+    /// would leak a slot on a long-lived socket watched by short-lived epolls.
+    fn drop(&mut self) {
+        let items = core::mem::take(&mut self.inner.lock().interest);
+        for item in items.values() {
+            if let Some(file) = item.file.upgrade() {
+                file.disarm_readiness(item.sub_id);
+            }
+        }
+    }
+}
+
 // ── Instance resolution — through the fd table, like Linux ──────────
 // The instance IS the fd's `FileOps` object, so resolve `epfd` through
 // the caller's fd table and downcast — exactly how Linux recovers the
@@ -1104,7 +1151,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
                     return;
                 }
             }
-            if instance.ctl_add(tfd, &target_ops, target_offset, events, data) {
+            if instance.ctl_add(tfd, &target_ops, target_offset, events, data, &ops) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(EEXIST);
@@ -1112,7 +1159,7 @@ pub fn sys_epoll_ctl(ctx: &mut dyn TrapContext) {
         }
         EPOLL_CTL_MOD => {
             let (events, data) = event.expect("MOD imported its event above");
-            if instance.ctl_mod(tfd, &target_ops, events, data) {
+            if instance.ctl_mod(tfd, &target_ops, events, data, &ops) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
                 ctx.set_return(ENOENT);
@@ -1571,28 +1618,24 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                         // from `CURRENT`, live for this trap; `state`/`exit_reason`
                         // are its own `UnsafeCell` fields and the `hook` consumes
                         // the same pointer to park exactly this task.
-                        // Durable per-fd wake: arm each interest fd's Readiness
-                        // cell so a `set` edge wakes this epoll_wait directly
-                        // (alongside the legacy net_io_wait path during
-                        // migration). Registration only — collect_ready above
-                        // owns delivery; a strict no-op until an fd migrates.
+                        // Publish this task's waker so a per-fd ready-list waker
+                        // (armed persistently at CTL_ADD) can unpark it. The cells
+                        // are already armed for the fd's lifetime, so this is O(1),
+                        // not a per-wait O(n) re-arm.
                         if let Some(w) = narf_scheduler::stackful::current_stackful_waker() {
-                            instance.arm_readiness_cells(&ops, task, &w);
+                            instance.set_parked_waker(&w);
                             // Register-then-recheck — closes the collect_ready ->
-                            // arm lost-wake window. A fd that went ready AFTER the
-                            // top collect_ready but before/at `arm_readiness_cells`
-                            // fired its `set` while no waker was armed, and no
-                            // future `set` will re-fire it, so parking here would
-                            // STRAND the wait forever (this is exactly what the
-                            // epoll-park census flags as `STRAND`, now unmasked
-                            // since the 10ms park backstop was deleted).
-                            // `poll_readiness()` non-destructively mirrors
-                            // collect_ready's exact delivery filters; if it now
-                            // reports deliverable, self-wake so the park
-                            // re-executes and delivers instead of stranding.
-                            // Mirrored filters mean a benign always-writable
-                            // EPOLLOUT or an already-consumed EPOLLET edge does
-                            // NOT trigger, so this cannot spin.
+                            // park lost-wake window. A fd whose persistent waker
+                            // fired push_ready AFTER the top collect_ready but
+                            // BEFORE set_parked_waker listed it on the ready-list
+                            // with no parked waker to wake; without this recheck
+                            // the park would STRAND. `poll_readiness()`
+                            // non-destructively mirrors collect_ready's delivery
+                            // filters; if it now reports deliverable, self-wake so
+                            // the park re-executes and delivers. Mirrored filters
+                            // mean a benign always-writable EPOLLOUT or an
+                            // already-consumed EPOLLET edge does NOT trigger, so
+                            // this cannot spin.
                             if instance.poll_readiness() != 0 {
                                 w.wake_by_ref();
                             }
