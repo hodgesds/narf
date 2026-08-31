@@ -133,6 +133,10 @@ impl ModuleSyscallError {
                 | ModuleSyscallError::Load(LoadError::BadSection(_))
                 | ModuleSyscallError::Load(LoadError::MissingInit)
                 | ModuleSyscallError::Load(LoadError::SignatureRejected(_))
+                // An image built for another architecture is definitively
+                // not a module this kernel could ever load — the same class
+                // as a foreign Linux `.ko`.
+                | ModuleSyscallError::Load(LoadError::WrongArch { .. })
         )
     }
 
@@ -157,6 +161,8 @@ impl ModuleSyscallError {
             // -ENOMEM: no module VA, no frames, or the image could not be
             // given its final permissions.
             ModuleSyscallError::Load(LoadError::Image(_)) => -12,
+            // -ENOEXEC: right file format, wrong machine.
+            ModuleSyscallError::Load(LoadError::WrongArch { .. }) => -8,
             ModuleSyscallError::InitFailed(_) => -22,
             ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(_)) => -16,
             ModuleSyscallError::ExitFailed(_) => -22,

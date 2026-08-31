@@ -44,6 +44,7 @@ pub mod lifecycle;
 pub mod loader;
 pub mod manifest;
 pub mod params;
+pub mod plt;
 pub mod proc_modules;
 pub mod refcount;
 pub mod relocator;

@@ -15,14 +15,15 @@ use narf_memory::module_text::{self, ModuleTextError, Prot};
 use crate::domain;
 use crate::elf::{
     enumerate_sections, parse_header, parse_section, sections::SECT_MODINFO,
-    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
+    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, EM_AARCH64, SHF_ALLOC,
+    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::lifecycle::{ModuleExitFn, ModuleInitFn, ModuleState};
 use crate::manifest::{Manifest, ManifestError};
 use crate::params::{self, ParamSlot};
+use crate::plt::{Plt, VENEER_BYTES};
 use crate::refcount::RefCount;
-use crate::relocator::{apply_all_relas, RelocatorError, SectionPlacement};
+use crate::relocator::{apply_all_relas, RelocContext, RelocatorError, SectionPlacement};
 use crate::sign;
 use crate::symbols::{kernel_abi, ModuleId};
 
@@ -53,6 +54,9 @@ pub enum LoadError {
     /// The module image could not be mapped, or its regions could not be
     /// given their final permissions.
     Image(ModuleTextError),
+    /// The ELF was built for a different architecture than the running
+    /// kernel.
+    WrongArch { runtime: &'static str, elf: u16 },
 }
 
 impl From<HeaderError> for LoadError {
@@ -143,8 +147,17 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         return Err(LoadError::SignatureRejected(reason));
     }
 
-    // 2. ELF header validation.
+    // 2. ELF header validation, then architecture. The relocator applies
+    //    x86_64 or aarch64 relocations purely on `e_machine`, so without this
+    //    check a foreign-arch `.ko` relocates "successfully" and faults on its
+    //    first instruction instead of being rejected at load.
     let hdr = parse_header(image)?;
+    if hdr.e_machine != native_machine() {
+        return Err(LoadError::WrongArch {
+            runtime: native_arch_name(),
+            elf: hdr.e_machine,
+        });
+    }
 
     // 3. Find `.modinfo` and parse the manifest.
     let modinfo_section = find_section_by_name(image, &hdr, SECT_MODINFO)
@@ -261,11 +274,83 @@ struct BuiltImage {
     params: Vec<ParamSlot>,
 }
 
+/// `e_machine` value a module must carry to run on this kernel.
+#[inline]
+fn native_machine() -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::elf::EM_X86_64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        EM_AARCH64
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
+#[inline]
+fn native_arch_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "unknown"
+    }
+}
+
+/// Upper bound on the veneers an aarch64 module needs: one per `CALL26` /
+/// `JUMP26` relocation.
+///
+/// An over-count, deliberately. Several relocations usually share a target
+/// and `Plt::veneer_for` folds them onto one slot, so the arena ends up
+/// partly unused — a few dozen bytes against the alternative of a second
+/// pass to compute the exact figure. Linux over-counts and then sorts to
+/// fold duplicates (`arch/arm64/kernel/module-plts.c::count_plts`).
+fn count_branch_relocs(bytes: &[u8], hdr: &Elf64Header) -> usize {
+    use crate::elf::reloc::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
+
+    let mut n = 0usize;
+    for i in 0..hdr.e_shnum as usize {
+        let Ok(shdr) = parse_section(bytes, hdr, i) else {
+            continue;
+        };
+        if shdr.sh_type != SHT_RELA || shdr.sh_entsize == 0 {
+            continue;
+        }
+        let count = (shdr.sh_size / shdr.sh_entsize) as usize;
+        for e in 0..count {
+            let off = shdr.sh_offset as usize + e * shdr.sh_entsize as usize;
+            let Some(r) = crate::elf::parse_rela(bytes, off) else {
+                continue;
+            };
+            if matches!(r.ty(), R_AARCH64_CALL26 | R_AARCH64_JUMP26) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 /// A page-aligned plan for the module image.
 #[derive(Debug)]
 struct ImageLayout {
     /// `(section_idx, offset_from_image_base, size)` in layout order.
     sections: Vec<(usize, u64, usize)>,
+    /// Offset of the aarch64 veneer arena within the image. Always inside
+    /// the text region; meaningless when `plt_slots` is zero.
+    plt_offset: u64,
+    /// Veneer slots reserved — an upper bound (see [`count_branch_relocs`]),
+    /// and zero on x86_64.
+    plt_slots: usize,
     text_pages: usize,
     rodata_pages: usize,
     total_pages: usize,
@@ -282,6 +367,8 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
     let mut cursor = 0u64;
     let mut region_start = [0u64; REGION_ORDER.len()];
     let mut region_end = [0u64; REGION_ORDER.len()];
+    let mut plt_offset = 0u64;
+    let mut plt_slots = 0usize;
 
     for (ri, region) in REGION_ORDER.iter().enumerate() {
         cursor = page_up(cursor);
@@ -312,6 +399,23 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
             sections.push((i, cursor, shdr.sh_size as usize));
             cursor = cursor.wrapping_add(shdr.sh_size);
         }
+        // The veneer arena is executable and must be within branch range of
+        // every call site in the module, so it goes at the end of the text
+        // region rather than in a section of its own. Linux reserves it the
+        // same way, as a synthetic `.plt` section
+        // (`arch/arm64/kernel/module-plts.c::module_frob_arch_sections`).
+        if *region == Region::Text {
+            // A64 instructions must be 4-byte aligned, and the last text
+            // section's size is arbitrary.
+            cursor = (cursor + 3) & !3;
+            plt_offset = cursor;
+            plt_slots = if hdr.e_machine == EM_AARCH64 {
+                count_branch_relocs(bytes, hdr)
+            } else {
+                0
+            };
+            cursor = cursor.wrapping_add((plt_slots * VENEER_BYTES) as u64);
+        }
         region_end[ri] = cursor;
     }
 
@@ -321,6 +425,8 @@ fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError
     }
     Ok(ImageLayout {
         sections,
+        plt_offset,
+        plt_slots,
         text_pages: ((page_up(region_end[0]) - region_start[0]) / PAGE) as usize,
         rodata_pages: ((page_up(region_end[1]) - region_start[1]) / PAGE) as usize,
         total_pages: (total / PAGE) as usize,
@@ -377,7 +483,13 @@ fn build_image(
     }
 
     let symbols = SymbolTable::new(bytes, symtab_pair.0, symtab_pair.1);
-    let _ = apply_all_relas(bytes, hdr, &symbols, &mut placements, manifest)?;
+    let mut plt =
+        (layout.plt_slots > 0).then(|| Plt::new(mem.base + layout.plt_offset, layout.plt_slots));
+    let mut ctx = RelocContext {
+        manifest,
+        plt: plt.as_mut(),
+    };
+    let _ = apply_all_relas(bytes, hdr, &symbols, &mut placements, &mut ctx)?;
 
     // Resolved before sealing so that every step which can fail is on the
     // writable side of the seal.

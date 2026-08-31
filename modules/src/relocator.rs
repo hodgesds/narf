@@ -14,12 +14,29 @@
 //! kernel export declares a `required_cap`, the module must
 //! list that CapKind in its manifest.
 
+use crate::elf::reloc::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
 use crate::elf::{
     apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
     SymbolTable, EM_AARCH64, EM_X86_64,
 };
 use crate::manifest::Manifest;
+use crate::plt::Plt;
 use crate::symbols::{resolve, ResolveError};
+
+/// Everything the relocator needs beyond the ELF itself.
+///
+/// Bundled rather than passed as separate arguments because the PLT has to
+/// reach two levels down, and a growing argument list is how the veneer
+/// arena would end up being silently skipped on one path.
+#[derive(Debug)]
+pub struct RelocContext<'a> {
+    /// The loading module's manifest, consulted for cap-gated exports.
+    pub manifest: &'a Manifest,
+    /// aarch64 veneer arena. `None` for an x86_64 image, whose module window
+    /// is inside PC32 range of every kernel symbol by construction — see
+    /// `crate::plt`.
+    pub plt: Option<&'a mut Plt>,
+}
 
 /// Errors raised by the relocator.
 #[derive(Debug, PartialEq, Eq)]
@@ -36,6 +53,10 @@ pub enum RelocatorError {
     NoTargetSection,
     /// Architecture in the ELF header doesn't match the runtime.
     ArchMismatch { runtime: &'static str, elf: u16 },
+    /// An aarch64 branch overflowed ±128 MiB and no veneer could be emitted:
+    /// either the arena the layout pass sized is full, or the target is
+    /// beyond ADRP's reach. Both mean the module cannot be relocated.
+    PltExhausted(alloc::string::String),
 }
 
 /// Per-section layout — where the loader put one section in the module
@@ -94,7 +115,7 @@ pub fn apply_one_rela_section(
     rela_idx: usize,
     symbols: &SymbolTable,
     placements: &mut [SectionPlacement],
-    manifest: &Manifest,
+    ctx: &mut RelocContext<'_>,
 ) -> Result<usize, RelocatorError> {
     let rela_shdr = parse_section(bytes, hdr, rela_idx)
         .map_err(|_| RelocatorError::ApplyFailed(RelocError::OutOfBounds))?;
@@ -126,7 +147,7 @@ pub fn apply_one_rela_section(
 
         let sym_value = if sym.is_undefined() {
             let name = symbols.name(&sym);
-            match resolve(name, None, manifest) {
+            match resolve(name, None, ctx.manifest) {
                 Ok(res) => res.addr as u64,
                 Err(ResolveError::Unknown) => {
                     return Err(RelocatorError::SymbolNotFound(name.into()));
@@ -142,21 +163,54 @@ pub fn apply_one_rela_section(
             resolve_local_symbol(&sym, placements).unwrap_or(sym.st_value)
         };
 
+        let loc = r.r_offset as usize;
+
+        // aarch64 long branches: when the direct displacement will not fit
+        // the 26-bit field, route the call through a veneer in the module's
+        // own text. Resolved BEFORE `dest` is borrowed below, because
+        // emitting a veneer writes elsewhere in the same image.
+        //
+        // The veneer is keyed on the fully-resolved target (symbol value plus
+        // addend), so the addend is folded in here and passed on as zero —
+        // applying it a second time would branch past the callee.
+        let (sym_value, addend) = if hdr.e_machine == EM_AARCH64
+            && matches!(r.ty(), R_AARCH64_CALL26 | R_AARCH64_JUMP26)
+        {
+            let target = (sym_value as i64).wrapping_add(r.r_addend) as u64;
+            let place = target_addr.wrapping_add(loc as u64);
+            let words = (target as i64).wrapping_sub(place as i64) >> 2;
+            // Same ±128 MiB bound `apply_aarch64` enforces, checked here so
+            // an overflow can be fixed instead of failing the load.
+            if !(-(1 << 25)..(1 << 25)).contains(&words) {
+                let name = symbols.name(&sym);
+                let plt = ctx
+                    .plt
+                    .as_deref_mut()
+                    .ok_or_else(|| RelocatorError::PltExhausted(name.into()))?;
+                // SAFETY: relocation runs before `module_text::protect` seals
+                // the text region, so the arena is still mapped writable.
+                let veneer = unsafe { plt.veneer_for(target) }
+                    .ok_or_else(|| RelocatorError::PltExhausted(name.into()))?;
+                (veneer, 0)
+            } else {
+                (sym_value, r.r_addend)
+            }
+        } else {
+            (sym_value, r.r_addend)
+        };
+
         // Find the placement holding the patched section.
         let dest = placements
             .iter_mut()
             .find(|p| p.section_idx == target_section)
             .ok_or(RelocatorError::NoTargetSection)?;
-        let loc = r.r_offset as usize;
         // SAFETY: relocation runs between `module_text::alloc` and the
         // `protect` calls that seal the image, so every section is still
         // mapped RW.
         let dest_bytes = unsafe { dest.bytes_mut() };
         let result = match hdr.e_machine {
-            EM_X86_64 => apply_x86_64(dest_bytes, loc, target_addr, sym_value, r.r_addend, r.ty()),
-            EM_AARCH64 => {
-                apply_aarch64(dest_bytes, loc, target_addr, sym_value, r.r_addend, r.ty())
-            }
+            EM_X86_64 => apply_x86_64(dest_bytes, loc, target_addr, sym_value, addend, r.ty()),
+            EM_AARCH64 => apply_aarch64(dest_bytes, loc, target_addr, sym_value, addend, r.ty()),
             other => {
                 return Err(RelocatorError::ArchMismatch {
                     runtime: current_runtime_arch_name(),
@@ -177,7 +231,7 @@ pub fn apply_all_relas(
     hdr: &Elf64Header,
     symbols: &SymbolTable,
     placements: &mut [SectionPlacement],
-    manifest: &Manifest,
+    ctx: &mut RelocContext<'_>,
 ) -> Result<usize, RelocatorError> {
     let mut total = 0usize;
     for i in 0..hdr.e_shnum as usize {
@@ -198,7 +252,7 @@ pub fn apply_all_relas(
             let _ = name;
             continue;
         }
-        total += apply_one_rela_section(bytes, hdr, i, symbols, placements, manifest)?;
+        total += apply_one_rela_section(bytes, hdr, i, symbols, placements, ctx)?;
     }
     Ok(total)
 }
