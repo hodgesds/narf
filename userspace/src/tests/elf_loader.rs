@@ -1446,7 +1446,7 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
     // stays in bounds and the frame is not aliased yet.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
     }
 
     // PML4[1]; PML4[0] is the kernel's identity-map (1 GiB huge
@@ -1666,7 +1666,7 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
     // segment base; the loader copied the segment there, so reading the leading
     // 7 bytes is in-bounds, and a `[u8; 7]` has alignment 1.
     // SAFETY: Valid memory or trusted environment
-    let payload: [u8; 7] = unsafe { core::ptr::read_volatile(phys.raw() as *const [u8; 7]) };
+    let payload: [u8; 7] = unsafe { core::ptr::read_volatile(phys.kernel_ptr::<[u8; 7]>()) };
     if payload != [0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x69, 0x01] {
         return TestResult::Fail("segment payload bytes did not land in the mapped frame");
     }
@@ -1781,7 +1781,7 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
         // SAFETY: `phys` is the identity-mapped frame `translate` resolved; the
         // loader stored the per-page sentinel byte there, so a 1-byte read is valid.
         // SAFETY: Valid memory or trusted environment
-        let got: u8 = unsafe { core::ptr::read_volatile(phys.raw() as *const u8) };
+        let got: u8 = unsafe { core::ptr::read_volatile(phys.kernel_ptr::<u8>()) };
         if got != want {
             return TestResult::Fail("per-page sentinel mismatch — scatter list not honoured");
         }
@@ -1800,14 +1800,14 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // it is 4 KiB-aligned so a `u32` write at offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile(data_p1_phys.raw() as *mut u32, 0xCAFEBABE);
+        core::ptr::write_volatile(data_p1_phys.kernel_mut_ptr::<u32>(), 0xCAFEBABE);
     }
     // SAFETY: re-translating the same vaddr yields the identity-mapped phys of the
     // page just written; reading the `u32` back at offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
     let echo: u32 = unsafe {
         let p = paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)).expect("re-translate");
-        core::ptr::read_volatile(p.raw() as *const u32)
+        core::ptr::read_volatile(p.kernel_ptr::<u32>())
     };
     if echo != 0xCAFEBABE {
         return TestResult::Fail("kernel-side write/read via translate did not round-trip");

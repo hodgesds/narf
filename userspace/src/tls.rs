@@ -121,7 +121,7 @@ fn align_up(n: u64, align: u64) -> Option<u64> {
 ///
 /// # Safety
 /// - The low-4-GiB identity map must be live (we write the TLS
-///   block via the kernel's identity view of each phys page).
+///   block via the kernel's direct-map view of each phys page).
 /// - The frame allocator must be initialised.
 /// - `address_space` must have been constructed via `new_for_user`
 ///   so its `materialize` is meaningful.
@@ -169,7 +169,7 @@ pub unsafe fn stage_tls(
         // is exclusively ours until we hand it to `map_region`.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(p.kernel_mut_ptr::<u8>(), 0, 4096);
         }
         phys_list.push(p);
     }
@@ -210,16 +210,16 @@ pub unsafe fn stage_tls(
         let off = vaddr & 0xFFFu64;
         // SAFETY: we just mapped + materialised the TLS region;
         // every vaddr in `[region_base, region_base + mapped_bytes)`
-        // resolves to a phys that's identity-mapped in the low 4
+        // resolves to a phys reached through the kernel direct map
         // GiB of the kernel's view.
         // SAFETY: Valid memory or trusted environment
         let phys = unsafe { narf_memory::x86_64::paging::translate(root, VirtAddr::new(page)) }
             .ok_or(TlsError::Translate)?;
-        // SAFETY: identity-mapped phys; exclusive ownership through
+        // SAFETY: direct-mapped phys; exclusive ownership through
         // the duration of staging (no other CPU is in this AS yet).
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            *((phys.as_u64() + off) as *mut u8) = b;
+            *narf_memory::PhysAddr::new(phys.as_u64() + off).kernel_mut_ptr::<u8>() = b;
         }
     }
 
@@ -249,7 +249,7 @@ pub unsafe fn stage_tls(
         if off + 8 <= 4096 {
             // SAFETY: dst lies within a single mapped phys page.
             unsafe {
-                *((phys.as_u64() + off) as *mut u64) = value;
+                *narf_memory::PhysAddr::new(phys.as_u64() + off).kernel_mut_ptr::<u64>() = value;
             }
         } else {
             // Slow path: byte-wise across the page boundary.
@@ -263,7 +263,7 @@ pub unsafe fn stage_tls(
                 let byte = (value >> (i * 8)) as u8;
                 // SAFETY: identity-mapped, exclusive.
                 unsafe {
-                    *((ph.as_u64() + o) as *mut u8) = byte;
+                    *narf_memory::PhysAddr::new(ph.as_u64() + o).kernel_mut_ptr::<u8>() = byte;
                 }
             }
         }

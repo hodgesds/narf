@@ -414,7 +414,7 @@ pub unsafe fn load_user_process_with_root(
         // Zero the stack page.
         // SAFETY: identity-mapped in low 4 GiB.
         unsafe {
-            core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
         }
         stack_phys_list.push(phys);
     }
@@ -510,10 +510,12 @@ pub unsafe fn load_user_process_with_root(
             for (i, &byte) in key[..16].iter().enumerate() {
                 if let Some(phys) = resolve_user_phys_byte(root, entropy_va + i as u64) {
                     // SAFETY: stack region is mapped+materialised R+W
-                    // above; identity-mapped low 4 GiB.
+                    // above; reached through the kernel direct map (this
+                    // runs with a user CR3 live, which no longer carries
+                    // the low identity map).
                     // SAFETY: Valid memory or trusted environment
                     unsafe {
-                        *(phys as *mut u8) = byte;
+                        *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
                     }
                 }
             }
@@ -814,11 +816,12 @@ pub unsafe fn init_sysv_stack(
     let write_u8 = |vaddr: u64, byte: u8| -> Result<(), SysVStackError> {
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
         // SAFETY: `phys` is a materialized stack-page phys returned by
-        // `resolve_user_phys_byte`, reachable through the live low-4-GiB
-        // identity map; a single byte write is in-bounds for that page.
+        // `resolve_user_phys_byte`, reached through the kernel direct map
+        // (this runs with a user CR3 live, which no longer carries the low
+        // identity map); a single byte write is in-bounds for that page.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            *(phys as *mut u8) = byte;
+            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>() = byte;
         }
         Ok(())
     };
@@ -826,12 +829,12 @@ pub unsafe fn init_sysv_stack(
         // u64 writes never cross a page boundary if vaddr is 8-aligned
         // (which all our targets are by construction).
         let phys = resolve_user_phys_byte(root, vaddr).ok_or(SysVStackError::Overflow)?;
-        // SAFETY: `phys` is a materialized stack-page phys via the live
-        // low-4-GiB identity map; callers only pass 8-aligned vaddrs so the
+        // SAFETY: `phys` is a materialized stack-page phys reached through
+        // the kernel direct map; callers only pass 8-aligned vaddrs so the
         // u64 store stays within the single resolved page.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            *(phys as *mut u64) = val;
+            *narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u64>() = val;
         }
         Ok(())
     };

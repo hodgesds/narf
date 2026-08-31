@@ -204,7 +204,7 @@ pub unsafe fn scan_bios_for_rsdp() -> Option<PhysAddr> {
 /// (v2 RSDP length).
 pub unsafe fn parse_rsdp(phys: PhysAddr) -> Result<u64, AcpiError> {
     const RSDP_SIG: [u8; 8] = *b"RSD PTR ";
-    let p = phys.raw() as *const u8;
+    let p = phys.kernel_ptr::<u8>();
     // SAFETY: caller asserts ≥36 readable bytes.
     let signature = unsafe { core::slice::from_raw_parts(p, 8) };
     if signature != RSDP_SIG {

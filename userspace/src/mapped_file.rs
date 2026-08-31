@@ -675,7 +675,7 @@ pub(crate) fn publish_shared_file_pages(
         // SAFETY: every candidate is a freshly allocated, identity-mapped
         // fallback page owned by this publication attempt.
         let clean =
-            unsafe { core::slice::from_raw_parts(candidate.raw() as *const u8, 4096).to_vec() };
+            unsafe { core::slice::from_raw_parts(candidate.kernel_ptr::<u8>(), 4096).to_vec() };
         prepared.push((candidate, clean));
     }
     let mut rejected = Vec::with_capacity(prepared.len());
@@ -1409,7 +1409,7 @@ fn snapshot_dirty_page(
     }
     // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
     // mapping release from removing and freeing the entry during this copy.
-    let current = unsafe { core::slice::from_raw_parts(phys.raw() as *const u8, len) };
+    let current = unsafe { core::slice::from_raw_parts(phys.kernel_ptr::<u8>(), len) };
     if page.clean.get(..len) == Some(current) {
         None
     } else {

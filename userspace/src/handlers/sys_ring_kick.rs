@@ -22,7 +22,7 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     let mut sq = unsafe {
         SharedConsumer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.raw() as *mut SqRing
+            pair.sq_phys.kernel_mut_ptr::<SqRing>()
         )
     };
     // SAFETY: `pair.cq_phys` is the CQ frame this task owns in BOOTSTRAP_TABLE,
@@ -31,7 +31,7 @@ pub(crate) fn sys_ring_kick(ctx: &mut dyn TrapContext) {
     // SAFETY: Valid memory or trusted environment
     let mut cq = unsafe {
         SharedProducer::<Completion, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.raw() as *mut CqRing
+            pair.cq_phys.kernel_mut_ptr::<CqRing>()
         )
     };
 

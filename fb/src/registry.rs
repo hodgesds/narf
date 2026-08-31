@@ -99,8 +99,9 @@ pub fn connect(pid: u64, scanout_id: u32) -> Result<u64, ConnectError> {
     let frame = narf_memory::alloc_frame().map_err(|_| ConnectError::OutOfMemory)?;
     let phys = frame.start_address();
 
-    let ring_ptr = phys.raw() as *mut DrawRing;
-    // SAFETY: identity-mapped 4 KiB region; we own this freshly-
+    // Buddy RAM, not MMIO -- reached through the kernel direct map.
+    let ring_ptr = phys.kernel_mut_ptr::<DrawRing>();
+    // SAFETY: direct-mapped 4 KiB region; we own this freshly-
     // allocated frame.
     // SAFETY: Valid memory or trusted environment
     unsafe {

@@ -101,7 +101,11 @@ pub fn register_vdso_image(bytes: &[u8], cycles_per_ns: u32) {
         let chunk = core::cmp::min(4096, bytes.len() - off);
         // SAFETY: freshly-allocated frame, identity-mapped in low RAM; chunk <= 4096.
         unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr().add(off), frame.raw() as *mut u8, chunk);
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr().add(off),
+                frame.kernel_mut_ptr::<u8>(),
+                chunk,
+            );
         }
         frames.push(frame);
     }
@@ -196,13 +200,13 @@ pub fn map_into(addr_space: &AddressSpace) -> Option<u64> {
 fn zero_frame(frame: PhysAddr) {
     // SAFETY: identity-mapped freshly-allocated frame.
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
     }
 }
 
 fn read_u32(frame: PhysAddr, off: usize) -> u32 {
     // SAFETY: identity-mapped vvar frame; off+4 <= 4096.
-    unsafe { core::ptr::read_volatile((frame.raw() as *const u8).add(off) as *const u32) }
+    unsafe { core::ptr::read_volatile((frame.kernel_ptr::<u8>()).add(off) as *const u32) }
 }
 
 /// Write the vvar fields under a seqlock: bump seq to odd, store the
@@ -214,7 +218,7 @@ fn read_u32(frame: PhysAddr, off: usize) -> u32 {
 /// current scale.
 fn write_vvar(frame: PhysAddr, cycles_per_ns: u32, offset_ns: i64) {
     let (mult, shift) = narf_scheduler::narf_time::cyc_to_ns_mult_shift();
-    let base = frame.raw() as *mut u8;
+    let base = frame.kernel_mut_ptr::<u8>();
     // SAFETY: identity-mapped vvar frame; all offsets within the page.
     unsafe {
         let seq_ptr = base.add(VVAR_SEQ) as *mut u32;

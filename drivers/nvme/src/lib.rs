@@ -2540,7 +2540,11 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         // is coherent DMA memory, not MMIO, and per-byte volatility
         // defeats vectorisation on the hottest path in the system.
         unsafe {
-            core::ptr::copy_nonoverlapping(phys as *const u8, out.as_mut_ptr(), need);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                out.as_mut_ptr(),
+                need,
+            );
         }
         Ok(())
     }

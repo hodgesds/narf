@@ -597,8 +597,24 @@ static BASE_OVERRIDE: AtomicU64 = AtomicU64::new(0);
 
 /// Override the HPET MMIO base — for ACPI HPET-table parsing.
 /// Must be called before [`init`].
+///
+/// Despite the name this is the address the driver DEREFERENCES, not
+/// necessarily a physical one. `frame` now passes the `ioremap` virtual
+/// base: HPET lives below 4 GiB, and that region stopped being mapped in
+/// every address space when PML4[0] became user space.
 pub fn set_base_phys(phys: u64) {
     BASE_OVERRIDE.store(phys, Ordering::Release);
+}
+
+/// Physical base the caller should `ioremap` before calling
+/// [`set_base_phys`] with the resulting virtual address: the
+/// ACPI-provided override if one was recorded, else the architectural
+/// default.
+pub fn base_phys_for_ioremap() -> u64 {
+    match BASE_OVERRIDE.load(Ordering::Acquire) {
+        0 => HPET_DEFAULT_BASE,
+        v => v,
+    }
 }
 
 /// Probe + enable HPET. Returns `Ok` on x86_64 with a working

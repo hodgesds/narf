@@ -254,11 +254,9 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // and child address spaces (COW bypass).
     //
     // Strategy:
-    //   PML4[0]:       copy from cur_pml4 — kernel identity-map of
-    //                  physical RAM (0..512 GiB), used for kernel
-    //                  heap/stack access while the user CR3 is active.
-    //                  Shared but kernel-only (intermediate entries
-    //                  have U=0), so user-mode code can't reach it.
+    //   PML4[0]:       zeroed — AS-private, like PML4[2..255]. Kernel
+    //                  access to physical RAM while this CR3 is active
+    //                  goes through the high-half direct map instead.
     //   PML4[1]:       fixed below with a fresh private PDPT so the
     //                  user binary subtree (PDPT[0]) is isolated.
     //   PML4[2..255]:  zeroed — populated on demand by `materialize`
@@ -269,14 +267,21 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // SAFETY: `phys` points at a freshly-allocated identity-mapped frame.
     unsafe {
         // Start with all zeroes.
-        ptr::write_bytes(phys.raw() as *mut u8, 0, core::mem::size_of::<PageTable>());
-        // Preserve PML4[0] (kernel identity window) and
-        // PML4[256..511] (kernel high half) from the current PML4.
-        let src_e0 = ptr::read_volatile(cur_pml4.raw() as *const u64);
-        ptr::write_volatile(phys.raw() as *mut u64, src_e0);
+        ptr::write_bytes(
+            phys.kernel_mut_ptr::<u8>(),
+            0,
+            core::mem::size_of::<PageTable>(),
+        );
+        // PML4[0] is deliberately NOT copied. It used to carry the kernel's
+        // low identity map so kernel code could reach physical RAM while a
+        // user CR3 was active; the high-half direct map does that job now,
+        // and it rides along in the PML4[256..512] copy below. Leaving slot
+        // 0 empty is what makes the bottom 512 GiB of every user address
+        // space actually usable -- an ordinary `gcc -static` binary puts
+        // PT_LOAD at 0x400000, which lands here.
         for i in 256u64..512 {
-            let src = (cur_pml4.raw() + i * 8) as *const u64;
-            let dst = (phys.raw() + i * 8) as *mut u64;
+            let src = PhysAddr::new(cur_pml4.raw() + i * 8).kernel_ptr::<u64>();
+            let dst = PhysAddr::new(phys.raw() + i * 8).kernel_mut_ptr::<u64>();
             ptr::write_volatile(dst, ptr::read_volatile(src));
         }
     }
@@ -307,7 +312,8 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     // and naturally aligned for a `u64` read. Volatile because the entry
     // can be mutated by other paging code.
     // SAFETY: Valid memory or trusted environment
-    let kernel_pml4_e1: u64 = unsafe { ptr::read_volatile((cur_pml4.raw() + 8) as *const u64) };
+    let kernel_pml4_e1: u64 =
+        unsafe { ptr::read_volatile(PhysAddr::new(cur_pml4.raw() + 8).kernel_ptr::<u64>()) };
     if kernel_pml4_e1 & 1 != 0 {
         let kernel_pdpt_phys = PhysAddr::new(kernel_pml4_e1 & 0x000f_ffff_ffff_f000);
         let user_pdpt_frame =
@@ -328,7 +334,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // Zero the fresh PDPT.
         // SAFETY: identity-mapped freshly-allocated frame.
         unsafe {
-            ptr::write_bytes(user_pdpt_phys.raw() as *mut u8, 0, 4096);
+            ptr::write_bytes(user_pdpt_phys.kernel_mut_ptr::<u8>(), 0, 4096);
         }
         // Copy kernel PDPT[1..512] (skip PDPT[0] — that's where the
         // user binary lives, must stay private to this AS).
@@ -337,8 +343,9 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // SAFETY: Valid memory or trusted environment
         unsafe {
             for i in 1usize..512 {
-                let src = (kernel_pdpt_phys.raw() as usize + i * 8) as *const u64;
-                let dst = (user_pdpt_phys.raw() as usize + i * 8) as *mut u64;
+                let src = PhysAddr::new(kernel_pdpt_phys.raw() + i as u64 * 8).kernel_ptr::<u64>();
+                let dst =
+                    PhysAddr::new(user_pdpt_phys.raw() + i as u64 * 8).kernel_mut_ptr::<u64>();
                 ptr::write_volatile(dst, ptr::read_volatile(src));
             }
         }
@@ -359,7 +366,10 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // offset 8 (entry 1, 8 bytes each), inside the page and u64-aligned.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            ptr::write_volatile((phys.raw() + 8) as *mut u64, new_e1);
+            ptr::write_volatile(
+                PhysAddr::new(phys.raw() + 8).kernel_mut_ptr::<u64>(),
+                new_e1,
+            );
         }
     } else {
         // Kernel didn't map PML4[1] at all (legacy boot path). Fall
@@ -369,7 +379,7 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
         // base, PML4[1] is at u64-aligned byte offset 8 inside the page.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            ptr::write_volatile((phys.raw() + 8) as *mut u64, 0);
+            ptr::write_volatile(PhysAddr::new(phys.raw() + 8).kernel_mut_ptr::<u64>(), 0);
         }
     }
 
@@ -1822,7 +1832,11 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
         // every table they allocate); a kernel-shared PDPT is never
         // registered, so the `__pagetable_is_registered` check below skips
         // it.
-        for slot in 1usize..256 {
+        // Slot 0 is included: it is AS-private now that the kernel identity
+        // map no longer lives there. The `__pagetable_is_registered` check
+        // below still protects any kernel-shared PDPT, which is never
+        // registered, so widening the bound cannot free a kernel table.
+        for slot in 0usize..256 {
             let pml4e = pml4.entries[slot];
             if !pml4e.is_present() {
                 continue;

@@ -51,6 +51,19 @@ pub fn install(fs: &'static Initramfs) {
     }
 }
 
+/// Replace an already-installed archive.
+///
+/// [`install`] is first-wins, which is right for the normal boot handoff
+/// but wrong for the direct-map re-stage: the first staging necessarily
+/// runs before `init_mmu`, so it mints the archive slice from identity
+/// addresses. Those stop resolving once user address spaces drop the low
+/// identity map, and the slice is `&'static` -- read on every later
+/// `exec`. The boot path re-parses against the direct map and calls this
+/// to swap the instance. The superseded one is leaked, as it already was.
+pub fn install_replacing(fs: &'static Initramfs) {
+    *STAGED.lock() = Some(fs);
+}
+
 /// Borrow the staged initramfs. `None` until `install` runs.
 pub fn staged() -> Option<&'static Initramfs> {
     *STAGED.lock()
@@ -77,21 +90,31 @@ pub fn __reset_staged() {
 /// the spec's "stage once, borrow forever" principle.
 ///
 /// # Safety
-/// `phys` + `len` must point at a readable, identity-mapped CPIO
-/// newc archive of exactly `len` bytes. The bootloader contract
-/// guarantees both for the region it advertises in
-/// `BootInfo::initramfs`.
-pub unsafe fn stage_from_phys(name: &'static str, phys: u64, len: u64) -> Result<(), CpioError> {
+/// `phys` + `len` must point at a readable CPIO newc archive of exactly
+/// `len` bytes, addressed by a pointer that stays valid for the life of
+/// the kernel IN EVERY ADDRESS SPACE — the archive slice is `&'static`
+/// and is read on every `exec`, long after boot, with a user CR3 live.
+/// Callers pass the kernel direct-map address, not a raw physical one.
+pub unsafe fn stage_from_phys(
+    name: &'static str,
+    phys: u64,
+    len: u64,
+    replacing: bool,
+) -> Result<(), CpioError> {
     if len == 0 {
         return Ok(());
     }
-    // SAFETY: caller-asserted readability + identity mapping.
+    // SAFETY: caller-asserted readability + kernel-wide mapping.
     let archive: &'static [u8] =
         // SAFETY: Valid memory or trusted environment
         unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
     let fs = Initramfs::from_cpio(name, archive)?;
     let leaked: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-    install(leaked);
+    if replacing {
+        install_replacing(leaked);
+    } else {
+        install(leaked);
+    }
     Ok(())
 }
 

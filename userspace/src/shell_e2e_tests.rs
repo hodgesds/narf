@@ -848,6 +848,13 @@ kernel_test_in!("userspace/shell", smoke_shell_dup2_stdin_from_pipe);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_shell_fork_wait4_exit_status() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0x5012;
 
     crate::syscall::__test_clear_global();

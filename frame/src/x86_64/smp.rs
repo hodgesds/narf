@@ -437,7 +437,15 @@ pub unsafe fn start_aps() -> u32 {
         // usable stack range (a per-page loop only used the first frame's
         // top, assuming a contiguity it never guaranteed).
         let stack_top: u64 = match alloc_pages_on(0, AP_STACK_ORDER) {
-            Ok(f) => f.start_address().raw() + (AP_STACK_PAGES as u64 * 4096),
+            // Direct-map VA, not the raw physical address. The AP loads this
+            // straight into rsp, and it must stay valid once the AP is
+            // scheduling tasks on user address spaces -- those no longer
+            // carry the low identity map. The trampoline sets rsp in long
+            // mode with the kernel PML4 already in CR3, so the direct map is
+            // live by then.
+            Ok(f) => {
+                f.start_address().kernel_mut_ptr::<u8>() as u64 + (AP_STACK_PAGES as u64 * 4096)
+            }
             Err(_) => {
                 let _ = writeln!(Writer, "  smp(x86): AP {}: stack alloc failed", logical);
                 continue;

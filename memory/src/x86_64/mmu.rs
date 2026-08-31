@@ -342,7 +342,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // RAM above 4 GiB: on a q35 PCI-hole split (QEMU -m ≥ 4G, real
         // 16 GiB laptops) usable RAM is relocated to start at phys
         // 4 GiB, so anything past the boundary was untouchable and a
-        // direct `phys.raw() as *mut T` access would #PF. Blanketing
+        // direct `phys.kernel_mut_ptr::<T>()` access would #PF. Blanketing
         // the low 512 GiB makes every installed frame reachable by an
         // identity (phys == virt) pointer; unpopulated gaps in that
         // range are simply never accessed (the buddy only hands out

@@ -448,6 +448,11 @@ kernel_test_in!("userspace", smoke_userspace_spawn_dispatcher_for_helper);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_dup_clones_fd() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, FdEntry, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -970,7 +975,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // child's fresh frame.
     // SAFETY: identity-mapped, single-task ownership.
     unsafe {
-        *(frame.raw() as *mut u32) = 0xCAFEBABE;
+        *(frame.kernel_mut_ptr::<u32>()) = 0xCAFEBABE;
     }
 
     let parent_as = Arc::new(parent_as_inner);
@@ -1045,7 +1050,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // stamped; it is 4 KiB-aligned so reading the `u32` sentinel at offset 0 is
     // aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
-    let shared_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
+    let shared_word = unsafe { *(parent_region.phys[0].kernel_ptr::<u32>()) };
     if shared_word != 0xCAFEBABE {
         return TestResult::Fail("shared COW frame lost the sentinel");
     }
@@ -1084,7 +1089,7 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // split just allocated and memcpy'd into; 4 KiB-aligned, so the `u32` read at
     // offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
-    let child_word = unsafe { *(post_split_child.phys[0].raw() as *const u32) };
+    let child_word = unsafe { *(post_split_child.phys[0].kernel_ptr::<u32>()) };
     if child_word != 0xCAFEBABE {
         return TestResult::Fail("split didn't memcpy the parent's bytes");
     }
@@ -1092,12 +1097,12 @@ fn smoke_userspace_fork_distinct_address_space() -> TestResult {
     // aligned, in-bounds, and only the child owns this post-split frame.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        *(post_split_child.phys[0].raw() as *mut u32) = 0xDEADBEEF;
+        *(post_split_child.phys[0].kernel_mut_ptr::<u32>()) = 0xDEADBEEF;
     }
     // SAFETY: `parent_region.phys[0]` is the parent's still-owned identity-mapped
     // frame; reading the `u32` at offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
-    let parent_word = unsafe { *(parent_region.phys[0].raw() as *const u32) };
+    let parent_word = unsafe { *(parent_region.phys[0].kernel_ptr::<u32>()) };
     if parent_word != 0xCAFEBABE {
         return TestResult::Fail("mutating child's split frame leaked into parent");
     }

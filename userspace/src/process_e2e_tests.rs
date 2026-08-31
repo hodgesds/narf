@@ -205,6 +205,13 @@ fn teardown_process_state() {
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_fork_basic_wait4_reap() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
 
     const PARENT: u64 = 0xF0_01;
@@ -2904,6 +2911,13 @@ fn signal_ctx_returning_to_user() -> SignalCtx {
 // path — `*NULL = 1` in user code lands here as vector 14).
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave55_sigsegv_default_terminate_sets_wifsignaled() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_55_01;
     const CHILD: u64 = 0xC0_55_01;
     const SIGSEGV: u32 = 11;
@@ -2988,6 +3002,13 @@ kernel_test_in!(
 // action is Terminate (no core), wait4 sees WIFSIGNALED.
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave55_sigterm_default_terminate_sets_wifsignaled() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_55_02;
     const CHILD: u64 = 0xC0_55_02;
     const SIGTERM: u32 = 15;
@@ -3078,6 +3099,13 @@ kernel_test_in!(
 // just verify the no-handler path.
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave55_sigkill_default_terminate_sets_wifsignaled() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_55_03;
     const CHILD: u64 = 0xC0_55_03;
     const SIGKILL: u32 = 9;
@@ -3158,6 +3186,13 @@ kernel_test_in!(
 // handler installed, default action is Terminate.
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave55_self_sighup_default_terminate_sets_wifsignaled() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_55_04;
     const CHILD: u64 = 0xC0_55_04;
     const SIGHUP: u32 = 1;
@@ -3838,6 +3873,13 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
 
     const PARENT: u64 = 0xF0_65;
@@ -3963,6 +4005,13 @@ kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
 /// by contrast, must DEEP-COPY (post-fork installs stay private).
 #[cfg(target_arch = "x86_64")]
 fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
     const PARENT: u64 = 0xF0_67;
     const SIGUSR1: usize = 10;
@@ -4144,6 +4193,13 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
 
     const PARENT: u64 = 0xF0_67;
@@ -4298,6 +4354,13 @@ kernel_test_in!(
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_ptrace_e2e() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::ptrace::*;
     use narf_memory::AddressSpace;
 
@@ -4587,6 +4650,13 @@ kernel_test_in!("userspace/process", smoke_process_ptrace_e2e);
 // records state and returns instead of parking, so we can assert on it.
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_ptrace_syscall_stop() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::ptrace::*;
     use narf_memory::AddressSpace;
 
@@ -5455,6 +5525,13 @@ kernel_test_in!("userspace/process", smoke_process_fork_child_pid_identity);
 // matching the x86_64-gated kernel_test_in! registration below.
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_clone_thread_shares_pid() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use narf_memory::AddressSpace;
 
     const PARENT: u64 = 0xF0_61;
@@ -5562,6 +5639,13 @@ kernel_test_in!("userspace/process", smoke_process_clone_thread_shares_pid);
 /// immediately visible to the creator.
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_clone_thread_shares_rlimit() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_68;
     const CLONE_VM: u64 = 0x0000_0100;
     const CLONE_SIGHAND: u64 = 0x0000_0800;
@@ -5655,6 +5739,13 @@ kernel_test_in!(
 /// parent's values, but subsequent changes remain private to each process.
 #[cfg(target_arch = "x86_64")]
 fn smoke_process_fork_copies_rlimit() -> TestResult {
+    // Kernel stack buffers stand in for user buffers throughout this test
+    // (`&args as *const _ as u64` into a syscall arg). That worked
+    // implicitly while the kernel stack lived in the low identity map and
+    // was indistinguishable from user memory; the stack is high-half now,
+    // so `validate_user_range` correctly rejects it. Take the opt-in built
+    // for exactly this.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     const PARENT: u64 = 0xF0_69;
 
     crate::syscall::__test_clear_global();

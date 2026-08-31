@@ -6766,7 +6766,7 @@ impl AddressSpace {
             // SAFETY: identity-mapped DMA-equivalent; the frame is exclusively
             // owned by this ticket until finish_demand_page publishes it.
             unsafe {
-                core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+                core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
             }
             phys
         };

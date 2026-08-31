@@ -22,7 +22,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     };
     // SAFETY: identity-mapped low 4 GiB; phys is page-aligned.
     unsafe {
-        core::ptr::write_bytes(phys.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096);
     }
     let user_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);
 
@@ -98,7 +98,7 @@ pub(crate) fn sys_bootstrap(ctx: &mut dyn TrapContext) {
     // the user runtime can name the rings.
     // SAFETY: identity-mapped low 4 GiB; aligned u64 + u32 stores.
     unsafe {
-        let header = phys.raw() as *mut BootstrapHeader;
+        let header = phys.kernel_mut_ptr::<BootstrapHeader>();
         (*header).magic = ABI_BOOTSTRAP_MAGIC;
         (*header).version = ABI_BOOTSTRAP_VERSION;
         (*header).task_id = task;

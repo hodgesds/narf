@@ -1345,7 +1345,11 @@ fn handle_create_dumb(
     // the allocation covers `size` bytes at `phys`.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(phys as *mut u8, 0, size as usize);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+            0,
+            size as usize,
+        );
     }
 
     // Register in the card's dumb_backings table.

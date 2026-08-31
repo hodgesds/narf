@@ -225,7 +225,7 @@ pub unsafe fn load_elf_into_at(
     for &p in &allocated {
         // SAFETY: identity-mapped in low 4 GiB.
         unsafe {
-            core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(p.kernel_mut_ptr::<u8>(), 0, 4096);
         }
     }
 
@@ -291,7 +291,7 @@ pub unsafe fn load_elf_into_at(
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src.as_ptr().add(written),
-                    (frame.raw() as *mut u8).add(dst_off),
+                    (frame.kernel_mut_ptr::<u8>()).add(dst_off),
                     chunk,
                 );
             }
@@ -314,7 +314,7 @@ pub unsafe fn load_elf_into_at(
 /// # Safety
 /// - `bytes` must be a live slice for the duration of this call.
 /// - The kernel must be running with the low 4 GiB identity-mapped
-///   so `phys.raw() as *mut u8` writes reach the backing storage.
+///   so `phys.kernel_mut_ptr::<u8>()` writes reach the backing storage.
 /// - Frame allocator must be initialised.
 pub unsafe fn load_elf_bytes(
     bytes: &[u8],
@@ -499,7 +499,7 @@ fn user_vaddr_to_kernel_ptr(addr_space: &AddressSpace, vaddr: u64) -> Option<*mu
         // address, so the walk stays within valid table entries.
         // SAFETY: Valid memory or trusted environment
         unsafe { narf_memory::x86_64::paging::translate(addr_space.root, VirtAddr::new(page)) }?;
-    Some((p.as_u64() + off) as *mut u8)
+    Some(narf_memory::PhysAddr::new(p.as_u64() + off).kernel_mut_ptr::<u8>())
 }
 
 #[cfg(not(target_arch = "x86_64"))]

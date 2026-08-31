@@ -4130,7 +4130,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // Stamp a sentinel so the post-split memcpy is observable.
     // SAFETY: identity-mapped phys; sole owner.
     unsafe {
-        *(frame.raw() as *mut u32) = 0xC0FF_EE42;
+        *(frame.kernel_mut_ptr::<u32>()) = 0xC0FF_EE42;
     }
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -4194,7 +4194,7 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
         return TestResult::Fail("split must not move the parent's frame");
     }
     // SAFETY: identity-mapped.
-    let copied = unsafe { *(c_split.phys[0].raw() as *const u32) };
+    let copied = unsafe { *(c_split.phys[0].kernel_ptr::<u32>()) };
     if copied != 0xC0FF_EE42 {
         return TestResult::Fail("split didn't memcpy the sentinel");
     }
@@ -4255,7 +4255,7 @@ fn smoke_memory_fork_child_demand_faults_lazily() -> TestResult {
     }
     // SAFETY: identity-mapped phys; sole owner. Sentinel proves the split copy.
     unsafe {
-        *(frame.raw() as *mut u32) = 0xC0FF_EE42;
+        *(frame.kernel_mut_ptr::<u32>()) = 0xC0FF_EE42;
     }
     // SAFETY: paging live; new child AS, no concurrent writers.
     let child = match unsafe { parent.clone_for_fork() } {
@@ -4308,7 +4308,7 @@ fn smoke_memory_fork_child_demand_faults_lazily() -> TestResult {
             return TestResult::Fail("split should allocate a fresh child frame");
         }
         // SAFETY: identity-mapped fresh frame.
-        if unsafe { *(c.phys[0].raw() as *const u32) } != 0xC0FF_EE42 {
+        if unsafe { *(c.phys[0].kernel_ptr::<u32>()) } != 0xC0FF_EE42 {
             return TestResult::Fail("split didn't memcpy the sentinel from the shared frame");
         }
         TestResult::Pass
@@ -4575,7 +4575,7 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
     // through to the shared master.
     // SAFETY: identity-mapped freshly-allocated frame.
     unsafe {
-        *(master.raw() as *mut u32) = SENTINEL;
+        *(master.kernel_mut_ptr::<u32>()) = SENTINEL;
     }
 
     if as_
@@ -4623,13 +4623,13 @@ fn smoke_memory_vdso_shaped_cow_region_splits_on_write() -> TestResult {
     }
     // The private copy carries the master's bytes (memcpy proof).
     // SAFETY: identity-mapped.
-    if unsafe { *(private_phys.raw() as *const u32) } != SENTINEL {
+    if unsafe { *(private_phys.kernel_ptr::<u32>()) } != SENTINEL {
         return TestResult::Fail("split didn't copy the master's bytes");
     }
     // The shared master is untouched — a write-through would corrupt every
     // other process's vDSO.
     // SAFETY: identity-mapped.
-    if unsafe { *(master.raw() as *const u32) } != SENTINEL {
+    if unsafe { *(master.kernel_ptr::<u32>()) } != SENTINEL {
         return TestResult::Fail("master frame was written through (COW violated)");
     }
     // cow_split dec_ref'd the master once (2 -> 1) when it privatised.
@@ -7335,7 +7335,7 @@ fn smoke_memory_demand_alloc_zero_fills_frame() -> TestResult {
     // by the allocator and is exclusively held by `a`.
     // SAFETY: Valid memory or trusted environment
     let all_zero = unsafe {
-        let p = phys.raw() as *const u8;
+        let p = phys.kernel_ptr::<u8>();
         (0..4096).all(|i| *p.add(i) == 0)
     };
     core::mem::forget(a);
@@ -7691,7 +7691,7 @@ fn smoke_memory_try_grow_stack_preserves_exec_without_annexing() -> TestResult {
     let zeroed = unsafe { translate_arch(a.root, VirtAddr::new(lowest)) }
         .map(|pa| {
             // SAFETY: identity-mapped low physical memory.
-            let byte = unsafe { core::ptr::read_volatile(pa.raw() as *const u8) };
+            let byte = unsafe { core::ptr::read_volatile(pa.kernel_ptr::<u8>()) };
             byte == 0
         })
         .unwrap_or(false);
@@ -9293,7 +9293,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     }
     // SAFETY: parent is sole owner; identity-mapped.
     unsafe {
-        *(p_frame.raw() as *mut u32) = 0xCAFEBABE;
+        *(p_frame.kernel_mut_ptr::<u32>()) = 0xCAFEBABE;
     }
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9360,15 +9360,15 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     // frame must not see the change.
     // SAFETY: identity-mapped, child is now sole owner of child_phys.
     unsafe {
-        *(child_phys.raw() as *mut u32) = 0xDEADBEEF;
+        *(child_phys.kernel_mut_ptr::<u32>()) = 0xDEADBEEF;
     }
     // SAFETY: identity-mapped.
-    let parent_word = unsafe { *(p_frame.raw() as *const u32) };
+    let parent_word = unsafe { *(p_frame.kernel_ptr::<u32>()) };
     if parent_word != 0xCAFEBABE {
         return TestResult::Fail("child's post-split write leaked into parent");
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let child_word = unsafe { *(child_phys.raw() as *const u32) };
+    let child_word = unsafe { *(child_phys.kernel_ptr::<u32>()) };
     if child_word != 0xDEADBEEF {
         return TestResult::Fail("child's private frame did not retain write");
     }
@@ -9423,7 +9423,7 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     }
     // SAFETY: sole owner pre-fork.
     unsafe {
-        *(orig_frame.raw() as *mut u32) = 0xA5A5_A5A5;
+        *(orig_frame.kernel_mut_ptr::<u32>()) = 0xA5A5_A5A5;
     }
 
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
@@ -9470,10 +9470,10 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
 
     // SAFETY: identity-mapped, parent owns parent_phys exclusively.
     unsafe {
-        *(parent_phys.raw() as *mut u32) = 0x5A5A_5A5A;
+        *(parent_phys.kernel_mut_ptr::<u32>()) = 0x5A5A_5A5A;
     }
     // SAFETY: identity-mapped.
-    let child_word = unsafe { *(orig_frame.raw() as *const u32) };
+    let child_word = unsafe { *(orig_frame.kernel_ptr::<u32>()) };
     if child_word != 0xA5A5_A5A5 {
         return TestResult::Fail("parent split leaked into child's frame");
     }
@@ -9955,7 +9955,7 @@ fn smoke_memory_madvise_dontneed_releases_pages() -> TestResult {
     // zeroed frame on next access.
     // SAFETY: identity-map covers the just-allocated frame.
     unsafe {
-        core::ptr::write_bytes(target.raw() as *mut u8, 0xAB, 4096);
+        core::ptr::write_bytes(target.kernel_mut_ptr::<u8>(), 0xAB, 4096);
     }
 
     if a.madvise_dontneed(v, 0x1000).is_err() {
@@ -10803,10 +10803,10 @@ fn smoke_memory_shmat_shared_attach_range_materialize() -> TestResult {
     // phys doubles as a kernel VA here.
     const SENTINEL: u64 = 0x5347_5F53_484D_4154;
     // SAFETY: `seg` is a live, identity-mapped, freshly allocated frame.
-    unsafe { core::ptr::write_volatile(seg.raw() as *mut u64, SENTINEL) };
+    unsafe { core::ptr::write_volatile(seg.kernel_mut_ptr::<u64>(), SENTINEL) };
     // SAFETY: B translated to `seg`; reading through that phys observes the
     // write, proving cross-attach shared visibility.
-    let seen = unsafe { core::ptr::read_volatile(seg.raw() as *const u64) };
+    let seen = unsafe { core::ptr::read_volatile(seg.kernel_ptr::<u64>()) };
     if seen != SENTINEL {
         return TestResult::Fail("shared write not visible through the second attach");
     }
@@ -10822,7 +10822,7 @@ fn smoke_memory_shmat_shared_attach_range_materialize() -> TestResult {
         return TestResult::Fail("detaching A tore down B's still-live attach");
     }
     // SAFETY: as above.
-    if unsafe { core::ptr::read_volatile(seg.raw() as *const u64) } != SENTINEL {
+    if unsafe { core::ptr::read_volatile(seg.kernel_ptr::<u64>()) } != SENTINEL {
         return TestResult::Fail("shared frame was clobbered by A's detach");
     }
     // The clinching double-free check: had A's drop freed the still-mapped

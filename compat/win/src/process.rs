@@ -337,7 +337,7 @@ pub unsafe fn load_pe(
         for &p in &guard.frames {
             // SAFETY: identity-mapped low-4-GiB frames.
             unsafe {
-                core::ptr::write_bytes(p.raw() as *mut u8, 0, 4096);
+                core::ptr::write_bytes(p.kernel_mut_ptr::<u8>(), 0, 4096);
             }
         }
         // Copy raw_size bytes from the file blob into the frames,
@@ -359,7 +359,7 @@ pub unsafe fn load_pe(
                 unsafe {
                     core::ptr::copy_nonoverlapping(
                         src.as_ptr().add(written),
-                        frame.raw() as *mut u8,
+                        frame.kernel_mut_ptr::<u8>(),
                         chunk,
                     );
                 }
@@ -402,7 +402,7 @@ pub unsafe fn load_pe(
         }
         // SAFETY: identity-mapped, page-resident, bounds checked above.
         unsafe {
-            let p = (frame.raw() as *mut u8).add(off) as *mut u64;
+            let p = (frame.kernel_mut_ptr::<u8>()).add(off) as *mut u64;
             p.write_unaligned(value);
         }
     }
@@ -425,7 +425,7 @@ pub unsafe fn load_pe(
         }
         // SAFETY: identity-mapped, page-resident, bounds checked.
         unsafe {
-            let p = (frame.raw() as *mut u8).add(off) as *mut u64;
+            let p = (frame.kernel_mut_ptr::<u8>()).add(off) as *mut u64;
             p.write_unaligned(addr);
         }
     }
@@ -444,13 +444,13 @@ pub unsafe fn load_pe(
     // them so no concurrent reader exists.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(peb_frame.raw() as *mut u8, 0, 4096);
-        core::ptr::write_bytes(teb_frame.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(peb_frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        core::ptr::write_bytes(teb_frame.kernel_mut_ptr::<u8>(), 0, 4096);
 
         // Build the page contents on the kernel side, then they'll
         // be visible to user mode through the user-VA mapping.
-        let peb_page = &mut *(peb_frame.raw() as *mut [u8; personality::PAGE]);
-        let teb_page = &mut *(teb_frame.raw() as *mut [u8; personality::PAGE]);
+        let peb_page = &mut *(peb_frame.kernel_mut_ptr::<[u8; personality::PAGE]>());
+        let teb_page = &mut *(teb_frame.kernel_mut_ptr::<[u8; personality::PAGE]>());
         personality::init_peb(peb_page, layout);
         personality::init_teb(teb_page, layout);
     }
@@ -487,7 +487,7 @@ pub unsafe fn load_pe(
         let f = alloc_frame().map_err(|_| LoadError::NoFrame)?;
         // SAFETY: identity-mapped fresh frame.
         unsafe {
-            core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096);
+            core::ptr::write_bytes(f.start_address().kernel_mut_ptr::<u8>(), 0, 4096);
         }
         stack_frames.push(f.start_address());
     }

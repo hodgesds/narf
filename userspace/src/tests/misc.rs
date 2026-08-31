@@ -153,7 +153,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // SAFETY: Valid memory or trusted environment
     let mut sq_prod = unsafe {
         SharedProducer::<Submission, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.sq_phys.raw() as *mut SqRing
+            pair.sq_phys.kernel_mut_ptr::<SqRing>(),
         )
     };
     let mut sub = Submission::noop(Tag::new(0xFEED));
@@ -181,7 +181,7 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
     // SAFETY: Valid memory or trusted environment
     let mut cq_cons = unsafe {
         SharedConsumer::<CqRing, BOOTSTRAP_SHARED_RING_DEPTH>::from_raw(
-            pair.cq_phys.raw() as *mut CqRingT
+            pair.cq_phys.kernel_mut_ptr::<CqRingT>(),
         )
     };
     let comp = match cq_cons.try_recv() {
