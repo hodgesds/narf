@@ -54,10 +54,12 @@ name = "rtl9999"
 crate-type = ["staticlib"]   # produces .a; we extract the .o
 
 [dependencies]
-# Modules link against the kernel's exported symbols via narf-modules.
-# In-tree the path; out-of-tree use the version published on crates.io.
-narf-modules = { path = "../narf-modules" }
-narf-capabilities = { path = "../narf-capabilities" }
+# None. A module links *against* the kernel — the loader resolves its
+# undefined symbols through KSYMTAB — so it declares what it calls in an
+# `extern "C"` block and depends on nothing. In particular do NOT depend
+# on `narf-modules`: that is the loader, and pulling it in would compile
+# a second copy of the memory, filesystem, console and time crates into
+# your module, all already resident in the running kernel.
 ```
 
 Source layout:
@@ -156,9 +158,21 @@ unsafe extern "C" {
 }
 ```
 
-Every export is `unsafe`, including the ones taking no pointers — the
+These stay undefined in the object you build; the loader resolves them
+against KSYMTAB and patches the call sites. A name the kernel does not
+export is a load-time failure reporting that symbol, not a link error
+here — your module is linked long before it meets a kernel.
+
+Every export is `unsafe`, including the ones taking no pointers. The
 boundary is unsafe as a whole, because nothing has verified your
-arguments.
+arguments, and marking only the pointer-taking ones would imply the rest
+had been checked.
+
+If you wrap them in safe helpers, mark the wrappers `#[inline]`. Anything
+left out of line in a *different crate* is a symbol
+`cargo xtask build-module` does not put in your `.ko`, so the module ends
+up referencing your Rust-mangled wrapper — which is in no kernel's
+KSYMTAB — instead of `narf_printk`.
 
 Each export carries a CRC computed from its signature. If the kernel's
 signature changes, your module is refused at load with a CRC mismatch
@@ -169,57 +183,21 @@ Referencing a symbol that is *not* exported is a load-time failure, not
 a link-time one: the relocator reports `SymbolNotFound` naming the
 symbol.
 
-## The `narf_module!` macro
+## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:
-`narf_module_init` and `narf_module_exit`. The recommended way is
-the `narf_module!` macro, which hides the unsafe `extern "C"`
-plumbing:
+`narf_module_init` and `narf_module_exit`. You write them directly —
+there is no macro, and deliberately so. The plumbing is six lines, and a
+macro to hide it would have to live in a crate you depend on, which for
+anything but a trivial one means compiling a second copy of kernel code
+into your module.
 
 ```rust
 #![no_std]
-extern crate alloc;
 
-use core::result::Result;
-
-fn my_init() -> Result<(), &'static str> {
-    // ... register devices, install pump tasks, etc.
-    Ok(())
-}
-
-fn my_exit() {
-    // ... tear down, drop resources, unregister.
-}
-
-narf_modules::narf_module! {
-    name: "rtl9999",
-    init: my_init,
-    exit: my_exit,
-}
-```
-
-The macro expands to:
-
-```rust
-#[no_mangle]
-pub extern "C" fn narf_module_init() -> i32 {
-    match my_init() {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn narf_module_exit() {
-    my_exit()
-}
-```
-
-You can write the C-ABI symbols directly if you need finer
-control over the i32 return value:
-
-```rust
-#[no_mangle]
+/// Called once, after relocations are applied and the image is sealed.
+/// Return 0 for success, or a negative errno.
+#[unsafe(no_mangle)]
 pub extern "C" fn narf_module_init() -> i32 {
     if !hardware_present() {
         return -19;   // -ENODEV
@@ -227,11 +205,17 @@ pub extern "C" fn narf_module_init() -> i32 {
     0
 }
 
-#[no_mangle]
+/// Called on `rmmod` once the refcount reaches zero. Optional — omit it
+/// and the loader treats the module as having nothing to tear down.
+#[unsafe(no_mangle)]
 pub extern "C" fn narf_module_exit() {
     teardown_everything();
 }
 ```
+
+Returning the errno yourself is the point: a wrapper that mapped a
+`Result` onto `0` / `-1` would throw away exactly the distinction
+`insmod` reports to the user.
 
 ## Declaring capability requirements
 
@@ -364,10 +348,17 @@ fn my_exit() {
     unregister_proc("foo");
 }
 
-narf_modules::narf_module! {
-    name: "rtl9999",
-    init: my_init,
-    exit: my_exit,
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_init() -> i32 {
+    match my_init() {
+        Ok(()) => 0,
+        Err(_) => -22,   // -EINVAL
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_exit() {
+    my_exit()
 }
 ```
 
