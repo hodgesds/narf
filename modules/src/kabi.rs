@@ -260,6 +260,13 @@ kernel_test_in!("modules/kabi", smoke_kabi_crc_tracks_signature);
 /// The ABI hash must be derived from the table, not a constant — otherwise
 /// it cannot catch the "wrong kernel" case it exists for.
 fn smoke_kabi_abi_hash_follows_the_table() -> TestResult {
+    // Start from the boot state. Several unrelated smokes call
+    // `set_kernel_abi(0)` after resetting, so whether the published hash
+    // matches the table depends on what ran before this — asserting on
+    // ambient global state made this smoke order-dependent, and it failed in
+    // CI for that reason rather than for anything about the hash.
+    crate::symbols::__reset_for_test();
+
     let before = crate::symbols::compute_abi_hash();
     if before == 0 {
         return TestResult::Fail("ABI hash is zero over a non-empty export table");

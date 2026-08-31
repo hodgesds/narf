@@ -166,15 +166,32 @@ set GLOBAL, and may, because its VA is never recycled.
 ### aarch64 needs veneers
 
 ```text
-  aarch64  L0[511] L1[0]  0xFFFF_FF80_0000_0000  low-PA device window
-           L0[511] L1[1]  0xFFFF_FF80_4000_0000  RAM linear map + kernel
-           L0[511] L1[2]  0xFFFF_FF80_8000_0000  module images
+  aarch64  L0[510] L1[511] 0xFFFF_FF7F_F800_0000  module images
+           L0[511] L1[0]   0xFFFF_FF80_0000_0000  linear map: phys 0-1 GiB
+           L0[511] L1[1]   0xFFFF_FF80_4000_0000  linear map: phys 1-2 GiB
+           L0[511] L1[2]   0xFFFF_FF80_8000_0000  linear map: phys 2-3 GiB
 ```
 
-There is no equivalent free lunch. `frame/src/aarch64/boot.S` already
-owns hi_L1[0] and hi_L1[1], so the first free slot is 1 GiB out, while
-`R_AARCH64_CALL26` reaches only ±128 MiB. Moving closer is not an
-option — the intervening GiB *is* the linear map.
+aarch64 goes **below** `KERNEL_VIRT_BASE`, and the reason is worth
+stating because the obvious placement is wrong.
+`PhysAddr::kernel_mut_ptr` is `phys | KERNEL_PHYS_OFFSET` for *every*
+physical address, so everything from `KERNEL_VIRT_BASE` upward is the
+linear map's image of RAM. The L1 slots `boot.S` leaves empty are not
+free address space — they are the images of physical memory the boot
+map has not needed to populate. Slot 2 is the image of physical
+2–3 GiB, so a window there aliases live frames on any machine with more
+than 2 GiB, which QEMU's 2048 MiB default already is. That mistake was
+made here and cost a hard fault; the smoke now asserts
+`MODULE_VA_BASE + MODULE_VA_USABLE <= KERNEL_VIRT_BASE` rather than
+anything about which slots boot.S writes.
+
+Below the base the linear map cannot reach, because it only ever adds.
+L0[510] is untouched by boot.S, by the BPF windows (L0[273], L0[275])
+and by vmalloc (L0[384]).
+
+Veneers are still required: the window is ~1.1 GiB from kernel text and
+`R_AARCH64_CALL26` reaches ±128 MiB. Nowhere is close enough — the GiB
+adjacent to the kernel image *is* the linear map.
 
 So `src/plt.rs` emits `adrp x16 / add x16 / br x16` trampolines into an
 arena at the end of the module's own text, within branch range of every

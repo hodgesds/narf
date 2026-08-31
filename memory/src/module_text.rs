@@ -48,16 +48,24 @@
 //! of the kernel root, exactly as `vmalloc` does.
 //!
 //! ```text
-//!   aarch64  L0[511] L1[0]  0xFFFF_FF80_0000_0000  low-PA device window
-//!            L0[511] L1[1]  0xFFFF_FF80_4000_0000  RAM linear map + kernel
-//!            L0[511] L1[2]  0xFFFF_FF80_8000_0000  module images  ← here
+//!   aarch64  L0[510] L1[511] 0xFFFF_FF7F_F800_0000  module images  ← here
+//!            L0[511] L1[0]   0xFFFF_FF80_0000_0000  linear map: phys 0-1 GiB
+//!            L0[511] L1[1]   0xFFFF_FF80_4000_0000  linear map: phys 1-2 GiB
+//!            L0[511] L1[2]   0xFFFF_FF80_8000_0000  linear map: phys 2-3 GiB
 //! ```
 //!
-//! aarch64 gets no equivalent free lunch. The first L1 slot not already spoken
-//! for by `frame/src/aarch64/boot.S` is 1 GiB from the kernel image, and
-//! `R_AARCH64_CALL26` reaches only ±128 MiB — so aarch64 modules need PLT
-//! veneers in the relocator no matter where in the free space they land.
-//! Moving them closer is not an option either: the intervening GiB *is* the
+//! aarch64 goes **below** `KERNEL_VIRT_BASE`, not above. Everything at or
+//! above it is the linear map: `PhysAddr::kernel_mut_ptr` is
+//! `phys | KERNEL_PHYS_OFFSET` for every physical address, so the L1 slots
+//! boot.S leaves empty are images of RAM it has not had to map, not free
+//! address space. A window in slot 2 aliases live frames on any machine with
+//! over 2 GiB. Below the base the linear map cannot reach, because it only
+//! ever adds.
+//!
+//! aarch64 gets no equivalent free lunch on *range*, though: the window is
+//! ~1.1 GiB from kernel text and `R_AARCH64_CALL26` reaches ±128 MiB, so
+//! aarch64 modules need PLT veneers in the relocator. Nowhere in the address
+//! space is close enough — the GiB adjacent to the kernel image *is* the
 //! linear map. Linux arm64 reaches the same conclusion from the same
 //! constraint (`CONFIG_ARM64_MODULE_PLTS`,
 //! `arch/arm64/kernel/module-plts.c`). This allocator is arch-neutral and does
@@ -102,14 +110,27 @@ use crate::{PhysAddr, PhysFrame, VirtAddr};
 /// Base kernel VA of the module image window.
 #[cfg(target_arch = "x86_64")]
 pub const MODULE_VA_BASE: u64 = 0xFFFF_FFFF_C000_0000;
-/// Base kernel VA of the module image window.
+/// Base kernel VA of the module image window: the top 128 MiB of the L0 slot
+/// **below** `KERNEL_VIRT_BASE`, ending exactly where it begins.
 ///
-/// TTBR1's L1 table (`l1_hi` in `frame/src/aarch64/boot.S`) already spends
-/// slot 0 on the low-PA device window (PL011, GIC) and slot 1 on the RAM
-/// linear map that `PhysAddr::kernel_ptr` resolves through — the kernel image
-/// itself lives in slot 1. Slot **2** is the first free one.
+/// Placing it *above* `KERNEL_VIRT_BASE` is what an empty L1 slot tempts you
+/// into, and it is wrong. `PhysAddr::kernel_mut_ptr` is
+/// `phys | KERNEL_PHYS_OFFSET` for **every** physical address, so the entire
+/// range from `KERNEL_VIRT_BASE` upward is the linear map's image of RAM. The
+/// L1 slots `frame/src/aarch64/boot.S` leaves empty are not free addresses —
+/// they are the images of physical memory the boot map has not needed to
+/// populate yet. Slot 2 is the image of physical 2–3 GiB, so on a machine
+/// with more than 2 GiB (QEMU is configured with 2048 MiB, RAM
+/// 0x4000_0000..0xC000_0000) a window there aliases live frames.
+///
+/// Below `KERNEL_VIRT_BASE` the linear map cannot reach by construction: it
+/// only ever adds. L0[510] is untouched by boot.S, by the BPF windows
+/// (L0[273], L0[275]) and by vmalloc (L0[384]).
+///
+/// Still within ADRP's ±4 GiB of kernel text — about 1.1 GiB — so the veneers
+/// in `narf_modules::plt` continue to resolve.
 #[cfg(target_arch = "aarch64")]
-pub const MODULE_VA_BASE: u64 = 0xFFFF_FF80_8000_0000;
+pub const MODULE_VA_BASE: u64 = 0xFFFF_FF7F_F800_0000;
 /// Base kernel VA of the module image window.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub const MODULE_VA_BASE: u64 = 0;
@@ -622,19 +643,32 @@ fn smoke_module_text_window_placement() -> TestResult {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        if (MODULE_VA_BASE >> 39) & 0x1FF != 511 {
-            return TestResult::Fail("module window is not under TTBR1 L0[511]");
+        const KERNEL_VIRT_BASE: u64 = 0xFFFF_FF80_0000_0000;
+        // THE invariant. `PhysAddr::kernel_mut_ptr` is
+        // `phys | KERNEL_PHYS_OFFSET` for every physical address, so
+        // everything from KERNEL_VIRT_BASE upward is the linear map's image
+        // of RAM — including the L1 slots boot.S has not populated, which are
+        // merely the images of memory it has not needed to map. A window
+        // there aliases live frames on any machine large enough to reach it.
+        //
+        // Checking "which L1 slots does boot.S write" instead of this is
+        // what put the window on top of the image of physical 2-3 GiB, where
+        // it corrupted the module image on a 2 GiB QEMU machine.
+        if MODULE_VA_BASE + MODULE_VA_USABLE > KERNEL_VIRT_BASE {
+            return TestResult::Fail("module window overlaps the RAM linear map");
+        }
+        if MODULE_VA_BASE >> 48 != 0xFFFF {
+            return TestResult::Fail("module window is not a TTBR1 address");
         }
         let l1 = (MODULE_VA_BASE >> 30) & 0x1FF;
-        // boot.S owns L1[0] (device window) and L1[1] (RAM linear map, which
-        // contains the kernel image). Landing on either would alias live
-        // kernel memory.
-        if l1 < 2 {
-            return TestResult::Fail("module window collides with a boot.S-owned L1 slot");
-        }
         let end_l1 = ((MODULE_VA_BASE + MODULE_VA_USABLE - 1) >> 30) & 0x1FF;
         if end_l1 != l1 {
             return TestResult::Fail("module window straddles an L1 slot boundary");
+        }
+        // ADRP reaches +/-4 GiB and the veneers rely on it.
+        let to_kernel = KERNEL_VIRT_BASE - MODULE_VA_BASE;
+        if to_kernel > (4u64 << 30) {
+            return TestResult::Fail("module window is beyond ADRP reach of kernel text");
         }
     }
     TestResult::Pass

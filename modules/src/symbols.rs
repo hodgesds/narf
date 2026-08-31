@@ -305,6 +305,11 @@ pub fn __reset_for_test() {
     // describing a table that no longer exists — a cross-test failure
     // arbitrarily far from whichever smoke called this.
     crate::kabi::register_all();
+    // Republish the hash too. Restoring the table but not the value derived
+    // from it is only half a reset, and leaves exactly the inconsistency this
+    // function exists to prevent. Smokes that deliberately want a different
+    // published hash call `set_kernel_abi` after this, and still win.
+    set_kernel_abi(compute_abi_hash());
 }
 
 /// Whether `name` is currently in KSYMTAB. Unlike [`resolve`] this needs no
