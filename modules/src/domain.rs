@@ -97,3 +97,76 @@ pub fn resolve(name: &str) -> Result<DomainId, DomainError> {
     }
     lookup_domain(name).ok_or_else(|| DomainError::Unknown(name.to_string()))
 }
+
+// ── Running module code inside its domain ──────────────────────────────
+
+/// A narrowed PKS rights state, to be handed back to [`exit`].
+///
+/// Opaque and arch-neutral: on x86_64 it carries the saved `IA32_PKRS`, and
+/// on every other target it carries nothing, because no backend there tags
+/// pages by domain yet.
+#[derive(Debug)]
+pub struct DomainScope {
+    #[cfg(target_arch = "x86_64")]
+    saved: narf_arch::x86_64::pks::SavedPkrs,
+}
+
+/// Enter `domain` — deny every PKS domain except the kernel's and this one.
+///
+/// Called around each entry into module code (`narf_module_init`,
+/// `narf_module_exit`). While the scope is open a module can reach its own
+/// image and the kernel, and faults on the other fourteen domains. That is
+/// the isolation DESIGN.md §2 describes: a buggy module cannot corrupt
+/// another driver's memory.
+///
+/// The kernel's domain deliberately stays reachable. A module that could not
+/// call an exported function or read a kernel global could not do anything,
+/// and closing that direction instead would mean an MSR write on every
+/// crossing — worth measuring before it is anyone's default.
+///
+/// A no-op when PKS is not the active enforcer (a pre-SPR Intel or AMD part
+/// running the PCID backend, or a kernel built for another architecture).
+/// Pages still carry their key; nothing consults it.
+pub fn enter(domain: DomainId) -> DomainScope {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if narf_arch::x86_64::pks::is_active() {
+            // SAFETY: `is_active` establishes CR4.PKS; both ids are 0..=15
+            // (`DomainId` is constructed from that range).
+            let saved = unsafe {
+                narf_arch::x86_64::pks::enter_domain(DomainId::FRAME.raw(), domain.raw())
+            };
+            return DomainScope { saved };
+        }
+        // Inactive: capture the current value so `exit` restores exactly
+        // what was there rather than assuming all-allow.
+        DomainScope {
+            saved: narf_arch::x86_64::pks::SavedPkrs(0),
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = domain;
+        DomainScope {}
+    }
+}
+
+/// Leave a scope opened by [`enter`], restoring the previous rights.
+///
+/// Must run even when the module's entry point returned an error: leaving
+/// PKRS narrowed would deny the rest of the kernel access to every domain
+/// but two, and the fault would land arbitrarily far from here.
+pub fn exit(scope: DomainScope) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if narf_arch::x86_64::pks::is_active() {
+            // SAFETY: CR4.PKS is on and `scope.saved` came from the matching
+            // `enter_domain`.
+            unsafe { narf_arch::x86_64::pks::exit_domain(scope.saved) };
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = scope;
+    }
+}
