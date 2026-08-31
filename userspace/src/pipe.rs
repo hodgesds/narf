@@ -29,7 +29,7 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -345,15 +345,14 @@ struct PipeShared {
     /// Set when the read half is dropped. The write half observes
     /// this and reports `BrokenPipe` to the syscall layer.
     reader_closed: AtomicBool,
-    readable_token: AtomicU64,
-    writable_token: AtomicU64,
-    /// Durable readiness cell shared by both halves — the migration target
-    /// that replaces the two edge tokens + the `notify(0)` herd with a fused
-    /// arm/set per-fd wake (see `narf_lib::readiness`). One cell carries the
-    /// union of both views: POLL_IN (queue non-empty), POLL_OUT (room), POLL_HUP
-    /// (writer gone), POLL_ERR (reader gone). The read fd arms POLL_IN|POLL_HUP,
-    /// the write fd arms POLL_OUT|POLL_ERR (the poll/epoll layer folds ERR|HUP
-    /// into every arm interest), and `set` wakes each waiter on its own bits.
+    /// Durable readiness cell shared by both halves — the SOLE readiness
+    /// mechanism (there is no edge token). One cell carries the union of both
+    /// views: POLL_IN (queue non-empty), POLL_OUT (room), POLL_HUP (writer gone),
+    /// POLL_ERR (reader gone). The read fd arms POLL_IN|POLL_HUP, the write fd
+    /// arms POLL_OUT|POLL_ERR (the poll/epoll layer folds ERR|HUP into every arm
+    /// interest); `set` wakes each waiter on its own rising bits, and `notify`
+    /// (see [`PipeShared::sync_readiness`]) fires the wait-queue for the changed
+    /// direction so an EPOLLET consumer re-fires even at the same level.
     readiness: narf_lib::readiness::Readiness,
 }
 
@@ -364,10 +363,12 @@ impl PipeShared {
     /// POLL_ERR (reader gone) — exactly the union of `PipeRead::poll_readiness`
     /// and `PipeWrite::poll_readiness`. `set` bumps its edge sequence and wakes
     /// armed waiters only on a rising edge, all under one lock (drop-free), so a
-    /// concurrent `arm` can never miss this transition. Called after every
-    /// write/read/close that changes state; the legacy edge tokens + `notify`
-    /// stay belt-and-suspenders during the migration.
-    fn sync_readiness(&self) {
+    /// concurrent `arm` can never miss this transition. `notify(event & add)`
+    /// then fires the wait-queue for the just-changed direction UNCONDITIONALLY
+    /// so an EPOLLET consumer re-fires even at the same level. `event` is the
+    /// direction the caller changed: POLL_IN on a write, POLL_OUT on a read.
+    /// Called after every write/read/close that changes state.
+    fn sync_readiness(&self, event: u32) {
         let (len, full) = {
             let q = self.queue.lock();
             (q.len(), q.is_full())
@@ -400,6 +401,11 @@ impl PipeShared {
             clear |= narf_filesystem::POLL_ERR;
         }
         self.readiness.set(add, clear);
+        // Fire the wait-queue for the caller's direction (plus any peer-close bit
+        // that just latched, so a close reliably wakes the peer), masked to what
+        // is actually ready.
+        self.readiness
+            .notify((event | narf_filesystem::POLL_HUP | narf_filesystem::POLL_ERR) & add);
     }
 }
 
@@ -455,8 +461,6 @@ pub fn pipe_pair_flags(packetized: bool) -> (Arc<PipeRead>, Arc<PipeWrite>) {
         queue: IrqSafeSpinLock::new(PipeBufs::new()),
         writer_closed: AtomicBool::new(false),
         reader_closed: AtomicBool::new(false),
-        readable_token: AtomicU64::new(0),
-        writable_token: AtomicU64::new(0),
         // Fresh pipe: empty (not readable), has room (writable), both ends open.
         readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
     });
@@ -504,7 +508,6 @@ impl PipeRead {
                 Err(narf_filesystem::FsError::WouldBlock)
             };
         }
-        let was_full = q.is_full();
         // `splice_from_pipe` hands the actor ONE buffer at a time, so the
         // offered span stops at a packet boundary of its own accord.
         let (n, _) = q.read_span(core::cmp::min(max, avail));
@@ -517,14 +520,10 @@ impl PipeRead {
         // (`buf->offset += ret; buf->len -= ret;`) and leaves the remainder
         // queued. Only `pipe_read` retires a partially-copied packet.
         q.commit(written);
-        let became_writable = was_full && written != 0;
         drop(q);
 
-        if became_writable {
-            self.shared.writable_token.fetch_add(1, Ordering::Release);
-        }
         if written != 0 {
-            self.shared.sync_readiness();
+            self.shared.sync_readiness(narf_filesystem::POLL_OUT);
             narf_net::readiness::notify(0);
         }
         Ok(written)
@@ -548,7 +547,7 @@ impl PipeRead {
 
         let src_addr = Arc::as_ptr(&self.shared) as usize;
         let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (moved, src_was_full, dst_was_empty) = if src_addr < dst_addr {
+        let (moved, _, _) = if src_addr < dst_addr {
             let mut src = self.shared.queue.lock();
             let mut dstq = dst.shared.queue.lock();
             move_pipe_prefix(
@@ -568,15 +567,9 @@ impl PipeRead {
             )?
         };
 
-        if src_was_full && moved != 0 {
-            self.shared.writable_token.fetch_add(1, Ordering::Release);
-        }
-        if dst_was_empty && moved != 0 {
-            dst.shared.readable_token.fetch_add(1, Ordering::Release);
-        }
         if moved != 0 {
-            self.shared.sync_readiness();
-            dst.shared.sync_readiness();
+            self.shared.sync_readiness(narf_filesystem::POLL_OUT);
+            dst.shared.sync_readiness(narf_filesystem::POLL_IN);
             narf_net::readiness::notify(0);
         }
         Ok(moved)
@@ -604,7 +597,7 @@ impl PipeRead {
         let writer_closed = self.shared.writer_closed.load(Ordering::Acquire);
         let src_addr = Arc::as_ptr(&self.shared) as usize;
         let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (copied, dst_was_empty) = if src_addr < dst_addr {
+        let (copied, _) = if src_addr < dst_addr {
             let src = self.shared.queue.lock();
             let mut dstq = dst.shared.queue.lock();
             copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
@@ -614,14 +607,11 @@ impl PipeRead {
             copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
         };
 
-        if dst_was_empty && copied != 0 {
-            dst.shared.readable_token.fetch_add(1, Ordering::Release);
-        }
         if copied != 0 {
             // Only the destination changed: tee leaves the source queue intact,
             // so the source's readiness is unchanged and must not be
             // republished as an edge.
-            dst.shared.sync_readiness();
+            dst.shared.sync_readiness(narf_filesystem::POLL_IN);
             narf_net::readiness::notify(0);
         }
         Ok(copied)
@@ -683,19 +673,14 @@ impl PipeRead {
                 Err(VmspliceDrainError::WouldBlock)
             };
         }
-        let was_full = q.is_full();
         let (n, packet_consumed) = q.read_span(max);
         staging.extend(q.bytes.iter().copied().take(n));
 
         copy(&staging).map_err(VmspliceDrainError::User)?;
         q.commit(if discard_packets { packet_consumed } else { n });
-        let became_writable = was_full;
         drop(q);
 
-        if became_writable {
-            self.shared.writable_token.fetch_add(1, Ordering::Release);
-        }
-        self.shared.sync_readiness();
+        self.shared.sync_readiness(narf_filesystem::POLL_OUT);
         narf_net::readiness::notify(0);
         Ok(n)
     }
@@ -757,11 +742,10 @@ impl Drop for PipeRead {
         // there are no readers left and the writer should observe
         // EOF on its side.
         self.shared.reader_closed.store(true, Ordering::Release);
-        self.shared.writable_token.fetch_add(1, Ordering::Release);
         // Latch POLL_ERR into the durable cell (store THEN sync so it observes
         // reader_closed=true) — wakes a writer parked on POLL_OUT|POLL_ERR, even
         // one blocked on a full pipe where no POLL_OUT edge ever comes.
-        self.shared.sync_readiness();
+        self.shared.sync_readiness(narf_filesystem::POLL_OUT);
         narf_net::readiness::notify(0);
     }
 }
@@ -771,11 +755,10 @@ impl Drop for PipeWrite {
         // Same Arc-counted reasoning as PipeRead::drop — only flips
         // when every writer fd has been closed.
         self.shared.writer_closed.store(true, Ordering::Release);
-        self.shared.readable_token.fetch_add(1, Ordering::Release);
         // Latch POLL_HUP into the durable cell (store THEN sync so it observes
         // writer_closed=true) — wakes a reader parked on POLL_IN|POLL_HUP so it
         // runs read()→0=EOF instead of hanging on the lost-wake backstop.
-        self.shared.sync_readiness();
+        self.shared.sync_readiness(narf_filesystem::POLL_IN);
         narf_net::readiness::notify(0);
     }
 }
@@ -802,7 +785,6 @@ impl FileOps for PipeRead {
                     Err(narf_filesystem::FsError::WouldBlock)
                 };
             }
-            let was_full = q.is_full();
             let (n, consumed) = q.read_span(buf.len());
             // Bulk drain: `VecDeque::drain` copies the front bytes in as few
             // `memcpy`s as the ring's two contiguous slices allow, instead of
@@ -814,11 +796,7 @@ impl FileOps for PipeRead {
                 *slot = byte;
             }
             q.retire_frames(consumed);
-            let became_writable = was_full && consumed != 0;
             drop(q);
-            if became_writable {
-                self.shared.writable_token.fetch_add(1, Ordering::Release);
-            }
             if n != 0 {
                 // Draining can clear POLL_IN (queue now empty) and set POLL_OUT
                 // (room freed); republish so a writer parked on this pipe's
@@ -826,7 +804,7 @@ impl FileOps for PipeRead {
                 // a writer parked via `park_reexecute_on_io` (armed on that
                 // generation, not the cell) re-runs instead of sleeping out its
                 // deadline.
-                self.shared.sync_readiness();
+                self.shared.sync_readiness(narf_filesystem::POLL_OUT);
                 narf_net::readiness::notify(0);
             }
             Ok(n)
@@ -898,10 +876,6 @@ impl FileOps for PipeRead {
         true
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (self.shared.readable_token.load(Ordering::Acquire), 0)
-    }
-
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         // The shared cell reaches both halves; a read fd's poller arms it with
         // POLL_IN|POLL_HUP (the poll/epoll layer folds HUP in), and a peer write
@@ -961,7 +935,6 @@ impl FileOps for PipeWrite {
                 return Err(narf_filesystem::FsError::BrokenPipe);
             }
             let mut q = self.shared.queue.lock();
-            let was_empty = q.is_empty();
             // `is_packetized(filp)` is re-read per write, so a mid-stream
             // F_SETFL takes effect from the next write onward.
             let packet = self.packetized.load(Ordering::Acquire);
@@ -983,12 +956,9 @@ impl FileOps for PipeWrite {
             q.push(&buf[..n], packet);
             drop(q);
             if n != 0 {
-                if was_empty {
-                    self.shared.readable_token.fetch_add(1, Ordering::Release);
-                }
                 // Data added sets POLL_IN (and clears POLL_OUT if now full);
                 // republish so a reader parked on this pipe wakes.
-                self.shared.sync_readiness();
+                self.shared.sync_readiness(narf_filesystem::POLL_IN);
                 narf_net::readiness::notify(0);
             }
             Ok(n)
@@ -1042,10 +1012,6 @@ impl FileOps for PipeWrite {
 
     fn readiness_notifies(&self) -> bool {
         true
-    }
-
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (0, self.shared.writable_token.load(Ordering::Acquire))
     }
 
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {

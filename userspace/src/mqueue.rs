@@ -572,28 +572,21 @@ struct InotifyState {
     events: VecDeque<Vec<u8>>,
     /// Monotonic cookie source for pairing IN_MOVED_FROM/IN_MOVED_TO.
     next_cookie: u32,
-    /// Empty-to-nonempty generation used by edge-triggered epoll.
-    readable_token: u64,
-    /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the
-    /// migration target that fuses the arm/notify wake so a poll/epoll parked on
-    /// this inotify fd is woken by a TARGETED `set` edge instead of the coarse
-    /// ~10 ms backstop. An inotify fd is read-only and never EOFs, so the cell
-    /// only ever carries POLL_IN: set when an event is queued (the produce
-    /// sites, `inotify_dispatch`/`notify_moved`) and cleared by the read that
-    /// drains the queue (the consume site). It lives behind the global
-    /// `INOTIFY` lock, so — like the lock-guarded ring cells in `socket.rs` —
-    /// `InotifyFile` reaches it by cloning this `Arc` out UNDER that lock and
-    /// arming/`set`ting OFF it (the cell has its own lock; never nest it under
-    /// `INOTIFY`). Additive to the kept `readable_token` +
-    /// `narf_net::readiness::notify(0)` fallback during the migration.
+    /// Durable per-fd readiness cell (see `narf_lib::readiness`) — the SOLE
+    /// readiness mechanism (there is no edge token). An inotify fd is read-only
+    /// and never EOFs, so the cell only ever carries POLL_IN: `set`+`notify` when
+    /// an event is queued (the produce sites, `inotify_dispatch`/`notify_moved`)
+    /// — `notify` fires the wait-queue on EVERY event so an EPOLLET consumer
+    /// re-fires even at the same readable level — and cleared by the read that
+    /// drains the queue (the consume site). It lives behind the global `INOTIFY`
+    /// lock, so — like the lock-guarded ring cells in `socket.rs` — `InotifyFile`
+    /// reaches it by cloning this `Arc` out UNDER that lock and arming/`set`ting
+    /// OFF it (the cell has its own lock; never nest it under `INOTIFY`).
     readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
 impl InotifyState {
     fn enqueue(&mut self, event: Vec<u8>) {
-        if self.events.is_empty() {
-            self.readable_token = self.readable_token.wrapping_add(1);
-        }
         self.events.push_back(event);
     }
 }
@@ -796,6 +789,9 @@ fn inotify_dispatch(abs_path: &str, mask: u32, is_dir: bool) {
     // notify(0) fired by fs_notify after this returns.
     for cell in woken {
         cell.set(narf_filesystem::POLL_IN, 0);
+        // Linux wait-queue: fire on every queued event so an EPOLLET consumer
+        // re-fires even when the fd stays readable at the same level.
+        cell.notify(narf_filesystem::POLL_IN);
     }
 }
 
@@ -916,6 +912,9 @@ pub(crate) fn notify_moved(from: &str, to: &str) {
     // notify(0) fired below.
     for cell in woken {
         cell.set(narf_filesystem::POLL_IN, 0);
+        // Linux wait-queue: fire on every queued event so an EPOLLET consumer
+        // re-fires even when the fd stays readable at the same level.
+        cell.notify(narf_filesystem::POLL_IN);
     }
     // fanotify sees the same move as two events on the affected objects.
     fanotify_dispatch(from, IN_MOVED_FROM as u64);
@@ -945,13 +944,6 @@ impl FileOps for InotifyFile {
         } else {
             0
         }
-    }
-
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (
-            with_inotify(|m| m.get(&self.id).map(|s| s.readable_token).unwrap_or(0)),
-            0,
-        )
     }
 
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -1087,7 +1079,6 @@ fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
                 watches: BTreeMap::new(),
                 events: VecDeque::new(),
                 next_cookie: 0,
-                readable_token: 0,
                 // Fresh instance: no events queued, never writable → mask 0.
                 readiness: Arc::new(narf_lib::readiness::Readiness::new(0)),
             },
@@ -1251,6 +1242,9 @@ fn fanotify_dispatch(abs_path: &str, mask: u64) {
     // notify_moved caller after this returns.
     for cell in woken {
         cell.set(narf_filesystem::POLL_IN, 0);
+        // Linux wait-queue: fire on every queued event so an EPOLLET consumer
+        // re-fires even when the fd stays readable at the same level.
+        cell.notify(narf_filesystem::POLL_IN);
     }
 }
 

@@ -838,10 +838,6 @@ impl narf_filesystem::FileOps for CurrentTtyFile {
         self.inner.poll_readiness_at(offset)
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        self.inner.poll_edge_token()
-    }
-
     fn acknowledge_poll_readiness(&self, readiness: u32) {
         self.inner.acknowledge_poll_readiness(readiness);
     }
@@ -4988,6 +4984,10 @@ fn signal_raise_notify(task: u64, was_empty: bool) {
     signal_bits_update_or_init(&SIGNAL_RAISE_GEN, task, |generation| {
         *generation = generation.wrapping_add(1);
     });
+    // Fire any signalfd's readiness wait-queue (Linux wakes the signalfd wait
+    // queue on delivery) so an EPOLLET consumer re-fires on a drain→re-raise
+    // refill; the fd's poll_readiness still gates delivery on its mask.
+    crate::io_mux::wake_signalfds(task);
     wake_signal(task);
 }
 

@@ -119,14 +119,6 @@ impl FileOps for PidExtFile {
         ready
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        if matches!(self.field, PidExtField::Mountinfo) {
-            (hook_ns_mountinfo_generation(self.pid), 0)
-        } else {
-            (0, 0)
-        }
-    }
-
     fn acknowledge_poll_readiness(&self, readiness: u32) {
         if matches!(self.field, PidExtField::Mountinfo)
             && readiness & (crate::POLL_PRI | crate::POLL_ERR) != 0

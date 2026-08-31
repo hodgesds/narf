@@ -6,8 +6,8 @@
 //! arrives here) → register waker → sleep forever*. NARF historically closed
 //! it only by convention (a global generation counter re-checked after
 //! registering) backed by a ~10 ms fallback tick, and it split a file's
-//! readiness across three separate, drift-prone `FileOps` methods
-//! (`poll_readiness` level, `poll_edge_token` edge, `readiness_notifies` a
+//! readiness across separate, drift-prone `FileOps` methods (`poll_readiness`
+//! level plus a per-provider edge token, and `readiness_notifies` a
 //! hand-maintained "do I even wake anyone" boolean). Any one of them getting
 //! out of sync is a lost wake or a busy-spin.
 //!

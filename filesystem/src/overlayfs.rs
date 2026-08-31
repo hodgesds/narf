@@ -1054,10 +1054,6 @@ impl FileOps for OverlayFile {
         self.active().poll_readiness_at(offset)
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        self.active().poll_edge_token()
-    }
-
     fn acknowledge_poll_readiness(&self, readiness: u32) {
         self.active().acknowledge_poll_readiness(readiness);
     }

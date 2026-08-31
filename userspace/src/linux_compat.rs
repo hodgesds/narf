@@ -45,13 +45,21 @@ pub const SIGNALFD_SIGINFO_LEN: usize = 128;
 pub struct SignalFdFile {
     mask: AtomicU64,
     owner_task: u64,
+    /// Durable readiness cell (Linux signalfd wait queue). Fired by
+    /// [`crate::io_mux::wake_signalfds`] on every signal raised for `owner_task`,
+    /// so an EPOLLET consumer re-fires on a drain→re-raise refill where the
+    /// readiness mask stays POLL_IN.
+    readiness: Arc<narf_lib::readiness::Readiness>,
 }
 
 impl SignalFdFile {
     pub fn new(mask: u64, owner: u64) -> Arc<Self> {
+        let readiness = Arc::new(narf_lib::readiness::Readiness::new(0));
+        crate::io_mux::register_signalfd_cell(owner, &readiness);
         Arc::new(Self {
             mask: AtomicU64::new(mask),
             owner_task: owner,
+            readiness,
         })
     }
 
@@ -150,11 +158,39 @@ impl FileOps for SignalFdFile {
         }
     }
 
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (
-            crate::handlers::signal_readable_generation(self.owner_task),
-            0,
-        )
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.readiness)
+    }
+
+    /// Reconcile the cell to the live pending level before arming so a stale
+    /// latched POLL_IN (a signal drained since the last wake) can't spuriously
+    /// return Ready; `wake_signalfds` re-latches + notifies on the next raise.
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        let readable = self.pending() != 0;
+        self.readiness.set(
+            if readable { POLL_IN } else { 0 },
+            if readable { 0 } else { POLL_IN },
+        );
+        Some(self.readiness.arm(task_id, interest, waker))
+    }
+
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        let readable = self.pending() != 0;
+        self.readiness.set(
+            if readable { POLL_IN } else { 0 },
+            if readable { 0 } else { POLL_IN },
+        );
+        Some(self.readiness.arm_persistent(id, interest, waker))
     }
 }
 

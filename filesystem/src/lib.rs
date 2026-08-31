@@ -962,9 +962,10 @@ pub trait FileOps: Send + Sync {
     /// ([`narf_lib::readiness::Readiness`]): a parked waiter registers in the
     /// cell and is woken the instant `set` records a matching readiness edge —
     /// a durable, per-fd, IRQ-safe wake with no reliance on a fallback re-scan,
-    /// and it subsumes `poll_readiness` (the cell's level `mask`),
-    /// `poll_edge_token` (its `seq`), and `readiness_notifies` (waking is
-    /// intrinsic to every `set`). `None` (the default) keeps the legacy
+    /// and it subsumes `poll_readiness` (the cell's level `mask`), the epoll
+    /// edge (ready-list membership fed by `set`/`notify`), and
+    /// `readiness_notifies` (waking is intrinsic to every `set`). `None` (the
+    /// default) keeps the legacy
     /// level-scan + generation-guard path, so descriptors migrate one at a
     /// time. Sockets, pipes, eventfds, mqueues, ttys — anything whose readiness
     /// transitions asynchronously — override this as they migrate; always-ready
@@ -1021,28 +1022,6 @@ pub trait FileOps: Send + Sync {
         } else {
             false
         }
-    }
-
-    /// Monotonic source-local tokens for edge-triggered readiness.
-    ///
-    /// A readiness provider that can transition away from and back to the
-    /// same readiness mask between two polls should advance one of these
-    /// tokens on every state-changing I/O operation. Epoll uses the tokens
-    /// to distinguish a new edge from a continuously-ready file. The default
-    /// is stable for providers whose readiness is adequately represented by
-    /// the current mask alone.
-    fn poll_edge_token(&self) -> (u64, u64) {
-        (0, 0)
-    }
-
-    /// Fused readiness level + edge token under a SINGLE provider-lock
-    /// acquisition, for the epoll confirm step of an edge-triggered fd (which
-    /// needs both). The default composes the two separate methods; providers
-    /// whose `poll_readiness_at` and `poll_edge_token` share one internal lock
-    /// (sockets) override this to acquire it once, halving the per-fd lock
-    /// traffic on the collect_ready hot path. Returns `(mask, (read_tok, write_tok))`.
-    fn poll_readiness_and_token_at(&self, offset: u64) -> (u32, (u64, u64)) {
-        (self.poll_readiness_at(offset), self.poll_edge_token())
     }
 
     /// Acknowledge readiness after an event multiplexer has actually delivered

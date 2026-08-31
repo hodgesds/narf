@@ -97,12 +97,8 @@ struct EpollItem {
     events: u32,
     /// Opaque user data echoed back in every event notification.
     data: u64,
-    /// Last readiness mask observed — for EPOLLET edge detection.
+    /// Last readiness mask observed — for EPOLLET rising-mask edge detection.
     last_mask: u32,
-    /// Source-local state token observed with `last_mask`. This closes the
-    /// drain→new-data→epoll_wait race where the readiness mask is `POLL_IN`
-    /// both before and after a real edge.
-    last_token: (u64, u64),
     /// True once this fd was armed on a durable Readiness cell (its
     /// `arm_readiness_persistent` returned `Some`). Cell-backed fds report
     /// readiness by pushing themselves onto the ready-list via their PERSISTENT
@@ -127,7 +123,6 @@ impl core::fmt::Debug for EpollItem {
             .field("events", &self.events)
             .field("data", &self.data)
             .field("last_mask", &self.last_mask)
-            .field("last_token", &self.last_token)
             .finish()
     }
 }
@@ -139,7 +134,8 @@ impl core::fmt::Debug for EpollItem {
 static EPOLL_SUB_SEQ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn next_sub_id() -> u64 {
-    (EPOLL_SUB_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & (u64::MAX >> 1)) | (1u64 << 63)
+    (EPOLL_SUB_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) & (u64::MAX >> 1))
+        | (1u64 << 63)
 }
 
 // ── EpollInstance — the core object ──────────────────────────────────
@@ -196,14 +192,6 @@ fn poll_item_readiness(item: &EpollItem) -> u32 {
         .unwrap_or(0)
 }
 
-/// Provider tokens are directional: tuple element 0 represents readable
-/// transitions and element 1 writable transitions. A hidden read edge must
-/// not manufacture an EPOLLOUT delivery merely because OUT remains level-ready.
-fn token_changed_for_ready(ready: u32, current: (u64, u64), prior: (u64, u64)) -> bool {
-    (ready & EPOLLIN != 0 && current.0 != prior.0)
-        || (ready & EPOLLOUT != 0 && current.1 != prior.1)
-}
-
 // ── Per-fd wake (Linux eppoll_entry / ep_poll_callback) ─────────────
 //
 // Each interest fd is armed on its durable Readiness cell with its OWN waker.
@@ -230,18 +218,28 @@ static EPOLL_FD_VTABLE: core::task::RawWakerVTable =
     core::task::RawWakerVTable::new(efw_clone, efw_wake, efw_wake_by_ref, efw_drop);
 
 unsafe fn efw_clone(p: *const ()) -> core::task::RawWaker {
+    // SAFETY: `p` is an `Arc<EpollFdWake>` raw pointer minted by `epoll_fd_waker`
+    // (via `Arc::into_raw`) or a prior `efw_clone`; incrementing its strong count
+    // balances the `RawWaker` copy returned here.
     unsafe { Arc::increment_strong_count(p as *const EpollFdWake) };
     core::task::RawWaker::new(p, &EPOLL_FD_VTABLE)
 }
 unsafe fn efw_wake(p: *const ()) {
+    // SAFETY: `p` is an `Arc<EpollFdWake>` raw pointer that this call consumes;
+    // reconstituting the `Arc` takes ownership of that one strong count and drops
+    // it when `arc` falls out of scope.
     let arc = unsafe { Arc::from_raw(p as *const EpollFdWake) };
     efw_fire(&arc);
 }
 unsafe fn efw_wake_by_ref(p: *const ()) {
+    // SAFETY: `p` is a live `Arc<EpollFdWake>` raw pointer; `ManuallyDrop` borrows
+    // it WITHOUT consuming the strong count (wake_by_ref must not drop the waker).
     let arc = core::mem::ManuallyDrop::new(unsafe { Arc::from_raw(p as *const EpollFdWake) });
     efw_fire(&arc);
 }
 unsafe fn efw_drop(p: *const ()) {
+    // SAFETY: `p` is an `Arc<EpollFdWake>` raw pointer that this call consumes;
+    // reconstituting and dropping the `Arc` releases its one strong count.
     drop(unsafe { Arc::from_raw(p as *const EpollFdWake) });
 }
 
@@ -317,7 +315,6 @@ impl EpollInstance {
                     events,
                     data,
                     last_mask: 0,
-                    last_token: (0, 0),
                     cell_backed: false,
                     sub_id: next_sub_id(),
                 },
@@ -378,7 +375,11 @@ impl EpollInstance {
                 .get(&fd)
                 .and_then(|item| item.file.upgrade())
                 .is_some_and(|watched| Arc::ptr_eq(&watched, file));
-            let removed = if matches { g.interest.remove(&fd) } else { None };
+            let removed = if matches {
+                g.interest.remove(&fd)
+            } else {
+                None
+            };
             if let Some(item) = &removed {
                 g.ready.remove(&fd);
                 exclusive_release(fd, owner_id);
@@ -421,7 +422,6 @@ impl EpollInstance {
             // rising-mask edge state, exactly as `ctl_add` initializes it, so the
             // next scan treats current readiness as a rising edge.
             item.last_mask = 0;
-            item.last_token = (0, 0);
         }
         // Re-arm the persistent waker with the new interest (replaces by sub_id)
         // and re-seed the ready-list, so a still-ready fd fires a fresh edge —
@@ -440,26 +440,25 @@ impl EpollInstance {
     #[cfg(feature = "unix-latency-trace")]
     #[allow(clippy::type_complexity)]
     fn dbg_interest_edge_state(&self) -> Vec<(i32, u32, u32, u32, u64, u64, bool)> {
-        let snapshot: Vec<(i32, EpollItem)> = {
+        let (snapshot, ready_set): (Vec<(i32, EpollItem)>, alloc::collections::BTreeSet<i32>) = {
             let g = self.inner.lock();
-            g.interest.iter().map(|(k, v)| (*k, v.clone())).collect()
+            (
+                g.interest.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                g.ready.clone(),
+            )
         };
         snapshot
             .into_iter()
             .map(|(fd, item)| {
-                let cur_token = item
-                    .file
-                    .upgrade()
-                    .map(|o| o.poll_edge_token())
-                    .unwrap_or((0, 0));
                 let cur_mask = poll_item_readiness(&item);
                 let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
                 let ready = cur_mask & (want | EPOLLERR | EPOLLHUP);
+                let in_ready = item.cell_backed && ready_set.contains(&fd);
                 let would_deliver = if ready == 0 {
                     false
                 } else if (item.events & EPOLLET) != 0 {
                     let new_bits = ready & !item.last_mask;
-                    new_bits != 0 || token_changed_for_ready(ready, cur_token, item.last_token)
+                    new_bits != 0 || in_ready
                 } else {
                     true
                 };
@@ -468,8 +467,8 @@ impl EpollInstance {
                     item.events,
                     cur_mask,
                     item.last_mask,
-                    cur_token.0,
-                    item.last_token.0,
+                    in_ready as u64,
+                    0,
                     would_deliver,
                 )
             })
@@ -529,7 +528,12 @@ impl EpollInstance {
         // arm) plus non-cell-backed fds (timerfd / nested / raw / legacy, which
         // have no edge). Full pass (fallback, or before any fd is cell-backed)
         // scans the whole interest set and reseeds the ready-list.
-        let snapshot: Vec<(i32, EpollItem)> = {
+        // `ready_set` is the ready-list (Linux rdllist) membership at snapshot
+        // time: a cell-backed fd is listed iff its persistent per-fd waker fired
+        // (a `set`/`notify` event) since the last drain. It IS the EPOLLET edge
+        // the per-source token used to carry — an fd that is level-ready but not
+        // listed has had no fresh event, so EPOLLET must not re-report it.
+        let (snapshot, ready_set): (Vec<(i32, EpollItem)>, alloc::collections::BTreeSet<i32>) = {
             let g = self.inner.lock();
             let any_cell = g.interest.values().any(|it| it.cell_backed);
             let mut entries: Vec<_> = if full || !any_cell {
@@ -549,7 +553,7 @@ impl EpollInstance {
                     entries.rotate_left(start);
                 }
             }
-            entries
+            (entries, g.ready.clone())
         };
 
         let mut results = Vec::new();
@@ -591,26 +595,17 @@ impl EpollInstance {
                     // Backing open file dropped → not ready; record a zero
                     // observation so the write-back clears any stale readiness,
                     // exactly as the previous per-call upgrades did.
-                    observed.push((*fd, 0, (0, 0)));
+                    observed.push((*fd, 0));
                     continue;
                 }
             };
-            // `poll_edge_token` is a second socket-lock acquisition per fd, and
-            // its value is consumed ONLY by the EPOLLET rising-edge check below
-            // (and its write-back). A level-triggered item — the common case:
-            // redis, systemd, dbus all use level-triggered epoll — never reads
-            // it, so skip that lock entirely for those, halving the per-fd lock
-            // traffic on the O(N) collect_ready hot path.
-            // EPOLLET needs both the mask AND the edge token; fetch them under a
-            // SINGLE provider-lock acquisition (step 3) via the fused method
-            // instead of two separate locks. Level-triggered never reads the
-            // token, so it takes only the one readiness lock.
-            let (cur_mask, cur_token): (u32, (u64, u64)) = if (item.events & EPOLLET) != 0 {
-                file.poll_readiness_and_token_at(item.offset)
-            } else {
-                (file.poll_readiness_at(item.offset), (0, 0))
-            };
-            observed.push((*fd, cur_mask, cur_token));
+            // One provider-lock acquisition per fd for the mask. The EPOLLET edge
+            // no longer needs a second (token) lock: the wait-queue edge is the
+            // fd's membership in `ready_set`, captured lock-free from the snapshot
+            // above (Linux ep_send_events drains the rdllist; ep_item_poll only
+            // re-confirms the mask).
+            let cur_mask = file.poll_readiness_at(item.offset);
+            observed.push((*fd, cur_mask));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             // Linux always reports ERR/HUP even when the caller omitted them
@@ -623,10 +618,19 @@ impl EpollInstance {
                 continue;
             }
 
-            // EPOLLET: only report on rising edge.
+            // EPOLLET: report only on a fresh edge. Two edge sources, matching
+            // Linux: (1) a rising mask bit (`ready & !last_mask`) covers a level
+            // transition and every non-cell-backed source (timerfd / nested epoll
+            // / legacy netlink, always full-scanned); (2) ready-list membership
+            // covers a same-level event on a cell-backed source (a second
+            // datagram / accept / RX byte while the mask stays POLL_IN — the
+            // persistent wait-queue waker listed it). Level-ready but neither
+            // newly-risen nor listed = no event since last drain, so not
+            // re-reported.
             if (item.events & EPOLLET) != 0 {
                 let new_bits = ready & !item.last_mask;
-                if new_bits == 0 && !token_changed_for_ready(ready, cur_token, item.last_token) {
+                let listed = item.cell_backed && ready_set.contains(fd);
+                if new_bits == 0 && !listed {
                     continue;
                 }
             }
@@ -651,7 +655,7 @@ impl EpollInstance {
         // while holding this instance's non-reentrant spin lock.
         {
             let mut g = self.inner.lock();
-            for (fd, cur_mask, cur_token) in observed {
+            for (fd, cur_mask) in observed {
                 // Ready-list bookkeeping (Linux rdllist): a level-triggered fd
                 // that was delivered stays a candidate so the next wait
                 // re-reports it until the app drains (its next poll then shows
@@ -661,11 +665,10 @@ impl EpollInstance {
                 let mut keep_ready = false;
                 if let Some(item) = g.interest.get_mut(&fd) {
                     if delivered_fds.contains(&fd) {
-                        // Delivered to the caller — the EPOLLET edge is now
-                        // consumed, so advance the recorded mask/token to the
-                        // values that were reported.
+                        // Delivered to the caller — the EPOLLET edge (ready-list
+                        // listing) is now consumed, so advance the recorded mask
+                        // and drop the listing for ET/oneshot.
                         item.last_mask = cur_mask;
-                        item.last_token = cur_token;
                         keep_ready =
                             item.cell_backed && (item.events & (EPOLLET | EPOLLONESHOT)) == 0;
                         if (item.events & EPOLLONESHOT) != 0 {
@@ -674,20 +677,19 @@ impl EpollInstance {
                         }
                     } else {
                         // Observed but NOT delivered (an EPOLLET item with no
-                        // new edge, a not-ready fd, an EPOLLEXCLUSIVE claim lost
-                        // to another epoll, or a fd drained by a concurrent
-                        // reader between the token snapshot and the readiness
-                        // poll). Re-arm by clearing readiness bits that have
-                        // dropped so a later rising edge still fires, but do NOT
-                        // consume the edge: advancing `last_token` here to a
-                        // stale/racing snapshot swallowed an AF_UNIX listener's
-                        // accept-ready edge — the connection stayed queued and
-                        // EPOLLET never re-reported it, permanently stranding a
-                        // socket-activation acceptor (dbus-broker / journald)
-                        // whose accept thread races its epoll thread. `last_token`
-                        // is left untouched so the still-pending edge is
-                        // delivered on the next scan.
+                        // fresh edge, a not-ready fd, or an EPOLLEXCLUSIVE claim
+                        // lost to another epoll). Re-arm by clearing readiness
+                        // bits that have dropped so a later rising edge still
+                        // fires. A cell-backed EPOLLET fd that WAS listed (had a
+                        // wait-queue edge) but lost an exclusive claim keeps its
+                        // listing so the still-pending edge is delivered on the
+                        // next scan — this preserves the AF_UNIX socket-activation
+                        // acceptor (dbus-broker / journald) whose accept thread
+                        // races its epoll thread; the token used to hold that edge.
                         item.last_mask &= cur_mask;
+                        keep_ready = item.cell_backed
+                            && (item.events & EPOLLET) != 0
+                            && ready_set.contains(&fd);
                     }
                 }
                 if keep_ready {
@@ -758,37 +760,32 @@ impl FileOps for EpollInstance {
         // `EpollInstance::poll_readiness`), so holding any lock across
         // it risks the same re-entrant deadlock the outer epoll path
         // hit. See `poll_fd_readiness`.
-        let snapshot: Vec<EpollItem> = {
+        let (snapshot, ready_set): (Vec<EpollItem>, alloc::collections::BTreeSet<i32>) = {
             let g = self.inner.lock();
-            g.interest.values().cloned().collect()
+            (g.interest.values().cloned().collect(), g.ready.clone())
         };
         for item in snapshot {
             let events = item.events;
             let last_mask = item.last_mask;
-            let last_token = item.last_token;
             // Disarmed EPOLLONESHOT items deliver nothing.
             if (events & EPOLLONESHOT) != 0
                 && (events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
             {
                 continue;
             }
-            let cur_token = item
-                .file
-                .upgrade()
-                .map(|o| o.poll_edge_token())
-                .unwrap_or((0, 0));
             let cur = poll_item_readiness(&item);
             let want = events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             let ready = cur & (want | EPOLLERR | EPOLLHUP);
             if ready == 0 {
                 continue;
             }
-            // EPOLLET: readable only on a rising edge, same as
-            // `collect_ready`. (The EPOLLEXCLUSIVE claim is deliberately
-            // NOT mirrored — a readiness QUERY must not claim the fd.)
+            // EPOLLET: readable only on a fresh edge, same as `collect_ready` —
+            // a rising mask bit or ready-list membership (the wait-queue edge).
+            // (The EPOLLEXCLUSIVE claim is deliberately NOT mirrored — a
+            // readiness QUERY must not claim the fd.)
             if (events & EPOLLET) != 0
                 && (ready & !last_mask) == 0
-                && !token_changed_for_ready(ready, cur_token, last_token)
+                && !(item.cell_backed && ready_set.contains(&item.fd))
             {
                 continue;
             }
