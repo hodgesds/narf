@@ -1326,8 +1326,19 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     crate::frame::free_frame(crate::frame::PhysFrame::new(l3_phys));
     // Cascade: if that emptied the L2 too, free it and clear its L1 entry. Stop
     // at the L1 — it is the reserved L0 slot's shared child and must persist.
+    //
+    // The L2's own address comes from `l1e` — the entry in its PARENT that
+    // names it. `l2e` is an entry *inside* the L2 and names the L3, so using
+    // it here freed `l3_phys` a second time and leaked the real L2. The
+    // x86_64 twin has always taken the parent entry (`pdpte.addr()`); this is
+    // the same shape, and the mismatch was the bug.
+    //
+    // The double-freed frame lands on the buddy's free list twice and is
+    // handed to two owners at once. It surfaces far away as a slab free-block
+    // canary of 0x0 (`ensure_next_table` zeroes a fresh table) with a lone
+    // page-table descriptor at offset 0 of the block's page.
     if !l2.entries.iter().any(|e| e.is_valid()) {
-        let l2_phys = l2e.addr();
+        let l2_phys = l1e.addr();
         l1.entries[idx.l1] = PageTableEntry::EMPTY;
         crate::frame::__pagetable_unregister(l2_phys.raw());
         crate::frame::free_frame(crate::frame::PhysFrame::new(l2_phys));

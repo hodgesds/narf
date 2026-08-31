@@ -353,6 +353,100 @@ fn kernel_root() -> Result<PhysAddr, ModuleTextError> {
     crate::bpf_text::kernel_root_for_mapping().ok_or(ModuleTextError::RootUnavailable)
 }
 
+/// Top-level page-table slot the module window lives in.
+#[inline]
+pub const fn kernel_top_slot() -> usize {
+    ((MODULE_VA_BASE >> 39) & 0x1FF) as usize
+}
+
+/// Pre-populate the module window's top-level page-table entry in the live
+/// kernel root.
+///
+/// Must run at boot, after `init_mmu` installs the final kernel root and
+/// BEFORE the first user address space is created. `bpf_text` and `vmalloc`
+/// both do this for their own windows and neither relies on `map_4kb`'s lazy
+/// `ensure_next_table` to create a top-level entry, for two reasons:
+///
+///   * On x86_64, `new_user_pml4_on` snapshot-copies PML4[256..512] **by
+///     value**. A slot first populated after an address space exists is
+///     absent from that address space's root, and the first kernel access to
+///     the window while it is current faults on a not-present PML4 entry
+///     inside the fault handler's own working set — `bpf_text`'s §4.1 triple
+///     fault.
+///   * On aarch64 the kernel half lives in TTBR1 and is not copied, so the
+///     propagation hazard does not apply — but creating the entry once, at a
+///     known point, is still preferable to doing it under whatever lock and
+///     context the first `insmod` happens to arrive with.
+///
+/// Idempotent. On x86_64 this is normally a no-op: the window lives under
+/// PML4[511], which `init_mmu` has already built for the kernel image.
+pub fn reserve_kernel_slot() -> Result<(), ModuleTextError> {
+    debug_assert_eq!(
+        ((MODULE_VA_BASE >> 39) & 0x1FF) as usize,
+        kernel_top_slot(),
+        "MODULE_VA_BASE does not decode to kernel_top_slot()"
+    );
+    let root = kernel_root()?;
+    // SAFETY: `root` is the live kernel root and this runs single-threaded on
+    // the BSP at boot, so the read-modify-write of one entry cannot race.
+    unsafe { reserve_top_slot(root, kernel_top_slot()) }
+}
+
+/// Install a present, kernel-only next-level table at `root[slot]` if one is
+/// not already there.
+///
+/// # Safety
+/// `root` must be the live kernel root and the caller must have exclusive
+/// access to it (boot BSP).
+#[cfg(target_arch = "x86_64")]
+unsafe fn reserve_top_slot(root: PhysAddr, slot: usize) -> Result<(), ModuleTextError> {
+    use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
+    // SAFETY: caller's contract — live kernel PML4, identity-reachable.
+    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    if pml4.entries[slot].is_present() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| ModuleTextError::NoFrame)?;
+    let phys = frame.start_address();
+    crate::frame::__pagetable_register(phys.raw());
+    // SAFETY: fresh frame, exclusively ours until published below.
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096) };
+    pml4.entries[slot] = PageTableEntry::new(phys, PtFlags::PRESENT | PtFlags::WRITABLE);
+    Ok(())
+}
+
+/// aarch64 twin.
+///
+/// # Safety
+/// Same contract as the x86_64 version.
+#[cfg(target_arch = "aarch64")]
+unsafe fn reserve_top_slot(root: PhysAddr, slot: usize) -> Result<(), ModuleTextError> {
+    use crate::aarch64::paging::{PageTable, PageTableEntry};
+    // SAFETY: caller's contract — live TTBR1 L0.
+    let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
+    if l0.entries[slot].is_valid() {
+        return Ok(());
+    }
+    let frame = crate::frame::alloc_frame().map_err(|_| ModuleTextError::NoFrame)?;
+    let phys = frame.start_address();
+    // SAFETY: fresh frame, exclusively ours until published below.
+    unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096) };
+    // Table descriptor: bits[1:0] = 0b11 (valid + table); leaf entries carry
+    // the real permissions.
+    l0.entries[slot] = PageTableEntry::from_raw(phys.raw() | 0b11);
+    // Publish the descriptor before anything can walk it.
+    // SAFETY: barriers at EL1 are always legal.
+    unsafe {
+        core::arch::asm!("dsb ishst", "isb", options(nostack, preserves_flags));
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+unsafe fn reserve_top_slot(_root: PhysAddr, _slot: usize) -> Result<(), ModuleTextError> {
+    Err(ModuleTextError::MapFailed)
+}
+
 // ── Public API ─────────────────────────────────────────────────────────
 
 /// Map `pages` fresh, zeroed, **RW+NX** pages in the module window, plus one
@@ -405,14 +499,31 @@ pub fn alloc(pages: usize) -> Result<ModuleImage, ModuleTextError> {
             VA_MAP.lock().free_run(va_page, want);
             return Err(ModuleTextError::MapFailed);
         }
-        mapped += 1;
-    }
 
-    // Trap-fill rather than zero-fill: a stray call into a page the loader
-    // leaves untouched should stop, not decode zeros as instructions.
-    // SAFETY: every page in the run is mapped RW by the loop above.
-    unsafe {
-        core::ptr::write_bytes(base as *mut u8, TRAP_FILL, pages * 4096);
+        // Read the leaf back before touching the page. `map_4kb` reporting
+        // success is not the same as the translation being installed, and the
+        // difference between those two is otherwise a hard fault at the first
+        // write with no indication of which page or why.
+        if page_phys(root, va.as_u64()) != Some(frame.start_address().raw()) {
+            // SAFETY: `mapped` pages were installed; this one may have been
+            // partially installed and is covered by the same teardown.
+            unsafe { unmap_and_free(base, mapped + 1) };
+            VA_MAP.lock().free_run(va_page, want);
+            return Err(ModuleTextError::MapFailed);
+        }
+
+        // Trap-fill this page now, while we know it is mapped. Filling the
+        // whole run afterwards means one memset spans every page, so a single
+        // bad mapping faults somewhere inside a 128 KiB store with nothing to
+        // say which page was missing.
+        //
+        // Trap-fill rather than zero-fill: a stray call into a page the loader
+        // leaves untouched should stop, not decode zeros as instructions.
+        // SAFETY: the page was just mapped RW and its translation verified.
+        unsafe {
+            core::ptr::write_bytes(va.as_u64() as *mut u8, TRAP_FILL, 4096);
+        }
+        mapped += 1;
     }
 
     Ok(ModuleImage {
@@ -673,7 +784,7 @@ fn smoke_module_text_window_placement() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_module_text_window_placement);
+kernel_test_in!("memory/module_text", smoke_module_text_window_placement);
 
 /// The core claim of this file: bytes written into a module image and sealed
 /// `Rx` actually execute. Before this allocator existed the loader relocated
@@ -711,7 +822,7 @@ fn smoke_module_text_alloc_seal_execute() -> TestResult {
         TestResult::Fail("sealed module text returned the wrong value")
     }
 }
-kernel_test_in!("memory", smoke_module_text_alloc_seal_execute);
+kernel_test_in!("memory/module_text", smoke_module_text_alloc_seal_execute);
 
 /// W^X, stated as a property rather than a comment: once a page is executable
 /// at its module VA, no kernel window may still offer a writable alias of the
@@ -749,7 +860,10 @@ fn smoke_module_text_alias_closed_after_seal() -> TestResult {
         None => TestResult::Fail("alias_is_writable could not find the frame"),
     }
 }
-kernel_test_in!("memory", smoke_module_text_alias_closed_after_seal);
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_alias_closed_after_seal
+);
 
 /// `free` must give back both the VA and the alias. The second half is the
 /// one with teeth: a frame returned to the buddy still marked read-only is a
@@ -784,7 +898,65 @@ fn smoke_module_text_free_restores_va_and_alias() -> TestResult {
         None => TestResult::Skip("alias tracking unavailable on this arch"),
     }
 }
-kernel_test_in!("memory", smoke_module_text_free_restores_va_and_alias);
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_free_restores_va_and_alias
+);
+
+/// An alloc/free cycle must return exactly the frames it took — no more.
+///
+/// A page-table reclaim that frees a table twice pushes frames onto the
+/// buddy's free list that were never allocated, so the accounted total GROWS
+/// across cycles. Honest activity cannot do that, which makes this a sharp
+/// detector: `aarch64`'s `free_empty_pt` cascade freed the L3 a second time in
+/// place of the L2 (it took the address from an entry *inside* the L2 rather
+/// than from the parent entry naming it), and the frame was then handed to two
+/// owners at once. That surfaced arbitrarily far away as a slab free-block
+/// canary of 0x0 with a page-table descriptor sitting in the block — a
+/// diagnosis with nothing pointing back here.
+///
+/// Bracketed on `free + slab::frames_held()` rather than raw `free`: the slab
+/// draws frames from the buddy when a size class runs dry, so a bare `free`
+/// delta moves for reasons that have nothing to do with this path.
+fn smoke_module_text_alloc_free_conserves_frames() -> TestResult {
+    fn accounted() -> usize {
+        crate::frame::stats().free + crate::slab::frames_held()
+    }
+
+    // Two warm-up cycles: the first builds the window's intermediate page
+    // tables and the bookkeeping Vecs, and neither cost repeats.
+    for _ in 0..2 {
+        match alloc(2) {
+            // SAFETY: nothing was executed from the image.
+            Ok(img) => unsafe { free(img) },
+            Err(_) => return TestResult::Fail("module_text::alloc(2) failed"),
+        }
+    }
+
+    let before = accounted();
+    for _ in 0..8 {
+        match alloc(2) {
+            // SAFETY: nothing was executed from the image.
+            Ok(img) => unsafe { free(img) },
+            Err(_) => return TestResult::Fail("module_text::alloc(2) failed"),
+        }
+    }
+    let after = accounted();
+
+    if after > before {
+        // More frames accounted for than we started with: the free path put
+        // something back that it never took.
+        return TestResult::Fail("alloc/free cycle released more frames than it allocated");
+    }
+    if after < before {
+        return TestResult::Fail("alloc/free cycle leaked frames");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_alloc_free_conserves_frames
+);
 
 /// The guard page must be genuinely absent, not merely reserved in the
 /// bitmap — a module running off the end of its own text should fault with a
@@ -814,4 +986,4 @@ fn smoke_module_text_guard_page_unmapped() -> TestResult {
     }
     TestResult::Pass
 }
-kernel_test_in!("memory", smoke_module_text_guard_page_unmapped);
+kernel_test_in!("memory/module_text", smoke_module_text_guard_page_unmapped);
