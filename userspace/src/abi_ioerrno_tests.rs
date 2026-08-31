@@ -2600,8 +2600,27 @@ fn smoke_abi_ioerrno_path_syscalls_fault_not_eperm() -> TestResult {
             EFAULT,
             "statfs with an unreadable path was not EFAULT",
         )?;
+        // `creat` is one of the legacy calls arm64 does not wire (only
+        // architectures defining `__ARCH_WANT_SYSCALL_DEPRECATED` have it).
+        // Rather than drop the assertion there, issue what `creat` IS:
+        //
+        //     SYSCALL_DEFINE2(creat, pathname, mode)
+        //     { flags = O_CREAT | O_WRONLY | O_TRUNC;
+        //       return do_sys_open(AT_FDCWD, pathname, flags, mode); }
+        //
+        // Same `getname` on the same unreadable pointer, so the -EFAULT this
+        // is testing is reached by the same path on both architectures.
+        const O_CREAT_WRONLY_TRUNC: u64 = 0o100 | 0o1 | 0o1000;
+        let creat_r = if wired(Syscall::Creat) {
+            call(Syscall::Creat.raw(), a2(BAD_PTR, 0o644, 0))
+        } else {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, BAD_PTR, O_CREAT_WRONLY_TRUNC, 0o644),
+            )
+        };
         expect(
-            call(Syscall::Creat.raw(), a2(BAD_PTR, 0o644, 0)),
+            creat_r,
             EFAULT,
             "creat with an unreadable path was not EFAULT",
         )?;
@@ -2889,11 +2908,20 @@ fn smoke_abi_ioerrno_epoll_ctl_pollability_follows_the_inode() -> TestResult {
         // A FIFO in the SAME filesystem: opened through the pipe path, so it
         // keeps its poll and stays addable.
         let fifo = b"/abi-pollkind/pipe\0";
-        if call(
-            Syscall::Mknod.raw(),
-            a3(fifo.as_ptr() as u64, S_IFIFO | 0o644, 0, 0),
-        ) != Some(0)
-        {
+        // arm64 wires only `mknodat` (generic table nr 33); it takes a
+        // directory fd ahead of the same pathname/mode/dev triple.
+        let mknod_r = if wired(Syscall::Mknod) {
+            call(
+                Syscall::Mknod.raw(),
+                a3(fifo.as_ptr() as u64, S_IFIFO | 0o644, 0, 0),
+            )
+        } else {
+            call(
+                Syscall::Mknodat.raw(),
+                a3(AT_FDCWD, fifo.as_ptr() as u64, S_IFIFO | 0o644, 0),
+            )
+        };
+        if mknod_r != Some(0) {
             // Not tolerated: without a FIFO this test proves only the
             // regular-file half, which is the half a blanket "this backend is
             // unpollable" would also satisfy.

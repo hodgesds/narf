@@ -203,6 +203,30 @@ pub fn call_raw(num: u32, args: SyscallArgs) -> SyscallReturn {
     ctx.ret.unwrap_or_else(|| SyscallReturn::ok(0xDEAD_u64)) // no set_return => sentinel
 }
 
+/// `AT_FDCWD` — the `*at` forms' "relative to the cwd" directory fd.
+pub const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+
+/// `AT_REMOVEDIR` — makes `unlinkat` behave as `rmdir`.
+pub const AT_REMOVEDIR: u64 = 0x200;
+
+/// Whether this architecture wires `s` at all.
+///
+/// The legacy path syscalls — `mkdir`, `rmdir`, `unlink`, `link`, `creat`,
+/// `mknod` — exist only where the architecture opts into
+/// `__ARCH_WANT_SYSCALL_DEPRECATED`. x86_64 does; arm64 does not, and its
+/// `include/uapi/asm-generic/unistd.h` carries only the `*at` forms
+/// (`mkdirat` 34, `unlinkat` 35, `linkat` 37, `mknodat` 33). NARF's per-arch
+/// tables mirror that correctly.
+///
+/// `Syscall::raw()` returns `u32::MAX` for a variant with no row on this
+/// arch, and dispatching that yields `InvalidOp` — which `call` reports as
+/// `None`. A test that hardcodes a legacy number therefore reads a syscall
+/// that does not exist as one that misbehaved, and fails on arm64 for a
+/// reason that has nothing to do with what it is testing.
+pub fn wired(s: Syscall) -> bool {
+    s.raw() != u32::MAX
+}
+
 // ── Arg builders (the rest default to 0) ──
 pub fn a0(arg0: u64) -> SyscallArgs {
     SyscallArgs {
