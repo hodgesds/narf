@@ -27,22 +27,63 @@ use crate::registry;
 pub fn sys_init_module(bytes: &[u8]) -> Result<Arc<Module>, ModuleSyscallError> {
     let module = loader::load_image(bytes).map_err(ModuleSyscallError::Load)?;
 
-    if registry::contains(module.name()) {
+    // Claim the name atomically. A `contains` check followed by a separate
+    // insert lets two concurrent loads of the same name both observe
+    // "absent" and both register.
+    if !registry::insert_unique(module.clone()) {
+        // SAFETY: the module never entered the registry and its init never
+        // ran, so nothing can be referencing its image.
+        unsafe { loader::release_image(&module) };
         return Err(ModuleSyscallError::Load(LoadError::AlreadyLoaded(
             module.name().into(),
         )));
     }
-    registry::insert(module.clone());
 
-    // Call the init function; if it fails, unregister and surface the
-    // error. SAFETY: we just loaded the module and own its placements.
-    // SAFETY: Valid memory or trusted environment
+    // Take a reference on every module this one linked against, so a
+    // provider cannot be unloaded while this module holds relocated pointers
+    // into its text. Done before `invoke_init` because init is the first
+    // moment the module can call through one of those pointers.
+    take_dependency_refs(&module);
+
+    // Call the init function; if it fails, unwind everything the load put in
+    // place and surface the error.
+    // SAFETY: we just loaded the module and own its placements.
     let invoke = unsafe { loader::invoke_init(&module) };
     if let Err(e) = invoke {
+        drop_dependency_refs(&module);
+        let _removed = crate::symbols::unregister_exports_of(module.id);
         registry::remove(module.name());
+        // SAFETY: init failed, so the module is not Live; its exports are
+        // swept and it is out of the registry. It may have registered
+        // resources before failing, which is the module's own contract to
+        // clean up before returning non-zero — same as Linux, where a failed
+        // `do_init_module` frees the module regardless.
+        unsafe { loader::release_image(&module) };
         return Err(ModuleSyscallError::InitFailed(e));
     }
     Ok(module)
+}
+
+/// Take a reference on each module `module` resolved a symbol from.
+fn take_dependency_refs(module: &Module) {
+    for dep in &module.deps {
+        if let Some(provider) = registry::lookup_by_id(*dep) {
+            provider.refcount.get();
+        }
+    }
+}
+
+/// Release the references [`take_dependency_refs`] took.
+///
+/// A provider that has already been removed from the registry is skipped —
+/// it cannot happen while this module is loaded, precisely because the
+/// reference we are dropping is what prevented it.
+fn drop_dependency_refs(module: &Module) {
+    for dep in &module.deps {
+        if let Some(provider) = registry::lookup_by_id(*dep) {
+            provider.refcount.put();
+        }
+    }
 }
 
 /// `sys_finit_module(fd, params, flags)` — Linux variant that reads
@@ -69,8 +110,12 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     // SAFETY: registry::lookup gave us an Arc<Module> that owns its
     // placements; we hold it until invoke_exit returns, after which
     // registry::remove drops the registry's reference.
-    // SAFETY: Valid memory or trusted environment
     unsafe { loader::invoke_exit(&module) }.map_err(ModuleSyscallError::ExitFailed)?;
+
+    // Release this module's hold on its providers. After `invoke_exit`, so a
+    // provider stays pinned for as long as the exit handler might still call
+    // into it.
+    drop_dependency_refs(&module);
 
     // Sweep all KSYMTAB entries registered by this module during its
     // init.  Must happen before the Arc is dropped so that if the

@@ -36,6 +36,11 @@ pub struct RelocContext<'a> {
     /// is inside PC32 range of every kernel symbol by construction — see
     /// `crate::plt`.
     pub plt: Option<&'a mut Plt>,
+    /// Modules this image resolved a symbol from, deduplicated. The kernel's
+    /// own exports are excluded — it never unloads. The loader takes a
+    /// reference on each of these so a provider cannot be unloaded out from
+    /// under a consumer holding a relocated pointer into its text.
+    pub deps: alloc::vec::Vec<crate::symbols::ModuleId>,
 }
 
 /// Errors raised by the relocator.
@@ -148,7 +153,14 @@ pub fn apply_one_rela_section(
         let sym_value = if sym.is_undefined() {
             let name = symbols.name(&sym);
             match resolve(name, None, ctx.manifest) {
-                Ok(res) => res.addr as u64,
+                Ok(res) => {
+                    if res.owner != crate::symbols::KERNEL_MODULE_ID
+                        && !ctx.deps.contains(&res.owner)
+                    {
+                        ctx.deps.push(res.owner);
+                    }
+                    res.addr as u64
+                }
                 Err(ResolveError::Unknown) => {
                     return Err(RelocatorError::SymbolNotFound(name.into()));
                 }

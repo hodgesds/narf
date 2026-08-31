@@ -88,9 +88,38 @@ pub mod registry {
         MODULES.lock().iter().find(|m| m.name() == name).cloned()
     }
 
-    /// Insert a module. Caller verifies non-duplication beforehand.
-    pub fn insert(module: Arc<Module>) {
-        MODULES.lock().push(module);
+    /// Look up a module by its `ModuleId`. Used to resolve dependency edges,
+    /// which are recorded by id rather than by name — a name can be reused
+    /// across a load/unload cycle, an id never is.
+    pub fn lookup_by_id(id: crate::symbols::ModuleId) -> Option<Arc<Module>> {
+        MODULES.lock().iter().find(|m| m.id == id).cloned()
+    }
+
+    /// Insert a module unless one of that name is already registered.
+    /// Returns false if one was.
+    ///
+    /// Atomic against a concurrent insert of the same name, which a
+    /// `contains` check followed by `insert` is not: two `init_module` calls
+    /// racing on the same name could both observe "absent" and both push.
+    pub fn insert_unique(module: Arc<Module>) -> bool {
+        let mut g = MODULES.lock();
+        if g.iter().any(|m| m.name() == module.name()) {
+            return false;
+        }
+        g.push(module);
+        true
+    }
+
+    /// Modules holding a reference on `id`, by name. Backs the holders column
+    /// of `/proc/modules`, which Linux fills the same way
+    /// (`kernel/module/procfs.c::m_show`).
+    pub fn holders_of(id: crate::symbols::ModuleId) -> Vec<alloc::string::String> {
+        MODULES
+            .lock()
+            .iter()
+            .filter(|m| m.deps.contains(&id))
+            .map(|m| alloc::string::String::from(m.name()))
+            .collect()
     }
 
     /// Remove a module by name. Returns true iff one was removed.

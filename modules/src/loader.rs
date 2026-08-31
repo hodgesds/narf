@@ -116,6 +116,19 @@ pub struct Module {
     pub exit_addr: Option<usize>,
     /// Module parameters from `.narf_kparams`.
     pub params: Vec<ParamSlot>,
+    /// Modules this one resolved symbols from, deduplicated.
+    ///
+    /// `sys_init_module` takes a reference on each after a successful load,
+    /// and `sys_delete_module` drops them, so a provider reports EBUSY while
+    /// any consumer is loaded. This is `try_module_get` done at link time
+    /// rather than per call: NARF already resolves cap requirements when the
+    /// pointer is wired in (DESIGN.md §1), and lifetime is the same kind of
+    /// obligation.
+    ///
+    /// It also makes `depends=` enforcement fall out — a module that links
+    /// against another cannot outlive it regardless of what its manifest
+    /// claims.
+    pub deps: Vec<crate::symbols::ModuleId>,
     /// Reference count.
     pub refcount: RefCount,
     /// Current lifecycle state.
@@ -199,6 +212,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         init_addr,
         exit_addr,
         params,
+        deps,
     } = match built {
         Ok(v) => v,
         Err(e) => {
@@ -220,6 +234,7 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         init_addr,
         exit_addr,
         params,
+        deps,
         refcount: RefCount::new(),
         state: IrqSafeSpinLock::new(ModuleState::Loading),
     }))
@@ -272,6 +287,7 @@ struct BuiltImage {
     init_addr: usize,
     exit_addr: Option<usize>,
     params: Vec<ParamSlot>,
+    deps: Vec<crate::symbols::ModuleId>,
 }
 
 /// `e_machine` value a module must carry to run on this kernel.
@@ -488,6 +504,7 @@ fn build_image(
     let mut ctx = RelocContext {
         manifest,
         plt: plt.as_mut(),
+        deps: Vec::new(),
     };
     let _ = apply_all_relas(bytes, hdr, &symbols, &mut placements, &mut ctx)?;
 
@@ -512,6 +529,7 @@ fn build_image(
         init_addr,
         exit_addr,
         params,
+        deps: ctx.deps,
     })
 }
 

@@ -131,6 +131,14 @@ pub enum ResolveError {
 pub struct Resolution {
     pub addr: usize,
     pub crc: u32,
+    /// Who owns the symbol. `KERNEL_MODULE_ID` for the in-tree ABI surface;
+    /// another module's id when one module resolves against another's export.
+    ///
+    /// The relocator records these so the load can take a reference on every
+    /// module it links against — see `loader`'s dependency handling. Without
+    /// it, unloading the provider leaves the consumer holding a raw pointer
+    /// into freed text.
+    pub owner: ModuleId,
 }
 
 /// The kernel's exported symbol table. Populated at boot via
@@ -257,6 +265,7 @@ pub fn resolve(
     Ok(Resolution {
         addr: entry.addr,
         crc: entry.crc,
+        owner: entry.owner,
     })
 }
 
