@@ -1280,6 +1280,22 @@ impl VirtioNetPci {
     /// ring is empty, or the replacement allocation fails (in which
     /// case the original stays in place — the device-filled buffer
     /// is not surrendered until the refill is guaranteed).
+    /// Arm this RX pair's used-ring interrupt and report whether a completion is
+    /// ALREADY pending — the `virtqueue_enable_cb` re-check a forwarder runs
+    /// right before it parks, so a suppressed/coalesced RX interrupt can't
+    /// strand a frame in the ring until the poll backstop deadline. `false` for
+    /// a missing pair/queue (nothing to wait on).
+    pub fn rx_arm_and_pending(&self, pair_idx: usize) -> bool {
+        let Some(pair) = self.pairs.get(pair_idx) else {
+            return false;
+        };
+        let mut g = pair.rx_queue.lock();
+        match g.as_mut() {
+            Some(q) => q.enable_used_cb_and_pending(),
+            None => false,
+        }
+    }
+
     pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
         let pair = self.pairs.get(pair_idx)?;
         let elem = {
@@ -1747,10 +1763,36 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                                 drop(w);
                                 narf_scheduler::yield_now().await;
                             } else {
+                                // Register-then-recheck (Linux
+                                // virtqueue_enable_cb): arm the used-ring
+                                // interrupt and re-read `used.idx` BEFORE
+                                // committing to the park. If a completion is
+                                // already pending the device suppressed or
+                                // coalesced its interrupt (EVENT_IDX arm race /
+                                // QEMU-SLIRP used-ring coalescing), so the
+                                // `wait_for_irq` edge would never come and we'd
+                                // sleep out the 2 ms backstop on a frame already
+                                // sitting in the ring — the sequential off-box
+                                // request/reply p99 tail. Drain it now instead.
+                                // `w`'s pre-drain `fire_count` baseline still
+                                // covers a frame that fires the IRQ AFTER this
+                                // re-read, so the two together are lossless.
+                                if with_at(idx, |c| c.rx_arm_and_pending(pair_idx)).unwrap_or(false)
+                                {
+                                    idle_rounds = 0;
+                                    drop(w);
+                                    continue;
+                                }
                                 // Idle: park on the IRQ. The edge resolves `w`
                                 // immediately when caught; the 2 ms deadline only
                                 // backstops a missed/late RX MSI-X so the executor
                                 // can HLT and save power while no traffic flows.
+                                // (A/B measured: extending this to 50 ms did NOT
+                                // change the sequential-PING p99 tail and `max`
+                                // never approached 50 ms, so the RX IRQ is
+                                // reliable and the backstop cadence is not the
+                                // tail — keep it tight for concurrent-load
+                                // responsiveness.)
                                 let dl = narf_time::Deadline::after_ms(2);
                                 let _ = narf_time::timeout(dl, w).await;
                             }

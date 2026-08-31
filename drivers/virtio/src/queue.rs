@@ -438,4 +438,46 @@ impl Virtqueue {
         }
         Some((elem.id, elem.len))
     }
+
+    /// Enable used-ring interrupts and re-check for an already-pending
+    /// completion — the Linux `virtqueue_enable_cb()` sequence, run by a poller
+    /// right before it commits to parking on the IRQ.
+    ///
+    /// Returns `true` if the device has ALREADY published a completion we have
+    /// not consumed. The caller MUST then drain instead of parking: the device
+    /// may have suppressed the interrupt for that completion (EVENT_IDX arm
+    /// race, or QEMU/SLIRP used-ring interrupt coalescing), so `wait_for_irq`
+    /// would sleep out its deadline on a frame that is already sitting in the
+    /// ring — the missed-interrupt that gives sequential off-box request/reply
+    /// its p99 tail. Arming BEFORE the re-read (with the barrier between) is
+    /// load-bearing: it guarantees the device raises an interrupt for any
+    /// completion it publishes AFTER our re-read, so a frame in the tiny window
+    /// between the read and the park still wakes us.
+    pub fn enable_used_cb_and_pending(&mut self) -> bool {
+        if self.event_idx {
+            // EVENT_IDX: arm `used_event` at the index we've consumed so the
+            // device interrupts on the next completion. Same store `poll_used`
+            // makes on consume, but done explicitly here for the empty-drain
+            // case where nothing was consumed this round.
+            let cap = self.layout.capacity as usize;
+            // SAFETY: avail ring is DMA memory sized for `capacity` entries plus
+            // the trailing used_event u16 (VirtqueueLayout::new); offset 2 + cap.
+            unsafe {
+                core::ptr::write_volatile(self.avail_base().add(2 + cap), self.last_used_idx);
+            }
+        } else {
+            // No EVENT_IDX: clear VRING_AVAIL_F_NO_INTERRUPT (avail flags @ off 0)
+            // so the device raises used-ring interrupts.
+            // SAFETY: avail_base is the avail ring's `flags` u16 (DMA memory).
+            unsafe {
+                core::ptr::write_volatile(self.avail_base(), 0u16);
+            }
+        }
+        // Store-load barrier: the arm above must be visible to the device
+        // before we load `used.idx`, mirroring virtqueue_enable_cb's mb().
+        virtio_mb();
+        // SAFETY: used_base+1 is the device-published `used.idx` (see poll_used).
+        let used_idx = unsafe { core::ptr::read_volatile(self.used_base().add(1)) };
+        used_idx != self.last_used_idx
+    }
 }
