@@ -71,6 +71,22 @@ pub const R_AARCH64_LDST64_ABS_LO12_NC: u32 = 286;
 pub const R_AARCH64_JUMP26: u32 = 282;
 pub const R_AARCH64_CALL26: u32 = 283;
 
+// MOVZ/MOVK immediate groups — the four-instruction sequence LLVM emits to
+// materialise a 64-bit absolute address in a register. Each relocation
+// patches the 16-bit immediate of one instruction with its slice of the
+// value. The `_NC` ("no check") variants skip the overflow test, because
+// only the group holding the value's top bits can meaningfully overflow.
+//
+// Numbers and semantics: `arch/arm64/include/asm/elf.h:33` and
+// `arch/arm64/kernel/module.c::reloc_insn_movw`.
+pub const R_AARCH64_MOVW_UABS_G0: u32 = 263;
+pub const R_AARCH64_MOVW_UABS_G0_NC: u32 = 264;
+pub const R_AARCH64_MOVW_UABS_G1: u32 = 265;
+pub const R_AARCH64_MOVW_UABS_G1_NC: u32 = 266;
+pub const R_AARCH64_MOVW_UABS_G2: u32 = 267;
+pub const R_AARCH64_MOVW_UABS_G2_NC: u32 = 268;
+pub const R_AARCH64_MOVW_UABS_G3: u32 = 269;
+
 /// Errors raised while applying relocations.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RelocError {
@@ -213,6 +229,46 @@ pub fn apply_aarch64(
             let cur = read_u32_in(dest, loc)?;
             // Imm12 field is bits 10..21.
             let new = (cur & !(0xFFF << 10)) | (imm << 10);
+            write_u32(dest, loc, new)
+        }
+        // MOVZ/MOVK immediate groups. `reloc_insn_movw` computes
+        // `imm = val >> lsb` and writes it into the instruction's 16-bit
+        // field at bits 20:5, leaving the opcode alone for the unsigned
+        // (`MOVKZ`) forms these all are.
+        //
+        // Needed because a real rustc-built module uses them and a
+        // synthesized test ELF does not: LLVM materialises the address of a
+        // `static` this way, so the reference module's four `.modinfo`-adjacent
+        // address loads arrive as one G0_NC/G1_NC/G2_NC/G3 quartet each.
+        // Without these the load failed outright with `UnsupportedType`.
+        R_AARCH64_MOVW_UABS_G0
+        | R_AARCH64_MOVW_UABS_G0_NC
+        | R_AARCH64_MOVW_UABS_G1
+        | R_AARCH64_MOVW_UABS_G1_NC
+        | R_AARCH64_MOVW_UABS_G2
+        | R_AARCH64_MOVW_UABS_G2_NC
+        | R_AARCH64_MOVW_UABS_G3 => {
+            let lsb = match ty {
+                R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G0_NC => 0,
+                R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G1_NC => 16,
+                R_AARCH64_MOVW_UABS_G2 | R_AARCH64_MOVW_UABS_G2_NC => 32,
+                _ => 48,
+            };
+            // The checked forms require the value to fit entirely within this
+            // group and the ones below it. G3 is never checked — it holds the
+            // top bits, so nothing can overflow past it.
+            let checked = matches!(
+                ty,
+                R_AARCH64_MOVW_UABS_G0 | R_AARCH64_MOVW_UABS_G1 | R_AARCH64_MOVW_UABS_G2
+            );
+            let shifted = val >> lsb;
+            if checked && shifted > 0xFFFF {
+                return Err(RelocError::Overflow);
+            }
+            let imm = (shifted & 0xFFFF) as u32;
+            let cur = read_u32_in(dest, loc)?;
+            // imm16 occupies bits 20:5 of MOVZ/MOVK.
+            let new = (cur & !(0xFFFF << 5)) | (imm << 5);
             write_u32(dest, loc, new)
         }
         R_AARCH64_LDST64_ABS_LO12_NC => {
