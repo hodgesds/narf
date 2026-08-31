@@ -149,6 +149,16 @@ struct EpollInner {
     /// The currently-parked poller's waker, woken when a per-fd waker lists a
     /// ready fd. Set at park, cleared on return.
     parked_waker: Option<core::task::Waker>,
+    /// collect_ready call counter for the periodic full-scan floor. The
+    /// ready-list can under-report a cell-backed fd that became ready while the
+    /// poller was between waits (the Readiness cell removes a waiter when `arm`
+    /// returns Ready, so a busy poller that rarely re-arms can miss a later
+    /// edge). The fast-then-full fallback only rescans when the fast pass is
+    /// EMPTY; under saturating load some fd is always ready, so the fast pass
+    /// never empties and a starved connection would never be revisited. Forcing
+    /// a full O(n) scan every `FULL_SCAN_EVERY` waits bounds that starvation to
+    /// a few waits — O(ready) amortized, O(n) worst-case, never worse.
+    scan_ctr: u32,
 }
 
 /// Poll one fd's readiness WITHOUT holding the fd-table lock across the
@@ -252,6 +262,7 @@ impl EpollInstance {
                 scan_after: None,
                 ready: BTreeSet::new(),
                 parked_waker: None,
+                scan_ctr: 0,
             }),
         })
     }
@@ -459,9 +470,22 @@ impl EpollInstance {
     /// strand a wake. Under load the fast pass delivers and the full scan is
     /// never reached; worst case is O(n), never worse.
     fn collect_ready(&self, task_id: u64, maxevents: usize) -> Vec<(u32, u64)> {
-        let fast = self.collect_ready_pass(task_id, maxevents, false);
-        if !fast.is_empty() {
-            return fast;
+        // Periodic full-scan floor: every FULL_SCAN_EVERY-th wait, scan the
+        // whole interest set so a cell-backed fd the ready-list under-reported
+        // (a later edge lost after `arm` removed its waiter under saturating
+        // load) is revisited within a bounded number of waits — no connection
+        // can starve. Cheap under load (1-in-N is O(n); the rest O(ready)).
+        const FULL_SCAN_EVERY: u32 = 8;
+        let force_full = {
+            let mut g = self.inner.lock();
+            g.scan_ctr = g.scan_ctr.wrapping_add(1);
+            g.scan_ctr % FULL_SCAN_EVERY == 0
+        };
+        if !force_full {
+            let fast = self.collect_ready_pass(task_id, maxevents, false);
+            if !fast.is_empty() {
+                return fast;
+            }
         }
         self.collect_ready_pass(task_id, maxevents, true)
     }
