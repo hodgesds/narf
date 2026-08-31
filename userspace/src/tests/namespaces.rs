@@ -1552,7 +1552,7 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
     // A second parentless namespace compares as a DIFFERENT namespace, so the
     // walk stops at its `is_initial()` arm instead of matching the caller's —
     // and the test then passes or fails for reasons unrelated to the rule.
-    let host = crate::namespaces::current_user_ns(0xBEEF_00);
+    let host = crate::namespaces::current_user_ns(0xBEEF00);
     // Two sibling namespaces beneath the host, BOTH owned by host uid 1000 —
     // the shape a single user running two rootless containers produces.
     let mine = UserNamespace::new_child(host.clone(), 1000);
@@ -1563,7 +1563,7 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
     // And one nested inside `mine`, which its owner should also govern.
     let nested = UserNamespace::new_child(mine.clone(), 1000);
 
-    let task: u64 = 0xBEEF_01;
+    let task: u64 = 0xBEEF01;
     // Unprivileged: no capabilities at all in the host.
     crate::handlers::__test_set_caps(task, 0, 0);
     crate::handlers::__test_set_uidgid_euid(task, 1000);
@@ -1597,7 +1597,7 @@ fn smoke_user_ns_capable_is_scoped_to_the_target_namespace() -> TestResult {
 
     // A host-privileged task is unaffected by any of this: arm 1 answers for
     // its own (initial) namespace, and every target above it resolves there.
-    let root: u64 = 0xBEEF_02;
+    let root: u64 = 0xBEEF02;
     crate::handlers::__test_set_caps(root, !0, !0);
     crate::handlers::__test_set_uidgid_euid(root, 0);
     if !crate::handlers::__test_task_ns_capable(root, &host, CAP_SYS_ADMIN) {
@@ -1640,7 +1640,7 @@ fn smoke_user_ns_uts_admin_follows_the_uts_namespace() -> TestResult {
     let admin_bit = 1u64 << CAP_SYS_ADMIN;
 
     // 1. Unprivileged, entirely in the host's namespaces: refused.
-    let plain: u64 = 0xBEEF_11;
+    let plain: u64 = 0xBEEF11;
     crate::handlers::__test_set_caps(plain, 0, 0);
     crate::handlers::__test_set_uidgid_euid(plain, 1000);
     if crate::handlers::__test_uts_admin(plain) {
@@ -1648,7 +1648,7 @@ fn smoke_user_ns_uts_admin_follows_the_uts_namespace() -> TestResult {
     }
 
     // 2. CAP_SYS_ADMIN in the host, host UTS namespace: allowed, unchanged.
-    let admin: u64 = 0xBEEF_12;
+    let admin: u64 = 0xBEEF12;
     crate::handlers::__test_set_caps(admin, admin_bit, admin_bit);
     crate::handlers::__test_set_uidgid_euid(admin, 0);
     if !crate::handlers::__test_uts_admin(admin) {
@@ -1658,10 +1658,10 @@ fn smoke_user_ns_uts_admin_follows_the_uts_namespace() -> TestResult {
     // 3. CAP_SYS_ADMIN, but the task has moved into its own user namespace
     // while STAYING in the host UTS namespace. Its capabilities are bound to
     // the new namespace, so the host's hostname is out of reach.
-    let escapee: u64 = 0xBEEF_13;
+    let escapee: u64 = 0xBEEF13;
     crate::handlers::__test_set_caps(escapee, admin_bit, admin_bit);
     crate::handlers::__test_set_uidgid_euid(escapee, 1000);
-    let host = crate::namespaces::current_user_ns(0xBEEF_10);
+    let host = crate::namespaces::current_user_ns(0xBEEF10);
     let uns = UserNamespace::new_child(host, 1000);
     crate::namespaces::setns_user(escapee, uns);
     if crate::handlers::__test_uts_admin(escapee) {
