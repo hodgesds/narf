@@ -528,32 +528,38 @@ impl EpollInstance {
         // arm) plus non-cell-backed fds (timerfd / nested / raw / legacy, which
         // have no edge). Full pass (fallback, or before any fd is cell-backed)
         // scans the whole interest set and reseeds the ready-list.
-        // `ready_set` is the ready-list (Linux rdllist) membership at snapshot
-        // time: a cell-backed fd is listed iff its persistent per-fd waker fired
-        // (a `set`/`notify` event) since the last drain. It IS the EPOLLET edge
-        // the per-source token used to carry — an fd that is level-ready but not
-        // listed has had no fresh event, so EPOLLET must not re-report it.
-        let (snapshot, ready_set): (Vec<(i32, EpollItem)>, alloc::collections::BTreeSet<i32>) = {
+        // Each entry carries `in_ready`: the fd's ready-list (Linux rdllist)
+        // membership at snapshot time — a cell-backed fd is listed iff its
+        // persistent per-fd waker fired (a `set`/`notify` event) since the last
+        // drain. It IS the EPOLLET edge the per-source token used to carry: an fd
+        // that is level-ready but not listed has had no fresh event, so EPOLLET
+        // must not re-report it. Captured per-entry UNDER the lock (a single
+        // `contains` while cloning the item) so the hot path never clones the
+        // whole ready set.
+        let snapshot: Vec<(i32, EpollItem, bool)> = {
             let g = self.inner.lock();
             let any_cell = g.interest.values().any(|it| it.cell_backed);
             let mut entries: Vec<_> = if full || !any_cell {
-                g.interest.iter().map(|(k, v)| (*k, v.clone())).collect()
+                g.interest
+                    .iter()
+                    .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
+                    .collect()
             } else {
                 g.interest
                     .iter()
                     .filter(|(fd, it)| g.ready.contains(fd) || !it.cell_backed)
-                    .map(|(k, v)| (*k, v.clone()))
+                    .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
                     .collect()
             };
             if let Some(after) = g.scan_after {
                 // Linux moves a delivered level-triggered item to the tail of
                 // its ready list. Rotating this rescan has the same observable
                 // fairness: successive short waits visit later ready fds.
-                if let Some(start) = entries.iter().position(|(fd, _)| *fd > after) {
+                if let Some(start) = entries.iter().position(|(fd, _, _)| *fd > after) {
                     entries.rotate_left(start);
                 }
             }
-            (entries, g.ready.clone())
+            entries
         };
 
         let mut results = Vec::new();
@@ -563,7 +569,7 @@ impl EpollInstance {
         // inversions under concurrent event-loop updates.
         let mut observed = Vec::new();
         let mut delivered_fds = Vec::new();
-        for (fd, item) in &snapshot {
+        for (fd, item, in_ready) in &snapshot {
             // `maxevents` limits acceptance, not merely userspace copying.
             // Do not poll, acknowledge, advance edge state, take an exclusive
             // claim, or disarm a one-shot entry that this wait cannot return.
@@ -595,17 +601,17 @@ impl EpollInstance {
                     // Backing open file dropped → not ready; record a zero
                     // observation so the write-back clears any stale readiness,
                     // exactly as the previous per-call upgrades did.
-                    observed.push((*fd, 0));
+                    observed.push((*fd, 0, *in_ready));
                     continue;
                 }
             };
             // One provider-lock acquisition per fd for the mask. The EPOLLET edge
             // no longer needs a second (token) lock: the wait-queue edge is the
-            // fd's membership in `ready_set`, captured lock-free from the snapshot
+            // fd's `in_ready` membership, captured under the lock in the snapshot
             // above (Linux ep_send_events drains the rdllist; ep_item_poll only
             // re-confirms the mask).
             let cur_mask = file.poll_readiness_at(item.offset);
-            observed.push((*fd, cur_mask));
+            observed.push((*fd, cur_mask, *in_ready));
             // Only report events the caller asked for.
             let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
             // Linux always reports ERR/HUP even when the caller omitted them
@@ -629,7 +635,7 @@ impl EpollInstance {
             // re-reported.
             if (item.events & EPOLLET) != 0 {
                 let new_bits = ready & !item.last_mask;
-                let listed = item.cell_backed && ready_set.contains(fd);
+                let listed = item.cell_backed && *in_ready;
                 if new_bits == 0 && !listed {
                     continue;
                 }
@@ -655,7 +661,7 @@ impl EpollInstance {
         // while holding this instance's non-reentrant spin lock.
         {
             let mut g = self.inner.lock();
-            for (fd, cur_mask) in observed {
+            for (fd, cur_mask, in_ready) in observed {
                 // Ready-list bookkeeping (Linux rdllist): a level-triggered fd
                 // that was delivered stays a candidate so the next wait
                 // re-reports it until the app drains (its next poll then shows
@@ -687,9 +693,7 @@ impl EpollInstance {
                         // acceptor (dbus-broker / journald) whose accept thread
                         // races its epoll thread; the token used to hold that edge.
                         item.last_mask &= cur_mask;
-                        keep_ready = item.cell_backed
-                            && (item.events & EPOLLET) != 0
-                            && ready_set.contains(&fd);
+                        keep_ready = item.cell_backed && (item.events & EPOLLET) != 0 && in_ready;
                     }
                 }
                 if keep_ready {
@@ -760,11 +764,16 @@ impl FileOps for EpollInstance {
         // `EpollInstance::poll_readiness`), so holding any lock across
         // it risks the same re-entrant deadlock the outer epoll path
         // hit. See `poll_fd_readiness`.
-        let (snapshot, ready_set): (Vec<EpollItem>, alloc::collections::BTreeSet<i32>) = {
+        // Per-entry `in_ready` (ready-list membership) captured under the lock,
+        // so the passive nested-epoll query never clones the whole ready set.
+        let snapshot: Vec<(EpollItem, bool)> = {
             let g = self.inner.lock();
-            (g.interest.values().cloned().collect(), g.ready.clone())
+            g.interest
+                .values()
+                .map(|v| (v.clone(), g.ready.contains(&v.fd)))
+                .collect()
         };
-        for item in snapshot {
+        for (item, in_ready) in snapshot {
             let events = item.events;
             let last_mask = item.last_mask;
             // Disarmed EPOLLONESHOT items deliver nothing.
@@ -785,7 +794,7 @@ impl FileOps for EpollInstance {
             // readiness QUERY must not claim the fd.)
             if (events & EPOLLET) != 0
                 && (ready & !last_mask) == 0
-                && !(item.cell_backed && ready_set.contains(&item.fd))
+                && !(item.cell_backed && in_ready)
             {
                 continue;
             }
