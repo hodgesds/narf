@@ -38,13 +38,36 @@ pub enum RelocatorError {
     ArchMismatch { runtime: &'static str, elf: u16 },
 }
 
-/// Per-section layout — what the loader allocated. Maps section index
-/// to the address + writable buffer it landed in.
+/// Per-section layout — where the loader put one section in the module
+/// image.
+///
+/// Holds no bytes of its own. `target_addr` is the address the section will
+/// actually execute at, inside the mapping `narf_memory::module_text` handed
+/// the loader, and the relocator patches it there. It used to own a
+/// `Vec<u8>` staging copy that the loader relocated and then kept for the
+/// module's entire lifetime — a permanent second copy of every loaded module,
+/// for no one's benefit.
 #[derive(Debug)]
 pub struct SectionPlacement {
     pub section_idx: usize,
     pub target_addr: u64,
-    pub bytes: alloc::vec::Vec<u8>,
+    /// Section size in bytes.
+    pub size: usize,
+}
+
+impl SectionPlacement {
+    /// The section's bytes as mapped, for the relocator to patch.
+    ///
+    /// # Safety
+    /// The module image must still be mapped and **writable** at
+    /// `target_addr` — that is, this must be called before
+    /// `module_text::protect` seals the section's region. After the seal the
+    /// returned slice is a write to read-only memory.
+    pub unsafe fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `target_addr` names `size` bytes inside the module image,
+        // which the caller guarantees is mapped writable.
+        unsafe { core::slice::from_raw_parts_mut(self.target_addr as *mut u8, self.size) }
+    }
 }
 
 /// Module-local symbol resolution: for a non-undefined symbol, find
@@ -125,23 +148,15 @@ pub fn apply_one_rela_section(
             .find(|p| p.section_idx == target_section)
             .ok_or(RelocatorError::NoTargetSection)?;
         let loc = r.r_offset as usize;
+        // SAFETY: relocation runs between `module_text::alloc` and the
+        // `protect` calls that seal the image, so every section is still
+        // mapped RW.
+        let dest_bytes = unsafe { dest.bytes_mut() };
         let result = match hdr.e_machine {
-            EM_X86_64 => apply_x86_64(
-                &mut dest.bytes,
-                loc,
-                target_addr,
-                sym_value,
-                r.r_addend,
-                r.ty(),
-            ),
-            EM_AARCH64 => apply_aarch64(
-                &mut dest.bytes,
-                loc,
-                target_addr,
-                sym_value,
-                r.r_addend,
-                r.ty(),
-            ),
+            EM_X86_64 => apply_x86_64(dest_bytes, loc, target_addr, sym_value, r.r_addend, r.ty()),
+            EM_AARCH64 => {
+                apply_aarch64(dest_bytes, loc, target_addr, sym_value, r.r_addend, r.ty())
+            }
             other => {
                 return Err(RelocatorError::ArchMismatch {
                     runtime: current_runtime_arch_name(),

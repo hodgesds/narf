@@ -1976,6 +1976,7 @@ dependencies = [
  "narf-filesystem",
  "narf-kernel-test",
  "narf-lib",
+ "narf-memory",
 ]
 
 [[package]]

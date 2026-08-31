@@ -41,6 +41,7 @@ pub mod kasan;
 pub mod kaslr;
 pub mod mempolicy;
 pub mod migrate;
+pub mod module_text;
 pub mod numa_tier;
 pub mod oom;
 pub mod pager;

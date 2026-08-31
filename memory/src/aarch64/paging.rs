@@ -471,6 +471,10 @@ pub enum MapError {
     AlreadyMapped,
     EncounteredBlock,
     NoFrame,
+    /// No valid leaf covers the target virtual address. Raised by
+    /// [`protect_4kb`], which rewrites an existing leaf rather than
+    /// installing one.
+    NotMapped,
 }
 
 // ── Allocation ──────────────────────────────────────────────────────
@@ -597,12 +601,6 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
     if root.raw() == 0 {
         return;
     }
-    /// True if this entry is present AND a TABLE (not a block).
-    /// At L0 every present entry is a table per ARM ARM. At L1/L2
-    /// a block entry stops the walk and must be skipped.
-    fn is_table_descriptor(e: PageTableEntry) -> bool {
-        e.is_valid() && (e.0 & 0b10) != 0
-    }
     // Reserve before taking the IRQ-safe root shard so detachment cannot grow
     // the vector while interrupts are disabled.
     let mut detached_l1s = Vec::with_capacity(512);
@@ -612,7 +610,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
         let l0 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
         for l0_idx in 0..512usize {
             let l0e = l0.entries[l0_idx];
-            if !is_table_descriptor(l0e) {
+            if !entry_is_table(l0e) {
                 continue;
             }
             detached_l1s.push(l0e.addr());
@@ -634,7 +632,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
         let l1 = unsafe { &mut *l1_pa.kernel_mut_ptr::<PageTable>() };
         for l1_idx in 0..512usize {
             let l1e = l1.entries[l1_idx];
-            if !is_table_descriptor(l1e) {
+            if !entry_is_table(l1e) {
                 continue;
             }
             let l2_pa = l1e.addr();
@@ -642,7 +640,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
             let l2 = unsafe { &mut *l2_pa.kernel_mut_ptr::<PageTable>() };
             for l2_idx in 0..512usize {
                 let l2e = l2.entries[l2_idx];
-                if !is_table_descriptor(l2e) {
+                if !entry_is_table(l2e) {
                     continue;
                 }
                 // L3 — leaf-level table; data frames already
@@ -1179,6 +1177,104 @@ pub unsafe fn unmap_4kb(root: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapE
     let _guard = pt_lock_for(root).lock();
     // SAFETY: the public contract is forwarded while the root lock is held.
     unsafe { unmap_4kb_locked(root, virt, true) }
+}
+
+/// True when `e` is a valid TABLE descriptor rather than a block or an
+/// invalid entry. Bit 1 distinguishes the two at L1/L2; at L0 with a 4 KiB
+/// granule and a 48-bit VA every valid entry is a table per the ARM ARM.
+#[inline]
+fn entry_is_table(e: PageTableEntry) -> bool {
+    e.is_valid() && (e.raw() & 0b10) != 0
+}
+
+/// Rewrite the permission bits of an existing 4 KiB leaf, preserving its
+/// output address. The x86_64 twin carries the full rationale; the short
+/// version is that `map_4kb` refuses a present leaf and unmap+remap would
+/// leave the page transiently absent under a peer CPU's instruction fetch.
+///
+/// This is a permission *change*, not a translation change, so it is NOT a
+/// break-before-make case: ARMv8 requires BBM when the output address, memory
+/// type, or shareability changes, and none of those move here. Changing only
+/// AP/XN in place is architecturally permitted, which is exactly why
+/// `text_poke` can protect a 4 KiB leaf but cannot split a live 2 MiB block.
+///
+/// Linux ref: `arch/arm64/mm/pageattr.c::__change_memory_common`, same
+/// in-place rewrite followed by a broadcast TLBI.
+///
+/// # Safety
+/// Same contract as [`map_4kb`]. The caller must ensure no CPU depends on the
+/// old permissions once this returns.
+pub unsafe fn protect_4kb(root: PhysAddr, virt: VirtAddr, flags: PtFlags) -> Result<(), MapError> {
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.as_u64() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+
+    let _guard = pt_lock_for(root).lock();
+    let idx = WalkIndices::from_virt(virt);
+
+    // SAFETY: `root` is a live, kernel-reachable translation root per the
+    // caller's contract, and the mutation lock is held.
+    let l0 = unsafe { &*(root.kernel_mut_ptr::<PageTable>()) };
+    let l0e = l0.entries[idx.l0];
+    if !entry_is_table(l0e) {
+        return Err(if l0e.is_valid() {
+            MapError::EncounteredBlock
+        } else {
+            MapError::NotMapped
+        });
+    }
+
+    // SAFETY: a table descriptor names a live next-level table in kernel-
+    // reachable memory.
+    let l1 = unsafe { &*(l0e.addr().kernel_mut_ptr::<PageTable>()) };
+    let l1e = l1.entries[idx.l1];
+    if !entry_is_table(l1e) {
+        return Err(if l1e.is_valid() {
+            MapError::EncounteredBlock
+        } else {
+            MapError::NotMapped
+        });
+    }
+
+    // SAFETY: as above.
+    let l2 = unsafe { &*(l1e.addr().kernel_mut_ptr::<PageTable>()) };
+    let l2e = l2.entries[idx.l2];
+    if !entry_is_table(l2e) {
+        return Err(if l2e.is_valid() {
+            MapError::EncounteredBlock
+        } else {
+            MapError::NotMapped
+        });
+    }
+
+    // SAFETY: as above — a live L3 table.
+    let l3 = unsafe { &mut *(l2e.addr().kernel_mut_ptr::<PageTable>()) };
+    let leaf = l3.entries[idx.l3];
+    if !leaf.is_valid() {
+        return Err(MapError::NotMapped);
+    }
+
+    // Same descriptor skeleton `map_4kb_locked` builds: without AF the first
+    // fetch after this takes an Access Flag fault, and without TYPE_PAGE at
+    // L3 the descriptor decodes as reserved.
+    let base = PtFlags::VALID
+        | PtFlags::TYPE_PAGE
+        | PtFlags::AF
+        | PtFlags::SH_INNER
+        | PtFlags::ATTR_NORMAL;
+    l3.entries[idx.l3] = PageTableEntry::new(leaf.addr(), base | flags);
+
+    // SAFETY: publish the descriptor, then retire the stale translation on
+    // every PE in the inner-shareable domain — peers may hold the old,
+    // more-permissive entry.
+    unsafe {
+        publish_table_write();
+        tlb_invalidate_va_all_asids_inner_shareable(virt);
+    }
+    Ok(())
 }
 
 /// If the last-level (L3) table covering `virt` in `root` holds no valid

@@ -805,6 +805,10 @@ fn arc_test_module(name: &str, abi: u32) -> Arc<crate::loader::Module> {
         manifest: mf,
         domain: narf_lib::id::DomainId::SCRATCH,
         image_size: 0,
+        // No mapped image: these helpers exercise the lifecycle, registry and
+        // param paths, not the loader, so there is nothing to map. Every
+        // consumer treats `None` as "already released".
+        image: narf_lib::sync::IrqSafeSpinLock::new(None),
         placements: Vec::new(),
         init_addr: noop_init as usize,
         exit_addr: Some(noop_exit as usize),
@@ -829,6 +833,7 @@ fn arc_test_module_with_params(
         manifest: m.manifest.clone(),
         domain: m.domain,
         image_size: m.image_size,
+        image: narf_lib::sync::IrqSafeSpinLock::new(None),
         placements: Vec::new(),
         init_addr: m.init_addr,
         exit_addr: m.exit_addr,

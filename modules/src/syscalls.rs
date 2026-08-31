@@ -78,6 +78,23 @@ pub fn sys_delete_module(name: &str) -> Result<(), ModuleSyscallError> {
     let _removed = crate::symbols::unregister_exports_of(module.id);
 
     registry::remove(name);
+
+    // Unmap the image last. Everything above has already made the module
+    // unreachable — it is out of the registry and its exports are gone — so
+    // this is the point at which returning the frames is safe.
+    //
+    // NOT yet safe against a CPU still *executing* module code: a task that
+    // entered the module before `invoke_exit` and is preempted inside it
+    // would resume on unmapped text. Closing that needs an RCU grace period
+    // between the sweep above and this free, which is the same gap
+    // `DESIGN.md` records for inter-module symbol references. Linux serialises
+    // this differently — `delete_module` refuses unless the refcount is zero
+    // *and* the module is quiesced via `stop_machine` on
+    // `CONFIG_MODULE_UNLOAD_TAINT_TRACKING` kernels.
+    //
+    // SAFETY: `invoke_exit` returned, the refcount was zero, the exports are
+    // swept, and the registry no longer names this module.
+    unsafe { loader::release_image(&module) };
     Ok(())
 }
 
@@ -137,6 +154,9 @@ impl ModuleSyscallError {
             ModuleSyscallError::Load(LoadError::Relocator(_)) => -8,
             ModuleSyscallError::Load(LoadError::AlreadyLoaded(_)) => -17,
             ModuleSyscallError::Load(LoadError::MissingInit) => -22,
+            // -ENOMEM: no module VA, no frames, or the image could not be
+            // given its final permissions.
+            ModuleSyscallError::Load(LoadError::Image(_)) => -12,
             ModuleSyscallError::InitFailed(_) => -22,
             ModuleSyscallError::ExitFailed(crate::lifecycle::LifecycleError::Busy(_)) => -16,
             ModuleSyscallError::ExitFailed(_) => -22,

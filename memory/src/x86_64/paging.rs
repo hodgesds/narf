@@ -681,6 +681,10 @@ pub enum MapError {
     /// The address isn't in canonical 48-bit form (bits 47–63 must be
     /// uniformly 0 or all-1).
     NonCanonical,
+    /// No present leaf covers the target virtual address. Raised by
+    /// [`protect_4kb`], which rewrites an existing leaf rather than
+    /// installing one.
+    NotMapped,
 }
 
 /// Indices into each level of the 4-level page-table walk.
@@ -1356,6 +1360,86 @@ pub unsafe fn rewrite_4kb_scatter_range(
 pub unsafe fn unmap_4kb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr, MapError> {
     // SAFETY: forwarded caller contract.
     unsafe { unmap_4kb_impl(pml4_phys, virt, true) }
+}
+
+/// Rewrite the permission flags of an existing 4 KiB leaf, preserving its
+/// physical backing.
+///
+/// `map_4kb` refuses to overwrite a present leaf and `unmap_4kb` + `map_4kb`
+/// would open a window in which the page is absent — wrong for kernel text
+/// that a peer CPU may be fetching from. This is the missing third operation:
+/// permissions change, translation does not.
+///
+/// The invalidation is **global** (broadcast), not the local `invlpg` a fresh
+/// mapping gets away with: peer CPUs may hold a cached translation carrying
+/// the OLD permissions, and every caller here is *restricting* them (RW+NX →
+/// RX for module text, → RO for rodata). A local-only flush would leave peers
+/// able to write memory this call just made read-only.
+///
+/// Linux ref: `arch/x86/mm/pat/set_memory.c::change_page_attr_set_clr`, which
+/// likewise rewrites leaves in place and follows with a cross-CPU flush.
+///
+/// # Safety
+/// Same identity-mapping and live-root contract as [`map_4kb`]. The caller is
+/// responsible for ensuring no CPU depends on the old permissions after this
+/// returns.
+pub unsafe fn protect_4kb(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+
+    // Same per-root lock `map_4kb`/`unmap_4kb` take: the walk plus the leaf
+    // rewrite must not interleave with a concurrent map/unmap of the same
+    // root.
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+
+    let idx = WalkIndices::from_virt(virt);
+    // SAFETY: caller guarantees `pml4_phys` is a live, identity-reachable root.
+    let pml4 = unsafe { &*pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4e = pml4.entries[idx.pml4];
+    if !pml4e.is_present() {
+        return Err(MapError::NotMapped);
+    }
+
+    // SAFETY: `pml4e` is present, so its address names a live PDPT that lives
+    // in identity-mapped low RAM like every other page table.
+    let pdpt = unsafe { &*pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpte = pdpt.entries[idx.pdpt];
+    if !pdpte.is_present() {
+        return Err(MapError::NotMapped);
+    }
+    if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+
+    // SAFETY: as above — present, non-huge entry naming a live PD.
+    let pd = unsafe { &*pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pde = pd.entries[idx.pd];
+    if !pde.is_present() {
+        return Err(MapError::NotMapped);
+    }
+    if pde.flags().contains(PtFlags::HUGE_PAGE) {
+        return Err(MapError::EncounteredHugePage);
+    }
+
+    // SAFETY: as above — present, non-huge entry naming a live PT.
+    let pt = unsafe { &mut *pde.addr().as_mut_ptr::<PageTable>() };
+    let leaf = pt.entries[idx.pt];
+    if !leaf.is_present() {
+        return Err(MapError::NotMapped);
+    }
+    pt.entries[idx.pt] = PageTableEntry::new(leaf.addr(), flags | PtFlags::PRESENT);
+
+    // SAFETY: INVLPG and its broadcast wrapper are always legal at CPL=0.
+    unsafe { invlpg_global(virt) };
+    Ok(())
 }
 
 /// If the level-1 page table (PT) covering `virt` in `root` holds no present

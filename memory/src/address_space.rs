@@ -5779,6 +5779,10 @@ impl AddressSpace {
                 AddressSpaceError::AlignmentMismatch
             }
             MapError::AlreadyMapped | MapError::EncounteredHugePage => AddressSpaceError::Overlap,
+            // Only `protect_4kb` raises this, and the install path never
+            // calls it — a leaf it is about to create cannot already be
+            // absent. Mapped for exhaustiveness.
+            MapError::NotMapped => AddressSpaceError::Unmapped,
         }
     }
 
@@ -5795,6 +5799,8 @@ impl AddressSpace {
                 AddressSpaceError::AlignmentMismatch
             }
             MapError::AlreadyMapped | MapError::EncounteredBlock => AddressSpaceError::Overlap,
+            // See the x86_64 twin: unreachable from the install path.
+            MapError::NotMapped => AddressSpaceError::Unmapped,
         }
     }
 
