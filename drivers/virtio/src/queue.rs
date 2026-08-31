@@ -121,6 +121,25 @@ pub struct Virtqueue {
     /// Free descriptors stack.
     free_head: Option<u16>,
     num_free: u16,
+
+    /// VIRTIO_RING_F_EVENT_IDX negotiated. When set, `needs_kick` consults the
+    /// device-published `avail_event` (via `vring_need_event`) instead of the
+    /// coarse VIRTQ_USED_F_NO_NOTIFY flag, suppressing far more TX-notify
+    /// VM-exits under load (each notify is a VM-exit to QEMU; on the SLIRP
+    /// backend that host crossing dominates the feed cost).
+    event_idx: bool,
+    /// The `avail_idx` value at the last notification the driver sent —
+    /// `old_idx` for `vring_need_event`.
+    last_notify_avail: u16,
+}
+
+/// Linux `vring_need_event`: with EVENT_IDX, notify the device iff its
+/// published `event_idx` (the avail index it wants a kick at) lies in the
+/// window of avail indices we just published `(old_idx, new_idx]`. Wrapping
+/// u16 arithmetic per the virtio spec §2.7.10.
+#[inline]
+fn vring_need_event(event_idx: u16, new_idx: u16, old_idx: u16) -> bool {
+    new_idx.wrapping_sub(event_idx).wrapping_sub(1) < new_idx.wrapping_sub(old_idx)
 }
 
 // SAFETY: Virtqueue owns its raw pointers (derived from layout) and
@@ -173,11 +192,19 @@ impl Virtqueue {
             last_used_idx: 0,
             free_head: Some(0),
             num_free: layout.capacity,
+            event_idx: false,
+            last_notify_avail: 0,
         }
     }
 
     pub fn capacity(&self) -> u16 {
         self.layout.capacity
+    }
+
+    /// Enable the EVENT_IDX notification protocol on this queue (call once at
+    /// bring-up if the transport negotiated VIRTIO_RING_F_EVENT_IDX).
+    pub fn set_event_idx(&mut self, on: bool) {
+        self.event_idx = on;
     }
 
     fn desc_table(&self) -> *mut VirtqDesc {
@@ -329,12 +356,32 @@ impl Virtqueue {
     /// In VIRTIO 1.0 (without EVENT_IDX), this is checked via the `used` ring's
     /// flags. If `VIRTQ_USED_F_NO_NOTIFY` (bit 0) is set, the device is actively
     /// processing the queue and does not need a kick.
-    pub fn needs_kick(&self) -> bool {
+    pub fn needs_kick(&mut self) -> bool {
         // Full barrier: our prior `avail_idx` store (in `submit`) must be
-        // visible to the device before we load its NO_NOTIFY flag, or the
-        // store→load reorder x86 permits lets us read a stale flag and skip
-        // a kick the device needed. Requires a real hardware fence.
+        // visible to the device before we load its notification state, or the
+        // store→load reorder x86 permits lets us read stale state and skip a
+        // kick the device needed. Requires a real hardware fence.
         virtio_mb();
+        if self.event_idx {
+            // EVENT_IDX: the device publishes `avail_event` (the avail index it
+            // wants a kick at) in the last u16 of the used ring. Notify only
+            // when our newly-published range crosses it. Used ring layout:
+            // flags(u16) idx(u16) ring[N](8B) avail_event(u16) → avail_event is
+            // at u16 offset 2 + N*4.
+            let cap = self.layout.capacity as usize;
+            // SAFETY: used ring is DMA memory sized for `capacity` entries plus
+            // the trailing avail_event u16 by VirtqueueLayout::new.
+            let avail_event =
+                unsafe { core::ptr::read_volatile(self.used_base().add(2 + cap * 4)) };
+            let new_idx = self.avail_idx;
+            let old_idx = self.last_notify_avail;
+            let need = vring_need_event(avail_event, new_idx, old_idx);
+            if need {
+                self.last_notify_avail = new_idx;
+            }
+            return need;
+        }
+        // VIRTIO 1.0 fallback: the coarse VIRTQ_USED_F_NO_NOTIFY flag.
         // SAFETY: used ring is identity-mapped DMA; offset +0 = flags.
         let flags = unsafe { core::ptr::read_volatile(self.used_base()) };
         (flags & 1) == 0
@@ -373,6 +420,22 @@ impl Virtqueue {
         let elem = unsafe { core::ptr::read_volatile(ring.add(slot)) };
 
         self.last_used_idx = self.last_used_idx.wrapping_add(1);
+        // EVENT_IDX: publish `used_event` = the index we've now consumed, so the
+        // device raises the next interrupt only when a NEW completion arrives
+        // (used_idx passes this). Without EVENT_IDX the device honours the avail
+        // ring's NO_INTERRUPT flag instead; with it negotiated, the flag is
+        // ignored and used_event is the sole interrupt control — so an RX queue
+        // whose forwarder parks on the IRQ would never wake without this write.
+        // Avail ring layout: flags(u16) idx(u16) ring[N](u16) used_event(u16) →
+        // used_event is at u16 offset 2 + N.
+        if self.event_idx {
+            let cap = self.layout.capacity as usize;
+            // SAFETY: avail ring is DMA memory sized for `capacity` entries plus
+            // the trailing used_event u16 by VirtqueueLayout::new.
+            unsafe {
+                core::ptr::write_volatile(self.avail_base().add(2 + cap), self.last_used_idx);
+            }
+        }
         Some((elem.id, elem.len))
     }
 }
