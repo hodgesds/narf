@@ -723,17 +723,23 @@ jobs:
       # The hardware tests that need capabilities GHA's old TCG qemu64
       # CPU lacks — x2APIC (the TLB-shootdown / IPI smokes) and the
       # cache-topology CPUID leaf — detect their absence and Skip.
-      - name: cargo xtask test --features cgroup-all
+      - name: cargo xtask test --features cgroup-all,container
         env:
           XTASK_QEMU_TIMEOUT_SECS: "2400"
           XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
         run: |
+          # `container` matches run_ci_locally.sh, which has carried it (and
+          # the reason) since the namespace tests landed: cgroup-all alone
+          # leaves every `container`-gated path compiled-but-unregistered, so
+          # the user/PID-namespace tests assert against code that is not in
+          # the image. The two gates had drifted, which is why
+          # `smoke_abi_caps_*` passed locally and failed here.
           SUBS="${{ needs.changes.outputs.subsystems }}"
           if [ -n "$SUBS" ]; then
             echo "kernel-test: affected-subsystem filter = $SUBS"
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all --subsystem "$SUBS"
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container --subsystem "$SUBS"
           else
-            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all
+            cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container
           fi
 
   feature-matrix:
