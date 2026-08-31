@@ -1408,6 +1408,18 @@ fn smoke_userspace_sigaltstack_install_and_query() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_sigaltstack_install_and_query);
 
 fn smoke_userspace_sigaltstack_rejects_too_small() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel stack/heap pointers as stand-in user buffers.
+    // `validate_user_range` confines a real syscall to the user half, so the
+    // scoped opt-in is what keeps the fixture working without weakening the
+    // production predicate. See `handlers::kernel_buffers_guard`.
+    //
+    // Required on aarch64 and merely invisible on x86_64: there, kernel data
+    // sits in the low identity map (virt == phys, below `USER_VA_LIMIT`), so a
+    // kernel pointer satisfies `in_user_half` by accident. aarch64 kernel
+    // pointers are `0xFFFF_FF80_…` in the high half and are correctly
+    // rejected, so the fixture only worked on one architecture.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
@@ -1790,6 +1802,18 @@ kernel_test_in!(
 );
 
 fn smoke_userspace_rt_sigtimedwait_no_pending_returns_minus_one() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly and
+    // passes it kernel stack/heap pointers as stand-in user buffers.
+    // `validate_user_range` confines a real syscall to the user half, so the
+    // scoped opt-in is what keeps the fixture working without weakening the
+    // production predicate. See `handlers::kernel_buffers_guard`.
+    //
+    // Required on aarch64 and merely invisible on x86_64: there, kernel data
+    // sits in the low identity map (virt == phys, below `USER_VA_LIMIT`), so a
+    // kernel pointer satisfies `in_user_half` by accident. aarch64 kernel
+    // pointers are `0xFFFF_FF80_…` in the high half and are correctly
+    // rejected, so the fixture only worked on one architecture.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global,
