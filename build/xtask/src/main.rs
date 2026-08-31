@@ -3675,11 +3675,43 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     let fw_dir = root.join("target").join("firmware");
     let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &args.build.initramfs_firmware)?;
+
+    // `XTASK_STAGE_BIN=/host/path[:guest/name]` puts an arbitrary host file
+    // into the guest's initramfs, so a Linux binary can be driven with
+    // `--cmd` without teaching xtask about that binary. Used for the
+    // stress-ng sweep, where the SAME file has to reach NARF and a real
+    // Linux kernel for the comparison to mean anything.
+    let staged: Option<(String, Vec<u8>)> = match std::env::var("XTASK_STAGE_BIN") {
+        Ok(spec) if !spec.is_empty() => {
+            let (host, guest) = match spec.split_once(':') {
+                Some((h, g)) => (h.to_string(), g.to_string()),
+                None => {
+                    let name = Path::new(&spec)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "staged".into());
+                    (spec.clone(), format!("bin/{name}"))
+                }
+            };
+            let bytes =
+                std::fs::read(&host).with_context(|| format!("XTASK_STAGE_BIN: reading {host}"))?;
+            println!(
+                "xtask: staging {host} ({} bytes) -> guest /{guest}",
+                bytes.len()
+            );
+            Some((guest, bytes))
+        }
+        _ => None,
+    };
+
     let mut cpio_path = None;
-    if !fw_initramfs.is_empty() {
+    if !fw_initramfs.is_empty() || staged.is_some() {
         let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
         for (path, bytes) in &fw_initramfs {
             cpio_entries.push((path.as_str(), bytes.as_slice()));
+        }
+        if let Some((name, bytes)) = &staged {
+            cpio_entries.push((name.as_str(), bytes.as_slice()));
         }
         let cpio = encode_cpio_newc(&cpio_entries);
         let p = out_dir.join("initramfs.cpio");
