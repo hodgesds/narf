@@ -347,12 +347,12 @@ unsafe fn leaf_is_writable(root: PhysAddr, va: u64) -> Option<bool> {
     let idx = WalkIndices::from_virt(VirtAddr::new(va));
     // SAFETY: read-only walk of live, identity-reachable page tables.
     unsafe {
-        let pml4 = &*root.as_ptr::<PageTable>();
+        let pml4 = &*root.kernel_ptr::<PageTable>();
         let e = pml4.entries[idx.pml4];
         if !e.is_present() {
             return None;
         }
-        let pdpt = &*e.addr().as_ptr::<PageTable>();
+        let pdpt = &*e.addr().kernel_ptr::<PageTable>();
         let pe = pdpt.entries[idx.pdpt];
         if !pe.is_present() {
             return None;
@@ -360,7 +360,7 @@ unsafe fn leaf_is_writable(root: PhysAddr, va: u64) -> Option<bool> {
         if pe.flags().contains(PtFlags::HUGE_PAGE) {
             return Some(pe.flags().contains(PtFlags::WRITABLE));
         }
-        let pd = &*pe.addr().as_ptr::<PageTable>();
+        let pd = &*pe.addr().kernel_ptr::<PageTable>();
         let de = pd.entries[idx.pd];
         if !de.is_present() {
             return None;
@@ -368,7 +368,7 @@ unsafe fn leaf_is_writable(root: PhysAddr, va: u64) -> Option<bool> {
         if de.flags().contains(PtFlags::HUGE_PAGE) {
             return Some(de.flags().contains(PtFlags::WRITABLE));
         }
-        let pt = &*de.addr().as_ptr::<PageTable>();
+        let pt = &*de.addr().kernel_ptr::<PageTable>();
         let te = pt.entries[idx.pt];
         if !te.is_present() {
             return None;
@@ -446,12 +446,12 @@ unsafe fn set_leaf_writable(
         // identity-reachable RAM and every level below the top was built by
         // `init_mmu` or by `split_leaf` below.
         unsafe {
-            let pml4 = &mut *root.as_mut_ptr::<PageTable>();
+            let pml4 = &mut *root.kernel_mut_ptr::<PageTable>();
             let e = pml4.entries[idx.pml4];
             if !e.is_present() {
                 return Err(PokeError::Walk);
             }
-            let pdpt = &mut *e.addr().as_mut_ptr::<PageTable>();
+            let pdpt = &mut *e.addr().kernel_mut_ptr::<PageTable>();
             let pe = pdpt.entries[idx.pdpt];
             if !pe.is_present() {
                 return Err(PokeError::Walk);
@@ -460,7 +460,7 @@ unsafe fn set_leaf_writable(
                 split_leaf(&mut pdpt.entries[idx.pdpt], true)?;
                 continue;
             }
-            let pd = &mut *pe.addr().as_mut_ptr::<PageTable>();
+            let pd = &mut *pe.addr().kernel_mut_ptr::<PageTable>();
             let de = pd.entries[idx.pd];
             if !de.is_present() {
                 return Err(PokeError::Walk);
@@ -473,7 +473,7 @@ unsafe fn set_leaf_writable(
                 split_leaf(&mut pd.entries[idx.pd], false)?;
                 continue;
             }
-            let pt = &mut *de.addr().as_mut_ptr::<PageTable>();
+            let pt = &mut *de.addr().kernel_mut_ptr::<PageTable>();
             if !pt.entries[idx.pt].is_present() {
                 return Err(PokeError::Walk);
             }
@@ -543,7 +543,7 @@ unsafe fn split_leaf(
     // SAFETY: a frame the buddy just handed us exclusively, identity-reachable
     // like every other page table in this tree.
     unsafe {
-        let t = &mut *table.as_mut_ptr::<PageTable>();
+        let t = &mut *table.kernel_mut_ptr::<PageTable>();
         for (i, slot) in t.entries.iter_mut().enumerate() {
             *slot = PageTableEntry::from_raw((base + (i as u64) * step) | child_flags);
         }

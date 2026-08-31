@@ -434,7 +434,7 @@ pub fn reserve_kernel_slot() -> Result<(), ModuleTextError> {
 unsafe fn reserve_top_slot(root: PhysAddr, slot: usize) -> Result<(), ModuleTextError> {
     use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
     // SAFETY: caller's contract — live kernel PML4, identity-reachable.
-    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
     if pml4.entries[slot].is_present() {
         return Ok(());
     }
@@ -973,10 +973,10 @@ fn smoke_module_text_pages_carry_their_domain_key() -> TestResult {
             // SAFETY: read-only walk of the live kernel root; every level was
             // installed by `alloc` through this same root.
             let key = unsafe {
-                let pml4 = &*root.as_ptr::<PageTable>();
-                let pdpt = &*pml4.entries[idx.pml4].addr().as_ptr::<PageTable>();
-                let pd = &*pdpt.entries[idx.pdpt].addr().as_ptr::<PageTable>();
-                let pt = &*pd.entries[idx.pd].addr().as_ptr::<PageTable>();
+                let pml4 = &*root.kernel_ptr::<PageTable>();
+                let pdpt = &*pml4.entries[idx.pml4].addr().kernel_ptr::<PageTable>();
+                let pd = &*pdpt.entries[idx.pdpt].addr().kernel_ptr::<PageTable>();
+                let pt = &*pd.entries[idx.pd].addr().kernel_ptr::<PageTable>();
                 PtFlags::pk_of(pt.entries[idx.pt].flags())
             };
             if key != domain.raw() {

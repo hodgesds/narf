@@ -422,43 +422,76 @@ fn smoke_direct_map_installed() -> TestResult {
     use narf_arch::x86_64::cr;
 
     if !crate::direct_map_live() {
-        // Built only when RAM > 512 GiB; the CI machine is smaller, so
-        // there is nothing to inspect. The >512 GiB path is exercised
-        // by a manual large-RAM boot.
-        return TestResult::Skip("direct map not built (RAM <= 512 GiB)");
+        // The map is built unconditionally now (it is how the kernel
+        // reaches physical memory at all), so absence is a real failure
+        // rather than a small-RAM skip.
+        return TestResult::Fail("direct map not live");
     }
 
-    // Walk the live kernel PML4. Page-table frames are < 4 GiB, so the
-    // low identity map (`as_ptr`) reaches them regardless of the direct
-    // map. SAFETY: CR3 read at CPL=0.
+    /// Resolve a kernel VA to a physical address, honouring a PS=1 leaf at
+    /// any level.
+    ///
+    /// The direct map is built as 1-GiB leaves, but it does not stay that
+    /// way, and asserting the leaf size was wrong. `text_poke::split_leaf`
+    /// splits a huge leaf into 512 children whenever `protect_ro` /
+    /// `protect_rw` adjusts the kernel *alias* of a physical page -- which
+    /// is how W^X is enforced for module and BPF text. That alias used to
+    /// live in the PML4[0] identity map; freeing the low half moved it into
+    /// the direct map, so the splitting lands here now. The split preserves
+    /// the translation and the flags, so what this smoke must check is that
+    /// `BASE + P` still resolves to `P` -- not which leaf size it uses.
+    unsafe fn translate(pml4_phys: u64, va: u64) -> Option<u64> {
+        // SAFETY: every table on the walk is reachable through the direct map.
+        unsafe {
+            let ent = |tbl: u64, idx: u64| {
+                core::ptr::read_volatile(PhysAddr::new(tbl + idx * 8).kernel_ptr::<u64>())
+            };
+            const ADDR: u64 = 0x000F_FFFF_FFFF_F000;
+            const PS: u64 = 1 << 7;
+
+            let e4 = ent(pml4_phys, (va >> 39) & 0x1FF);
+            if e4 & 1 == 0 {
+                return None;
+            }
+            let e3 = ent(e4 & ADDR, (va >> 30) & 0x1FF);
+            if e3 & 1 == 0 {
+                return None;
+            }
+            if e3 & PS != 0 {
+                return Some((e3 & 0x000F_FFFF_C000_0000) | (va & 0x3FFF_FFFF));
+            }
+            let e2 = ent(e3 & ADDR, (va >> 21) & 0x1FF);
+            if e2 & 1 == 0 {
+                return None;
+            }
+            if e2 & PS != 0 {
+                return Some((e2 & 0x000F_FFFF_FFE0_0000) | (va & 0x001F_FFFF));
+            }
+            let e1 = ent(e2 & ADDR, (va >> 12) & 0x1FF);
+            if e1 & 1 == 0 {
+                return None;
+            }
+            Some((e1 & ADDR) | (va & 0xFFF))
+        }
+    }
+
+    // SAFETY: CR3 read at CPL=0.
     let cr3 = unsafe { cr::read_cr3() };
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
-    // PML4[384] = the first direct-map slot (covers phys [0, 512 GiB)).
-    let base = crate::KERNEL_DIRECT_MAP_PML4_BASE as u64;
-    let e_ptr = PhysAddr::new(pml4_phys + base * 8).as_ptr::<u64>();
-    // SAFETY: PML4 base is identity-mapped; offset base*8 is in-page.
-    let e0 = unsafe { core::ptr::read_volatile(e_ptr) };
-    if e0 & 1 == 0 {
-        return TestResult::Fail("PML4[384] (direct map) not present");
-    }
-    let pdpt_phys = e0 & 0x000F_FFFF_FFFF_F000;
-
-    // Spot-check several 1-GiB huge-page entries map the right phys.
+    // Spot-check that the window maps phys P at BASE + P. Probes span the
+    // 512-GiB slot, including addresses with no RAM behind them (the map
+    // blankets the whole slot; nothing dereferences these).
     for gib in [0u64, 1, 3, 7, 511] {
-        let ep = PhysAddr::new(pdpt_phys + gib * 8).as_ptr::<u64>();
-        // SAFETY: PDPT base is identity-mapped; offset in-page.
-        let e = unsafe { core::ptr::read_volatile(ep) };
-        if e & 1 == 0 {
-            return TestResult::Fail("direct-map PDPT entry not present");
-        }
-        if e & (1 << 7) == 0 {
-            return TestResult::Fail("direct-map entry not a 1-GiB huge page");
-        }
-        // 1-GiB huge-page frame bits are [51:30].
-        let mapped = e & 0x000F_FFFF_C000_0000;
-        if mapped != (gib << 30) {
-            return TestResult::Fail("direct-map entry maps wrong physical address");
+        let phys = gib << 30;
+        let va = crate::KERNEL_DIRECT_MAP_BASE | phys;
+        // SAFETY: walking live kernel tables through the direct map.
+        match unsafe { translate(pml4_phys, va) } {
+            None => return TestResult::Fail("direct-map VA does not translate"),
+            Some(got) if got != phys => {
+                return TestResult::Fail("direct-map VA translates to the wrong physical address")
+            }
+            Some(_) => {}
         }
     }
     TestResult::Pass
@@ -466,44 +499,54 @@ fn smoke_direct_map_installed() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_direct_map_installed);
 
-/// The kernel RAM accessors are consistent: low frames (< 512 GiB, all
-/// that exist on the CI machine) stay identity-mapped so `ptr == phys`
-/// — that identity is what keeps the mass of `phys as *mut` code correct
-/// — and a real frame is dereferenceable through `kernel_mut_ptr`.
+/// A LOW frame (< 512 GiB — all that exist on the CI machine) is reached
+/// through the high-half direct map, not an identity map: `kernel_mut_ptr`
+/// applies the offset for every frame, the pointer is dereferenceable, and
+/// `from_kernel_ptr` inverts it.
+///
+/// This is the inverse of what this smoke asserted before the low half was
+/// freed. `kernel_mut_ptr` used to return `phys` unchanged below 512 GiB so
+/// that identity-assuming code stayed correct; that is exactly what pinned
+/// PML4[0] to an identity map and kept ordinary Linux `ET_EXEC` binaries
+/// (PT_LOAD at 0x400000) from loading. `ptr == phys` is now a bug, not an
+/// invariant, so the test asserts the offset is applied.
 #[cfg(target_arch = "x86_64")]
-fn smoke_direct_map_low_frame_is_identity() -> TestResult {
+fn smoke_direct_map_low_frame_uses_direct_map() -> TestResult {
     use crate::PhysAddr;
 
-    // Valid whether or not the direct map was built: a < 512 GiB frame
-    // is identity-mapped either way (the direct map only offsets frames
-    // the low identity map can't reach).
+    if !crate::direct_map_live() {
+        return TestResult::Fail("direct map is not live (it is now built unconditionally)");
+    }
+
     let frame = match crate::alloc_frame() {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let phys: PhysAddr = frame.start_address();
-    let id_ptr = phys.as_mut_ptr::<u64>();
     let km_ptr = phys.kernel_mut_ptr::<u64>();
 
     let result = (|| {
-        // A < 512 GiB frame must map identity: kernel_mut_ptr == phys.
-        if km_ptr as u64 != phys.raw() {
-            return TestResult::Fail("low frame not identity-mapped by kernel_mut_ptr");
+        // The offset applies to low frames too: ptr != phys, and the
+        // pointer lands inside the direct-map window.
+        if km_ptr as u64 != (phys.raw() | crate::KERNEL_DIRECT_MAP_BASE) {
+            return TestResult::Fail("low frame did not take the direct-map offset");
         }
-        if !core::ptr::eq(km_ptr, id_ptr) {
-            return TestResult::Fail("kernel_mut_ptr != as_mut_ptr for a low frame");
+        if (km_ptr as u64) < crate::KERNEL_DIRECT_MAP_BASE {
+            return TestResult::Fail("kernel_mut_ptr fell outside the direct-map window");
         }
-        // from_kernel_ptr must round-trip.
+        // from_kernel_ptr must still invert it.
         if PhysAddr::from_kernel_ptr(km_ptr).raw() != phys.raw() {
             return TestResult::Fail("from_kernel_ptr did not round-trip a low frame");
         }
-        // Dereferenceable through kernel_mut_ptr.
+        // And the mapping must actually be backed: write then read back
+        // through the direct-map pointer.
         let sentinel: u64 = 0xA5A5_1234_DEAD_BEEF;
-        // SAFETY: `phys` is a freshly-allocated, exclusively-owned frame.
+        // SAFETY: `phys` is a freshly-allocated, exclusively-owned frame,
+        // reachable at `km_ptr` through the direct map.
         unsafe {
             core::ptr::write_volatile(km_ptr, sentinel);
-            if core::ptr::read_volatile(phys.as_ptr::<u64>()) != sentinel {
-                return TestResult::Fail("kernel_mut_ptr write not visible via identity");
+            if core::ptr::read_volatile(phys.kernel_ptr::<u64>()) != sentinel {
+                return TestResult::Fail("direct-map write not read back");
             }
         }
         TestResult::Pass
@@ -513,7 +556,7 @@ fn smoke_direct_map_low_frame_is_identity() -> TestResult {
     result
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_direct_map_low_frame_is_identity);
+kernel_test_in!("memory", smoke_direct_map_low_frame_uses_direct_map);
 
 /// The direct-map address arithmetic is correct for a frame the low
 /// identity map can't reach (>= 512 GiB): `kernel_mut_ptr` applies the
@@ -705,7 +748,7 @@ fn smoke_map_preserves_pk_field() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
 
     let virt = VirtAddr::new(0x9abc_0000);
     let phys = PhysAddr::new(0x8765_0000);
@@ -747,7 +790,7 @@ fn smoke_paging_map_translate_unmap() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
 
     let virt = VirtAddr::new(0x5678_0000);
     let phys = PhysAddr::new(0x1234_0000);
@@ -794,7 +837,7 @@ fn smoke_paging_local_range_unmap_batches_present_leaves() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
     let base = VirtAddr::new(0x567a_0000);
     for (page, phys) in [(0, 0x1235_0000), (2, 0x1235_2000)] {
         // SAFETY: the isolated root is owned by this test; the synthetic
@@ -848,19 +891,19 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
     unsafe fn upper_user_bits(root: PhysAddr, virt: VirtAddr) -> Option<[bool; 3]> {
         let idx = WalkIndices::from_virt(virt);
         // SAFETY: the caller supplies a live, identity-reachable isolated root.
-        let pml4 = unsafe { &*root.as_ptr::<PageTable>() };
+        let pml4 = unsafe { &*root.kernel_ptr::<PageTable>() };
         let pml4e = pml4.entries[idx.pml4];
         if !pml4e.is_present() {
             return None;
         }
         // SAFETY: the present non-leaf entry was created by map_4kb below.
-        let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+        let pdpt = unsafe { &*pml4e.addr().kernel_ptr::<PageTable>() };
         let pdpte = pdpt.entries[idx.pdpt];
         if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
             return None;
         }
         // SAFETY: the verified non-huge entry names a live PD.
-        let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+        let pd = unsafe { &*pdpte.addr().kernel_ptr::<PageTable>() };
         let pde = pd.entries[idx.pd];
         if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
             return None;
@@ -879,7 +922,7 @@ fn smoke_paging_scatter_range_maps_present_and_skips_lazy() -> TestResult {
         }
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
-    PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
     let base = VirtAddr::new(0x567b_0000);
     let backing = [
         PhysAddr::new(0x1236_0000),
@@ -1334,7 +1377,7 @@ kernel_test_in!("memory", smoke_frame_alloc_returns_pointer_in_ram);
 fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
     // Same guarantee for the slab. Catches the case where a slab
     // class is grown from a buddy frame past the early MMU
-    // identity-map ceiling (4 GiB) — every slab object inside
+    // ceiling (4 GiB) — every slab object inside
     use core::alloc::Layout;
     #[cfg(target_arch = "x86_64")]
     let usable_bytes: u64 = 4u64 << 30;
@@ -1349,7 +1392,11 @@ fn smoke_slab_alloc_returns_pointer_in_ram() -> TestResult {
             let layout = Layout::from_size_align(size, size.min(64)).unwrap();
             match crate::slab::alloc(layout) {
                 Ok(p) => {
-                    let raw = p.as_ptr() as u64;
+                    // Slab objects live in buddy frames reached through the
+                    // kernel direct map, so the pointer carries
+                    // KERNEL_DIRECT_MAP_BASE. Invert it to recover the
+                    // physical address the range check is really about.
+                    let raw = crate::PhysAddr::from_kernel_ptr(p.as_ptr()).raw();
                     #[cfg(target_arch = "x86_64")]
                     if raw >= usable_bytes {
                         for (q, ql) in held.drain(..) {
@@ -2265,7 +2312,7 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                     // message names where the path diverges.
                     let v = VirtAddr::new(vbase);
                     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-                    let pml4 = unsafe { &*a.root.as_ptr::<crate::x86_64::paging::PageTable>() };
+                    let pml4 = unsafe { &*a.root.kernel_ptr::<crate::x86_64::paging::PageTable>() };
                     let pml4_idx = (v.raw() >> 39) & 0x1FF;
                     let pdpt_idx = (v.raw() >> 30) & 0x1FF;
                     let pd_idx = (v.raw() >> 21) & 0x1FF;
@@ -2273,15 +2320,16 @@ fn smoke_memory_address_space_materialize() -> TestResult {
                     let pml4e = pml4.entries[pml4_idx as usize];
                     let pdpt_pa = pml4e.addr();
                     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-                    let pdpt = unsafe { &*pdpt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
+                    let pdpt =
+                        unsafe { &*pdpt_pa.kernel_ptr::<crate::x86_64::paging::PageTable>() };
                     let pdpte = pdpt.entries[pdpt_idx as usize];
                     let pd_pa = pdpte.addr();
                     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-                    let pd = unsafe { &*pd_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
+                    let pd = unsafe { &*pd_pa.kernel_ptr::<crate::x86_64::paging::PageTable>() };
                     let pde = pd.entries[pd_idx as usize];
                     let pt_pa = pde.addr();
                     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-                    let pt = unsafe { &*pt_pa.as_ptr::<crate::x86_64::paging::PageTable>() };
+                    let pt = unsafe { &*pt_pa.kernel_ptr::<crate::x86_64::paging::PageTable>() };
                     let pte = pt.entries[pt_idx as usize];
                     let msg = alloc::format!(
                         "translate: target={:#x} got={:#x} root={:#x} \
@@ -2678,7 +2726,7 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
         let mut tables = alloc::vec![address_space.root];
         // SAFETY: the materialized root and each verified present descriptor
         // are identity-reachable, live, and exclusively owned by this test.
-        let pml4 = unsafe { &*address_space.root.as_ptr::<PageTable>() };
+        let pml4 = unsafe { &*address_space.root.kernel_ptr::<PageTable>() };
         for base in bases {
             let pml4e = pml4.entries[((base >> 39) & 0x1ff) as usize];
             if !pml4e.is_present() {
@@ -2687,7 +2735,7 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
             tables.push(pml4e.addr());
             // SAFETY: the present PML4 entry names a live, identity-reachable
             // PDPT in this test's exclusively owned hierarchy.
-            let pdpt = unsafe { &*pml4e.addr().as_ptr::<PageTable>() };
+            let pdpt = unsafe { &*pml4e.addr().kernel_ptr::<PageTable>() };
             let pdpte = pdpt.entries[((base >> 30) & 0x1ff) as usize];
             if !pdpte.is_present() {
                 return TestResult::Fail("sparse fixture is missing a PDPT entry");
@@ -2695,7 +2743,7 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
             tables.push(pdpte.addr());
             // SAFETY: the present PDPT entry names a live, identity-reachable
             // PD in this test's exclusively owned hierarchy.
-            let pd = unsafe { &*pdpte.addr().as_ptr::<PageTable>() };
+            let pd = unsafe { &*pdpte.addr().kernel_ptr::<PageTable>() };
             let pde = pd.entries[((base >> 21) & 0x1ff) as usize];
             if !pde.is_present() {
                 return TestResult::Fail("sparse fixture is missing a PD entry");

@@ -1453,17 +1453,17 @@ fn walk_to_leaf(pml4_phys: PhysAddr, virt: crate::VirtAddr) -> Option<*mut u64> 
     // contract); each level pointer is derived from a present entry's
     // frame address, which is likewise identity-mapped.
     unsafe {
-        let pml4 = &*pml4_phys.as_ptr::<crate::paging::PageTable>();
+        let pml4 = &*pml4_phys.kernel_ptr::<crate::paging::PageTable>();
         let e = pml4.entries[idx.pml4];
         if !e.is_present() {
             return None;
         }
-        let pdpt = &*e.addr().as_ptr::<crate::paging::PageTable>();
+        let pdpt = &*e.addr().kernel_ptr::<crate::paging::PageTable>();
         let e = pdpt.entries[idx.pdpt];
         if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
             return None;
         }
-        let pd = &*e.addr().as_ptr::<crate::paging::PageTable>();
+        let pd = &*e.addr().kernel_ptr::<crate::paging::PageTable>();
         let e = pd.entries[idx.pd];
         if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
             return None;
@@ -1739,7 +1739,7 @@ mod tests {
             Ok(f) => f.start_address(),
             Err(_) => return TestResult::Skip("frame allocator not initialised"),
         };
-        PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+        PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
 
         // Map N pages at distinct VAs, each frame filled with a known
         // byte pattern derived from its index. Use VAs in the empty
@@ -1900,7 +1900,7 @@ mod tests {
             Ok(f) => f.start_address(),
             Err(_) => return TestResult::Skip("frame allocator not initialised"),
         };
-        PageTable::zero_at(pml4.as_mut_ptr::<PageTable>());
+        PageTable::zero_at(pml4.kernel_mut_ptr::<PageTable>());
 
         const N: usize = 3;
         let base_va = 0x0000_0100_0000_0000u64;

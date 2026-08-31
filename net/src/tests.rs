@@ -291,7 +291,7 @@ fn smoke_net_loopback_roundtrip() -> TestResult {
         };
         // SAFETY: buf is exclusively owned here; identity-mapped low-RAM.
         unsafe {
-            let dst = buf.phys_addr().as_mut_ptr::<u8>();
+            let dst = buf.phys_addr().kernel_mut_ptr::<u8>();
             for (i, b) in PAYLOAD.iter().enumerate() {
                 core::ptr::write_volatile(dst.add(i), *b);
             }
@@ -311,7 +311,7 @@ fn smoke_net_loopback_roundtrip() -> TestResult {
         let mut ok = used as usize == PAYLOAD.len();
         // SAFETY: buf ownership transferred here; identity-mapped read.
         unsafe {
-            let src = buf.phys_addr().as_ptr::<u8>();
+            let src = buf.phys_addr().kernel_ptr::<u8>();
             for (i, expected) in PAYLOAD.iter().enumerate() {
                 if core::ptr::read_volatile(src.add(i)) != *expected {
                     ok = false;

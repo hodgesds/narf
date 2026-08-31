@@ -364,7 +364,7 @@ pub fn reserve_kernel_slot() -> Result<(), VmallocError> {
 unsafe fn reserve_slot(root: PhysAddr, slot: usize) -> Result<(), VmallocError> {
     use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
     // SAFETY: caller's contract — live kernel PML4.
-    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
     if pml4.entries[slot].is_present() {
         return Ok(());
     }

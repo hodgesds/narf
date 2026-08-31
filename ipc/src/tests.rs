@@ -283,7 +283,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // allocated length at byte granularity.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let dst = buf.phys_addr().as_mut_ptr::<u8>();
+            let dst = buf.phys_addr().kernel_mut_ptr::<u8>();
             for (i, b) in PATTERN.iter().enumerate() {
                 core::ptr::write_volatile(dst.add(i), *b);
             }
@@ -314,7 +314,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // allocated length — every `src.add(i)` is in-bounds.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let src = buf.phys_addr().as_ptr::<u8>();
+            let src = buf.phys_addr().kernel_ptr::<u8>();
             for (i, expected) in PATTERN.iter().enumerate() {
                 if core::ptr::read_volatile(src.add(i)) != *expected {
                     ok = false;
@@ -1408,10 +1408,13 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
     let mut sample_bad: u64 = 0;
     for _ in 0..256 {
         let (p, c) = crate::channel::<u64, 4>();
-        let ptr = p.__ring_ptr_for_test() as u64;
-        // Heap allocations land below the 4 GiB early identity-
-        // map ceiling on x86_64, and above 0 (Arc::as_ptr is never
-        // null on a live Arc).
+        // The kernel heap is reached through the high-half direct map, so
+        // the raw pointer carries KERNEL_DIRECT_MAP_BASE. Invert it to get
+        // the physical address the RAM-range check is really about; the
+        // canary is about *which frame* the Ring landed in, not which VA.
+        let ptr = narf_memory::PhysAddr::from_kernel_ptr(p.__ring_ptr_for_test()).raw();
+        // Heap allocations land below the 4 GiB ceiling on x86_64, and
+        // above 0 (Arc::as_ptr is never null on a live Arc).
         #[cfg(target_arch = "x86_64")]
         let is_bad = ptr == 0 || ptr >= (4u64 << 30);
         #[cfg(not(target_arch = "x86_64"))]
@@ -1423,8 +1426,10 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
                 sample_bad = ptr;
             }
         }
-        // Also check the consumer matches.
-        let cptr = c.__ring_ptr_for_test() as u64;
+        // Also check the consumer matches. Invert the direct-map offset on
+        // this one too -- comparing a physical address against a raw kernel
+        // pointer can never match.
+        let cptr = narf_memory::PhysAddr::from_kernel_ptr(c.__ring_ptr_for_test()).raw();
         if cptr != ptr {
             return TestResult::Fail("producer/consumer point at different rings");
         }

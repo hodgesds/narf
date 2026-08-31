@@ -810,14 +810,14 @@ pub(crate) unsafe fn map_2mb_locked(
     if flags.contains(PtFlags::USER) {
         table_flags |= PtFlags::USER;
     }
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags)? };
-    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pdpt_phys.kernel_mut_ptr::<PageTable>() };
     if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
     let pd_phys = unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], table_flags)? };
-    let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &mut *pd_phys.kernel_mut_ptr::<PageTable>() };
     if pd.entries[idx.pd].is_present() {
         return Err(MapError::AlreadyMapped);
     }
@@ -872,9 +872,9 @@ pub(crate) unsafe fn map_1gb_locked(
     if flags.contains(PtFlags::USER) {
         table_flags |= PtFlags::USER;
     }
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], table_flags)? };
-    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pdpt_phys.kernel_mut_ptr::<PageTable>() };
     if pdpt.entries[idx.pdpt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
@@ -900,17 +900,17 @@ pub unsafe fn unmap_2mb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     }
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let pml4e = pml4.entries[idx.pml4];
     if !pml4e.is_present() {
         return Err(MapError::AlreadyMapped);
     }
-    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
     let pdpte = pdpt.entries[idx.pdpt];
     if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::AlreadyMapped);
     }
-    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
     let leaf = pd.entries[idx.pd];
     if !leaf.is_present() || !leaf.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::AlreadyMapped);
@@ -935,12 +935,12 @@ pub unsafe fn unmap_1gb(pml4_phys: PhysAddr, virt: VirtAddr) -> Result<PhysAddr,
     }
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let pml4e = pml4.entries[idx.pml4];
     if !pml4e.is_present() {
         return Err(MapError::AlreadyMapped);
     }
-    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
     let leaf = pdpt.entries[idx.pdpt];
     if !leaf.is_present() || !leaf.flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::AlreadyMapped);
@@ -1004,14 +1004,14 @@ unsafe fn map_4kb_locked(
     }
 
     // SAFETY: caller guarantees pml4_phys is identity-reachable.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pdpt_phys = unsafe { ensure_next_table(&mut pml4.entries[idx.pml4], base_flags)? };
 
     // SAFETY: pdpt_phys came either from an existing mapping we
     // validated, or from a freshly-allocated frame (identity-mapped).
     // SAFETY: Valid memory or trusted environment
-    let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pdpt_phys.kernel_mut_ptr::<PageTable>() };
     if pdpt.entries[idx.pdpt].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
@@ -1019,7 +1019,7 @@ unsafe fn map_4kb_locked(
     let pd_phys = unsafe { ensure_next_table(&mut pdpt.entries[idx.pdpt], base_flags)? };
 
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &mut *pd_phys.kernel_mut_ptr::<PageTable>() };
     if pd.entries[idx.pd].flags().contains(PtFlags::HUGE_PAGE) {
         return Err(MapError::EncounteredHugePage);
     }
@@ -1027,7 +1027,7 @@ unsafe fn map_4kb_locked(
     let pt_phys = unsafe { ensure_next_table(&mut pd.entries[idx.pd], base_flags)? };
 
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pt = unsafe { &mut *pt_phys.as_mut_ptr::<PageTable>() };
+    let pt = unsafe { &mut *pt_phys.kernel_mut_ptr::<PageTable>() };
     if pt.entries[idx.pt].is_present() {
         return Err(MapError::AlreadyMapped);
     }
@@ -1106,7 +1106,7 @@ pub unsafe fn map_4kb_scatter_range(
 
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     // SAFETY: root is identity-reachable and protected by the mutation guard.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let mut cached_key = usize::MAX;
     let mut cached_pt: *mut PageTable = core::ptr::null_mut();
     let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
@@ -1145,7 +1145,7 @@ pub unsafe fn map_4kb_scatter_range(
                 }
             };
             // SAFETY: ensure_next_table returned a verified table descriptor.
-            let pdpt = unsafe { &mut *pdpt_phys.as_mut_ptr::<PageTable>() };
+            let pdpt = unsafe { &mut *pdpt_phys.kernel_mut_ptr::<PageTable>() };
             // SAFETY: the PDPT slot is live and root-locked for this mutation.
             let pdpte = &mut pdpt.entries[idx.pdpt];
             // SAFETY: pdpte is a live slot protected by the root lock.
@@ -1157,7 +1157,7 @@ pub unsafe fn map_4kb_scatter_range(
                 }
             };
             // SAFETY: ensure_next_table returned a verified table descriptor.
-            let pd = unsafe { &mut *pd_phys.as_mut_ptr::<PageTable>() };
+            let pd = unsafe { &mut *pd_phys.kernel_mut_ptr::<PageTable>() };
             // SAFETY: the PD slot is live and root-locked for this mutation.
             let pde = &mut pd.entries[idx.pd];
             // SAFETY: pde is a live slot protected by the root lock.
@@ -1171,7 +1171,7 @@ pub unsafe fn map_4kb_scatter_range(
             cached_pml4e = pml4e;
             cached_pdpte = pdpte;
             cached_pde = pde;
-            cached_pt = pt_phys.as_mut_ptr::<PageTable>();
+            cached_pt = pt_phys.kernel_mut_ptr::<PageTable>();
         }
 
         // SAFETY: cached_pt belongs to this complete upper-index tuple and is
@@ -1259,7 +1259,7 @@ pub unsafe fn rewrite_4kb_scatter_range(
     // normally touch already-materialized leaves, so this makes the common
     // path one upper walk plus one descriptor store per 512 pages.
     // SAFETY: root is identity-reachable and protected by the mutation guard.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let mut cached_key = usize::MAX;
     let mut cached_pt: *mut PageTable = core::ptr::null_mut();
     let mut cached_pml4e: *mut PageTableEntry = core::ptr::null_mut();
@@ -1282,7 +1282,7 @@ pub unsafe fn rewrite_4kb_scatter_range(
             let pml4e = &mut pml4.entries[idx.pml4];
             if pml4e.is_present() {
                 // SAFETY: verified present table descriptor under root lock.
-                let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+                let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
                 let pdpte = &mut pdpt.entries[idx.pdpt];
                 if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
                     result = Err(MapError::EncounteredHugePage);
@@ -1290,7 +1290,7 @@ pub unsafe fn rewrite_4kb_scatter_range(
                 }
                 if pdpte.is_present() {
                     // SAFETY: verified PDPT table descriptor under root lock.
-                    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+                    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
                     let pde = &mut pd.entries[idx.pd];
                     if pde.flags().contains(PtFlags::HUGE_PAGE) {
                         result = Err(MapError::EncounteredHugePage);
@@ -1300,7 +1300,7 @@ pub unsafe fn rewrite_4kb_scatter_range(
                         cached_pml4e = pml4e;
                         cached_pdpte = pdpte;
                         cached_pde = pde;
-                        cached_pt = pde.addr().as_mut_ptr::<PageTable>();
+                        cached_pt = pde.addr().kernel_mut_ptr::<PageTable>();
                     }
                 }
             }
@@ -1402,7 +1402,7 @@ pub unsafe fn protect_4kb(
 
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller guarantees `pml4_phys` is a live, identity-reachable root.
-    let pml4 = unsafe { &*pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &*pml4_phys.kernel_mut_ptr::<PageTable>() };
     let pml4e = pml4.entries[idx.pml4];
     if !pml4e.is_present() {
         return Err(MapError::NotMapped);
@@ -1410,7 +1410,7 @@ pub unsafe fn protect_4kb(
 
     // SAFETY: `pml4e` is present, so its address names a live PDPT that lives
     // in identity-mapped low RAM like every other page table.
-    let pdpt = unsafe { &*pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &*pml4e.addr().kernel_mut_ptr::<PageTable>() };
     let pdpte = pdpt.entries[idx.pdpt];
     if !pdpte.is_present() {
         return Err(MapError::NotMapped);
@@ -1420,7 +1420,7 @@ pub unsafe fn protect_4kb(
     }
 
     // SAFETY: as above — present, non-huge entry naming a live PD.
-    let pd = unsafe { &*pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &*pdpte.addr().kernel_mut_ptr::<PageTable>() };
     let pde = pd.entries[idx.pd];
     if !pde.is_present() {
         return Err(MapError::NotMapped);
@@ -1430,7 +1430,7 @@ pub unsafe fn protect_4kb(
     }
 
     // SAFETY: as above — present, non-huge entry naming a live PT.
-    let pt = unsafe { &mut *pde.addr().as_mut_ptr::<PageTable>() };
+    let pt = unsafe { &mut *pde.addr().kernel_mut_ptr::<PageTable>() };
     let leaf = pt.entries[idx.pt];
     if !leaf.is_present() {
         return Err(MapError::NotMapped);
@@ -1459,7 +1459,7 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     let _guard = pt_lock_for(root).lock();
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: root is identity-reachable and the mutation lock is held.
-    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
     let pml4e = pml4.entries[idx.pml4];
     if !pml4e.is_present() {
         return false;
@@ -1467,20 +1467,20 @@ pub unsafe fn free_empty_pt(root: PhysAddr, virt: VirtAddr) -> bool {
     // SAFETY: a present PML4 entry names an identity-reachable PDPT. The PDPT
     // itself is the shared, boot-reserved kernel vmalloc slot and is never
     // freed here, so this borrow is const.
-    let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
     let pdpte = pdpt.entries[idx.pdpt];
     if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
         return false;
     }
     // SAFETY: a present, non-huge PDPT entry names an identity-reachable PD.
-    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
     let pde = pd.entries[idx.pd];
     if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
         return false;
     }
     let pt_phys = pde.addr();
     // SAFETY: a present, non-huge PD entry names an identity-reachable PT.
-    let pt = unsafe { &*pt_phys.as_ptr::<PageTable>() };
+    let pt = unsafe { &*pt_phys.kernel_ptr::<PageTable>() };
     if pt.entries.iter().any(|e| e.is_present()) {
         return false;
     }
@@ -1561,7 +1561,7 @@ pub unsafe fn unmap_4kb_local_range(
     // every 4 KiB entry; absent upper-level entries are cached too.
     // SAFETY: root is identity-reachable per the caller's contract and the
     // per-root mutation lock remains held for the complete walk.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let mut cached_key = usize::MAX;
     let mut cached_pt: *mut PageTable = core::ptr::null_mut();
     for page in 0..pages {
@@ -1575,20 +1575,20 @@ pub unsafe fn unmap_4kb_local_range(
             if pml4e.is_present() {
                 // SAFETY: present non-leaf entry points at an identity-mapped
                 // page table under this root.
-                let pdpt = unsafe { &mut *pml4e.addr().as_mut_ptr::<PageTable>() };
+                let pdpt = unsafe { &mut *pml4e.addr().kernel_mut_ptr::<PageTable>() };
                 let pdpte = pdpt.entries[idx.pdpt];
                 if pdpte.is_present() {
                     if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
                         return Err(MapError::EncounteredHugePage);
                     }
                     // SAFETY: same, one level lower.
-                    let pd = unsafe { &mut *pdpte.addr().as_mut_ptr::<PageTable>() };
+                    let pd = unsafe { &mut *pdpte.addr().kernel_mut_ptr::<PageTable>() };
                     let pde = pd.entries[idx.pd];
                     if pde.is_present() {
                         if pde.flags().contains(PtFlags::HUGE_PAGE) {
                             return Err(MapError::EncounteredHugePage);
                         }
-                        cached_pt = pde.addr().as_mut_ptr::<PageTable>();
+                        cached_pt = pde.addr().kernel_mut_ptr::<PageTable>();
                     }
                 }
             }
@@ -1645,13 +1645,13 @@ unsafe fn unmap_4kb_locked(
 ) -> Result<PhysAddr, MapError> {
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller promises identity reachability.
-    let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return Err(MapError::AlreadyMapped);
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pdpt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+    let pdpt = unsafe { &mut *e.addr().kernel_mut_ptr::<PageTable>() };
 
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
@@ -1661,7 +1661,7 @@ unsafe fn unmap_4kb_locked(
         return Err(MapError::EncounteredHugePage);
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pd = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+    let pd = unsafe { &mut *e.addr().kernel_mut_ptr::<PageTable>() };
 
     let e = pd.entries[idx.pd];
     if !e.is_present() {
@@ -1671,7 +1671,7 @@ unsafe fn unmap_4kb_locked(
         return Err(MapError::EncounteredHugePage);
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+    let pt = unsafe { &mut *e.addr().kernel_mut_ptr::<PageTable>() };
 
     let removed = pt.entries[idx.pt];
     if !removed.is_present() {
@@ -1784,7 +1784,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
         // detached children need no TLB retirement before traversal.
         let _pt_guard = pt_lock_for(pml4_phys).lock();
         // SAFETY: identity-reachable per caller contract.
-        let pml4 = unsafe { &mut *pml4_phys.as_mut_ptr::<PageTable>() };
+        let pml4 = unsafe { &mut *pml4_phys.kernel_mut_ptr::<PageTable>() };
         // Only PML4[1] holds user-private subtree (per `new_user_pml4`,
         // user binaries link at virt 0x0000_0080_0000_1000 → PML4[1]
         // PDPT[0] PD[0] PT[1], and `new_user_pml4` allocates a fresh
@@ -1852,7 +1852,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
     for pdpt_pa in detached_pdpts {
         // SAFETY: identity-reachable; PDPT is a page-table frame.
-        let pdpt = unsafe { &mut *pdpt_pa.as_mut_ptr::<PageTable>() };
+        let pdpt = unsafe { &mut *pdpt_pa.kernel_mut_ptr::<PageTable>() };
         for pdpt_idx in 0..512usize {
             let pdpte = pdpt.entries[pdpt_idx];
             if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
@@ -1869,7 +1869,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                 continue;
             }
             // SAFETY: same.
-            let pd = unsafe { &mut *pd_pa.as_mut_ptr::<PageTable>() };
+            let pd = unsafe { &mut *pd_pa.kernel_mut_ptr::<PageTable>() };
             for pd_idx in 0..512usize {
                 let pde = pd.entries[pd_idx];
                 if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
@@ -1910,13 +1910,13 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
     }
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let pml4 = unsafe { &*pml4_phys.kernel_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pdpt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
         return None;
@@ -1925,7 +1925,7 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
         return None;
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pd = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() {
         return None;
@@ -1934,7 +1934,7 @@ pub unsafe fn flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PtFlags> {
         return None;
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
     if !e.is_present() {
         return None;
@@ -1958,13 +1958,13 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
     }
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller guarantees `pml4_phys` is identity-reachable.
-    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let pml4 = unsafe { &*pml4_phys.kernel_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
     // SAFETY: a present non-leaf PML4 entry names a live PDPT frame.
-    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pdpt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
         return None;
@@ -1973,7 +1973,7 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
         return Some((e.flags(), 1 << 30));
     }
     // SAFETY: a present non-huge PDPT entry names a live PD frame.
-    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pd = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() {
         return None;
@@ -1982,7 +1982,7 @@ pub unsafe fn leaf_flags_at(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<(PtFl
         return Some((e.flags(), 1 << 21));
     }
     // SAFETY: a present non-huge PD entry names a live PT frame.
-    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
     if !e.is_present() {
         return None;
@@ -2009,26 +2009,26 @@ unsafe fn with_leaf_mut<R>(
     let _pt_guard = pt_lock_for(pml4_phys).lock();
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: caller guarantees `pml4_phys` is identity-reachable.
-    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let pml4 = unsafe { &*pml4_phys.kernel_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
     // SAFETY: a present non-leaf PML4 entry names a live PDPT frame.
-    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pdpt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
         return None;
     }
     // SAFETY: a present non-huge PDPT entry names a live PD frame.
-    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pd = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
         return None;
     }
     // SAFETY: a present non-huge PD entry names a live PT frame; the walk lock
     // keeps it live for the mutation below.
-    let pt = unsafe { &mut *e.addr().as_mut_ptr::<PageTable>() };
+    let pt = unsafe { &mut *e.addr().kernel_mut_ptr::<PageTable>() };
     let leaf = &mut pt.entries[idx.pt];
     if !leaf.is_present() {
         return None;
@@ -2106,13 +2106,13 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
     }
     let idx = WalkIndices::from_virt(virt);
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pml4 = unsafe { &*pml4_phys.as_ptr::<PageTable>() };
+    let pml4 = unsafe { &*pml4_phys.kernel_ptr::<PageTable>() };
     let e = pml4.entries[idx.pml4];
     if !e.is_present() {
         return None;
     }
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pdpt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pdpt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pdpt.entries[idx.pdpt];
     if !e.is_present() {
         return None;
@@ -2123,7 +2123,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
         ));
     } // 1 GiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pd = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pd = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pd.entries[idx.pd];
     if !e.is_present() {
         return None;
@@ -2134,7 +2134,7 @@ pub unsafe fn translate(pml4_phys: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>
         ));
     } // 2 MiB
       // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
-    let pt = unsafe { &*e.addr().as_ptr::<PageTable>() };
+    let pt = unsafe { &*e.addr().kernel_ptr::<PageTable>() };
     let e = pt.entries[idx.pt];
     if !e.is_present() {
         return None;
@@ -2166,7 +2166,7 @@ unsafe fn ensure_next_table(
     crate::frame::__pagetable_register(phys.raw());
     // Caller promises identity-mapped reachability; the unsafe lives
     // inside PageTable::zero_at.
-    PageTable::zero_at(phys.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(phys.kernel_mut_ptr::<PageTable>());
     *slot = PageTableEntry::new(phys, flags);
     Ok(phys)
 }
