@@ -63,8 +63,6 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
 
     #[cfg(feature = "container")]
     {
-        const CLONE_NEWNS: u64 = 0x00020000;
-
         // ── fd-based setns (Linux primary path) ──────────────────
         //
         // The fd is normally one opened from /proc/<pid>/ns/<flavour>.

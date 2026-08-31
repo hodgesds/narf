@@ -1061,14 +1061,38 @@ fn smoke_abi_misc_path_family_efault_and_enametoolong() -> TestResult {
         // into -EFAULT and -ENAMETOOLONG.
         let long = ai_overlong();
         let lp = long.as_ptr() as u64;
-        let cases: [(u32, &str); 4] = [
-            (Syscall::Mkdir.raw(), "mkdir"),
-            (Syscall::Rmdir.raw(), "rmdir"),
-            (Syscall::Unlink.raw(), "unlink"),
-            (Syscall::Chdir.raw(), "chdir"),
+        // The legacy forms exist only where the arch opts into
+        // `__ARCH_WANT_SYSCALL_DEPRECATED` (x86_64 yes, arm64 no), so the
+        // list carries both them and the `*at` forms and skips whatever this
+        // arch does not wire. `at_form` says where the pathname sits: arg0
+        // for the legacy calls, arg1 for the `*at` ones, which take a
+        // directory fd first.
+        let cases: [(Syscall, &str, bool); 6] = [
+            (Syscall::Mkdir, "mkdir", false),
+            (Syscall::Rmdir, "rmdir", false),
+            (Syscall::Unlink, "unlink", false),
+            (Syscall::Chdir, "chdir", false),
+            (Syscall::Mkdirat, "mkdirat", true),
+            (Syscall::Unlinkat, "unlinkat", true),
         ];
-        for (num, what) in cases {
-            match call(num, a1(AI_BAD_PTR, 0o755)) {
+        let mut exercised = 0;
+        for (sc, what, at_form) in cases {
+            if !wired(sc) {
+                continue;
+            }
+            exercised += 1;
+            let num = sc.raw();
+            let bad = if at_form {
+                a2(AT_FDCWD, AI_BAD_PTR, 0o755)
+            } else {
+                a1(AI_BAD_PTR, 0o755)
+            };
+            let toolong = if at_form {
+                a2(AT_FDCWD, lp, 0o755)
+            } else {
+                a1(lp, 0o755)
+            };
+            match call(num, bad) {
                 Some(v) if v == AI_EFAULT => {}
                 Some(-1) => {
                     let _ = what;
@@ -1076,13 +1100,16 @@ fn smoke_abi_misc_path_family_efault_and_enametoolong() -> TestResult {
                 }
                 _ => return Err("path syscall with an unreadable path should be -EFAULT"),
             }
-            match call(num, a1(lp, 0o755)) {
+            match call(num, toolong) {
                 Some(v) if v == AI_ENAMETOOLONG => {}
                 Some(v) if v == AI_EFAULT => {
                     return Err("a path syscall reported EFAULT for a readable over-long path")
                 }
                 _ => return Err("path syscall with an over-long path should be -ENAMETOOLONG"),
             }
+        }
+        if exercised == 0 {
+            return Err("no path syscall from the list is wired on this architecture");
         }
         Ok(())
     })
@@ -1099,18 +1126,27 @@ fn smoke_abi_misc_link_reports_the_old_name_first() -> TestResult {
         // destructure this replaced evaluated both and reported one shared
         // sentinel, losing both which pathname was at fault and why.
         let good = b"/tmp/x\0";
+        // arm64 has no legacy `link`; `linkat` names the same two pathnames
+        // with a directory fd before each (`SYSCALL_DEFINE5(linkat)`), and
+        // propagates the OLD name's error first exactly the same way.
+        let at = !wired(Syscall::Link);
+        let sc = if at { Syscall::Linkat } else { Syscall::Link };
+        let pair = |old_p: u64, new_p: u64| {
+            if at {
+                a3(AT_FDCWD, old_p, AT_FDCWD, new_p)
+            } else {
+                a1(old_p, new_p)
+            }
+        };
         // Bad OLD name, good new name.
-        match call(Syscall::Link.raw(), a1(AI_BAD_PTR, good.as_ptr() as u64)) {
+        match call(sc.raw(), pair(AI_BAD_PTR, good.as_ptr() as u64)) {
             Some(v) if v == AI_EFAULT => {}
             Some(-1) => return Err("link(bad old) still returns the -1/EPERM sentinel"),
             _ => return Err("link with an unreadable oldpath should be -EFAULT"),
         }
         // Good old name, over-long new name -> the NEW name's reason.
         let long = ai_overlong();
-        match call(
-            Syscall::Link.raw(),
-            a1(good.as_ptr() as u64, long.as_ptr() as u64),
-        ) {
+        match call(sc.raw(), pair(good.as_ptr() as u64, long.as_ptr() as u64)) {
             Some(v) if v == AI_ENAMETOOLONG => Ok(()),
             Some(v) if v == AI_EFAULT => {
                 Err("link reported EFAULT for a readable over-long newpath")

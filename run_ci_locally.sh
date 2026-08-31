@@ -129,6 +129,25 @@ if should "$RUN_KERNEL_TEST"; then
   else
     XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=x86_64 --features cgroup-all,container
   fi
+
+  # aarch64 too. CI's kernel-test job is a matrix over BOTH arches while this
+  # script ran only x86_64, so every aarch64-only failure was invisible from
+  # the local gate and could surface for the first time in CI. That is not
+  # hypothetical: a batch of them did, and each was a real arch difference —
+  # fixtures handing kernel pointers to `validate_user_range` (which only
+  # passes on x86_64, where kernel data sits in the low identity map), and
+  # tests hardcoding the legacy path syscalls that arm64 does not wire.
+  #
+  # Runs after the x86_64 pass, not beside it: two QEMU instances collide on
+  # the NVMe image write lock, and that failure reads like a test failure.
+  if arch_on aarch64; then
+    echo "Running kernel-test (aarch64)"
+    if [ -n "$SUBS" ] && [ "$FULL" != "true" ]; then
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container --subsystem "$SUBS"
+    else
+      XTASK_QEMU_TIMEOUT_SECS=2400 XTASK_BOOT_SMOKE_TIMEOUT_SECS=1200 cargo xtask test --arch=aarch64 --features cgroup-all,container
+    fi
+  fi
 fi
 
 if should "$RUN_FEATURE_MATRIX"; then

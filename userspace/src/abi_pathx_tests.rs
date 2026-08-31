@@ -1077,7 +1077,18 @@ fn smoke_abi_pathx_getcwd_removed_directory_is_enoent() -> TestResult {
             _ => return Err("getcwd did not report the directory it was in"),
         }
         // Remove it out from under the task.
-        if call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64)) != Some(0) {
+        // arm64 has no legacy `rmdir`; `unlinkat` with AT_REMOVEDIR is the
+        // same operation (`SYSCALL_DEFINE3(unlinkat)` routes the flag to
+        // `do_rmdir`).
+        let rmdir_r = if wired(Syscall::Rmdir) {
+            call(Syscall::Rmdir.raw(), a0(dir.as_ptr() as u64))
+        } else {
+            call(
+                Syscall::Unlinkat.raw(),
+                a2(AT_FDCWD, dir.as_ptr() as u64, AT_REMOVEDIR),
+            )
+        };
+        if rmdir_r != Some(0) {
             return Err("rmdir of the cwd failed");
         }
         if call(

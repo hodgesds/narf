@@ -4191,11 +4191,11 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
 pub(crate) fn capable_over_task(target: u64, cap: u32) -> bool {
     #[cfg(feature = "container")]
     {
-        return task_ns_capable(
+        task_ns_capable(
             current_task_id(),
             &crate::namespaces::current_user_ns(target),
             cap,
-        );
+        )
     }
     #[cfg(not(feature = "container"))]
     {
@@ -4222,12 +4222,12 @@ pub(crate) fn mount_admin(task: u64) -> bool {
                 .as_any()
                 .downcast_ref::<crate::namespaces::UserNamespace>()
         });
-        return match owned {
+        match owned {
             Some(user_ns) => task_ns_capable(task, user_ns, CAP_SYS_ADMIN),
             // No recorded owner is the initial user namespace, which is
             // exactly the host question.
             None => task_capable(task, CAP_SYS_ADMIN),
-        };
+        }
     }
     #[cfg(not(feature = "container"))]
     {
@@ -4279,7 +4279,7 @@ fn cap_effective(task: u64, cap: u32) -> bool {
 pub(crate) fn task_capable_in_own_ns(task: u64, cap: u32) -> bool {
     #[cfg(feature = "container")]
     {
-        return task_ns_capable(task, &crate::namespaces::current_user_ns(task), cap);
+        task_ns_capable(task, &crate::namespaces::current_user_ns(task), cap)
     }
     #[cfg(not(feature = "container"))]
     {
