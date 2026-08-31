@@ -15,8 +15,10 @@
 //!     exercises relocation, and on aarch64 the PLT veneers too.
 //!   * Records init/exit firing in two `AtomicBool`s the kernel side
 //!     could observe.
-//!   * Exposes one ABI-stable export (`test_module_alive`) returning
-//!     a constant the loader smoke verifies.
+//!   * Defines `test_module_alive`, a `#[no_mangle]` global returning a
+//!     constant. Note this is an ELF-level global, NOT a KSYMTAB export —
+//!     a module publishes to KSYMTAB by registering at run time, the way
+//!     Linux's `EXPORT_SYMBOL` does, and this module registers nothing.
 //!
 //! Linux refs:
 //!   * `lib/test_modload.c` — kernel-side analogue.
@@ -37,7 +39,7 @@ pub static MODULE_INIT_RAN: AtomicBool = AtomicBool::new(false);
 /// confirm exit actually fired.
 pub static MODULE_EXIT_RAN: AtomicBool = AtomicBool::new(false);
 
-/// Constant returned by the exported `test_module_alive` symbol.
+/// Constant returned by the `test_module_alive` symbol.
 /// Smoke 2 (symbol export visible) calls the exported address and
 /// expects this value back.
 pub const TEST_MODULE_ALIVE_MAGIC: u32 = 0xDEAD_C0DE;

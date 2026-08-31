@@ -2437,6 +2437,47 @@ fn run_cmd_inner(args: &BuildArgs, gate_exit: bool) -> Result<()> {
             .qemu_args(&kernel, &args.display, args.hw_profile, args.gpu_backend),
     );
 
+    // Ship the reference kernel module to the guest as an initramfs, so the
+    // in-kernel suite can load a REAL, rustc-built `.ko` rather than an ELF
+    // synthesized in memory. Synthesized images exercise the loader's parsing
+    // and layout but never the compiler's actual relocation output, and the
+    // two have already disagreed once — rustc emits one `.modinfo` section
+    // per `#[link_section]` static, and a loader reading only the first saw a
+    // manifest of `name=` alone.
+    //
+    // `boot-init` runs get their initramfs from `run_interactive_cmd`; this
+    // path had none at all, so the smokes that look for the module skipped.
+    // Best-effort throughout: a build failure here leaves the guest without
+    // the file and those smokes skip, which is what they do on any image
+    // built without it.
+    let _ko_cpio_keepalive;
+    if args.features.contains("kernel-test") {
+        let ko_args = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-test-module".into(),
+            out: None,
+            kernel_abi: None,
+        };
+        match build_module(&ko_args, &root).and_then(|ko| Ok((std::fs::read(&ko)?, ko))) {
+            Ok((bytes, _)) => {
+                let cpio = encode_cpio_newc(&[("lib/modules/narf_test_module.ko", &bytes)]);
+                let p = out_dir.join("initramfs-kernel-test.cpio");
+                match std::fs::write(&p, &cpio) {
+                    Ok(()) => {
+                        println!(
+                            "xtask: staged test module ({} bytes) → guest                              /lib/modules/narf_test_module.ko",
+                            bytes.len()
+                        );
+                        cmd.arg("-initrd").arg(&p);
+                        _ko_cpio_keepalive = p;
+                    }
+                    Err(e) => println!("xtask: could not write test-module initramfs ({e})"),
+                }
+            }
+            Err(e) => println!("xtask: test module unavailable ({e}); its smokes will skip"),
+        }
+    }
+
     println!("xtask: launching {} {}", qemu, kernel.display());
 
     let mut child = cmd
@@ -7110,9 +7151,52 @@ fn image_cmd(args: &BuildArgs) -> Result<()> {
         }
     };
 
+    // The reference kernel module, staged at the Linux-conventional
+    // `/lib/modules/` path so an in-kernel test can load a REAL,
+    // rustc-built `.ko` — with genuine relocations against a kernel export
+    // (`R_X86_64_PLT32` on x86_64, `R_AARCH64_CALL26` needing a veneer on
+    // aarch64) — instead of an ELF synthesized in memory. Synthesized images
+    // exercise the loader's parsing and layout but never the compiler's
+    // actual relocation output, which is where the two can disagree.
+    //
+    // Built here rather than as a separate step so `cargo xtask test` needs
+    // no extra invocation. A failure to build it is NOT fatal: the module is
+    // a test fixture, not part of the kernel, and the smoke that loads it
+    // skips cleanly when the file is absent.
+    let test_module_bytes: Option<Vec<u8>> = {
+        let ko_args = BuildModuleArgs {
+            arch: args.arch,
+            package: "narf-test-module".into(),
+            out: None,
+            kernel_abi: None,
+        };
+        match build_module(&ko_args, &root) {
+            Ok(path) => match std::fs::read(&path) {
+                Ok(b) => {
+                    println!(
+                        "xtask image: test module staged ({} bytes) → lib/modules/narf_test_module.ko",
+                        b.len()
+                    );
+                    Some(b)
+                }
+                Err(e) => {
+                    println!("xtask image: test module unreadable ({e}); skipping");
+                    None
+                }
+            },
+            Err(e) => {
+                println!("xtask image: test module build failed ({e}); skipping");
+                None
+            }
+        }
+    };
+
     let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
     cpio_entries.push(("init", &init_bytes));
     cpio_entries.push(("shell", &shell_bytes));
+    if let Some(ref b) = test_module_bytes {
+        cpio_entries.push(("lib/modules/narf_test_module.ko", b.as_slice()));
+    }
     // Stage coreutils at bin/<name> so the shell's /bin/<name>
     // PATH resolution resolves them after the initramfs is mounted.
     for (path, bytes) in &coreutil_bytes {
