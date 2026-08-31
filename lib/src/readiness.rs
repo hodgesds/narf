@@ -181,6 +181,30 @@ impl Readiness {
         Poll::Pending
     }
 
+    /// Signal an EVENT on `bits` — a Linux wait-queue wakeup. Bumps `seq` and
+    /// wakes every waiter whose interest intersects `bits`, UNCONDITIONALLY:
+    /// unlike [`set`](Self::set), it does not gate on a rising level edge and
+    /// does not touch `mask`. This is what makes the epoll ready-list capture
+    /// events the level cannot represent — a follow-up write on an already
+    /// `POLL_IN` ring, or a new connection on an already-pending listener —
+    /// exactly as Linux wakes its wait queue on every such event. Used at the
+    /// real I/O event sites; the level-reconcile path stays on `set` (rising-
+    /// edge-gated) so a passive re-sync never spuriously fires. `bits == 0` is
+    /// a no-op. Retires the per-provider edge token, whose only job was to
+    /// carry these same-level events.
+    pub fn notify(&self, bits: u32) {
+        if bits == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        g.seq = g.seq.wrapping_add(1);
+        for w in g.waiters.values() {
+            if w.interest & bits != 0 {
+                w.waker.wake_by_ref();
+            }
+        }
+    }
+
     /// Remove any waiter registered under `id`. Called when a wait ends for a
     /// reason other than this cell (timeout, EINTR, the fd leaving the set, or
     /// task exit) so a stale waker is never fired.

@@ -5533,7 +5533,7 @@ impl RingBuf {
     /// lock (drop-free), so a concurrent `arm` can never miss this transition.
     /// Called after every write/read/close that changes occupancy; kept
     /// alongside the legacy edge tokens + `wake_reader` during the migration.
-    fn sync_readiness(&self) {
+    fn sync_readiness(&self, event: u32) {
         let closed = self.closed.load(Ordering::Acquire);
         let (data, space) = {
             let g = self.inner.lock();
@@ -5556,6 +5556,13 @@ impl RingBuf {
         }) | (if space { 0 } else { narf_filesystem::POLL_OUT })
             | (if closed { 0 } else { narf_filesystem::POLL_HUP });
         self.readiness.set(add, clear);
+        // Linux wait-queue wakeup: fire the waiters interested in the DIRECTION
+        // that just saw activity even when the level did not change (a
+        // follow-up write on an already-readable ring, a read that frees space
+        // while POLL_OUT was already set) — so an epoll ready-list edge is
+        // produced on every event, not just a rising level edge. This is the
+        // job the per-ring readable/writable edge tokens used to do.
+        self.readiness.notify(event & !clear);
     }
 
     /// The durable readiness cell shared by both endpoints of this ring. The
@@ -5598,7 +5605,7 @@ impl RingBuf {
         // desktop gate). Matches write_packet, which already bumps every write.
         if n != 0 {
             self.readable_token.fetch_add(1, Ordering::Release);
-            self.sync_readiness();
+            self.sync_readiness(narf_filesystem::POLL_IN);
         }
         n
     }
@@ -5628,7 +5635,7 @@ impl RingBuf {
         // write so an EPOLLET reader re-fires on bytes appended before it
         // drained. n > 0 here (the n == 0 case returned early above).
         self.readable_token.fetch_add(1, Ordering::Release);
-        self.sync_readiness();
+        self.sync_readiness(narf_filesystem::POLL_IN);
         n
     }
 
@@ -5649,7 +5656,7 @@ impl RingBuf {
         g.packet_bytes += src.len();
         drop(g);
         self.readable_token.fetch_add(1, Ordering::Release);
-        self.sync_readiness();
+        self.sync_readiness(narf_filesystem::POLL_IN);
         src.len()
     }
 
@@ -5687,7 +5694,7 @@ impl RingBuf {
         if n != 0 {
             // Draining bytes can clear POLL_IN (ring now empty) and set POLL_OUT
             // (space freed); republish so a writer parked on this ring wakes.
-            self.sync_readiness();
+            self.sync_readiness(narf_filesystem::POLL_OUT);
         }
         n
     }
@@ -5734,7 +5741,7 @@ impl RingBuf {
             }
             // A record was consumed: POLL_IN may fall (queue now empty) and
             // POLL_OUT may rise; republish for a writer parked on this ring.
-            self.sync_readiness();
+            self.sync_readiness(narf_filesystem::POLL_OUT);
         }
         Some((copied, full))
     }
@@ -5750,7 +5757,9 @@ impl RingBuf {
             // this ring wakes to a 0-byte read; POLL_OUT stays set so a parked
             // writer wakes to discover EPIPE. Ordering matters: set closed
             // (swap above), THEN sync so sync_readiness observes closed=true.
-            self.sync_readiness();
+            self.sync_readiness(
+                narf_filesystem::POLL_IN | narf_filesystem::POLL_OUT | narf_filesystem::POLL_HUP,
+            );
         }
     }
 
