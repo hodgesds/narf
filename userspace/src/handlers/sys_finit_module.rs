@@ -3,6 +3,16 @@ use super::*;
 
 pub(crate) fn sys_finit_module(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
+
+    // `may_init_module()` — `finit_module` shares the gate with
+    // `init_module` (`kernel/module/main.c:3737`), and it comes before the
+    // descriptor is even looked at, so an unprivileged caller cannot use this
+    // to probe which fds are open.
+    if !capable(CAP_SYS_MODULE) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
+
     let fd = args.arg0 as u32;
     // arg1 = params_ptr, arg2 = flags — both ignored in Phase 1.
     // Read the file via the fd table.
