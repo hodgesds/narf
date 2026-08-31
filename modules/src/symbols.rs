@@ -149,6 +149,42 @@ pub fn set_kernel_abi(hash: u32) {
     KERNEL_ABI.store(hash, Ordering::Release);
 }
 
+/// Derive the kernel ABI hash from the exported symbol table.
+///
+/// `DESIGN.md` lists "LTO-image hashing" as the intended source. Hashing the
+/// export table is better on the axis that matters: it changes exactly when
+/// the thing modules actually depend on changes, and not when an unrelated
+/// subsystem is recompiled. An image hash would reject every module on every
+/// kernel rebuild, which trains people to ignore it.
+///
+/// Order-independent — entries are combined with `wrapping_add`, because
+/// KSYMTAB's order is registration order and carries no meaning. Sorting
+/// first would need an allocation on a path that runs at boot with the
+/// table locked.
+///
+/// Per-symbol CRCs still do the fine-grained work; this catches the coarse
+/// "wrong kernel" case without per-symbol bookkeeping, which is the division
+/// of labour DESIGN.md describes.
+pub fn compute_abi_hash() -> u32 {
+    let g = KSYMTAB.lock();
+    let mut acc: u32 = 0;
+    for e in g.iter() {
+        // Fold name and CRC together so renaming a symbol is as visible as
+        // changing its signature.
+        let mut h: u32 = 0x811C_9DC5;
+        for b in e.name.as_bytes() {
+            h ^= *b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        for b in e.crc.to_le_bytes() {
+            h ^= b as u32;
+            h = h.wrapping_mul(0x0100_0193);
+        }
+        acc = acc.wrapping_add(h);
+    }
+    acc
+}
+
 /// Read the currently-configured kernel ABI hash.
 pub fn kernel_abi() -> u32 {
     KERNEL_ABI.load(Ordering::Acquire)
@@ -253,6 +289,19 @@ pub fn export_count() -> usize {
 pub fn __reset_for_test() {
     KSYMTAB.lock().clear();
     CURRENT_INIT_MODULE_ID.store(KERNEL_MODULE_ID.0, Ordering::Release);
+    // Reset to the BOOT state, not to an empty table. Since `kabi` began
+    // registering a real ABI surface at `Stage::Subsys`, clearing outright
+    // would leave every subsequent module load in this boot unable to resolve
+    // a single kernel symbol, and would leave the published `kernel_abi` hash
+    // describing a table that no longer exists — a cross-test failure
+    // arbitrarily far from whichever smoke called this.
+    crate::kabi::register_all();
+}
+
+/// Whether `name` is currently in KSYMTAB. Unlike [`resolve`] this needs no
+/// manifest and performs no cap or CRC check — it answers presence only.
+pub fn is_exported(name: &str) -> bool {
+    KSYMTAB.lock().iter().any(|e| e.name == name)
 }
 
 /// Convenience: build + register an export by parts.

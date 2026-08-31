@@ -40,6 +40,7 @@ extern crate alloc;
 
 pub mod domain;
 pub mod elf;
+pub mod kabi;
 pub mod lifecycle;
 pub mod loader;
 pub mod manifest;
@@ -117,18 +118,37 @@ pub mod registry {
     }
 }
 
-/// Wire the modules subsystem into the kernel at boot. Run from
-/// `narf-init` at `Stage::Subsys` (or later).
+/// Wire the modules subsystem into the kernel at boot. Called from
+/// `frame/src/bare_main.rs`.
 ///
-/// Steps:
-///   1. Install the default no-op signature verifier.
-///   2. Register the standard driver-domain name aliases.
-///   3. Install `/proc/modules`.
+/// Order within `modules-abi` matters: the ABI hash is *derived from* the
+/// export table, so the exports have to be registered first. That is the
+/// point of deriving it rather than accepting one — the hash cannot drift
+/// from the surface it describes, because there is nowhere for it to drift
+/// to. `/sys/module/<name>/` entries are installed per-module on load.
 ///
-/// `/sys/module/<name>/` entries are installed per-module on load.
-pub fn boot_init(kernel_abi_hash: u32) {
-    symbols::set_kernel_abi(kernel_abi_hash);
-    sign::install_verifier(alloc::boxed::Box::new(sign::AcceptAll));
-    domain::install_standard_domains();
-    proc_modules::install_proc_modules();
+/// Split across two stages. The ABI surface, the domain table and the
+/// signature verifier are `Subsys`: they are pure registration, and every one
+/// of them has to be in place before the first `init_module(2)` — which,
+/// arriving from userspace, cannot happen until long after `Late`.
+///
+/// `/proc/modules` waits for `Fs`, after `procfs-mount`. `register_proc`
+/// records into a registry that `ProcFs` consults per lookup, so the order is
+/// not load-bearing, but installing a `/proc` entry before `/proc` exists
+/// reads as a bug even when it works.
+pub fn register_initcalls() {
+    use narf_init::{InitResult, Stage};
+
+    narf_init::register(Stage::Subsys, "modules-abi", || {
+        domain::install_standard_domains();
+        kabi::register_all();
+        symbols::set_kernel_abi(symbols::compute_abi_hash());
+        sign::install_verifier(alloc::boxed::Box::new(sign::AcceptAll));
+        InitResult::Ok
+    });
+
+    narf_init::register(Stage::Fs, "modules-procfs", || {
+        proc_modules::install_proc_modules();
+        InitResult::Ok
+    });
 }

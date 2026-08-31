@@ -2382,6 +2382,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_bus::set_probe_log_hook(_init_log);
             narf_bus::set_probe_log(true);
 
+            // Loadable modules: register the kernel ABI surface with
+            // KSYMTAB, install the driver-domain name table, and derive the
+            // ABI hash from the surface. Until this runs KSYMTAB is empty,
+            // so a module can be relocated but cannot call anything.
+            narf_modules::register_initcalls();
+
             // BPF: collect and validate the `narf.kfuncs` link section.
             // `Subsys` because collection allocates; the boot-order
             // constraint that actually matters for BPF — reserving the

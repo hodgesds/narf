@@ -1776,6 +1776,7 @@ dependencies = [
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-modules",
  "narf-net",
  "narf-observability",
  "narf-pinctrl",
@@ -1973,10 +1974,13 @@ name = "narf-modules"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-console",
  "narf-filesystem",
+ "narf-init",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",
+ "narf-time",
 ]
 
 [[package]]

@@ -92,6 +92,7 @@ narf-power           = { path = "../power" }
 narf-observability   = { path = "../observability" }
 narf-rcu             = { path = "../rcu" }
 narf-filesystem      = { path = "../filesystem" }
+narf-modules         = { path = "../modules" }
 narf-userspace       = { path = "../userspace" }
 narf-user-runtime    = { path = "../user-runtime" }
 narf-bpf             = { path = "../bpf" }
