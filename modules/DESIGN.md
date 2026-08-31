@@ -27,13 +27,12 @@ Known gaps, each expanded where it belongs below:
     produces one for either architecture — extracting the crate's own
     members from the `staticlib` archive and `ld -r`-ing them into a
     single relocatable object with merged sections. What is still
-    missing is the last link: the reference module hardcodes
-    `kernel_abi=0x00000000`, and the running kernel's hash is derived
-    from its export table, so the load is correctly refused. Closing it
-    needs the build to learn the hash — either computed from the `kabi`
-    source at build time, or read from `/sys/kernel/abi_hash` on a
-    running kernel, which is the workflow a real out-of-tree module
-    uses. Until then every smoke still synthesizes its ELF.
+    missing is a smoke that loads one. `--kernel-abi` stamps the
+    running kernel's hash into the built object, so the pieces are
+    there; what is not is the plumbing to get a `.ko` in front of the
+    kernel under test — either in the initramfs for a smoke to
+    `finit_module`, or embedded at build time. Until then every smoke
+    still synthesizes its ELF.
   * **Driver domains are named but not enforced.** See §2.
   * **Per-action caps on the three syscalls are not wired.** See the
     trust model, tier 3.
@@ -457,9 +456,11 @@ asserts:
   * **Ed25519 signature verification.** The hook is in place; the
     implementation slots into `sign::install_verifier(...)`.
   * **Loading a real `.ko` in a test.** The build exists
-    (`cargo xtask build-module`); what is missing is making the
-    module's `kernel_abi=` match the running kernel, and a smoke that
-    reads the object and calls `sys_finit_module` on it. Until then,
+    (`cargo xtask build-module`, with `--kernel-abi` to stamp the
+    running kernel's hash). What is missing is getting the object in
+    front of the kernel under test — shipping it in the initramfs for a
+    smoke to `finit_module`, which also means the test run has to build
+    the module, boot once to read the hash, and rebuild. Until then,
     tests exercise the loader but not rustc's actual relocation output.
     This should be the next thing done.
 

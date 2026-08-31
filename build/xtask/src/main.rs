@@ -2033,6 +2033,92 @@ struct BuildModuleArgs {
     /// `target/<triple>/release/<package>.ko`.
     #[arg(long)]
     out: Option<PathBuf>,
+
+    /// Stamp this kernel ABI hash into the module's `.modinfo`, replacing
+    /// whatever `kernel_abi=` the source declared. Accepts `0x...` or bare
+    /// hex.
+    ///
+    /// The loader refuses a module whose hash does not match the running
+    /// kernel's, and that hash is derived from the kernel's export table —
+    /// so it is not knowable when the module crate is written. Read it from
+    /// a running kernel with `cat /sys/kernel/abi_hash` and pass it here.
+    #[arg(long)]
+    kernel_abi: Option<String>,
+}
+
+/// Overwrite the `kernel_abi=0x........` value inside a `.ko`'s `.modinfo`.
+///
+/// The field is fixed-width hex, so this is an in-place patch of eight bytes
+/// — no section has to grow and no offset moves. Scoped to the `.modinfo`
+/// section rather than done over the whole file so a matching byte string in
+/// debug info or a string literal cannot be hit by accident.
+fn stamp_kernel_abi(ko: &Path, value: u32) -> Result<()> {
+    let mut bytes = std::fs::read(ko).with_context(|| format!("read {}", ko.display()))?;
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        bail!("{} is not an ELF object", ko.display());
+    }
+    let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+    let u32at =
+        |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+    let u64at = |b: &[u8], o: usize| {
+        u64::from_le_bytes([
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
+        ]) as usize
+    };
+
+    let shoff = u64at(&bytes, 0x28);
+    let shentsize = u16at(&bytes, 0x3A);
+    let shnum = u16at(&bytes, 0x3C);
+    let shstrndx = u16at(&bytes, 0x3E);
+    if shoff == 0 || shnum == 0 || shstrndx >= shnum {
+        bail!("{}: unusable section header table", ko.display());
+    }
+    let strtab_off = u64at(&bytes, shoff + shstrndx * shentsize + 0x18);
+
+    let mut target: Option<(usize, usize)> = None;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let name_off = strtab_off + u32at(&bytes, sh);
+        let name_end = bytes[name_off..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|n| name_off + n)
+            .unwrap_or(name_off);
+        if &bytes[name_off..name_end] == b".modinfo" {
+            target = Some((u64at(&bytes, sh + 0x18), u64at(&bytes, sh + 0x20)));
+            break;
+        }
+    }
+    let Some((off, size)) = target else {
+        bail!("{}: no .modinfo section to stamp", ko.display());
+    };
+
+    const KEY: &[u8] = b"kernel_abi=0x";
+    let region = &bytes[off..off + size];
+    let Some(at) = region
+        .windows(KEY.len())
+        .position(|w| w == KEY)
+        .map(|p| off + p + KEY.len())
+    else {
+        bail!(
+            "{}: .modinfo has no `kernel_abi=0x` field to stamp",
+            ko.display()
+        );
+    };
+    if at + 8 > off + size {
+        bail!("{}: `kernel_abi=` value is truncated", ko.display());
+    }
+    let replacement = format!("{value:08x}");
+    bytes[at..at + 8].copy_from_slice(replacement.as_bytes());
+    std::fs::write(ko, &bytes).with_context(|| format!("write {}", ko.display()))?;
+    Ok(())
 }
 
 /// Build a module crate into the single relocatable object the loader wants.
@@ -2196,6 +2282,14 @@ fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
         );
     }
     let _ = std::fs::remove_dir_all(&work);
+
+    if let Some(raw) = &args.kernel_abi {
+        let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let value = u32::from_str_radix(hex, 16)
+            .with_context(|| format!("--kernel-abi {raw} is not a 32-bit hex value"))?;
+        stamp_kernel_abi(&out, value)?;
+        println!("xtask build-module: stamped kernel_abi=0x{value:08x}");
+    }
 
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     println!(

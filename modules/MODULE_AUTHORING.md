@@ -19,12 +19,24 @@ architecture-comparison overview, see the workspace-root
 > Works for `aarch64` too; it links with `rust-lld` rather than the host
 > `ld`, which refuses foreign-architecture objects.
 >
-> Two things still to know. Your `kernel_abi=` has to match the running
-> kernel (`cat /sys/kernel/abi_hash`) — the reference module's
-> `0x00000000` is a placeholder and will be refused. And a module that
-> uses `core` beyond what the compiler inlines will come out with
-> undefined references that nothing can satisfy; keep to the exported
-> ABI and your own code for now. See [DESIGN.md](./DESIGN.md).
+> Your `kernel_abi=` has to match the running kernel, and the hash is
+> derived from the kernel's export table, so it is not something you can
+> know when writing the crate. Read it from the target kernel and stamp
+> it in at build time:
+>
+> ```sh
+> cat /sys/kernel/abi_hash                       # e.g. 0x1f3a90c2
+> cargo xtask build-module --package <your-crate> \
+>       --arch x86_64 --kernel-abi 0x1f3a90c2
+> ```
+>
+> The source's own `kernel_abi=` line is a placeholder; `--kernel-abi`
+> overwrites it in place.
+>
+> One live limitation: a module that uses `core` beyond what the
+> compiler inlines comes out with undefined references nothing can
+> satisfy. Keep to the exported ABI and your own code for now. See
+> [DESIGN.md](./DESIGN.md).
 
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal
