@@ -49,6 +49,11 @@ struct ElfBuilder {
     // (target_section_idx, r_offset, sym_idx, ty, addend)
     relas: Vec<(u32, u64, u32, u32, i64)>,
     kparams: Vec<u8>,
+    /// A SECOND `.modinfo` section. rustc emits one section per
+    /// `#[link_section = ".modinfo"]` static — seven for the reference
+    /// module — and they are merged only by `ld -r`. This lets a smoke
+    /// build the un-merged shape.
+    modinfo2: Vec<u8>,
 }
 
 impl ElfBuilder {
@@ -62,6 +67,22 @@ impl ElfBuilder {
         Self {
             machine: EM_AARCH64,
             ..Default::default()
+        }
+    }
+    /// A builder targeting the running architecture.
+    ///
+    /// Required by any smoke that goes through `load_image`, which rejects a
+    /// foreign `e_machine` before it looks at anything else — so a
+    /// hardcoded-x86_64 image asserting some *later* failure would pass on
+    /// x86_64 and fail on aarch64 for an unrelated reason.
+    fn new_native() -> Self {
+        #[cfg(target_arch = "aarch64")]
+        {
+            Self::new_aarch64()
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            Self::new_x86_64()
         }
     }
     fn modinfo(mut self, raw: &[u8]) -> Self {
@@ -94,6 +115,11 @@ impl ElfBuilder {
     }
     fn kparams(mut self, raw: &[u8]) -> Self {
         self.kparams = raw.to_vec();
+        self
+    }
+    /// Split the manifest across a second `.modinfo` section.
+    fn modinfo2(mut self, raw: &[u8]) -> Self {
+        self.modinfo2 = raw.to_vec();
         self
     }
 
@@ -181,6 +207,8 @@ impl ElfBuilder {
         out.extend_from_slice(&rela);
         let off_kparams = out.len();
         out.extend_from_slice(&self.kparams);
+        let off_modinfo2 = out.len();
+        out.extend_from_slice(&self.modinfo2);
 
         // Align to 8 before section header table.
         while out.len() % 8 != 0 {
@@ -290,7 +318,22 @@ impl ElfBuilder {
             0,
         );
 
-        let shnum: u16 = 8;
+        // sec 8: a second `.modinfo`, sharing the first's name string.
+        push_shdr(
+            &mut out,
+            off_name_modinfo as u32,
+            SHT_PROGBITS,
+            SHF_ALLOC,
+            0,
+            off_modinfo2 as u64,
+            self.modinfo2.len() as u64,
+            0,
+            0,
+            1,
+            0,
+        );
+
+        let shnum: u16 = 9;
         let shentsize: u16 = 64;
         let shstrndx: u16 = 1;
 
@@ -422,7 +465,7 @@ fn smoke_elf_rejects_missing_modinfo() -> TestResult {
     crate::domain::__reset_for_test();
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0);
-    let bytes = ElfBuilder::new_x86_64()
+    let bytes = ElfBuilder::new_native()
         .modinfo(b"") // empty .modinfo
         .text(&[0xC3u8])
         .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
@@ -670,7 +713,7 @@ fn smoke_proc_modules_format() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xD0);
     let m = arc_test_module("pm_fmt", 0xD0);
-    crate::registry::insert(m.clone());
+    let _ = crate::registry::insert_unique(m.clone());
     let line = crate::proc_modules::render_one(&m);
     if line.contains("pm_fmt") && line.contains("0x") && line.contains("Loading") {
         TestResult::Pass
@@ -687,7 +730,7 @@ fn smoke_sysfs_refcnt_reads_count() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xE0);
     let m = arc_test_module("sf_ref", 0xE0);
-    crate::registry::insert(m.clone());
+    let _ = crate::registry::insert_unique(m.clone());
     let kobj = crate::sysfs_module::install_module(&m);
     m.refcount.get();
     m.refcount.get();
@@ -707,7 +750,7 @@ fn smoke_param_sysfs_rw_round_trip() -> TestResult {
     crate::domain::install_standard_domains();
     crate::symbols::set_kernel_abi(0xF0);
     let m = arc_test_module_with_params("sf_param", 0xF0, b"debug=1\nname=hi\n");
-    crate::registry::insert(m.clone());
+    let _ = crate::registry::insert_unique(m.clone());
     let kobj = crate::sysfs_module::install_module(&m);
     let params_kobj = kobj.get_child("parameters").expect("parameters dir");
     let initial = params_kobj.attr_show("debug").unwrap_or_default();
@@ -734,7 +777,7 @@ fn smoke_two_modules_dep_refcount() -> TestResult {
     crate::symbols::set_kernel_abi(0xFF);
     // Module A loads + registers an exported symbol.
     let a = arc_test_module("a_dep", 0xFF);
-    crate::registry::insert(a.clone());
+    let _ = crate::registry::insert_unique(a.clone());
     // Simulate B holding a reference to A via the refcount.
     a.refcount.get();
     // SAFETY: module `a` is in state `Loading`/`Live` with `exit_addr` =
@@ -805,10 +848,15 @@ fn arc_test_module(name: &str, abi: u32) -> Arc<crate::loader::Module> {
         manifest: mf,
         domain: narf_lib::id::DomainId::SCRATCH,
         image_size: 0,
+        // No mapped image: these helpers exercise the lifecycle, registry and
+        // param paths, not the loader, so there is nothing to map. Every
+        // consumer treats `None` as "already released".
+        image: narf_lib::sync::IrqSafeSpinLock::new(None),
         placements: Vec::new(),
         init_addr: noop_init as usize,
         exit_addr: Some(noop_exit as usize),
         params: Vec::new(),
+        deps: Vec::new(),
         refcount: crate::refcount::RefCount::new(),
         state: narf_lib::sync::IrqSafeSpinLock::new(crate::lifecycle::ModuleState::Loading),
     })
@@ -829,10 +877,12 @@ fn arc_test_module_with_params(
         manifest: m.manifest.clone(),
         domain: m.domain,
         image_size: m.image_size,
+        image: narf_lib::sync::IrqSafeSpinLock::new(None),
         placements: Vec::new(),
         init_addr: m.init_addr,
         exit_addr: m.exit_addr,
         params: slots,
+        deps: Vec::new(),
         refcount: crate::refcount::RefCount::new(),
         state: narf_lib::sync::IrqSafeSpinLock::new(crate::lifecycle::ModuleState::Loading),
     };
@@ -930,7 +980,7 @@ fn smoke_load_foreign_ko_shape_is_foreign() -> TestResult {
     crate::symbols::set_kernel_abi(0);
     // Well-formed Elf64 REL shell with no `.modinfo` — the shape a
     // stripped Linux `.ko` presents to `finit_module`.
-    let bytes = ElfBuilder::new_x86_64()
+    let bytes = ElfBuilder::new_native()
         .modinfo(b"")
         .text(&[0xC3u8])
         .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
@@ -947,3 +997,208 @@ fn smoke_load_foreign_ko_shape_is_foreign() -> TestResult {
     }
 }
 kernel_test_in!("modules/compat", smoke_load_foreign_ko_shape_is_foreign);
+
+// ── Inter-module dependencies ──────────────────────────────────────────
+
+/// Absolute 64-bit relocation for the running arch. Range-unlimited on both,
+/// so these smokes exercise the dependency edge and not the veneer path.
+#[cfg(target_arch = "aarch64")]
+const ABS64_RELOC: u32 = crate::elf::reloc::R_AARCH64_ABS64;
+#[cfg(not(target_arch = "aarch64"))]
+const ABS64_RELOC: u32 = crate::elf::reloc::R_X86_64_64;
+
+/// Resolving a symbol owned by another module must record a dependency edge.
+///
+/// Without one, `rmmod provider` succeeds while a consumer still holds a
+/// relocated pointer into the provider's text — the use-after-free DESIGN.md
+/// §6 lists under "deferred items". The edge is what lets `delete_module`
+/// answer EBUSY instead.
+fn smoke_load_records_dependency_on_provider() -> TestResult {
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    let abi = crate::symbols::kernel_abi();
+
+    // Stand in for a symbol another module exported during its init.
+    let provider = crate::symbols::alloc_module_id();
+    crate::symbols::register_export_owned_by(
+        provider,
+        crate::symbols::KernelExport {
+            name: "narf_smoke_provided",
+            addr: 0x1000,
+            crc: 0,
+            required_cap: None,
+            owner: provider,
+        },
+    );
+
+    // symtab: 0 reserved, 1 = the local init, 2 = the undef reference.
+    let bytes = ElfBuilder::new_native()
+        .modinfo(&modinfo_text("consumer", abi))
+        .text(&[0u8; 16])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .undef_sym("narf_smoke_provided", 1u8 << 4)
+        .add_rela(5, 8, 2, ABS64_RELOC, 0)
+        .build();
+
+    match crate::loader::load_image(&bytes) {
+        Ok(m) => {
+            let recorded = m.deps.len() == 1 && m.deps[0] == provider;
+            // SAFETY: the module never entered the registry and its init
+            // never ran, so nothing references its image.
+            unsafe { crate::loader::release_image(&m) };
+            if recorded {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("load did not record a dependency on the providing module")
+            }
+        }
+        Err(_) => TestResult::Fail("load_image rejected a reference to a module-owned export"),
+    }
+}
+kernel_test_in!("modules/deps", smoke_load_records_dependency_on_provider);
+
+/// Symbols owned by the kernel itself must NOT create an edge — the kernel
+/// never unloads, and pinning it would be meaningless bookkeeping on every
+/// relocation a module makes.
+fn smoke_kernel_owned_symbols_create_no_dependency() -> TestResult {
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    let abi = crate::symbols::kernel_abi();
+
+    // `__reset_for_test` restores the kernel ABI surface, so this resolves
+    // against a genuinely kernel-owned export.
+    let name = crate::kabi::NAMES[0];
+    let bytes = ElfBuilder::new_native()
+        .modinfo(&modinfo_text("kernel-only", abi))
+        .text(&[0u8; 16])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .undef_sym(name, 1u8 << 4)
+        .add_rela(5, 8, 2, ABS64_RELOC, 0)
+        .build();
+
+    match crate::loader::load_image(&bytes) {
+        Ok(m) => {
+            let empty = m.deps.is_empty();
+            // SAFETY: never registered, never initialised.
+            unsafe { crate::loader::release_image(&m) };
+            if empty {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("a kernel-owned export created a dependency edge")
+            }
+        }
+        Err(_) => TestResult::Fail("load_image rejected a reference to a kernel export"),
+    }
+}
+kernel_test_in!(
+    "modules/deps",
+    smoke_kernel_owned_symbols_create_no_dependency
+);
+
+/// `insert_unique` must be the only way in, and must refuse a duplicate name.
+fn smoke_registry_insert_unique_refuses_duplicate() -> TestResult {
+    crate::registry::__reset_for_test();
+    let a = arc_test_module("dup", 0);
+    let b = arc_test_module("dup", 0);
+    let first = crate::registry::insert_unique(a);
+    let second = crate::registry::insert_unique(b);
+    let n = crate::registry::len();
+    crate::registry::__reset_for_test();
+    if first && !second && n == 1 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("insert_unique admitted a duplicate module name")
+    }
+}
+kernel_test_in!(
+    "modules/deps",
+    smoke_registry_insert_unique_refuses_duplicate
+);
+
+/// `/proc/modules`' holders column is now derived from the dependency edges
+/// rather than being a hardcoded dash.
+fn smoke_proc_modules_holders_reflect_dependencies() -> TestResult {
+    crate::registry::__reset_for_test();
+    let provider = arc_test_module("provider", 0);
+    let provider_id = provider.id;
+
+    // A consumer that links against it.
+    let mut consumer = arc_test_module("consumer", 0);
+    match alloc::sync::Arc::get_mut(&mut consumer) {
+        Some(m) => m.deps.push(provider_id),
+        None => return TestResult::Fail("test module Arc was unexpectedly shared"),
+    }
+
+    let _ = crate::registry::insert_unique(provider.clone());
+    let _ = crate::registry::insert_unique(consumer);
+
+    let holders = crate::registry::holders_of(provider_id);
+    let line = crate::proc_modules::render_one(&provider);
+    crate::registry::__reset_for_test();
+
+    if holders.len() != 1 || holders[0] != "consumer" {
+        return TestResult::Fail("holders_of did not report the consuming module");
+    }
+    if !line.contains("consumer,") {
+        return TestResult::Fail("/proc/modules line does not list the holder");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/deps",
+    smoke_proc_modules_holders_reflect_dependencies
+);
+
+/// rustc emits one `.modinfo` section per `#[link_section]` static — the
+/// reference module produces seven — and they are merged into one only when
+/// the object is passed through `ld -r`. The loader must not depend on that
+/// having happened.
+///
+/// Reading only the first section meant a real module's manifest was whatever
+/// its first `MODULE_INFO` line happened to be, so `kernel_abi=` and
+/// `target_domain=` went missing and the load failed with a manifest error
+/// pointing nowhere near the cause.
+fn smoke_manifest_spans_multiple_modinfo_sections() -> TestResult {
+    crate::registry::__reset_for_test();
+    crate::symbols::__reset_for_test();
+    crate::domain::__reset_for_test();
+    crate::domain::install_standard_domains();
+    let abi = crate::symbols::kernel_abi();
+
+    // Split exactly where rustc would: one static per line, NUL-terminated,
+    // with the fields the parser needs spread across both sections.
+    let first = b"name=split\0version=0.1.0\0license=GPL-2.0-or-later\0";
+    let second = format!(
+        "author=test\0description=d\0target_domain=scratch\0kernel_abi=0x{:08x}\0",
+        abi
+    );
+
+    let bytes = ElfBuilder::new_native()
+        .modinfo(first)
+        .modinfo2(second.as_bytes())
+        .text(&[0u8; 16])
+        .local_sym("narf_module_init", 0, (1 << 4) | 2, 5)
+        .build();
+
+    match crate::loader::load_image(&bytes) {
+        Ok(m) => {
+            let name_ok = m.name() == "split";
+            // SAFETY: never registered, never initialised.
+            unsafe { crate::loader::release_image(&m) };
+            if name_ok {
+                TestResult::Pass
+            } else {
+                TestResult::Fail("manifest parsed but carries the wrong name")
+            }
+        }
+        Err(_) => TestResult::Fail("load_image could not read a manifest split across sections"),
+    }
+}
+kernel_test_in!(
+    "modules/manifest",
+    smoke_manifest_spans_multiple_modinfo_sections
+);

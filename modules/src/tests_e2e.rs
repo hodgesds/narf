@@ -43,9 +43,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use narf_capabilities::CapKind;
 use narf_kernel_test::{kernel_test_in, TestResult};
 
-use crate::elf::header::{
-    EM_X86_64, ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
-};
+use crate::elf::header::{ET_REL, SHF_ALLOC, SHF_EXECINSTR, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB};
 use crate::elf::symbols::{SHN_ABS, STB_GLOBAL, STT_FUNC};
 use crate::syscalls::{sys_delete_module, sys_init_module, ModuleSyscallError};
 
@@ -280,13 +278,29 @@ fn build_smoke_elf(spec: &SmokeElfSpec) -> Vec<u8> {
     write_header(
         &mut out,
         ET_REL,
-        EM_X86_64,
+        native_machine(),
         off_sht as u64,
         shentsize,
         shnum,
         shstrndx,
     );
     out
+}
+
+/// `e_machine` for the running architecture.
+///
+/// `load_image` rejects a foreign machine before anything else, so an image
+/// hardcoded to x86_64 would fail every one of these end-to-end smokes on an
+/// aarch64 kernel.
+fn native_machine() -> u16 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        crate::elf::EM_AARCH64
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        crate::elf::EM_X86_64
+    }
 }
 
 fn write_header(

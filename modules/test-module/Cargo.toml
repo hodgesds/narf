@@ -10,9 +10,10 @@
 # tracks the same shape so authors of out-of-tree modules can copy
 # from it.
 #
-# Built target: x86_64-unknown-none (matches the kernel). Built as
-# `staticlib` per MODULE_AUTHORING.md so the build emits an archive
-# we can later extract the .o from.
+# Built with `cargo xtask build-module`, which compiles it for the kernel
+# target, extracts this crate's own object members from the `staticlib`
+# archive, and `ld -r`s them into the single relocatable object the loader
+# wants — merging the per-static `.modinfo` sections in the process.
 #
 # Linux refs:
 #   * tools/testing/selftests/kmod/kmod_test.sh — userspace smoke
@@ -34,8 +35,12 @@ name        = "narf_test_module"
 crate-type  = ["staticlib"]
 
 [dependencies]
-# No runtime deps. The module touches only its own statics so the
-# loader has something observable to confirm init/exit fired.
+# None, and that is the point: a module links *against* the kernel — the
+# loader resolves its undefined symbols through KSYMTAB at load time — so it
+# declares what it calls in an `extern "C"` block and depends on nothing.
+# Depending on `narf-modules` (the loader) would compile a second copy of the
+# memory, filesystem, console and time crates into the module, all of which
+# are already resident in the running kernel.
 
 [lints]
 workspace = true

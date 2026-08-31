@@ -7,6 +7,37 @@ architecture-comparison overview, see the workspace-root
 
 ## Project layout
 
+> **Status note.** Build your module with:
+>
+> ```sh
+> cargo xtask build-module --package <your-crate> --arch x86_64
+> ```
+>
+> which compiles the crate, takes its own object members out of the
+> `staticlib` archive, and `ld -r`s them into a single relocatable
+> object — merging the per-static `.modinfo` sections in the process.
+> Works for `aarch64` too; it links with `rust-lld` rather than the host
+> `ld`, which refuses foreign-architecture objects.
+>
+> Your `kernel_abi=` has to match the running kernel, and the hash is
+> derived from the kernel's export table, so it is not something you can
+> know when writing the crate. Read it from the target kernel and stamp
+> it in at build time:
+>
+> ```sh
+> cat /sys/kernel/abi_hash                       # e.g. 0x1f3a90c2
+> cargo xtask build-module --package <your-crate> \
+>       --arch x86_64 --kernel-abi 0x1f3a90c2
+> ```
+>
+> The source's own `kernel_abi=` line is a placeholder; `--kernel-abi`
+> overwrites it in place.
+>
+> One live limitation: a module that uses `core` beyond what the
+> compiler inlines comes out with undefined references nothing can
+> satisfy. Keep to the exported ABI and your own code for now. See
+> [DESIGN.md](./DESIGN.md).
+
 A NARF module is a stand-alone Cargo crate that builds to a single
 relocatable ELF object (`crate-type = "staticlib"`). A minimal
 `Cargo.toml`:
@@ -23,10 +54,12 @@ name = "rtl9999"
 crate-type = ["staticlib"]   # produces .a; we extract the .o
 
 [dependencies]
-# Modules link against the kernel's exported symbols via narf-modules.
-# In-tree the path; out-of-tree use the version published on crates.io.
-narf-modules = { path = "../narf-modules" }
-narf-capabilities = { path = "../narf-capabilities" }
+# None. A module links *against* the kernel — the loader resolves its
+# undefined symbols through KSYMTAB — so it declares what it calls in an
+# `extern "C"` block and depends on nothing. In particular do NOT depend
+# on `narf-modules`: that is the loader, and pulling it in would compile
+# a second copy of the memory, filesystem, console and time crates into
+# your module, all already resident in the running kernel.
 ```
 
 Source layout:
@@ -91,60 +124,80 @@ The format is one `key=value` per line. Recognised keys:
   * `depends=` — comma-separated list of module names this module
     needs loaded first. Phase 1 doesn't auto-load deps; modprobe
     is expected to.
-  * `kernel_abi=` — 32-bit hex hash of the running kernel build.
-    Get it from `cat /sys/kernel/abi_hash` after boot.
+  * `kernel_abi=` — 32-bit hex hash of the kernel's exported ABI
+    surface. Get it from `cat /sys/kernel/abi_hash` after boot. It is
+    derived from the export table, so it changes when the symbols you
+    can call change — not on every kernel rebuild.
 
-## The `narf_module!` macro
+## What you can call
+
+A module may call the kernel only through the exported ABI in
+`modules/src/kabi.rs`. This is a hand-written surface, not a projection
+of the kernel's internal APIs, and the reason is that **Rust has no
+stable ABI**: the layout of `&dyn Trait`, of any `repr(Rust)` struct,
+and the calling convention itself may all change between compilations
+with nothing in the toolchain reporting it. Only `extern "C"` over
+primitives and `repr(C)` types can safely cross into a separately
+compiled module.
+
+So the surface is small and grows deliberately. Today:
+
+| Symbol | Signature | Notes |
+|---|---|---|
+| `narf_printk` | `(*const u8, usize) -> i32` | UTF-8 bytes to the console; `-22` on null / empty / invalid UTF-8 |
+| `narf_kmalloc` | `(usize, usize) -> *mut u8` | size, align; null on failure or invalid layout |
+| `narf_kfree` | `(*mut u8, usize, usize) -> ()` | must repeat the exact size and align |
+| `narf_monotonic_ns` | `() -> u64` | monotonic clock |
+
+Declare them as you would any foreign function:
+
+```rust
+unsafe extern "C" {
+    fn narf_printk(ptr: *const u8, len: usize) -> i32;
+    fn narf_monotonic_ns() -> u64;
+}
+```
+
+These stay undefined in the object you build; the loader resolves them
+against KSYMTAB and patches the call sites. A name the kernel does not
+export is a load-time failure reporting that symbol, not a link error
+here — your module is linked long before it meets a kernel.
+
+Every export is `unsafe`, including the ones taking no pointers. The
+boundary is unsafe as a whole, because nothing has verified your
+arguments, and marking only the pointer-taking ones would imply the rest
+had been checked.
+
+If you wrap them in safe helpers, mark the wrappers `#[inline]`. Anything
+left out of line in a *different crate* is a symbol
+`cargo xtask build-module` does not put in your `.ko`, so the module ends
+up referencing your Rust-mangled wrapper — which is in no kernel's
+KSYMTAB — instead of `narf_printk`.
+
+Each export carries a CRC computed from its signature. If the kernel's
+signature changes, your module is refused at load with a CRC mismatch
+rather than being called with the wrong stack layout. You do not have
+to do anything to opt into that.
+
+Referencing a symbol that is *not* exported is a load-time failure, not
+a link-time one: the relocator reports `SymbolNotFound` naming the
+symbol.
+
+## Lifecycle symbols
 
 Every NARF module exports two C-ABI symbols the kernel calls:
-`narf_module_init` and `narf_module_exit`. The recommended way is
-the `narf_module!` macro, which hides the unsafe `extern "C"`
-plumbing:
+`narf_module_init` and `narf_module_exit`. You write them directly —
+there is no macro, and deliberately so. The plumbing is six lines, and a
+macro to hide it would have to live in a crate you depend on, which for
+anything but a trivial one means compiling a second copy of kernel code
+into your module.
 
 ```rust
 #![no_std]
-extern crate alloc;
 
-use core::result::Result;
-
-fn my_init() -> Result<(), &'static str> {
-    // ... register devices, install pump tasks, etc.
-    Ok(())
-}
-
-fn my_exit() {
-    // ... tear down, drop resources, unregister.
-}
-
-narf_modules::narf_module! {
-    name: "rtl9999",
-    init: my_init,
-    exit: my_exit,
-}
-```
-
-The macro expands to:
-
-```rust
-#[no_mangle]
-pub extern "C" fn narf_module_init() -> i32 {
-    match my_init() {
-        Ok(()) => 0,
-        Err(_) => -1,
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn narf_module_exit() {
-    my_exit()
-}
-```
-
-You can write the C-ABI symbols directly if you need finer
-control over the i32 return value:
-
-```rust
-#[no_mangle]
+/// Called once, after relocations are applied and the image is sealed.
+/// Return 0 for success, or a negative errno.
+#[unsafe(no_mangle)]
 pub extern "C" fn narf_module_init() -> i32 {
     if !hardware_present() {
         return -19;   // -ENODEV
@@ -152,11 +205,17 @@ pub extern "C" fn narf_module_init() -> i32 {
     0
 }
 
-#[no_mangle]
+/// Called on `rmmod` once the refcount reaches zero. Optional — omit it
+/// and the loader treats the module as having nothing to tear down.
+#[unsafe(no_mangle)]
 pub extern "C" fn narf_module_exit() {
     teardown_everything();
 }
 ```
+
+Returning the errno yourself is the point: a wrapper that mapped a
+`Result` onto `0` / `-1` would throw away exactly the distinction
+`insmod` reports to the user.
 
 ## Declaring capability requirements
 
@@ -289,10 +348,17 @@ fn my_exit() {
     unregister_proc("foo");
 }
 
-narf_modules::narf_module! {
-    name: "rtl9999",
-    init: my_init,
-    exit: my_exit,
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_init() -> i32 {
+    match my_init() {
+        Ok(()) => 0,
+        Err(_) => -22,   // -EINVAL
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn narf_module_exit() {
+    my_exit()
 }
 ```
 

@@ -8,7 +8,11 @@
 //! The module:
 //!   * Declares the `.modinfo` lines (via `#[link_section]`).
 //!   * Exposes the lifecycle C-ABI symbols `narf_module_init` and
-//!     `narf_module_exit`.
+//!     `narf_module_exit`, written directly — there is no macro, and the
+//!     plumbing is six lines.
+//!   * Calls `narf_printk`, so the built object carries an undefined symbol
+//!     the loader has to resolve through KSYMTAB — which is the part that
+//!     exercises relocation, and on aarch64 the PLT veneers too.
 //!   * Records init/exit firing in two `AtomicBool`s the kernel side
 //!     could observe.
 //!   * Exposes one ABI-stable export (`test_module_alive`) returning
@@ -83,19 +87,50 @@ static MODINFO_KERNEL_ABI: [u8; 22] = *b"kernel_abi=0x00000000\0";
 // `narf_module_exit` is optional. If present, the kernel calls it on
 // `rmmod` after the refcount has dropped to zero.
 
+// ── Kernel ABI ──────────────────────────────────────────────────────
+//
+// What the module calls in the kernel. These stay UNDEFINED in the object
+// this crate builds to; the loader resolves them against KSYMTAB and patches
+// the call sites. That is what makes this example an exercise of the
+// mechanism rather than just its shape: it produces a real
+// `R_X86_64_PLT32` relocation on x86_64, and `R_AARCH64_CALL26` on aarch64 —
+// which needs a PLT veneer, because kernel text is further away than that
+// relocation reaches.
+//
+// Every export is `unsafe`: the boundary is unsafe as a whole, since nothing
+// has verified the arguments. See `modules/src/kabi.rs` for the kernel side.
+unsafe extern "C" {
+    /// Write `len` bytes of UTF-8 at `ptr` to the kernel console.
+    fn narf_printk(ptr: *const u8, len: usize) -> i32;
+}
+
+/// Safe wrapper: a `&str` is by construction valid UTF-8 over readable
+/// bytes, which is the whole of `narf_printk`'s contract.
+fn printk(s: &str) {
+    // SAFETY: `s` is a live `&str` for the duration of the call, so
+    // `s.as_ptr()` names `s.len()` readable bytes of valid UTF-8.
+    unsafe {
+        let _ = narf_printk(s.as_ptr(), s.len());
+    }
+}
+
 /// Module entry point. C-ABI, called by the kernel from
-/// `crate::loader::invoke_init`.
+/// `crate::loader::invoke_init` once relocations are applied and the image
+/// is sealed. Zero promotes the module to Live; a negative errno is
+/// surfaced verbatim through `sys_init_module`.
 #[unsafe(no_mangle)]
 pub extern "C" fn narf_module_init() -> i32 {
     MODULE_INIT_RAN.store(true, Ordering::Release);
+    printk("narf-test-module: init\n");
     0
 }
 
 /// Module teardown. C-ABI, called by the kernel from
-/// `crate::loader::invoke_exit` after refcount reaches 0.
+/// `crate::loader::invoke_exit` after the refcount reaches 0.
 #[unsafe(no_mangle)]
 pub extern "C" fn narf_module_exit() {
     MODULE_EXIT_RAN.store(true, Ordering::Release);
+    printk("narf-test-module: exit\n");
 }
 
 /// Exported symbol. The kernel smoke looks this up via

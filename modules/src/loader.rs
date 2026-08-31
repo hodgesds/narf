@@ -9,18 +9,21 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use narf_lib::id::DomainId;
+use narf_lib::sync::IrqSafeSpinLock;
+use narf_memory::module_text::{self, ModuleTextError, Prot};
 
 use crate::domain;
 use crate::elf::{
     enumerate_sections, parse_header, parse_section, sections::SECT_MODINFO,
-    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, SHF_ALLOC, SHF_EXECINSTR,
-    SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_STRTAB, SHT_SYMTAB,
+    sections::SECT_NARF_KPARAMS, Elf64Header, HeaderError, SymbolTable, EM_AARCH64, SHF_ALLOC,
+    SHF_EXECINSTR, SHF_WRITE, SHT_NOBITS, SHT_PROGBITS, SHT_RELA, SHT_STRTAB, SHT_SYMTAB,
 };
 use crate::lifecycle::{ModuleExitFn, ModuleInitFn, ModuleState};
 use crate::manifest::{Manifest, ManifestError};
 use crate::params::{self, ParamSlot};
+use crate::plt::{Plt, VENEER_BYTES};
 use crate::refcount::RefCount;
-use crate::relocator::{apply_all_relas, RelocatorError, SectionPlacement};
+use crate::relocator::{apply_all_relas, RelocContext, RelocatorError, SectionPlacement};
 use crate::sign;
 use crate::symbols::{kernel_abi, ModuleId};
 
@@ -48,6 +51,12 @@ pub enum LoadError {
     AlreadyLoaded(String),
     /// The mandatory `narf_module_init` symbol is missing.
     MissingInit,
+    /// The module image could not be mapped, or its regions could not be
+    /// given their final permissions.
+    Image(ModuleTextError),
+    /// The ELF was built for a different architecture than the running
+    /// kernel.
+    WrongArch { runtime: &'static str, elf: u16 },
 }
 
 impl From<HeaderError> for LoadError {
@@ -93,8 +102,13 @@ pub struct Module {
     /// `.modinfo` and signature data on demand. Could be dropped
     /// once init returns; we keep it for diagnostics.
     pub image_size: usize,
-    /// Section placements (text, rodata, data, bss). Each carries
-    /// its in-memory buffer and resolved address.
+    /// The mapped image — text RX, rodata RO, data + bss RW — as handed
+    /// out by `narf_memory::module_text`. Taken and unmapped by
+    /// [`release_image`] at unload, which is the only thing that makes it
+    /// `None`.
+    pub image: IrqSafeSpinLock<Option<module_text::ModuleImage>>,
+    /// Where each loadable section landed inside [`Module::image`]. Address
+    /// and size only; the bytes live in the image.
     pub placements: Vec<SectionPlacement>,
     /// Resolved init address — set during loading.
     pub init_addr: usize,
@@ -102,6 +116,19 @@ pub struct Module {
     pub exit_addr: Option<usize>,
     /// Module parameters from `.narf_kparams`.
     pub params: Vec<ParamSlot>,
+    /// Modules this one resolved symbols from, deduplicated.
+    ///
+    /// `sys_init_module` takes a reference on each after a successful load,
+    /// and `sys_delete_module` drops them, so a provider reports EBUSY while
+    /// any consumer is loaded. This is `try_module_get` done at link time
+    /// rather than per call: NARF already resolves cap requirements when the
+    /// pointer is wired in (DESIGN.md §1), and lifetime is the same kind of
+    /// obligation.
+    ///
+    /// It also makes `depends=` enforcement fall out — a module that links
+    /// against another cannot outlive it regardless of what its manifest
+    /// claims.
+    pub deps: Vec<crate::symbols::ModuleId>,
     /// Reference count.
     pub refcount: RefCount,
     /// Current lifecycle state.
@@ -115,18 +142,13 @@ impl Module {
 
     /// Aggregate byte size (text + rodata + data + bss).
     pub fn total_size(&self) -> usize {
-        self.placements.iter().map(|p| p.bytes.len()).sum()
+        self.placements.iter().map(|p| p.size).sum()
     }
 
-    /// Base address (text section, if any; falls back to first
-    /// placement). Used by `/proc/modules`.
+    /// Base address of the module image. Used by `/proc/modules`. Zero once
+    /// the image has been released.
     pub fn base_addr(&self) -> u64 {
-        for p in &self.placements {
-            if p.target_addr != 0 {
-                return p.target_addr;
-            }
-        }
-        0
+        self.image.lock().as_ref().map(|m| m.base).unwrap_or(0)
     }
 }
 
@@ -138,15 +160,25 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         return Err(LoadError::SignatureRejected(reason));
     }
 
-    // 2. ELF header validation.
+    // 2. ELF header validation, then architecture. The relocator applies
+    //    x86_64 or aarch64 relocations purely on `e_machine`, so without this
+    //    check a foreign-arch `.ko` relocates "successfully" and faults on its
+    //    first instruction instead of being rejected at load.
     let hdr = parse_header(image)?;
+    if hdr.e_machine != native_machine() {
+        return Err(LoadError::WrongArch {
+            runtime: native_arch_name(),
+            elf: hdr.e_machine,
+        });
+    }
 
-    // 3. Find `.modinfo` and parse the manifest.
-    let modinfo_section = find_section_by_name(image, &hdr, SECT_MODINFO)
-        .ok_or(LoadError::Manifest(ManifestError::Missing))?;
-    let modinfo_bytes = section_data(image, &modinfo_section);
+    // 3. Collect `.modinfo` and parse the manifest.
+    let modinfo_bytes = collect_modinfo(image, &hdr);
+    if modinfo_bytes.is_empty() {
+        return Err(LoadError::Manifest(ManifestError::Missing));
+    }
     let abi = kernel_abi();
-    let manifest = Manifest::parse(modinfo_bytes, abi)?;
+    let manifest = Manifest::parse(&modinfo_bytes, abi)?;
 
     // 4. Resolve target domain.
     let domain_id = domain::resolve(&manifest.target_domain)?;
@@ -166,65 +198,31 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
     // 6. Symbol table.
     let symtab_pair = find_symtab(image, &hdr).ok_or(LoadError::NoSymbols)?;
 
-    // 7. Allocate in-memory buffers for every PROGBITS/NOBITS+ALLOC
-    //    section. We synthesize a flat layout where text starts at
-    //    a deterministic base offset; the loader's actual VA
-    //    placement will come from a future PKS HAL hookup. For now
-    //    we use the buffer's own address so relocations land inside
-    //    a real allocation that we can hand to a test.
-    let mut placements: Vec<SectionPlacement> = Vec::new();
-    let mut cursor: u64 = 0;
-    for i in 0..hdr.e_shnum as usize {
-        let shdr = match parse_section(image, &hdr, i) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if (shdr.sh_flags & SHF_ALLOC) == 0 {
-            continue;
-        }
-        if shdr.sh_type != SHT_PROGBITS && shdr.sh_type != SHT_NOBITS {
-            continue;
-        }
-        // Align cursor.
-        let align = shdr.sh_addralign.max(1);
-        if align > 1 {
-            cursor = (cursor + align - 1) & !(align - 1);
-        }
-        let size = shdr.sh_size as usize;
-        let mut bytes = alloc::vec![0u8; size];
-        if shdr.sh_type == SHT_PROGBITS && size > 0 {
-            let off = shdr.sh_offset as usize;
-            if off + size <= image.len() {
-                bytes.copy_from_slice(&image[off..off + size]);
-            }
-        }
-        // Use the buffer's actual address as the runtime target.
-        // This makes self-referential relocations land in the
-        // correct place even without a separate VA map.
-        let addr = if !bytes.is_empty() {
-            bytes.as_ptr() as u64
-        } else {
-            cursor
-        };
-        placements.push(SectionPlacement {
-            section_idx: i,
-            target_addr: addr,
-            bytes,
-        });
-        cursor = cursor.wrapping_add(size as u64);
-    }
+    // 7. Plan the image layout, then map it. Sections are grouped by the
+    //    permission they will end up with so each region is page-aligned and
+    //    can be sealed with a single `protect` call.
+    let layout = plan_layout(image, &hdr)?;
+    let mut mem = module_text::alloc(layout.total_pages).map_err(LoadError::Image)?;
 
-    // 8. Apply relocations.
-    let symbols = SymbolTable::new(image, symtab_pair.0, symtab_pair.1);
-    let _ = apply_all_relas(image, &hdr, &symbols, &mut placements, &manifest)?;
-
-    // 9. Find init / exit symbols.
-    let (init_addr, exit_addr) = find_lifecycle_symbols(&symbols, &placements)?;
-
-    // 10. Parse module parameters.
-    let params = match find_section_by_name(image, &hdr, SECT_NARF_KPARAMS) {
-        Some(s) => params::parse_section(section_data(image, &s)),
-        None => Vec::new(),
+    // 8. Everything past this point can fail with the image already mapped,
+    //    so it runs in a helper whose `Err` unmaps before propagating —
+    //    otherwise a failed load leaks both frames and module VA.
+    let built = build_image(image, &hdr, &manifest, &layout, &mut mem, symtab_pair);
+    let BuiltImage {
+        placements,
+        init_addr,
+        exit_addr,
+        params,
+        deps,
+    } = match built {
+        Ok(v) => v,
+        Err(e) => {
+            // SAFETY: the load failed before `invoke_init`, so nothing has
+            // ever executed from this image and nothing holds a pointer into
+            // it.
+            unsafe { module_text::free(mem) };
+            return Err(e);
+        }
     };
 
     Ok(Arc::new(Module {
@@ -232,13 +230,345 @@ pub fn load_image(image: &[u8]) -> Result<Arc<Module>, LoadError> {
         manifest,
         domain: domain_id,
         image_size: image.len(),
+        image: IrqSafeSpinLock::new(Some(mem)),
         placements,
         init_addr,
         exit_addr,
         params,
+        deps,
         refcount: RefCount::new(),
-        state: narf_lib::sync::IrqSafeSpinLock::new(ModuleState::Loading),
+        state: IrqSafeSpinLock::new(ModuleState::Loading),
     }))
+}
+
+// ── Image layout ────────────────────────────────────────────────────
+
+/// Which of the image's three permission regions a section belongs to.
+///
+/// Linux splits the same space seven ways (`enum mod_mem_type` in
+/// `include/linux/module.h`), separating `ro_after_init` from plain rodata and
+/// giving `.init.*` its own text/data/rodata trio so the whole init region can
+/// be **freed** once `narf_module_init` returns. Both are worth having and
+/// neither is here yet; the layout is a loop over [`REGION_ORDER`] precisely so
+/// adding them is more entries rather than a rewrite.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Region {
+    /// `SHF_EXECINSTR` — sealed RX.
+    Text,
+    /// Neither executable nor writable — sealed RO.
+    Rodata,
+    /// `SHF_WRITE`, plus `.bss` (`SHT_NOBITS`) — stays RW.
+    Data,
+}
+
+/// Layout order. Also the order the regions are sealed in.
+const REGION_ORDER: [Region; 3] = [Region::Text, Region::Rodata, Region::Data];
+
+const PAGE: u64 = 4096;
+
+#[inline]
+fn page_up(v: u64) -> u64 {
+    (v + PAGE - 1) & !(PAGE - 1)
+}
+
+fn region_of(sh_flags: u64) -> Region {
+    if (sh_flags & SHF_EXECINSTR) != 0 {
+        Region::Text
+    } else if (sh_flags & SHF_WRITE) != 0 {
+        Region::Data
+    } else {
+        Region::Rodata
+    }
+}
+
+/// What [`build_image`] produces once the image is populated and sealed.
+#[derive(Debug)]
+struct BuiltImage {
+    placements: Vec<SectionPlacement>,
+    init_addr: usize,
+    exit_addr: Option<usize>,
+    params: Vec<ParamSlot>,
+    deps: Vec<crate::symbols::ModuleId>,
+}
+
+/// `e_machine` value a module must carry to run on this kernel.
+#[inline]
+fn native_machine() -> u16 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        crate::elf::EM_X86_64
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        EM_AARCH64
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        0
+    }
+}
+
+#[inline]
+fn native_arch_name() -> &'static str {
+    #[cfg(target_arch = "x86_64")]
+    {
+        "x86_64"
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        "aarch64"
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        "unknown"
+    }
+}
+
+/// Upper bound on the veneers an aarch64 module needs: one per `CALL26` /
+/// `JUMP26` relocation.
+///
+/// An over-count, deliberately. Several relocations usually share a target
+/// and `Plt::veneer_for` folds them onto one slot, so the arena ends up
+/// partly unused — a few dozen bytes against the alternative of a second
+/// pass to compute the exact figure. Linux over-counts and then sorts to
+/// fold duplicates (`arch/arm64/kernel/module-plts.c::count_plts`).
+fn count_branch_relocs(bytes: &[u8], hdr: &Elf64Header) -> usize {
+    use crate::elf::reloc::{R_AARCH64_CALL26, R_AARCH64_JUMP26};
+
+    let mut n = 0usize;
+    for i in 0..hdr.e_shnum as usize {
+        let Ok(shdr) = parse_section(bytes, hdr, i) else {
+            continue;
+        };
+        if shdr.sh_type != SHT_RELA || shdr.sh_entsize == 0 {
+            continue;
+        }
+        let count = (shdr.sh_size / shdr.sh_entsize) as usize;
+        for e in 0..count {
+            let off = shdr.sh_offset as usize + e * shdr.sh_entsize as usize;
+            let Some(r) = crate::elf::parse_rela(bytes, off) else {
+                continue;
+            };
+            if matches!(r.ty(), R_AARCH64_CALL26 | R_AARCH64_JUMP26) {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// A page-aligned plan for the module image.
+#[derive(Debug)]
+struct ImageLayout {
+    /// `(section_idx, offset_from_image_base, size)` in layout order.
+    sections: Vec<(usize, u64, usize)>,
+    /// Offset of the aarch64 veneer arena within the image. Always inside
+    /// the text region; meaningless when `plt_slots` is zero.
+    plt_offset: u64,
+    /// Veneer slots reserved — an upper bound (see [`count_branch_relocs`]),
+    /// and zero on x86_64.
+    plt_slots: usize,
+    text_pages: usize,
+    rodata_pages: usize,
+    total_pages: usize,
+}
+
+/// Group every loadable section by permission and give each an offset in the
+/// image.
+///
+/// Linux ref: `kernel/module/main.c::layout_sections`, which groups by
+/// `mod_mem_type` for the same reason — so a whole permission class can be
+/// flipped in one operation instead of per section.
+fn plan_layout(bytes: &[u8], hdr: &Elf64Header) -> Result<ImageLayout, LoadError> {
+    let mut sections = Vec::new();
+    let mut cursor = 0u64;
+    let mut region_start = [0u64; REGION_ORDER.len()];
+    let mut region_end = [0u64; REGION_ORDER.len()];
+    let mut plt_offset = 0u64;
+    let mut plt_slots = 0usize;
+
+    for (ri, region) in REGION_ORDER.iter().enumerate() {
+        cursor = page_up(cursor);
+        region_start[ri] = cursor;
+        for i in 0..hdr.e_shnum as usize {
+            let Ok(shdr) = parse_section(bytes, hdr, i) else {
+                continue;
+            };
+            if (shdr.sh_flags & SHF_ALLOC) == 0 {
+                continue;
+            }
+            if shdr.sh_type != SHT_PROGBITS && shdr.sh_type != SHT_NOBITS {
+                continue;
+            }
+            if region_of(shdr.sh_flags) != *region {
+                continue;
+            }
+            // The image base is page-aligned, so cursor arithmetic satisfies
+            // any alignment up to a page. A stricter request would need the
+            // allocator to over-allocate and shift; nothing rustc emits for a
+            // kernel module asks for it, so reject it loudly rather than
+            // silently mis-aligning the section.
+            let align = shdr.sh_addralign.max(1);
+            if align > PAGE {
+                return Err(LoadError::BadSection("section alignment exceeds a page"));
+            }
+            cursor = (cursor + align - 1) & !(align - 1);
+            sections.push((i, cursor, shdr.sh_size as usize));
+            cursor = cursor.wrapping_add(shdr.sh_size);
+        }
+        // The veneer arena is executable and must be within branch range of
+        // every call site in the module, so it goes at the end of the text
+        // region rather than in a section of its own. Linux reserves it the
+        // same way, as a synthetic `.plt` section
+        // (`arch/arm64/kernel/module-plts.c::module_frob_arch_sections`).
+        if *region == Region::Text {
+            // A64 instructions must be 4-byte aligned, and the last text
+            // section's size is arbitrary.
+            cursor = (cursor + 3) & !3;
+            plt_offset = cursor;
+            plt_slots = if hdr.e_machine == EM_AARCH64 {
+                count_branch_relocs(bytes, hdr)
+            } else {
+                0
+            };
+            cursor = cursor.wrapping_add((plt_slots * VENEER_BYTES) as u64);
+        }
+        region_end[ri] = cursor;
+    }
+
+    let total = page_up(cursor);
+    if total == 0 {
+        return Err(LoadError::BadSection("no loadable sections"));
+    }
+    Ok(ImageLayout {
+        sections,
+        plt_offset,
+        plt_slots,
+        text_pages: ((page_up(region_end[0]) - region_start[0]) / PAGE) as usize,
+        rodata_pages: ((page_up(region_end[1]) - region_start[1]) / PAGE) as usize,
+        total_pages: (total / PAGE) as usize,
+    })
+}
+
+/// Copy sections to their final addresses, relocate them there, seal the
+/// read-only regions, and resolve the lifecycle symbols.
+///
+/// Split out of [`load_image`] so every failure that happens with the image
+/// already mapped funnels through one `module_text::free`.
+///
+/// Relocation happens **in place**, against the addresses the code will
+/// actually execute at — same as Linux's `move_module` + `apply_relocations`
+/// pair (`kernel/module/main.c:2731`, `:1591`).
+fn build_image(
+    bytes: &[u8],
+    hdr: &Elf64Header,
+    manifest: &Manifest,
+    layout: &ImageLayout,
+    mem: &mut module_text::ModuleImage,
+    symtab_pair: (
+        crate::elf::Elf64SectionHeader,
+        crate::elf::Elf64SectionHeader,
+    ),
+) -> Result<BuiltImage, LoadError> {
+    let mut placements: Vec<SectionPlacement> = Vec::with_capacity(layout.sections.len());
+    for &(idx, off, size) in &layout.sections {
+        let shdr = parse_section(bytes, hdr, idx)
+            .map_err(|_| LoadError::BadSection("unreadable section"))?;
+        let va = mem.base + off;
+        // SAFETY: `plan_layout` sized the image to cover `[off, off + size)`,
+        // and every page is still `Rw` — nothing has been sealed yet.
+        let dst = unsafe { core::slice::from_raw_parts_mut(va as *mut u8, size) };
+        if shdr.sh_type == SHT_PROGBITS && size > 0 {
+            let src = shdr.sh_offset as usize;
+            let end = src
+                .checked_add(size)
+                .ok_or(LoadError::BadSection("section offset overflows"))?;
+            if end > bytes.len() {
+                return Err(LoadError::BadSection("section extends past end of image"));
+            }
+            dst.copy_from_slice(&bytes[src..end]);
+        } else {
+            // `module_text::alloc` trap-fills, so `.bss` has to be zeroed
+            // explicitly rather than left as it came.
+            dst.fill(0);
+        }
+        placements.push(SectionPlacement {
+            section_idx: idx,
+            target_addr: va,
+            size,
+        });
+    }
+
+    let symbols = SymbolTable::new(bytes, symtab_pair.0, symtab_pair.1);
+    let mut plt =
+        (layout.plt_slots > 0).then(|| Plt::new(mem.base + layout.plt_offset, layout.plt_slots));
+    let mut ctx = RelocContext {
+        manifest,
+        plt: plt.as_mut(),
+        deps: Vec::new(),
+    };
+    let _ = apply_all_relas(bytes, hdr, &symbols, &mut placements, &mut ctx)?;
+
+    // Resolved before sealing so that every step which can fail is on the
+    // writable side of the seal.
+    let (init_addr, exit_addr) = find_lifecycle_symbols(&symbols, &placements)?;
+
+    let params = match find_section_by_name(bytes, hdr, SECT_NARF_KPARAMS) {
+        Some(s) => params::parse_section(section_data(bytes, &s)),
+        None => Vec::new(),
+    };
+
+    // Seal. `protect` closes each region's writable linear-map alias before
+    // publishing the new permissions, so a failure here leaves nothing
+    // executable. Data + bss keep the `Rw` they were allocated with.
+    module_text::protect(mem, 0, layout.text_pages, Prot::Rx).map_err(LoadError::Image)?;
+    module_text::protect(mem, layout.text_pages, layout.rodata_pages, Prot::Ro)
+        .map_err(LoadError::Image)?;
+
+    Ok(BuiltImage {
+        placements,
+        init_addr,
+        exit_addr,
+        params,
+        deps: ctx.deps,
+    })
+}
+
+/// Concatenate every `.modinfo` section in the image.
+///
+/// There is usually more than one. Each `#[link_section = ".modinfo"]`
+/// static becomes its own section in rustc's output — the reference module
+/// emits seven — and they are only merged into a single `.modinfo` when the
+/// object is passed through `ld -r`, which is how a `.ko` is built.
+///
+/// Reading only the first section, as this used to, meant a real module's
+/// manifest was whatever its first `MODULE_INFO` line happened to be. For the
+/// reference module that is `name=`, so `kernel_abi=`, `license=` and
+/// `target_domain=` all went missing and the load failed with a manifest
+/// error that pointed nowhere near the cause.
+///
+/// Depending on `ld -r` to have merged them would work, but only for images
+/// built exactly that way; concatenating here costs one pass over the section
+/// table and makes the loader indifferent to it.
+fn collect_modinfo(bytes: &[u8], hdr: &Elf64Header) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (_i, shdr, name) in enumerate_sections(bytes, hdr) {
+        if name != SECT_MODINFO {
+            continue;
+        }
+        let data = section_data(bytes, &shdr);
+        if data.is_empty() {
+            continue;
+        }
+        // The entries are NUL-separated `key=value` strings and each static
+        // normally carries its own terminator. Supply one if a section does
+        // not end with it, so two sections cannot fuse into one bogus key.
+        if !out.is_empty() && out.last() != Some(&0) {
+            out.push(0);
+        }
+        out.extend_from_slice(data);
+    }
+    out
 }
 
 /// Helper: find a section by exact name.
@@ -414,6 +744,25 @@ pub unsafe fn invoke_exit(module: &Module) -> Result<(), crate::lifecycle::Lifec
     }
     *module.state.lock() = ModuleState::Dead;
     Ok(())
+}
+
+/// Unmap the module's image and return its frames.
+///
+/// # Safety
+/// The module must be `Dead`: `invoke_exit` has returned, its KSYMTAB exports
+/// have been swept by `symbols::unregister_exports_of`, and no CPU may still
+/// be executing its code or holding a pointer into it. `sys_delete_module` is
+/// the only intended caller.
+pub unsafe fn release_image(module: &Module) {
+    // `take()` in its own statement so the image lock is released before
+    // `module_text::free` runs — freeing walks page tables and takes the
+    // window's VA lock, and holding an unrelated lock across that is how
+    // lock-order inversions start.
+    let taken = module.image.lock().take();
+    if let Some(mem) = taken {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { module_text::free(mem) };
+    }
 }
 
 /// Format placement diagnostics for /sys/module/<name>/sections/.

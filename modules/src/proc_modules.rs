@@ -24,7 +24,21 @@ pub fn render_one(module: &Module) -> String {
         "Dead" => "Unloading",
         other => other,
     };
-    let holders = "-"; // dependency tracking placeholder
+    // Linux prints a comma-terminated list of the modules holding this one,
+    // or "-" when there are none (`kernel/module/procfs.c::m_show`). Now that
+    // the loader records dependency edges these are real rather than a
+    // placeholder dash.
+    let names = crate::registry::holders_of(module.id);
+    let holders = if names.is_empty() {
+        String::from("-")
+    } else {
+        let mut s = String::new();
+        for n in &names {
+            s.push_str(n);
+            s.push(',');
+        }
+        s
+    };
     format!(
         "{} {} {} {} {} 0x{:016x}",
         module.name(),

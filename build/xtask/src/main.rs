@@ -58,6 +58,9 @@ enum Cmd {
     Run(BuildArgs),
     /// Cross-compile and run kernel tests under QEMU.
     Test(TestArgs),
+    /// Cross-compile a kernel-module crate into a single relocatable
+    /// object — the NARF equivalent of a `.ko`.
+    BuildModule(BuildModuleArgs),
     /// Cross-compile and boot under QEMU as a real init pass (no
     /// kernel-test feature), parsing serial output for panic markers
     /// and known success markers. Catches regressions that smoke
@@ -2013,6 +2016,289 @@ fn workspace_root() -> Result<PathBuf> {
         .ok_or_else(|| anyhow!("manifest dir has no grandparent"))?
         .to_path_buf();
     Ok(root)
+}
+
+/// Args for `xtask build-module`.
+#[derive(clap::Args)]
+struct BuildModuleArgs {
+    /// Target architecture.
+    #[arg(long, value_enum, default_value_t = Arch::X86_64)]
+    arch: Arch,
+
+    /// Module crate to build.
+    #[arg(long, default_value = "narf-test-module")]
+    package: String,
+
+    /// Where to write the `.ko`. Defaults to
+    /// `target/<triple>/release/<package>.ko`.
+    #[arg(long)]
+    out: Option<PathBuf>,
+
+    /// Stamp this kernel ABI hash into the module's `.modinfo`, replacing
+    /// whatever `kernel_abi=` the source declared. Accepts `0x...` or bare
+    /// hex.
+    ///
+    /// The loader refuses a module whose hash does not match the running
+    /// kernel's, and that hash is derived from the kernel's export table —
+    /// so it is not knowable when the module crate is written. Read it from
+    /// a running kernel with `cat /sys/kernel/abi_hash` and pass it here.
+    #[arg(long)]
+    kernel_abi: Option<String>,
+}
+
+/// Overwrite the `kernel_abi=0x........` value inside a `.ko`'s `.modinfo`.
+///
+/// The field is fixed-width hex, so this is an in-place patch of eight bytes
+/// — no section has to grow and no offset moves. Scoped to the `.modinfo`
+/// section rather than done over the whole file so a matching byte string in
+/// debug info or a string literal cannot be hit by accident.
+fn stamp_kernel_abi(ko: &Path, value: u32) -> Result<()> {
+    let mut bytes = std::fs::read(ko).with_context(|| format!("read {}", ko.display()))?;
+    if bytes.len() < 64 || &bytes[0..4] != b"\x7fELF" {
+        bail!("{} is not an ELF object", ko.display());
+    }
+    let u16at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as usize;
+    let u32at =
+        |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]) as usize;
+    let u64at = |b: &[u8], o: usize| {
+        u64::from_le_bytes([
+            b[o],
+            b[o + 1],
+            b[o + 2],
+            b[o + 3],
+            b[o + 4],
+            b[o + 5],
+            b[o + 6],
+            b[o + 7],
+        ]) as usize
+    };
+
+    let shoff = u64at(&bytes, 0x28);
+    let shentsize = u16at(&bytes, 0x3A);
+    let shnum = u16at(&bytes, 0x3C);
+    let shstrndx = u16at(&bytes, 0x3E);
+    if shoff == 0 || shnum == 0 || shstrndx >= shnum {
+        bail!("{}: unusable section header table", ko.display());
+    }
+    let strtab_off = u64at(&bytes, shoff + shstrndx * shentsize + 0x18);
+
+    let mut target: Option<(usize, usize)> = None;
+    for i in 0..shnum {
+        let sh = shoff + i * shentsize;
+        let name_off = strtab_off + u32at(&bytes, sh);
+        let name_end = bytes[name_off..]
+            .iter()
+            .position(|b| *b == 0)
+            .map(|n| name_off + n)
+            .unwrap_or(name_off);
+        if &bytes[name_off..name_end] == b".modinfo" {
+            target = Some((u64at(&bytes, sh + 0x18), u64at(&bytes, sh + 0x20)));
+            break;
+        }
+    }
+    let Some((off, size)) = target else {
+        bail!("{}: no .modinfo section to stamp", ko.display());
+    };
+
+    const KEY: &[u8] = b"kernel_abi=0x";
+    let region = &bytes[off..off + size];
+    let Some(at) = region
+        .windows(KEY.len())
+        .position(|w| w == KEY)
+        .map(|p| off + p + KEY.len())
+    else {
+        bail!(
+            "{}: .modinfo has no `kernel_abi=0x` field to stamp",
+            ko.display()
+        );
+    };
+    if at + 8 > off + size {
+        bail!("{}: `kernel_abi=` value is truncated", ko.display());
+    }
+    let replacement = format!("{value:08x}");
+    bytes[at..at + 8].copy_from_slice(replacement.as_bytes());
+    std::fs::write(ko, &bytes).with_context(|| format!("write {}", ko.display()))?;
+    Ok(())
+}
+
+/// Build a module crate into the single relocatable object the loader wants.
+///
+/// A module crate is `crate-type = ["staticlib"]`, which produces an
+/// **archive** — not a loadable object. Two things have to happen to it:
+///
+///  1. Take only the crate's own members. The archive also contains every
+///     `core` and `compiler_builtins` object the linker might have wanted;
+///     pulling those in would produce a multi-megabyte module out of a
+///     hundred bytes of driver.
+///  2. `ld -r` them together. Besides combining the members, this **merges
+///     same-named sections** — which matters more than it sounds, because
+///     rustc emits one `.modinfo` section per `#[link_section]` static
+///     (seven for the reference module) and Linux's module build relies on
+///     exactly this merge. The loader tolerates the un-merged form too, but
+///     a `.ko` should be the merged one.
+///
+/// A module that calls into `core` beyond what the compiler inlines will
+/// come out with undefined references that neither the kernel's KSYMTAB nor
+/// this object can satisfy, and will fail to load naming the symbol. Linking
+/// the needed `core` members in as well is the next step for that case;
+/// nothing in-tree needs it yet.
+/// Pick a linker that can do `-r` on either target's objects.
+///
+/// The host `ld` is built for one architecture and refuses a foreign object
+/// with "file in wrong format", so an aarch64 module cannot be linked with it
+/// on an x86_64 host. LLD is architecture-neutral — it infers the target from
+/// the inputs — and `rust-lld` ships with the pinned toolchain's `llvm-tools`
+/// component, so preferring it means no cross-binutils to install. `ld.lld`
+/// from a system LLVM is an equally good fallback; plain `ld` is last, and
+/// works only for a native-arch module.
+fn module_linker(root: &Path) -> Result<(String, Vec<String>)> {
+    let _ = root;
+    // `rust-lld` needs an explicit flavor; the `ld.lld` alias implies GNU.
+    if let Ok(sysroot) = Command::new(std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into()))
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+    {
+        if sysroot.status.success() {
+            let base = PathBuf::from(String::from_utf8_lossy(&sysroot.stdout).trim().to_string());
+            for host in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+                let candidate = base
+                    .join("lib")
+                    .join("rustlib")
+                    .join(host)
+                    .join("bin")
+                    .join("rust-lld");
+                if candidate.exists() {
+                    return Ok((
+                        candidate.to_string_lossy().into_owned(),
+                        vec!["-flavor".into(), "gnu".into()],
+                    ));
+                }
+            }
+        }
+    }
+    for candidate in ["ld.lld", "lld"] {
+        if Command::new(candidate)
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Ok((candidate.to_string(), Vec::new()));
+        }
+    }
+    Ok(("ld".to_string(), Vec::new()))
+}
+
+fn build_module(args: &BuildModuleArgs, root: &Path) -> Result<PathBuf> {
+    let triple = args.arch.triple();
+    let status = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .current_dir(root)
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env_remove("RUSTFLAGS")
+        .arg("build")
+        .arg("-p")
+        .arg(&args.package)
+        .arg("--release")
+        .arg("--target")
+        .arg(triple)
+        .arg("-Z")
+        .arg("build-std=core,compiler_builtins,alloc")
+        .arg("-Z")
+        .arg("build-std-features=compiler-builtins-mem,compiler-builtins-no-f16-f128")
+        .status()
+        .with_context(|| format!("failed to spawn cargo for {}", args.package))?;
+    if !status.success() {
+        bail!("cargo build -p {} failed", args.package);
+    }
+
+    let stem = args.package.replace('-', "_");
+    let out_dir = root.join("target").join(triple).join("release");
+    let archive = out_dir.join(format!("lib{stem}.a"));
+    if !archive.exists() {
+        bail!(
+            "{} did not produce {} — is it `crate-type = [\"staticlib\"]`?",
+            args.package,
+            archive.display()
+        );
+    }
+
+    // Members belonging to this crate are named `<crate>-<hash>...o`; every
+    // other member came from core / compiler_builtins.
+    let listing = Command::new("ar")
+        .arg("t")
+        .arg(&archive)
+        .output()
+        .context("failed to run `ar t` — is binutils installed?")?;
+    if !listing.status.success() {
+        bail!("`ar t {}` failed", archive.display());
+    }
+    let prefix = format!("{stem}-");
+    let members: Vec<String> = String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|m| m.starts_with(&prefix) && m.ends_with(".o"))
+        .map(str::to_string)
+        .collect();
+    if members.is_empty() {
+        bail!(
+            "no `{prefix}*.o` members in {} — nothing of the crate's own to link",
+            archive.display()
+        );
+    }
+
+    // `ar x` extracts into the working directory, so give it one of its own
+    // rather than scattering objects across the target dir.
+    let work = out_dir.join(format!("{stem}.ko.d"));
+    let _ = std::fs::remove_dir_all(&work);
+    std::fs::create_dir_all(&work).with_context(|| format!("mkdir {}", work.display()))?;
+    let mut extract = Command::new("ar");
+    extract.current_dir(&work).arg("x").arg(&archive);
+    for m in &members {
+        extract.arg(m);
+    }
+    if !extract.status().context("failed to run `ar x`")?.success() {
+        bail!("`ar x` failed to extract members of {}", archive.display());
+    }
+
+    let out = args
+        .out
+        .clone()
+        .unwrap_or_else(|| out_dir.join(format!("{stem}.ko")));
+    let (linker, linker_args) = module_linker(root)?;
+    let mut link = Command::new(&linker);
+    link.args(&linker_args).arg("-r").arg("-o").arg(&out);
+    for m in &members {
+        link.arg(work.join(m));
+    }
+    if !link
+        .status()
+        .with_context(|| format!("failed to run `{linker} -r`"))?
+        .success()
+    {
+        bail!(
+            "`{linker} -r` failed to combine {} object(s)",
+            members.len()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&work);
+
+    if let Some(raw) = &args.kernel_abi {
+        let hex = raw.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let value = u32::from_str_radix(hex, 16)
+            .with_context(|| format!("--kernel-abi {raw} is not a 32-bit hex value"))?;
+        stamp_kernel_abi(&out, value)?;
+        println!("xtask build-module: stamped kernel_abi=0x{value:08x}");
+    }
+
+    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    println!(
+        "xtask build-module: {} -> {} ({size} bytes, {} object(s), {triple})",
+        args.package,
+        out.display(),
+        members.len()
+    );
+    Ok(out)
 }
 
 fn cargo_build(args: &BuildArgs, root: &Path) -> Result<PathBuf> {
@@ -8218,6 +8504,10 @@ fn main() -> Result<()> {
         }
         Cmd::Build(args) => {
             cargo_build(&args, &workspace_root()?)?;
+            Ok(())
+        }
+        Cmd::BuildModule(args) => {
+            build_module(&args, &workspace_root()?)?;
             Ok(())
         }
         Cmd::Run(args) => run_cmd(&args),

@@ -1514,6 +1514,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // Same for the loadable-module image window. On x86_64 it
+                // lives under PML4[511], which `init_mmu` already built, so
+                // this is a no-op; on aarch64 it is a fresh L0 entry that
+                // must exist before the first `insmod` walks it.
+                match narf_memory::module_text::reserve_kernel_slot() {
+                    Ok(()) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  module_text: kernel VA slot {} reserved",
+                            narf_memory::module_text::kernel_top_slot()
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            console::Writer,
+                            "  module_text: slot reservation failed: {e:?}"
+                        );
+                    }
+                }
+
                 // Per-domain PCID PML4s — deferred here, AFTER the MMU
                 // handoff (CR3 is now the final kernel PML4) and the buddy
                 // populate, so the clones snapshot the right PML4 from a live
@@ -2381,6 +2401,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // hung probe by name + (vendor:device) before silence.
             narf_bus::set_probe_log_hook(_init_log);
             narf_bus::set_probe_log(true);
+
+            // Loadable modules: register the kernel ABI surface with
+            // KSYMTAB, install the driver-domain name table, and derive the
+            // ABI hash from the surface. Until this runs KSYMTAB is empty,
+            // so a module can be relocated but cannot call anything.
+            narf_modules::register_initcalls();
 
             // BPF: collect and validate the `narf.kfuncs` link section.
             // `Subsys` because collection allocates; the boot-order

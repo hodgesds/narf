@@ -11960,6 +11960,38 @@ fn smoke_memory_shared_hugetlb_fork_aliases_frames() -> TestResult {
     }
 
     // ── Control: a PRIVATE huge mapping still forks by copy ───────────
+    //
+    // Unlike the shared arm, this one moves real bytes: forking a private
+    // huge mapping copies the whole 2 MiB between frames. The frames here are
+    // synthetic — fabricated addresses outside installed RAM, reserved so the
+    // shared arm can exercise refcount and mapping bookkeeping without
+    // perturbing the real pool — so whether they can be *dereferenced* is a
+    // question, not a given.
+    //
+    // On x86_64 the identity map spans 512 GiB regardless of how much RAM is
+    // installed, so the copy silently succeeds against physical addresses
+    // that are not memory. On aarch64 the kernel linear map covers only what
+    // `frame/src/aarch64/boot.S` mapped, and the copy faults. Ask the page
+    // tables rather than assume either.
+    let copy_target_is_addressable = {
+        let va = crate::PhysAddr::new(SYNTH_BASE).kernel_ptr::<u8>() as u64;
+        crate::bpf_text::kernel_root_for_mapping().is_some_and(|root| {
+            // SAFETY: `root` is the recorded live kernel root; `translate`
+            // only reads the tables.
+            unsafe { crate::paging::translate(root, VirtAddr::new(va)) }.is_some()
+        })
+    };
+    if !copy_target_is_addressable {
+        // Drain the two frames the private arm would have taken, so the pool
+        // is left exactly as it was found — three reserved, three drained.
+        let _ = alloc_hugepage_2m_on(node);
+        let _ = alloc_hugepage_2m_on(node);
+        return TestResult::Skip(
+            "synthetic huge frames are outside the kernel linear map; \
+             a private fork's 2 MiB copy cannot be performed on them",
+        );
+    }
+
     let private_frame = match alloc_hugepage_2m_on(node) {
         Ok(frame) => frame,
         Err(_) => return TestResult::Fail("private-hugetlb allocation failed"),
