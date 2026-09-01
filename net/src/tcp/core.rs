@@ -63,6 +63,75 @@ use super::options::{
     encode_data_options, encode_syn_options, OptionsState, ParsedOptions, DEFAULT_WSCALE, MIN_MSS,
 };
 use super::retransmit::{OutSeg, RttEstimator};
+
+// ── RX→TX in-guest latency instrument (boot flag `rxtx_hist`) ───────────
+// Measures, per redis-style request/response, the cycles from a DATA segment
+// arriving on an established connection (a PING) to the DATA segment we emit in
+// reply (the PONG). This is the whole in-guest path: RX forwarder → stack →
+// epoll wake → redis scheduled → read → compute → write → pump_send. If this
+// histogram is TIGHT while the client-observed p99 is wide, the tail is
+// host-side (QEMU/SLIRP); if this shows the same ~435µs tail, it's NARF-inbound
+// scheduling. Dumped every DUMP_EVERY samples to keep serial writes off the
+// measured path. Default off — zero cost unless `rxtx_hist` is set at boot.
+static RXTX_ENABLED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static RXTX_RX_CYC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RXTX_SAMPLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RXTX_MAX_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Bucket upper bounds in µs; last bucket is the overflow (>= last bound).
+const RXTX_BOUNDS_US: [u64; 9] = [50, 100, 150, 200, 250, 300, 400, 600, 1000];
+static RXTX_HIST: [core::sync::atomic::AtomicU64; 10] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 10];
+const RXTX_DUMP_EVERY: u64 = 20_000;
+
+/// Enable the RX→TX in-guest latency histogram (boot param `rxtx_hist`).
+pub fn set_rxtx_hist(on: bool) {
+    RXTX_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Tap: a DATA segment arrived on an established connection (request in).
+#[inline]
+fn rxtx_note_rx() {
+    if RXTX_ENABLED.load(Ordering::Relaxed) {
+        RXTX_RX_CYC.store(narf_scheduler::narf_time::now_cycles(), Ordering::Relaxed);
+    }
+}
+
+/// Tap: a DATA segment is being emitted (response out). Records the RX→TX
+/// latency and periodically dumps the histogram.
+#[inline]
+fn rxtx_note_tx() {
+    if !RXTX_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let rx = RXTX_RX_CYC.swap(0, Ordering::Relaxed);
+    if rx == 0 {
+        return;
+    }
+    let now = narf_scheduler::narf_time::now_cycles();
+    let us = narf_scheduler::narf_time::cycles_to_ns(now.wrapping_sub(rx)) / 1000;
+    let mut idx = RXTX_BOUNDS_US.len();
+    for (i, b) in RXTX_BOUNDS_US.iter().enumerate() {
+        if us < *b {
+            idx = i;
+            break;
+        }
+    }
+    RXTX_HIST[idx].fetch_add(1, Ordering::Relaxed);
+    RXTX_MAX_US.fetch_max(us, Ordering::Relaxed);
+    let n = RXTX_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % RXTX_DUMP_EVERY == 0 {
+        let mut counts = [0u64; 10];
+        for (i, c) in RXTX_HIST.iter().enumerate() {
+            counts[i] = c.load(Ordering::Relaxed);
+        }
+        narf_console::klog!(
+            "[rxtx] n={} <50:{} <100:{} <150:{} <200:{} <250:{} <300:{} <400:{} <600:{} <1000:{} >=1000:{} max={}us",
+            n, counts[0], counts[1], counts[2], counts[3], counts[4],
+            counts[5], counts[6], counts[7], counts[8], counts[9],
+            RXTX_MAX_US.load(Ordering::Relaxed)
+        );
+    }
+}
 use super::sack::{SackBlock, SackBook, SenderScoreboard};
 use super::socket_buf::{RecvBuf, SendBuf, DEFAULT_RCV_BUF, DEFAULT_SND_BUF};
 use super::state_machine::{DropCause, Shutdown, TcpState};
@@ -1277,6 +1346,9 @@ fn send_data(
     extra_flags: u8,
     record_retx: bool,
 ) {
+    if !payload.is_empty() {
+        rxtx_note_tx();
+    }
     // Egress (NIC src MAC + emit fn): use the per-connection memoized cache;
     // resolve `iface::for_dst` (global ROUTE_TABLE + IFACES locks) only on
     // the first segment, then reuse — keeping those locks off the hot path.
@@ -2156,6 +2228,7 @@ fn handle_in_established(
 ) {
     handle_ack(arc, hdr, parsed);
     if !payload.is_empty() {
+        rxtx_note_rx();
         enqueue_recv(arc, hdr.sequence, payload);
     }
     if hdr.flags & FLAG_FIN != 0 {

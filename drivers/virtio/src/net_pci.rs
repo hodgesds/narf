@@ -22,7 +22,28 @@
 //! parallel callers don't serialise on a single virtqueue lock,
 //! and each RX pair gets its own forwarder.
 
-use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+
+/// Latency policy for TX notification. EVENT_IDX suppression (default) lets the
+/// device (QEMU/SLIRP) tell us when to skip a notify VM-exit — great for
+/// concurrent throughput, but for a lone request-response frame it can defer the
+/// frame until the host next polls the ring on its own timer (the redis PING p99
+/// tail). When this is set the driver additionally kicks whenever a submission
+/// leaves TX descriptors in flight the device hasn't reclaimed — i.e. a lone
+/// frame after the ring had drained — mirroring Linux virtio-net, which kicks
+/// every non-`xmit_more` frame. Boot param `tx_always_kick`.
+static TX_ALWAYS_KICK: AtomicBool = AtomicBool::new(false);
+
+/// Enable the latency-first TX kick policy (boot param `tx_always_kick`).
+pub fn set_tx_always_kick(on: bool) {
+    TX_ALWAYS_KICK.store(on, Ordering::Relaxed);
+}
+
+/// Is the latency-first TX kick policy enabled?
+#[inline]
+pub fn tx_always_kick() -> bool {
+    TX_ALWAYS_KICK.load(Ordering::Relaxed)
+}
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1054,7 +1075,10 @@ impl VirtioNetPci {
                     }
                 }
             };
-            (head, q.needs_kick())
+            // EVENT_IDX suppression by default; latency-first policy forces the
+            // kick so a lone frame isn't stranded until the host next polls.
+            let nk = q.needs_kick();
+            (head, nk || TX_ALWAYS_KICK.load(Ordering::Relaxed))
         };
 
         // Park the buffer in its descriptor slot so it stays alive
@@ -1280,6 +1304,22 @@ impl VirtioNetPci {
     /// ring is empty, or the replacement allocation fails (in which
     /// case the original stays in place — the device-filled buffer
     /// is not surrendered until the refill is guaranteed).
+    /// Arm this RX pair's used-ring interrupt and report whether a completion is
+    /// ALREADY pending — the `virtqueue_enable_cb` re-check a forwarder runs
+    /// right before it parks, so a suppressed/coalesced RX interrupt can't
+    /// strand a frame in the ring until the poll backstop deadline. `false` for
+    /// a missing pair/queue (nothing to wait on).
+    pub fn rx_arm_and_pending(&self, pair_idx: usize) -> bool {
+        let Some(pair) = self.pairs.get(pair_idx) else {
+            return false;
+        };
+        let mut g = pair.rx_queue.lock();
+        match g.as_mut() {
+            Some(q) => q.enable_used_cb_and_pending(),
+            None => false,
+        }
+    }
+
     pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
         let pair = self.pairs.get(pair_idx)?;
         let elem = {
@@ -1595,6 +1635,13 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 // counts consecutive empty wakes.
                 const FAST_ROUNDS: u32 = 64;
                 let mut idle_rounds: u32 = FAST_ROUNDS;
+                // `wake_race` diagnostic: register the primary RX forwarder as the
+                // separately-tracked task so its own wake→dispatch tail (the
+                // RX-side blind spot io_next/rxtx_hist can't see) is isolated.
+                // No-op unless the instrument is on.
+                if pair_idx == 0 {
+                    narf_scheduler::wake_race_track(narf_scheduler::current_task_id().raw());
+                }
                 loop {
                     // Snapshot the IRQ generation BEFORE draining (Linux NAPI
                     // re-check pattern). A frame that lands during or after the
@@ -1747,10 +1794,36 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                                 drop(w);
                                 narf_scheduler::yield_now().await;
                             } else {
+                                // Register-then-recheck (Linux
+                                // virtqueue_enable_cb): arm the used-ring
+                                // interrupt and re-read `used.idx` BEFORE
+                                // committing to the park. If a completion is
+                                // already pending the device suppressed or
+                                // coalesced its interrupt (EVENT_IDX arm race /
+                                // QEMU-SLIRP used-ring coalescing), so the
+                                // `wait_for_irq` edge would never come and we'd
+                                // sleep out the 2 ms backstop on a frame already
+                                // sitting in the ring — the sequential off-box
+                                // request/reply p99 tail. Drain it now instead.
+                                // `w`'s pre-drain `fire_count` baseline still
+                                // covers a frame that fires the IRQ AFTER this
+                                // re-read, so the two together are lossless.
+                                if with_at(idx, |c| c.rx_arm_and_pending(pair_idx)).unwrap_or(false)
+                                {
+                                    idle_rounds = 0;
+                                    drop(w);
+                                    continue;
+                                }
                                 // Idle: park on the IRQ. The edge resolves `w`
                                 // immediately when caught; the 2 ms deadline only
                                 // backstops a missed/late RX MSI-X so the executor
                                 // can HLT and save power while no traffic flows.
+                                // (A/B measured: extending this to 50 ms did NOT
+                                // change the sequential-PING p99 tail and `max`
+                                // never approached 50 ms, so the RX IRQ is
+                                // reliable and the backstop cadence is not the
+                                // tail — keep it tight for concurrent-load
+                                // responsiveness.)
                                 let dl = narf_time::Deadline::after_ms(2);
                                 let _ = narf_time::timeout(dl, w).await;
                             }

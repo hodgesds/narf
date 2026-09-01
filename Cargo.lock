@@ -1989,6 +1989,7 @@ name = "narf-net"
 version = "0.0.0"
 dependencies = [
  "narf-capabilities",
+ "narf-console",
  "narf-io",
  "narf-ipc",
  "narf-kernel-test",
@@ -2076,6 +2077,7 @@ dependencies = [
  "narf-acpi",
  "narf-arch",
  "narf-capabilities",
+ "narf-console",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

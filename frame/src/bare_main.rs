@@ -3920,6 +3920,51 @@ fn run_async_demo() -> ! {
                 );
             }
         }
+        // NO_HZ_IDLE opt-in (`nohz_idle` cmdline flag, default off): let an idle
+        // CPU stop the periodic tick and HLT until a real event. Set before the
+        // executor's first idle so the very first halt is tickless.
+        if narf_boot::args().has_flag("nohz_idle") {
+            narf_time::set_nohz_idle_enabled(true);
+            let _ = writeln!(console::Writer, "  nohz_idle: tickless idle ENABLED");
+        }
+        // Latency-first virtio-net TX: kick the device for a lone frame instead
+        // of letting EVENT_IDX suppression defer it (redis PING p99 tail).
+        if narf_boot::args().has_flag("tx_always_kick") {
+            narf_drivers_virtio::net_pci::set_tx_always_kick(true);
+            let _ = writeln!(
+                console::Writer,
+                "  tx_always_kick: latency-first TX ENABLED"
+            );
+        }
+        // Narrow directed wake for I/O owners only (redis p99 ordering tail):
+        // dispatch a just-woken socket owner ahead of queued maintenance tasks,
+        // without the generic every-wake next-buddy thrash.
+        if narf_boot::args().has_flag("io_next") {
+            narf_scheduler::enable_io_next();
+            let _ = writeln!(
+                console::Writer,
+                "  io_next: narrow I/O directed wake ENABLED"
+            );
+        }
+        // Diagnostic: wake→run race — is a woken task's dispatch delayed by a
+        // lost-wakeup (executor HLTed with it runnable) or pure round-robin
+        // ordering? Prints a latency×halted histogram to serial periodically.
+        if narf_boot::args().has_flag("wake_race") {
+            narf_scheduler::enable_wake_race();
+            let _ = writeln!(
+                console::Writer,
+                "  wake_race: wake→run race instrument ENABLED"
+            );
+        }
+        // Diagnostic: RX→TX in-guest latency histogram (localizes the redis p99
+        // tail to NARF-inbound vs host-side). Prints to serial periodically.
+        if narf_boot::args().has_flag("rxtx_hist") {
+            narf_net::tcp::core::set_rxtx_hist(true);
+            let _ = writeln!(
+                console::Writer,
+                "  rxtx_hist: RX→TX latency histogram ENABLED"
+            );
+        }
     }
 
     // Bring up the HPET timer-wheel pump now that HPET, IDT, and
@@ -4258,34 +4303,18 @@ fn boot_userspace_init() {
         let _ = narf_scheduler::poll_one_round();
         IN_FLIGHT.store(false, Ordering::Release);
     }
-    narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+    // Nested-only: the executor-step pump advances spawned tasks when a
+    // boot-init / syscall sync-wait blocks the executor loop. Registered
+    // nested-only so it does NOT run from `run_until_empty`'s own idle/busy
+    // pump path (where its `poll_one_round` is redundant with the loop and its
+    // cost was the redis PING p99 tail).
+    narf_userspace::handlers::sleep_pumps::register_nested_only(scheduler_step_pump);
 
-    // Drain any RX bytes the platform UART has queued (typed bytes
-    // via `qemu -serial stdio`, or a real serial console on bare
-    // metal) and publish them as `InputEvent::AsciiByte` on the
-    // global input ring so /dev/console reads see them. Bounded
-    // per-tick so a runaway producer can't monopolise the pump.
-    fn serial_input_pump() {
-        // Non-blocking: this backstop fires on every core's every park, so
-        // it must NEVER spin on the shared CONSOLE.lock — under a
-        // thread-dense SMP workload (KDE Plasma) that becomes a
-        // machine-wide thundering herd. IRQ 4 is the primary RX path; a
-        // skipped cycle when the lock is contended is free.
-        for _ in 0..16 {
-            match narf_console::try_read_byte_uncontended() {
-                Some(b) => {
-                    let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
-                }
-                None => break,
-            }
-        }
-    }
-    // Keep the pump as a defensive backstop — runs whenever a
-    // user task parks in sys_sleep. The IRQ path below is the
-    // primary delivery mechanism; the pump catches anything
-    // that slips past (e.g. on systems where IRQ 4 routing
-    // failed).
-    narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
+    // NOTE: the serial-input sleep-pump backstop was removed. It read the UART
+    // LSR via `inb(0x3FD)` on every idle park — a userspace PIO VM-exit taking
+    // QEMU's BQL, which was the dominant redis PING p99 tail. IRQ 4 (installed
+    // below) is the reliable primary serial-RX path, so the pump backstop is
+    // unnecessary (it existed as a defence against unreliable IRQ4 routing).
 
     // Real IRQ-driven serial RX: install a handler at ISA IRQ 4
     // (COM1's standard line), route the GSI through the IOAPIC,
