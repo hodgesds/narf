@@ -131,6 +131,11 @@ pub struct Virtqueue {
     /// The `avail_idx` value at the last notification the driver sent —
     /// `old_idx` for `vring_need_event`.
     last_notify_avail: u16,
+    /// NAPI: while set, `poll_used` does NOT re-arm `used_event` per consume, so
+    /// used-ring interrupts stay suppressed (the driver is sustained-polling and
+    /// does not need them). Pushed far ahead by `disable_used_cb`; cleared +
+    /// re-armed by `enable_used_cb_and_pending` before the poller parks.
+    cb_suppressed: bool,
 }
 
 /// Linux `vring_need_event`: with EVENT_IDX, notify the device iff its
@@ -198,6 +203,7 @@ impl Virtqueue {
             num_free: layout.capacity,
             event_idx: false,
             last_notify_avail: 0,
+            cb_suppressed: false,
         }
     }
 
@@ -439,7 +445,7 @@ impl Virtqueue {
         // whose forwarder parks on the IRQ would never wake without this write.
         // Avail ring layout: flags(u16) idx(u16) ring[N](u16) used_event(u16) →
         // used_event is at u16 offset 2 + N.
-        if self.event_idx {
+        if self.event_idx && !self.cb_suppressed {
             let cap = self.layout.capacity as usize;
             // SAFETY: avail ring is DMA memory sized for `capacity` entries plus
             // the trailing used_event u16 by VirtqueueLayout::new.
@@ -448,6 +454,34 @@ impl Virtqueue {
             }
         }
         Some((elem.id, elem.len))
+    }
+
+    /// NAPI `virtqueue_disable_cb`: suppress used-ring interrupts while the
+    /// driver is sustained-polling this queue (it drains the ring itself, so an
+    /// MSI per frame is pure overhead — a VM-exit for the guest and, on the
+    /// SLIRP backend, an irqfd crossing for the single-threaded host iothread
+    /// that is also relaying the traffic). With EVENT_IDX, park `used_event`
+    /// far ahead of `used.idx` so the device won't cross it; `cb_suppressed`
+    /// then stops `poll_used` from re-arming it per consume. Re-enabled by
+    /// `enable_used_cb_and_pending` before the poller commits to a park.
+    pub fn disable_used_cb(&mut self) {
+        self.cb_suppressed = true;
+        if self.event_idx {
+            let cap = self.layout.capacity as usize;
+            // Half the u16 ring space ahead — the device won't reach it before
+            // the poller re-arms at park time.
+            let far = self.last_used_idx.wrapping_add(0x8000);
+            // SAFETY: avail ring DMA, used_event at u16 offset 2 + cap.
+            unsafe {
+                core::ptr::write_volatile(self.avail_base().add(2 + cap), far);
+            }
+        } else {
+            // No EVENT_IDX: set VRING_AVAIL_F_NO_INTERRUPT (avail flags @ off 0).
+            // SAFETY: avail_base is the avail ring's `flags` u16 (DMA memory).
+            unsafe {
+                core::ptr::write_volatile(self.avail_base(), 1u16);
+            }
+        }
     }
 
     /// Enable used-ring interrupts and re-check for an already-pending
@@ -465,6 +499,8 @@ impl Virtqueue {
     /// completion it publishes AFTER our re-read, so a frame in the tiny window
     /// between the read and the park still wakes us.
     pub fn enable_used_cb_and_pending(&mut self) -> bool {
+        // Re-enable per-consume re-arming (NAPI complete).
+        self.cb_suppressed = false;
         if self.event_idx {
             // EVENT_IDX: arm `used_event` at the index we've consumed so the
             // device interrupts on the next completion. Same store `poll_used`
