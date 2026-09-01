@@ -3927,6 +3927,24 @@ fn run_async_demo() -> ! {
             narf_time::set_nohz_idle_enabled(true);
             let _ = writeln!(console::Writer, "  nohz_idle: tickless idle ENABLED");
         }
+        // Latency-first virtio-net TX: kick the device for a lone frame instead
+        // of letting EVENT_IDX suppression defer it (redis PING p99 tail).
+        if narf_boot::args().has_flag("tx_always_kick") {
+            narf_drivers_virtio::net_pci::set_tx_always_kick(true);
+            let _ = writeln!(
+                console::Writer,
+                "  tx_always_kick: latency-first TX ENABLED"
+            );
+        }
+        // Diagnostic: RX→TX in-guest latency histogram (localizes the redis p99
+        // tail to NARF-inbound vs host-side). Prints to serial periodically.
+        if narf_boot::args().has_flag("rxtx_hist") {
+            narf_net::tcp::core::set_rxtx_hist(true);
+            let _ = writeln!(
+                console::Writer,
+                "  rxtx_hist: RX→TX latency histogram ENABLED"
+            );
+        }
     }
 
     // Bring up the HPET timer-wheel pump now that HPET, IDT, and

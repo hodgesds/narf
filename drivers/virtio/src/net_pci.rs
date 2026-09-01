@@ -22,7 +22,28 @@
 //! parallel callers don't serialise on a single virtqueue lock,
 //! and each RX pair gets its own forwarder.
 
-use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, Ordering};
+
+/// Latency policy for TX notification. EVENT_IDX suppression (default) lets the
+/// device (QEMU/SLIRP) tell us when to skip a notify VM-exit — great for
+/// concurrent throughput, but for a lone request-response frame it can defer the
+/// frame until the host next polls the ring on its own timer (the redis PING p99
+/// tail). When this is set the driver additionally kicks whenever a submission
+/// leaves TX descriptors in flight the device hasn't reclaimed — i.e. a lone
+/// frame after the ring had drained — mirroring Linux virtio-net, which kicks
+/// every non-`xmit_more` frame. Boot param `tx_always_kick`.
+static TX_ALWAYS_KICK: AtomicBool = AtomicBool::new(false);
+
+/// Enable the latency-first TX kick policy (boot param `tx_always_kick`).
+pub fn set_tx_always_kick(on: bool) {
+    TX_ALWAYS_KICK.store(on, Ordering::Relaxed);
+}
+
+/// Is the latency-first TX kick policy enabled?
+#[inline]
+pub fn tx_always_kick() -> bool {
+    TX_ALWAYS_KICK.load(Ordering::Relaxed)
+}
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -1054,7 +1075,10 @@ impl VirtioNetPci {
                     }
                 }
             };
-            (head, q.needs_kick())
+            // EVENT_IDX suppression by default; latency-first policy forces the
+            // kick so a lone frame isn't stranded until the host next polls.
+            let nk = q.needs_kick();
+            (head, nk || TX_ALWAYS_KICK.load(Ordering::Relaxed))
         };
 
         // Park the buffer in its descriptor slot so it stays alive
