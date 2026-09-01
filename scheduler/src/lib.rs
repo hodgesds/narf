@@ -412,6 +412,47 @@ static WAKE_NEXT_ENABLED: AtomicBool = AtomicBool::new(false);
 static WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
 
+/// Narrow directed wake for I/O owners only (boot flag `io_next`). The generic
+/// `WAKE_NEXT` path names EVERY wake its CPU's next-buddy and was measured to
+/// thrash this cooperative executor (redis throughput halved, #235). This
+/// instead sets the next-buddy ONLY from `wake_io_owner` — the targeted wake a
+/// socket/pipe readiness edge fires at its owning task — so a just-woken redis
+/// jumps ahead of the maintenance tasks queued in front of it (the measured
+/// non-halted round-robin ordering tail, see the `wake_race` instrument)
+/// WITHOUT boosting the RX forwarder or the periodic pumps. Reuses the same
+/// `WAKE_NEXT` slot + `pick_next_slot` honor; gated separately so enabling it
+/// does NOT turn on the generic every-wake path. The forwarder drains its RX
+/// ring to empty before yielding, so redis running next still sees the full
+/// batch — no de-batch.
+static IO_NEXT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable narrow I/O-owner directed wake (boot param `io_next`).
+pub fn enable_io_next() {
+    IO_NEXT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Whether narrow I/O-owner directed wake is enabled.
+pub fn io_next_enabled() -> bool {
+    IO_NEXT_ENABLED.load(Ordering::Acquire)
+}
+
+/// Name `task` the current CPU's next-buddy because a targeted I/O readiness
+/// wake just fired at it. No-op unless `io_next` is enabled. Called from the
+/// I/O owner-wake path (`wake_io_owner`), NOT the generic waker — that
+/// narrowness is the whole point. The task's home CPU is the CPU running this
+/// wake (the readiness edge is dispatched on the owner's core), so the boost
+/// lands on the queue `pick_next_slot` will scan; a cross-core miss is harmless
+/// (the id simply won't match any local slot and is cleared on the next take).
+pub fn hint_io_next(task: u64) {
+    if task == 0 || !IO_NEXT_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < WAKE_NEXT.len() {
+        WAKE_NEXT[cpu].store(task, Ordering::Release);
+    }
+}
+
 /// Enable wake-next dispatch. Opt-in (see [`WAKE_NEXT_ENABLED`]).
 pub fn enable_wake_next() {
     WAKE_NEXT_ENABLED.store(true, Ordering::Release);
@@ -442,7 +483,11 @@ fn record_wake_next(cpu: u32, task: u64) {
 /// this once per pick; clearing on read makes the boost a one-shot so a buddy
 /// that turns out not to be top-tier does not stick.
 pub(crate) fn take_wake_next(cpu: u32) -> u64 {
-    if !WAKE_NEXT_ENABLED.load(Ordering::Acquire) || (cpu as usize) >= WAKE_NEXT.len() {
+    // Honored when EITHER the generic every-wake path or the narrow I/O-owner
+    // path is enabled; both feed the same single-slot hint.
+    if (!WAKE_NEXT_ENABLED.load(Ordering::Acquire) && !IO_NEXT_ENABLED.load(Ordering::Acquire))
+        || (cpu as usize) >= WAKE_NEXT.len()
+    {
         return 0;
     }
     WAKE_NEXT[cpu as usize].swap(0, Ordering::AcqRel)

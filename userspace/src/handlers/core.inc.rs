@@ -297,6 +297,12 @@ pub(crate) fn wake_io_owner(owner: u64) {
         g.as_mut().and_then(|m| m.remove(&owner))
     };
     if let Some(w) = waker {
+        // Narrow directed wake (boot flag `io_next`, default off): name this
+        // just-woken I/O owner its CPU's next-buddy so the executor dispatches
+        // it ahead of the maintenance tasks queued in front of it, cutting the
+        // non-halted round-robin ordering tail. Scoped to the targeted I/O wake
+        // — never the generic every-wake path that thrashes the executor.
+        narf_scheduler::hint_io_next(owner);
         wake_one(owner, w);
     }
 }

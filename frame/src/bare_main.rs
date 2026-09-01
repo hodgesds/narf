@@ -3936,6 +3936,16 @@ fn run_async_demo() -> ! {
                 "  tx_always_kick: latency-first TX ENABLED"
             );
         }
+        // Narrow directed wake for I/O owners only (redis p99 ordering tail):
+        // dispatch a just-woken socket owner ahead of queued maintenance tasks,
+        // without the generic every-wake next-buddy thrash.
+        if narf_boot::args().has_flag("io_next") {
+            narf_scheduler::enable_io_next();
+            let _ = writeln!(
+                console::Writer,
+                "  io_next: narrow I/O directed wake ENABLED"
+            );
+        }
         // Diagnostic: wake→run race — is a woken task's dispatch delayed by a
         // lost-wakeup (executor HLTed with it runnable) or pure round-robin
         // ordering? Prints a latency×halted histogram to serial periodically.
