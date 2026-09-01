@@ -799,7 +799,9 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         // frames until mmap_ops is dropped. Linux's u64 metadata fields are
         // naturally aligned within the first page.
         let read_meta = |offset: usize| unsafe {
-            core::ptr::read_volatile((frames[0] as usize + offset) as *const u64)
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(frames[0] + offset as u64).kernel_ptr::<u64>(),
+            )
         };
         if read_meta(1040) != 4096 || read_meta(1048) != 8192 {
             return Err("perf mmap data_offset/data_size metadata is invalid");
@@ -886,8 +888,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         crate::perf_event::sample_from_irq_for_test(88, 0xDEAD_BEEF);
         // SAFETY: sample_ops owns the metadata frame.
-        if unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) }
-            != 0
+        if unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        } != 0
         {
             return Err("paused perf output still committed a record");
         }
@@ -900,8 +905,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         crate::perf_event::sample_from_irq_for_test(88, 0x1234_5678);
         // SAFETY: sample_ops owns all three identity-mapped frames here.
-        let data_head =
-            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        let data_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if data_head == 0 {
             return Err("inherited perf event did not sample its child task");
         }
@@ -961,8 +969,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         // Both the target event and redirected event commit a 104-byte sample
         // to the target ring; the redirected event has no mmap of its own.
         // SAFETY: sample_ops owns the mapped metadata frame.
-        let redirected_head =
-            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        let redirected_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if redirected_head != data_head + 208 {
             return Err("PERF_EVENT_IOC_SET_OUTPUT did not share the target ring");
         }
@@ -994,16 +1005,25 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         // emitted first with the sample_id_all trailer perf uses to resolve
         // the owning event.
         // SAFETY: sample_ops owns the metadata and two data frames.
-        let full_head =
-            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        let full_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         // SAFETY: userspace owns data_tail in perf_event_mmap_page.
         unsafe {
-            core::ptr::write_volatile((sample_frames[0] as usize + 1032) as *mut u64, full_head);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1032).kernel_mut_ptr::<u64>(),
+                full_head,
+            );
         }
         crate::perf_event::sample_from_irq_for_test(88, 0xCAFE_BABE);
         // SAFETY: sample_ops owns the metadata frame.
-        let recovered_head =
-            unsafe { core::ptr::read_volatile((sample_frames[0] as usize + 1024) as *const u64) };
+        let recovered_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(sample_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if recovered_head != full_head + 160 {
             return Err("PERF_RECORD_LOST and following sample have wrong combined size");
         }
@@ -1083,8 +1103,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         crate::perf_event::on_fork(pid, 77, task, 88);
         crate::perf_event::on_process_exit(pid, task);
         // SAFETY: metadata_ops owns these identity-mapped frames.
-        let metadata_head =
-            unsafe { core::ptr::read_volatile((metadata_frames[0] as usize + 1024) as *const u64) };
+        let metadata_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(metadata_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if metadata_head != 448 {
             return Err("perf metadata records have the wrong combined wire size");
         }
@@ -1300,8 +1323,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         narf_tracing::emit_event(0x5a17, &[0xaa, 0xbb, 0xcc]);
         crate::perf_event::drain_irq_samples();
         // SAFETY: trace_ops owns the metadata and data frames.
-        let trace_head =
-            unsafe { core::ptr::read_volatile((trace_frames[0] as usize + 1024) as *const u64) };
+        let trace_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(trace_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if trace_head != 16 {
             return Err("tracepoint did not emit one aligned PERF_RECORD_SAMPLE");
         }
@@ -1318,8 +1344,11 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         narf_tracing::fire(0x5a17, narf_tracing::ProbeArgs::two(0x11, 0x22));
         crate::perf_event::drain_irq_samples();
         // SAFETY: trace_ops retains the metadata frame.
-        let probe_head =
-            unsafe { core::ptr::read_volatile((trace_frames[0] as usize + 1024) as *const u64) };
+        let probe_head = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(trace_frames[0] + 1024).kernel_ptr::<u64>(),
+            )
+        };
         if probe_head != 64 {
             return Err("dynamic probe did not emit a perf raw sample");
         }
@@ -1557,7 +1586,12 @@ fn smoke_abi_perf_pmuv3_overflow_record() -> TestResult {
             }
             crate::perf_event::drain_irq_samples();
             // SAFETY: ops owns this mapped metadata frame.
-            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
+            if unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(frames[0] + 1024).kernel_ptr::<u64>(),
+                )
+            } != 0
+            {
                 if crate::perf_event::event_refresh_state_for_test(fd) != Some((false, 0, true)) {
                     return Err("real PMUv3 overflow did not exhaust refresh budget");
                 }
@@ -1654,7 +1688,12 @@ fn smoke_abi_perf_pmuv3_programmable_overflow_record() -> TestResult {
             }
             crate::perf_event::drain_irq_samples();
             // SAFETY: ops owns this mapped metadata frame for the test duration.
-            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } != 0 {
+            if unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(frames[0] + 1024).kernel_ptr::<u64>(),
+                )
+            } != 0
+            {
                 let _ = call(Syscall::Close.raw(), a0(fd as u64));
                 return Ok(());
             }
@@ -1714,7 +1753,11 @@ fn smoke_abi_perf_pmuv3_frequency_record() -> TestResult {
             }
             crate::perf_event::drain_irq_samples();
             // SAFETY: ops owns this mapped metadata frame for the test duration.
-            if unsafe { core::ptr::read_volatile((frames[0] as usize + 1024) as *const u64) } >= 32
+            if unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(frames[0] + 1024).kernel_ptr::<u64>(),
+                )
+            } >= 32
             {
                 if restore_mask {
                     // SAFETY: restore the kernel-test harness's masked entry state.

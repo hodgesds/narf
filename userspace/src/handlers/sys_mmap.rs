@@ -757,11 +757,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // SAFETY: freshly-allocated identity-mapped frame; zero the whole
             // page first so any tail past `want` (and past EOF) reads as zero.
             unsafe {
-                core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+                core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
             }
             // SAFETY: `frame` is identity-mapped in the low 4 GiB and `want`
             // is <= 4096, so the slice stays within the page.
-            let dst = unsafe { core::slice::from_raw_parts_mut(frame.raw() as *mut u8, want) };
+            let dst = unsafe { core::slice::from_raw_parts_mut(frame.kernel_mut_ptr::<u8>(), want) };
             let mut done = 0usize;
             while done < want {
                 // Poll each read to COMPLETION, keeping the one future alive for
@@ -1376,7 +1376,7 @@ mod tests {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 c"JOURNAL".as_ptr().cast(),
-                region.phys[0].raw() as *mut u8,
+                region.phys[0].kernel_mut_ptr::<u8>(),
                 8,
             );
         }
@@ -1409,7 +1409,7 @@ mod tests {
             return TestResult::Fail("same-range MAP_SHARED mappings did not alias one file page");
         }
         // SAFETY: both mappings resolve to the same identity-mapped page.
-        if unsafe { core::slice::from_raw_parts(second_region.phys[0].raw() as *const u8, 8) }
+        if unsafe { core::slice::from_raw_parts(second_region.phys[0].kernel_ptr::<u8>(), 8) }
             != b"JOURNAL\0"
         {
             return TestResult::Fail(
@@ -1449,7 +1449,7 @@ mod tests {
 
         // SAFETY: both mappings still retain the identity-mapped page.
         unsafe {
-            *(second_region.phys[0].raw() as *mut u8).add(8) = b'!';
+            *(second_region.phys[0].kernel_mut_ptr::<u8>()).add(8) = b'!';
         }
         crate::handlers::sys_fsync(&mut fsync);
         if file.writes.load(Ordering::Relaxed) != 2 || file.bytes.lock()[8] != b'!' {

@@ -234,7 +234,7 @@ impl RtsxController {
             return Ok(());
         }
         let n = buf.len();
-        let phys = self.cmd_buf.phys_addr().raw();
+        let phys = self.cmd_buf.dma_addr().raw();
 
         // Serialise entries into the DMA page.
         // SAFETY: identity-mapped DMA page; exclusive access.
@@ -449,7 +449,7 @@ impl RtsxController {
         if out.len() < 512 {
             return Err(RtsxError::NoCard);
         }
-        let data_phys = self.data_buf.phys_addr().raw();
+        let data_phys = self.data_buf.dma_addr().raw();
 
         // Issue CMD17.
         let mut buf = CmdBuf::new();

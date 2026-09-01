@@ -523,10 +523,9 @@ impl VirtioIommuPci {
         // at +0x800.
         let pool =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let pool_phys = pool.phys_addr().raw();
         // SAFETY: page-sized DMA.
         unsafe {
-            core::ptr::write_bytes(pool_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(pool.cpu_mut_ptr::<u8>(), 0, 4096);
         }
 
         Ok(Self {
@@ -570,18 +569,27 @@ impl VirtioIommuPci {
         if req.is_empty() || req.len() > 0x800 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let req_phys = pool_phys;
         let tail_phys = pool_phys + 0x800;
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             for (i, &b) in req.iter().enumerate() {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
             // Mark the tail slot so a stale 0 can't masquerade as OK.
-            core::ptr::write_volatile(tail_phys as *mut u8, 0xFF);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(tail_phys).kernel_mut_ptr::<u8>(),
+                0xFF,
+            );
             for i in 1..REQ_TAIL_LEN {
-                core::ptr::write_volatile((tail_phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(tail_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    0,
+                );
             }
         }
         let descs = [
@@ -636,7 +644,9 @@ impl VirtioIommuPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(tail_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(tail_phys).kernel_ptr::<u8>())
+        };
         let mut g = self.requestq.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);
@@ -726,7 +736,7 @@ unsafe fn setup_queue(
     let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
     // SAFETY: identity-mapped MMIO.
     unsafe {
         common.write16(CC_QUEUE_SIZE, qsize);

@@ -83,11 +83,10 @@ impl Ring {
             alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
         // Zero the ring so an unprogrammed engine reads NOPs
         // (PM4 TYPE0 with count 0 = a benign 1-dword no-op).
-        let phys = backing.phys_addr().raw();
         // SAFETY: identity-mapped DMA-coherent page; we own it.
         unsafe {
             for i in 0..RING_SIZE_DW {
-                core::ptr::write_volatile((phys + (i * 4) as u64) as *mut u32, 0);
+                core::ptr::write_volatile(backing.cpu_mut_ptr_at::<u32>((i * 4) as u64), 0);
             }
         }
         Ok(Self {
@@ -102,7 +101,7 @@ impl Ring {
     /// the GPU's CP_RB_BASE / SDMA_GFX_RB_BASE registers at GFX
     /// bring-up.
     pub fn phys_addr(&self) -> u64 {
-        self.backing.phys_addr().raw()
+        self.backing.dma_addr().raw()
     }
 
     /// Current host write-pointer (in dwords).
@@ -131,7 +130,6 @@ impl Ring {
         if self.wptr_dw + packet.len() > RING_SIZE_DW {
             return Err(RingError::NotEnoughRoomBeforeWrap);
         }
-        let phys = self.backing.phys_addr().raw();
         for (i, &w) in packet.iter().enumerate() {
             let off = ((self.wptr_dw + i) * 4) as u64;
             // SAFETY: `phys` is the base of the ring's identity-mapped DMA
@@ -140,7 +138,7 @@ impl Ring {
             // RING_SIZE_DW` was checked above, so `off` stays within the page.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                core::ptr::write_volatile((phys + off) as *mut u32, w);
+                core::ptr::write_volatile(self.backing.cpu_mut_ptr_at::<u32>(off), w);
             }
         }
         compiler_fence(Ordering::SeqCst);

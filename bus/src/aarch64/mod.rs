@@ -80,7 +80,7 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
 
     // Try the FDT walk first when we have a plausible pointer.
     if let Some(dtb_phys) = dtb {
-        let base = dtb_phys.raw() as *const u8;
+        let base = dtb_phys.kernel_ptr::<u8>();
         if !base.is_null() {
             // SAFETY: caller promise — `base` covers at least
             // `sizeof(FdtHeader)`. `read_header` validates magic.
@@ -139,7 +139,7 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
 /// # Safety
 /// `dtb` must point at a live, identity-mapped flattened Devicetree blob.
 pub unsafe fn discover_pmu_ppi(dtb: PhysAddr) -> Option<u32> {
-    let base = dtb.raw() as *const u8;
+    let base = dtb.kernel_ptr::<u8>();
     if base.is_null() {
         return None;
     }

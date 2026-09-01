@@ -375,7 +375,7 @@ pub unsafe fn submit_tx_frame(
     // this slot is reused (reap_tx).
     let mut buf = narf_io::alloc_coherent(total_len.max(64), narf_lib::id::DomainId::DRIVER_0)
         .map_err(|_| TxRxError::BufferAllocFailed)?;
-    let phys = buf.phys_addr().as_u64();
+    let phys = buf.dma_addr().raw();
     {
         let bytes = buf.as_mut_slice();
         // Encode the TXD at the head of the buffer.

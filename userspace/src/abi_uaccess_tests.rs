@@ -96,9 +96,10 @@ fn canary_arm() -> Result<u64, &'static str> {
 ///
 /// Only where this build's kernel stack and heap are numerically in the
 /// user half. On x86_64 they are: the frame allocator hands back physical
-/// addresses reached through the low identity map (`memory/src/addr.rs`,
-/// `LOW_IDENTITY_LIMIT`), so a stack array's address is < 2^47. On aarch64
-/// they are not — everything runs out of TTBR1 at
+/// addresses reached through the low identity map, so a fixture's address
+/// was < 2^47. That is no longer true of the heap: it is reached through
+/// the high-half direct map (`KERNEL_DIRECT_MAP_BASE`), like aarch64, where
+/// everything runs out of TTBR1 at
 /// `KERNEL_VIRT_BASE = 0xFFFF_FF80_0000_0000`.
 ///
 /// Tests that need to *drive a syscall through its fixture* and have the
@@ -109,8 +110,15 @@ fn canary_arm() -> Result<u64, &'static str> {
 /// predicate itself is still covered on aarch64 by the tests that pass a
 /// kernel address as a bare syscall *argument*, which needs no fixture.
 fn fixture_ptrs_are_user_half() -> bool {
-    let probe = [0u8; 8];
-    (probe.as_ptr() as u64) < (1u64 << 47)
+    // Probe BOTH kernel stack and kernel heap. These used to travel
+    // together on x86_64 -- both were reached through the low identity map,
+    // so one probe answered for both. Freeing the low half moved the heap
+    // into the high-half direct map while the stack stayed low, so a
+    // stack-only probe now reports "user half" for a fixture whose heap
+    // buffers are kernel-half, and the test fails where it means to skip.
+    let stack_probe = [0u8; 8];
+    let heap_probe: alloc::vec::Vec<u8> = alloc::vec![0u8; 8];
+    (stack_probe.as_ptr() as u64) < (1u64 << 47) && (heap_probe.as_ptr() as u64) < (1u64 << 47)
 }
 
 /// Did anything write to the canary?

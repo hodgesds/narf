@@ -934,7 +934,7 @@ impl PerfMmap {
             // mapped for the full 4 KiB page.
             unsafe {
                 core::ptr::write_bytes(
-                    frame.start_address().raw() as *mut u8,
+                    frame.start_address().kernel_mut_ptr::<u8>(),
                     0,
                     PERF_MMAP_PAGE_BYTES,
                 );
@@ -955,7 +955,8 @@ impl PerfMmap {
         // every call site uses a naturally aligned in-page u32 field.
         unsafe {
             core::ptr::write_volatile(
-                (self.frames[0].start_address().raw() as usize + offset) as *mut u32,
+                narf_memory::PhysAddr::new(self.frames[0].start_address().raw() + offset as u64)
+                    .kernel_mut_ptr::<u32>(),
                 value,
             );
         }
@@ -965,7 +966,8 @@ impl PerfMmap {
         // SAFETY: same as write_u32, for naturally aligned u64 fields.
         unsafe {
             core::ptr::write_volatile(
-                (self.frames[0].start_address().raw() as usize + offset) as *mut u64,
+                narf_memory::PhysAddr::new(self.frames[0].start_address().raw() + offset as u64)
+                    .kernel_mut_ptr::<u64>(),
                 value,
             );
         }
@@ -982,7 +984,8 @@ impl PerfMmap {
         // SAFETY: Linux perf metadata indices are naturally aligned u64
         // locations shared atomically between kernel and userspace.
         let atomic = unsafe {
-            &*((self.frames[0].start_address().raw() as usize + offset) as *const AtomicU64)
+            &*(narf_memory::PhysAddr::new(self.frames[0].start_address().raw() + offset as u64)
+                .kernel_ptr::<AtomicU64>())
         };
         atomic.load(Ordering::Acquire)
     }
@@ -990,7 +993,8 @@ impl PerfMmap {
     fn write_u64_release(&self, offset: usize, value: u64) {
         // SAFETY: same shared-index contract as read_u64_acquire.
         let atomic = unsafe {
-            &*((self.frames[0].start_address().raw() as usize + offset) as *const AtomicU64)
+            &*(narf_memory::PhysAddr::new(self.frames[0].start_address().raw() + offset as u64)
+                .kernel_ptr::<AtomicU64>())
         };
         atomic.store(value, Ordering::Release);
     }
@@ -1005,7 +1009,10 @@ impl PerfMmap {
             // frames; the mapping lock gives this writer exclusive access.
             unsafe {
                 core::ptr::write_volatile(
-                    (self.frames[page].start_address().raw() as usize + in_page) as *mut u8,
+                    narf_memory::PhysAddr::new(
+                        self.frames[page].start_address().raw() + in_page as u64,
+                    )
+                    .kernel_mut_ptr::<u8>(),
                     byte,
                 );
             }

@@ -107,7 +107,7 @@ impl TxRing {
     /// Ring base address (low + high 32 bits).
     #[inline]
     pub fn dma_base(&self) -> u64 {
-        self.buf.phys_addr().raw()
+        self.buf.dma_addr().raw()
     }
 
     /// Number of slots available for the producer.
@@ -157,7 +157,7 @@ impl RxRing {
 
     #[inline]
     pub fn dma_base(&self) -> u64 {
-        self.buf.phys_addr().raw()
+        self.buf.dma_addr().raw()
     }
 }
 

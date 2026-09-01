@@ -461,7 +461,7 @@ impl VirtioNetPci {
             let qsize = if qsize == 0 { 4 } else { qsize.min(qmax) };
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let phys = buf.phys_addr().raw();
+            let phys = buf.dma_addr().raw();
             let layout = VirtqueueLayout::new(qsize, phys).ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
             unsafe {
@@ -593,7 +593,7 @@ impl VirtioNetPci {
             for _ in 0..posted {
                 let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                     .map_err(|_| VirtioPciError::BarMapFailed)?;
-                let phys = buf.phys_addr().raw();
+                let phys = buf.dma_addr().raw();
                 let descs = [VirtqDesc {
                     addr: phys,
                     len: MAX_FRAME as u32,
@@ -996,7 +996,7 @@ impl VirtioNetPci {
             let slice = buf.as_mut_slice();
             slice[..12].fill(0);
         }
-        let buf_phys = buf.phys_addr().raw();
+        let buf_phys = buf.dma_addr().raw();
 
         // Lazy completion reclaim: drain every TX the device has
         // finished since the last transmit. For each completed head,
@@ -1197,19 +1197,19 @@ impl VirtioNetPci {
         if payload.len() > 240 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let phys = g.buf.phys_addr().raw();
+        let phys = g.buf.dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; the offsets stay
         // within the 4 KiB page allocated above.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_volatile(phys as *mut u8, class);
-            core::ptr::write_volatile((phys + 1) as *mut u8, cmd);
+            core::ptr::write_volatile(g.buf.cpu_mut_ptr::<u8>(), class);
+            core::ptr::write_volatile(g.buf.cpu_mut_ptr_at::<u8>(1), cmd);
             for (i, b) in payload.iter().enumerate() {
-                core::ptr::write_volatile((phys + 16 + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(g.buf.cpu_mut_ptr_at::<u8>(16 + i as u64), *b);
             }
             // Seed the ack byte with a sentinel so we can spot
             // "device didn't write anything".
-            core::ptr::write_volatile((phys + 256) as *mut u8, 0xFF);
+            core::ptr::write_volatile(g.buf.cpu_mut_ptr_at::<u8>(256), 0xFF);
         }
         let descs = [
             VirtqDesc {
@@ -1255,7 +1255,7 @@ impl VirtioNetPci {
         // SAFETY: device wrote the ack byte before publishing the
         // used-ring entry; identity-mapped read.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let ack = unsafe { core::ptr::read_volatile((phys + 256) as *const u8) };
+        let ack = unsafe { core::ptr::read_volatile(g.buf.cpu_ptr_at::<u8>(256)) };
         Ok(ack)
     }
 
@@ -1334,7 +1334,7 @@ impl VirtioNetPci {
         // None — better than handing the stack a frame and losing
         // the refill slot.
         let replacement = self.rx_buf_acquire()?;
-        let rep_phys = replacement.phys_addr().raw();
+        let rep_phys = replacement.dma_addr().raw();
         // Now swap: take the original out of its slot, free the
         // descriptor chain, post the replacement, stash it under
         // its new head index.

@@ -150,9 +150,27 @@ long_mode_start:
     pop rdi
     pop rsi
 
-    /* Stack remains in low phys during early Rust bringup.
-     * Higher-half stack swap happens during Wave 2.
+    /* Move the stack to its higher-half alias before entering Rust.
+     *
+     * `stack_top` is a .boot.data address, i.e. low physical. That was
+     * fine while every address space carried the low identity map, but
+     * PML4[0] is user space now: a kernel task scheduled onto a user CR3
+     * would find its own stack unmapped and take a #PF on the push, then
+     * #DF on the fault handler's own push.
+     *
+     * The alias is already live -- boot.S maps PML4[511] -> pdpt and
+     * pdpt[510] -> phys 0..1 GiB, and `init_mmu` keeps that same window
+     * through `pd_hi_kernel`, so `phys + KERNEL_VIRT_BASE` addresses the
+     * identical bytes both before and after the MMU handoff.
+     *
+     * Done HERE, at the one point where the stack is empty: the handoff
+     * pops are complete and Rust has not run, so no saved frame pointer
+     * and no pointer-to-stack-local exists yet to be left pointing at the
+     * low alias. Every push from the `call` below lands high.
      */
+    movabs rax, 0xFFFFFFFF80000000              /* KERNEL_VIRT_BASE */
+    add rsp, rax
+
     call _start_rust
 
 1:  hlt

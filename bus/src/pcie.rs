@@ -140,6 +140,10 @@ pub unsafe fn enumerate_segment(ecam_base: PhysAddr, n_buses: u16, segment: u16)
 unsafe fn ecam_read32(addr: PhysAddr) -> u32 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts `addr` is a readable 4-byte MMIO slot.
+    //
+    // Deliberately NOT `kernel_ptr`: ECAM is device MMIO, and the kernel
+    // direct map is write-back cacheable. MMIO reaches the kernel through
+    // the identity window / `ioremap`, not the RAM direct map.
     let v = unsafe { core::ptr::read_volatile(addr.raw() as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v

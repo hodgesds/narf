@@ -71,7 +71,7 @@ struct MemmapEntry {
 /// `payload` must point at at least 4 bytes of readable memory.
 pub unsafe fn is_hvm_start_info(payload: PhysAddr) -> bool {
     // SAFETY: caller promises 4-byte readability.
-    let magic = unsafe { (payload.raw() as *const u32).read_unaligned() };
+    let magic = unsafe { (payload.kernel_ptr::<u32>()).read_unaligned() };
     magic == MAGIC
 }
 

@@ -3675,11 +3675,43 @@ fn run_interactive_cmd(args: &RunInteractiveArgs) -> Result<()> {
 
     let fw_dir = root.join("target").join("firmware");
     let (fw_initramfs, _) = collect_firmware_blobs(&fw_dir, &args.build.initramfs_firmware)?;
+
+    // `XTASK_STAGE_BIN=/host/path[:guest/name]` puts an arbitrary host file
+    // into the guest's initramfs, so a Linux binary can be driven with
+    // `--cmd` without teaching xtask about that binary. Used for the
+    // stress-ng sweep, where the SAME file has to reach NARF and a real
+    // Linux kernel for the comparison to mean anything.
+    let staged: Option<(String, Vec<u8>)> = match std::env::var("XTASK_STAGE_BIN") {
+        Ok(spec) if !spec.is_empty() => {
+            let (host, guest) = match spec.split_once(':') {
+                Some((h, g)) => (h.to_string(), g.to_string()),
+                None => {
+                    let name = Path::new(&spec)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "staged".into());
+                    (spec.clone(), format!("bin/{name}"))
+                }
+            };
+            let bytes =
+                std::fs::read(&host).with_context(|| format!("XTASK_STAGE_BIN: reading {host}"))?;
+            println!(
+                "xtask: staging {host} ({} bytes) -> guest /{guest}",
+                bytes.len()
+            );
+            Some((guest, bytes))
+        }
+        _ => None,
+    };
+
     let mut cpio_path = None;
-    if !fw_initramfs.is_empty() {
+    if !fw_initramfs.is_empty() || staged.is_some() {
         let mut cpio_entries: Vec<(&str, &[u8])> = Vec::new();
         for (path, bytes) in &fw_initramfs {
             cpio_entries.push((path.as_str(), bytes.as_slice()));
+        }
+        if let Some((name, bytes)) = &staged {
+            cpio_entries.push((name.as_str(), bytes.as_slice()));
         }
         let cpio = encode_cpio_newc(&cpio_entries);
         let p = out_dir.join("initramfs.cpio");
@@ -8883,4 +8915,190 @@ fn host_test_cmd() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Source guard: the DEVICE address must never be dereferenced.
+///
+/// `DmaAddr::raw()` has to yield a `u64` — device registers and descriptor
+/// fields need the integer — and any `u64` casts to a pointer, so the type
+/// system cannot forbid `buf.dma_addr().raw() as *mut T` on its own.
+///
+/// The FIRST version of this guard matched only the contiguous one-line
+/// literal, and an external review found ~15 live violations it was passing
+/// over: the value gets laundered through a local (`let phys =
+/// buf.dma_addr().raw();` … `(phys + off) as *mut T`), through a second hop
+/// (`let resp = pool + 0x1000;`), or simply wrapped so the cast lands on a
+/// different line. A guard that reports clean while the bug class is live is
+/// worse than no guard, because the migration was signed off on its say-so.
+///
+/// So this scans STATEMENTS (split on `;`, so wrapping cannot hide a cast)
+/// and taints locals bound from `dma_addr()`, following `let y = x + …`
+/// aliases transitively. The CPU-side spelling is `cpu_ptr` / `cpu_mut_ptr`
+/// / `_at`.
+#[cfg(test)]
+mod dma_addr_source_guard {
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if name != "target" && name != ".git" {
+                    rust_sources(&p, out);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Strip `//` comments so prose quoting the banned shape (including this
+    /// module's own docs) cannot trip the scan.
+    fn decomment(src: &str) -> String {
+        src.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && !t.starts_with('*')
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn is_ident_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    /// Whole-identifier search: `phys` must not match inside `rx_phys`.
+    fn mentions(hay: &str, ident: &str) -> bool {
+        let mut from = 0;
+        while let Some(i) = hay[from..].find(ident) {
+            let a = from + i;
+            let b = a + ident.len();
+            let before_ok = a == 0 || !hay[..a].chars().next_back().is_some_and(is_ident_char);
+            let after_ok = b >= hay.len() || !hay[b..].chars().next().is_some_and(is_ident_char);
+            if before_ok && after_ok {
+                return true;
+            }
+            from = b;
+        }
+        false
+    }
+
+    /// `let NAME = ...` — the bound identifier, if this is a binding.
+    fn bound_name(stmt: &str) -> Option<&str> {
+        let rest = stmt.trim_start().strip_prefix("let ")?;
+        let rest = rest.strip_prefix("mut ").unwrap_or(rest);
+        let name = rest.split(|c: char| !is_ident_char(c)).next()?;
+        (!name.is_empty()).then_some(name)
+    }
+
+    #[test]
+    fn device_address_is_never_dereferenced() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("xtask manifest dir has a workspace grandparent")
+            .to_path_buf();
+        let mut files = Vec::new();
+        rust_sources(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "source scan found only {} files — the walk is broken, not the tree",
+            files.len()
+        );
+
+        // Split so this file does not match its own detector.
+        let dma = concat!("dma_addr", "()");
+        let cast_mut = concat!(" as *", "mut ");
+        let cast_const = concat!(" as *", "const ");
+
+        // Conversions that legitimately produce a dereferenceable pointer, so
+        // neither taint nor a cast through them is a defect.
+        const SANCTIONED: &[&str] = &[
+            "ioremap(",
+            "kernel_ptr",
+            "kernel_mut_ptr",
+            "cpu_ptr",
+            "cpu_mut_ptr",
+            "as_ptr(",
+            "as_mut_ptr(",
+        ];
+
+        let mut offenders = Vec::new();
+        for f in &files {
+            let Ok(raw) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            let text = decomment(&raw);
+            // Function bodies are not tracked separately: a name bound from a
+            // device address anywhere in a file is suspect everywhere in it.
+            // Over-approximating is right here — a false positive is a code
+            // review, a false negative is silent DMA corruption.
+            let split = |t: &str| -> Vec<String> {
+                t.split(|c| c == ';' || c == '}' || c == '{')
+                    .map(|s| s.to_string())
+                    .collect()
+            };
+            let mut tainted: Vec<String> = Vec::new();
+            for stmt in split(&text) {
+                let stmt = stmt.as_str();
+                if stmt.contains(dma) {
+                    if let Some(n) = bound_name(stmt) {
+                        tainted.push(n.to_string());
+                    }
+                }
+            }
+            for _ in 0..3 {
+                let snapshot = tainted.clone();
+                for stmt in split(&text) {
+                    let stmt = stmt.as_str();
+                    let Some(n) = bound_name(stmt) else { continue };
+                    if tainted.iter().any(|t| t == n) {
+                        continue;
+                    }
+                    // `ioremap` and the kernel_*/cpu_* accessors are the
+                    // sanctioned physical -> virtual conversions. A value
+                    // produced by one is a VALID pointer, so taint stops
+                    // here rather than propagating into every use of it.
+                    if SANCTIONED.iter().any(|k| stmt.contains(k)) {
+                        continue;
+                    }
+                    if snapshot.iter().any(|t| mentions(stmt, t)) {
+                        tainted.push(n.to_string());
+                    }
+                }
+            }
+
+            for stmt in split(&text) {
+                let stmt = stmt.as_str();
+                if !stmt.contains(cast_mut) && !stmt.contains(cast_const) {
+                    continue;
+                }
+                // A cast whose operand is already a POINTER (`as_ptr()`,
+                // `as_mut_ptr()`, `Arc::as_ptr`) is a pointer->pointer cast,
+                // not a device address being dereferenced.
+                if SANCTIONED.iter().any(|k| stmt.contains(k)) {
+                    continue;
+                }
+                let hit = stmt.contains(dma) || tainted.iter().any(|t| mentions(stmt, t));
+                if hit {
+                    offenders.push(format!(
+                        "{}: {}",
+                        f.strip_prefix(&root).unwrap_or(f).display(),
+                        stmt.split_whitespace().collect::<Vec<_>>().join(" ")
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "a DEVICE address reached a pointer cast — use cpu_ptr/cpu_mut_ptr/_at \
+             for CPU access; dma_addr() is what the hardware dereferences:\n{}",
+            offenders.join("\n")
+        );
+    }
 }

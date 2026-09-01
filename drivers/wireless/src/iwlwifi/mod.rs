@@ -184,10 +184,10 @@ impl IwlDevice {
 
         let mut tfd = tx::Tfd::default();
         tfd.push_seg(
-            cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+            cmd_dma.dma_addr().raw() + (slot * 32) as u64,
             core::mem::size_of::<tx::IwlTxCmd>() as u16,
         );
-        tfd.push_seg(buf.phys_addr().as_u64(), frame_len);
+        tfd.push_seg(buf.dma_addr().raw(), frame_len);
 
         tx_q.enqueue(tfd);
         tx::tx_doorbell(&mut mmio, 0, tx_q.write_ptr);
@@ -361,10 +361,10 @@ impl WirelessNetIface for IwlDevice {
                 // 3. Build TFD.
                 let mut tfd = tx::Tfd::default();
                 tfd.push_seg(
-                    cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+                    cmd_dma.dma_addr().raw() + (slot * 32) as u64,
                     core::mem::size_of::<tx::IwlCmdHeader>() as u16,
                 );
-                tfd.push_seg(pd.phys_addr().as_u64(), cmd_body.len() as u16);
+                tfd.push_seg(pd.dma_addr().raw(), cmd_body.len() as u16);
 
                 // 4. Enqueue and kick.
                 tx_q.enqueue(tfd);
@@ -445,11 +445,11 @@ impl WirelessNetIface for IwlDevice {
 
             let mut tfd = tx::Tfd::default();
             tfd.push_seg(
-                cmd_dma.phys_addr().as_u64() + (slot * 32) as u64,
+                cmd_dma.dma_addr().raw() + (slot * 32) as u64,
                 core::mem::size_of::<tx::IwlTxCmd>() as u16,
             );
             tfd.push_seg(
-                frame.buf().phys_addr().as_u64() + frame.offset() as u64,
+                frame.buf().dma_addr().raw() + frame.offset() as u64,
                 frame.len() as u16,
             );
 
@@ -620,11 +620,11 @@ async fn iwl_tx_pump(device: Arc<IwlDevice>, mut tx_cons: Consumer<Frame, TX_RIN
         let mut tfd = tx::Tfd::default();
         // Segment 0: IwlTxCmd header.
         let cmd_size = core::mem::size_of::<tx::IwlTxCmd>();
-        let cmd_phys = cmd_dma.phys_addr().as_u64() + (slot * 32) as u64;
+        let cmd_phys = cmd_dma.dma_addr().raw() + (slot * 32) as u64;
         tfd.push_seg(cmd_phys, cmd_size as u16);
         // Segment 1: Frame payload.
         tfd.push_seg(
-            frame.buf().phys_addr().as_u64() + frame.offset() as u64,
+            frame.buf().dma_addr().raw() + frame.offset() as u64,
             frame.len() as u16,
         );
 
@@ -1433,7 +1433,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
                 // and is properly aligned for `RxDescriptor`.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 unsafe {
-                    (*rx_descs.add(i)).host_phys = buf.phys_addr().as_u64();
+                    (*rx_descs.add(i)).host_phys = buf.dma_addr().raw();
                 }
             }
 
@@ -1508,7 +1508,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // Program hardware RX registers.
             mmio.write(
                 rx::CSR_FH_MEM_RSCSR_CHNL0_RBDCB_BASE_REG,
-                rx_ring_mem.phys_addr().as_u64() as u32,
+                rx_ring_mem.dma_addr().raw() as u32,
             );
             mmio.write(rx::CSR_FH_RSCSR_CHNL0_WPTR, (rx::RX_RING_SIZE - 1) as u32);
 
@@ -1516,7 +1516,7 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
             // TODO: Read real MAC from hardware/firmware.
             let mac_addr = [0x00, 0x16, 0xEA, 0x12, 0x34, 0x56];
 
-            let rx_q = rx::RxQueue::new(rx_descs, rx_ring_mem.phys_addr().as_u64());
+            let rx_q = rx::RxQueue::new(rx_descs, rx_ring_mem.dma_addr().raw());
             let tx_q0 = tx::TxQueue::new(0, tx_ring0_mem.as_mut_ptr() as *mut tx::Tfd);
 
             let device = Arc::new(IwlDevice::new(

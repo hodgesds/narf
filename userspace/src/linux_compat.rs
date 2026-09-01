@@ -248,7 +248,7 @@ impl MemfdStore {
                     // SAFETY: a freshly-allocated frame is identity-mapped
                     // (x86_64 KERNEL_PHYS_OFFSET == 0) and owned by us.
                     unsafe {
-                        core::ptr::write_bytes(f.start_address().raw() as *mut u8, 0, 4096);
+                        core::ptr::write_bytes(f.start_address().kernel_mut_ptr::<u8>(), 0, 4096);
                     }
                     self.frames.push(f);
                 }
@@ -260,7 +260,7 @@ impl MemfdStore {
 
     /// Identity-mapped pointer to backing page `page`.
     fn page_ptr(&self, page: usize) -> *mut u8 {
-        self.frames[page].start_address().raw() as *mut u8
+        self.frames[page].start_address().kernel_mut_ptr::<u8>()
     }
 }
 

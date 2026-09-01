@@ -394,6 +394,14 @@ fn smoke_smap_sys_read_kbuf_roundtrip() -> TestResult {
     }
 
     // Simulated "user" output buffer: kernel heap, all zeros initially.
+    //
+    // This needs the kernel-buffer opt-in. It did not before the low half
+    // was freed: the kernel heap lived in the low identity map, so a heap
+    // pointer was indistinguishable from a user pointer and
+    // `validate_user_range` waved it through. The heap now lives in the
+    // high-half direct map, so the check correctly rejects it -- which is
+    // the point of the check. Open the scope the handler unit-tests use.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     let mut out_buf = alloc::vec![0u8; 16];
     let mut ctx = FakeCtx {
         args: SyscallArgs {

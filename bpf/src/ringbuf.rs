@@ -152,11 +152,15 @@ impl RingBuf {
         // identity-mapped for their full extents (2 pages / `data_size` bytes).
         unsafe {
             core::ptr::write_bytes(
-                control.start_address().raw() as *mut u8,
+                control.start_address().kernel_mut_ptr::<u8>(),
                 0,
                 (2 * PAGE) as usize,
             );
-            core::ptr::write_bytes(data.start_address().raw() as *mut u8, 0, data_size as usize);
+            core::ptr::write_bytes(
+                data.start_address().kernel_mut_ptr::<u8>(),
+                0,
+                data_size as usize,
+            );
         }
         Ok(Self {
             attr,
@@ -173,19 +177,22 @@ impl RingBuf {
     fn consumer(&self) -> &AtomicU64 {
         // SAFETY: control page 0 is a live identity-mapped frame; offset zero is
         // a naturally aligned `u64` shared with the userspace consumer mapping.
-        unsafe { &*(self.control.start_address().raw() as *const AtomicU64) }
+        unsafe { &*(self.control.start_address().kernel_ptr::<AtomicU64>()) }
     }
 
     /// The `producer_pos` cell, at offset zero of control page 1.
     fn producer(&self) -> &AtomicU64 {
         // SAFETY: control page 1 is the second frame of the order-1 block;
         // offset zero there is a naturally aligned `u64`.
-        unsafe { &*((self.control.start_address().raw() + PAGE) as *const AtomicU64) }
+        unsafe {
+            &*(narf_memory::PhysAddr::new(self.control.start_address().raw() + PAGE)
+                .kernel_ptr::<AtomicU64>())
+        }
     }
 
     /// The base of the contiguous data area.
     fn data_ptr(&self) -> *mut u8 {
-        self.data.start_address().raw() as *mut u8
+        self.data.start_address().kernel_mut_ptr::<u8>()
     }
 
     /// The data-area size in bytes.

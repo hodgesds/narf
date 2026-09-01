@@ -208,7 +208,7 @@ pub fn dispatch_virtgpu_render(
                     nr_samples: req.nr_samples,
                     flags: req.flags,
                 },
-                buffer.phys_addr().raw(),
+                buffer.dma_addr().raw(),
                 buffer.len() as u32,
             )
             .map_err(|_| FsError::InvalidData)?;
@@ -373,7 +373,7 @@ pub fn dispatch_virtgpu_mmap(
     if len > resource.buffer.len() {
         return Err(FsError::InvalidData);
     }
-    let phys = resource.buffer.phys_addr().raw();
+    let phys = resource.buffer.dma_addr().raw();
     Ok((0..len / 4096)
         .map(|page| phys + page as u64 * 4096)
         .collect())
@@ -1345,7 +1345,11 @@ fn handle_create_dumb(
     // the allocation covers `size` bytes at `phys`.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(phys as *mut u8, 0, size as usize);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+            0,
+            size as usize,
+        );
     }
 
     // Register in the card's dumb_backings table.
@@ -1733,7 +1737,11 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
         // SAFETY: both buffers are DMA allocations identity-mapped by the
         // x86_64 kernel.  Row bounds are clamped to each buffer's geometry.
         unsafe {
-            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
+                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                row_bytes,
+            );
         }
     }
 
@@ -1798,7 +1806,11 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
         // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
+                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                row_bytes,
+            );
         }
     }
     // Tell the FB cursor renderer the frame was fully repainted so it drops

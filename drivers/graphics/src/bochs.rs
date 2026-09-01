@@ -173,13 +173,20 @@ impl BochsDisplay {
     /// Caller must ensure no concurrent draw is in flight; framebuffer
     /// writes go directly through MMIO without a lock.
     pub unsafe fn framebuffer(&self) -> Framebuffer {
-        // SAFETY: BAR0's phys is identity-mapped; size covers
-        // width*height*4 bytes by mode-setting math (1024*768*4=3MB,
-        // bochs BAR0 is at least 16 MiB).
+        // Use the ioremap VA `map_bar` already installed, not the raw
+        // physical base. BAR0 lands in the sub-4-GiB MMIO hole, which was
+        // reachable only through the PML4[0] identity map -- that slot is
+        // user space now, so drawing a glyph from a task on a user CR3
+        // #PF'd on the framebuffer. `MmioRegion::virt` is the mapping the
+        // rest of the MMIO helpers already deref, and for a prefetchable
+        // BAR like this one it is write-combining rather than uncached.
+        //
+        // Size covers width*height*4 by mode-setting math
+        // (1024*768*4 = 3 MiB; bochs BAR0 is at least 16 MiB).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             Framebuffer::new(
-                self.fb_region.phys.raw() as *mut u32,
+                self.fb_region.virt as *mut u32,
                 self.width,
                 self.height,
                 self.width, // stride = width for bochs (linear, no padding)

@@ -134,7 +134,11 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         // kernel data.
         // SAFETY: identity-mapped low-RAM frame; owned by us.
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, PAGE as usize);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                0,
+                PAGE as usize,
+            );
         }
         frames.push(phys);
     }

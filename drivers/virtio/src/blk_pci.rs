@@ -219,7 +219,7 @@ impl VirtioBlkPci {
         // Allocate the queue backing page.
         let q_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let q_phys = q_buf.phys_addr().raw();
+        let q_phys = q_buf.dma_addr().raw();
         let layout = VirtqueueLayout::new(qsize, q_phys).ok_or(VirtioPciError::QueueTooSmall)?;
 
         // Program queue addresses. Use the 64-bit split-write helper.
@@ -332,31 +332,34 @@ impl VirtioBlkPci {
     /// Issue a single 512-byte write at `sector`. Polled.
     pub fn write_sector(&self, sector: u64, data: &[u8; 512]) -> Result<(), VirtioPciError> {
         // Build header into the per-request pool slot 0.
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_OUT,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
         // Stage the payload into a fresh DMA page.
         let payload =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         // SAFETY: page-sized DMA buffer; fill the first 512 bytes
         // with the caller's data.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &byte) in data.iter().enumerate() {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, byte);
+                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), byte);
             }
         }
         // For Write, payload is read-only from the device's POV.
@@ -431,7 +434,9 @@ impl VirtioBlkPci {
             // this request; the descriptor chain remains owned until the
             // device completes it, so the byte is valid for this diagnostic
             // volatile read.
-            let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+            let status = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+            };
             STALLED_REQUEST.store(
                 (sector << 16) | ((status as u64) << 8) | head as u64,
                 Ordering::Relaxed,
@@ -449,7 +454,9 @@ impl VirtioBlkPci {
         }
         debug_assert!(done);
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         if status != VIRTIO_BLK_S_OK {
             let mut g = self.queue.lock();
             if let Some(q) = g.as_mut() {
@@ -470,34 +477,37 @@ impl VirtioBlkPci {
     /// MSI-X for virtio-pci (a follow-up).
     pub fn read_sector(&self, sector: u64, out: &mut [u8; 512]) -> Result<(), VirtioPciError> {
         // Build header + status into the per-request pool slot 0.
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_IN,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
 
         // Allocate a 4 KiB DMA scratch buffer for the read payload.
         // (DMA buffers are page-sized; we only consume 512 bytes.)
         let payload =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         // SAFETY: page-sized DMA buffer; zero the first 512 bytes so
         // a stale read shows up clearly if the device misses our
         // request.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for i in 0..512usize {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
 
@@ -574,7 +584,9 @@ impl VirtioBlkPci {
 
         // Read the status byte; non-zero means I/O error.
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         if status != VIRTIO_BLK_S_OK {
             // Free chain to avoid leak.
             let mut g = self.queue.lock();
@@ -592,7 +604,7 @@ impl VirtioBlkPci {
         // freshly allocated so it cannot overlap `out`. Bulk copy rather than
         // a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
+            core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), out.len());
         }
 
         // Free the descriptor chain.
@@ -627,25 +639,28 @@ impl VirtioBlkPci {
         if out.len() < bytes {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_IN,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
 
         let payload =
             alloc_coherent(bytes, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         // SAFETY: coherent DMA buffer of >= `bytes`; zero the bytes we'll read
         // so a missed device write shows up clearly.
         //
@@ -658,7 +673,7 @@ impl VirtioBlkPci {
         // MMIO, and the ordering that matters is the fence below, which is
         // what publishes these zeroes before the device is notified.
         unsafe {
-            core::ptr::write_bytes(payload_phys as *mut u8, 0, bytes);
+            core::ptr::write_bytes(payload.cpu_mut_ptr::<u8>(), 0, bytes);
         }
 
         let descs = [
@@ -725,7 +740,9 @@ impl VirtioBlkPci {
         debug_assert!(done);
 
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         if status != VIRTIO_BLK_S_OK {
             let mut g = self.queue.lock();
             if let Some(q) = g.as_mut() {
@@ -747,7 +764,7 @@ impl VirtioBlkPci {
         // `read_volatile` per byte, so a 4 KiB read cost 4096 single-byte
         // loads that could not be vectorised.
         unsafe {
-            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), bytes);
+            core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), bytes);
         }
 
         let mut g = self.queue.lock();
@@ -768,24 +785,27 @@ impl VirtioBlkPci {
     /// the (status, payload) phys addresses. Caller must keep the
     /// returned `payload` alive until drain completes.
     pub fn submit_read(&self, sector: u64) -> Result<(u16, DmaBuffer, u64, u64), VirtioPciError> {
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_IN,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
         let payload =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         let descs = [
             VirtqDesc {
                 addr: header_phys,
@@ -860,7 +880,9 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         if status != VIRTIO_BLK_S_OK {
             let mut g = self.queue.lock();
             if let Some(q) = g.as_mut() {
@@ -875,7 +897,11 @@ impl VirtioBlkPci {
         // separately allocated so it cannot overlap `out`. Bulk copy rather
         // than a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(payload_phys).kernel_ptr::<u8>(),
+                out.as_mut_ptr(),
+                out.len(),
+            );
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {
@@ -893,28 +919,31 @@ impl VirtioBlkPci {
         sector: u64,
         data: &[u8; 512],
     ) -> Result<(u16, DmaBuffer, u64), VirtioPciError> {
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_OUT,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
         let payload =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         // SAFETY: page-sized DMA buffer; copy in caller's data.
         unsafe {
             for (i, &byte) in data.iter().enumerate() {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, byte);
+                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), byte);
             }
         }
         // Write payload is read-only from the device's POV (no
@@ -986,7 +1015,9 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);
@@ -1007,28 +1038,31 @@ impl VirtioBlkPci {
             None => return self.read_sector(sector, out),
         };
         // Build header.
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let header_phys = pool_phys;
         let status_phys = pool_phys + 16;
         // SAFETY: identity-mapped DMA.
         unsafe {
             core::ptr::write_volatile(
-                header_phys as *mut BlkHeader,
+                narf_memory::PhysAddr::new(header_phys).kernel_mut_ptr::<BlkHeader>(),
                 BlkHeader {
                     type_tag: VIRTIO_BLK_T_IN,
                     _resv: 0,
                     sector,
                 },
             );
-            core::ptr::write_volatile(status_phys as *mut u8, 0xFFu8);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u8>(),
+                0xFFu8,
+            );
         }
         let payload =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let payload_phys = payload.phys_addr().raw();
+        let payload_phys = payload.dma_addr().raw();
         // SAFETY: page-sized.
         unsafe {
             for i in 0..512usize {
-                core::ptr::write_volatile((payload_phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(payload.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
         let descs = [
@@ -1102,7 +1136,9 @@ impl VirtioBlkPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u8>())
+        };
         if status != VIRTIO_BLK_S_OK {
             let mut g = self.queue.lock();
             if let Some(q) = g.as_mut() {
@@ -1117,7 +1153,7 @@ impl VirtioBlkPci {
         // separately allocated so it cannot overlap `out`. Bulk copy rather
         // than a per-byte volatile loop — see `read_sectors`.
         unsafe {
-            core::ptr::copy_nonoverlapping(payload_phys as *const u8, out.as_mut_ptr(), out.len());
+            core::ptr::copy_nonoverlapping(payload.cpu_ptr::<u8>(), out.as_mut_ptr(), out.len());
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {

@@ -3240,7 +3240,7 @@ fn smoke_frame_x86_64_user_mode_roundtrip() -> TestResult {
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
-            code_frame.raw() as *mut u8,
+            code_frame.kernel_mut_ptr::<u8>(),
             code_bytes.len(),
         );
     }
@@ -3485,7 +3485,7 @@ fn smoke_frame_x86_64_user_mode_yield_resume() -> TestResult {
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
-            code_frame.raw() as *mut u8,
+            code_frame.kernel_mut_ptr::<u8>(),
             code_bytes.len(),
         );
     }
@@ -3632,7 +3632,7 @@ fn smoke_frame_x86_64_user_task_poll_yield_exit() -> TestResult {
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
-            code_frame.raw() as *mut u8,
+            code_frame.kernel_mut_ptr::<u8>(),
             code_bytes.len(),
         );
     }
@@ -3795,7 +3795,7 @@ fn smoke_userspace_user_task_future_yield_exit() -> TestResult {
     unsafe {
         core::ptr::copy_nonoverlapping(
             code_bytes.as_ptr(),
-            code_frame.raw() as *mut u8,
+            code_frame.kernel_mut_ptr::<u8>(),
             code_bytes.len(),
         );
     }

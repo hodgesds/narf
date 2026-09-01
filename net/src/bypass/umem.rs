@@ -137,7 +137,7 @@ impl Umem {
         // up to the buffer's actual length as the live region.
         let buf = narf_io::alloc_coherent(size as usize, DomainId::USERSPACE_K)
             .map_err(|_| UmemError::NoMemory)?;
-        let base_phys = buf.phys_addr().as_u64();
+        let base_phys = buf.dma_addr().raw();
         let base_virt = buf.as_ptr() as u64;
         let cap = Cap::<UmemRegion, Invoke>::bootstrap();
         Ok(Arc::new(Self {

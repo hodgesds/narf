@@ -925,10 +925,10 @@ unsafe fn mint_shared_ring_pair(
     let cq_phys = narf_memory::alloc_frame().map_err(|_| ())?.start_address();
     // SAFETY: identity-mapped low 4 GiB + page-aligned phys.
     unsafe {
-        core::ptr::write_bytes(sq_phys.raw() as *mut u8, 0, 4096);
-        core::ptr::write_bytes(cq_phys.raw() as *mut u8, 0, 4096);
-        SqRing::init_in(sq_phys.raw() as *mut SqRing);
-        CqRing::init_in(cq_phys.raw() as *mut CqRing);
+        core::ptr::write_bytes(sq_phys.kernel_mut_ptr::<u8>(), 0, 4096);
+        core::ptr::write_bytes(cq_phys.kernel_mut_ptr::<u8>(), 0, 4096);
+        SqRing::init_in(sq_phys.kernel_mut_ptr::<SqRing>());
+        CqRing::init_in(cq_phys.kernel_mut_ptr::<CqRing>());
     }
 
     let sq_vaddr = MMAP_CURSOR.fetch_add(0x1000, Ordering::Relaxed);

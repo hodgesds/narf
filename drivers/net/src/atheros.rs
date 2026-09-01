@@ -404,9 +404,9 @@ impl AtlNic {
         // 4a. Pre-fill RFD ring: each slot points at its pooled
         //     buffer. NIC consumes the RFD ring left-to-right; the
         //     RRS ring reports back which RFD slot was used.
-        let rfd_phys = rfd_ring.phys_addr().raw();
+        let rfd_phys = rfd_ring.dma_addr().raw();
         for (i, buf) in rfd_pool.iter().enumerate() {
-            let buf_phys = buf.phys_addr().raw();
+            let buf_phys = buf.dma_addr().raw();
             let d = Rfd {
                 addr_lo: buf_phys as u32,
                 addr_hi: (buf_phys >> 32) as u32,
@@ -416,7 +416,10 @@ impl AtlNic {
             // at `rfd_phys + i*8` lies within the ring's mapped 8-byte stride.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                core::ptr::write_volatile((rfd_phys + (i * 8) as u64) as *mut Rfd, d);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rfd_phys + (i * 8) as u64).kernel_mut_ptr::<Rfd>(),
+                    d,
+                );
             }
         }
 
@@ -424,8 +427,8 @@ impl AtlNic {
         //     offset; the high 32 bits at HEAD_HI. The chip's high-32
         //     of the RFD/RRS bases is shared (a single common DMA
         //     window); we program it on TPD_RING_HEAD_HI.
-        let tpd_phys = tpd_ring.phys_addr().raw();
-        let rrs_phys = rrs_ring.phys_addr().raw();
+        let tpd_phys = tpd_ring.dma_addr().raw();
+        let rrs_phys = rrs_ring.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TPD_RING_HEAD, tpd_phys as u32);
@@ -513,20 +516,22 @@ impl AtlNic {
         }
         let mut head_g = self.tpd_head.lock();
         let slot = (*head_g) as usize % TPD_RING_LEN;
-        let buf_phys = self.tpd_pool[slot].phys_addr().raw();
+        let buf_phys = self.tpd_pool[slot].dma_addr().raw();
 
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((buf_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(self.tpd_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
 
-        let ring_phys = self.tpd_ring.phys_addr().raw();
+        let ring_phys = self.tpd_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring; slot < TPD_RING_LEN.
-        let cur = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        let cur = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+        };
         if cur & TPD_OWN != 0 {
             return Err(NicError::TxRingFull);
         }
@@ -542,14 +547,26 @@ impl AtlNic {
         // as the r8169 path.
         // SAFETY: identity-mapped DMA ring.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.word1);
-            core::ptr::write_volatile((desc_addr + 8) as *mut u32, d.addr_lo);
-            core::ptr::write_volatile((desc_addr + 12) as *mut u32, d.addr_hi);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                d.word1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                d.addr_lo,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                d.addr_hi,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut u32, d.word0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                d.word0,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -563,7 +580,7 @@ impl AtlNic {
         // Poll for OWN → 0. responsive_spin_until ticks sleep_pumps.
         let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: same.
-            || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TPD_OWN == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>()) } & TPD_OWN == 0,
             narf_time::Deadline::after_ms(250),
         );
         if !owned {
@@ -577,11 +594,13 @@ impl AtlNic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rrs_head.lock();
         let slot = (*head_g) as usize % RRS_RING_LEN;
-        let ring_phys = self.rrs_ring.phys_addr().raw();
+        let ring_phys = self.rrs_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let word2 = unsafe { core::ptr::read_volatile((desc_addr + 8) as *const u32) };
+        let word2 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 8).kernel_ptr::<u32>())
+        };
         // NIC writes OWN=1 when it has populated the slot.
         if word2 & RRS_OWN == 0 {
             return None;
@@ -593,12 +612,14 @@ impl AtlNic {
             // Bad descriptor — clear OWN to recycle and skip.
             // SAFETY: same.
             unsafe {
-                core::ptr::write_volatile((desc_addr + 8) as *mut u32, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                    0,
+                );
             }
             *head_g = (*head_g + 1) % (RRS_RING_LEN as u32);
             return None;
         }
-        let buf_phys = self.rfd_pool[rfd_slot].phys_addr().raw();
 
         let copy_len = len.min(RX_BUF_LEN);
         let mut out = alloc::vec::Vec::with_capacity(copy_len);
@@ -608,14 +629,19 @@ impl AtlNic {
             // within that DMA-coherent allocation. Volatile because the NIC
             // wrote the bytes via DMA.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+            out.push(unsafe {
+                core::ptr::read_volatile(self.rfd_pool[rfd_slot].cpu_ptr_at::<u8>(i as u64))
+            });
         }
 
         // Rearm: clear OWN on RRS slot — the matching RFD slot
         // remains pre-armed (NIC tracks its own RFD consumer cursor).
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 8) as *mut u32, 0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 

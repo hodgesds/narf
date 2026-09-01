@@ -154,7 +154,7 @@ pub unsafe fn init_per_domain_pdpts() -> Result<u8, DomainMapError> {
         let pdpt_addr = pdpt_frame.start_address();
         // The 4 KiB identity-map covers `pdpt_addr`, so the raw
         // pointer is valid for `PageTable`-sized writes.
-        PageTable::zero_at(pdpt_addr.as_mut_ptr::<PageTable>());
+        PageTable::zero_at(pdpt_addr.kernel_mut_ptr::<PageTable>());
 
         // Install the private PDPT in this domain's PML4 only.
         let entry = PageTableEntry::new(pdpt_addr, PtFlags::PRESENT | PtFlags::WRITABLE);

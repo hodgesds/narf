@@ -751,7 +751,7 @@ impl Rtl8126Nic {
         unsafe { mmio.write8(REG_CR, CR_TE | CR_RE) };
 
         // 6a. TX descriptor ring base + TCR.
-        let tx_phys = tx_ring.phys_addr().raw();
+        let tx_phys = tx_ring.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TNPDS, tx_phys as u32);
@@ -761,9 +761,9 @@ impl Rtl8126Nic {
         }
 
         // 6b. Pre-fill RX descriptors.
-        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let rx_ring_phys = rx_ring.dma_addr().raw();
         for (i, buf) in rx_pool.iter().enumerate() {
-            let buf_phys = buf.phys_addr().raw();
+            let buf_phys = buf.dma_addr().raw();
             let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & RXD_LEN_MASK);
             if i == RING_LEN - 1 {
                 flags |= RXD_EOR;
@@ -776,7 +776,11 @@ impl Rtl8126Nic {
             };
             // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
             unsafe {
-                core::ptr::write_volatile((rx_ring_phys + (i * 16) as u64) as *mut TxDesc, d);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
+                        .kernel_mut_ptr::<TxDesc>(),
+                    d,
+                );
             }
         }
         // SAFETY: identity-mapped MMIO.
@@ -889,18 +893,20 @@ impl Rtl8126Nic {
         }
         let mut head_g = self.tx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let cur_flags = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        let cur_flags = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+        };
         if cur_flags & TXD_OWN != 0 {
             return Err(NicError::TxRingFull);
         }
@@ -911,13 +917,27 @@ impl Rtl8126Nic {
         }
         // SAFETY: identity-mapped DMA ring.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 4) as *mut u32, 0u32);
-            core::ptr::write_volatile((desc_addr + 8) as *mut u32, phys as u32);
-            core::ptr::write_volatile((desc_addr + 12) as *mut u32, (phys >> 32) as u32);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                0u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                (phys >> 32) as u32,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
-        unsafe { core::ptr::write_volatile(desc_addr as *mut u32, flags) };
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                flags,
+            )
+        };
         compiler_fence(Ordering::SeqCst);
 
         // Ring the TX doorbell at TxPoll_8125 (0x90).
@@ -929,7 +949,7 @@ impl Rtl8126Nic {
 
         let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA ring.
-            || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TXD_OWN == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>()) } & TXD_OWN == 0,
             narf_time::Deadline::after_ms(250),
         );
         if !owned {
@@ -942,17 +962,19 @@ impl Rtl8126Nic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let flags_len = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        let flags_len = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+        };
         if flags_len & RXD_OWN != 0 {
             return None;
         }
 
         let len = (flags_len & RXD_LEN_MASK) as usize;
-        let buf_phys = self.rx_pool[slot].phys_addr().raw();
+        let buf_phys = self.rx_pool[slot].dma_addr().raw();
 
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flags_len & RXD_LS != 0 {
@@ -962,7 +984,9 @@ impl Rtl8126Nic {
                 // of this slot's RX DMA buffer (RX_BUF_LEN bytes); `i <
                 // copy_len <= RX_BUF_LEN`, so the byte read is in bounds.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+                out.push(unsafe {
+                    core::ptr::read_volatile(self.rx_pool[slot].cpu_ptr_at::<u8>(i as u64))
+                });
             }
         }
 
@@ -978,7 +1002,12 @@ impl Rtl8126Nic {
             addr_hi: (buf_phys >> 32) as u32,
         };
         // SAFETY: same.
-        unsafe { core::ptr::write_volatile(desc_addr as *mut TxDesc, d) };
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                d,
+            )
+        };
         compiler_fence(Ordering::SeqCst);
 
         *head_g = (*head_g + 1) % (RING_LEN as u32);

@@ -73,9 +73,9 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     // zero-filling the whole page is in-bounds.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
     }
-    let kernel_view = frame.raw() as *mut SharedRing<u64, 8>;
+    let kernel_view = frame.kernel_mut_ptr::<SharedRing<u64, 8>>();
 
     // Verify the layout fits in 4 KiB.
     if SharedRing::<u64, 8>::size_bytes() > 4096 {
@@ -95,7 +95,7 @@ fn smoke_ipc_shared_ring_round_trip() -> TestResult {
     // Two distinct pointer values that resolve to the same backing
     // (here, both are the same kernel-identity vaddr; in real use
     // one of them would be the user's mapping of the same phys).
-    let user_view = frame.raw() as *mut SharedRing<u64, 8>;
+    let user_view = frame.kernel_mut_ptr::<SharedRing<u64, 8>>();
 
     // SAFETY: `kernel_view` points at the `init_in`-initialised ring and
     // this is the only producer constructed for it, upholding the SPSC
@@ -283,7 +283,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // allocated length at byte granularity.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let dst = buf.phys_addr().as_mut_ptr::<u8>();
+            let dst = buf.phys_addr().kernel_mut_ptr::<u8>();
             for (i, b) in PATTERN.iter().enumerate() {
                 core::ptr::write_volatile(dst.add(i), *b);
             }
@@ -314,7 +314,7 @@ fn smoke_exit_gate_buffer_handoff() -> TestResult {
         // allocated length — every `src.add(i)` is in-bounds.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let src = buf.phys_addr().as_ptr::<u8>();
+            let src = buf.phys_addr().kernel_ptr::<u8>();
             for (i, expected) in PATTERN.iter().enumerate() {
                 if core::ptr::read_volatile(src.add(i)) != *expected {
                     ok = false;
@@ -700,10 +700,10 @@ fn smoke_ipc_shared_ring_wrap_around() -> TestResult {
     // and large enough to hold the ring; `init_in`'s contract is met.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-        SharedRing::<u32, 4>::init_in(frame.raw() as *mut SharedRing<u32, 4>);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        SharedRing::<u32, 4>::init_in(frame.kernel_mut_ptr::<SharedRing<u32, 4>>());
     }
-    let view = frame.raw() as *mut SharedRing<u32, 4>;
+    let view = frame.kernel_mut_ptr::<SharedRing<u32, 4>>();
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
     // SAFETY: Valid memory or trusted environment
@@ -752,10 +752,10 @@ fn smoke_ipc_shared_ring_close_from_consumer() -> TestResult {
     // and large enough to hold the ring; `init_in`'s contract is met.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-        SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        SharedRing::<u64, 4>::init_in(frame.kernel_mut_ptr::<SharedRing<u64, 4>>());
     }
-    let view = frame.raw() as *mut SharedRing<u64, 4>;
+    let view = frame.kernel_mut_ptr::<SharedRing<u64, 4>>();
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
     // SAFETY: Valid memory or trusted environment
@@ -793,10 +793,10 @@ fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
     // and large enough to hold the ring; `init_in`'s contract is met.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-        SharedRing::<u64, 4>::init_in(frame.raw() as *mut SharedRing<u64, 4>);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        SharedRing::<u64, 4>::init_in(frame.kernel_mut_ptr::<SharedRing<u64, 4>>());
     }
-    let view = frame.raw() as *mut SharedRing<u64, 4>;
+    let view = frame.kernel_mut_ptr::<SharedRing<u64, 4>>();
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
     // SAFETY: Valid memory or trusted environment
@@ -813,7 +813,9 @@ fn smoke_ipc_shared_ring_volatile_payload_persists() -> TestResult {
     // 8-aligned (frame base is page-aligned). The producer's volatile
     // store above published a fully-initialised `u64` there.
     // SAFETY: Valid memory or trusted environment
-    let v = unsafe { core::ptr::read_volatile((frame.raw() + 64) as *const u64) };
+    let v = unsafe {
+        core::ptr::read_volatile(narf_memory::PhysAddr::new(frame.raw() + 64).kernel_ptr::<u64>())
+    };
     if v == 0xDEAD_BEEF_CAFE_F00D {
         TestResult::Pass
     } else {
@@ -836,10 +838,10 @@ fn smoke_ipc_shared_ring_full_then_drain_then_send_again() -> TestResult {
     // and large enough to hold the ring; `init_in`'s contract is met.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_bytes(frame.raw() as *mut u8, 0, 4096);
-        SharedRing::<u32, 2>::init_in(frame.raw() as *mut SharedRing<u32, 2>);
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        SharedRing::<u32, 2>::init_in(frame.kernel_mut_ptr::<SharedRing<u32, 2>>());
     }
-    let view = frame.raw() as *mut SharedRing<u32, 2>;
+    let view = frame.kernel_mut_ptr::<SharedRing<u32, 2>>();
     // SAFETY: `view` points at the just-initialised ring and is the only
     // producer for it, upholding `from_raw`'s SPSC contract.
     // SAFETY: Valid memory or trusted environment
@@ -1408,10 +1410,13 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
     let mut sample_bad: u64 = 0;
     for _ in 0..256 {
         let (p, c) = crate::channel::<u64, 4>();
-        let ptr = p.__ring_ptr_for_test() as u64;
-        // Heap allocations land below the 4 GiB early identity-
-        // map ceiling on x86_64, and above 0 (Arc::as_ptr is never
-        // null on a live Arc).
+        // The kernel heap is reached through the high-half direct map, so
+        // the raw pointer carries KERNEL_DIRECT_MAP_BASE. Invert it to get
+        // the physical address the RAM-range check is really about; the
+        // canary is about *which frame* the Ring landed in, not which VA.
+        let ptr = narf_memory::PhysAddr::from_kernel_ptr(p.__ring_ptr_for_test()).raw();
+        // Heap allocations land below the 4 GiB ceiling on x86_64, and
+        // above 0 (Arc::as_ptr is never null on a live Arc).
         #[cfg(target_arch = "x86_64")]
         let is_bad = ptr == 0 || ptr >= (4u64 << 30);
         #[cfg(not(target_arch = "x86_64"))]
@@ -1423,8 +1428,10 @@ fn smoke_ipc_channel_construction_stays_in_heap() -> TestResult {
                 sample_bad = ptr;
             }
         }
-        // Also check the consumer matches.
-        let cptr = c.__ring_ptr_for_test() as u64;
+        // Also check the consumer matches. Invert the direct-map offset on
+        // this one too -- comparing a physical address against a raw kernel
+        // pointer can never match.
+        let cptr = narf_memory::PhysAddr::from_kernel_ptr(c.__ring_ptr_for_test()).raw();
         if cptr != ptr {
             return TestResult::Fail("producer/consumer point at different rings");
         }

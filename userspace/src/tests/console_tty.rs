@@ -783,6 +783,11 @@ kernel_test_in!("userspace", smoke_echo_hello_world_end_to_end);
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocgwinsz_default_80x24() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -863,6 +868,11 @@ kernel_test_in!("userspace", smoke_console_ioctl_tiocgwinsz_default_80x24);
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocswinsz_round_trip() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -955,6 +965,11 @@ kernel_test_in!("userspace", smoke_console_ioctl_tiocswinsz_round_trip);
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_fionread_empty_ring_returns_zero() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -1036,6 +1051,11 @@ kernel_test_in!(
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_tiocspgrp_round_trip() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,
@@ -1130,6 +1150,11 @@ kernel_test_in!("userspace", smoke_console_ioctl_tiocspgrp_round_trip);
 // own `fg_pgrp` — see the devfs_pty tests.)
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_fg_pgrp_is_shared_singleton() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::fd::{ConsoleFile, TIOCGPGRP, TIOCSPGRP};
     use narf_filesystem::FileOps;
 
@@ -1181,6 +1206,11 @@ kernel_test_in!("userspace", smoke_console_fg_pgrp_is_shared_singleton);
 
 #[allow(dead_code)] // TODO(narf): used only on x86_64 today
 fn smoke_console_ioctl_unknown_cmd_returns_enotty() -> TestResult {
+    // See the other kernel_buffers_guard() call sites: this test hands a
+    // pointer to a kernel stack local to a syscall as if it were a user
+    // buffer. The kernel stack is high-half now, so the check that used to
+    // wave it through correctly rejects it.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
     use crate::{
         fd, install_core_syscalls, install_global, install_task_id_lookup, kernel_syscall_entry,
         syscall::__test_clear_global, Syscall, SyscallArgs, SyscallReturn, SyscallTable,

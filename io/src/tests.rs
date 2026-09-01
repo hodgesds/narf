@@ -13,10 +13,10 @@ fn smoke_io_dma_alloc_free() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable in this flavour"),
     };
-    if buf.phys_addr().raw() == 0 {
+    if buf.dma_addr().raw() == 0 {
         return TestResult::Fail("DMA buffer phys addr is zero");
     }
-    if buf.phys_addr().raw() & (PAGE_SIZE - 1) != 0 {
+    if buf.dma_addr().raw() & (PAGE_SIZE - 1) != 0 {
         return TestResult::Fail("DMA buffer phys addr not page-aligned");
     }
     if buf.len() != PAGE_SIZE as usize {
@@ -189,7 +189,7 @@ fn smoke_iommu_context_map_returns_identity_iova() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     iommu::__force_identity_for_test();
     let ctx = IommuContext::new(dom);
@@ -270,7 +270,10 @@ fn smoke_ioremap_direct_round_trip() -> TestResult {
     const SENTINEL: u64 = 0xCAFE_BABE_DEAD_BEEF;
     // SAFETY: identity-mapped low-RAM frame; we own it.
     unsafe {
-        core::ptr::write_volatile(phys as *mut u64, SENTINEL);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u64>(),
+            SENTINEL,
+        );
     }
     compiler_fence(Ordering::SeqCst);
 
@@ -312,7 +315,7 @@ fn smoke_io_register_with_cap_resolves() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
     let cap = register_with_cap(buf);
 
     if !cap.is_live() {
@@ -323,7 +326,7 @@ fn smoke_io_register_with_cap_resolves() -> TestResult {
         Some(b) => b,
         None => return TestResult::Fail("resolve_cap returned None"),
     };
-    if resolved.phys_addr().raw() != phys {
+    if resolved.dma_addr().raw() != phys {
         return TestResult::Fail("resolve_cap returned wrong buffer");
     }
     if resolved.slot_index() != Some(cap.slot().index) {
@@ -393,7 +396,7 @@ fn smoke_io_dma_buffer_accessors() -> TestResult {
             if big.len() != 64 * 1024 {
                 return TestResult::Fail("64 KiB alloc len != 65536");
             }
-            if big.phys_addr().raw() & (narf_memory::PAGE_SIZE - 1) != 0 {
+            if big.dma_addr().raw() & (narf_memory::PAGE_SIZE - 1) != 0 {
                 return TestResult::Fail("multi-page buffer not page-aligned");
             }
             free_coherent(big);
@@ -419,7 +422,7 @@ fn smoke_io_dma_buffer_accessors() -> TestResult {
     if buf.domain() != DomainId::DRIVER_0 {
         return TestResult::Fail("domain() didn't reflect construction");
     }
-    if buf.phys_addr().raw() == 0 {
+    if buf.dma_addr().raw() == 0 {
         return TestResult::Fail("phys_addr is zero — frame allocator misfire?");
     }
     if buf.slot_index().is_some() {

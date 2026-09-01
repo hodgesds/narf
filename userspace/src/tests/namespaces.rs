@@ -162,7 +162,7 @@ fn smoke_userspace_bootstrap_returns_config_page() -> TestResult {
     // config page; the kernel wrote a `BootstrapHeader` there, whose layout `Hdr`
     // mirrors `#[repr(C)]`, so a single volatile struct read is valid and aligned.
     // SAFETY: Valid memory or trusted environment
-    let hdr = unsafe { core::ptr::read_volatile(phys.raw() as *const Hdr) };
+    let hdr = unsafe { core::ptr::read_volatile(phys.kernel_ptr::<Hdr>()) };
 
     if hdr.magic != 0x4E_41_52_46 {
         *USER_AS_BS.lock() = None;

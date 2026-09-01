@@ -943,7 +943,7 @@ pub fn alloc_user_frame_on_strict(node: usize) -> Result<PhysFrame, FrameAllocEr
 /// returns only frames whose physical address is strictly below
 /// this value. Reason: pre-MMU-init code (per-domain PML4 setup,
 /// init_mmu's own page tables, anything that writes through
-/// `phys.raw() as *mut T`) only works when phys is in the
+/// `phys.kernel_mut_ptr::<T>()`) only works when phys is in the
 /// boot.S identity map (currently 0..4 GiB). On systems with
 /// the q35 PCI-hole RAM split (real Zen2 laptops with 16 GiB,
 /// QEMU q35 with -m ≥ 4G) usable RAM straddles 4 GiB; an

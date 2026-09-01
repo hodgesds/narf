@@ -1176,18 +1176,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // bootloader's reserved phys range is still
             // unambiguously identity-mapped readable.
             if let Some(region) = info.initramfs {
-                // SAFETY: bootloader contract — the region is
-                // identity-mapped reserved memory of exactly
-                // `region.len` bytes carrying a CPIO newc
-                // archive. `narf-initramfs` parses + leaks the
-                // result so the lifetime extends to kernel
-                // shutdown.
+                // SAFETY: bootloader contract — the region is reserved
+                // memory of exactly `region.len` bytes carrying a CPIO
+                // newc archive. `narf-initramfs` parses + leaks the
+                // result so the lifetime extends to kernel shutdown.
+                //
+                // Pass the DIRECT-MAP address, not the raw physical one.
+                // The archive slice is `&'static` and is read long after
+                // boot -- every `exec` of a staged binary walks it -- so it
+                // must stay reachable once a user CR3 is live, and user
+                // address spaces no longer carry the low identity map.
                 // SAFETY: Valid memory or trusted environment
                 let staged = unsafe {
                     narf_initramfs::stage_from_phys(
                         "boot-initramfs",
-                        region.start.raw(),
+                        region.start.kernel_ptr::<u8>() as u64,
                         region.len,
+                        false,
                     )
                 };
                 match staged {
@@ -1258,6 +1263,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 alloc::vec::Vec::with_capacity(1 + huge_excludes.len());
             excludes.extend_from_slice(&kernel_exclude);
             excludes.extend(huge_excludes.iter().copied());
+
+            // Keep the initramfs out of the buddy.
+            //
+            // `narf_initramfs` parses the CPIO in place and leaks a `&'static`
+            // view of it: every entry's name AND contents are borrowed from
+            // these physical frames for the life of the kernel. Nothing was
+            // reserving them, so the buddy handed them out and the archive was
+            // overwritten under us. The corruption is size-dependent, which is
+            // why it hid for so long -- a small archive can survive by luck,
+            // while a larger one loses pages. Symptoms were a staged binary
+            // that boot-time enumeration listed correctly but `execve` could
+            // not find (clobbered name), and a large binary that loaded and ran
+            // but whose .data read back as zeroes (clobbered mid-file page) --
+            // the latter looked exactly like a loader bug.
+            if let Some(r) = info.initramfs {
+                let lo = r.start.raw() & !0xFFF;
+                let hi = (r.start.raw() + r.len + 0xFFF) & !0xFFF;
+                if hi > lo {
+                    excludes.push((lo, hi));
+                }
+            }
 
             // KASAN: reserve a flat shadow byte-array (1 byte / 8 memory
             // bytes) covering [0, ram_top) out of the buddy, so the software
@@ -1426,6 +1452,50 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         // hole (QEMU -m ≥ 4G, real 16 GiB laptops) stays
                         // permanently unusable.
                         narf_memory::release_early_ceiling();
+
+                        // Re-stage the initramfs against the direct map.
+                        //
+                        // The first staging ran before `init_mmu`, so
+                        // `kernel_ptr` correctly fell back to identity and the
+                        // archive slice holds low physical addresses. That was
+                        // fine for the parse (it happened right then, on the
+                        // boot CR3) but the slice is `&'static` and is read on
+                        // every later `exec` -- with a user CR3 live, where the
+                        // low identity map no longer exists. Re-parse against
+                        // the direct-map view now that it is active; `install`
+                        // replaces the earlier instance.
+                        if let Some(region) = info.initramfs {
+                            // SAFETY: same bootloader contract as the first
+                            // staging; the direct map is live as of the CR3
+                            // swap above, so this address is valid in every
+                            // address space.
+                            let restaged = unsafe {
+                                narf_initramfs::stage_from_phys(
+                                    "boot-initramfs",
+                                    region.start.kernel_ptr::<u8>() as u64,
+                                    region.len,
+                                    true,
+                                )
+                            };
+                            match restaged {
+                                Ok(()) => {
+                                    let n = narf_initramfs::staged()
+                                        .map(|f| f.iter_files().count())
+                                        .unwrap_or(0);
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  initramfs: re-staged via direct map, {n} file(s)"
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  initramfs: direct-map re-stage FAILED: {e:?}"
+                                    );
+                                }
+                            }
+                        }
+
                         let s = narf_memory::frame_stats();
                         let _ = writeln!(
                             console::Writer,
@@ -3761,6 +3831,31 @@ fn run_async_demo() -> ! {
     // doesn't deliver, HPET never tried).
     #[cfg(target_arch = "x86_64")]
     {
+        // ioremap the HPET register block and hand `narf_time` the VIRTUAL
+        // base. The driver dereferences whatever base it is given, and it
+        // used to be given the raw physical address -- fine only while every
+        // address space carried the low identity map. HPET sits in the
+        // legacy MMIO hole below 4 GiB, i.e. squarely in PML4[0], which is
+        // user space now; a timer write taken while a user CR3 was live
+        // #PF'd on 0xfed00xxx. `ioremap` puts it in the vmalloc window,
+        // which IS shared into every address space, and maps it Device
+        // (uncached) -- correct for MMIO, unlike the write-back direct map.
+        //
+        // 1 KiB covers the general block plus 32 comparators
+        // (0x100 + 0x20*32 = 0x500).
+        // SAFETY: HPET's ACPI-declared register block, owned by us.
+        match unsafe {
+            narf_memory::ioremap::ioremap(
+                narf_time::hpet::base_phys_for_ioremap(),
+                0x1000,
+                narf_memory::ioremap::MmioAttrs::Device,
+            )
+        } {
+            Ok(m) => narf_time::hpet::set_base_phys(m.virt),
+            Err(e) => {
+                let _ = writeln!(console::Writer, "  hpet: ioremap failed: {e:?}");
+            }
+        }
         // SAFETY: BSP, single-threaded boot context.
         match unsafe { narf_time::hpet::init() } {
             Ok(()) => {

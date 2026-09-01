@@ -208,7 +208,7 @@ impl VirtioP9Pci {
             alloc_coherent(8192, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         // SAFETY: page-sized DMA.
         unsafe {
-            core::ptr::write_bytes(pool.phys_addr().raw() as *mut u8, 0, 8192);
+            core::ptr::write_bytes(pool.cpu_mut_ptr::<u8>(), 0, 8192);
         }
 
         Ok(Self {
@@ -249,15 +249,22 @@ impl VirtioP9Pci {
         if req.is_empty() || req.len() > 0x1000 || resp_max > 0x1000 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let req_phys = pool_phys;
         let resp_phys = pool_phys + 0x1000;
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, &b) in req.iter().enumerate() {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
-            core::ptr::write_bytes(resp_phys as *mut u8, 0, resp_max);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u8>(),
+                0,
+                resp_max,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -321,7 +328,9 @@ impl VirtioP9Pci {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, slot) in out.iter_mut().enumerate().take(n) {
-                *slot = core::ptr::read_volatile((resp_phys + i as u64) as *const u8);
+                *slot = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(resp_phys + i as u64).kernel_ptr::<u8>(),
+                );
             }
         }
         let mut g = self.requestq.lock();
@@ -445,7 +454,7 @@ unsafe fn setup_queue(
     let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
     // SAFETY: identity-mapped MMIO.
     unsafe {
         common.write16(CC_QUEUE_SIZE, qsize);

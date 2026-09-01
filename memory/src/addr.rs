@@ -79,13 +79,22 @@ impl PhysAddr {
     pub fn kernel_mut_ptr<T>(self) -> *mut T {
         #[cfg(target_arch = "x86_64")]
         {
-            // Only frames the low identity map (PML4[0], 0..512 GiB)
-            // can't reach need the direct-map offset. Keeping frames
-            // below LOW_IDENTITY_LIMIT identity-mapped means `ptr ==
-            // phys` for all real hardware and every < 512 GiB machine,
-            // so the large body of code that assumes it stays correct;
-            // only genuine high RAM takes the offset path.
-            if direct_map_live() && self.0 >= LOW_IDENTITY_LIMIT {
+            // EVERY frame takes the direct-map offset once the map is
+            // live -- not just those above LOW_IDENTITY_LIMIT.
+            //
+            // This used to be gated on `self.0 >= LOW_IDENTITY_LIMIT` so
+            // that `ptr == phys` held on any machine under 512 GiB, which
+            // let identity-assuming code stay correct. That gate is what
+            // kept PML4[0] pinned to an identity map, and PML4[0] is the
+            // slot an ordinary Linux `ET_EXEC` binary wants to load into
+            // (PT_LOAD at 0x400000). Routing all kernel physical access
+            // through the high-half direct map frees the entire low half
+            // for user space.
+            //
+            // The `direct_map_live()` fallback still yields identity
+            // before `init_mmu` installs the map, which is what early
+            // boot (running on boot.S's identity CR3) needs.
+            if direct_map_live() {
                 (self.0 | KERNEL_DIRECT_MAP_BASE) as *mut T
             } else {
                 self.0 as *mut T
@@ -106,8 +115,8 @@ impl PhysAddr {
     pub fn kernel_ptr<T>(self) -> *const T {
         #[cfg(target_arch = "x86_64")]
         {
-            // See `kernel_mut_ptr`: low frames stay identity-mapped.
-            if direct_map_live() && self.0 >= LOW_IDENTITY_LIMIT {
+            // See `kernel_mut_ptr`: all frames take the offset once live.
+            if direct_map_live() {
                 (self.0 | KERNEL_DIRECT_MAP_BASE) as *const T
             } else {
                 self.0 as *const T

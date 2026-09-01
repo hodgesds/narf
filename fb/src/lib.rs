@@ -792,11 +792,13 @@ impl FbWriter {
                     None => return Err(FbWriteError::OutOfBounds),
                 };
                 // SAFETY: `phys` was just resolved by `phys_at` for this in-bounds
-                // (row, col) offset, so it is a valid identity-mapped address of a
+                // (row, col) offset, so it is a valid direct-mapped address of a
                 // kernel-allocated shmem frame we own; the 4-byte u32 read is within
                 // that frame and naturally aligned (offset is a multiple of 4).
                 // SAFETY: Valid memory or trusted environment
-                let pix = unsafe { core::ptr::read_volatile(phys as *const u32) };
+                let pix = unsafe {
+                    core::ptr::read_volatile(narf_memory::PhysAddr::new(phys).kernel_ptr::<u32>())
+                };
                 fb.draw_pixel(clipped.x + col, clipped.y + row, Pixel32(pix));
             }
         }

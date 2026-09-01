@@ -245,7 +245,7 @@ impl Ring {
 
     /// Physical address of descriptor 0.
     pub fn desc_phys(&self) -> u64 {
-        self.desc_mem.phys_addr().as_u64()
+        self.desc_mem.dma_addr().raw()
     }
 
     /// Current host write index (CPU pointer).
@@ -394,11 +394,7 @@ pub fn alloc_rx_ring(q_idx: u8, depth: usize, buf_len: usize) -> Result<Ring, Dm
     // Collect the buffer phys-addresses first to avoid simultaneously
     // borrowing `ring.buffers` (immutable) and `ring` (mutable via
     // `descriptors_mut`).
-    let phys_addrs: Vec<u64> = ring
-        .buffers
-        .iter()
-        .map(|b| b.phys_addr().as_u64())
-        .collect();
+    let phys_addrs: Vec<u64> = ring.buffers.iter().map(|b| b.dma_addr().raw()).collect();
     {
         let descs = ring.descriptors_mut();
         let buf_len_capped =

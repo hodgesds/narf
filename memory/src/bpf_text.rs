@@ -360,7 +360,7 @@ unsafe fn reserve_slot_x86(root: PhysAddr, slot: usize) -> Result<(), TextError>
     use crate::x86_64::paging::{PageTable, PageTableEntry, PtFlags};
 
     // SAFETY: caller guarantees `root` is a live, identity-reachable PML4.
-    let pml4 = unsafe { &mut *root.as_mut_ptr::<PageTable>() };
+    let pml4 = unsafe { &mut *root.kernel_mut_ptr::<PageTable>() };
     if pml4.entries[slot].is_present() {
         return Ok(());
     }
@@ -1242,17 +1242,17 @@ unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
         // SAFETY: `root` is live and identity-reachable; every level below it
         // was created by `map_2mb`/`map_4kb` through this same root.
         unsafe {
-            let pml4 = &mut *root.as_mut_ptr::<PageTable>();
+            let pml4 = &mut *root.kernel_mut_ptr::<PageTable>();
             let e = pml4.entries[idx.pml4];
             if !e.is_present() {
                 return Err(TextError::MapFailed);
             }
-            let pdpt = &mut *e.addr().as_mut_ptr::<PageTable>();
+            let pdpt = &mut *e.addr().kernel_mut_ptr::<PageTable>();
             let e = pdpt.entries[idx.pdpt];
             if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
                 return Err(TextError::MapFailed);
             }
-            let pd = &mut *e.addr().as_mut_ptr::<PageTable>();
+            let pd = &mut *e.addr().kernel_mut_ptr::<PageTable>();
             let leaf_slot: &mut PageTableEntry = if huge {
                 &mut pd.entries[idx.pd]
             } else {
@@ -1260,7 +1260,7 @@ unsafe fn seal_mapping(root: PhysAddr, p: &Pack) -> Result<(), TextError> {
                 if !e.is_present() || e.flags().contains(PtFlags::HUGE_PAGE) {
                     return Err(TextError::MapFailed);
                 }
-                let pt = &mut *e.addr().as_mut_ptr::<PageTable>();
+                let pt = &mut *e.addr().kernel_mut_ptr::<PageTable>();
                 &mut pt.entries[idx.pt]
             };
             if !leaf_slot.is_present() {
@@ -1559,7 +1559,7 @@ fn smoke_bpf_text_slots_present_in_active_root() -> TestResult {
     // identity-reachable low RAM.
     let live = unsafe { crate::x86_64::paging::read_cr3() };
     // SAFETY: `live` is the active PML4, identity-reachable.
-    let pml4 = unsafe { &*live.as_ptr::<crate::x86_64::paging::PageTable>() };
+    let pml4 = unsafe { &*live.kernel_ptr::<crate::x86_64::paging::PageTable>() };
     if !pml4.entries[BPF_TEXT_PML4_SLOT].is_present() {
         return TestResult::Fail("BPF text PML4 slot absent from the active root");
     }

@@ -336,10 +336,10 @@ impl VirtioVsockPci {
         // RX pool: pre-post RX_PREPOST × RX_BUF_LEN bytes.
         let rx_pool =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let rx_pool_phys = rx_pool.phys_addr().raw();
+        let rx_pool_phys = rx_pool.dma_addr().raw();
         // SAFETY: page-sized DMA buffer.
         unsafe {
-            core::ptr::write_bytes(rx_pool_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(rx_pool.cpu_mut_ptr::<u8>(), 0, 4096);
         }
         // RX_BUF_LEN × RX_PREPOST = 16 KiB; only one 4 KiB page,
         // so cap RX_PREPOST × RX_BUF_LEN to 4 KiB. Use 16 × 256.
@@ -426,15 +426,18 @@ impl VirtioVsockPci {
         // Stage the packet in a fresh DMA page.
         let buf =
             alloc_coherent(8192, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let phys = buf.phys_addr().raw();
+        let phys = buf.dma_addr().raw();
         let hdr_bytes = hdr.encode();
         // SAFETY: page-sized DMA buffer.
         unsafe {
             for (i, &b) in hdr_bytes.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(buf.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
             for (i, &b) in payload.iter().enumerate() {
-                core::ptr::write_volatile((phys + (VsockHdr::WIRE_SIZE + i) as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    buf.cpu_mut_ptr_at::<u8>((VsockHdr::WIRE_SIZE + i) as u64),
+                    b,
+                );
             }
         }
         let total = (VsockHdr::WIRE_SIZE + payload.len()) as u32;
@@ -491,7 +494,7 @@ impl VirtioVsockPci {
     /// Poll the rx ring and return the next packet, if any.
     /// Re-posts the descriptor for further use.
     pub fn recv(&self) -> Option<(VsockHdr, alloc::vec::Vec<u8>)> {
-        let pool_phys = self.rx_pool.phys_addr().raw();
+        let pool_phys = self.rx_pool.dma_addr().raw();
         let per = (4096u64 / RX_PREPOST as u64) as u32;
         let elem = {
             let mut g = self.rx_queue.lock();
@@ -510,7 +513,8 @@ impl VirtioVsockPci {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, slot) in hdr_buf.iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((pool_phys + slot_off + i as u64) as *const u8);
+                *slot =
+                    core::ptr::read_volatile(self.rx_pool.cpu_ptr_at::<u8>(slot_off + i as u64));
             }
         }
         let hdr = VsockHdr::decode(&hdr_buf)?;
@@ -520,7 +524,10 @@ impl VirtioVsockPci {
         unsafe {
             for (i, slot) in payload.iter_mut().enumerate() {
                 *slot = core::ptr::read_volatile(
-                    (pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64) as *const u8,
+                    narf_memory::PhysAddr::new(
+                        pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64,
+                    )
+                    .kernel_ptr::<u8>(),
                 );
             }
         }
@@ -591,7 +598,7 @@ unsafe fn setup_queue(
     let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
     // SAFETY: identity-mapped MMIO.
     unsafe {
         common.write16(CC_QUEUE_SIZE, qsize);

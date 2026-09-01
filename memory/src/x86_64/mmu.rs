@@ -90,6 +90,23 @@ struct EarlyPageTables {
     /// Demotion of the higher-half kernel window (phys 0..1 GiB) into
     /// 2-MiB leaves, so only the kernel's own text stays executable.
     pd_hi_kernel: PageTable,
+    /// PDPT for the FIRST direct-map chunk (physical [0, 512 GiB) at
+    /// `KERNEL_DIRECT_MAP_BASE`) — i.e. the whole direct map on every
+    /// machine with <= 512 GiB of RAM, which is all of them in practice.
+    ///
+    /// Static, like every other table here, rather than `alloc_frame()`.
+    /// It used to come from the buddy, and the frame's contents were being
+    /// overwritten at runtime: `smoke_direct_map_installed` found PDPT[0]
+    /// holding a 4-KiB table pointer instead of its 1-GiB leaf, while
+    /// PML4[384] still pointed at the original frame. A buddy frame that
+    /// backs live kernel page tables but is not tracked as one is exactly
+    /// the "kernel page table returned to the allocator, handed to a
+    /// driver, memset to zero" failure the teardown code in
+    /// `x86_64/paging.rs` documents. Static storage takes the frame out of
+    /// the allocator's reach entirely.
+    ///
+    /// Chunks >= 1 (only on > 512 GiB machines) still allocate.
+    pdpt_direct_0: PageTable,
 }
 
 const ZERO_ENTRIES: [PageTableEntry; 512] = [PageTableEntry::EMPTY; 512];
@@ -113,6 +130,9 @@ static mut EARLY_PAGE_TABLES: EarlyPageTables = EarlyPageTables {
         entries: ZERO_ENTRIES,
     },
     pd_hi_kernel: PageTable {
+        entries: ZERO_ENTRIES,
+    },
+    pdpt_direct_0: PageTable {
         entries: ZERO_ENTRIES,
     },
 };
@@ -284,17 +304,20 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     let pd_lo_0_addr = PhysAddr::new(pd_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pt_lo_0_addr = PhysAddr::new(pt_lo_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
     let pd_hi_kernel_addr = PhysAddr::new(pd_hi_kernel_virt.wrapping_sub(KERNEL_VIRT_BASE));
+    // SAFETY: single-threaded boot-time access to this static; no concurrent mutation is possible.
+    let pdpt_direct_0_virt = unsafe { core::ptr::addr_of_mut!((*tables_ptr).pdpt_direct_0) } as u64;
+    let pdpt_direct_0_addr = PhysAddr::new(pdpt_direct_0_virt.wrapping_sub(KERNEL_VIRT_BASE));
 
     // These frames came from the allocator and are identity-mapped in
     // the boot.S page tables (the low 1 GiB huge page covers them),
     // so the raw pointer is valid for a 4 KiB write.
-    PageTable::zero_at(pml4_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pdpt_lo_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pdpt_hi_mmio_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pdpt_hi_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pd_lo_0_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pt_lo_0_addr.as_mut_ptr::<PageTable>());
-    PageTable::zero_at(pd_hi_kernel_addr.as_mut_ptr::<PageTable>());
+    PageTable::zero_at(pml4_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_lo_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_hi_mmio_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pdpt_hi_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pd_lo_0_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pt_lo_0_addr.kernel_mut_ptr::<PageTable>());
+    PageTable::zero_at(pd_hi_kernel_addr.kernel_mut_ptr::<PageTable>());
 
     // Step 2: populate.
     //
@@ -319,7 +342,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // RAM above 4 GiB: on a q35 PCI-hole split (QEMU -m ≥ 4G, real
         // 16 GiB laptops) usable RAM is relocated to start at phys
         // 4 GiB, so anything past the boundary was untouchable and a
-        // direct `phys.raw() as *mut T` access would #PF. Blanketing
+        // direct `phys.kernel_mut_ptr::<T>()` access would #PF. Blanketing
         // the low 512 GiB makes every installed frame reachable by an
         // identity (phys == virt) pointer; unpopulated gaps in that
         // range are simply never accessed (the buddy only hands out
@@ -461,14 +484,26 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // per-domain / user PML4 (see x86_64/paging.rs), so the direct map
     // reaches every address space without extra work.
     //
-    // Built ONLY when installed RAM actually exceeds the low identity
-    // map (512 GiB): below that every frame is reachable at `phys ==
-    // virt` and the map is pure overhead, and its mere presence in the
-    // cloned PML4s perturbs the PCID per-domain isolation setup. So on
-    // all real hardware and QEMU up to 512 GiB the kernel runs on the
-    // low identity map alone, exactly as before this feature.
+    // Built UNCONDITIONALLY. It used to be built only when installed RAM
+    // exceeded the low identity map (512 GiB), on the reasoning that below
+    // that every frame is reachable at `phys == virt` so the map is pure
+    // overhead.
+    //
+    // That reasoning holds only while the kernel is willing to spend PML4[0]
+    // on an identity map — and that is what stops NARF running an ordinary
+    // Linux static binary. `gcc -static` emits ET_EXEC with PT_LOAD at
+    // 0x400000, which lands in PML4[0]; with the identity map there, user
+    // VA 0x400000 aliases PHYSICAL 0x400000, kernel memory mapped U=0, and
+    // `load_elf_bytes` has to refuse it. Freeing the low half means the
+    // kernel needs a way to reach physical memory that is not the identity
+    // map, and this is it.
+    //
+    // Making it unconditional is step one: nothing yet depends on it, so a
+    // small-RAM boot simply gains a second, redundant view of RAM. The
+    // switchover (`kernel_ptr` routing through it, then dropping PML4[0])
+    // comes after this is proven present and harmless.
     const CHUNK_BYTES: u64 = 512u64 << 30; // one PML4 slot = 512 GiB
-    let build_direct_map = max_ram_phys > crate::addr::LOW_IDENTITY_LIMIT;
+    let build_direct_map = true;
     if build_direct_map {
         let want_chunks = max_ram_phys.div_ceil(CHUNK_BYTES).max(1);
         let dmap_chunks = want_chunks.min(crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS as u64);
@@ -479,11 +514,17 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             // map for the fill writes below. This alloc only runs on
             // > 512 GiB machines, so a small-RAM boot's frame layout is
             // untouched.
-            let pdpt = crate::frame::alloc_frame()?.start_address();
+            // Chunk 0 uses static storage (see `pdpt_direct_0`); only the
+            // >512 GiB chunks come from the allocator.
+            let pdpt = if chunk == 0 {
+                pdpt_direct_0_addr
+            } else {
+                crate::frame::alloc_frame()?.start_address()
+            };
             // SAFETY: `pdpt` is < 4 GiB, identity-mapped by boot.S, so the
             // raw pointer is valid for a 4 KiB zero + entry writes.
             unsafe {
-                PageTable::zero_at(pdpt.as_mut_ptr::<PageTable>());
+                PageTable::zero_at(pdpt.kernel_mut_ptr::<PageTable>());
                 for gib in 0u64..512 {
                     let phys = PhysAddr::new(chunk * CHUNK_BYTES + (gib << 30));
                     let entry = PageTableEntry::new(phys, flags_1gb);

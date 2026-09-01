@@ -72,7 +72,7 @@ pub unsafe fn parse_raw(raw: &RawBootInfo) -> Result<BootInfo, BootError> {
     // Validate DTB magic only if the bootloader gave us a non-null
     // pointer. Null → treat as "no DTB, use defaults."
     if raw.payload.raw() != 0 {
-        let magic_ptr = raw.payload.raw() as *const u32;
+        let magic_ptr = raw.payload.kernel_ptr::<u32>();
         // SAFETY: `raw.payload` is non-null (checked above) and points into
         // identity-mapped RAM the bootloader handed us; an unaligned 4-byte
         // read of the DTB magic is defined on aarch64.
