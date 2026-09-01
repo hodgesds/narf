@@ -4303,52 +4303,18 @@ fn boot_userspace_init() {
         let _ = narf_scheduler::poll_one_round();
         IN_FLIGHT.store(false, Ordering::Release);
     }
-    // `no_step_pump` skips the nested poll_one_round pump (runs in the idle
-    // wake→dispatch hop) — A/B knob for the redis PING p99 tail.
-    if !narf_boot::args().has_flag("no_step_pump") {
-        narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
-    } else {
-        let _ = writeln!(
-            console::Writer,
-            "  no_step_pump: scheduler step pump SKIPPED"
-        );
-    }
+    // Nested-only: the executor-step pump advances spawned tasks when a
+    // boot-init / syscall sync-wait blocks the executor loop. Registered
+    // nested-only so it does NOT run from `run_until_empty`'s own idle/busy
+    // pump path (where its `poll_one_round` is redundant with the loop and its
+    // cost was the redis PING p99 tail).
+    narf_userspace::handlers::sleep_pumps::register_nested_only(scheduler_step_pump);
 
-    // Drain any RX bytes the platform UART has queued (typed bytes
-    // via `qemu -serial stdio`, or a real serial console on bare
-    // metal) and publish them as `InputEvent::AsciiByte` on the
-    // global input ring so /dev/console reads see them. Bounded
-    // per-tick so a runaway producer can't monopolise the pump.
-    fn serial_input_pump() {
-        // Non-blocking: this backstop fires on every core's every park, so
-        // it must NEVER spin on the shared CONSOLE.lock — under a
-        // thread-dense SMP workload (KDE Plasma) that becomes a
-        // machine-wide thundering herd. IRQ 4 is the primary RX path; a
-        // skipped cycle when the lock is contended is free.
-        for _ in 0..16 {
-            match narf_console::try_read_byte_uncontended() {
-                Some(b) => {
-                    let _ = narf_input::push_global(narf_input::InputEvent::AsciiByte(b));
-                }
-                None => break,
-            }
-        }
-    }
-    // Keep the pump as a defensive backstop — runs whenever a
-    // user task parks in sys_sleep. The IRQ path below is the
-    // primary delivery mechanism; the pump catches anything
-    // that slips past (e.g. on systems where IRQ 4 routing
-    // failed). `no_serial_pump` skips it: the pump's LSR `inb(0x3FD)`
-    // is a userspace PIO VM-exit taking QEMU's BQL on every idle park
-    // (~1/request) — a suspect for the redis PING p99 tail. A/B knob.
-    if !narf_boot::args().has_flag("no_serial_pump") {
-        narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
-    } else {
-        let _ = writeln!(
-            console::Writer,
-            "  no_serial_pump: serial input pump SKIPPED"
-        );
-    }
+    // NOTE: the serial-input sleep-pump backstop was removed. It read the UART
+    // LSR via `inb(0x3FD)` on every idle park — a userspace PIO VM-exit taking
+    // QEMU's BQL, which was the dominant redis PING p99 tail. IRQ 4 (installed
+    // below) is the reliable primary serial-RX path, so the pump backstop is
+    // unnecessary (it existed as a defence against unreliable IRQ4 routing).
 
     // Real IRQ-driven serial RX: install a handler at ISA IRQ 4
     // (COM1's standard line), route the GSI through the IOAPIC,

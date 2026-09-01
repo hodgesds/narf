@@ -3754,7 +3754,10 @@ pub fn run_until_empty() {
             let _ = narf_time::timer_wheel::fire_due(now);
             if now.wrapping_sub(last_pump_cycles) >= pump_interval_cycles {
                 last_pump_cycles = now;
-                sleep_pumps::run();
+                // `run_io`, not `run`: the executor loop is running, so the
+                // nested-only pumps (executor step) are redundant here and their
+                // cost would land in the wake→dispatch hop (redis PING p99 tail).
+                sleep_pumps::run_io();
                 let _ = narf_lib::deferred_wake::drain_and_wake();
             }
             continue;
@@ -3770,8 +3773,10 @@ pub fn run_until_empty() {
             // serial-input drain (push bytes → wake a blocked console
             // reader), and kernel async stepping. Their wakes land in the
             // deferred queue / signal wakers and are picked up by the
-            // drain + the next round.
-            sleep_pumps::run();
+            // drain + the next round. `run_io` excludes the nested-only pumps
+            // (executor step) — redundant here since this IS the executor loop,
+            // and their per-park cost was the redis PING p99 tail.
+            sleep_pumps::run_io();
             // sleep_pumps may itself have stashed wakers (signal
             // wakers, freshly-due wheel slots) — drain them before
             // committing to a halt.
@@ -4637,20 +4642,23 @@ pub mod sleep_pumps {
     const MAX_PUMPS: usize = 8;
     pub type Pump = fn();
 
-    static SLOTS: [AtomicUsize; MAX_PUMPS] = [
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-    ];
+    #[allow(clippy::declare_interior_mutable_const)]
+    const Z: AtomicUsize = AtomicUsize::new(0);
+    /// IO/timer pumps (serial backstop, POSIX/TCP timers, FB drain). Run from
+    /// BOTH the executor's own idle/busy branches (`run_io`) and nested
+    /// sync-waits (`run`).
+    static SLOTS: [AtomicUsize; MAX_PUMPS] = [Z; MAX_PUMPS];
+    /// Pumps that are ONLY useful from a NESTED `run()` — a boot-init / syscall
+    /// sync-wait that blocks the executor loop. The executor-step pump lives
+    /// here: its `poll_one_round()` is REDUNDANT inside `run_until_empty`'s own
+    /// idle branch (the loop already polls) and injecting it there put its cost
+    /// into the wake→dispatch hop (the redis PING p99 tail). Excluded from
+    /// `run_io`, included in `run`.
+    static NESTED_SLOTS: [AtomicUsize; MAX_PUMPS] = [Z; MAX_PUMPS];
 
-    pub fn register(p: Pump) {
+    fn register_in(slots: &[AtomicUsize], p: Pump) {
         let p_addr = p as usize;
-        for slot in SLOTS.iter() {
+        for slot in slots.iter() {
             if slot
                 .compare_exchange(0, p_addr, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
@@ -4661,24 +4669,53 @@ pub mod sleep_pumps {
         panic!("sleep_pumps: registry full ({} slots)", MAX_PUMPS);
     }
 
-    pub fn run() {
-        for slot in SLOTS.iter() {
+    /// Register an IO/timer pump (runs in both the executor loop and nested waits).
+    pub fn register(p: Pump) {
+        register_in(&SLOTS, p);
+    }
+
+    /// Register a pump that runs ONLY from nested `run()` calls, never from the
+    /// executor's own idle/busy pump path — for work that duplicates what the
+    /// executor loop already does (e.g. the executor-step pump).
+    pub fn register_nested_only(p: Pump) {
+        register_in(&NESTED_SLOTS, p);
+    }
+
+    fn run_slots(slots: &[AtomicUsize]) {
+        for slot in slots.iter() {
             let p = slot.load(Ordering::Acquire);
             if p == 0 {
                 return;
             }
-            // SAFETY: slot was populated by `register` with a
-            // valid `Pump` (`fn()`), and the static lifetime is
-            // the kernel's.
-            // SAFETY: Valid memory or trusted environment
+            // SAFETY: slot was populated by `register*` with a valid `Pump`
+            // (`fn()`), and the static lifetime is the kernel's.
             let f: Pump = unsafe { core::mem::transmute(p) };
             f();
         }
     }
 
+    /// Full run: IO/timer pumps + nested-only pumps. Called from nested
+    /// sync-waits (boot-init, blocking syscalls) where the executor loop is
+    /// blocked and cannot advance peers itself.
+    pub fn run() {
+        run_slots(&SLOTS);
+        run_slots(&NESTED_SLOTS);
+    }
+
+    /// IO/timer pumps ONLY — excludes nested-only pumps. Called from
+    /// `run_until_empty`'s own idle/busy branches, where the executor loop is
+    /// already running so the nested-only pumps would be redundant and their
+    /// cost would land in the wake→dispatch hop.
+    pub fn run_io() {
+        run_slots(&SLOTS);
+    }
+
     #[doc(hidden)]
     pub fn __reset_for_test() {
         for slot in SLOTS.iter() {
+            slot.store(0, Ordering::Release);
+        }
+        for slot in NESTED_SLOTS.iter() {
             slot.store(0, Ordering::Release);
         }
     }
