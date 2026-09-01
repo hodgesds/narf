@@ -3920,6 +3920,13 @@ fn run_async_demo() -> ! {
                 );
             }
         }
+        // NO_HZ_IDLE opt-in (`nohz_idle` cmdline flag, default off): let an idle
+        // CPU stop the periodic tick and HLT until a real event. Set before the
+        // executor's first idle so the very first halt is tickless.
+        if narf_boot::args().has_flag("nohz_idle") {
+            narf_time::set_nohz_idle_enabled(true);
+            let _ = writeln!(console::Writer, "  nohz_idle: tickless idle ENABLED");
+        }
     }
 
     // Bring up the HPET timer-wheel pump now that HPET, IDT, and

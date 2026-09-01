@@ -890,9 +890,18 @@ pub fn on_timer_tick() {
         };
         TSC_DEADLINE_NEXT[cpu].store(periodic_next, Ordering::Relaxed);
     }
+    // NO_HZ_IDLE: while this CPU is idle the scheduler clears
+    // PERIODIC_TICK_WANTED, so we DON'T anchor the next deadline to the periodic
+    // tick — we arm only for the next wheel deadline (or, with none, `u64::MAX`
+    // → the floor, effectively "sleep until a device IRQ / reschedule IPI").
+    let periodic_anchor = if narf_time::periodic_tick_wanted(cpu) {
+        periodic_next
+    } else {
+        u64::MAX
+    };
     let target = next_arm_target(
         now,
-        periodic_next,
+        periodic_anchor,
         narf_time::timer_wheel::next_deadline_cycles_try(),
         MIN_DELTA_CYCLES,
     );

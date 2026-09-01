@@ -92,6 +92,48 @@ impl Instant {
     }
 }
 
+/// NO_HZ_IDLE per-CPU "wants the periodic scheduler tick" flag. Shared here
+/// because the scheduler writes it (idle vs dispatch) and the arch timer ISR
+/// reads it every tick. The scheduler clears it when a CPU goes idle so the ISR
+/// stops re-anchoring the TSC-deadline to the periodic tick — the CPU then HLTs
+/// until a real event (device IRQ, reschedule IPI, or an armed wheel deadline),
+/// matching Linux tickless idle. Defaults `true`, so an unmanaged CPU ticks.
+const TICK_MAX_CPUS: usize = narf_lib::percpu::MAX_CPUS;
+static PERIODIC_TICK_WANTED: [core::sync::atomic::AtomicBool; TICK_MAX_CPUS] =
+    [const { core::sync::atomic::AtomicBool::new(true) }; TICK_MAX_CPUS];
+
+/// Scheduler hook: `false` before halting an idle CPU, `true` on task dispatch.
+#[inline]
+pub fn set_periodic_tick_wanted(cpu: usize, wanted: bool) {
+    if cpu < TICK_MAX_CPUS {
+        PERIODIC_TICK_WANTED[cpu].store(wanted, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Arch-timer-ISR read: does `cpu` still want the periodic tick re-armed?
+#[inline]
+pub fn periodic_tick_wanted(cpu: usize) -> bool {
+    cpu >= TICK_MAX_CPUS || PERIODIC_TICK_WANTED[cpu].load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Global NO_HZ_IDLE opt-in (boot parameter `nohz_idle`, default OFF). When off,
+/// the scheduler never suppresses the periodic tick, so behaviour is unchanged
+/// — the tickless idle path is dead code. Set once at boot.
+static NOHZ_IDLE_ENABLED: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Enable tickless idle (called at boot when the `nohz_idle` cmdline flag is set).
+#[inline]
+pub fn set_nohz_idle_enabled(on: bool) {
+    NOHZ_IDLE_ENABLED.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Is tickless idle enabled? Gates the scheduler's periodic-tick suppression.
+#[inline]
+pub fn nohz_idle_enabled() -> bool {
+    NOHZ_IDLE_ENABLED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Read the raw monotonic counter.
 #[inline]
 pub fn now_cycles() -> u64 {

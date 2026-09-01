@@ -3198,6 +3198,16 @@ pub fn run_until_empty() {
             // merely receiving an IRQ or running maintenance does not make a
             // CPU active from a scheduling-policy perspective.
             notify_cpu_active(cpu);
+            // NO_HZ_IDLE (boot opt-in): resuming execution after a tickless idle
+            // — re-enable the periodic preemption tick and re-arm it a slice out,
+            // so a CPU-bound task is still preempted (a cooperative task yields
+            // long before it fires). Only on the idle→run transition, so a busy
+            // run of dispatches doesn't re-arm every round.
+            if narf_time::nohz_idle_enabled() && !narf_time::periodic_tick_wanted(cpu) {
+                narf_time::set_periodic_tick_wanted(cpu, true);
+                let period = narf_time::ns_to_cycles(1_000_000); // 1 ms
+                arm_scheduler_deadline(narf_time::now_cycles().wrapping_add(period));
+            }
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
@@ -3707,6 +3717,15 @@ pub fn run_until_empty() {
             };
             if let Some(deadline) = budget_deadline {
                 arm_scheduler_deadline(deadline);
+            }
+            // NO_HZ_IDLE (boot opt-in): committing to an idle HLT — stop the
+            // periodic tick so `on_timer_tick` stops re-anchoring the TSC
+            // deadline to it. This CPU then HLTs until a real event: a device
+            // IRQ, a reschedule IPI (both reliable, Dekker/CPU_HALTED handshake),
+            // or the wheel/budget deadline just armed above. At most one residual
+            // periodic tick fires (the one already armed) before it goes tickless.
+            if narf_time::nohz_idle_enabled() {
+                narf_time::set_periodic_tick_wanted(cpu, false);
             }
             // We are between task polls and hold no RCU read guard. This halt
             // can be indefinite when the queue contains only parked slots, so
