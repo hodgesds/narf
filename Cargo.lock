@@ -768,6 +768,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "narf-bpf-oom"
+version = "0.0.0"
+dependencies = [
+ "narf-bpf",
+ "narf-bpf-isa",
+ "narf-bpf-structops",
+ "narf-bpf-verifier",
+ "narf-capabilities",
+ "narf-kernel-test",
+ "narf-lib",
+ "narf-memory",
+ "narf-scheduler",
+ "narf-userspace",
+]
+
+[[package]]
 name = "narf-bpf-structops"
 version = "0.0.0"
 dependencies = [
@@ -1719,6 +1735,7 @@ dependencies = [
  "narf-bpf",
  "narf-bpf-idle",
  "narf-bpf-leds",
+ "narf-bpf-oom",
  "narf-bus",
  "narf-console",
  "narf-crypto",
@@ -2234,6 +2251,7 @@ dependencies = [
  "narf-bpf",
  "narf-bpf-idle",
  "narf-bpf-leds",
+ "narf-bpf-oom",
  "narf-bpf-structops",
  "narf-bus",
  "narf-busybox",

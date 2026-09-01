@@ -85,6 +85,44 @@ const XDP_CTX: [narf_bpf_verifier::ArgDesc; 2] = [
     },
 ];
 
+const REGION_CTX_KEY: narf_bpf_verifier::TypeKey = narf_bpf_verifier::TypeKey(
+    narf_bpf_verifier::kfunc::fnv1a32_nonzero("narf_bpf::ctx_region"),
+);
+
+/// The context a *region-ctx* program enters with: `(data, data_end)` over a
+/// read-only structure the hook supplies.
+///
+/// Same `Mem`/`MemEnd` shape [`XDP_CTX`] uses — that pairing is the verifier's
+/// general model of a dynamically-bounded region, not a packet-specific one —
+/// with two differences. The key is its own, so a region-ctx pointer is not
+/// interchangeable with a packet pointer and the XDP adjust intrinsics (which
+/// key packet-bound invalidation on `PtrKind::Ctx` against the packet region)
+/// cannot reach it. And `data` is `READONLY`: a hook context describes kernel
+/// state the program is being asked about, so a store through it is rejected at
+/// verification rather than merely being pointless.
+///
+/// `MAX_CTX_WORDS` is 4 and this shape spends 2 of them, which is the point:
+/// the remaining state lives *inside* the region, so a hook is no longer capped
+/// at four scalars of context.
+pub const REGION_CTX: [narf_bpf_verifier::ArgDesc; 2] = [
+    narf_bpf_verifier::ArgDesc {
+        kind: narf_bpf_verifier::TypeKind::Ptr {
+            kind: narf_bpf_verifier::PtrKind::Mem,
+            key: REGION_CTX_KEY,
+        },
+        domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
+        flags: narf_bpf_verifier::ArgFlags::READONLY,
+    },
+    narf_bpf_verifier::ArgDesc {
+        kind: narf_bpf_verifier::TypeKind::Ptr {
+            kind: narf_bpf_verifier::PtrKind::MemEnd,
+            key: REGION_CTX_KEY,
+        },
+        domain: narf_bpf_verifier::ValidityDomain::NonPreemptible,
+        flags: narf_bpf_verifier::ArgFlags::READONLY,
+    },
+];
+
 /// Why loading failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoadError {
@@ -105,6 +143,8 @@ pub enum LoadError {
     TypedProbeTooLarge,
     /// XDP frames are borrowed only for an atomic classifier callback.
     XdpRequiresAtomic,
+    /// A ctx region is borrowed only for one non-preemptible call.
+    RegionCtxRequiresAtomic,
 }
 
 impl From<CapError> for LoadError {
@@ -184,6 +224,18 @@ pub struct BpfProg {
     uses_xdp_adjust: bool,
     /// Rust-native typed-probe schema, for runtime attach validation.
     typed_probe: Option<TypedProbeLayout>,
+    /// Whether the program was verified against [`REGION_CTX`] — a
+    /// `(data, data_end)` pair over a read-only hook structure — rather than
+    /// four scalars.
+    ///
+    /// Load-time, not a run-time argument, for the same reason `typed_probe` is:
+    /// what the ctx *means* is proved once, against the descriptor the verifier
+    /// saw. It gates the run entries in both directions — a region-ctx program
+    /// refuses [`Self::run_atomic`] (whose caller supplies no region, so every
+    /// bounded read would trap) and a scalar-ctx program refuses
+    /// [`Self::run_atomic_region`] (which would hand it two pointers it was
+    /// verified to treat as plain numbers).
+    region_ctx: bool,
     /// Loads the verifier certified as exact typed-field reads through the
     /// tracing wrapper. The interpreter services these through the live
     /// [`narf_tracing::TypedProbeRef`] rather than as bare dereferences; empty
@@ -344,7 +396,7 @@ impl BpfProg {
     ///
     /// See [`LoadError`].
     pub fn load(cap: &Cap<BpfProgLoad, Grant>, req: LoadRequest) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, LoadMetadata::default(), None)
+        Self::load_with_options(cap, req, None, LoadMetadata::default(), None, false)
     }
 
     /// Verify and load with the compatibility classification of the license
@@ -386,7 +438,7 @@ impl BpfProg {
         req: LoadRequest,
         metadata: LoadMetadata,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, None, metadata, None)
+        Self::load_with_options(cap, req, None, metadata, None, false)
     }
 
     /// Verify and load against the XDP `data` / `data_end` context.
@@ -409,6 +461,7 @@ impl BpfProg {
                 ..LoadMetadata::default()
             },
             None,
+            false,
         )
     }
 
@@ -444,7 +497,34 @@ impl BpfProg {
         req: LoadRequest,
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_with_options(cap, req, arenas, LoadMetadata::default(), None)
+        Self::load_with_options(cap, req, arenas, LoadMetadata::default(), None, false)
+    }
+
+    /// Verify and load a program whose context is a **read-only region** —
+    /// `(data, data_end)` over a structure the hook fills — instead of four
+    /// scalars.
+    ///
+    /// This is what lifts a hook out of the four-word context tuple: the
+    /// program proves `data + off + size <= data_end` and reads fields out of
+    /// the structure, so a hook can describe as much state as it likes without
+    /// `MAX_CTX_WORDS` growing. The region is bound per invocation by
+    /// [`Self::run_atomic_region`]; a program loaded this way cannot be run any
+    /// other way, so there is no path on which its pointers are unbacked.
+    ///
+    /// # Errors
+    ///
+    /// See [`LoadError`]. `RegionCtxRequiresAtomic` if the hook declares a
+    /// sleepable context — a region is borrowed for the duration of one
+    /// non-preemptible call, exactly as a typed probe object and an XDP frame
+    /// are, and nothing keeps it alive across an await.
+    pub fn load_region_ctx(
+        cap: &Cap<BpfProgLoad, Grant>,
+        req: LoadRequest,
+    ) -> Result<Arc<Self>, LoadError> {
+        if req.context != Context::Atomic {
+            return Err(LoadError::RegionCtxRequiresAtomic);
+        }
+        Self::load_with_options(cap, req, None, LoadMetadata::default(), None, true)
     }
 
     /// Verify and load for one Rust-described typed tracing object.
@@ -479,6 +559,7 @@ impl BpfProg {
                 size,
                 fields,
             }),
+            false,
         )
     }
 
@@ -488,6 +569,7 @@ impl BpfProg {
         arenas: Option<Arc<crate::arena::ArenaGroup>>,
         metadata: LoadMetadata,
         typed_probe: Option<TypedProbeLayout>,
+        region_ctx: bool,
     ) -> Result<Arc<Self>, LoadError> {
         cap.check_live()?;
         let xdp = metadata.linux_prog_type == Some(BPF_PROG_TYPE_XDP);
@@ -561,6 +643,8 @@ impl BpfProg {
                 &typed_ctx_storage
             } else if xdp {
                 &XDP_CTX
+            } else if region_ctx {
+                &REGION_CTX
             } else {
                 &CTX_SCALARS
             },
@@ -650,6 +734,7 @@ impl BpfProg {
             context: req.context,
             uses_xdp_adjust,
             typed_probe,
+            region_ctx,
             typed_load_sites,
             initial_fuel: DEFAULT_FUEL,
             stack_bytes,
@@ -688,6 +773,21 @@ impl BpfProg {
     #[must_use]
     pub const fn context(&self) -> Context {
         self.context
+    }
+
+    /// Whether this program was verified against a region ctx
+    /// ([`Self::load_region_ctx`]) rather than four scalars.
+    ///
+    /// A hook that supplies a region must check this before binding a program,
+    /// for the same reason it checks [`Self::context`]: the mismatch is silent
+    /// otherwise. [`Self::run_atomic_region`] returns `None` for a scalar-ctx
+    /// program, and a `None` outcome is indistinguishable from a declined run,
+    /// so the hook would fall back to its default on every call and look
+    /// installed while doing nothing.
+    #[inline]
+    #[must_use]
+    pub const fn is_region_ctx(&self) -> bool {
+        self.region_ctx
     }
 
     /// Stable type key of this program's typed tracing context, if any.
@@ -988,10 +1088,46 @@ impl BpfProg {
         // Only `run_typed_probe` may construct that context; admitting a raw
         // caller here would let it forge the wrapper pointer before the
         // runtime mediator had a chance to validate anything.
-        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
+        // A region-ctx program is refused for the same reason: it was verified
+        // holding `ctx[0]`/`ctx[1]` as a bounded pointer pair, and this entry
+        // has no region to point them at. Running it here would either trap on
+        // every bounded read (interpreted) or dereference whatever the caller
+        // happened to put in those words (native).
+        if self.typed_probe.is_some()
+            || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP)
+            || self.region_ctx
+        {
             return None;
         }
         self.run_atomic_inner(ctx, ctx_len)
+    }
+
+    /// Run a region-ctx program against `region`, the structure it reads its
+    /// context out of.
+    ///
+    /// The counterpart to [`Self::load_region_ctx`]: `data`/`data_end` are the
+    /// bounds of `region`, so the program's proof obligation
+    /// (`data + off + size <= data_end`) is discharged against the real extent
+    /// the caller supplied. Returns `None` for a program that was not verified
+    /// against a region ctx — its `ctx[0]`/`ctx[1]` mean something else — and
+    /// for a declined per-CPU stack claim, as [`Self::run_atomic`] does.
+    ///
+    /// `region` is `&mut` because the interpreter's bounded-access path takes
+    /// the region that way, not because a program may write to it: `REGION_CTX`
+    /// marks `data` `READONLY`, so a store through it fails verification. A
+    /// caller that would rather not expose the original at all can pass a copy
+    /// — which is what `narf-bpf-structops`' generated adapter does.
+    pub fn run_atomic_region(&self, region: &mut [u8]) -> Option<Outcome> {
+        if !self.region_ctx {
+            return None;
+        }
+        let range = region.as_ptr_range();
+        self.run_atomic_inner_with_region(
+            [range.start as u64, range.end as u64, 0, 0],
+            2,
+            Some(region),
+            None,
+        )
     }
 
     /// Run an XDP program against one live, writable packet frame, returning the
@@ -1227,7 +1363,10 @@ impl BpfProg {
         ctx: [u64; MAX_CTX_WORDS],
         ctx_len: usize,
     ) -> Option<Outcome> {
-        if self.typed_probe.is_some() || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP) {
+        if self.typed_probe.is_some()
+            || self.linux_prog_type == Some(BPF_PROG_TYPE_XDP)
+            || self.region_ctx
+        {
             return None;
         }
         // This public differential-test entry point is still an execution

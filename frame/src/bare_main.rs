@@ -2495,6 +2495,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // `narf.kfuncs` entry.
             #[cfg(feature = "bpf-leds")]
             narf_bpf_leds::register_initcalls();
+            // The BPF OOM policy (a struct_ops consumer). Force-link anchor for
+            // its `narf.structops` descriptor + registration of the live
+            // candidate source. The in-tree `narf_userspace::oom` policy keeps
+            // `memory`'s slot until a program set is installed at runtime.
+            #[cfg(feature = "bpf-oom")]
+            narf_bpf_oom::register_initcalls();
             narf_input::register_initcalls();
             narf_drivers_nvme::register_initcalls();
             narf_drivers_virtio::register_initcalls();
