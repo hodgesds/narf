@@ -194,7 +194,7 @@ impl Vmxnet3Nic {
         )
         .map_err(|_| Vmxnet3Error::NoMemory)?;
         // SAFETY: alloc_coherent returns a zeroed identity-mapped page.
-        let shared_ptr = shared.dma_addr().raw() as *mut Vmxnet3DriverShared;
+        let shared_ptr = shared.cpu_mut_ptr::<Vmxnet3DriverShared>();
         // SAFETY: shared_ptr fits an identity-mapped DMA page sized
         // for sizeof::<Vmxnet3DriverShared>().
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -558,7 +558,7 @@ impl Vmxnet3Nic {
         //       cpu_to_le32(~VMXNET3_IC_DISABLE_ALL);
         // Must happen after ACTIVATE_DEV so the device sees the
         // updated intrCtrl on its next shared-memory read.
-        let shared_ptr = self.shared.dma_addr().raw() as *mut Vmxnet3DriverShared;
+        let shared_ptr = self.shared.cpu_mut_ptr::<Vmxnet3DriverShared>();
         // SAFETY: identity-mapped DMA; shared struct lifetime ≥ self.
         unsafe {
             let ctrl = (*shared_ptr).devRead.intrConf.intrCtrl;

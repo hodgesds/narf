@@ -165,7 +165,7 @@ impl VirtioScsiPci {
             alloc_coherent(8192, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
         // SAFETY: page-sized DMA.
         unsafe {
-            core::ptr::write_bytes(pool.dma_addr().raw() as *mut u8, 0, 8192);
+            core::ptr::write_bytes(pool.cpu_mut_ptr::<u8>(), 0, 8192);
         }
 
         Ok(Self {

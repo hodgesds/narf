@@ -492,7 +492,7 @@ impl GfxContext {
         // not garbage.
         // SAFETY: identity-mapped, exclusive owner.
         unsafe {
-            core::ptr::write_volatile(fence_buf.dma_addr().raw() as *mut u64, 0);
+            core::ptr::write_volatile(fence_buf.cpu_mut_ptr::<u64>(), 0);
         }
         Ok(Self {
             ring,
@@ -574,7 +574,7 @@ impl GfxContext {
     pub fn fence_completed(&self, fence: &Fence) -> bool {
         let observed: u32 =
             // SAFETY: identity-mapped DMA backing, exclusive owner.
-            unsafe { core::ptr::read_volatile(self.fence_buf.dma_addr().raw() as *const u32) };
+            unsafe { core::ptr::read_volatile(self.fence_buf.cpu_ptr::<u32>()) };
         (observed as u64) >= fence.seq
     }
 
@@ -592,7 +592,7 @@ impl GfxContext {
     pub fn set_fence_for_test(&self, seq: u32) {
         // SAFETY: identity-mapped DMA backing, exclusive owner.
         unsafe {
-            core::ptr::write_volatile(self.fence_buf.dma_addr().raw() as *mut u32, seq);
+            core::ptr::write_volatile(self.fence_buf.cpu_mut_ptr::<u32>(), seq);
         }
     }
 }

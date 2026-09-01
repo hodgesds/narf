@@ -264,8 +264,8 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     // `i` < 4096 keeps both writes inside their respective page.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
-        let pa = page_a.dma_addr().raw() as *mut u8;
-        let pb = page_b.dma_addr().raw() as *mut u8;
+        let pa = page_a.cpu_mut_ptr::<u8>();
+        let pb = page_b.cpu_mut_ptr::<u8>();
         for i in 0..4096usize {
             core::ptr::write_volatile(pa.add(i), (i as u8).wrapping_add(0x11));
             core::ptr::write_volatile(pb.add(i), (i as u8).wrapping_add(0xC3));
@@ -285,8 +285,8 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
     // exclusively here; every `i` < 4096 keeps both writes in-bounds.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
-        let pa = page_a.dma_addr().raw() as *mut u8;
-        let pb = page_b.dma_addr().raw() as *mut u8;
+        let pa = page_a.cpu_mut_ptr::<u8>();
+        let pb = page_b.cpu_mut_ptr::<u8>();
         for i in 0..4096usize {
             core::ptr::write_volatile(pa.add(i), 0);
             core::ptr::write_volatile(pb.add(i), 0);
@@ -301,8 +301,8 @@ fn smoke_nvme_io_multipage_round_trip() -> TestResult {
         // both reads inside their respective page.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            let pa = page_a.dma_addr().raw() as *const u8;
-            let pb = page_b.dma_addr().raw() as *const u8;
+            let pa = page_a.cpu_ptr::<u8>();
+            let pb = page_b.cpu_ptr::<u8>();
             if core::ptr::read_volatile(pa.add(i)) != (i as u8).wrapping_add(0x11) {
                 return TestResult::Fail("page A read-back mismatch");
             }
@@ -1530,9 +1530,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     // its page, so each is a valid, aligned `u8` to write.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
-        let pa = page_a.dma_addr().raw() as *mut u8;
-        let pb = page_b.dma_addr().raw() as *mut u8;
-        let pc = page_c.dma_addr().raw() as *mut u8;
+        let pa = page_a.cpu_mut_ptr::<u8>();
+        let pb = page_b.cpu_mut_ptr::<u8>();
+        let pc = page_c.cpu_mut_ptr::<u8>();
         for i in 0..4096usize {
             core::ptr::write_volatile(pa.add(i), (i as u8).wrapping_add(0xAA));
             core::ptr::write_volatile(pb.add(i), (i as u8).wrapping_add(0xBB));
@@ -1552,9 +1552,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
     // zero.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
-        let pa = page_a.dma_addr().raw() as *mut u8;
-        let pb = page_b.dma_addr().raw() as *mut u8;
-        let pc = page_c.dma_addr().raw() as *mut u8;
+        let pa = page_a.cpu_mut_ptr::<u8>();
+        let pb = page_b.cpu_mut_ptr::<u8>();
+        let pc = page_c.cpu_mut_ptr::<u8>();
         for i in 0..4096usize {
             core::ptr::write_volatile(pa.add(i), 0);
             core::ptr::write_volatile(pb.add(i), 0);
@@ -1570,9 +1570,9 @@ fn smoke_nvme_prp_list_three_pages() -> TestResult {
         // read back.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            let pa = page_a.dma_addr().raw() as *const u8;
-            let pb = page_b.dma_addr().raw() as *const u8;
-            let pc = page_c.dma_addr().raw() as *const u8;
+            let pa = page_a.cpu_ptr::<u8>();
+            let pb = page_b.cpu_ptr::<u8>();
+            let pc = page_c.cpu_ptr::<u8>();
             if core::ptr::read_volatile(pa.add(i)) != (i as u8).wrapping_add(0xAA) {
                 return TestResult::Fail("page A read-back mismatch (PRP list 3-page)");
             }

@@ -640,7 +640,7 @@ impl VirtioGpuPci {
         // SAFETY: scanout_buf is identity-mapped + sized for w*h*4.
         unsafe {
             Framebuffer::new(
-                self.scanout_buf.dma_addr().raw() as *mut u32,
+                self.scanout_buf.cpu_mut_ptr::<u32>(),
                 self.mode().width,
                 self.mode().height,
                 self.mode().width,
@@ -655,7 +655,7 @@ impl VirtioGpuPci {
         let _gate = ReqGate::acquire(&self.req_gate);
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
-            let p = self.scanout_buf.dma_addr().raw() as *mut u32;
+            let p = self.scanout_buf.cpu_mut_ptr::<u32>();
             let mode = self.mode();
             for i in 0..(mode.width * mode.height) as usize {
                 core::ptr::write_volatile(p.add(i), bgra);
@@ -673,7 +673,7 @@ impl VirtioGpuPci {
         // Magenta background + cyan center square.
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
-            let p = self.scanout_buf.dma_addr().raw() as *mut u32;
+            let p = self.scanout_buf.cpu_mut_ptr::<u32>();
             let mode = self.mode();
             for y in 0..mode.height as usize {
                 for x in 0..mode.width as usize {
@@ -847,7 +847,7 @@ impl VirtioGpuPci {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 request.as_ptr(),
-                self.req_buf.dma_addr().raw() as *mut u8,
+                self.req_buf.cpu_mut_ptr::<u8>(),
                 request.len(),
             );
         }

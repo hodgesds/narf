@@ -1692,7 +1692,10 @@ unsafe fn ahci_lba_ncq(
     let header_w0 = (1u32 << 16) | (if write { 1u32 << 6 } else { 0 }) | 5;
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(slot as *mut u32, header_w0);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(slot).kernel_mut_ptr::<u32>(),
+            header_w0,
+        );
         core::ptr::write_volatile(
             narf_memory::PhysAddr::new(slot + 4).kernel_mut_ptr::<u32>(),
             0,

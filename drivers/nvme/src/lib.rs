@@ -1221,7 +1221,7 @@ impl Controller {
             admin.submit(bar0, sqe)?;
         }
         // Parse: up to 1024 NSIDs, LE u32 each. A zero terminates.
-        let base = buf.dma_addr().raw() as *const u32;
+        let base = buf.cpu_ptr::<u32>();
         let cap = out.len().min(1024);
         let mut n = 0;
         for i in 0..cap {
@@ -1287,7 +1287,7 @@ impl Controller {
             admin.submit(bar0, sqe)?;
         }
         // Read the 4 KiB response into a slice and parse.
-        let base = buf.dma_addr().raw() as *const u8;
+        let base = buf.cpu_ptr::<u8>();
         let mut raw = alloc::vec![0u8; 4096];
         for (i, byte) in raw.iter_mut().enumerate() {
             // SAFETY: `base` is the 4 KiB identity-mapped DMA page just
@@ -1502,7 +1502,7 @@ impl Controller {
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         // SAFETY: identity-mapped DMA buffer; exclusively owned here.
         unsafe {
-            let base = buf.dma_addr().raw() as *mut u8;
+            let base = buf.cpu_mut_ptr::<u8>();
             for (i, &b) in data.iter().enumerate() {
                 core::ptr::write_volatile(base.add(i), b);
             }
@@ -1564,7 +1564,7 @@ impl Controller {
         // Copy DMA buffer into caller's slice.
         // SAFETY: identity-mapped DMA page; buf.len() == al.
         unsafe {
-            let base = dma.dma_addr().raw() as *const u8;
+            let base = dma.cpu_ptr::<u8>();
             for (i, slot) in buf.iter_mut().enumerate() {
                 *slot = core::ptr::read_volatile(base.add(i));
             }
@@ -2000,7 +2000,7 @@ fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeErro
 /// `buf` must be a live coherent DMA buffer sized for
 /// `ADMIN_Q_DEPTH * 64` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
-    let base = buf.dma_addr().raw() as *mut Sqe;
+    let base = buf.cpu_mut_ptr::<Sqe>();
     // SAFETY: caller guarantees buf is page-aligned and large
     // enough; index is bounded.
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -2016,7 +2016,7 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
 /// `buf` must be a live coherent DMA buffer sized for at least
 /// `index + 1` 16-byte CQEs.
 unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
-    let base = buf.dma_addr().raw() as *const Cqe;
+    let base = buf.cpu_ptr::<Cqe>();
     // SAFETY: caller guarantees buf is page-aligned and large enough.
     unsafe { core::ptr::read_volatile(base.add(index as usize)) }
 }
@@ -2028,7 +2028,7 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// `buf` must be a live coherent DMA buffer sized for
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
-    let base = buf.dma_addr().raw() as *const Cqe;
+    let base = buf.cpu_ptr::<Cqe>();
     // responsive_spin_until keeps cursor/FB/serial alive on a slow
     // or stuck controller. 5 s wall-clock budget — NVMe admin
     // commands (IDENTIFY etc.) are sub-millisecond on real hardware;
@@ -2057,7 +2057,7 @@ unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<C
 /// `buf` must point to a 4096-byte coherent DMA buffer the controller
 /// has finished writing to (CQE arrived).
 unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
-    let base = buf.dma_addr().raw() as *const u8;
+    let base = buf.cpu_ptr::<u8>();
     // SAFETY: 4 KiB DMA buffer; we read in-bounds.
     let read_u16 = |off: usize| -> u16 {
         // SAFETY: same buffer.
@@ -2098,7 +2098,7 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
 /// `buf` must be a 4 KiB coherent DMA buffer the controller has
 /// finished writing to (CQE arrived).
 unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
-    let base = buf.dma_addr().raw() as *const u8;
+    let base = buf.cpu_ptr::<u8>();
     // SAFETY: 4 KiB DMA buffer.
     let nsze = unsafe { core::ptr::read_volatile(base as *const u64) };
     // SAFETY: same buffer.
