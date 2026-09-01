@@ -255,9 +255,16 @@ impl VirtioP9Pci {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, &b) in req.iter().enumerate() {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
-            core::ptr::write_bytes(resp_phys as *mut u8, 0, resp_max);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u8>(),
+                0,
+                resp_max,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -321,7 +328,9 @@ impl VirtioP9Pci {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, slot) in out.iter_mut().enumerate().take(n) {
-                *slot = core::ptr::read_volatile((resp_phys + i as u64) as *const u8);
+                *slot = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(resp_phys + i as u64).kernel_ptr::<u8>(),
+                );
             }
         }
         let mut g = self.requestq.lock();

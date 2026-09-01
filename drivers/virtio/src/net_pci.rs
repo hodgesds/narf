@@ -1202,7 +1202,10 @@ impl VirtioNetPci {
         // within the 4 KiB page allocated above.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_volatile(phys as *mut u8, class);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                class,
+            );
             core::ptr::write_volatile((phys + 1) as *mut u8, cmd);
             for (i, b) in payload.iter().enumerate() {
                 core::ptr::write_volatile((phys + 16 + i as u64) as *mut u8, *b);

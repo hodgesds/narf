@@ -396,14 +396,14 @@ unsafe fn read_vtd_caps(base: u64) -> Option<IommuCaps> {
 #[inline]
 unsafe fn read_u64(phys: u64) -> u64 {
     // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe { core::ptr::read_volatile(phys as *const u64) }
+    unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(phys).kernel_ptr::<u64>()) }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn read_u32(phys: u64) -> u32 {
     // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe { core::ptr::read_volatile(phys as *const u32) }
+    unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(phys).kernel_ptr::<u32>()) }
 }
 
 #[cfg(not(target_arch = "x86_64"))]

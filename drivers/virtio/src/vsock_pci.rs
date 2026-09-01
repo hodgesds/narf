@@ -339,7 +339,11 @@ impl VirtioVsockPci {
         let rx_pool_phys = rx_pool.phys_addr().raw();
         // SAFETY: page-sized DMA buffer.
         unsafe {
-            core::ptr::write_bytes(rx_pool_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(rx_pool_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
         // RX_BUF_LEN × RX_PREPOST = 16 KiB; only one 4 KiB page,
         // so cap RX_PREPOST × RX_BUF_LEN to 4 KiB. Use 16 × 256.
@@ -510,7 +514,9 @@ impl VirtioVsockPci {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, slot) in hdr_buf.iter_mut().enumerate() {
-                *slot = core::ptr::read_volatile((pool_phys + slot_off + i as u64) as *const u8);
+                *slot = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(pool_phys + slot_off + i as u64).kernel_ptr::<u8>(),
+                );
             }
         }
         let hdr = VsockHdr::decode(&hdr_buf)?;
@@ -520,7 +526,10 @@ impl VirtioVsockPci {
         unsafe {
             for (i, slot) in payload.iter_mut().enumerate() {
                 *slot = core::ptr::read_volatile(
-                    (pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64) as *const u8,
+                    narf_memory::PhysAddr::new(
+                        pool_phys + slot_off + (VsockHdr::WIRE_SIZE + i) as u64,
+                    )
+                    .kernel_ptr::<u8>(),
                 );
             }
         }

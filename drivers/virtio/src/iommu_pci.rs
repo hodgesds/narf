@@ -526,7 +526,11 @@ impl VirtioIommuPci {
         let pool_phys = pool.phys_addr().raw();
         // SAFETY: page-sized DMA.
         unsafe {
-            core::ptr::write_bytes(pool_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(pool_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
 
         Ok(Self {
@@ -576,12 +580,21 @@ impl VirtioIommuPci {
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             for (i, &b) in req.iter().enumerate() {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
             // Mark the tail slot so a stale 0 can't masquerade as OK.
-            core::ptr::write_volatile(tail_phys as *mut u8, 0xFF);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(tail_phys).kernel_mut_ptr::<u8>(),
+                0xFF,
+            );
             for i in 1..REQ_TAIL_LEN {
-                core::ptr::write_volatile((tail_phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(tail_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    0,
+                );
             }
         }
         let descs = [
@@ -636,7 +649,9 @@ impl VirtioIommuPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(tail_phys as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(tail_phys).kernel_ptr::<u8>())
+        };
         let mut g = self.requestq.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);

@@ -426,7 +426,10 @@ impl Ixgbe {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile((tx_phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(tx_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    0,
+                );
             }
         }
         // SAFETY: identity-mapped MMIO.
@@ -467,7 +470,11 @@ impl Ixgbe {
             };
             // SAFETY: identity-mapped DMA ring page.
             unsafe {
-                core::ptr::write_volatile((rx_ring_phys + (i * 16) as u64) as *mut RxDesc, desc);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
+                        .kernel_mut_ptr::<RxDesc>(),
+                    desc,
+                );
             }
             rx_pool.push(buf);
         }
@@ -555,7 +562,10 @@ impl Ixgbe {
         };
         // SAFETY: identity-mapped DMA ring.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut AdvTxDesc, desc);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDesc>(),
+                desc,
+            );
         }
         let next_tail = (*tail_g + 1) % (TX_RING_LEN as u32);
         compiler_fence(Ordering::SeqCst);
@@ -572,7 +582,7 @@ impl Ixgbe {
         // covers a worst-case Tx-side congestion stall.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u32) } & ADVTXD_STAT_DD != 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u32>()) } & ADVTXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -589,7 +599,9 @@ impl Ixgbe {
         let ring_phys = self.rx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
-        let desc = unsafe { core::ptr::read_volatile(desc_addr as *const RxDesc) };
+        let desc = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<RxDesc>())
+        };
         if desc.status & RXD_STAT_DD == 0 {
             return 0;
         }
@@ -600,7 +612,11 @@ impl Ixgbe {
             // descriptor-published frame address and `i < len <= RX_BUF_LEN`,
             // so the byte read stays within the device-owned buffer.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         let new_desc = RxDesc {
             addr: buf_phys,
@@ -612,7 +628,10 @@ impl Ixgbe {
         };
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut RxDesc, new_desc);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<RxDesc>(),
+                new_desc,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: MMIO.
@@ -630,7 +649,9 @@ impl Ixgbe {
         let ring_phys = self.rx_ring.phys_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
-        let status = unsafe { core::ptr::read_volatile((desc_addr + 12) as *const u8) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>())
+        };
         status & RXD_STAT_DD != 0
     }
 

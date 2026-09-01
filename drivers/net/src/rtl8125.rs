@@ -754,7 +754,11 @@ impl RtlNic {
             };
             // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
             unsafe {
-                core::ptr::write_volatile((rx_ring_phys + (i * 16) as u64) as *mut TxDesc, d);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
+                        .kernel_mut_ptr::<TxDesc>(),
+                    d,
+                );
             }
         }
         // SAFETY: identity-mapped MMIO.
@@ -901,7 +905,9 @@ impl RtlNic {
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring; slot < RING_LEN.
-        let cur_flags = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        let cur_flags = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+        };
         if cur_flags & TXD_OWN != 0 {
             return Err(NicError::TxRingFull);
         }
@@ -936,14 +942,26 @@ impl RtlNic {
         // them first, fence, then publish OWN.
         // SAFETY: identity-mapped DMA ring.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.vlan);
-            core::ptr::write_volatile((desc_addr + 8) as *mut u32, d.addr_lo);
-            core::ptr::write_volatile((desc_addr + 12) as *mut u32, d.addr_hi);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                d.vlan,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 8).kernel_mut_ptr::<u32>(),
+                d.addr_lo,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 12).kernel_mut_ptr::<u32>(),
+                d.addr_hi,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut u32, d.flags_len);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                d.flags_len,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -964,7 +982,7 @@ impl RtlNic {
         // so the FB cursor / serial drain stay alive.
         let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA ring.
-            || unsafe { core::ptr::read_volatile(desc_addr as *const u32) } & TXD_OWN == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>()) } & TXD_OWN == 0,
             narf_time::Deadline::after_ms(250),
         );
         if !owned {
@@ -983,7 +1001,9 @@ impl RtlNic {
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let flags_len = unsafe { core::ptr::read_volatile(desc_addr as *const u32) };
+        let flags_len = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())
+        };
         if flags_len & RXD_OWN_LOCAL != 0 {
             return None;
         }
@@ -1005,7 +1025,11 @@ impl RtlNic {
                 // just filled for this slot; `i < copy_len <= RX_BUF_LEN`, so
                 // `buf_phys + i` stays inside the buffer.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+                out.push(unsafe {
+                    core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    )
+                });
             }
         }
 
@@ -1023,7 +1047,10 @@ impl RtlNic {
         };
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut TxDesc, d);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<TxDesc>(),
+                d,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 

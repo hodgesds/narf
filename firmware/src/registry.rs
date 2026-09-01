@@ -133,6 +133,10 @@ pub(crate) fn view_for<'a>(
         .ok_or(FirmwareError::NotFound)?
         .clone();
     let phys = b.backing.phys_addr().raw();
+    // NOTE: identity, deliberately. `narf-firmware` has no narf-memory
+    // dependency, and blob reads happen during driver probe on the kernel
+    // CR3, where PML4[0] still maps RAM. If firmware is ever fetched from a
+    // user-CR3 context this must take a direct-map pointer from the caller.
     let bytes_ptr = phys as *const u8;
     // SAFETY: the backing is identity-mapped DMA-coherent memory;
     // the `payload_len` was set when the entry was installed and

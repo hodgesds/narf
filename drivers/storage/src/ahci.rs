@@ -626,9 +626,13 @@ impl Ahci {
         // not MMIO, and the ordering that matters is the fence before
         // the CI doorbell below, which publishes these stores before
         // the device can look.
-        // SAFETY: identity-mapped DMA page.
+        // SAFETY: coherent DMA page, reached through the kernel direct map.
         unsafe {
-            core::ptr::write_bytes(base as *mut u8, 0, 0x600 + 512);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+                0,
+                0x600 + 512,
+            );
         }
 
         // Command List entry 0: H[5..0] = FIS length in DWORDs (5
@@ -640,11 +644,21 @@ impl Ahci {
         //
         // CFL = 5 (H2D FIS = 5 DWORDs). Bits[4:0]. R=0, B=0, C=0,
         // RST=0, P=0. PRDT length = 1.
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: coherent DMA page, reached through the kernel direct map.
         unsafe {
-            core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
-            core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-            core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+                (1u32 << 16) | 5,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            // Value stays PHYSICAL — the HBA dereferences it.
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+                cmd_tbl,
+            );
         }
 
         // Command Table:
@@ -660,9 +674,18 @@ impl Ahci {
         //   +3  features (low) = 0
         // SAFETY: same DMA page.
         unsafe {
-            core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-            core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
-            core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xEC);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+                0x27,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+                0x80,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+                0xEC,
+            );
         }
         // PRDT entry 0 at +0x80 of cmd table:
         //   +0x00 u64 data base PA
@@ -671,9 +694,19 @@ impl Ahci {
         let prdt = cmd_tbl + 0x80;
         // SAFETY: same DMA page.
         unsafe {
-            core::ptr::write_volatile(prdt as *mut u64, data_buf);
-            core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-            core::ptr::write_volatile((prdt + 12) as *mut u32, 511);
+            // PRDT data base stays PHYSICAL — the HBA DMAs to it.
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+                data_buf,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+                511,
+            );
         }
 
         // Program port CLB / FB.
@@ -752,7 +785,11 @@ impl Ahci {
         // rather than a per-byte volatile loop — the payload is
         // coherent DMA memory, not MMIO.
         unsafe {
-            core::ptr::copy_nonoverlapping(data_buf as *const u8, out.as_mut_ptr(), 512);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
+                out.as_mut_ptr(),
+                512,
+            );
         }
         // Stop the port.
         // SAFETY: caller-asserted.
@@ -806,7 +843,11 @@ pub unsafe fn ahci_write_lba(
     // cannot overlap the scratch page, and the caller-checked
     // `n_sectors * 512 <= 4096` keeps the copy inside the data area.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x600,
+        );
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
             data_buf as *mut u8,
@@ -1228,7 +1269,11 @@ pub async unsafe fn ahci_write_lba_async(
     // (checked at entry) keeps the copy inside the scratch page, and
     // `data` is a kernel slice that cannot overlap it.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x600,
+        );
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
             data_buf as *mut u8,
@@ -1405,7 +1450,11 @@ unsafe fn ahci_lba_ncq(
     // scratch page, and `data_in` is a kernel slice that cannot
     // overlap it.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x600);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x600,
+        );
         if write {
             core::ptr::copy_nonoverlapping(
                 data_in.as_ptr(),
@@ -1914,7 +1963,7 @@ pub unsafe fn atapi_send_cdb(
         0
     };
     let header_w0: u32 = (prdt_len << 16) | w_bit | (1 << 5) | 5; // A=1, CFL=5
-                                                                  // SAFETY: identity-mapped DMA.
+                                                                  // SAFETY: coherent DMA page, reached through the kernel direct map.
     unsafe {
         core::ptr::write_volatile(cmd_list as *mut u32, header_w0);
         core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);

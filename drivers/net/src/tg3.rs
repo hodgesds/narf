@@ -904,7 +904,11 @@ impl Tg3Nic {
             // stays within that frame. A byte read is naturally aligned, and
             // `read_volatile` forces the chip-written DMA bytes to be observed.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+            out.push(unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            });
         }
 
         // Rearm the slot in place: zero the metadata, restore the

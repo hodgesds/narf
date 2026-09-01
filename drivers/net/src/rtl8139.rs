@@ -293,7 +293,10 @@ impl Rtl8139 {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((buf_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
         // Pad runts to 60 bytes — the chip adds the 4-byte FCS.
@@ -326,9 +329,17 @@ impl Rtl8139 {
         // Each packet starts with a 4-byte header:
         //   +0 u16 status | +2 u16 length (incl. CRC)
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile((ring_phys + off as u64) as *const u16) };
+        let status = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(ring_phys + off as u64).kernel_ptr::<u16>(),
+            )
+        };
         // SAFETY: same.
-        let len = unsafe { core::ptr::read_volatile((ring_phys + (off + 2) as u64) as *const u16) };
+        let len = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(ring_phys + (off + 2) as u64).kernel_ptr::<u16>(),
+            )
+        };
         if status & RX_OK == 0 || len < 4 || len as usize > 1518 + 4 {
             // Poisoned / corrupt — reset the ring.
             // SAFETY: identity-mapped MMIO.
@@ -351,7 +362,9 @@ impl Rtl8139 {
             // by `frame_len`, so `off + 4 + i` stays within the mapped ring.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe {
-                core::ptr::read_volatile((ring_phys + (off + 4 + i) as u64) as *const u8)
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(ring_phys + (off + 4 + i) as u64).kernel_ptr::<u8>(),
+                )
             };
         }
         // Advance: header (4) + payload (len) rounded up to 4 bytes.

@@ -594,7 +594,8 @@ impl Igc {
         // SAFETY: identity-mapped DMA, freshly zeroed.
         unsafe {
             for (i, buf) in rx_buf_pool.iter().enumerate().take(RX_RING_LEN) {
-                let desc = (rx_phys + (i * 16) as u64) as *mut AdvRxDescRead;
+                let desc = narf_memory::PhysAddr::new(rx_phys + (i * 16) as u64)
+                    .kernel_mut_ptr::<AdvRxDescRead>();
                 core::ptr::write_volatile(
                     desc,
                     AdvRxDescRead {
@@ -739,7 +740,10 @@ impl Igc {
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((buf_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
         let mut tail = self.tx_tail.lock();
@@ -751,7 +755,7 @@ impl Igc {
             // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
             unsafe {
                 core::ptr::write_volatile(
-                    desc_addr as *mut AdvTxDataDesc,
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDataDesc>(),
                     AdvTxDataDesc::with_tso(buf_phys, frame.len() as u16, mss),
                 );
             }
@@ -759,12 +763,12 @@ impl Igc {
             // SAFETY: same.
             unsafe {
                 core::ptr::write_volatile(
-                    desc_addr as *mut AdvTxDataDesc,
+                    narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<AdvTxDataDesc>(),
                     AdvTxDataDesc::with_csum(buf_phys, frame.len() as u16),
                 );
             }
         } else {
-            let desc = desc_addr as *mut LegacyTxDesc;
+            let desc = narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<LegacyTxDesc>();
             // SAFETY: identity-mapped DMA, idx < TX_RING_LEN.
             unsafe {
                 core::ptr::write_volatile(
@@ -789,7 +793,7 @@ impl Igc {
         // congestion stall on a single packet.
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile((desc_addr as *const u8).add(12)) } & TXD_STAT_DD != 0,
+            || unsafe { core::ptr::read_volatile((narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u8>()).add(12)) } & TXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
         if !done {
@@ -817,7 +821,8 @@ impl Igc {
         let mut head = self.rx_head.lock();
         let idx = *head as usize;
         let ring_phys = self.rx_ring_buf.phys_addr().raw();
-        let desc_ptr = (ring_phys + (idx * 16) as u64) as *mut AdvRxDescWb;
+        let desc_ptr = narf_memory::PhysAddr::new(ring_phys + (idx * 16) as u64)
+            .kernel_mut_ptr::<AdvRxDescWb>();
         // SAFETY: identity-mapped DMA; idx < RX_RING_LEN.
         let desc = unsafe { core::ptr::read_volatile(desc_ptr) };
         if desc.status_error & ADV_RXD_STAT_DD == 0 {
@@ -830,7 +835,11 @@ impl Igc {
             // RX slot's packet buffer (`rx_buf_pool[idx]`); `i < len` and
             // `len <= FRAME_SIZE` so `buf_phys + i` stays inside the buffer.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         let _ = ADV_RXD_STAT_EOP; // multi-buffer frames land in a follow-up.
                                   // Refill: write the slot in the read form so the chip can

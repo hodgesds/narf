@@ -352,10 +352,17 @@ impl VirtioSoundPci {
         // not MMIO; ordering vs. the device comes from the SeqCst fence
         // before the notify write below.
         unsafe {
-            core::ptr::copy_nonoverlapping(req.as_ptr(), req_phys as *mut u8, req.len());
+            core::ptr::copy_nonoverlapping(
+                req.as_ptr(),
+                narf_memory::PhysAddr::new(req_phys).kernel_mut_ptr::<u8>(),
+                req.len(),
+            );
             // Pre-clear the response slot so we can detect a
             // device that didn't write anything.
-            core::ptr::write_volatile(resp_phys as *mut u32, 0xFFFF_FFFF);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u32>(),
+                0xFFFF_FFFF,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -414,7 +421,9 @@ impl VirtioSoundPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(resp_phys as *const u32) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(resp_phys).kernel_ptr::<u32>())
+        };
         let mut g = self.control_q.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);
@@ -530,11 +539,23 @@ impl VirtioSoundPci {
         // SAFETY: identity-mapped scratch DMA.
         unsafe {
             // virtio_snd_pcm_xfer { u32 stream_id, u32 padding }
-            core::ptr::write_volatile(hdr_phys as *mut u32, 0u32);
-            core::ptr::write_volatile((hdr_phys + 4) as *mut u32, 0u32);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys).kernel_mut_ptr::<u32>(),
+                0u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys + 4).kernel_mut_ptr::<u32>(),
+                0u32,
+            );
             // Pre-clear status to detect non-write-back.
-            core::ptr::write_volatile(status_phys as *mut u32, 0xFFFF_FFFF);
-            core::ptr::write_volatile((status_phys + 4) as *mut u32, 0u32);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys).kernel_mut_ptr::<u32>(),
+                0xFFFF_FFFF,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(status_phys + 4).kernel_mut_ptr::<u32>(),
+                0u32,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -599,7 +620,9 @@ impl VirtioSoundPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let status = unsafe { core::ptr::read_volatile(status_phys as *const u32) };
+        let status = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(status_phys).kernel_ptr::<u32>())
+        };
         let mut g = self.tx_q.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);
@@ -631,7 +654,11 @@ impl VirtioSoundPci {
         // period. Ordering vs. the device comes from the SeqCst fence
         // before the notify write in `play_buffer_phys_locked`.
         unsafe {
-            core::ptr::copy_nonoverlapping(pcm.as_ptr(), payload_phys as *mut u8, pcm.len());
+            core::ptr::copy_nonoverlapping(
+                pcm.as_ptr(),
+                narf_memory::PhysAddr::new(payload_phys).kernel_mut_ptr::<u8>(),
+                pcm.len(),
+            );
         }
         self.play_buffer_phys_locked(params, payload_phys, pcm.len() as u32)
     }

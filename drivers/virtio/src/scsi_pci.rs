@@ -231,15 +231,21 @@ impl VirtioScsiPci {
         unsafe {
             let src = &req as *const _ as *const u8;
             for i in 0..req_size {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, *src.add(i));
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *src.add(i),
+                );
             }
             core::ptr::write_bytes(
-                resp_phys as *mut u8,
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u8>(),
                 0,
                 core::mem::size_of::<VirtioScsiCmdResp>(),
             );
             for (i, &b) in data_out.iter().enumerate() {
-                core::ptr::write_volatile((data_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
 
@@ -321,7 +327,7 @@ impl VirtioScsiPci {
         };
         // SAFETY: identity-mapped DMA.
         unsafe {
-            let p = resp_phys as *const u8;
+            let p = narf_memory::PhysAddr::new(resp_phys).kernel_ptr::<u8>();
             resp.sense_len = core::ptr::read_volatile(p.add(0) as *const u32);
             resp.residual = core::ptr::read_volatile(p.add(4) as *const u32);
             resp.status_qualifier = core::ptr::read_volatile(p.add(8) as *const u16);
@@ -338,7 +344,9 @@ impl VirtioScsiPci {
         // SAFETY: same.
         unsafe {
             for (i, slot) in data_in.iter_mut().enumerate().take(data_in_len as usize) {
-                *slot = core::ptr::read_volatile((data_phys + i as u64) as *const u8);
+                *slot = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_ptr::<u8>(),
+                );
             }
         }
         let mut g = self.cmdq.lock();
@@ -365,9 +373,15 @@ impl VirtioScsiPci {
         unsafe {
             let src = &req as *const _ as *const u8;
             for i in 0..req_size {
-                core::ptr::write_volatile((req_phys + i as u64) as *mut u8, *src.add(i));
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(req_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *src.add(i),
+                );
             }
-            core::ptr::write_volatile(resp_phys as *mut u8, 0xFF);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u8>(),
+                0xFF,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -420,7 +434,9 @@ impl VirtioScsiPci {
             return Err(VirtioPciError::QueueTooSmall);
         }
         // SAFETY: identity-mapped DMA.
-        let response = unsafe { core::ptr::read_volatile(resp_phys as *const u8) };
+        let response = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(resp_phys).kernel_ptr::<u8>())
+        };
         let mut g = self.ctrlq.lock();
         if let Some(q) = g.as_mut() {
             q.free_chain(head);

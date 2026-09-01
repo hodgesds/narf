@@ -669,7 +669,11 @@ impl ForcedethNic {
             };
             // SAFETY: identity-mapped DMA ring page; i < RING_LEN.
             unsafe {
-                core::ptr::write_volatile((rx_ring_phys + (i * 8) as u64) as *mut Desc, d);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 8) as u64)
+                        .kernel_mut_ptr::<Desc>(),
+                    d,
+                );
             }
         }
 
@@ -739,7 +743,9 @@ impl ForcedethNic {
         let desc_addr = ring_phys + (slot * 8) as u64;
 
         // SAFETY: identity-mapped DMA ring page.
-        let cur = unsafe { core::ptr::read_volatile((desc_addr + 4) as *const u32) };
+        let cur = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 4).kernel_ptr::<u32>())
+        };
         if cur & TXD_VALID != 0 {
             return Err(NicError::TxRingFull);
         }
@@ -760,12 +766,18 @@ impl ForcedethNic {
         // sees VALID set only after the buffer pointer has propagated.
         // SAFETY: identity-mapped DMA ring page.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut u32, d.buf);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<u32>(),
+                d.buf,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((desc_addr + 4) as *mut u32, d.flaglen);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr + 4).kernel_mut_ptr::<u32>(),
+                d.flaglen,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -784,7 +796,7 @@ impl ForcedethNic {
         // has been DMA'd to its TX FIFO. 250 ms wall-clock budget.
         let owned = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA ring.
-            || unsafe { core::ptr::read_volatile((desc_addr + 4) as *const u32) } & TXD_VALID == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 4).kernel_ptr::<u32>()) } & TXD_VALID == 0,
             narf_time::Deadline::after_ms(250),
         );
         if !owned {
@@ -803,7 +815,9 @@ impl ForcedethNic {
         let desc_addr = ring_phys + (slot * 8) as u64;
 
         // SAFETY: identity-mapped DMA ring.
-        let flaglen = unsafe { core::ptr::read_volatile((desc_addr + 4) as *const u32) };
+        let flaglen = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 4).kernel_ptr::<u32>())
+        };
         if flaglen & RXD_AVAIL != 0 {
             return None;
         }
@@ -820,7 +834,11 @@ impl ForcedethNic {
                 // <= RX_BUF_LEN`, so `buf_phys + i` stays inside that
                 // buffer and is a valid, aligned `u8` address to read.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                out.push(unsafe { core::ptr::read_volatile((buf_phys + i as u64) as *const u8) });
+                out.push(unsafe {
+                    core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
+                    )
+                });
             }
         }
 
@@ -831,7 +849,10 @@ impl ForcedethNic {
         };
         // SAFETY: identity-mapped DMA ring.
         unsafe {
-            core::ptr::write_volatile(desc_addr as *mut Desc, d);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(desc_addr).kernel_mut_ptr::<Desc>(),
+                d,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 

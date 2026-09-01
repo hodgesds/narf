@@ -2566,7 +2566,11 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         // that cannot overlap the DMA page. Bulk copy rather than a
         // per-byte volatile loop — see `read`.
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, need);
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                need,
+            );
         }
         // Publish the payload before `write_lba` posts the SQE +
         // doorbell that lets the device DMA-read it.

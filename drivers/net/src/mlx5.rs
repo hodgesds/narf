@@ -553,7 +553,10 @@ impl Mlx5Hca {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -566,7 +569,7 @@ impl Mlx5Hca {
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(own_phys).kernel_ptr::<u8>()) } & STATUS_OWN_BIT == 0,
             narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
@@ -580,7 +583,11 @@ impl Mlx5Hca {
             // allocated for this command; `i < CQE_LEN` keeps the byte read
             // within the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         // Sanity check + decode.
         debug_assert!(is_complete(&completed));
@@ -697,7 +704,10 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA cmdq, exclusively owned.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -709,7 +719,7 @@ impl Mlx5Hca {
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(own_phys).kernel_ptr::<u8>()) } & STATUS_OWN_BIT == 0,
             narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
@@ -723,7 +733,11 @@ impl Mlx5Hca {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         debug_assert!(is_complete(&completed));
         let _resp = decode_response(&completed).map_err(Mlx5Error::CmdFailed)?;
@@ -794,7 +808,10 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped cmdq DMA.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile((slot_phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -803,7 +820,7 @@ impl Mlx5Hca {
         let own_phys = slot_phys + CQE_OFF_STATUS_OWN as u64;
         let done = narf_scheduler::responsive_spin_until(
             // SAFETY: identity-mapped DMA.
-            || unsafe { core::ptr::read_volatile(own_phys as *const u8) } & STATUS_OWN_BIT == 0,
+            || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(own_phys).kernel_ptr::<u8>()) } & STATUS_OWN_BIT == 0,
             narf_time::Deadline::after_ms(CMD_DEADLINE_MS),
         );
         if !done {
@@ -815,7 +832,11 @@ impl Mlx5Hca {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((slot_phys + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         debug_assert!(is_complete(&completed));
         decode_response(&completed).map_err(Mlx5Error::CmdFailed)
@@ -1114,7 +1135,7 @@ impl Mlx5Hca {
                 // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
                 // stays within the CQE.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe { core::ptr::read_volatile((cq_phys + off as u64 + i as u64) as *const u8) };
+                unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(cq_phys + off as u64 + i as u64).kernel_ptr::<u8>()) };
         }
         if cqe::is_hw_owned(&bytes) {
             return Ok(None);

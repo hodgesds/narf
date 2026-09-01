@@ -528,7 +528,13 @@ impl VirtioGpuPci {
         let mut out = alloc::vec![0u8; payload_len];
         // SAFETY: the response descriptor covers `resp_buf.len()` bytes and
         // the vector owns exactly `payload_len` writable bytes.
-        unsafe { core::ptr::copy_nonoverlapping(src as *const u8, out.as_mut_ptr(), payload_len) };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src).kernel_ptr::<u8>(),
+                out.as_mut_ptr(),
+                payload_len,
+            )
+        };
         Ok(out)
     }
 
@@ -814,16 +820,35 @@ impl VirtioGpuPci {
         unsafe {
             // ctrl_hdr fields: type, flags, fence_id_lo, fence_id_hi,
             // ctx_id, padding (all little-endian).
-            core::ptr::write_volatile(hdr_phys as *mut u32, cmd);
-            core::ptr::write_volatile((hdr_phys + 4) as *mut u32, 0); // flags
-            core::ptr::write_volatile((hdr_phys + 8) as *mut u64, 0); // fence_id
-            core::ptr::write_volatile((hdr_phys + 16) as *mut u32, 0); // ctx_id
-            core::ptr::write_volatile((hdr_phys + 20) as *mut u32, 0); // padding
-                                                                       // Bulk copy the body — coherent DMA memory, not MMIO, so
-                                                                       // per-byte volatile buys nothing (see the virtio-blk DMA
-                                                                       // copy fix). Ordering vs. the device is provided by the
-                                                                       // SeqCst fence before the notify write in `submit`.
-            core::ptr::copy_nonoverlapping(body.as_ptr(), (hdr_phys + 24) as *mut u8, body.len());
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys).kernel_mut_ptr::<u32>(),
+                cmd,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys + 4).kernel_mut_ptr::<u32>(),
+                0,
+            ); // flags
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys + 8).kernel_mut_ptr::<u64>(),
+                0,
+            ); // fence_id
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys + 16).kernel_mut_ptr::<u32>(),
+                0,
+            ); // ctx_id
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(hdr_phys + 20).kernel_mut_ptr::<u32>(),
+                0,
+            ); // padding
+               // Bulk copy the body — coherent DMA memory, not MMIO, so
+               // per-byte volatile buys nothing (see the virtio-blk DMA
+               // copy fix). Ordering vs. the device is provided by the
+               // SeqCst fence before the notify write in `submit`.
+            core::ptr::copy_nonoverlapping(
+                body.as_ptr(),
+                narf_memory::PhysAddr::new(hdr_phys + 24).kernel_mut_ptr::<u8>(),
+                body.len(),
+            );
         }
     }
 
@@ -848,7 +873,7 @@ impl VirtioGpuPci {
     fn response_type(&self) -> u32 {
         let p = self.resp_buf.phys_addr().raw();
         // SAFETY: resp_buf is 4 KiB.
-        unsafe { core::ptr::read_volatile(p as *const u32) }
+        unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(p).kernel_ptr::<u32>()) }
     }
 
     /// Submit GET_DISPLAY_INFO and parse the response into `out`.
@@ -869,15 +894,25 @@ impl VirtioGpuPci {
         for (i, slot) in out.iter_mut().enumerate().take(MAX_SCANOUTS) {
             let entry = p + HDR_LEN as u64 + (i as u64) * 24;
             // SAFETY: resp_buf is 4 KiB and we never read past 408.
-            let _x = unsafe { core::ptr::read_volatile(entry as *const u32) };
+            let _x = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(entry).kernel_ptr::<u32>())
+            };
             // SAFETY: same.
-            let _y = unsafe { core::ptr::read_volatile((entry + 4) as *const u32) };
+            let _y = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(entry + 4).kernel_ptr::<u32>())
+            };
             // SAFETY: same.
-            let w = unsafe { core::ptr::read_volatile((entry + 8) as *const u32) };
+            let w = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(entry + 8).kernel_ptr::<u32>())
+            };
             // SAFETY: same.
-            let h = unsafe { core::ptr::read_volatile((entry + 12) as *const u32) };
+            let h = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(entry + 12).kernel_ptr::<u32>())
+            };
             // SAFETY: same.
-            let en = unsafe { core::ptr::read_volatile((entry + 16) as *const u32) };
+            let en = unsafe {
+                core::ptr::read_volatile(narf_memory::PhysAddr::new(entry + 16).kernel_ptr::<u32>())
+            };
             *slot = DisplayMode {
                 width: w,
                 height: h,

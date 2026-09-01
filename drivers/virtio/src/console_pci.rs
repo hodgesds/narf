@@ -334,7 +334,11 @@ impl VirtioConsolePci {
         let rx_pool_phys = rx_pool.phys_addr().raw();
         // SAFETY: page-sized DMA buffer.
         unsafe {
-            core::ptr::write_bytes(rx_pool_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(rx_pool_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
 
         let mut rx_q_lock = IrqSafeSpinLock::new(Some(rx_q));
@@ -527,8 +531,9 @@ impl VirtioConsolePci {
             // SAFETY: identity-mapped DMA buffer; offset in-pool.
             unsafe {
                 for i in 0..n {
-                    out[written + i] =
-                        core::ptr::read_volatile((pool_phys + off + i as u64) as *const u8);
+                    out[written + i] = core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(pool_phys + off + i as u64).kernel_ptr::<u8>(),
+                    );
                 }
             }
             written += n;

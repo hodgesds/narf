@@ -784,10 +784,22 @@ impl Xhci {
             let trb_addr = cmd_phys + (i * 16) as u64;
             // SAFETY: identity-mapped DMA, in-page.
             unsafe {
-                core::ptr::write_volatile(trb_addr as *mut u32, 0);
-                core::ptr::write_volatile((trb_addr + 4) as *mut u32, 0);
-                core::ptr::write_volatile((trb_addr + 8) as *mut u32, 0);
-                core::ptr::write_volatile((trb_addr + 12) as *mut u32, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
+                    0,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
+                    0,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
+                    0,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
+                    0,
+                );
             }
         }
         // Re-plant the Link TRB (cycle=0; submit_command toggles
@@ -797,10 +809,22 @@ impl Xhci {
         let cmd_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(cmd_link_addr as *mut u32, cmd_phys as u32);
-            core::ptr::write_volatile((cmd_link_addr + 4) as *mut u32, (cmd_phys >> 32) as u32);
-            core::ptr::write_volatile((cmd_link_addr + 8) as *mut u32, 0);
-            core::ptr::write_volatile((cmd_link_addr + 12) as *mut u32, cmd_link_d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr).kernel_mut_ptr::<u32>(),
+                cmd_phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 4).kernel_mut_ptr::<u32>(),
+                (cmd_phys >> 32) as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 12).kernel_mut_ptr::<u32>(),
+                cmd_link_d3,
+            );
         }
 
         // Drain any queued events — they're stale (controller-reset
@@ -1121,10 +1145,22 @@ impl Xhci {
         let cmd_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
         // SAFETY: identity-mapped DMA, in-page.
         unsafe {
-            core::ptr::write_volatile(cmd_link_addr as *mut u32, cmd_phys as u32);
-            core::ptr::write_volatile((cmd_link_addr + 4) as *mut u32, (cmd_phys >> 32) as u32);
-            core::ptr::write_volatile((cmd_link_addr + 8) as *mut u32, 0);
-            core::ptr::write_volatile((cmd_link_addr + 12) as *mut u32, cmd_link_d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr).kernel_mut_ptr::<u32>(),
+                cmd_phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 4).kernel_mut_ptr::<u32>(),
+                (cmd_phys >> 32) as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_link_addr + 12).kernel_mut_ptr::<u32>(),
+                cmd_link_d3,
+            );
         }
 
         // Optional: allocate scratchpad buffers if MAX_SCRATCHPAD_BUFS
@@ -1161,7 +1197,8 @@ impl Xhci {
                 // SAFETY: identity-mapped DMA.
                 unsafe {
                     core::ptr::write_volatile(
-                        (sb_phys + (i * 8) as u64) as *mut u64,
+                        narf_memory::PhysAddr::new(sb_phys + (i * 8) as u64)
+                            .kernel_mut_ptr::<u64>(),
                         p.phys_addr().raw(),
                     );
                 }
@@ -1170,7 +1207,10 @@ impl Xhci {
             // Plant the scratchpad-buffer-array pointer at DCBAA[0].
             // SAFETY: identity-mapped DCBAA page.
             unsafe {
-                core::ptr::write_volatile(dcbaa_phys as *mut u64, sb_phys);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(dcbaa_phys).kernel_mut_ptr::<u64>(),
+                    sb_phys,
+                );
             }
             Some(sb)
         } else {
@@ -1219,9 +1259,18 @@ impl Xhci {
         // alloc_coherent, exclusive to this driver.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_volatile(erst_phys as *mut u64, er_phys);
-            core::ptr::write_volatile((erst_phys + 8) as *mut u32, ER_SEG_TRBS as u32);
-            core::ptr::write_volatile((erst_phys + 12) as *mut u32, 0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(erst_phys).kernel_mut_ptr::<u64>(),
+                er_phys,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(erst_phys + 8).kernel_mut_ptr::<u32>(),
+                ER_SEG_TRBS as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(erst_phys + 12).kernel_mut_ptr::<u32>(),
+                0,
+            );
         }
 
         // Program interrupter 0: ERSTSZ = 1 (one segment), ERSTBA =
@@ -1398,7 +1447,11 @@ impl Xhci {
             let trb_off = (drained_evs * 16) as u64;
             let er_addr = event_ring.phys_addr().raw() + trb_off;
             // SAFETY: identity-mapped DMA.
-            let d3 = unsafe { core::ptr::read_volatile((er_addr + 12) as *const u32) };
+            let d3 = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(er_addr + 12).kernel_ptr::<u32>(),
+                )
+            };
             if d3 & TRB_CYCLE_BIT == 0 {
                 break;
             }
@@ -1896,7 +1949,10 @@ impl Xhci {
             // planted at init time and don't change.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
+                    link_d3,
+                );
             }
             compiler_fence(Ordering::SeqCst);
             *enq_g = 0;
@@ -1911,14 +1967,26 @@ impl Xhci {
         // half-written TRB.
         // SAFETY: identity-mapped DMA page; trb_off in-range.
         unsafe {
-            core::ptr::write_volatile(trb_addr as *mut u32, dword0);
-            core::ptr::write_volatile((trb_addr + 4) as *mut u32, dword1);
-            core::ptr::write_volatile((trb_addr + 8) as *mut u32, dword2);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
+                dword0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
+                dword1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
+                dword2,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((trb_addr + 12) as *mut u32, dword3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
+                dword3,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         *enq_g += 1;
@@ -1937,16 +2005,24 @@ impl Xhci {
         let trb_off = (*deq_g * 16) as u64;
         let trb_addr = self.event_ring.phys_addr().raw() + trb_off;
         // SAFETY: identity-mapped DMA page; deq in-range.
-        let d3 = unsafe { core::ptr::read_volatile((trb_addr + 12) as *const u32) };
+        let d3 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr + 12).kernel_ptr::<u32>())
+        };
         if (d3 & TRB_CYCLE_BIT) != *ccs_g {
             return None;
         }
         // SAFETY: same.
-        let d0 = unsafe { core::ptr::read_volatile(trb_addr as *const u32) };
+        let d0 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr).kernel_ptr::<u32>())
+        };
         // SAFETY: same.
-        let d1 = unsafe { core::ptr::read_volatile((trb_addr + 4) as *const u32) };
+        let d1 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr + 4).kernel_ptr::<u32>())
+        };
         // SAFETY: same.
-        let d2 = unsafe { core::ptr::read_volatile((trb_addr + 8) as *const u32) };
+        let d2 = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr + 8).kernel_ptr::<u32>())
+        };
         *deq_g += 1;
         if *deq_g >= ER_SEG_TRBS {
             *deq_g = 0;
@@ -2241,13 +2317,22 @@ impl Xhci {
         let ctrl_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
-            core::ptr::write_volatile(ctrl_link_addr as *mut u32, ctrl_tr_phys as u32);
             core::ptr::write_volatile(
-                (ctrl_link_addr + 4) as *mut u32,
+                narf_memory::PhysAddr::new(ctrl_link_addr).kernel_mut_ptr::<u32>(),
+                ctrl_tr_phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ctrl_link_addr + 4).kernel_mut_ptr::<u32>(),
                 (ctrl_tr_phys >> 32) as u32,
             );
-            core::ptr::write_volatile((ctrl_link_addr + 8) as *mut u32, 0);
-            core::ptr::write_volatile((ctrl_link_addr + 12) as *mut u32, ctrl_link_d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ctrl_link_addr + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ctrl_link_addr + 12).kernel_mut_ptr::<u32>(),
+                ctrl_link_d3,
+            );
         }
 
         // Input Control Context (§6.2.5.1):
@@ -2280,9 +2365,21 @@ impl Xhci {
         // but be explicit so a future allocator change can't bite.
         // SAFETY: identity-mapped DMA; 4 KiB contiguous.
         unsafe {
-            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
-            core::ptr::write_bytes(dev_ctx_phys as *mut u8, 0, 4096);
-            core::ptr::write_bytes(ctrl_tr_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(dev_ctx_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(ctrl_tr_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
 
         let cs = self.context_stride();
@@ -2295,7 +2392,10 @@ impl Xhci {
         // Input Control Context — A0 (Slot) + A1 (EP0).
         // SAFETY: identity-mapped DMA; offsets in-page.
         unsafe {
-            core::ptr::write_volatile((input_ctrl + 4) as *mut u32, (1 << 0) | (1 << 1));
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(input_ctrl + 4).kernel_mut_ptr::<u32>(),
+                (1 << 0) | (1 << 1),
+            );
         }
 
         // Slot Context dword0 + dword1 + dword2 (xHCI 1.2 §6.2.2).
@@ -2331,9 +2431,18 @@ impl Xhci {
             | ((topology.tt_think_time as u32 & 0x3) << 16);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
-            core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
-            core::ptr::write_volatile((slot_ctx + 8) as *mut u32, slot_d2);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx).kernel_mut_ptr::<u32>(),
+                slot_d0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
+                slot_d1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 8).kernel_mut_ptr::<u32>(),
+                slot_d2,
+            );
         }
 
         // EP0 Context — Control endpoint, default MaxPacketSize.
@@ -2346,10 +2455,22 @@ impl Xhci {
         let trdp_hi = (ctrl_tr_phys >> 32) as u32;
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((ep0_ctx + 4) as *mut u32, ep0_d1);
-            core::ptr::write_volatile((ep0_ctx + 8) as *mut u32, trdp_lo);
-            core::ptr::write_volatile((ep0_ctx + 12) as *mut u32, trdp_hi);
-            core::ptr::write_volatile((ep0_ctx + 16) as *mut u32, 8u32); // Avg TRB Len
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ep0_ctx + 4).kernel_mut_ptr::<u32>(),
+                ep0_d1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ep0_ctx + 8).kernel_mut_ptr::<u32>(),
+                trdp_lo,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ep0_ctx + 12).kernel_mut_ptr::<u32>(),
+                trdp_hi,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ep0_ctx + 16).kernel_mut_ptr::<u32>(),
+                8u32,
+            ); // Avg TRB Len
         }
 
         // Plant Device Context phys at DCBAA[slot_id] BEFORE issuing
@@ -2364,7 +2485,8 @@ impl Xhci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             core::ptr::write_volatile(
-                (dcbaa_phys + (slot_id as u64) * 8) as *mut u64,
+                narf_memory::PhysAddr::new(dcbaa_phys + (slot_id as u64) * 8)
+                    .kernel_mut_ptr::<u64>(),
                 dev_ctx_phys,
             );
         }
@@ -2476,7 +2598,11 @@ impl Xhci {
         let input_phys = input.phys_addr().raw();
         // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
         unsafe {
-            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
         let cs = self.context_stride();
         let input_ctrl = input_phys;
@@ -2485,7 +2611,10 @@ impl Xhci {
         // Add Slot only (A0=1). Drop mask = 0.
         // SAFETY: identity-mapped, in-page.
         unsafe {
-            core::ptr::write_volatile((input_ctrl + 4) as *mut u32, 1 << 0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(input_ctrl + 4).kernel_mut_ptr::<u32>(),
+                1 << 0,
+            );
         }
 
         let mut slot_d0 = (1u32 << 27) | ((speed as u32) << 20) | (1u32 << 26); // Hub
@@ -2495,8 +2624,14 @@ impl Xhci {
         let slot_d1 = ((port as u32) << 16) | ((num_ports as u32) << 24);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
-            core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx).kernel_mut_ptr::<u32>(),
+                slot_d0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
+                slot_d1,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -2541,7 +2676,11 @@ impl Xhci {
         let input_phys = input.phys_addr().raw();
         // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
         unsafe {
-            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
         let cs = self.context_stride();
         let input_ctrl = input_phys;
@@ -2551,7 +2690,10 @@ impl Xhci {
         // Add EP0 only (A1=1, A0=0). Drop mask = 0.
         // SAFETY: identity-mapped, in-page.
         unsafe {
-            core::ptr::write_volatile((input_ctrl + 4) as *mut u32, 1 << 1);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(input_ctrl + 4).kernel_mut_ptr::<u32>(),
+                1 << 1,
+            );
         }
         // Re-populate Slot Context dword0/1 (Context Entries=1 + Speed
         // + Root Hub Port) so an xHC that snapshots them sees a sane
@@ -2560,8 +2702,14 @@ impl Xhci {
         let slot_d1 = (port as u32) << 16;
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile(slot_ctx as *mut u32, slot_d0);
-            core::ptr::write_volatile((slot_ctx + 4) as *mut u32, slot_d1);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx).kernel_mut_ptr::<u32>(),
+                slot_d0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx + 4).kernel_mut_ptr::<u32>(),
+                slot_d1,
+            );
         }
         // EP0 dword1 with the new MPS. Other EP0 fields (TR Dequeue
         // Pointer, Avg TRB Length) are ignored by Evaluate Context per
@@ -2571,7 +2719,10 @@ impl Xhci {
         let ep0_d1 = (3 << 1) | (4 << 3) | ((new_mps as u32) << 16);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((ep0_ctx + 4) as *mut u32, ep0_d1);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ep0_ctx + 4).kernel_mut_ptr::<u32>(),
+                ep0_d1,
+            );
         }
         compiler_fence(Ordering::SeqCst);
 
@@ -2638,7 +2789,10 @@ impl Xhci {
                 (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (dev.ctrl_pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
-                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
+                    link_d3,
+                );
             }
             compiler_fence(Ordering::SeqCst);
             dev.ctrl_enq = 0;
@@ -2649,14 +2803,26 @@ impl Xhci {
         let d3 = d3_no_cycle | (dev.ctrl_pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
-            core::ptr::write_volatile(trb_addr as *mut u32, d0);
-            core::ptr::write_volatile((trb_addr + 4) as *mut u32, d1);
-            core::ptr::write_volatile((trb_addr + 8) as *mut u32, d2);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
+                d0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
+                d1,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
+                d2,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((trb_addr + 12) as *mut u32, d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
+                d3,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         dev.ctrl_enq += 1;
@@ -2703,7 +2869,11 @@ impl Xhci {
         // response on a short read.
         // SAFETY: identity-mapped DMA page; persistent and 4 KiB.
         unsafe {
-            core::ptr::write_bytes(data_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(data_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
 
         // ── Setup Stage TRB (§6.4.1.2.1) ──────────────────────────
@@ -2788,7 +2958,11 @@ impl Xhci {
             // page; `i < copy ≤ xferred ≤ w_length ≤ 4096` keeps the
             // byte read inside that page, aligned for a `u8`.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe { core::ptr::read_volatile((data_phys + i as u64) as *const u8) };
+            *slot = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         Ok(xferred)
     }
@@ -2826,9 +3000,16 @@ impl Xhci {
         // tail can't leak into a subsequent transfer.
         // SAFETY: identity-mapped DMA page; ≤ 4 KiB.
         unsafe {
-            core::ptr::write_bytes(data_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(data_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
             for (i, b) in data.iter().enumerate() {
-                core::ptr::write_volatile((data_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(data_phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
 
@@ -2977,7 +3158,11 @@ impl Xhci {
         let input_phys = input.phys_addr().raw();
         // SAFETY: identity-mapped DMA; fresh 4 KiB page.
         unsafe {
-            core::ptr::write_bytes(input_phys as *mut u8, 0, 4096);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
+                0,
+                4096,
+            );
         }
 
         // Build per-endpoint state + the Input Control + per-EP
@@ -3009,7 +3194,11 @@ impl Xhci {
             let tr_phys = tr.phys_addr().raw();
             // SAFETY: same.
             unsafe {
-                core::ptr::write_bytes(tr_phys as *mut u8, 0, 4096);
+                core::ptr::write_bytes(
+                    narf_memory::PhysAddr::new(tr_phys).kernel_mut_ptr::<u8>(),
+                    0,
+                    4096,
+                );
             }
             // Plant a Link TRB at slot CTRL_TR_TRBS-1 pointing back
             // to slot 0 with TC=1. Cycle bit starts at 0 (the
@@ -3022,10 +3211,22 @@ impl Xhci {
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC; // TC=1, cycle=0
                                                                       // SAFETY: identity-mapped DMA, offset checked.
             unsafe {
-                core::ptr::write_volatile(link_addr as *mut u32, tr_phys as u32);
-                core::ptr::write_volatile((link_addr + 4) as *mut u32, (tr_phys >> 32) as u32);
-                core::ptr::write_volatile((link_addr + 8) as *mut u32, 0);
-                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr).kernel_mut_ptr::<u32>(),
+                    tr_phys as u32,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 4).kernel_mut_ptr::<u32>(),
+                    (tr_phys >> 32) as u32,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 8).kernel_mut_ptr::<u32>(),
+                    0,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
+                    link_d3,
+                );
             }
             // Persistent per-EP DMA scratch. One page; bulk_in /
             // bulk_out reuse this instead of allocating on every
@@ -3052,10 +3253,22 @@ impl Xhci {
             };
             // SAFETY: identity-mapped DMA; offset in-page.
             unsafe {
-                core::ptr::write_volatile((ep_ctx + 4) as *mut u32, ep_d1);
-                core::ptr::write_volatile((ep_ctx + 8) as *mut u32, trdp_lo);
-                core::ptr::write_volatile((ep_ctx + 12) as *mut u32, trdp_hi);
-                core::ptr::write_volatile((ep_ctx + 16) as *mut u32, avg_trb);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx + 4).kernel_mut_ptr::<u32>(),
+                    ep_d1,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx + 8).kernel_mut_ptr::<u32>(),
+                    trdp_lo,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx + 12).kernel_mut_ptr::<u32>(),
+                    trdp_hi,
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(ep_ctx + 16).kernel_mut_ptr::<u32>(),
+                    avg_trb,
+                );
             }
             new_eps.push(EndpointState {
                 dci,
@@ -3083,7 +3296,9 @@ impl Xhci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let dev_ctx_phys = unsafe {
             let dcbaa_phys = self.dcbaa.phys_addr().raw();
-            core::ptr::read_volatile((dcbaa_phys + (slot_id as u64) * 8) as *const u64)
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(dcbaa_phys + (slot_id as u64) * 8).kernel_ptr::<u64>(),
+            )
         };
         let slot_ctx_off = input_phys + self.context_stride();
         // Copy the full Slot Context (4 dwords; bytes 0..16). The
@@ -3094,19 +3309,32 @@ impl Xhci {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for off in 0..4u64 {
-                let v = core::ptr::read_volatile((dev_ctx_phys + off * 4) as *const u32);
-                core::ptr::write_volatile((slot_ctx_off + off * 4) as *mut u32, v);
+                let v = core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(dev_ctx_phys + off * 4).kernel_ptr::<u32>(),
+                );
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(slot_ctx_off + off * 4).kernel_mut_ptr::<u32>(),
+                    v,
+                );
             }
             // Refresh Context Entries with the new max DCI.
-            let d0 = core::ptr::read_volatile(slot_ctx_off as *const u32);
+            let d0 = core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(slot_ctx_off).kernel_ptr::<u32>(),
+            );
             let new_d0 = (d0 & !(0x1Fu32 << 27)) | (max_dci << 27);
-            core::ptr::write_volatile(slot_ctx_off as *mut u32, new_d0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(slot_ctx_off).kernel_mut_ptr::<u32>(),
+                new_d0,
+            );
         }
 
         // Input Control Context: dword1 = add mask.
         // SAFETY: identity-mapped DMA.
         unsafe {
-            core::ptr::write_volatile((input_phys + 4) as *mut u32, add_mask);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(input_phys + 4).kernel_mut_ptr::<u32>(),
+                add_mask,
+            );
         }
 
         // Issue Configure Endpoint (§6.4.3.5): same TRB shape as
@@ -3181,7 +3409,10 @@ impl Xhci {
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
-                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
+                    link_d3,
+                );
             }
             compiler_fence(Ordering::SeqCst);
             ep.enq = 0;
@@ -3192,14 +3423,26 @@ impl Xhci {
         let d3 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | (ep.pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
-            core::ptr::write_volatile(trb_addr as *mut u32, phys as u32);
-            core::ptr::write_volatile((trb_addr + 4) as *mut u32, (phys >> 32) as u32);
-            core::ptr::write_volatile((trb_addr + 8) as *mut u32, len);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
+                phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
+                (phys >> 32) as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
+                len,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((trb_addr + 12) as *mut u32, d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
+                d3,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         ep.enq += 1;
@@ -3232,7 +3475,10 @@ impl Xhci {
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
-                core::ptr::write_volatile((link_addr + 12) as *mut u32, link_d3);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(link_addr + 12).kernel_mut_ptr::<u32>(),
+                    link_d3,
+                );
             }
             compiler_fence(Ordering::SeqCst);
             ep.enq = 0;
@@ -3250,14 +3496,26 @@ impl Xhci {
         let d3 = (TRB_TYPE_ISOCH << TRB_TYPE_SHIFT) | TRB_IOC | TRB_SIA | (ep.pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
-            core::ptr::write_volatile(trb_addr as *mut u32, phys as u32);
-            core::ptr::write_volatile((trb_addr + 4) as *mut u32, (phys >> 32) as u32);
-            core::ptr::write_volatile((trb_addr + 8) as *mut u32, len);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr).kernel_mut_ptr::<u32>(),
+                phys as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 4).kernel_mut_ptr::<u32>(),
+                (phys >> 32) as u32,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 8).kernel_mut_ptr::<u32>(),
+                len,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         // SAFETY: same.
         unsafe {
-            core::ptr::write_volatile((trb_addr + 12) as *mut u32, d3);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(trb_addr + 12).kernel_mut_ptr::<u32>(),
+                d3,
+            );
         }
         compiler_fence(Ordering::SeqCst);
         ep.enq += 1;
@@ -3281,7 +3539,11 @@ impl Xhci {
         let phys = self.ep_dma_phys(slot_id, dci)?;
         // SAFETY: identity-mapped DMA page; size bounded above.
         unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), phys as *mut u8, data.len());
+            core::ptr::copy_nonoverlapping(
+                data.as_ptr(),
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                data.len(),
+            );
         }
         compiler_fence(Ordering::SeqCst);
         self.ep_enqueue_isoch(slot_id, dci, phys, data.len() as u32)?;
@@ -3323,7 +3585,11 @@ impl Xhci {
         // persistent buffer mustn't masquerade as device payload.
         // SAFETY: identity-mapped DMA page; bounds-checked above.
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, out.len());
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                0,
+                out.len(),
+            );
         }
         self.ep_enqueue_isoch(slot_id, dci, phys, out.len() as u32)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
@@ -3349,7 +3615,11 @@ impl Xhci {
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            *slot = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         Ok(xferred)
     }
@@ -3370,7 +3640,11 @@ impl Xhci {
         // upstream `out.len() > 4096` guard.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, out.len());
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                0,
+                out.len(),
+            );
         }
         self.ep_enqueue_normal(slot_id, dci, phys, out.len() as u32)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
@@ -3400,7 +3674,11 @@ impl Xhci {
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            *slot = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         Ok(xferred)
     }
@@ -3422,7 +3700,11 @@ impl Xhci {
         // device data.
         // SAFETY: identity-mapped DMA page; bounds-checked above.
         unsafe {
-            core::ptr::write_bytes(phys as *mut u8, 0, len as usize);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                0,
+                len as usize,
+            );
         }
         self.ep_enqueue_normal(slot_id, dci, phys, len)?;
         self.ring_slot_doorbell(slot_id, dci as u32);
@@ -3494,7 +3776,11 @@ impl Xhci {
             // page; `i < copy ≤ xferred ≤ out.len() ≤ 4096` keeps the
             // read inside that page, aligned for a `u8`.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            *slot = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         // Re-arm for the next report.
         self.arm_interrupt_in(slot_id, dci, out.len() as u32)?;
@@ -3530,7 +3816,10 @@ impl Xhci {
         // SAFETY: identity-mapped DMA page; bounds-checked by guard.
         unsafe {
             for (i, &b) in data.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         self.ep_enqueue_normal(slot_id, dci, phys, data.len() as u32)?;
