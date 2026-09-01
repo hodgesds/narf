@@ -63,6 +63,10 @@ struct ParsedElf {
     segment_count: usize,
     load_start: u64,
     load_end: u64,
+    /// Highest address holding FILE-backed bytes. `[file_backed_end,
+    /// load_end)` is .bss: it must be zero when the kernel starts, but it
+    /// need not be allocated while boot services are live.
+    file_backed_end: u64,
 }
 
 impl ParsedElf {
@@ -169,8 +173,68 @@ fn load_and_start() -> Result<(), LoadError> {
     {
         return Err(LoadError::InvalidElf);
     }
+
+    // Allocate only the FILE-backed prefix, not the whole memsz span.
+    //
+    // The kernel's last segment is mostly .bss — ~35 MB of it on aarch64,
+    // dominated by `perf_event::PENDING_SAMPLES` — and the span therefore
+    // runs to 0x44034ac0. Firmware parks BOOT_SERVICES_DATA at
+    // 0x44000000-0x44020000, inside that span, so an AllocateAddress for the
+    // full range fails and the loader dies with `Allocation` even though RAM
+    // is plentiful. The overshoot is only ~215 KB; the kernel does not
+    // otherwise care.
+    //
+    // .bss does not need to exist while boot services are live — it only has
+    // to be zero when the kernel starts. BOOT_SERVICES_* memory becomes free
+    // for the OS at ExitBootServices, so the tail is claimed implicitly then
+    // and zeroed just before the jump. That is the ordinary bootloader
+    // contract, and it removes the size ceiling entirely rather than buying
+    // headroom that the next 215 KB of growth would eat.
+    let alloc_end = align_up(elf.file_backed_end, PAGE_SIZE).ok_or(LoadError::Arithmetic)?;
+    // The deferred tail must be memory the OS actually owns after
+    // ExitBootServices. Anything else (MMIO, runtime-services, reserved) would
+    // make the post-EBS zeroing corrupt something, so refuse to boot instead.
+    if alloc_end < page_end {
+        let map = boot::memory_map(MemoryType::LOADER_DATA).map_err(|_| LoadError::Allocation)?;
+        let mut covered = alloc_end;
+        while covered < page_end {
+            let Some(descriptor) = map.entries().find(|d| {
+                let end = d
+                    .phys_start
+                    .saturating_add(d.page_count.saturating_mul(PAGE_SIZE));
+                d.phys_start <= covered && covered < end
+            }) else {
+                uefi::println!(
+                    "NARF UEFI loader: .bss tail {:#x}-{:#x} has no memory-map entry at {:#x}",
+                    alloc_end,
+                    page_end,
+                    covered
+                );
+                return Err(LoadError::Allocation);
+            };
+            if !matches!(
+                descriptor.ty,
+                MemoryType::CONVENTIONAL
+                    | MemoryType::BOOT_SERVICES_CODE
+                    | MemoryType::BOOT_SERVICES_DATA
+                    | MemoryType::LOADER_CODE
+                    | MemoryType::LOADER_DATA
+            ) {
+                uefi::println!(
+                    "NARF UEFI loader: .bss tail crosses non-reclaimable {:?} at {:#x}",
+                    descriptor.ty,
+                    covered
+                );
+                return Err(LoadError::Allocation);
+            }
+            covered = descriptor
+                .phys_start
+                .saturating_add(descriptor.page_count.saturating_mul(PAGE_SIZE));
+        }
+    }
+
     let pages =
-        usize::try_from((page_end - page_start) / PAGE_SIZE).map_err(|_| LoadError::Arithmetic)?;
+        usize::try_from((alloc_end - page_start) / PAGE_SIZE).map_err(|_| LoadError::Arithmetic)?;
     let allocation = boot::allocate_pages(
         AllocateType::Address(page_start),
         MemoryType::LOADER_DATA,
@@ -207,18 +271,10 @@ fn load_and_start() -> Result<(), LoadError> {
         let destination =
             unsafe { slice::from_raw_parts_mut(segment.physical as *mut u8, source_len) };
         read_exact_at(&mut kernel, segment.file_offset, destination)?;
-        // ELF requires only the p_memsz - p_filesz tail to be zero. Clearing
-        // that tail after the direct read avoids writing every file-backed
-        // byte twice and leaves alignment holes untouched.
-        // SAFETY: p_filesz <= p_memsz and the complete segment was validated
-        // inside the exclusively allocated physical load range.
-        unsafe {
-            ptr::write_bytes(
-                (segment.physical + segment.file_size) as *mut u8,
-                0,
-                zero_len,
-            )
-        };
+        // The p_memsz - p_filesz tail is zeroed AFTER ExitBootServices — see
+        // the allocation comment above. Part of it may still belong to
+        // firmware right now.
+        let _ = zero_len;
     }
 
     drop(kernel);
@@ -228,6 +284,28 @@ fn load_and_start() -> Result<(), LoadError> {
     // loaded pages and the firmware-owned DTB intentionally remain live.
     let memory_map = unsafe { boot::exit_boot_services(None) };
     core::mem::forget(memory_map);
+
+    // Boot services are gone, so every BOOT_SERVICES_* range is now ordinary
+    // free memory owned by us — including the .bss tail deliberately left
+    // outside the allocation above. Zero it now, before the kernel runs.
+    // Validated as reclaimable before EBS; no diagnostics are possible here,
+    // which is exactly why that check happens while console output still
+    // works.
+    for segment in elf.segments() {
+        let zero_len = segment.memory_size - segment.file_size;
+        if zero_len == 0 {
+            continue;
+        }
+        // SAFETY: p_filesz <= p_memsz; the range lies inside the validated
+        // load span, and after ExitBootServices the loader owns all of it.
+        unsafe {
+            ptr::write_bytes(
+                (segment.physical + segment.file_size) as *mut u8,
+                0,
+                zero_len as usize,
+            )
+        };
+    }
 
     // The NARF aarch64 entry follows the Linux boot protocol: x0 is the
     // physical DTB address and execution begins at the ELF entry at EL1.
@@ -287,6 +365,10 @@ fn parse_program_headers(
     let mut segment_count = 0usize;
     let mut load_start = u64::MAX;
     let mut load_end = 0u64;
+    // Highest address that must hold FILE bytes. The tail beyond this is
+    // .bss, which only has to be zero by the time the kernel runs — see
+    // `load_and_start` for why that distinction matters.
+    let mut file_backed_end = 0u64;
     let mut entry_is_executable = false;
     for index in 0..header.program_headers_count {
         let offset = index * PROGRAM_HEADER_SIZE;
@@ -329,6 +411,12 @@ fn parse_program_headers(
         }
         load_start = load_start.min(segment.physical);
         load_end = load_end.max(memory_end);
+        file_backed_end = file_backed_end.max(
+            segment
+                .physical
+                .checked_add(segment.file_size)
+                .ok_or(LoadError::Arithmetic)?,
+        );
         segments[segment_count] = segment;
         segment_count += 1;
     }
@@ -350,6 +438,7 @@ fn parse_program_headers(
         segment_count,
         load_start,
         load_end,
+        file_backed_end,
     })
 }
 
@@ -467,6 +556,23 @@ mod tests {
         bytes[ph + 40..ph + 48].copy_from_slice(&8u64.to_le_bytes());
         bytes[ph + 48..ph + 56].copy_from_slice(&1u64.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn file_backed_end_excludes_the_bss_tail() {
+        // The loader allocates only up to `file_backed_end` and zeroes the
+        // rest after ExitBootServices. If those two ever collapse to the same
+        // value the allocation grows back to the full memsz span and aarch64
+        // UEFI boot fails with `Allocation` again — firmware parks
+        // BOOT_SERVICES_DATA inside that tail.
+        let elf = parse_elf(&valid_elf()).unwrap();
+        // The fixture is p_filesz = 4, p_memsz = 8.
+        assert_eq!(elf.file_backed_end, 0x4008_0000 + 4);
+        assert_eq!(elf.load_end, 0x4008_0000 + 8);
+        assert!(
+            elf.file_backed_end < elf.load_end,
+            "the .bss tail must stay outside the allocated range"
+        );
     }
 
     #[test]
