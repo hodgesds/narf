@@ -232,7 +232,7 @@ impl VirtioBalloonPci {
         // SAFETY: identity-mapped scratch DMA, single-flight per queue.
         unsafe {
             for (i, p) in pfns.iter().enumerate() {
-                core::ptr::write_volatile((phys + (i * 4) as u64) as *mut u32, p.to_le());
+                core::ptr::write_volatile(buf.cpu_mut_ptr_at::<u32>((i * 4) as u64), p.to_le());
             }
         }
         let descs = [VirtqDesc {

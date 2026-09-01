@@ -831,7 +831,7 @@ impl VirtioInputPci {
         event[4..8].copy_from_slice(&value.to_le_bytes());
         // SAFETY: phys + off + 8 ≤ phys + 4096 because slot < 64.
         unsafe {
-            core::ptr::write_volatile((phys + off) as *mut [u8; 8], event);
+            core::ptr::write_volatile(self.led_event_buf.cpu_mut_ptr_at::<[u8; 8]>(off), event);
         }
         let descs = [VirtqDesc {
             addr: phys + off,
@@ -944,7 +944,7 @@ impl VirtioInputPci {
             // know the head index → byte offset.
             let off = (head as u64) * EVENT_SIZE as u64;
             // SAFETY: identity-mapped DMA, 8-byte aligned read.
-            let raw = unsafe { core::ptr::read_volatile((rx_phys + off) as *const [u8; 8]) };
+            let raw = unsafe { self.rx_buf.cpu_ptr_at::<[u8; 8]>(off).read_volatile() };
             let etype = u16::from_le_bytes([raw[0], raw[1]]);
             let code = u16::from_le_bytes([raw[2], raw[3]]);
             let value = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]);

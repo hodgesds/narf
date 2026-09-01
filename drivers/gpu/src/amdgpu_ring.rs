@@ -83,11 +83,10 @@ impl Ring {
             alloc_coherent(RING_BYTES, DomainId::DRIVER_0).map_err(|_| RingError::NoMemory)?;
         // Zero the ring so an unprogrammed engine reads NOPs
         // (PM4 TYPE0 with count 0 = a benign 1-dword no-op).
-        let phys = backing.dma_addr().raw();
         // SAFETY: identity-mapped DMA-coherent page; we own it.
         unsafe {
             for i in 0..RING_SIZE_DW {
-                core::ptr::write_volatile((phys + (i * 4) as u64) as *mut u32, 0);
+                core::ptr::write_volatile(backing.cpu_mut_ptr_at::<u32>((i * 4) as u64), 0);
             }
         }
         Ok(Self {

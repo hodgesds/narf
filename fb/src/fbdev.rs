@@ -173,7 +173,7 @@ impl FileOps for DevFb0 {
                     // in-bounds of the scanout buffer.
                     // SAFETY: Valid memory or trusted environment
                     unsafe {
-                        let src = (info.phys + offset) as *const u8;
+                        let src = narf_memory::PhysAddr::new(info.phys + offset).kernel_ptr::<u8>();
                         core::ptr::copy_nonoverlapping(src, buf.as_mut_ptr(), n);
                     }
                     n
@@ -196,7 +196,8 @@ impl FileOps for DevFb0 {
                     // SAFETY: identity-mapped; in-bounds by construction above.
                     // SAFETY: Valid memory or trusted environment
                     unsafe {
-                        let dst = (info.phys + offset) as *mut u8;
+                        let dst =
+                            narf_memory::PhysAddr::new(info.phys + offset).kernel_mut_ptr::<u8>();
                         core::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n);
                     }
                     fbdev_flush();

@@ -1737,7 +1737,11 @@ fn blit_to_virtio_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32)
         // SAFETY: both buffers are DMA allocations identity-mapped by the
         // x86_64 kernel.  Row bounds are clamped to each buffer's geometry.
         unsafe {
-            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
+                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                row_bytes,
+            );
         }
     }
 
@@ -1802,7 +1806,11 @@ fn blit_to_scanout(src_phys: u64, src_pitch: u32, src_w: u32, src_h: u32) {
         // the allocation bounds (row < dst_h <= src_h, dst_w <= src_w).
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            core::ptr::copy_nonoverlapping(src_row as *const u8, dst_row as *mut u8, row_bytes);
+            core::ptr::copy_nonoverlapping(
+                narf_memory::PhysAddr::new(src_row).kernel_ptr::<u8>(),
+                narf_memory::PhysAddr::new(dst_row).kernel_mut_ptr::<u8>(),
+                row_bytes,
+            );
         }
     }
     // Tell the FB cursor renderer the frame was fully repainted so it drops

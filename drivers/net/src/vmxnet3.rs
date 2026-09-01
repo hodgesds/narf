@@ -249,7 +249,6 @@ impl Vmxnet3Nic {
         //    the device flips its GEN and writes a comp-ring entry.
         //    Stage 2: gen = 1 on every initial slot (per
         //    `VMXNET3_INIT_GEN`).
-        let rx_ring1_pa = rx_ring1.dma_addr().raw();
         for (i, buf) in rx_buffers.iter().enumerate().take(RX_RING_LEN) {
             let buf_pa = buf.dma_addr().raw();
             // len in low 14 bits, btype HEAD (=0), gen=1.
@@ -263,8 +262,9 @@ impl Vmxnet3Nic {
             // SAFETY: identity-mapped DMA page, i < RX_RING_LEN.
             unsafe {
                 core::ptr::write_volatile(
-                    (rx_ring1_pa + (i * core::mem::size_of::<Vmxnet3RxDesc>()) as u64)
-                        as *mut Vmxnet3RxDesc,
+                    rx_ring1.cpu_mut_ptr_at::<Vmxnet3RxDesc>(
+                        (i * core::mem::size_of::<Vmxnet3RxDesc>()) as u64,
+                    ),
                     desc,
                 );
             }
@@ -320,7 +320,7 @@ impl Vmxnet3Nic {
         //    DMA the rings.
         // SAFETY: identity-mapped DMA page sized for both descs.
         unsafe {
-            let txqd = queue_desc_pa as *mut Vmxnet3TxQueueDesc;
+            let txqd = queue_desc.cpu_mut_ptr::<Vmxnet3TxQueueDesc>();
             (*txqd).conf.txRingBasePA = tx_ring.dma_addr().raw().to_le();
             (*txqd).conf.dataRingBasePA = 0;
             (*txqd).conf.compRingBasePA = tx_comp_ring.dma_addr().raw().to_le();
@@ -332,8 +332,9 @@ impl Vmxnet3Nic {
             (*txqd).conf.intrIdx = 0;
             (*txqd).conf.txDataRingDescSize = 0;
 
-            let rxqd = (queue_desc_pa + core::mem::size_of::<Vmxnet3TxQueueDesc>() as u64)
-                as *mut Vmxnet3RxQueueDesc;
+            let rxqd = queue_desc.cpu_mut_ptr_at::<Vmxnet3RxQueueDesc>(core::mem::size_of::<
+                Vmxnet3TxQueueDesc,
+            >() as u64);
             (*rxqd).conf.rxRingBasePA[0] = rx_ring1.dma_addr().raw().to_le();
             (*rxqd).conf.rxRingBasePA[1] = rx_ring2.dma_addr().raw().to_le();
             (*rxqd).conf.compRingBasePA = rx_comp_ring.dma_addr().raw().to_le();

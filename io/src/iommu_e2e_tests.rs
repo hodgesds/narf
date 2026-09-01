@@ -213,11 +213,16 @@ impl FakeDevice {
         let phys = iommu.translate(iova, /*write=*/ false)?;
         // SAFETY: `phys` was returned by our FakeIommu which only stores
         // addresses obtained from `alloc_coherent` → `alloc_frame`.
-        // Those frames are identity-mapped in the kernel address space.
+        // Those frames are reached through the kernel direct map.
         // `out.len()` is caller-bounded to be within one page in all
         // callers below.  The borrow lives only for this function.
         // SAFETY: Valid memory or trusted environment
-        let src = unsafe { core::slice::from_raw_parts(phys as *const u8, out.len()) };
+        let src = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+                out.len(),
+            )
+        };
         out.copy_from_slice(src);
         Ok(())
     }
@@ -229,7 +234,12 @@ impl FakeDevice {
         // SAFETY: same argument as `dma_read`. Unique write is safe because
         // the test holds the only live reference to the backing frame.
         // SAFETY: Valid memory or trusted environment
-        let dst = unsafe { core::slice::from_raw_parts_mut(phys as *mut u8, data.len()) };
+        let dst = unsafe {
+            core::slice::from_raw_parts_mut(
+                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+                data.len(),
+            )
+        };
         dst.copy_from_slice(data);
         Ok(())
     }
@@ -419,7 +429,9 @@ fn iommu_e2e_03_host_writes_visible_to_device() -> TestResult {
     // pointer — models a device that resolves IOVA→phys then offsets within
     // the page.  SAFETY: phys is an allocated frame; offset 4088 < 4096.
     // SAFETY: Valid memory or trusted environment
-    let tail_val = unsafe { core::ptr::read_volatile((phys + 4088) as *const u8) };
+    let tail_val = unsafe {
+        core::ptr::read_volatile(narf_memory::PhysAddr::new(phys + 4088).kernel_ptr::<u8>())
+    };
     if tail_val != PATTERN {
         let _ = iommu.unmap_page(iova);
         free_coherent(buf);
@@ -806,7 +818,9 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     // byte written via `as_mut_slice()[4095] = LAST_SENTINEL` above —
     // so the read is in-bounds and reads an initialized `u8`.
     // SAFETY: Valid memory or trusted environment
-    let last_val = unsafe { core::ptr::read_volatile((last_phys + 4095) as *const u8) };
+    let last_val = unsafe {
+        core::ptr::read_volatile(narf_memory::PhysAddr::new(last_phys + 4095).kernel_ptr::<u8>())
+    };
     if last_val != LAST_SENTINEL {
         for i in 0..N_PAGES {
             let _ = iommu.unmap_page(base_iova + (i as u64) * PAGE_SIZE);
@@ -1161,7 +1175,11 @@ fn iommu_e2e_11_nvme_queue_alloc_through_iommu() -> TestResult {
     let asq = &queues[0];
     // SAFETY: phys is a valid frame; 64 bytes is within the 4 KiB page.
     unsafe {
-        core::ptr::copy_nonoverlapping(SQE.as_ptr(), asq.phys as *mut u8, 64);
+        core::ptr::copy_nonoverlapping(
+            SQE.as_ptr(),
+            narf_memory::PhysAddr::new(asq.phys).kernel_mut_ptr::<u8>(),
+            64,
+        );
     }
 
     let dev = FakeDevice;

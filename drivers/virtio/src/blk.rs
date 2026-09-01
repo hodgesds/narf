@@ -139,12 +139,20 @@ impl DmaPool {
         self.free.set(idx);
     }
 
+    /// CPU-side pointers. These are dereferenced HERE, so they must be
+    /// direct-map; `header_phys`/`status_phys` below are the DEVICE side and
+    /// stay physical. Previously both pairs came off `dma_addr()`, so the
+    /// header/status writes landed at the physical address interpreted as a
+    /// virtual one — which silently worked on a kernel CR3 and, once user
+    /// address spaces stopped carrying the identity map, wrote into user
+    /// memory while the device still read a stale header.
     fn header_ptr(&self, idx: usize) -> *mut VirtioBlkHeader {
-        (self.buf.dma_addr().raw() + (idx * 64) as u64) as *mut _
+        self.buf
+            .cpu_mut_ptr_at::<VirtioBlkHeader>((idx * 64) as u64)
     }
 
     fn status_ptr(&self, idx: usize) -> *mut u8 {
-        (self.buf.dma_addr().raw() + (idx * 64 + 16) as u64) as *mut _
+        self.buf.cpu_mut_ptr_at::<u8>((idx * 64 + 16) as u64)
     }
 
     fn header_phys(&self, idx: usize) -> u64 {

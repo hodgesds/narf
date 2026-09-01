@@ -593,8 +593,9 @@ impl Tg3Nic {
             // bounded by RX_STD_RING_LEN.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                let slot = (rx_ring_phys + (i * core::mem::size_of::<RxBufferDesc>()) as u64)
-                    as *mut RxBufferDesc;
+                let slot = rx_ring.cpu_mut_ptr_at::<RxBufferDesc>(
+                    (i * core::mem::size_of::<RxBufferDesc>()) as u64,
+                );
                 core::ptr::write_volatile(slot, d);
             }
         }
@@ -606,8 +607,9 @@ impl Tg3Nic {
             // bounded by TX_RING_LEN.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                let slot = (tx_ring_phys + (i * core::mem::size_of::<TxBufferDesc>()) as u64)
-                    as *mut TxBufferDesc;
+                let slot = tx_ring.cpu_mut_ptr_at::<TxBufferDesc>(
+                    (i * core::mem::size_of::<TxBufferDesc>()) as u64,
+                );
                 core::ptr::write_volatile(slot, TxBufferDesc::default());
             }
         }
@@ -852,11 +854,11 @@ impl Tg3Nic {
                 vlan_tag: 0,
             }
         };
-        // SAFETY: identity-mapped DMA ring; slot < TX_RING_LEN.
+        // SAFETY: DMA ring via the kernel direct map; slot < TX_RING_LEN.
         unsafe {
-            let p = (self.tx_ring.dma_addr().raw()
-                + (slot * core::mem::size_of::<TxBufferDesc>()) as u64)
-                as *mut TxBufferDesc;
+            let p = self.tx_ring.cpu_mut_ptr_at::<TxBufferDesc>(
+                (slot * core::mem::size_of::<TxBufferDesc>()) as u64,
+            );
             core::ptr::write_volatile(p, d);
         }
         compiler_fence(Ordering::SeqCst);
@@ -876,10 +878,10 @@ impl Tg3Nic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RX_STD_RING_LEN;
-        let ring_phys = self.rx_ring.dma_addr().raw();
-        let desc_ptr = (ring_phys + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
-            as *const RxBufferDesc;
-        // SAFETY: identity-mapped DMA ring; slot < RX_STD_RING_LEN.
+        let desc_ptr = self
+            .rx_ring
+            .cpu_ptr_at::<RxBufferDesc>((slot * core::mem::size_of::<RxBufferDesc>()) as u64);
+        // SAFETY: DMA ring via the kernel direct map; slot < RX_STD_RING_LEN.
         let d = unsafe { core::ptr::read_volatile(desc_ptr) };
 
         // On a fresh pre-arm we wrote `(idx << 16) | RX_BUF_LEN` into
@@ -923,11 +925,11 @@ impl Tg3Nic {
             reserved: 0,
             opaque: slot as u32,
         };
-        // SAFETY: identity-mapped DMA ring.
+        // SAFETY: DMA ring via the kernel direct map.
         unsafe {
-            let p = (self.rx_ring.dma_addr().raw()
-                + (slot * core::mem::size_of::<RxBufferDesc>()) as u64)
-                as *mut RxBufferDesc;
+            let p = self.rx_ring.cpu_mut_ptr_at::<RxBufferDesc>(
+                (slot * core::mem::size_of::<RxBufferDesc>()) as u64,
+            );
             core::ptr::write_volatile(p, rearmed);
         }
         compiler_fence(Ordering::SeqCst);
@@ -943,19 +945,19 @@ impl Tg3Nic {
     /// Used by the FakeMmio round-trip smoke test to verify that
     /// `transmit` produces the descriptor shape the chip expects.
     pub fn read_tx_descriptor(&self, slot: usize) -> TxBufferDesc {
-        let p = (self.tx_ring.dma_addr().raw()
-            + ((slot % TX_RING_LEN) * core::mem::size_of::<TxBufferDesc>()) as u64)
-            as *const TxBufferDesc;
-        // SAFETY: identity-mapped DMA ring; slot bounded by modulo.
+        let p = self.tx_ring.cpu_ptr_at::<TxBufferDesc>(
+            ((slot % TX_RING_LEN) * core::mem::size_of::<TxBufferDesc>()) as u64,
+        );
+        // SAFETY: DMA ring via the kernel direct map; slot bounded by modulo.
         unsafe { core::ptr::read_volatile(p) }
     }
 
     /// Stage 2 introspection: read the RX descriptor at `slot`.
     pub fn read_rx_descriptor(&self, slot: usize) -> RxBufferDesc {
-        let p = (self.rx_ring.dma_addr().raw()
-            + ((slot % RX_STD_RING_LEN) * core::mem::size_of::<RxBufferDesc>()) as u64)
-            as *const RxBufferDesc;
-        // SAFETY: identity-mapped DMA ring.
+        let p = self.rx_ring.cpu_ptr_at::<RxBufferDesc>(
+            ((slot % RX_STD_RING_LEN) * core::mem::size_of::<RxBufferDesc>()) as u64,
+        );
+        // SAFETY: DMA ring via the kernel direct map.
         unsafe { core::ptr::read_volatile(p) }
     }
 

@@ -234,7 +234,11 @@ impl VirtioFsPci {
                     b,
                 );
             }
-            core::ptr::write_bytes(resp_phys as *mut u8, 0, resp_max);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(resp_phys).kernel_mut_ptr::<u8>(),
+                0,
+                resp_max,
+            );
         }
         let descs = [
             VirtqDesc {

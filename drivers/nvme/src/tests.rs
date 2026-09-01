@@ -179,7 +179,10 @@ fn smoke_nvme_io_round_trip() -> TestResult {
     // SAFETY: identity-mapped DMA buffer.
     unsafe {
         for i in 0..512usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8) ^ 0xA5);
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                (i as u8) ^ 0xA5,
+            );
         }
     }
     if ctrl.write_lba(0, 1, &buf).is_err() {
@@ -188,7 +191,10 @@ fn smoke_nvme_io_round_trip() -> TestResult {
     // SAFETY: still our identity-mapped DMA buffer.
     unsafe {
         for i in 0..4096usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                0,
+            );
         }
     }
     if ctrl.read_lba(0, 1, &buf).is_err() {
@@ -198,7 +204,9 @@ fn smoke_nvme_io_round_trip() -> TestResult {
         // SAFETY: `phys` is the 4096-byte identity-mapped DMA buffer the
         // controller just wrote via `read_lba`; `i` < 512 stays in-bounds.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        let v = unsafe {
+            core::ptr::read_volatile((narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>()).add(i))
+        };
         let expected = (i as u8) ^ 0xA5;
         if v != expected {
             return TestResult::Fail("read-back pattern mismatch");
@@ -382,7 +390,10 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     // SAFETY: alloc_coherent returns a live identity-mapped DMA page.
     unsafe {
         for i in 0..512usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8).wrapping_mul(0x37));
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                (i as u8).wrapping_mul(0x37),
+            );
         }
     }
     let write_cap = register_with_cap(buf);
@@ -449,7 +460,10 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
     // SAFETY: same identity-mapped DMA page.
     unsafe {
         for i in 0..4096usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                0,
+            );
         }
     }
 
@@ -474,7 +488,9 @@ fn smoke_nvme_block_device_async_round_trip() -> TestResult {
 
     for i in 0..512usize {
         // SAFETY: same DMA page; bounded read.
-        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        let v = unsafe {
+            core::ptr::read_volatile((narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>()).add(i))
+        };
         let expected = (i as u8).wrapping_mul(0x37);
         if v != expected {
             return TestResult::Fail("async-trait read-back pattern mismatch");
@@ -543,7 +559,10 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     // SAFETY: identity-mapped DMA page.
     unsafe {
         for i in 0..512usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), (i as u8).wrapping_mul(7));
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                (i as u8).wrapping_mul(7),
+            );
         }
     }
     if ctrl
@@ -555,7 +574,10 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
     // SAFETY: same.
     unsafe {
         for i in 0..4096usize {
-            core::ptr::write_volatile((phys as *mut u8).add(i), 0);
+            core::ptr::write_volatile(
+                (narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>()).add(i),
+                0,
+            );
         }
     }
     if ctrl
@@ -569,7 +591,9 @@ fn smoke_nvme_io_msix_irq_driven() -> TestResult {
         // `alloc_coherent`; `i < 512` stays well within the page, so
         // `phys+i` is a valid, aligned `u8` to read back.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let v = unsafe { core::ptr::read_volatile((phys as *const u8).add(i)) };
+        let v = unsafe {
+            core::ptr::read_volatile((narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>()).add(i))
+        };
         if v != (i as u8).wrapping_mul(7) {
             return TestResult::Fail("IRQ-driven read-back pattern mismatch");
         }

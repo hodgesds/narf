@@ -434,7 +434,10 @@ impl VirtioVsockPci {
                 core::ptr::write_volatile(buf.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
             for (i, &b) in payload.iter().enumerate() {
-                core::ptr::write_volatile((phys + (VsockHdr::WIRE_SIZE + i) as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    buf.cpu_mut_ptr_at::<u8>((VsockHdr::WIRE_SIZE + i) as u64),
+                    b,
+                );
             }
         }
         let total = (VsockHdr::WIRE_SIZE + payload.len()) as u32;

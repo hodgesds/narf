@@ -270,7 +270,10 @@ fn smoke_ioremap_direct_round_trip() -> TestResult {
     const SENTINEL: u64 = 0xCAFE_BABE_DEAD_BEEF;
     // SAFETY: identity-mapped low-RAM frame; we own it.
     unsafe {
-        core::ptr::write_volatile(phys as *mut u64, SENTINEL);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u64>(),
+            SENTINEL,
+        );
     }
     compiler_fence(Ordering::SeqCst);
 
