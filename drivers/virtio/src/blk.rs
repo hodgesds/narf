@@ -140,19 +140,19 @@ impl DmaPool {
     }
 
     fn header_ptr(&self, idx: usize) -> *mut VirtioBlkHeader {
-        (self.buf.phys_addr().raw() + (idx * 64) as u64) as *mut _
+        (self.buf.dma_addr().raw() + (idx * 64) as u64) as *mut _
     }
 
     fn status_ptr(&self, idx: usize) -> *mut u8 {
-        (self.buf.phys_addr().raw() + (idx * 64 + 16) as u64) as *mut _
+        (self.buf.dma_addr().raw() + (idx * 64 + 16) as u64) as *mut _
     }
 
     fn header_phys(&self, idx: usize) -> u64 {
-        self.buf.phys_addr().raw() + (idx * 64) as u64
+        self.buf.dma_addr().raw() + (idx * 64) as u64
     }
 
     fn status_phys(&self, idx: usize) -> u64 {
-        self.buf.phys_addr().raw() + (idx * 64 + 16) as u64
+        self.buf.dma_addr().raw() + (idx * 64 + 16) as u64
     }
 }
 
@@ -221,7 +221,7 @@ impl VirtioBlkDevice {
             .write_u32(VirtioMmioDevice::REG_QUEUE_NUM, queue_size as u32);
 
         let q_buf = alloc_coherent(4096, domain).map_err(|_| VirtioError::NoMemory)?;
-        let q_ptr = q_buf.phys_addr().raw();
+        let q_ptr = q_buf.dma_addr().raw();
 
         let layout = VirtqueueLayout::new(queue_size, q_ptr).ok_or(VirtioError::QueueTooLarge)?;
 

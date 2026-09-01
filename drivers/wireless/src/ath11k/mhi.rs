@@ -146,7 +146,7 @@ fn load_amss_firmware(
         .map_err(|_| ProbeError::Bar0MapFailed)?;
     dma_buf.as_mut_slice().copy_from_slice(view.bytes);
 
-    let phys = dma_buf.phys_addr().as_u64();
+    let phys = dma_buf.dma_addr().raw();
     let size = view.bytes.len() as u32;
 
     // Read the BHI offset from BAR0+0x28.

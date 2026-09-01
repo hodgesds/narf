@@ -642,8 +642,8 @@ impl ForcedethNic {
         //    RxRingPhysAddr; on parts with the *_HIGH companion
         //    registers we still write 0 there because DESC_VER_2
         //    descriptors only carry a 32-bit buffer pointer (`buf`).
-        let tx_phys = tx_ring.phys_addr().raw();
-        let rx_phys = rx_ring.phys_addr().raw();
+        let tx_phys = tx_ring.dma_addr().raw();
+        let rx_phys = rx_ring.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TX_RING_PHYS, tx_phys as u32);
@@ -660,9 +660,9 @@ impl ForcedethNic {
         // 8. Prime the RX ring — every slot points at its persistent
         //    pool buffer + carries AVAIL=1 so the chip can DMA into
         //    it on first receive.
-        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let rx_ring_phys = rx_ring.dma_addr().raw();
         for (i, slot) in rx_pool.iter().enumerate().take(RING_LEN) {
-            let buf_phys = slot.phys_addr().raw();
+            let buf_phys = slot.dma_addr().raw();
             let d = Desc {
                 buf: buf_phys as u32,
                 flaglen: RXD_AVAIL | (RX_BUF_LEN as u32 & DESC_LEN_MASK_V2),
@@ -730,19 +730,16 @@ impl ForcedethNic {
 
         let mut head_g = self.tx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked by
         // FrameTooLong guard.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 8) as u64;
 
         // SAFETY: identity-mapped DMA ring page.
@@ -814,7 +811,7 @@ impl ForcedethNic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 8) as u64;
 
         // SAFETY: identity-mapped DMA ring.
@@ -826,7 +823,7 @@ impl ForcedethNic {
         }
 
         let len = (flaglen & DESC_LEN_MASK_V2) as usize;
-        let buf_phys = self.rx_pool[slot].phys_addr().raw();
+        let buf_phys = self.rx_pool[slot].dma_addr().raw();
 
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flaglen & RXD_DESCRIPTOR_VALID != 0 {
@@ -838,9 +835,7 @@ impl ForcedethNic {
                 // buffer and is a valid, aligned `u8` address to read.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe {
-                    core::ptr::read_volatile(
-                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
-                    )
+                    core::ptr::read_volatile(self.rx_pool[slot].cpu_ptr_at::<u8>(i as u64))
                 });
             }
         }

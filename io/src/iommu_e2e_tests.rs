@@ -268,7 +268,7 @@ fn iommu_e2e_01_alloc_and_map() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     if phys == 0 {
         return TestResult::Fail("alloc returned zero phys");
@@ -319,7 +319,7 @@ fn iommu_e2e_02_cap_holds_iova_grant() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     let cap = register_with_cap(buf);
     if !cap.is_live() {
@@ -335,7 +335,7 @@ fn iommu_e2e_02_cap_holds_iova_grant() -> TestResult {
             return TestResult::Fail("resolve_cap returned None");
         }
     };
-    if resolved.phys_addr().raw() != phys {
+    if resolved.dma_addr().raw() != phys {
         drop(resolved);
         unregister(cap);
         return TestResult::Fail("resolved phys doesn't match allocated phys");
@@ -352,7 +352,7 @@ fn iommu_e2e_02_cap_holds_iova_grant() -> TestResult {
     }
 
     // The IOVA is derivable from the cap's backing buffer.
-    if resolved.phys_addr().raw() != phys {
+    if resolved.dma_addr().raw() != phys {
         drop(resolved);
         let _ = iommu.unmap_page(iova);
         unregister(cap);
@@ -386,7 +386,7 @@ fn iommu_e2e_03_host_writes_visible_to_device() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     // CPU writes the pattern through the kernel mapping.
     buf.as_mut_slice()[0..8].fill(PATTERN);
@@ -448,7 +448,7 @@ fn iommu_e2e_04_device_writes_visible_to_host() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     // Confirm buffer is zero-filled on alloc (alloc_with zeroes it).
     if buf.as_slice()[0] != 0 || buf.as_slice()[4095] != 0 {
@@ -506,7 +506,7 @@ fn iommu_e2e_05_cap_revoke_unmaps_iova() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     let cap = register_with_cap(buf);
     let mut iommu = FakeIommu::new();
@@ -572,7 +572,7 @@ fn iommu_e2e_06_stale_iova_traps() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     let cap = register_with_cap(buf);
     let mut iommu = FakeIommu::new();
@@ -638,7 +638,7 @@ fn iommu_e2e_07_realloc_iova_no_alias() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys_a = buf_a.phys_addr().raw();
+    let phys_a = buf_a.dma_addr().raw();
     let cap_a = register_with_cap(buf_a);
 
     let mut iommu = FakeIommu::new();
@@ -662,7 +662,7 @@ fn iommu_e2e_07_realloc_iova_no_alias() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator exhausted on second alloc"),
     };
-    let phys_b = buf_b.phys_addr().raw();
+    let phys_b = buf_b.dma_addr().raw();
     let cap_b = register_with_cap(buf_b);
 
     let iova_b = next_iova();
@@ -747,7 +747,7 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     for (i, buf) in bufs.iter().enumerate() {
         let iova = base_iova + (i as u64) * PAGE_SIZE;
         if iommu
-            .map_page(iova, buf.phys_addr().raw(), IommuPerms::READ)
+            .map_page(iova, buf.dma_addr().raw(), IommuPerms::READ)
             .is_err()
         {
             for j in 0..i {
@@ -797,7 +797,7 @@ fn iommu_e2e_08_scatter_gather_multi_page() -> TestResult {
     // The FakeDevice dma_read resolves only the page base, so we access the
     // last byte via a direct phys read — modelling a device that has already
     // resolved the IOVA to phys and then DMAed to an offset within the page.
-    let last_phys = bufs[N_PAGES - 1].phys_addr().raw();
+    let last_phys = bufs[N_PAGES - 1].dma_addr().raw();
     // SAFETY: `last_phys` is the physical base of a live 4096-byte
     // coherent buffer (`alloc_coherent(4096, ..)` at the top of this
     // test, still owned in `bufs`), and coherent DMA memory is
@@ -860,7 +860,7 @@ fn iommu_e2e_09_dma_direction_enforcement() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys_r = buf_r.phys_addr().raw();
+    let phys_r = buf_r.dma_addr().raw();
 
     let buf_w = match alloc_coherent(4096, DomainId::DRIVER_1) {
         Ok(b) => b,
@@ -869,7 +869,7 @@ fn iommu_e2e_09_dma_direction_enforcement() -> TestResult {
             return TestResult::Skip("frame allocator couldn't provide second page");
         }
     };
-    let phys_w = buf_w.phys_addr().raw();
+    let phys_w = buf_w.dma_addr().raw();
 
     let mut iommu = FakeIommu::new();
     let iova_r = next_iova(); // READ-only mapping (DMA_TO_DEVICE)
@@ -1001,7 +1001,7 @@ fn iommu_e2e_10_concurrent_allocs_no_collision() -> TestResult {
     for _ in 0..N {
         match alloc_coherent(4096, DomainId::DRIVER_0) {
             Ok(b) => {
-                let p = b.phys_addr().raw();
+                let p = b.dma_addr().raw();
                 let iova = next_iova();
 
                 // Physical addresses must all be distinct.
@@ -1116,7 +1116,7 @@ fn iommu_e2e_11_nvme_queue_alloc_through_iommu() -> TestResult {
                 return TestResult::Skip("frame allocator couldn't provide NVMe queue buffers");
             }
         };
-        let phys = buf.phys_addr().raw();
+        let phys = buf.dma_addr().raw();
         let iova = next_iova();
 
         if iommu.map_page(iova, phys, IommuPerms::READ_WRITE).is_err() {
@@ -1221,14 +1221,14 @@ fn iommu_e2e_12_iommu_stats() -> TestResult {
     let iova_a = next_iova();
     let iova_b = next_iova();
 
-    let _ = iommu.map_page(iova_a, buf_a.phys_addr().raw(), IommuPerms::READ_WRITE);
+    let _ = iommu.map_page(iova_a, buf_a.dma_addr().raw(), IommuPerms::READ_WRITE);
     if iommu.nr_mapped != 1 {
         free_coherent(buf_a);
         free_coherent(buf_b);
         return TestResult::Fail("nr_mapped != 1 after first map");
     }
 
-    let _ = iommu.map_page(iova_b, buf_b.phys_addr().raw(), IommuPerms::READ);
+    let _ = iommu.map_page(iova_b, buf_b.dma_addr().raw(), IommuPerms::READ);
     if iommu.nr_mapped != 2 {
         free_coherent(buf_a);
         free_coherent(buf_b);
@@ -1288,7 +1288,7 @@ fn iommu_e2e_13_fault_queue_drain() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Skip("frame allocator unavailable"),
     };
-    let phys = buf.phys_addr().raw();
+    let phys = buf.dma_addr().raw();
 
     let mut iommu = FakeIommu::new();
     let iova = next_iova();
@@ -1312,7 +1312,7 @@ fn iommu_e2e_13_fault_queue_drain() -> TestResult {
             return TestResult::Skip("frame allocator couldn't provide second page");
         }
     };
-    let phys_ro = buf_ro.phys_addr().raw();
+    let phys_ro = buf_ro.dma_addr().raw();
     let _ = iommu.map_page(iova_ro, phys_ro, IommuPerms::READ);
     let _ = dev.dma_write(&mut iommu, iova_ro, &[0xFFu8; 4]); // triggers permission fault
 

@@ -523,14 +523,9 @@ impl VirtioIommuPci {
         // at +0x800.
         let pool =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let pool_phys = pool.phys_addr().raw();
         // SAFETY: page-sized DMA.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(pool_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(pool.cpu_mut_ptr::<u8>(), 0, 4096);
         }
 
         Ok(Self {
@@ -574,7 +569,7 @@ impl VirtioIommuPci {
         if req.is_empty() || req.len() > 0x800 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let pool_phys = self.pool.phys_addr().raw();
+        let pool_phys = self.pool.dma_addr().raw();
         let req_phys = pool_phys;
         let tail_phys = pool_phys + 0x800;
         // SAFETY: identity-mapped DMA buffer.
@@ -741,7 +736,7 @@ unsafe fn setup_queue(
     let qsize = if qsize == 0 { 4 } else { qsize.min(qsize_max) };
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
     // SAFETY: identity-mapped MMIO.
     unsafe {
         common.write16(CC_QUEUE_SIZE, qsize);

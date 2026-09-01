@@ -127,7 +127,7 @@ impl VirtioRngPci {
 
         let q_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let layout = VirtqueueLayout::new(qsize, q_buf.phys_addr().raw())
+        let layout = VirtqueueLayout::new(qsize, q_buf.dma_addr().raw())
             .ok_or(VirtioPciError::QueueTooSmall)?;
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -193,14 +193,11 @@ impl VirtioRngPci {
         let len = out.len().min(4096);
         let buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let phys = buf.phys_addr().raw();
+        let phys = buf.dma_addr().raw();
         // SAFETY: page-sized.
         unsafe {
             for i in 0..len {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    0,
-                );
+                core::ptr::write_volatile(buf.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
         let descs = [VirtqDesc {
@@ -256,11 +253,7 @@ impl VirtioRngPci {
         let n = used_len.min(len);
         for (i, slot) in out.iter_mut().enumerate().take(n) {
             // SAFETY: identity-mapped DMA; phys is the allocated coherent buffer base.
-            *slot = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
+            *slot = unsafe { core::ptr::read_volatile(buf.cpu_ptr_at::<u8>(i as u64)) };
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {

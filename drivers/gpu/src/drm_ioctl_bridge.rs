@@ -208,7 +208,7 @@ pub fn dispatch_virtgpu_render(
                     nr_samples: req.nr_samples,
                     flags: req.flags,
                 },
-                buffer.phys_addr().raw(),
+                buffer.dma_addr().raw(),
                 buffer.len() as u32,
             )
             .map_err(|_| FsError::InvalidData)?;
@@ -373,7 +373,7 @@ pub fn dispatch_virtgpu_mmap(
     if len > resource.buffer.len() {
         return Err(FsError::InvalidData);
     }
-    let phys = resource.buffer.phys_addr().raw();
+    let phys = resource.buffer.dma_addr().raw();
     Ok((0..len / 4096)
         .map(|page| phys + page as u64 * 4096)
         .collect())

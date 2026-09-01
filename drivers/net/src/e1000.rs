@@ -1207,19 +1207,16 @@ impl E1000 {
         // on return).
         let mut tail_g = self.tx_tail.lock();
         let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked by
         // the FrameTooLong guard above (1518 < 4096).
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = TxDesc {
             addr: phys,
@@ -1265,7 +1262,7 @@ impl E1000 {
     /// return whether its DD bit is set. Used by `tx_async` to
     /// detect completion after `wait_for_irq` returns.
     fn tx_slot_done(&self, slot: usize) -> bool {
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         // SAFETY: identity-mapped DMA ring; slot < TX_RING_LEN.
         let status = unsafe {
@@ -1288,17 +1285,14 @@ impl E1000 {
         // be moved through the async future.
         let mut tail_g = self.tx_tail.lock();
         let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = TxDesc {
             addr: phys,
@@ -1334,7 +1328,7 @@ impl E1000 {
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring; head < RX_RING_LEN.
         let desc = unsafe {
@@ -1392,7 +1386,7 @@ impl E1000 {
     /// consuming.
     pub fn rx_has_pending(&self) -> bool {
         let head = (*self.rx_head.lock()) as usize;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let status = unsafe {

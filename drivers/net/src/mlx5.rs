@@ -465,7 +465,7 @@ impl Mlx5Hca {
         // Stage 3: cmdq allocation + register programming.
         let cmdq = alloc_coherent(STAGE3_CMDQ_PAGE_LEN, DomainId::DRIVER_0)
             .map_err(|_| Mlx5Error::CmdqAlloc)?;
-        let cmdq_phys = cmdq.phys_addr().raw();
+        let cmdq_phys = cmdq.dma_addr().raw();
         program_cmdq_registers(&mmio, cmdq_phys, STAGE3_CMDQ_LOG_SIZE);
 
         let (rx_prod, rx_cons) = channel::<Frame, RX_RING_N>();
@@ -547,16 +547,13 @@ impl Mlx5Hca {
             .map_err(Mlx5Error::CmdBuild)?;
 
         // Write the CQE bytes into slot 0 of the cmdq DMA buffer.
-        let slot_phys = self.cmdq.phys_addr().raw();
+        let slot_phys = self.cmdq.dma_addr().raw();
         // SAFETY: identity-mapped DMA; cmdq is exclusively owned by
         // this driver.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    b,
-                );
+                core::ptr::write_volatile(self.cmdq.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -583,11 +580,7 @@ impl Mlx5Hca {
             // allocated for this command; `i < CQE_LEN` keeps the byte read
             // within the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
+            *b = unsafe { core::ptr::read_volatile(self.cmdq.cpu_ptr_at::<u8>(i as u64)) };
         }
         // Sanity check + decode.
         debug_assert!(is_complete(&completed));
@@ -606,7 +599,7 @@ impl Mlx5Hca {
 
     /// Phys address of the cmdq DMA backing (Stage 3+).
     pub fn cmdq_phys(&self) -> u64 {
-        self.cmdq.phys_addr().raw()
+        self.cmdq.dma_addr().raw()
     }
 
     /// Stage 4: issue a command with DMA-mailbox input and output.
@@ -646,34 +639,26 @@ impl Mlx5Hca {
             out_blocks
                 .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.phys_addr().raw()).collect();
-        let out_phys: Vec<u64> = out_blocks.iter().map(|b| b.phys_addr().raw()).collect();
+        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.dma_addr().raw()).collect();
+        let out_phys: Vec<u64> = out_blocks.iter().map(|b| b.dma_addr().raw()).collect();
 
         // Populate input mailbox blocks.
         let in_data = mailbox::write_input_chain(input, &in_phys, token);
         for (block, dma) in in_data.iter().zip(in_blocks.iter()) {
-            let phys = dma.phys_addr().raw();
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile(
-                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                        b,
-                    );
+                    core::ptr::write_volatile(dma.cpu_mut_ptr_at::<u8>(i as u64), b);
                 }
             }
         }
         // Output blocks: zero them so any "left untouched" bytes
         // read back as 0 rather than stale DMA contents.
         for dma in out_blocks.iter() {
-            let phys = dma.phys_addr().raw();
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for i in 0..MAILBOX_BLOCK_LEN {
-                    core::ptr::write_volatile(
-                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                        0,
-                    );
+                    core::ptr::write_volatile(dma.cpu_mut_ptr_at::<u8>(i as u64), 0);
                 }
             }
         }
@@ -687,6 +672,8 @@ impl Mlx5Hca {
             let l = (next & 0xFFFF_FFFF) as u32;
             // SAFETY: identity-mapped DMA; offsets within block.
             unsafe {
+                // `phys` here is an element of `out_phys`, NOT a DmaBuffer
+                // handle, so this stays a PhysAddr conversion.
                 for (j, &b) in h.to_be_bytes().iter().enumerate() {
                     core::ptr::write_volatile(
                         narf_memory::PhysAddr::new(phys + 0x1F0 + j as u64).kernel_mut_ptr::<u8>(),
@@ -712,14 +699,11 @@ impl Mlx5Hca {
             output_len as u32,
             token,
         );
-        let slot_phys = self.cmdq.phys_addr().raw();
+        let slot_phys = self.cmdq.dma_addr().raw();
         // SAFETY: identity-mapped DMA cmdq, exclusively owned.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    b,
-                );
+                core::ptr::write_volatile(self.cmdq.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -745,11 +729,7 @@ impl Mlx5Hca {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
+            *b = unsafe { core::ptr::read_volatile(self.cmdq.cpu_ptr_at::<u8>(i as u64)) };
         }
         debug_assert!(is_complete(&completed));
         let _resp = decode_response(&completed).map_err(Mlx5Error::CmdFailed)?;
@@ -757,18 +737,13 @@ impl Mlx5Hca {
         // Read output blocks back into a contiguous Vec.
         let mut blocks: Vec<[u8; MAILBOX_BLOCK_LEN]> = Vec::with_capacity(n_out);
         for dma in out_blocks.iter() {
-            let phys = dma.phys_addr().raw();
             let mut block = [0u8; MAILBOX_BLOCK_LEN];
             for (i, b) in block.iter_mut().enumerate() {
                 // SAFETY: `phys` is the identity-mapped DMA mailbox-block buffer
                 // from `out_blocks`; `i < MAILBOX_BLOCK_LEN` bounds the read to
                 // that block.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                *b = unsafe {
-                    core::ptr::read_volatile(
-                        narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
-                    )
-                };
+                *b = unsafe { core::ptr::read_volatile(dma.cpu_ptr_at::<u8>(i as u64)) };
             }
             blocks.push(block);
         }
@@ -799,17 +774,13 @@ impl Mlx5Hca {
             in_blocks
                 .push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.phys_addr().raw()).collect();
+        let in_phys: Vec<u64> = in_blocks.iter().map(|b| b.dma_addr().raw()).collect();
         let in_data = mailbox::write_input_chain(input, &in_phys, token);
         for (block, dma) in in_data.iter().zip(in_blocks.iter()) {
-            let phys = dma.phys_addr().raw();
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile(
-                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                        b,
-                    );
+                    core::ptr::write_volatile(dma.cpu_mut_ptr_at::<u8>(i as u64), b);
                 }
             }
         }
@@ -823,14 +794,11 @@ impl Mlx5Hca {
             /* output_len */ 0,
             token,
         );
-        let slot_phys = self.cmdq.phys_addr().raw();
+        let slot_phys = self.cmdq.dma_addr().raw();
         // SAFETY: identity-mapped cmdq DMA.
         unsafe {
             for (i, &b) in cqe.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    b,
-                );
+                core::ptr::write_volatile(self.cmdq.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -851,11 +819,7 @@ impl Mlx5Hca {
             // SAFETY: `slot_phys` is the identity-mapped DMA-coherent CQE slot
             // for this command; `i < CQE_LEN` bounds the read to the slot.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(slot_phys + i as u64).kernel_ptr::<u8>(),
-                )
-            };
+            *b = unsafe { core::ptr::read_volatile(self.cmdq.cpu_ptr_at::<u8>(i as u64)) };
         }
         debug_assert!(is_complete(&completed));
         decode_response(&completed).map_err(Mlx5Error::CmdFailed)
@@ -872,7 +836,7 @@ impl Mlx5Hca {
         for _ in 0..page_count {
             pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let phys: Vec<u64> = pages.iter().map(|p| p.dma_addr().raw()).collect();
         let payload = eq::build_create_eq_input(params, &phys).map_err(Mlx5Error::EqBuild)?;
         let resp = self.issue_command_with_input_mailbox(CmdOp::CreateEq, 0, &payload)?;
         // PRM: eq_number rides in the low 24 bits of output_modifier.
@@ -895,7 +859,6 @@ impl Mlx5Hca {
             .find(|e| e.eq_number == eq_number)
             .ok_or(Mlx5Error::UnknownQp)?;
         let cap = 1u32 << e.params.log_eq_size;
-        let phys = e.pages[0].phys_addr().raw();
         let off = ((e.consumer % cap) as usize) * eqe::EQE_LEN;
         let mut bytes = [0u8; eqe::EQE_LEN];
         for (i, b) in bytes.iter_mut().enumerate() {
@@ -904,9 +867,7 @@ impl Mlx5Hca {
             // within the EQE.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             *b = unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(phys + off as u64 + i as u64).kernel_ptr::<u8>(),
-                )
+                core::ptr::read_volatile(e.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64))
             };
         }
         if eqe::is_hw_owned(&bytes) {
@@ -976,7 +937,7 @@ impl Mlx5Hca {
         for _ in 0..page_count {
             pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let phys: Vec<u64> = pages.iter().map(|p| p.dma_addr().raw()).collect();
         let payload = cq::build_create_cq_input(params, &phys).map_err(Mlx5Error::CqBuild)?;
         let resp = self.issue_command_with_input_mailbox(CmdOp::CreateCq, 0, &payload)?;
         let cq_number = resp.output_modifier & 0x00FF_FFFF;
@@ -1017,7 +978,7 @@ impl Mlx5Hca {
         for _ in 0..page_count {
             pages.push(alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| Mlx5Error::CmdqAlloc)?);
         }
-        let phys: Vec<u64> = pages.iter().map(|p| p.phys_addr().raw()).collect();
+        let phys: Vec<u64> = pages.iter().map(|p| p.dma_addr().raw()).collect();
         let payload = qp::build_create_qp_input(params, &phys).map_err(Mlx5Error::QpBuild)?;
         let resp = self.issue_command_with_input_mailbox(CmdOp::CreateQp, 0, &payload)?;
         let qp_number = resp.output_modifier & 0x00FF_FFFF;
@@ -1094,7 +1055,7 @@ impl Mlx5Hca {
         let wqe_bytes = ring::build_send_wqe(qp_number, wqe_idx as u16, opcode, cqe_req, iovecs)
             .map_err(Mlx5Error::RingBuild)?;
         // SQ starts at offset 0 of the QP buffer.
-        let sq_phys = q.pages[0].phys_addr().raw();
+        let sq_phys = q.pages[0].dma_addr().raw();
         let dst = sq_phys + ring::sq_offset_of(wqe_idx) as u64;
         // SAFETY: identity-mapped DMA, exclusively owned by this QP.
         unsafe {
@@ -1127,7 +1088,7 @@ impl Mlx5Hca {
         let wqe_idx = q.rq_tail % rq_capacity;
         let wqe_bytes = ring::build_recv_wqe(iovecs).map_err(Mlx5Error::RingBuild)?;
         // RQ region starts after the SQ.
-        let qp_phys = q.pages[0].phys_addr().raw();
+        let qp_phys = q.pages[0].dma_addr().raw();
         let rq_base = qp_phys + ring::sq_size_bytes(q.params.log_sq_size) as u64;
         let dst = rq_base + ring::rq_offset_of(wqe_idx) as u64;
         // SAFETY: identity-mapped DMA, owned by this QP.
@@ -1156,7 +1117,6 @@ impl Mlx5Hca {
             .ok_or(Mlx5Error::UnknownCq)?;
         let cq_capacity = 1u32 << c.params.log_cq_size;
         let off = ring::cq_offset_of(c.consumer, cq_capacity);
-        let cq_phys = c.pages[0].phys_addr().raw();
         let mut bytes = [0u8; cqe::CQE_LEN];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b =
@@ -1164,7 +1124,7 @@ impl Mlx5Hca {
                 // the in-range entry offset and `i < cqe::CQE_LEN`, so the read
                 // stays within the CQE.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(cq_phys + off as u64 + i as u64).kernel_ptr::<u8>()) };
+                unsafe { core::ptr::read_volatile(c.pages[0].cpu_ptr_at::<u8>(off as u64 + i as u64)) };
         }
         if cqe::is_hw_owned(&bytes) {
             return Ok(None);

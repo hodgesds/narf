@@ -524,7 +524,7 @@ impl VirtioGpuPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let payload_len = self.resp_buf.len() - HDR_LEN;
-        let src = self.resp_buf.phys_addr().raw() + HDR_LEN as u64;
+        let src = self.resp_buf.dma_addr().raw() + HDR_LEN as u64;
         let mut out = alloc::vec![0u8; payload_len];
         // SAFETY: the response descriptor covers `resp_buf.len()` bytes and
         // the vector owns exactly `payload_len` writable bytes.
@@ -610,7 +610,7 @@ impl VirtioGpuPci {
             self.resource_create_2d(1, FMT_B8G8R8X8_UNORM, width, height)?;
             self.resource_attach_backing(
                 1,
-                self.scanout_buf.phys_addr().raw(),
+                self.scanout_buf.dma_addr().raw(),
                 scanout_bytes as u32,
             )?;
             self.set_scanout(0, 1, width, height)?;
@@ -626,7 +626,7 @@ impl VirtioGpuPci {
     /// into a userspace `mmap`. Stable for the controller's lifetime
     /// once `init_scanout` has run.
     pub fn scanout_phys(&self) -> u64 {
-        self.scanout_buf.phys_addr().raw()
+        self.scanout_buf.dma_addr().raw()
     }
 
     /// Borrow a `Framebuffer` view over the scanout buffer.
@@ -640,7 +640,7 @@ impl VirtioGpuPci {
         // SAFETY: scanout_buf is identity-mapped + sized for w*h*4.
         unsafe {
             Framebuffer::new(
-                self.scanout_buf.phys_addr().raw() as *mut u32,
+                self.scanout_buf.dma_addr().raw() as *mut u32,
                 self.mode().width,
                 self.mode().height,
                 self.mode().width,
@@ -655,7 +655,7 @@ impl VirtioGpuPci {
         let _gate = ReqGate::acquire(&self.req_gate);
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
-            let p = self.scanout_buf.phys_addr().raw() as *mut u32;
+            let p = self.scanout_buf.dma_addr().raw() as *mut u32;
             let mode = self.mode();
             for i in 0..(mode.width * mode.height) as usize {
                 core::ptr::write_volatile(p.add(i), bgra);
@@ -673,7 +673,7 @@ impl VirtioGpuPci {
         // Magenta background + cyan center square.
         // SAFETY: scanout_buf is identity-mapped + sized w*h*4.
         unsafe {
-            let p = self.scanout_buf.phys_addr().raw() as *mut u32;
+            let p = self.scanout_buf.dma_addr().raw() as *mut u32;
             let mode = self.mode();
             for y in 0..mode.height as usize {
                 for x in 0..mode.width as usize {
@@ -748,13 +748,13 @@ impl VirtioGpuPci {
     unsafe fn submit(&self, req_len: usize, resp_len: usize) -> Result<(), VirtioPciError> {
         let descs = [
             VirtqDesc {
-                addr: self.req_buf.phys_addr().raw(),
+                addr: self.req_buf.dma_addr().raw(),
                 len: req_len as u32,
                 flags: VIRTQ_DESC_F_NEXT,
                 next: 0, // patched by Virtqueue::add_buffer
             },
             VirtqDesc {
-                addr: self.resp_buf.phys_addr().raw(),
+                addr: self.resp_buf.dma_addr().raw(),
                 len: resp_len as u32,
                 flags: VIRTQ_DESC_F_WRITE,
                 next: 0,
@@ -815,38 +815,22 @@ impl VirtioGpuPci {
     /// Internal: write a 24-byte ctrl_hdr at offset 0 of req_buf,
     /// followed by `body_bytes` starting at offset 24.
     fn write_request(&self, cmd: u32, body: &[u8]) {
-        let hdr_phys = self.req_buf.phys_addr().raw();
         // SAFETY: req_buf is 4 KiB; we write 24 + body.len() <= 4096.
         unsafe {
             // ctrl_hdr fields: type, flags, fence_id_lo, fence_id_hi,
             // ctx_id, padding (all little-endian).
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(hdr_phys).kernel_mut_ptr::<u32>(),
-                cmd,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(hdr_phys + 4).kernel_mut_ptr::<u32>(),
-                0,
-            ); // flags
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(hdr_phys + 8).kernel_mut_ptr::<u64>(),
-                0,
-            ); // fence_id
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(hdr_phys + 16).kernel_mut_ptr::<u32>(),
-                0,
-            ); // ctx_id
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(hdr_phys + 20).kernel_mut_ptr::<u32>(),
-                0,
-            ); // padding
-               // Bulk copy the body — coherent DMA memory, not MMIO, so
-               // per-byte volatile buys nothing (see the virtio-blk DMA
-               // copy fix). Ordering vs. the device is provided by the
-               // SeqCst fence before the notify write in `submit`.
+            core::ptr::write_volatile(self.req_buf.cpu_mut_ptr::<u32>(), cmd);
+            core::ptr::write_volatile(self.req_buf.cpu_mut_ptr_at::<u32>(4), 0); // flags
+            core::ptr::write_volatile(self.req_buf.cpu_mut_ptr_at::<u64>(8), 0); // fence_id
+            core::ptr::write_volatile(self.req_buf.cpu_mut_ptr_at::<u32>(16), 0); // ctx_id
+            core::ptr::write_volatile(self.req_buf.cpu_mut_ptr_at::<u32>(20), 0); // padding
+                                                                                  // Bulk copy the body — coherent DMA memory, not MMIO, so
+                                                                                  // per-byte volatile buys nothing (see the virtio-blk DMA
+                                                                                  // copy fix). Ordering vs. the device is provided by the
+                                                                                  // SeqCst fence before the notify write in `submit`.
             core::ptr::copy_nonoverlapping(
                 body.as_ptr(),
-                narf_memory::PhysAddr::new(hdr_phys + 24).kernel_mut_ptr::<u8>(),
+                self.req_buf.cpu_mut_ptr_at::<u8>(24),
                 body.len(),
             );
         }
@@ -863,7 +847,7 @@ impl VirtioGpuPci {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 request.as_ptr(),
-                self.req_buf.phys_addr().raw() as *mut u8,
+                self.req_buf.dma_addr().raw() as *mut u8,
                 request.len(),
             );
         }
@@ -871,9 +855,8 @@ impl VirtioGpuPci {
 
     /// Internal: read the response type word from the start of resp_buf.
     fn response_type(&self) -> u32 {
-        let p = self.resp_buf.phys_addr().raw();
         // SAFETY: resp_buf is 4 KiB.
-        unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(p).kernel_ptr::<u32>()) }
+        unsafe { core::ptr::read_volatile(self.resp_buf.cpu_ptr::<u32>()) }
     }
 
     /// Submit GET_DISPLAY_INFO and parse the response into `out`.
@@ -890,7 +873,7 @@ impl VirtioGpuPci {
         if response != RESP_OK_DISPLAY_INFO {
             return Err(VirtioPciError::UnexpectedResponse(response));
         }
-        let p = self.resp_buf.phys_addr().raw();
+        let p = self.resp_buf.dma_addr().raw();
         for (i, slot) in out.iter_mut().enumerate().take(MAX_SCANOUTS) {
             let entry = p + HDR_LEN as u64 + (i as u64) * 24;
             // SAFETY: resp_buf is 4 KiB and we never read past 408.
@@ -1079,7 +1062,7 @@ unsafe fn setup_queue(
     }
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
     // SAFETY: identity-mapped MMIO.
     unsafe {
         common.write16(CC_QUEUE_SIZE, qsize);

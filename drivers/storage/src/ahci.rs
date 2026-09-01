@@ -94,7 +94,7 @@ fn with_ahci_scratch<R>(f: impl FnOnce(&DmaBuffer) -> R) -> Option<R> {
 /// SAFETY: callers serialise on per-port busy registers; the
 /// returned phys is stable for the controller's lifetime.
 fn ahci_scratch_phys() -> u64 {
-    with_ahci_scratch(|b| b.phys_addr().raw()).unwrap_or(0)
+    with_ahci_scratch(|b| b.dma_addr().raw()).unwrap_or(0)
 }
 
 /// Byte offset of the data area inside the shared 4 KiB scratch

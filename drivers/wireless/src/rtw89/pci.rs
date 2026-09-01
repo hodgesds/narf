@@ -288,7 +288,7 @@ pub unsafe fn bring_up(
                     buf_size: 2048,
                     ..Default::default()
                 };
-                bd.set_phys(pkt_buf.phys_addr().raw());
+                bd.set_phys(pkt_buf.dma_addr().raw());
                 core::ptr::write_volatile(ring_ptr.add(i as usize), bd);
             }
             bufs.push(pkt_buf);
@@ -306,7 +306,7 @@ pub unsafe fn bring_up(
     for i in 0..TXCH_NUM {
         let r = &tx_rings[i].lock();
         let dma = &tx_ring_dma[i];
-        let phys = dma.phys_addr().raw();
+        let phys = dma.dma_addr().raw();
         // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
         // in-range TX ring register offsets (`desa_l/h`, `num`, `bdram`, `idx`)
         // for this channel, so these MMIO writes target valid device registers
@@ -326,7 +326,7 @@ pub unsafe fn bring_up(
     for i in 0..RXCH_NUM {
         let r = &rx_rings[i].lock();
         let dma = &rx_ring_dma[i];
-        let phys = dma.phys_addr().raw();
+        let phys = dma.dma_addr().raw();
         // SAFETY: `mmio_bar2` is the caller-owned BAR2 region; `r.regs` holds the
         // in-range RX ring register offsets (`desa_l/h`, `num`, `idx`) for this
         // channel, so these MMIO writes target valid device registers with
@@ -426,7 +426,7 @@ pub fn send_frame(frame: &[u8]) -> Result<(), ()> {
                 opt: TXBD_OPT_LS,
                 ..Default::default()
             };
-            bd.set_phys(buf.phys_addr().raw());
+            bd.set_phys(buf.dma_addr().raw());
             core::ptr::write_volatile(ring_ptr.add(slot), bd);
         }
 

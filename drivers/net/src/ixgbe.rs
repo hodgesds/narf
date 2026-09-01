@@ -417,7 +417,7 @@ impl Ixgbe {
         // 6. Set up the TX ring (queue 0) + persistent per-slot
         //    frame buffers (audit #4).
         let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-        let tx_phys = tx_ring.phys_addr().raw();
+        let tx_phys = tx_ring.dma_addr().raw();
         let mut tx_pool: Vec<DmaBuffer> = Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
             tx_pool
@@ -426,10 +426,7 @@ impl Ixgbe {
         // SAFETY: identity-mapped DMA.
         unsafe {
             for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(tx_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    0,
-                );
+                core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
         // SAFETY: identity-mapped MMIO.
@@ -455,11 +452,11 @@ impl Ixgbe {
 
         // 7. RX ring + pool.
         let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let rx_ring_phys = rx_ring.dma_addr().raw();
         let mut rx_pool = Vec::with_capacity(RX_RING_LEN);
         for i in 0..RX_RING_LEN {
             let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| IxgbeError::NoMemory)?;
-            let bp = buf.phys_addr().raw();
+            let bp = buf.dma_addr().raw();
             let desc = RxDesc {
                 addr: bp,
                 length: 0,
@@ -539,17 +536,14 @@ impl Ixgbe {
         // Persistent per-slot buffer (audit #4).
         let mut tail_g = self.tx_tail.lock();
         let slot = (*tail_g) as usize % TX_RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
         let desc = if let Some(mss) = meta.tso_mss {
             AdvTxDesc::with_tso(phys, frame.len() as u16, mss)
@@ -599,7 +593,7 @@ impl Ixgbe {
     pub fn rx_recv(&self, out: &mut [u8]) -> usize {
         let mut head_g = self.rx_head.lock();
         let head = (*head_g) as usize;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let desc = unsafe {
@@ -649,7 +643,7 @@ impl Ixgbe {
 
     pub fn rx_has_pending(&self) -> bool {
         let head = (*self.rx_head.lock()) as usize;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (head * 16) as u64;
         // SAFETY: identity-mapped DMA ring.
         let status = unsafe {

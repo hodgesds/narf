@@ -739,8 +739,8 @@ impl Xhci {
         // comment in `bring_up`: the implementation commits the
         // full 64-bit address on the HIGH write, reading LOW at
         // that moment.
-        let dcbaa_phys = self.dcbaa.phys_addr().raw();
-        let cmd_phys = self.cmd_ring.phys_addr().raw();
+        let dcbaa_phys = self.dcbaa.dma_addr().raw();
+        let cmd_phys = self.cmd_ring.dma_addr().raw();
         // SAFETY: same.
         unsafe {
             mmio.write32(op_off + OP_DCBAAP, dcbaa_phys as u32);
@@ -750,8 +750,8 @@ impl Xhci {
         }
 
         // Re-program IR0.
-        let er_phys = self.event_ring.phys_addr().raw();
-        let erst_phys = self._erst.phys_addr().raw();
+        let er_phys = self.event_ring.dma_addr().raw();
+        let erst_phys = self._erst.dma_addr().raw();
         let ir0 = self.rts_off + IR_BASE_OFF;
         // SAFETY: same. LOW-then-HIGH order on ERDP/ERSTBA — see
         // the matching comment in `bring_up`.
@@ -1130,7 +1130,7 @@ impl Xhci {
         // requires a 64-byte-aligned (max_slots+1) * 8-byte array.
         // One 4 KiB page covers up to 511 slots — plenty.
         let dcbaa = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let dcbaa_phys = dcbaa.phys_addr().raw();
+        let dcbaa_phys = dcbaa.dma_addr().raw();
 
         // Allocate the Command Ring. 4 KiB = 256 TRBs (each 16 bytes).
         // Place a Link TRB at slot N-1 with TC=1 pointing back at the
@@ -1139,7 +1139,7 @@ impl Xhci {
         // toggles the producer cycle state) the first time it wraps,
         // matching the controller's PCS=1 dequeue state.
         let cmd_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let cmd_phys = cmd_ring.phys_addr().raw();
+        let cmd_phys = cmd_ring.dma_addr().raw();
         let cmd_link_off = ((CMD_RING_TRBS - 1) * 16) as u64;
         let cmd_link_addr = cmd_phys + cmd_link_off;
         let cmd_link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC;
@@ -1175,7 +1175,7 @@ impl Xhci {
             // One page holds 512 8-byte pointers — plenty for any
             // realistic scratchpad count (max 1023 per spec).
             let sb = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-            let sb_phys = sb.phys_addr().raw();
+            let sb_phys = sb.dma_addr().raw();
             // PAGESIZE register tells us the natural scratchpad
             // page size; xHCI 1.2 §5.4.3 says it's a bitmap where
             // bit n means "supports 4 KiB << n". Use the lowest
@@ -1199,7 +1199,7 @@ impl Xhci {
                     core::ptr::write_volatile(
                         narf_memory::PhysAddr::new(sb_phys + (i * 8) as u64)
                             .kernel_mut_ptr::<u64>(),
-                        p.phys_addr().raw(),
+                        p.dma_addr().raw(),
                     );
                 }
                 scratch_pages.push(p);
@@ -1207,10 +1207,7 @@ impl Xhci {
             // Plant the scratchpad-buffer-array pointer at DCBAA[0].
             // SAFETY: identity-mapped DCBAA page.
             unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(dcbaa_phys).kernel_mut_ptr::<u64>(),
-                    sb_phys,
-                );
+                core::ptr::write_volatile(dcbaa.cpu_mut_ptr::<u64>(), sb_phys);
             }
             Some(sb)
         } else {
@@ -1248,9 +1245,9 @@ impl Xhci {
         // controller knows how big the table is when it walks it.
         let event_ring =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let er_phys = event_ring.phys_addr().raw();
+        let er_phys = event_ring.dma_addr().raw();
         let erst = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let erst_phys = erst.phys_addr().raw();
+        let erst_phys = erst.dma_addr().raw();
         // ERST entry layout (16 bytes, §6.5):
         //   +0  Ring Segment Base (64-bit, 64-byte aligned)
         //   +8  Ring Segment Size (low 16 bits = TRB count)
@@ -1259,18 +1256,9 @@ impl Xhci {
         // alloc_coherent, exclusive to this driver.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(erst_phys).kernel_mut_ptr::<u64>(),
-                er_phys,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(erst_phys + 8).kernel_mut_ptr::<u32>(),
-                ER_SEG_TRBS as u32,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(erst_phys + 12).kernel_mut_ptr::<u32>(),
-                0,
-            );
+            core::ptr::write_volatile(erst.cpu_mut_ptr::<u64>(), er_phys);
+            core::ptr::write_volatile(erst.cpu_mut_ptr_at::<u32>(8), ER_SEG_TRBS as u32);
+            core::ptr::write_volatile(erst.cpu_mut_ptr_at::<u32>(12), 0);
         }
 
         // Program interrupter 0: ERSTSZ = 1 (one segment), ERSTBA =
@@ -1445,7 +1433,7 @@ impl Xhci {
         let mut drained_evs = 0usize;
         loop {
             let trb_off = (drained_evs * 16) as u64;
-            let er_addr = event_ring.phys_addr().raw() + trb_off;
+            let er_addr = event_ring.dma_addr().raw() + trb_off;
             // SAFETY: identity-mapped DMA.
             let d3 = unsafe {
                 core::ptr::read_volatile(
@@ -1468,7 +1456,7 @@ impl Xhci {
         } else {
             drained_evs
         };
-        let new_deq_phys = event_ring.phys_addr().raw() + (erdp_slot as u64) * 16;
+        let new_deq_phys = event_ring.dma_addr().raw() + (erdp_slot as u64) * 16;
         let ir0 = rtsoff as u64 + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -1942,7 +1930,7 @@ impl Xhci {
         // then wrap enq=0 and toggle PCS so the next normal TRB we
         // write also matches the post-link consumer cycle.
         if *enq_g >= CMD_RING_TRBS - 1 {
-            let link_addr = self.cmd_ring.phys_addr().raw() + ((CMD_RING_TRBS - 1) * 16) as u64;
+            let link_addr = self.cmd_ring.dma_addr().raw() + ((CMD_RING_TRBS - 1) * 16) as u64;
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (*pcs_g & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, in-page; only the cycle
             // bit + TC bit need rewriting — the address dwords were
@@ -1960,7 +1948,7 @@ impl Xhci {
         }
 
         let trb_off = (*enq_g * 16) as u64;
-        let trb_addr = self.cmd_ring.phys_addr().raw() + trb_off;
+        let trb_addr = self.cmd_ring.dma_addr().raw() + trb_off;
         let dword3 = dword3_no_cycle | (*pcs_g & TRB_CYCLE_BIT);
         // Write the data dwords first, then publish dword3 (which
         // carries the cycle bit) so the controller can't observe a
@@ -2003,7 +1991,7 @@ impl Xhci {
         let mut deq_g = self.er_dequeue.lock();
         let mut ccs_g = self.er_ccs.lock();
         let trb_off = (*deq_g * 16) as u64;
-        let trb_addr = self.event_ring.phys_addr().raw() + trb_off;
+        let trb_addr = self.event_ring.dma_addr().raw() + trb_off;
         // SAFETY: identity-mapped DMA page; deq in-range.
         let d3 = unsafe {
             core::ptr::read_volatile(narf_memory::PhysAddr::new(trb_addr + 12).kernel_ptr::<u32>())
@@ -2030,7 +2018,7 @@ impl Xhci {
         }
         // Update ERDP — write the new dequeue phys address (4-byte
         // aligned) with EHB set to clear the busy flag.
-        let new_deq_phys = self.event_ring.phys_addr().raw() + (*deq_g as u64) * 16;
+        let new_deq_phys = self.event_ring.dma_addr().raw() + (*deq_g as u64) * 16;
         let ir0 = self.rts_off + IR_BASE_OFF;
         // SAFETY: identity-mapped MMIO.
         unsafe {
@@ -2305,9 +2293,9 @@ impl Xhci {
         let ctrl_data =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
 
-        let input_phys = input.phys_addr().raw();
-        let dev_ctx_phys = dev_ctx.phys_addr().raw();
-        let ctrl_tr_phys = ctrl_tr.phys_addr().raw();
+        let input_phys = input.dma_addr().raw();
+        let dev_ctx_phys = dev_ctx.dma_addr().raw();
+        let ctrl_tr_phys = ctrl_tr.dma_addr().raw();
         // Plant a Link TRB at the last slot of the control transfer
         // ring so ctrl_enqueue can wrap (audit #1 — same fix as the
         // per-EP ring above). Cycle bit starts at 0; ctrl_pcs starts
@@ -2365,21 +2353,9 @@ impl Xhci {
         // but be explicit so a future allocator change can't bite.
         // SAFETY: identity-mapped DMA; 4 KiB contiguous.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(dev_ctx_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(ctrl_tr_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(dev_ctx.cpu_mut_ptr::<u8>(), 0, 4096);
+            core::ptr::write_bytes(ctrl_tr.cpu_mut_ptr::<u8>(), 0, 4096);
         }
 
         let cs = self.context_stride();
@@ -2476,7 +2452,7 @@ impl Xhci {
         // Plant Device Context phys at DCBAA[slot_id] BEFORE issuing
         // the command (§4.3.4 step 6). The engine reads DCBAA when
         // it processes Address Device.
-        let dcbaa_phys = self.dcbaa.phys_addr().raw();
+        let dcbaa_phys = self.dcbaa.dma_addr().raw();
         // SAFETY: `dcbaa_phys` is the identity-mapped base of the
         // DCBAA page this controller allocated; `slot_id < MaxSlots`
         // (validated at slot-enable) so `slot_id*8` stays inside the
@@ -2595,14 +2571,10 @@ impl Xhci {
         };
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let input_phys = input.phys_addr().raw();
+        let input_phys = input.dma_addr().raw();
         // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
         }
         let cs = self.context_stride();
         let input_ctrl = input_phys;
@@ -2673,14 +2645,10 @@ impl Xhci {
         }
 
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let input_phys = input.phys_addr().raw();
+        let input_phys = input.dma_addr().raw();
         // SAFETY: identity-mapped DMA, 4 KiB contiguous, just allocated.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
         }
         let cs = self.context_stride();
         let input_ctrl = input_phys;
@@ -2784,7 +2752,7 @@ impl Xhci {
             // enq, toggle pcs. Same shape as ep_enqueue_normal's
             // wrap branch.
             let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
-            let link_addr = dev.ctrl_tr.phys_addr().raw() + link_off;
+            let link_addr = dev.ctrl_tr.dma_addr().raw() + link_off;
             let link_d3 =
                 (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (dev.ctrl_pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
@@ -2799,7 +2767,7 @@ impl Xhci {
             dev.ctrl_pcs ^= 1;
         }
         let trb_off = (dev.ctrl_enq * 16) as u64;
-        let trb_addr = dev.ctrl_tr.phys_addr().raw() + trb_off;
+        let trb_addr = dev.ctrl_tr.dma_addr().raw() + trb_off;
         let d3 = d3_no_cycle | (dev.ctrl_pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
@@ -2863,7 +2831,7 @@ impl Xhci {
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            d.ctrl_data.phys_addr().raw()
+            d.ctrl_data.dma_addr().raw()
         };
         // Zero so a stale buffer can't be confused with the device
         // response on a short read.
@@ -2993,7 +2961,7 @@ impl Xhci {
                 .get(slot_id as usize)
                 .and_then(|x| x.as_ref())
                 .ok_or(XhciError::CmdFailed(0xFD))?;
-            d.ctrl_data.phys_addr().raw()
+            d.ctrl_data.dma_addr().raw()
         };
         // Stage caller's bytes into the persistent control-data
         // buffer (audit F-45). Zero the prefix first so a stale
@@ -3155,14 +3123,10 @@ impl Xhci {
         // stride, per-EP Ctx at `stride * (1 + dci - 1)` =
         // `stride * dci`. The stride is 32 or 64 depending on CSZ.
         let input = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-        let input_phys = input.phys_addr().raw();
+        let input_phys = input.dma_addr().raw();
         // SAFETY: identity-mapped DMA; fresh 4 KiB page.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(input_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(input.cpu_mut_ptr::<u8>(), 0, 4096);
         }
 
         // Build per-endpoint state + the Input Control + per-EP
@@ -3191,14 +3155,10 @@ impl Xhci {
             add_mask |= 1 << dci;
 
             let tr = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| XhciError::NoMemory)?;
-            let tr_phys = tr.phys_addr().raw();
+            let tr_phys = tr.dma_addr().raw();
             // SAFETY: same.
             unsafe {
-                core::ptr::write_bytes(
-                    narf_memory::PhysAddr::new(tr_phys).kernel_mut_ptr::<u8>(),
-                    0,
-                    4096,
-                );
+                core::ptr::write_bytes(tr.cpu_mut_ptr::<u8>(), 0, 4096);
             }
             // Plant a Link TRB at slot CTRL_TR_TRBS-1 pointing back
             // to slot 0 with TC=1. Cycle bit starts at 0 (the
@@ -3295,7 +3255,7 @@ impl Xhci {
         // slot's device context.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let dev_ctx_phys = unsafe {
-            let dcbaa_phys = self.dcbaa.phys_addr().raw();
+            let dcbaa_phys = self.dcbaa.dma_addr().raw();
             core::ptr::read_volatile(
                 narf_memory::PhysAddr::new(dcbaa_phys + (slot_id as u64) * 8).kernel_ptr::<u64>(),
             )
@@ -3331,10 +3291,7 @@ impl Xhci {
         // Input Control Context: dword1 = add mask.
         // SAFETY: identity-mapped DMA.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(input_phys + 4).kernel_mut_ptr::<u32>(),
-                add_mask,
-            );
+            core::ptr::write_volatile(input.cpu_mut_ptr_at::<u32>(4), add_mask);
         }
 
         // Issue Configure Endpoint (§6.4.3.5): same TRB shape as
@@ -3405,7 +3362,7 @@ impl Xhci {
             // forever (engine reads it once, follows it, but
             // subsequent wraps need fresh cycle bits).
             let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
-            let link_addr = ep.tr.phys_addr().raw() + link_off;
+            let link_addr = ep.tr.dma_addr().raw() + link_off;
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
@@ -3419,7 +3376,7 @@ impl Xhci {
             ep.pcs ^= 1;
         }
         let trb_off = (ep.enq * 16) as u64;
-        let trb_addr = ep.tr.phys_addr().raw() + trb_off;
+        let trb_addr = ep.tr.dma_addr().raw() + trb_off;
         let d3 = (TRB_TYPE_NORMAL << TRB_TYPE_SHIFT) | TRB_IOC | (ep.pcs & TRB_CYCLE_BIT);
         // SAFETY: identity-mapped DMA; offset in-page.
         unsafe {
@@ -3471,7 +3428,7 @@ impl Xhci {
         // Link-wrap (mirrors the Normal path).
         if ep.enq == CTRL_TR_TRBS - 1 {
             let link_off = ((CTRL_TR_TRBS - 1) * 16) as u64;
-            let link_addr = ep.tr.phys_addr().raw() + link_off;
+            let link_addr = ep.tr.dma_addr().raw() + link_off;
             let link_d3 = (TRB_TYPE_LINK << TRB_TYPE_SHIFT) | TRB_TC | (ep.pcs & TRB_CYCLE_BIT);
             // SAFETY: identity-mapped DMA, offset in-page.
             unsafe {
@@ -3485,7 +3442,7 @@ impl Xhci {
             ep.pcs ^= 1;
         }
         let trb_off = (ep.enq * 16) as u64;
-        let trb_addr = ep.tr.phys_addr().raw() + trb_off;
+        let trb_addr = ep.tr.dma_addr().raw() + trb_off;
         // Iso TRB d3:
         //   bit 0 = cycle (matches ep.pcs)
         //   bit 5 = IOC (interrupt on completion)
@@ -3800,7 +3757,7 @@ impl Xhci {
             .get(idx)
             .and_then(|s| s.as_ref())
             .ok_or(XhciError::CmdFailed(0xFA))?;
-        Ok(ep.dma_buf.phys_addr().raw())
+        Ok(ep.dma_buf.dma_addr().raw())
     }
 
     /// Issue a bulk-OUT write. Mirror of `bulk_in`: stages caller's

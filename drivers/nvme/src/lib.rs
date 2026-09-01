@@ -648,8 +648,8 @@ impl Controller {
         // documented contract zero-fills before handing out, so the
         // SQ/CQ start in the canonical "nothing in flight, phase tag
         // 0 on every CQE" state.
-        let sq_phys = sq_buf.phys_addr().raw();
-        let cq_phys = cq_buf.phys_addr().raw();
+        let sq_phys = sq_buf.dma_addr().raw();
+        let cq_phys = cq_buf.dma_addr().raw();
 
         // ── 4. Program AQA / ASQ / ACQ ────────────────────────────
         // AQA: bits[11:0] = ASQ size-1, bits[27:16] = ACQ size-1.
@@ -719,7 +719,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::Identify as u32;
         sqe.nsid = 0;
-        sqe.prp1 = id_buf.phys_addr().raw();
+        sqe.prp1 = id_buf.dma_addr().raw();
         sqe.cdw10 = 1; // CNS = 1: Identify Controller
                        // SAFETY: queue is live; bar0 is identity-mapped MMIO.
         match unsafe { admin.submit(&bar0, sqe) } {
@@ -741,7 +741,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::Identify as u32;
         sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = ns_buf.phys_addr().raw();
+        sqe.prp1 = ns_buf.dma_addr().raw();
         sqe.cdw10 = 0; // CNS = 0: Identify Namespace
                        // SAFETY: same queue + bar.
         let _ = unsafe { admin.submit(&bar0, sqe)? };
@@ -799,8 +799,8 @@ impl Controller {
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
-        let sq_phys = sq_buf.phys_addr().raw();
-        let cq_phys = cq_buf.phys_addr().raw();
+        let sq_phys = sq_buf.dma_addr().raw();
+        let cq_phys = cq_buf.dma_addr().raw();
 
         // Create I/O CQ (admin opcode 0x05).
         // CDW10: bits[31:16] = qsize-1, bits[15:0] = qid.
@@ -1056,7 +1056,7 @@ impl Controller {
             // that names an unallocated CQID).
             let cq_buf = alloc_coherent(16 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
                 .map_err(|_| NvmeError::OutOfDmaMemory)?;
-            let cq_phys = cq_buf.phys_addr().raw();
+            let cq_phys = cq_buf.dma_addr().raw();
 
             {
                 // Borrow admin mutably for the submit; drop before
@@ -1084,7 +1084,7 @@ impl Controller {
 
             let sq_buf = alloc_coherent(64 * IO_Q_DEPTH as usize, DomainId::DRIVER_0)
                 .map_err(|_| NvmeError::OutOfDmaMemory)?;
-            let sq_phys = sq_buf.phys_addr().raw();
+            let sq_phys = sq_buf.dma_addr().raw();
 
             {
                 let admin = self.admin.as_mut().ok_or(NvmeError::NotReady)?;
@@ -1214,14 +1214,14 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::Identify as u32;
         sqe.nsid = start_nsid;
-        sqe.prp1 = buf.phys_addr().raw();
+        sqe.prp1 = buf.dma_addr().raw();
         sqe.cdw10 = admin::CNS_NAMESPACE_LIST as u32;
         // SAFETY: admin queue + BAR live; buf is a fresh DMA page.
         unsafe {
             admin.submit(bar0, sqe)?;
         }
         // Parse: up to 1024 NSIDs, LE u32 each. A zero terminates.
-        let base = buf.phys_addr().raw() as *const u32;
+        let base = buf.dma_addr().raw() as *const u32;
         let cap = out.len().min(1024);
         let mut n = 0;
         for i in 0..cap {
@@ -1280,14 +1280,14 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = AdminOpcode::Identify as u32;
         sqe.nsid = nsid;
-        sqe.prp1 = buf.phys_addr().raw();
+        sqe.prp1 = buf.dma_addr().raw();
         sqe.cdw10 = admin::CNS_NAMESPACE as u32;
         // SAFETY: admin queue + BAR live.
         unsafe {
             admin.submit(bar0, sqe)?;
         }
         // Read the 4 KiB response into a slice and parse.
-        let base = buf.phys_addr().raw() as *const u8;
+        let base = buf.dma_addr().raw() as *const u8;
         let mut raw = alloc::vec![0u8; 4096];
         for (i, byte) in raw.iter_mut().enumerate() {
             // SAFETY: `base` is the 4 KiB identity-mapped DMA page just
@@ -1502,7 +1502,7 @@ impl Controller {
             .map_err(|_| NvmeError::OutOfDmaMemory)?;
         // SAFETY: identity-mapped DMA buffer; exclusively owned here.
         unsafe {
-            let base = buf.phys_addr().raw() as *mut u8;
+            let base = buf.dma_addr().raw() as *mut u8;
             for (i, &b) in data.iter().enumerate() {
                 core::ptr::write_volatile(base.add(i), b);
             }
@@ -1514,7 +1514,7 @@ impl Controller {
             secp,
             spsp,
             tl,
-            buf.phys_addr().raw(),
+            buf.dma_addr().raw(),
         );
         // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
         unsafe {
@@ -1555,7 +1555,7 @@ impl Controller {
             secp,
             spsp,
             al,
-            dma.phys_addr().raw(),
+            dma.dma_addr().raw(),
         );
         // SAFETY: admin queue + BAR live; DMA buffer valid for submit duration.
         unsafe {
@@ -1564,7 +1564,7 @@ impl Controller {
         // Copy DMA buffer into caller's slice.
         // SAFETY: identity-mapped DMA page; buf.len() == al.
         unsafe {
-            let base = dma.phys_addr().raw() as *const u8;
+            let base = dma.dma_addr().raw() as *const u8;
             for (i, slot) in buf.iter_mut().enumerate() {
                 *slot = core::ptr::read_volatile(base.add(i));
             }
@@ -1650,7 +1650,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = opcode as u32;
         sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = buf.phys_addr().raw();
+        sqe.prp1 = buf.dma_addr().raw();
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
         sqe.cdw12 = (n_blocks - 1) as u32;
@@ -1778,7 +1778,7 @@ impl Controller {
             let mut sqe = Sqe::zero();
             sqe.cdw0 = opcode as u32;
             sqe.nsid = DEFAULT_NSID;
-            sqe.prp1 = buf.phys_addr().raw();
+            sqe.prp1 = buf.dma_addr().raw();
             sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
             sqe.cdw11 = (lba >> 32) as u32;
             sqe.cdw12 = (n_blocks - 1) as u32;
@@ -1857,7 +1857,7 @@ impl Controller {
         let mut sqe = Sqe::zero();
         sqe.cdw0 = opcode as u32;
         sqe.nsid = DEFAULT_NSID;
-        sqe.prp1 = buf.phys_addr().raw();
+        sqe.prp1 = buf.dma_addr().raw();
         // CDW10/11 = SLBA (64-bit, little-endian split).
         sqe.cdw10 = (lba & 0xFFFF_FFFF) as u32;
         sqe.cdw11 = (lba >> 32) as u32;
@@ -1943,7 +1943,7 @@ impl Controller {
                         core::ptr::write_volatile(entries_ptr.add(i), p.raw());
                     }
                 }
-                sqe.prp2 = buf.phys_addr().raw();
+                sqe.prp2 = buf.dma_addr().raw();
                 _prp_list_keepalive = Some(buf);
             }
         }
@@ -2000,7 +2000,7 @@ fn wait_csts<F: Fn(u32) -> bool>(bar: &MmioRegion, ok: F) -> Result<(), NvmeErro
 /// `buf` must be a live coherent DMA buffer sized for
 /// `ADMIN_Q_DEPTH * 64` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
-    let base = buf.phys_addr().raw() as *mut Sqe;
+    let base = buf.dma_addr().raw() as *mut Sqe;
     // SAFETY: caller guarantees buf is page-aligned and large
     // enough; index is bounded.
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -2016,7 +2016,7 @@ unsafe fn write_sqe(buf: &DmaBuffer, index: u16, sqe: &Sqe) {
 /// `buf` must be a live coherent DMA buffer sized for at least
 /// `index + 1` 16-byte CQEs.
 unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
-    let base = buf.phys_addr().raw() as *const Cqe;
+    let base = buf.dma_addr().raw() as *const Cqe;
     // SAFETY: caller guarantees buf is page-aligned and large enough.
     unsafe { core::ptr::read_volatile(base.add(index as usize)) }
 }
@@ -2028,7 +2028,7 @@ unsafe fn peek_cqe(buf: &DmaBuffer, index: u16) -> Cqe {
 /// `buf` must be a live coherent DMA buffer sized for
 /// `ADMIN_Q_DEPTH * 16` bytes; `index < ADMIN_Q_DEPTH`.
 unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<Cqe, NvmeError> {
-    let base = buf.phys_addr().raw() as *const Cqe;
+    let base = buf.dma_addr().raw() as *const Cqe;
     // responsive_spin_until keeps cursor/FB/serial alive on a slow
     // or stuck controller. 5 s wall-clock budget — NVMe admin
     // commands (IDENTIFY etc.) are sub-millisecond on real hardware;
@@ -2057,7 +2057,7 @@ unsafe fn wait_cqe(buf: &DmaBuffer, index: u16, expected_phase: u16) -> Result<C
 /// `buf` must point to a 4096-byte coherent DMA buffer the controller
 /// has finished writing to (CQE arrived).
 unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
-    let base = buf.phys_addr().raw() as *const u8;
+    let base = buf.dma_addr().raw() as *const u8;
     // SAFETY: 4 KiB DMA buffer; we read in-bounds.
     let read_u16 = |off: usize| -> u16 {
         // SAFETY: same buffer.
@@ -2098,7 +2098,7 @@ unsafe fn parse_identify(buf: &DmaBuffer) -> IdentifyController {
 /// `buf` must be a 4 KiB coherent DMA buffer the controller has
 /// finished writing to (CQE arrived).
 unsafe fn parse_identify_namespace(buf: &DmaBuffer) -> (u64, u32) {
-    let base = buf.phys_addr().raw() as *const u8;
+    let base = buf.dma_addr().raw() as *const u8;
     // SAFETY: 4 KiB DMA buffer.
     let nsze = unsafe { core::ptr::read_volatile(base as *const u64) };
     // SAFETY: same buffer.
@@ -2526,7 +2526,6 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         // recycled page).
         let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        let phys = buf.phys_addr().raw();
         ctrl.read_lba(lba, n_blocks, buf)
             .map_err(|_| narf_block::BlockIoError::DriverError)?;
         // The CQ poll inside `read_lba` is what makes the device's
@@ -2540,11 +2539,7 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         // is coherent DMA memory, not MMIO, and per-byte volatility
         // defeats vectorisation on the hottest path in the system.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
-                out.as_mut_ptr(),
-                need,
-            );
+            core::ptr::copy_nonoverlapping(buf.cpu_ptr::<u8>(), out.as_mut_ptr(), need);
         }
         Ok(())
     }
@@ -2560,17 +2555,12 @@ impl narf_block::BlockDeviceSync for NvmeBlockSync {
         // contents), no IRQ-masking lock across the transfer.
         let mut ctrl = probed_controller().ok_or(narf_block::BlockIoError::DeviceRemoved)?;
         let buf = nvme_scratch().ok_or(narf_block::BlockIoError::DriverError)?;
-        let phys = buf.phys_addr().raw();
         // SAFETY: `phys` is the identity-mapped 4 KiB scratch DMA page;
         // `need` ≤ 4096 (checked above) and `data` is a kernel slice
         // that cannot overlap the DMA page. Bulk copy rather than a
         // per-byte volatile loop — see `read`.
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                need,
-            );
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buf.cpu_mut_ptr::<u8>(), need);
         }
         // Publish the payload before `write_lba` posts the SQE +
         // doorbell that lets the device DMA-read it.

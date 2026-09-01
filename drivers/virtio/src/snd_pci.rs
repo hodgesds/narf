@@ -263,7 +263,7 @@ impl VirtioSoundPci {
             let qsize = 4u16.min(qmax);
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let layout = VirtqueueLayout::new(qsize, buf.phys_addr().raw())
+            let layout = VirtqueueLayout::new(qsize, buf.dma_addr().raw())
                 .ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
             unsafe {
@@ -346,7 +346,7 @@ impl VirtioSoundPci {
         if req.len() > 60 {
             return Err(VirtioPciError::QueueTooSmall);
         }
-        let req_phys = self.ctrl_buf.phys_addr().raw();
+        let req_phys = self.ctrl_buf.dma_addr().raw();
         let resp_phys = req_phys + 64;
         // SAFETY: identity-mapped DMA. Bulk copy — coherent DMA memory,
         // not MMIO; ordering vs. the device comes from the SeqCst fence
@@ -354,7 +354,7 @@ impl VirtioSoundPci {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 req.as_ptr(),
-                narf_memory::PhysAddr::new(req_phys).kernel_mut_ptr::<u8>(),
+                self.ctrl_buf.cpu_mut_ptr::<u8>(),
                 req.len(),
             );
             // Pre-clear the response slot so we can detect a
@@ -532,7 +532,7 @@ impl VirtioSoundPci {
         // 4 KiB scratch. Per-controller, single-outstanding-submit
         // today; concurrency lands when AudioWriter grows a
         // submission ring.
-        let base = self.tx_buf.phys_addr().raw();
+        let base = self.tx_buf.dma_addr().raw();
         let hdr_phys = base;
         let status_phys = base + 4088;
 
@@ -646,7 +646,7 @@ impl VirtioSoundPci {
         // players could interleave their copies into the shared scratch
         // and then serialise only the submits.
         let _gate = ReqGate::acquire(&self.req_gate);
-        let base = self.tx_buf.phys_addr().raw();
+        let base = self.tx_buf.dma_addr().raw();
         let payload_phys = base + 64;
         // SAFETY: identity-mapped scratch DMA; the gate makes the slot
         // ours. Bulk copy — this is the per-PCM-buffer hot path, and a

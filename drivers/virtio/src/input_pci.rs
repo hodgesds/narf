@@ -592,7 +592,7 @@ impl VirtioInputPci {
         }
         let q0_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let layout_e = VirtqueueLayout::new(qsize_e, q0_buf.phys_addr().raw())
+        let layout_e = VirtqueueLayout::new(qsize_e, q0_buf.dma_addr().raw())
             .ok_or(VirtioPciError::QueueTooSmall)?;
         // SAFETY: same.
         unsafe {
@@ -628,7 +628,7 @@ impl VirtioInputPci {
             }
             let q1_buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let layout_s = VirtqueueLayout::new(qsize_s, q1_buf.phys_addr().raw())
+            let layout_s = VirtqueueLayout::new(qsize_s, q1_buf.dma_addr().raw())
                 .ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
             unsafe {
@@ -652,7 +652,7 @@ impl VirtioInputPci {
             // disabled in this branch via status_q_notify_off = None.
             let q1_buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let layout_s = VirtqueueLayout::new(1, q1_buf.phys_addr().raw())
+            let layout_s = VirtqueueLayout::new(1, q1_buf.dma_addr().raw())
                 .ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
             (unsafe { Virtqueue::new(layout_s) }, q1_buf, None)
@@ -679,7 +679,7 @@ impl VirtioInputPci {
         // descriptor heads to the used ring.
         let rx_buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let rx_phys = rx_buf.phys_addr().raw();
+        let rx_phys = rx_buf.dma_addr().raw();
         for i in 0..qsize_e {
             let off = i as u64 * EVENT_SIZE as u64;
             let descs = [VirtqDesc {
@@ -819,7 +819,7 @@ impl VirtioInputPci {
             .led_slot_next
             .fetch_add(1, Ordering::AcqRel)
             .rem_euclid(LED_SLOTS);
-        let phys = self.led_event_buf.phys_addr().raw();
+        let phys = self.led_event_buf.dma_addr().raw();
         let off = slot.checked_mul(8).ok_or(VirtioPciError::QueueTooSmall)?;
         // virtio_input_event { type=EV_LED, code=led_code, value=on }
         let etype = EV_LED;
@@ -926,7 +926,7 @@ impl VirtioInputPci {
     /// Rebinds each freed descriptor as a fresh receive buffer so the
     /// eventQ stays full.
     pub fn drain_events(&self) -> usize {
-        let rx_phys = self.rx_buf.phys_addr().raw();
+        let rx_phys = self.rx_buf.dma_addr().raw();
         let mut g = self.queues.lock();
         let queues = match g.as_mut() {
             Some(q) => q,

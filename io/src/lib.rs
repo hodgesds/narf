@@ -211,7 +211,7 @@ impl fmt::Debug for DmaBuffer {
 /// not a sparse warning.
 ///
 /// It exists because the alternative cost real bugs. While RAM was
-/// identity-mapped, `buf.phys_addr().raw() as *mut u8` both compiled and
+/// identity-mapped, `buf.dma_addr().raw() as *mut u8` both compiled and
 /// worked, so ~220 driver sites dereferenced device addresses directly.
 /// Every one of them became a kernel #PF the moment user address spaces
 /// stopped carrying the identity map.
@@ -271,6 +271,12 @@ impl DmaBuffer {
     #[inline]
     pub fn cpu_mut_ptr<T>(&self) -> *mut T {
         self.phys.kernel_mut_ptr::<T>()
+    }
+
+    /// Const CPU pointer at a byte offset.
+    #[inline]
+    pub fn cpu_ptr_at<T>(&self, offset: u64) -> *const T {
+        crate::PhysAddr::new(self.phys.raw() + offset).kernel_ptr::<T>()
     }
 
     /// CPU pointer at a byte offset — the counterpart to

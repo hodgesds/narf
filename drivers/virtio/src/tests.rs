@@ -1172,7 +1172,7 @@ fn smoke_virtio_balloon_pci_inflate_deflate() -> TestResult {
         Ok(b) => b,
         Err(_) => return TestResult::Fail("alloc_coherent"),
     };
-    let pfn = (buf.phys_addr().raw() >> 12) as u32;
+    let pfn = (buf.dma_addr().raw() >> 12) as u32;
     let pfns = [pfn];
     let r = balloon_pci::with_controller(|c| c.inflate(&pfns));
     match r {

@@ -404,9 +404,9 @@ impl AtlNic {
         // 4a. Pre-fill RFD ring: each slot points at its pooled
         //     buffer. NIC consumes the RFD ring left-to-right; the
         //     RRS ring reports back which RFD slot was used.
-        let rfd_phys = rfd_ring.phys_addr().raw();
+        let rfd_phys = rfd_ring.dma_addr().raw();
         for (i, buf) in rfd_pool.iter().enumerate() {
-            let buf_phys = buf.phys_addr().raw();
+            let buf_phys = buf.dma_addr().raw();
             let d = Rfd {
                 addr_lo: buf_phys as u32,
                 addr_hi: (buf_phys >> 32) as u32,
@@ -427,8 +427,8 @@ impl AtlNic {
         //     offset; the high 32 bits at HEAD_HI. The chip's high-32
         //     of the RFD/RRS bases is shared (a single common DMA
         //     window); we program it on TPD_RING_HEAD_HI.
-        let tpd_phys = tpd_ring.phys_addr().raw();
-        let rrs_phys = rrs_ring.phys_addr().raw();
+        let tpd_phys = tpd_ring.dma_addr().raw();
+        let rrs_phys = rrs_ring.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             mmio.write32(REG_TPD_RING_HEAD, tpd_phys as u32);
@@ -516,19 +516,16 @@ impl AtlNic {
         }
         let mut head_g = self.tpd_head.lock();
         let slot = (*head_g) as usize % TPD_RING_LEN;
-        let buf_phys = self.tpd_pool[slot].phys_addr().raw();
+        let buf_phys = self.tpd_pool[slot].dma_addr().raw();
 
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tpd_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
 
-        let ring_phys = self.tpd_ring.phys_addr().raw();
+        let ring_phys = self.tpd_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring; slot < TPD_RING_LEN.
@@ -597,7 +594,7 @@ impl AtlNic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rrs_head.lock();
         let slot = (*head_g) as usize % RRS_RING_LEN;
-        let ring_phys = self.rrs_ring.phys_addr().raw();
+        let ring_phys = self.rrs_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
@@ -623,7 +620,6 @@ impl AtlNic {
             *head_g = (*head_g + 1) % (RRS_RING_LEN as u32);
             return None;
         }
-        let buf_phys = self.rfd_pool[rfd_slot].phys_addr().raw();
 
         let copy_len = len.min(RX_BUF_LEN);
         let mut out = alloc::vec::Vec::with_capacity(copy_len);
@@ -634,9 +630,7 @@ impl AtlNic {
             // wrote the bytes via DMA.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             out.push(unsafe {
-                core::ptr::read_volatile(
-                    narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
-                )
+                core::ptr::read_volatile(self.rfd_pool[rfd_slot].cpu_ptr_at::<u8>(i as u64))
             });
         }
 

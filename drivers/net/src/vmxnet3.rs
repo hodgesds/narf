@@ -194,7 +194,7 @@ impl Vmxnet3Nic {
         )
         .map_err(|_| Vmxnet3Error::NoMemory)?;
         // SAFETY: alloc_coherent returns a zeroed identity-mapped page.
-        let shared_ptr = shared.phys_addr().raw() as *mut Vmxnet3DriverShared;
+        let shared_ptr = shared.dma_addr().raw() as *mut Vmxnet3DriverShared;
         // SAFETY: shared_ptr fits an identity-mapped DMA page sized
         // for sizeof::<Vmxnet3DriverShared>().
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -249,9 +249,9 @@ impl Vmxnet3Nic {
         //    the device flips its GEN and writes a comp-ring entry.
         //    Stage 2: gen = 1 on every initial slot (per
         //    `VMXNET3_INIT_GEN`).
-        let rx_ring1_pa = rx_ring1.phys_addr().raw();
+        let rx_ring1_pa = rx_ring1.dma_addr().raw();
         for (i, buf) in rx_buffers.iter().enumerate().take(RX_RING_LEN) {
-            let buf_pa = buf.phys_addr().raw();
+            let buf_pa = buf.dma_addr().raw();
             // len in low 14 bits, btype HEAD (=0), gen=1.
             let len = (RX_BUF_LEN as u32) & RXD_LEN_MASK;
             let gen: u32 = 1 << RXD_GEN_SHIFT;
@@ -274,7 +274,7 @@ impl Vmxnet3Nic {
         //    table phys addr + queue/ring sizes, devRead.intrConf
         //    with a single auto-mask vector, and the queue-desc
         //    table itself with the ring-base PAs.
-        let queue_desc_pa = queue_desc.phys_addr().raw();
+        let queue_desc_pa = queue_desc.dma_addr().raw();
         // SAFETY: identity-mapped DMA page. devRead lives at offset
         // 8 of Vmxnet3DriverShared (after magic + size).
         // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -284,7 +284,7 @@ impl Vmxnet3Nic {
             (*shared_ptr).devRead.misc.driverInfo.vmxnet3RevSpt = 1u32.to_le();
             (*shared_ptr).devRead.misc.driverInfo.uptVerSpt = 1u32.to_le();
             (*shared_ptr).devRead.misc.uptFeatures = 0u64.to_le();
-            (*shared_ptr).devRead.misc.ddPA = shared.phys_addr().raw().to_le();
+            (*shared_ptr).devRead.misc.ddPA = shared.dma_addr().raw().to_le();
             (*shared_ptr).devRead.misc.queueDescPA = queue_desc_pa.to_le();
             (*shared_ptr).devRead.misc.ddLen =
                 (core::mem::size_of::<Vmxnet3DriverShared>() as u32).to_le();
@@ -321,9 +321,9 @@ impl Vmxnet3Nic {
         // SAFETY: identity-mapped DMA page sized for both descs.
         unsafe {
             let txqd = queue_desc_pa as *mut Vmxnet3TxQueueDesc;
-            (*txqd).conf.txRingBasePA = tx_ring.phys_addr().raw().to_le();
+            (*txqd).conf.txRingBasePA = tx_ring.dma_addr().raw().to_le();
             (*txqd).conf.dataRingBasePA = 0;
-            (*txqd).conf.compRingBasePA = tx_comp_ring.phys_addr().raw().to_le();
+            (*txqd).conf.compRingBasePA = tx_comp_ring.dma_addr().raw().to_le();
             (*txqd).conf.ddPA = 0;
             (*txqd).conf.txRingSize = (TX_RING_LEN as u32).to_le();
             (*txqd).conf.dataRingSize = 0;
@@ -334,9 +334,9 @@ impl Vmxnet3Nic {
 
             let rxqd = (queue_desc_pa + core::mem::size_of::<Vmxnet3TxQueueDesc>() as u64)
                 as *mut Vmxnet3RxQueueDesc;
-            (*rxqd).conf.rxRingBasePA[0] = rx_ring1.phys_addr().raw().to_le();
-            (*rxqd).conf.rxRingBasePA[1] = rx_ring2.phys_addr().raw().to_le();
-            (*rxqd).conf.compRingBasePA = rx_comp_ring.phys_addr().raw().to_le();
+            (*rxqd).conf.rxRingBasePA[0] = rx_ring1.dma_addr().raw().to_le();
+            (*rxqd).conf.rxRingBasePA[1] = rx_ring2.dma_addr().raw().to_le();
+            (*rxqd).conf.compRingBasePA = rx_comp_ring.dma_addr().raw().to_le();
             (*rxqd).conf.ddPA = 0;
             (*rxqd).conf.rxDataRingBasePA = 0;
             (*rxqd).conf.rxRingSize[0] = (RX_RING_LEN as u32).to_le();
@@ -350,7 +350,7 @@ impl Vmxnet3Nic {
         // 10. Publish the DriverShared phys addr split into DSAL/DSAH.
         //     The device latches these on the next CMD write, so the
         //     order matters: DSAL first, DSAH second, then CMD.
-        let shared_pa = shared.phys_addr().raw();
+        let shared_pa = shared.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             vd.write32(REG_DSAL, (shared_pa & 0xFFFF_FFFF) as u32);
@@ -533,7 +533,7 @@ impl Vmxnet3Nic {
 
         // Step 3: re-publish DriverShared PA into DSAL/DSAH (cleared
         // by RESET_DEV) and re-activate.
-        let shared_pa = self.shared.phys_addr().raw();
+        let shared_pa = self.shared.dma_addr().raw();
         // SAFETY: identity-mapped MMIO.
         unsafe {
             self.vd.write32(REG_DSAL, (shared_pa & 0xFFFF_FFFF) as u32);
@@ -558,7 +558,7 @@ impl Vmxnet3Nic {
         //       cpu_to_le32(~VMXNET3_IC_DISABLE_ALL);
         // Must happen after ACTIVATE_DEV so the device sees the
         // updated intrCtrl on its next shared-memory read.
-        let shared_ptr = self.shared.phys_addr().raw() as *mut Vmxnet3DriverShared;
+        let shared_ptr = self.shared.dma_addr().raw() as *mut Vmxnet3DriverShared;
         // SAFETY: identity-mapped DMA; shared struct lifetime ≥ self.
         unsafe {
             let ctrl = (*shared_ptr).devRead.intrConf.intrCtrl;

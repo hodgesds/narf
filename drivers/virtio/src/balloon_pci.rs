@@ -134,7 +134,7 @@ impl VirtioBalloonPci {
             let qsize = 4u16.min(qmax);
             let buf = alloc_coherent(4096, DomainId::DRIVER_0)
                 .map_err(|_| VirtioPciError::BarMapFailed)?;
-            let layout = VirtqueueLayout::new(qsize, buf.phys_addr().raw())
+            let layout = VirtqueueLayout::new(qsize, buf.dma_addr().raw())
                 .ok_or(VirtioPciError::QueueTooSmall)?;
             // SAFETY: same.
             unsafe {
@@ -228,7 +228,7 @@ impl VirtioBalloonPci {
             ),
             _ => return Err(VirtioPciError::NoQueues),
         };
-        let phys = buf.phys_addr().raw();
+        let phys = buf.dma_addr().raw();
         // SAFETY: identity-mapped scratch DMA, single-flight per queue.
         unsafe {
             for (i, p) in pfns.iter().enumerate() {

@@ -331,14 +331,10 @@ impl VirtioConsolePci {
         // can deliver bytes immediately.
         let rx_pool =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let rx_pool_phys = rx_pool.phys_addr().raw();
+        let rx_pool_phys = rx_pool.dma_addr().raw();
         // SAFETY: page-sized DMA buffer.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(rx_pool_phys).kernel_mut_ptr::<u8>(),
-                0,
-                4096,
-            );
+            core::ptr::write_bytes(rx_pool.cpu_mut_ptr::<u8>(), 0, 4096);
         }
 
         let mut rx_q_lock = IrqSafeSpinLock::new(Some(rx_q));
@@ -434,14 +430,11 @@ impl VirtioConsolePci {
         // Stage payload in a fresh DMA page.
         let buf =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let phys = buf.phys_addr().raw();
+        let phys = buf.dma_addr().raw();
         // SAFETY: page-sized DMA buffer.
         unsafe {
             for (i, &b) in data.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    b,
-                );
+                core::ptr::write_volatile(buf.cpu_mut_ptr_at::<u8>(i as u64), b);
             }
         }
         // TX descriptor: device-readable (no F_WRITE).
@@ -504,7 +497,7 @@ impl VirtioConsolePci {
         if out.is_empty() {
             return Ok(0);
         }
-        let pool_phys = self.rx_pool.phys_addr().raw();
+        let pool_phys = self.rx_pool.dma_addr().raw();
         let mut written = 0usize;
 
         loop {
@@ -534,9 +527,8 @@ impl VirtioConsolePci {
             // SAFETY: identity-mapped DMA buffer; offset in-pool.
             unsafe {
                 for i in 0..n {
-                    out[written + i] = core::ptr::read_volatile(
-                        narf_memory::PhysAddr::new(pool_phys + off + i as u64).kernel_ptr::<u8>(),
-                    );
+                    out[written + i] =
+                        core::ptr::read_volatile(self.rx_pool.cpu_ptr_at::<u8>(off + i as u64));
                 }
             }
             written += n;
@@ -586,7 +578,7 @@ unsafe fn setup_queue(
 
     let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
     let layout =
-        VirtqueueLayout::new(qsize, buf.phys_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
+        VirtqueueLayout::new(qsize, buf.dma_addr().raw()).ok_or(VirtioPciError::QueueTooSmall)?;
 
     // SAFETY: identity-mapped MMIO.
     unsafe {

@@ -197,7 +197,7 @@ impl VirtioMemPci {
         }
         let queue_dma =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| VirtioPciError::BarMapFailed)?;
-        let layout = VirtqueueLayout::new(qsize.max(2), queue_dma.phys_addr().raw())
+        let layout = VirtqueueLayout::new(qsize.max(2), queue_dma.dma_addr().raw())
             .ok_or(VirtioPciError::QueueTooSmall)?;
         // SAFETY: fixed queue fields for selected queue 0.
         unsafe {
@@ -297,7 +297,7 @@ impl VirtioMemPci {
     }
 
     fn request(&self, request_type: u16, addr: u64) -> Result<u16, VirtioMemError> {
-        let phys = self.request_dma.phys_addr().raw();
+        let phys = self.request_dma.dma_addr().raw();
         let ptr = self.request_dma.as_mut_ptr();
         // Request at +0 (24 bytes), response at +64 (8 bytes).
         // SAFETY: page-sized coherent scratch is single-flight under the

@@ -452,7 +452,7 @@ impl RtlNic {
         //     descriptor's EOR bit is set lazily on first transmit —
         //     it's safe to leave the ring in all-zero (host-owned)
         //     state since we touch slot 0 first and walk linearly.
-        let tx_phys = tx_ring.phys_addr().raw();
+        let tx_phys = tx_ring.dma_addr().raw();
         // SAFETY: identity-mapped MMIO. RDSAR / TNPDS take a 64-bit
         // value; per §2.20 the spec splits it as low-32 at offset+0
         // and high-32 at offset+4.
@@ -468,9 +468,9 @@ impl RtlNic {
         //     buffer + has BufferSize=RX_BUF_LEN + OWN=1 so the NIC
         //     can DMA into it. Slot RING_LEN-1 carries EOR so the
         //     internal ring pointer wraps correctly.
-        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let rx_ring_phys = rx_ring.dma_addr().raw();
         for (i, buf) in rx_pool.iter().enumerate().take(RING_LEN) {
-            let buf_phys = buf.phys_addr().raw();
+            let buf_phys = buf.dma_addr().raw();
             let mut flags = RXD_OWN | (RX_BUF_LEN as u32 & 0x3FFF);
             if i == RING_LEN - 1 {
                 flags |= RXD_EOR;
@@ -611,17 +611,14 @@ impl RtlNic {
         // Persistent per-slot buffer (audit #4); index by slot.
         let mut head_g = self.tx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let phys = self.tx_pool[slot].phys_addr().raw();
+        let phys = self.tx_pool[slot].dma_addr().raw();
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
-                    *b,
-                );
+                core::ptr::write_volatile(self.tx_pool[slot].cpu_mut_ptr_at::<u8>(i as u64), *b);
             }
         }
-        let ring_phys = self.tx_ring.phys_addr().raw();
+        let ring_phys = self.tx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // Make sure the slot is ours before we scribble. If OWN is
@@ -726,7 +723,7 @@ impl RtlNic {
     pub fn receive(&self) -> Option<alloc::vec::Vec<u8>> {
         let mut head_g = self.rx_head.lock();
         let slot = (*head_g) as usize % RING_LEN;
-        let ring_phys = self.rx_ring.phys_addr().raw();
+        let ring_phys = self.rx_ring.dma_addr().raw();
         let desc_addr = ring_phys + (slot * 16) as u64;
 
         // SAFETY: identity-mapped DMA ring.
@@ -743,7 +740,7 @@ impl RtlNic {
         // We require LS to be set, otherwise we'd have a multi-
         // segment packet — Stage-4 drops those.
         let len = (flags_len & 0x3FFF) as usize;
-        let buf_phys = self.rx_pool[slot].phys_addr().raw();
+        let buf_phys = self.rx_pool[slot].dma_addr().raw();
 
         let mut out = alloc::vec::Vec::with_capacity(len.min(RX_BUF_LEN));
         if flags_len & RXD_LS != 0 {
@@ -754,9 +751,7 @@ impl RtlNic {
                 // `i < copy_len <= RX_BUF_LEN`, so `buf_phys + i` is in range.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
                 out.push(unsafe {
-                    core::ptr::read_volatile(
-                        narf_memory::PhysAddr::new(buf_phys + i as u64).kernel_ptr::<u8>(),
-                    )
+                    core::ptr::read_volatile(self.rx_pool[slot].cpu_ptr_at::<u8>(i as u64))
                 });
             }
         }
@@ -849,7 +844,7 @@ impl RtlNic {
         {
             let mut head_g = self.tx_head.lock();
             slot = (*head_g) as usize % RING_LEN;
-            phys = self.tx_pool[slot].phys_addr().raw();
+            phys = self.tx_pool[slot].dma_addr().raw();
             // SAFETY: identity-mapped DMA buffer; bounds-checked by
             // FrameTooLong guard.
             // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -861,7 +856,7 @@ impl RtlNic {
                     );
                 }
             }
-            desc_addr = self.tx_ring.phys_addr().raw() + (slot * 16) as u64;
+            desc_addr = self.tx_ring.dma_addr().raw() + (slot * 16) as u64;
             // SAFETY: identity-mapped DMA ring.
             let cur_flags = unsafe {
                 core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr).kernel_ptr::<u32>())

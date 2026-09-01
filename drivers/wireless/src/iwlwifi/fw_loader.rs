@@ -111,7 +111,7 @@ impl DmaAllocator for DmaAllocatorImpl {
         let buf = narf_io::alloc_coherent(size, narf_lib::id::DomainId::DRIVER_0)
             .expect("iwlwifi: failed to allocate coherent DMA memory");
         let ptr = buf.as_mut_ptr();
-        let phys = buf.phys_addr().as_u64();
+        let phys = buf.dma_addr().raw();
         self.buffers.push(buf);
         (ptr, phys)
     }
