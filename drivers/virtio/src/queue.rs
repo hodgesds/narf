@@ -171,9 +171,13 @@ impl Virtqueue {
         // fit within PAGE_SIZE; the buffer is owned by the caller.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_bytes(layout.desc_table as *mut u8, 0, total as usize);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(layout.desc_table).kernel_mut_ptr::<u8>(),
+                0,
+                total as usize,
+            );
         }
-        let desc = layout.desc_table as *mut VirtqDesc;
+        let desc = narf_memory::PhysAddr::new(layout.desc_table).kernel_mut_ptr::<VirtqDesc>();
         // Initialise free descriptors stack.
         for i in 0..(layout.capacity - 1) {
             // SAFETY: `desc` points at the descriptor table that
@@ -207,14 +211,21 @@ impl Virtqueue {
         self.event_idx = on;
     }
 
+    // `layout.*` are DEVICE addresses — they are what gets programmed into
+    // the queue registers (`write64_split(CC_QUEUE_DESC, layout.desc_table)`),
+    // so they must stay physical there. The CPU cannot dereference them
+    // directly: virtio I/O runs on whatever address space the calling task
+    // has, and user address spaces no longer carry the low identity map.
+    // Casting these to pointers faulted the moment a userspace process drove
+    // the NIC — `netserve: accepted connection` then #PF in `poll_used`.
     fn desc_table(&self) -> *mut VirtqDesc {
-        self.layout.desc_table as *mut _
+        narf_memory::PhysAddr::new(self.layout.desc_table).kernel_mut_ptr::<VirtqDesc>()
     }
     fn avail_base(&self) -> *mut u16 {
-        self.layout.avail_ring as *mut _
+        narf_memory::PhysAddr::new(self.layout.avail_ring).kernel_mut_ptr::<u16>()
     }
     fn used_base(&self) -> *mut u16 {
-        self.layout.used_ring as *mut _
+        narf_memory::PhysAddr::new(self.layout.used_ring).kernel_mut_ptr::<u16>()
     }
 
     fn alloc_desc(&mut self) -> Option<u16> {
