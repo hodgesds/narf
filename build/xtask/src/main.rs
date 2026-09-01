@@ -8916,3 +8916,86 @@ fn host_test_cmd() -> Result<()> {
     }
     Ok(())
 }
+
+/// Source guard: the DEVICE address must never be dereferenced.
+///
+/// `DmaAddr::raw()` has to yield a `u64` — device registers and descriptor
+/// fields need the integer — and any `u64` casts to a pointer, so the type
+/// system cannot forbid `buf.dma_addr().raw() as *mut T` on its own. This
+/// test forbids it instead.
+///
+/// It exists because 36 sites did exactly that. They work by accident on
+/// the kernel CR3 (PML4[0] still identity-maps RAM there) and fault under
+/// a user CR3, which is where driver I/O runs when serving a userspace
+/// process. Worse, the shape reads as deliberate: `phys_addr().raw() as
+/// *mut u8` looked suspect, `dma_addr().raw() as *mut u8` does not.
+///
+/// The CPU-side spelling is `cpu_ptr` / `cpu_mut_ptr` / `_at`.
+#[cfg(test)]
+mod dma_addr_source_guard {
+    use std::path::{Path, PathBuf};
+
+    fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if p.is_dir() {
+                // `target/` is build output; `.git` is not source.
+                if name != "target" && name != ".git" {
+                    rust_sources(&p, out);
+                }
+            } else if name.ends_with(".rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    fn device_address_is_never_dereferenced() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("xtask manifest dir has a workspace grandparent")
+            .to_path_buf();
+        let mut files = Vec::new();
+        rust_sources(&root, &mut files);
+        assert!(
+            files.len() > 100,
+            "source scan found only {} files — the walk is broken, not the tree",
+            files.len()
+        );
+
+        let mut offenders = Vec::new();
+        for f in &files {
+            let Ok(text) = std::fs::read_to_string(f) else {
+                continue;
+            };
+            for (i, line) in text.lines().enumerate() {
+                let t = line.trim_start();
+                // Prose, not code: the pattern is quoted in the docs that
+                // explain why it is banned (here and on `DmaAddr` itself).
+                if t.starts_with("//") || t.starts_with('*') {
+                    continue;
+                }
+                // Split so this line does not itself match the scan.
+                if line.contains(concat!("dma_addr().raw()", " as *")) {
+                    offenders.push(format!(
+                        "{}:{}: {}",
+                        f.strip_prefix(&root).unwrap_or(f).display(),
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the DEVICE address was cast to a pointer — use cpu_ptr/cpu_mut_ptr \
+             for CPU access; dma_addr() is what the hardware dereferences:\n{}",
+            offenders.join("\n")
+        );
+    }
+}
