@@ -4303,7 +4303,16 @@ fn boot_userspace_init() {
         let _ = narf_scheduler::poll_one_round();
         IN_FLIGHT.store(false, Ordering::Release);
     }
-    narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+    // `no_step_pump` skips the nested poll_one_round pump (runs in the idle
+    // wake→dispatch hop) — A/B knob for the redis PING p99 tail.
+    if !narf_boot::args().has_flag("no_step_pump") {
+        narf_userspace::handlers::sleep_pumps::register(scheduler_step_pump);
+    } else {
+        let _ = writeln!(
+            console::Writer,
+            "  no_step_pump: scheduler step pump SKIPPED"
+        );
+    }
 
     // Drain any RX bytes the platform UART has queued (typed bytes
     // via `qemu -serial stdio`, or a real serial console on bare
@@ -4329,8 +4338,17 @@ fn boot_userspace_init() {
     // user task parks in sys_sleep. The IRQ path below is the
     // primary delivery mechanism; the pump catches anything
     // that slips past (e.g. on systems where IRQ 4 routing
-    // failed).
-    narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
+    // failed). `no_serial_pump` skips it: the pump's LSR `inb(0x3FD)`
+    // is a userspace PIO VM-exit taking QEMU's BQL on every idle park
+    // (~1/request) — a suspect for the redis PING p99 tail. A/B knob.
+    if !narf_boot::args().has_flag("no_serial_pump") {
+        narf_userspace::handlers::sleep_pumps::register(serial_input_pump);
+    } else {
+        let _ = writeln!(
+            console::Writer,
+            "  no_serial_pump: serial input pump SKIPPED"
+        );
+    }
 
     // Real IRQ-driven serial RX: install a handler at ISA IRQ 4
     // (COM1's standard line), route the GSI through the IOAPIC,
