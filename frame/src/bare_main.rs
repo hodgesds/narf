@@ -1264,6 +1264,27 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             excludes.extend_from_slice(&kernel_exclude);
             excludes.extend(huge_excludes.iter().copied());
 
+            // Keep the initramfs out of the buddy.
+            //
+            // `narf_initramfs` parses the CPIO in place and leaks a `&'static`
+            // view of it: every entry's name AND contents are borrowed from
+            // these physical frames for the life of the kernel. Nothing was
+            // reserving them, so the buddy handed them out and the archive was
+            // overwritten under us. The corruption is size-dependent, which is
+            // why it hid for so long -- a small archive can survive by luck,
+            // while a larger one loses pages. Symptoms were a staged binary
+            // that boot-time enumeration listed correctly but `execve` could
+            // not find (clobbered name), and a large binary that loaded and ran
+            // but whose .data read back as zeroes (clobbered mid-file page) --
+            // the latter looked exactly like a loader bug.
+            if let Some(r) = info.initramfs {
+                let lo = r.start.raw() & !0xFFF;
+                let hi = (r.start.raw() + r.len + 0xFFF) & !0xFFF;
+                if hi > lo {
+                    excludes.push((lo, hi));
+                }
+            }
+
             // KASAN: reserve a flat shadow byte-array (1 byte / 8 memory
             // bytes) covering [0, ram_top) out of the buddy, so the software
             // outline check (memory/src/kasan.rs) can poison freed slab
@@ -1456,11 +1477,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     true,
                                 )
                             };
-                            if restaged.is_err() {
-                                let _ = writeln!(
-                                    console::Writer,
-                                    "  initramfs: direct-map re-stage FAILED"
-                                );
+                            match restaged {
+                                Ok(()) => {
+                                    let n = narf_initramfs::staged()
+                                        .map(|f| f.iter_files().count())
+                                        .unwrap_or(0);
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  initramfs: re-staged via direct map, {n} file(s)"
+                                    );
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(
+                                        console::Writer,
+                                        "  initramfs: direct-map re-stage FAILED: {e:?}"
+                                    );
+                                }
                             }
                         }
 
