@@ -775,6 +775,39 @@ mod perf_dump {
         }
         let mut g = PMUC.lock();
         if g.is_none() {
+            // One-shot diagnostic: why are the hardware counters zero under KVM?
+            static PMU_DIAG: core::sync::atomic::AtomicBool =
+                core::sync::atomic::AtomicBool::new(false);
+            if !PMU_DIAG.swap(true, Ordering::Relaxed) {
+                // SAFETY: CPL=0; leaf 0 + ext leaf 1 always defined on x86_64.
+                let (v, ext, arch) = unsafe {
+                    (
+                        core::arch::x86_64::__cpuid(0),
+                        core::arch::x86_64::__cpuid(0x8000_0001),
+                        core::arch::x86_64::__cpuid(0x0A),
+                    )
+                };
+                use core::fmt::Write as _;
+                // SAFETY: CPL=0; ext leaf 0x80000022 (PerfMonV2) query is
+                // always safe — returns zeros if unimplemented.
+                let ext22 = unsafe { core::arch::x86_64::__cpuid(0x8000_0022) };
+                let (v2, ctl_rb, gctl_rb, delta) = pmu::amd_kvm_selftest();
+                let _ = writeln!(
+                    narf_console::TrapWriter,
+                    "PMU-DIAG detect={} vendor_ebx={:#x} ext1_ecx={:#x} perfctr_core={} arch_pmu_eax={:#x} v2_cpuid_eax={:#x}",
+                    pmu::detect().is_some(),
+                    v.ebx,
+                    ext.ecx,
+                    (ext.ecx >> 23) & 1,
+                    arch.eax,
+                    ext22.eax
+                );
+                let _ = writeln!(
+                    narf_console::TrapWriter,
+                    "PMU-SELFTEST v2={} ctl_readback={:#x} global_ctl_readback={:#x} counter_delta={}",
+                    v2, ctl_rb, gctl_rb, delta
+                );
+            }
             // SAFETY: tick handler runs at CPL=0; single-CPU init.
             unsafe {
                 if let (Ok(a), Ok(b), Ok(c), Ok(d)) = (
