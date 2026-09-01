@@ -599,6 +599,13 @@ pub(crate) struct WakeCell {
     /// The owning task's id, so the raw waker can name it as its CPU's
     /// wake-next buddy (see [`record_wake_next`]). Immutable after creation.
     task: u64,
+    /// Instrument (boot flag `wake_race`): the cycle a wake flipped `flag`
+    /// false→true, and the value of `HALT_GEN[home]` at that instant. Read at
+    /// dispatch to measure wake→run latency and whether a HLT intervened (a
+    /// lost-wakeup) vs the task merely waiting extra passes (pure ordering).
+    /// Zero when never externally woken. Off-path unless `wake_race` is set.
+    wake_cyc: AtomicU64,
+    wake_halt_gen: AtomicU64,
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -624,6 +631,95 @@ static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 /// lost wake).
 static NEED_RESCHED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+// ── Wake→run race instrument (boot flag `wake_race`) ────────────────────
+// Nails the redis in-guest p99 tail: is a just-woken task's dispatch delayed
+// because the executor HLTed despite it being runnable (LOST-WAKEUP), or
+// because it simply waited extra round-robin passes (PURE ORDERING)? Every
+// external wake stamps the wake cycle + this CPU's HALT_GEN; dispatch measures
+// wake→run latency and whether HALT_GEN advanced (a real HLT ran in between).
+// Default off — a single relaxed load gates the hot wake/dispatch paths.
+static WAKE_RACE_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Per-CPU count of committed idle HLTs (`idle_halt_then_disable`). Bumped once
+/// per real halt so a wake→dispatch that spans a halt is detectable.
+static HALT_GEN: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// wake→run latency buckets (µs): <1,<5,<10,<25,<50,<100,<150,<200,<300,>=300.
+const WR_BOUNDS_US: [u64; 9] = [1, 5, 10, 25, 50, 100, 150, 200, 300];
+static WR_HIST: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+/// Of the samples in each bucket, how many spanned ≥1 HLT (lost-wakeup).
+static WR_HIST_HALTED: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static WR_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static WR_MAX_US: AtomicU64 = AtomicU64::new(0);
+const WR_DUMP_EVERY: u64 = 20_000;
+
+/// Enable the wake→run race instrument (boot param `wake_race`).
+pub fn enable_wake_race() {
+    WAKE_RACE_ENABLED.store(true, Ordering::Release);
+}
+
+/// Wake side: stamp the false→true transition with the wake cycle + the home
+/// CPU's current HALT_GEN. `home` is the wake's target CPU.
+#[inline]
+fn wake_race_stamp(cell: &WakeCell, home: u32) {
+    if !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    cell.wake_cyc
+        .store(narf_time::now_cycles(), Ordering::Relaxed);
+    let g = if (home as usize) < HALT_GEN.len() {
+        HALT_GEN[home as usize].load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    cell.wake_halt_gen.store(g, Ordering::Relaxed);
+}
+
+/// Dispatch side: a slot with a set awake flag is about to run on `cpu`. Record
+/// wake→run latency and whether a HLT intervened since the wake.
+#[inline]
+fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
+    if !WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let w = cell.wake_cyc.swap(0, Ordering::Relaxed);
+    if w == 0 {
+        return;
+    }
+    let now = narf_time::now_cycles();
+    let us = narf_time::cycles_to_ns(now.wrapping_sub(w)) / 1000;
+    let halted = cpu < HALT_GEN.len()
+        && HALT_GEN[cpu].load(Ordering::Relaxed) != cell.wake_halt_gen.load(Ordering::Relaxed);
+    let mut idx = WR_BOUNDS_US.len();
+    for (i, b) in WR_BOUNDS_US.iter().enumerate() {
+        if us < *b {
+            idx = i;
+            break;
+        }
+    }
+    WR_HIST[idx].fetch_add(1, Ordering::Relaxed);
+    if halted {
+        WR_HIST_HALTED[idx].fetch_add(1, Ordering::Relaxed);
+    }
+    WR_MAX_US.fetch_max(us, Ordering::Relaxed);
+    let n = WR_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % WR_DUMP_EVERY == 0 {
+        let mut c = [0u64; 10];
+        let mut h = [0u64; 10];
+        for i in 0..10 {
+            c[i] = WR_HIST[i].load(Ordering::Relaxed);
+            h[i] = WR_HIST_HALTED[i].load(Ordering::Relaxed);
+        }
+        // Each bucket prints total(halted). A tail bucket with halted≈total ⇒
+        // lost-wakeup; halted≈0 ⇒ pure round-robin ordering.
+        narf_console::klog!(
+            "[wake_race] n={} <1:{}({}) <5:{}({}) <10:{}({}) <25:{}({}) <50:{}({}) <100:{}({}) <150:{}({}) <200:{}({}) <300:{}({}) >=300:{}({}) max={}us",
+            n, c[0],h[0], c[1],h[1], c[2],h[2], c[3],h[3], c[4],h[4],
+            c[5],h[5], c[6],h[6], c[7],h[7], c[8],h[8], c[9],h[9],
+            WR_MAX_US.load(Ordering::Relaxed)
+        );
+    }
+}
 
 /// Per-CPU periodic-budget boundaries for the currently polling slot. Zero
 /// means no period budget. The timer trap reads these without touching the
@@ -1934,6 +2030,8 @@ where
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
             task: id.raw(),
+            wake_cyc: AtomicU64::new(0),
+            wake_halt_gen: AtomicU64::new(0),
         }),
         id,
         spec,
@@ -1993,6 +2091,8 @@ where
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(cpu as u32),
             task: id.raw(),
+            wake_cyc: AtomicU64::new(0),
+            wake_halt_gen: AtomicU64::new(0),
         }),
         id,
         spec,
@@ -2214,6 +2314,8 @@ where
             flag: AtomicBool::new(true),
             cpu: AtomicU32::new(0),
             task: id.raw(),
+            wake_cyc: AtomicU64::new(0),
+            wake_halt_gen: AtomicU64::new(0),
         }),
         id,
         spec,
@@ -2716,11 +2818,14 @@ unsafe fn wake_raw(data: *const ()) {
     // wake-by-value: consume the Arc.
     // SAFETY: same as clone_raw; we own the refcount handed to us.
     let arc = unsafe { Arc::<WakeCell>::from_raw(data as *const WakeCell) };
-    arc.flag.store(true, Ordering::Release);
+    let prev_awake = arc.flag.swap(true, Ordering::Release);
     // Kick the owner's CPU if it's idle on another core (else the awake
     // bit waits until that CPU's next timer tick — the cross-core wake
     // tail). `resched_remote` no-ops for same-CPU / running targets.
     let home = arc.cpu.load(Ordering::Acquire);
+    if !prev_awake {
+        wake_race_stamp(&arc, home);
+    }
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
     record_wake_next(home, arc.task);
@@ -2733,10 +2838,14 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
     // SAFETY: Valid memory or trusted environment
-    let (home, task) = unsafe {
-        (*ptr).flag.store(true, Ordering::Release);
-        ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task)
+    let (home, task, prev_awake) = unsafe {
+        let prev = (*ptr).flag.swap(true, Ordering::Release);
+        ((*ptr).cpu.load(Ordering::Acquire), (*ptr).task, prev)
     };
+    if !prev_awake {
+        // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
+        unsafe { wake_race_stamp(&*ptr, home) };
+    }
     // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
     record_wake_next(home, task);
     resched_remote(home);
@@ -3194,6 +3303,8 @@ pub fn run_until_empty() {
                 enqueue_after_poll(cpu, slot);
                 continue;
             }
+            // Instrument: measure this wake→run gap + whether a HLT intervened.
+            wake_race_dispatch(&slot.awake, cpu);
             // This is the first point at which idle has become execution:
             // merely receiving an IRQ or running maintenance does not make a
             // CPU active from a scheduling-policy perspective.
@@ -3827,6 +3938,12 @@ pub fn run_until_empty() {
                     unsafe {
                         narf_arch::idle_halt_then_disable();
                     }
+                    // Instrument: a real HLT just completed on this CPU. A
+                    // wake→dispatch that spans this bump ran despite the CPU
+                    // idling = lost-wakeup (vs pure round-robin ordering).
+                    if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+                        HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
@@ -3840,6 +3957,11 @@ pub fn run_until_empty() {
                 // IF=0 (no user-task-SMP) spin — both handled by `idle_wait`,
                 // which doesn't HLT-through-an-IPI, so the race doesn't apply.
                 idle_wait(next_deadline);
+                // Instrument: count this fallback idle as a halt too, so a
+                // wake→dispatch spanning it can't be misclassified non-halted.
+                if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+                    HALT_GEN[cpu].fetch_add(1, Ordering::Relaxed);
+                }
                 CPU_HALTED[cpu].store(false, Ordering::SeqCst);
                 narf_memory::tlb_shootdown::mark_busy(cpu as u32);
             }
@@ -4622,6 +4744,8 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         cpu: AtomicU32::new(narf_lib::percpu::current_cpu() as u32),
         // Nested block_on future: not a ready-queue slot, so no wake-next id.
         task: 0,
+        wake_cyc: AtomicU64::new(0),
+        wake_halt_gen: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

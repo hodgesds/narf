@@ -2077,6 +2077,7 @@ dependencies = [
  "narf-acpi",
  "narf-arch",
  "narf-capabilities",
+ "narf-console",
  "narf-kernel-test",
  "narf-lib",
  "narf-memory",

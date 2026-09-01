@@ -3936,6 +3936,16 @@ fn run_async_demo() -> ! {
                 "  tx_always_kick: latency-first TX ENABLED"
             );
         }
+        // Diagnostic: wake→run race — is a woken task's dispatch delayed by a
+        // lost-wakeup (executor HLTed with it runnable) or pure round-robin
+        // ordering? Prints a latency×halted histogram to serial periodically.
+        if narf_boot::args().has_flag("wake_race") {
+            narf_scheduler::enable_wake_race();
+            let _ = writeln!(
+                console::Writer,
+                "  wake_race: wake→run race instrument ENABLED"
+            );
+        }
         // Diagnostic: RX→TX in-guest latency histogram (localizes the redis p99
         // tail to NARF-inbound vs host-side). Prints to serial periodically.
         if narf_boot::args().has_flag("rxtx_hist") {
