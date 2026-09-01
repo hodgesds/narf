@@ -698,9 +698,31 @@ static WR_SAMPLES: AtomicU64 = AtomicU64::new(0);
 static WR_MAX_US: AtomicU64 = AtomicU64::new(0);
 const WR_DUMP_EVERY: u64 = 20_000;
 
+/// One specific task id (0 = none) whose wake→run samples are ALSO recorded in
+/// a SEPARATE histogram, so a single hot task (e.g. the RX forwarder — which
+/// wakes on an IRQ waiter, NOT `wake_io_owner`, so `io_next` can't touch it) can
+/// be isolated from the aggregate. Registered by the task itself via
+/// `wake_race_track`. This is the RX-side blind spot `rxtx_hist` can't see
+/// (it starts at `handle_in_established`, already inside the forwarder's run).
+static WAKE_RACE_TRACK: AtomicU64 = AtomicU64::new(0);
+static WR_FWD_HIST: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static WR_FWD_HALTED: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static WR_FWD_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static WR_FWD_MAX_US: AtomicU64 = AtomicU64::new(0);
+const WR_FWD_DUMP_EVERY: u64 = 5_000;
+
 /// Enable the wake→run race instrument (boot param `wake_race`).
 pub fn enable_wake_race() {
     WAKE_RACE_ENABLED.store(true, Ordering::Release);
+}
+
+/// Register `task_id` as the extra task tracked in the forwarder histogram.
+/// Called by the RX forwarder on its first poll when `wake_race` is on. No-op
+/// when the instrument is off, so it costs nothing in normal boots.
+pub fn wake_race_track(task_id: u64) {
+    if WAKE_RACE_ENABLED.load(Ordering::Relaxed) {
+        WAKE_RACE_TRACK.store(task_id, Ordering::Relaxed);
+    }
 }
 
 /// Wake side: stamp the false→true transition with the wake cycle + the home
@@ -747,6 +769,30 @@ fn wake_race_dispatch(cell: &WakeCell, cpu: usize) {
         WR_HIST_HALTED[idx].fetch_add(1, Ordering::Relaxed);
     }
     WR_MAX_US.fetch_max(us, Ordering::Relaxed);
+    // Same sample, also folded into the isolated per-task (forwarder) histogram.
+    let track = WAKE_RACE_TRACK.load(Ordering::Relaxed);
+    if track != 0 && cell.task == track {
+        WR_FWD_HIST[idx].fetch_add(1, Ordering::Relaxed);
+        if halted {
+            WR_FWD_HALTED[idx].fetch_add(1, Ordering::Relaxed);
+        }
+        WR_FWD_MAX_US.fetch_max(us, Ordering::Relaxed);
+        let fnn = WR_FWD_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
+        if fnn % WR_FWD_DUMP_EVERY == 0 {
+            let mut c = [0u64; 10];
+            let mut h = [0u64; 10];
+            for i in 0..10 {
+                c[i] = WR_FWD_HIST[i].load(Ordering::Relaxed);
+                h[i] = WR_FWD_HALTED[i].load(Ordering::Relaxed);
+            }
+            narf_console::klog!(
+                "[wake_race:fwd] n={} <1:{}({}) <5:{}({}) <10:{}({}) <25:{}({}) <50:{}({}) <100:{}({}) <150:{}({}) <200:{}({}) <300:{}({}) >=300:{}({}) max={}us",
+                fnn, c[0],h[0], c[1],h[1], c[2],h[2], c[3],h[3], c[4],h[4],
+                c[5],h[5], c[6],h[6], c[7],h[7], c[8],h[8], c[9],h[9],
+                WR_FWD_MAX_US.load(Ordering::Relaxed)
+            );
+        }
+    }
     let n = WR_SAMPLES.fetch_add(1, Ordering::Relaxed) + 1;
     if n % WR_DUMP_EVERY == 0 {
         let mut c = [0u64; 10];

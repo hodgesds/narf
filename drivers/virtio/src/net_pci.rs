@@ -1635,6 +1635,13 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                 // counts consecutive empty wakes.
                 const FAST_ROUNDS: u32 = 64;
                 let mut idle_rounds: u32 = FAST_ROUNDS;
+                // `wake_race` diagnostic: register the primary RX forwarder as the
+                // separately-tracked task so its own wake→dispatch tail (the
+                // RX-side blind spot io_next/rxtx_hist can't see) is isolated.
+                // No-op unless the instrument is on.
+                if pair_idx == 0 {
+                    narf_scheduler::wake_race_track(narf_scheduler::current_task_id().raw());
+                }
                 loop {
                     // Snapshot the IRQ generation BEFORE draining (Linux NAPI
                     // re-check pattern). A frame that lands during or after the
