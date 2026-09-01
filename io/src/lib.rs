@@ -198,7 +198,96 @@ impl fmt::Debug for DmaBuffer {
     }
 }
 
+/// A **device-side** DMA address: what hardware dereferences.
+///
+/// Deliberately opaque. There is no method on this type that yields a
+/// pointer, so a driver cannot dereference it — the CPU-side view comes
+/// from [`DmaBuffer::cpu_ptr`] / [`DmaBuffer::cpu_mut_ptr`] instead.
+///
+/// This is Linux's `dma_addr_t` discipline (see `Documentation/core-api/
+/// dma-api.txt`): `dma_alloc_coherent` hands back a CPU pointer *and* a
+/// separate `dma_addr_t`, and the two are never interchangeable. Rust can
+/// enforce what C only annotates — mixing them here is a compile error,
+/// not a sparse warning.
+///
+/// It exists because the alternative cost real bugs. While RAM was
+/// identity-mapped, `buf.phys_addr().raw() as *mut u8` both compiled and
+/// worked, so ~220 driver sites dereferenced device addresses directly.
+/// Every one of them became a kernel #PF the moment user address spaces
+/// stopped carrying the identity map.
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DmaAddr(u64);
+
+impl DmaAddr {
+    /// The raw bus address, for programming into a descriptor field or a
+    /// device register. This is the ONLY way out of the newtype, and it
+    /// yields a `u64` — never a pointer.
+    #[inline]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Address of a sub-range, for ring/descriptor arithmetic. Keeping
+    /// this in the type is what stops drivers dropping to `raw() + off`
+    /// and re-opening the hole.
+    #[inline]
+    pub const fn offset(self, bytes: u64) -> Self {
+        Self(self.0 + bytes)
+    }
+}
+
+impl fmt::Debug for DmaAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "DmaAddr({:#x})", self.0)
+    }
+}
+
 impl DmaBuffer {
+    /// The address to hand the DEVICE. Program this into descriptors and
+    /// registers; it cannot be dereferenced (see [`DmaAddr`]).
+    #[inline]
+    pub fn dma_addr(&self) -> DmaAddr {
+        DmaAddr(self.phys.raw())
+    }
+
+    /// Device-side address of a sub-range, for ring arithmetic.
+    #[inline]
+    pub fn dma_addr_at(&self, offset: u64) -> DmaAddr {
+        DmaAddr(self.phys.raw() + offset)
+    }
+
+    /// The pointer the CPU should use, resolved through the kernel direct
+    /// map (x86_64) / TTBR1 high-half window (aarch64). Valid in every
+    /// address space, so it survives a user CR3/TTBR0 swap.
+    #[inline]
+    pub fn cpu_ptr<T>(&self) -> *const T {
+        self.phys.kernel_ptr::<T>()
+    }
+
+    /// Mutable counterpart to [`Self::cpu_ptr`]. Takes `&self` for the
+    /// same reason as [`Self::as_byte_ptr`]: a `DmaBuffer` is usually held
+    /// behind an `Arc`, and the device may write into it while the CPU
+    /// holds only a shared reference.
+    #[inline]
+    pub fn cpu_mut_ptr<T>(&self) -> *mut T {
+        self.phys.kernel_mut_ptr::<T>()
+    }
+
+    /// CPU pointer at a byte offset — the counterpart to
+    /// [`Self::dma_addr_at`] for descriptor-ring walks.
+    #[inline]
+    pub fn cpu_mut_ptr_at<T>(&self, offset: u64) -> *mut T {
+        crate::PhysAddr::new(self.phys.raw() + offset).kernel_mut_ptr::<T>()
+    }
+
+    /// Physical base.
+    ///
+    /// Prefer [`Self::dma_addr`] for the device side and
+    /// [`Self::cpu_mut_ptr`] for the CPU side. This accessor is what let
+    /// `.raw() as *mut _` become the path of least resistance across the
+    /// driver tree; it stays for callers that genuinely need a
+    /// `PhysAddr` (page-table and IOMMU plumbing) and will be narrowed
+    /// once the remaining drivers move to the typed pair.
     #[inline]
     pub fn phys_addr(&self) -> PhysAddr {
         self.phys

@@ -435,7 +435,10 @@ impl VirtioVsockPci {
         // SAFETY: page-sized DMA buffer.
         unsafe {
             for (i, &b) in hdr_bytes.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
             for (i, &b) in payload.iter().enumerate() {
                 core::ptr::write_volatile((phys + (VsockHdr::WIRE_SIZE + i) as u64) as *mut u8, b);

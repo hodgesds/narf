@@ -54,7 +54,14 @@ use narf_arch::x86_64::cpuid::cpuid;
 
 // ── FCH MMIO base ────────────────────────────────────────────────────
 
-/// AMD FCH MMIO base, identity-mapped. Architecturally fixed.
+/// AMD FCH MMIO base. Architecturally fixed.
+///
+/// NOTE: reached through the low identity map, which now exists only in the
+/// KERNEL PML4 — user address spaces no longer carry it. These registers are
+/// therefore only safe to touch on the kernel CR3. If AOAC is ever driven
+/// from task context it needs `ioremap` (Device attrs), the same fix HPET
+/// took when the low half was freed; the direct map is write-back cacheable
+/// and wrong for MMIO.
 /// Same address used by `gpio-amd-fch.c` (`AMD_FCH_MMIO_BASE`).
 pub const FCH_MMIO_BASE: u64 = 0xFED8_0000;
 

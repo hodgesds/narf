@@ -897,7 +897,10 @@ impl Rtl8126Nic {
         // SAFETY: identity-mapped DMA buffer.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
         let ring_phys = self.tx_ring.phys_addr().raw();

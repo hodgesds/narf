@@ -945,7 +945,8 @@ impl E1000 {
         //    call so a delayed DMA write (AMD-Vi turn-around
         //    latency) can't land on a freed page.
         let tx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
-        let ring_phys = tx_ring.phys_addr().raw();
+        // Device-side handle; CPU access goes through `tx_ring.cpu_*` below.
+        let tx_ring_dma = tx_ring.dma_addr();
         let mut tx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(TX_RING_LEN);
         for _ in 0..TX_RING_LEN {
             let b = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
@@ -953,19 +954,16 @@ impl E1000 {
         }
         // Zero the ring (alloc_coherent guarantees fresh memory but
         // we're explicit).
-        // SAFETY: identity-mapped DMA.
+        // SAFETY: coherent DMA via the kernel direct map.
         unsafe {
             for i in 0..(TX_RING_LEN * 16) {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(ring_phys + i as u64).kernel_mut_ptr::<u8>(),
-                    0,
-                );
+                core::ptr::write_volatile(tx_ring.cpu_mut_ptr_at::<u8>(i as u64), 0);
             }
         }
         // SAFETY: same.
         unsafe {
-            mmio.write32(REG_TDBAL, ring_phys as u32);
-            mmio.write32(REG_TDBAH, (ring_phys >> 32) as u32);
+            mmio.write32(REG_TDBAL, tx_ring_dma.raw() as u32);
+            mmio.write32(REG_TDBAH, (tx_ring_dma.raw() >> 32) as u32);
             mmio.write32(REG_TDLEN, (TX_RING_LEN * 16) as u32);
             mmio.write32(REG_TDH, 0);
             mmio.write32(REG_TDT, 0);
@@ -981,33 +979,30 @@ impl E1000 {
 
         // 5b. Allocate RX descriptor ring + buffer pool.
         let rx_ring = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
-        let rx_ring_phys = rx_ring.phys_addr().raw();
+        let rx_ring_dma = rx_ring.dma_addr();
         let mut rx_pool: alloc::vec::Vec<DmaBuffer> = alloc::vec::Vec::with_capacity(RX_RING_LEN);
         for i in 0..RX_RING_LEN {
             let buf = alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| E1000Error::NoMemory)?;
-            let buf_phys = buf.phys_addr().raw();
+            // The descriptor carries the DEVICE address of the buffer.
+            let buf_dma = buf.dma_addr();
             let desc = RxDesc {
-                addr: buf_phys,
+                addr: buf_dma.raw(),
                 length: 0,
                 csum: 0,
                 status: 0,
                 errors: 0,
                 special: 0,
             };
-            // SAFETY: identity-mapped DMA ring.
+            // SAFETY: coherent DMA ring via the kernel direct map.
             unsafe {
-                core::ptr::write_volatile(
-                    narf_memory::PhysAddr::new(rx_ring_phys + (i * 16) as u64)
-                        .kernel_mut_ptr::<RxDesc>(),
-                    desc,
-                );
+                core::ptr::write_volatile(rx_ring.cpu_mut_ptr_at::<RxDesc>((i * 16) as u64), desc);
             }
             rx_pool.push(buf);
         }
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            mmio.write32(REG_RDBAL, rx_ring_phys as u32);
-            mmio.write32(REG_RDBAH, (rx_ring_phys >> 32) as u32);
+            mmio.write32(REG_RDBAL, rx_ring_dma.raw() as u32);
+            mmio.write32(REG_RDBAH, (rx_ring_dma.raw() >> 32) as u32);
             mmio.write32(REG_RDLEN, (RX_RING_LEN * 16) as u32);
             mmio.write32(REG_RDH, 0);
             // RDT points to the last *available* slot (i.e. one past
@@ -1218,7 +1213,10 @@ impl E1000 {
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
         let ring_phys = self.tx_ring.phys_addr().raw();
@@ -1253,7 +1251,7 @@ impl E1000 {
         // 250 ms wall-clock budget covers worst-case Tx-side
         // congestion stall.
         let done = narf_scheduler::responsive_spin_until(
-            // SAFETY: identity-mapped DMA.
+            // SAFETY: coherent DMA via the kernel direct map.
             || unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(desc_addr + 12).kernel_ptr::<u8>()) } & TXD_STAT_DD != 0,
             narf_time::Deadline::after_ms(250),
         );
@@ -1294,7 +1292,10 @@ impl E1000 {
         // SAFETY: identity-mapped DMA buffer; bounds-checked above.
         unsafe {
             for (i, b) in frame.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
         }
         let ring_phys = self.tx_ring.phys_addr().raw();

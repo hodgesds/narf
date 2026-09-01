@@ -1206,13 +1206,22 @@ impl VirtioNetPci {
                 narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
                 class,
             );
-            core::ptr::write_volatile((phys + 1) as *mut u8, cmd);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(phys + 1).kernel_mut_ptr::<u8>(),
+                cmd,
+            );
             for (i, b) in payload.iter().enumerate() {
-                core::ptr::write_volatile((phys + 16 + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + 16 + i as u64).kernel_mut_ptr::<u8>(),
+                    *b,
+                );
             }
             // Seed the ack byte with a sentinel so we can spot
             // "device didn't write anything".
-            core::ptr::write_volatile((phys + 256) as *mut u8, 0xFF);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(phys + 256).kernel_mut_ptr::<u8>(),
+                0xFF,
+            );
         }
         let descs = [
             VirtqDesc {
@@ -1258,7 +1267,9 @@ impl VirtioNetPci {
         // SAFETY: device wrote the ack byte before publishing the
         // used-ring entry; identity-mapped read.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let ack = unsafe { core::ptr::read_volatile((phys + 256) as *const u8) };
+        let ack = unsafe {
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(phys + 256).kernel_ptr::<u8>())
+        };
         Ok(ack)
     }
 

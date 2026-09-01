@@ -197,7 +197,10 @@ impl VirtioRngPci {
         // SAFETY: page-sized.
         unsafe {
             for i in 0..len {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    0,
+                );
             }
         }
         let descs = [VirtqDesc {
@@ -253,7 +256,11 @@ impl VirtioRngPci {
         let n = used_len.min(len);
         for (i, slot) in out.iter_mut().enumerate().take(n) {
             // SAFETY: identity-mapped DMA; phys is the allocated coherent buffer base.
-            *slot = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+            *slot = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         let mut g = self.queue.lock();
         if let Some(q) = g.as_mut() {

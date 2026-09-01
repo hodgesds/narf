@@ -615,11 +615,19 @@ impl Ahci {
         //   +0x600  Data buffer   (512 bytes for IDENTIFY response)
         let scratch =
             alloc_coherent(4096, DomainId::DRIVER_0).map_err(|_| AhciError::BarMapFailed)?;
-        let base = scratch.phys_addr().raw();
-        let cmd_list = base;
-        let fis_recv = base + 0x400;
-        let cmd_tbl = base + 0x500;
-        let data_buf = base + 0x600;
+        // Device-side handles (programmed into the HBA) and CPU-side
+        // pointers (dereferenced here) are now separate types, so the two
+        // cannot be confused: `DmaAddr` has no pointer conversion at all.
+        const OFF_CMD_LIST: u64 = 0x000;
+        const OFF_FIS_RECV: u64 = 0x400;
+        const OFF_CMD_TBL: u64 = 0x500;
+        const OFF_DATA_BUF: u64 = 0x600;
+        const OFF_PRDT: u64 = OFF_CMD_TBL + 0x80;
+
+        let cmd_list_dma = scratch.dma_addr_at(OFF_CMD_LIST);
+        let fis_recv_dma = scratch.dma_addr_at(OFF_FIS_RECV);
+        let cmd_tbl_dma = scratch.dma_addr_at(OFF_CMD_TBL);
+        let data_buf_dma = scratch.dma_addr_at(OFF_DATA_BUF);
 
         // Zero the regions we touch. Bulk `write_bytes`, not a
         // per-byte volatile loop — the scratch is coherent DMA memory,
@@ -628,11 +636,7 @@ impl Ahci {
         // the device can look.
         // SAFETY: coherent DMA page, reached through the kernel direct map.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
-                0,
-                0x600 + 512,
-            );
+            core::ptr::write_bytes(scratch.cpu_mut_ptr::<u8>(), 0, 0x600 + 512);
         }
 
         // Command List entry 0: H[5..0] = FIS length in DWORDs (5
@@ -647,17 +651,14 @@ impl Ahci {
         // SAFETY: coherent DMA page, reached through the kernel direct map.
         unsafe {
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+                scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST),
                 (1u32 << 16) | 5,
             );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
-                0,
-            );
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_CMD_LIST + 4), 0);
             // Value stays PHYSICAL — the HBA dereferences it.
             core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
-                cmd_tbl,
+                scratch.cpu_mut_ptr_at::<u64>(OFF_CMD_LIST + 8),
+                cmd_tbl_dma.raw(),
             );
         }
 
@@ -674,48 +675,31 @@ impl Ahci {
         //   +3  features (low) = 0
         // SAFETY: same DMA page.
         unsafe {
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
-                0x27,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
-                0x80,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
-                0xEC,
-            );
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL), 0x27);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 1), 0x80);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u8>(OFF_CMD_TBL + 2), 0xEC);
         }
         // PRDT entry 0 at +0x80 of cmd table:
         //   +0x00 u64 data base PA
         //   +0x08 u32 reserved
         //   +0x0C u32 = (Interrupt-on-completion bit 31) | (byte count - 1)
-        let prdt = cmd_tbl + 0x80;
         // SAFETY: same DMA page.
         unsafe {
             // PRDT data base stays PHYSICAL — the HBA DMAs to it.
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
-                data_buf,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
-                0,
-            );
-            core::ptr::write_volatile(
-                narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
-                511,
-            );
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u64>(OFF_PRDT), data_buf_dma.raw());
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_PRDT + 8), 0);
+            core::ptr::write_volatile(scratch.cpu_mut_ptr_at::<u32>(OFF_PRDT + 12), 511);
         }
 
         // Program port CLB / FB.
         // SAFETY: identity-mapped MMIO.
         unsafe {
-            self.mmio.write32(off, cmd_list as u32);
-            self.mmio.write32(off + 0x04, (cmd_list >> 32) as u32);
-            self.mmio.write32(off + 0x08, fis_recv as u32);
-            self.mmio.write32(off + 0x0C, (fis_recv >> 32) as u32);
+            self.mmio.write32(off, cmd_list_dma.raw() as u32);
+            self.mmio
+                .write32(off + 0x04, (cmd_list_dma.raw() >> 32) as u32);
+            self.mmio.write32(off + 0x08, fis_recv_dma.raw() as u32);
+            self.mmio
+                .write32(off + 0x0C, (fis_recv_dma.raw() >> 32) as u32);
         }
 
         // Clear PORT_IS / PORT_SERR (write-1-to-clear).
@@ -786,7 +770,7 @@ impl Ahci {
         // coherent DMA memory, not MMIO.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
+                scratch.cpu_ptr::<u8>().add(OFF_DATA_BUF as usize),
                 out.as_mut_ptr(),
                 512,
             );
@@ -839,7 +823,7 @@ pub unsafe fn ahci_write_lba(
     // rather than per-byte volatile loops — the scratch is coherent
     // DMA memory, not MMIO, and the fence before the CI doorbell below
     // is what publishes these stores before the device can look.
-    // SAFETY: identity-mapped DMA; `data` is a kernel slice that
+    // SAFETY: coherent DMA reached through the kernel direct map; `data` is a kernel slice that
     // cannot overlap the scratch page, and the caller-checked
     // `n_sectors * 512 <= 4096` keeps the copy inside the data area.
     unsafe {
@@ -850,43 +834,100 @@ pub unsafe fn ahci_write_lba(
         );
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            data_buf as *mut u8,
+            narf_memory::PhysAddr::new(data_buf).kernel_mut_ptr::<u8>(),
             (n_sectors as usize) * 512,
         );
     }
 
     // Cmd list slot 0: PRDT length = 1, CFL = 5, W bit = 1 (write).
-    // SAFETY: identity-mapped DMA.
+    // SAFETY: coherent DMA reached through the kernel direct map.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | (1u32 << 6) | 5); // bit 6 = W
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            (1u32 << 16) | (1u32 << 6) | 5,
+        ); // bit 6 = W
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
 
     // CFIS = H2D for WRITE DMA EXT (0x35).
-    // SAFETY: identity-mapped DMA.
+    // SAFETY: coherent DMA reached through the kernel direct map.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x35);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0x35,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 4).kernel_mut_ptr::<u8>(),
+            (lba & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 5).kernel_mut_ptr::<u8>(),
+            ((lba >> 8) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 6).kernel_mut_ptr::<u8>(),
+            ((lba >> 16) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 7).kernel_mut_ptr::<u8>(),
+            0x40,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 8).kernel_mut_ptr::<u8>(),
+            ((lba >> 24) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 9).kernel_mut_ptr::<u8>(),
+            ((lba >> 32) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 10).kernel_mut_ptr::<u8>(),
+            ((lba >> 40) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 12).kernel_mut_ptr::<u8>(),
+            (n_sectors & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 13).kernel_mut_ptr::<u8>(),
+            ((n_sectors >> 8) & 0xFF) as u8,
+        );
     }
     let prdt = cmd_tbl + 0x80;
     let bytes = (n_sectors as u32) * 512;
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(prdt as *mut u64, data_buf);
-        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+            data_buf,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+            bytes - 1,
+        );
     }
 
     // SAFETY: identity-mapped MMIO.
@@ -987,15 +1028,28 @@ pub unsafe fn ahci_read_lba(
     // ≤ 0x600 + SCRATCH_DATA_MAX = 4096 (checked at entry), i.e.
     // within the one-page scratch.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x600 + (n_sectors as usize) * 512);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x600 + (n_sectors as usize) * 512,
+        );
     }
 
     // Cmd list slot 0: PRDT length = 1, CFL = 5 (H2D FIS).
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            (1u32 << 16) | 5,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
 
     // CFIS: H2D Register FIS for READ DMA EXT.
@@ -1017,27 +1071,75 @@ pub unsafe fn ahci_read_lba(
     //   +15 Control = 0
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x25);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0x25,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 4).kernel_mut_ptr::<u8>(),
+            (lba & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 5).kernel_mut_ptr::<u8>(),
+            ((lba >> 8) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 6).kernel_mut_ptr::<u8>(),
+            ((lba >> 16) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 7).kernel_mut_ptr::<u8>(),
+            0x40,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 8).kernel_mut_ptr::<u8>(),
+            ((lba >> 24) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 9).kernel_mut_ptr::<u8>(),
+            ((lba >> 32) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 10).kernel_mut_ptr::<u8>(),
+            ((lba >> 40) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 12).kernel_mut_ptr::<u8>(),
+            (n_sectors & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 13).kernel_mut_ptr::<u8>(),
+            ((n_sectors >> 8) & 0xFF) as u8,
+        );
     }
     let prdt = cmd_tbl + 0x80;
     let bytes = (n_sectors as u32) * 512;
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(prdt as *mut u64, data_buf);
-        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+            data_buf,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+            bytes - 1,
+        );
     }
 
     // SAFETY: identity-mapped MMIO.
@@ -1095,7 +1197,7 @@ pub unsafe fn ahci_read_lba(
     // vectorisation on the hottest path in the system.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            data_buf as *const u8,
+            narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
             out.as_mut_ptr(),
             (n_sectors as usize) * 512,
         );
@@ -1150,37 +1252,98 @@ pub async unsafe fn ahci_read_lba_async(
     // volatile loop.
     // SAFETY: identity-mapped DMA; extent ≤ 4096 (checked at entry).
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x600 + (n_sectors as usize) * 512);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x600 + (n_sectors as usize) * 512,
+        );
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | 5);
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            (1u32 << 16) | 5,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x25);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0x25,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 4).kernel_mut_ptr::<u8>(),
+            (lba & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 5).kernel_mut_ptr::<u8>(),
+            ((lba >> 8) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 6).kernel_mut_ptr::<u8>(),
+            ((lba >> 16) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 7).kernel_mut_ptr::<u8>(),
+            0x40,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 8).kernel_mut_ptr::<u8>(),
+            ((lba >> 24) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 9).kernel_mut_ptr::<u8>(),
+            ((lba >> 32) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 10).kernel_mut_ptr::<u8>(),
+            ((lba >> 40) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 12).kernel_mut_ptr::<u8>(),
+            (n_sectors & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 13).kernel_mut_ptr::<u8>(),
+            ((n_sectors >> 8) & 0xFF) as u8,
+        );
     }
     let prdt = cmd_tbl + 0x80;
     let bytes = (n_sectors as u32) * 512;
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(prdt as *mut u64, data_buf);
-        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+            data_buf,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+            bytes - 1,
+        );
     }
 
     // SAFETY: identity-mapped MMIO.
@@ -1218,7 +1381,7 @@ pub async unsafe fn ahci_read_lba_async(
     // per-byte volatile loop — see `ahci_read_lba`.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            data_buf as *const u8,
+            narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
             out.as_mut_ptr(),
             (n_sectors as usize) * 512,
         );
@@ -1276,40 +1439,97 @@ pub async unsafe fn ahci_write_lba_async(
         );
         core::ptr::copy_nonoverlapping(
             data.as_ptr(),
-            data_buf as *mut u8,
+            narf_memory::PhysAddr::new(data_buf).kernel_mut_ptr::<u8>(),
             (n_sectors as usize) * 512,
         );
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
         // bit 6 = W (write).
-        core::ptr::write_volatile(cmd_list as *mut u32, (1u32 << 16) | (1u32 << 6) | 5);
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            (1u32 << 16) | (1u32 << 6) | 5,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80);
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0x35);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, 0);
-        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, (n_sectors & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 13) as *mut u8, ((n_sectors >> 8) & 0xFF) as u8);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0x35,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 4).kernel_mut_ptr::<u8>(),
+            (lba & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 5).kernel_mut_ptr::<u8>(),
+            ((lba >> 8) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 6).kernel_mut_ptr::<u8>(),
+            ((lba >> 16) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 7).kernel_mut_ptr::<u8>(),
+            0x40,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 8).kernel_mut_ptr::<u8>(),
+            ((lba >> 24) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 9).kernel_mut_ptr::<u8>(),
+            ((lba >> 32) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 10).kernel_mut_ptr::<u8>(),
+            ((lba >> 40) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 12).kernel_mut_ptr::<u8>(),
+            (n_sectors & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 13).kernel_mut_ptr::<u8>(),
+            ((n_sectors >> 8) & 0xFF) as u8,
+        );
     }
     let prdt = cmd_tbl + 0x80;
     let bytes = (n_sectors as u32) * 512;
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(prdt as *mut u64, data_buf);
-        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+            data_buf,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+            bytes - 1,
+        );
     }
 
     // SAFETY: identity-mapped MMIO.
@@ -1458,7 +1678,7 @@ unsafe fn ahci_lba_ncq(
         if write {
             core::ptr::copy_nonoverlapping(
                 data_in.as_ptr(),
-                data_buf as *mut u8,
+                narf_memory::PhysAddr::new(data_buf).kernel_mut_ptr::<u8>(),
                 (n_sectors as usize) * 512,
             );
         }
@@ -1473,8 +1693,14 @@ unsafe fn ahci_lba_ncq(
     // SAFETY: identity-mapped DMA.
     unsafe {
         core::ptr::write_volatile(slot as *mut u32, header_w0);
-        core::ptr::write_volatile((slot + 4) as *mut u32, 0);
-        core::ptr::write_volatile((slot + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(slot + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(slot + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
 
     // CFIS H2D (FIS type 0x27) for FPDMA QUEUED:
@@ -1494,27 +1720,75 @@ unsafe fn ahci_lba_ncq(
     let sec_hi = ((n_sectors >> 8) & 0xFF) as u8;
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80 | (pmp & 0x0F));
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, opcode);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, sec_lo);
-        core::ptr::write_volatile((cmd_tbl + 4) as *mut u8, (lba & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 5) as *mut u8, ((lba >> 8) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 6) as *mut u8, ((lba >> 16) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 7) as *mut u8, 0x40);
-        core::ptr::write_volatile((cmd_tbl + 8) as *mut u8, ((lba >> 24) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 9) as *mut u8, ((lba >> 32) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 10) as *mut u8, ((lba >> 40) & 0xFF) as u8);
-        core::ptr::write_volatile((cmd_tbl + 11) as *mut u8, sec_hi);
-        core::ptr::write_volatile((cmd_tbl + 12) as *mut u8, tag << 3);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80 | (pmp & 0x0F),
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            opcode,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            sec_lo,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 4).kernel_mut_ptr::<u8>(),
+            (lba & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 5).kernel_mut_ptr::<u8>(),
+            ((lba >> 8) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 6).kernel_mut_ptr::<u8>(),
+            ((lba >> 16) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 7).kernel_mut_ptr::<u8>(),
+            0x40,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 8).kernel_mut_ptr::<u8>(),
+            ((lba >> 24) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 9).kernel_mut_ptr::<u8>(),
+            ((lba >> 32) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 10).kernel_mut_ptr::<u8>(),
+            ((lba >> 40) & 0xFF) as u8,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 11).kernel_mut_ptr::<u8>(),
+            sec_hi,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 12).kernel_mut_ptr::<u8>(),
+            tag << 3,
+        );
     }
     let prdt = cmd_tbl + 0x80;
     let bytes = (n_sectors as u32) * 512;
     // SAFETY: same.
     unsafe {
-        core::ptr::write_volatile(prdt as *mut u64, data_buf);
-        core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-        core::ptr::write_volatile((prdt + 12) as *mut u32, bytes - 1);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+            data_buf,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+            bytes - 1,
+        );
     }
 
     // SAFETY: identity-mapped MMIO.
@@ -1577,7 +1851,7 @@ unsafe fn ahci_lba_ncq(
         // `ahci_read_lba`.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                data_buf as *const u8,
+                narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>(),
                 out.as_mut_ptr(),
                 (n_sectors as usize) * 512,
             );
@@ -1674,15 +1948,28 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     // MMIO; the fence before the CI doorbell publishes it.
     // SAFETY: identity-mapped DMA, extent within the 4 KiB scratch.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x500 + 64);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x500 + 64,
+        );
     }
 
     // Command-list header 0: PRDT length = 0 (NODATA), CFL = 5.
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32, 5); // PRDT_LEN=0, CFL=5
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            5,
+        ); // PRDT_LEN=0, CFL=5
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
 
     // CFIS: H2D Register FIS for READ PORT MULTIPLIER (0xE4).
@@ -1692,10 +1979,22 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     //   +3  features = GSCR register index
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80 | PMP_CTRL_PORT);
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xE4);
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, reg);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80 | PMP_CTRL_PORT,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0xE4,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            reg,
+        );
     }
 
     // Program port CLB / FB.
@@ -1767,10 +2066,14 @@ pub unsafe fn pmp_read_gscr(ahci: &Ahci, port_idx: u8, reg: u8) -> Result<u32, A
     // the D2H FIS area and offsets 4..=8 are within the 256-byte FIS structure.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let val = unsafe {
-        let nsect = core::ptr::read_volatile((d2h + 4) as *const u8) as u32;
-        let lbal = core::ptr::read_volatile((d2h + 5) as *const u8) as u32;
-        let lbam = core::ptr::read_volatile((d2h + 6) as *const u8) as u32;
-        let lbah = core::ptr::read_volatile((d2h + 8) as *const u8) as u32;
+        let nsect =
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(d2h + 4).kernel_ptr::<u8>()) as u32;
+        let lbal =
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(d2h + 5).kernel_ptr::<u8>()) as u32;
+        let lbam =
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(d2h + 6).kernel_ptr::<u8>()) as u32;
+        let lbah =
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(d2h + 8).kernel_ptr::<u8>()) as u32;
         nsect | (lbal << 8) | (lbam << 16) | (lbah << 24)
     };
 
@@ -1948,7 +2251,11 @@ pub unsafe fn atapi_send_cdb(
     // doorbell publishes it.
     // SAFETY: identity-mapped DMA, extent within the 4 KiB scratch.
     unsafe {
-        core::ptr::write_bytes(base as *mut u8, 0, 0x500 + 0x90);
+        core::ptr::write_bytes(
+            narf_memory::PhysAddr::new(base).kernel_mut_ptr::<u8>(),
+            0,
+            0x500 + 0x90,
+        );
     }
 
     // Command-list header 0.
@@ -1965,9 +2272,18 @@ pub unsafe fn atapi_send_cdb(
     let header_w0: u32 = (prdt_len << 16) | w_bit | (1 << 5) | 5; // A=1, CFL=5
                                                                   // SAFETY: coherent DMA page, reached through the kernel direct map.
     unsafe {
-        core::ptr::write_volatile(cmd_list as *mut u32, header_w0);
-        core::ptr::write_volatile((cmd_list + 4) as *mut u32, 0);
-        core::ptr::write_volatile((cmd_list + 8) as *mut u64, cmd_tbl);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list).kernel_mut_ptr::<u32>(),
+            header_w0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 4).kernel_mut_ptr::<u32>(),
+            0,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_list + 8).kernel_mut_ptr::<u64>(),
+            cmd_tbl,
+        );
     }
 
     // CFIS (H2D Register FIS, 20 bytes at cmd_tbl+0x00).
@@ -1980,28 +2296,52 @@ pub unsafe fn atapi_send_cdb(
     };
     // SAFETY: identity-mapped DMA.
     unsafe {
-        core::ptr::write_volatile(cmd_tbl as *mut u8, 0x27);
-        core::ptr::write_volatile((cmd_tbl + 1) as *mut u8, 0x80); // C=1, PMP=0
-        core::ptr::write_volatile((cmd_tbl + 2) as *mut u8, 0xA0); // ATA PACKET
-        core::ptr::write_volatile((cmd_tbl + 3) as *mut u8, feat);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl).kernel_mut_ptr::<u8>(),
+            0x27,
+        );
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 1).kernel_mut_ptr::<u8>(),
+            0x80,
+        ); // C=1, PMP=0
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 2).kernel_mut_ptr::<u8>(),
+            0xA0,
+        ); // ATA PACKET
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(cmd_tbl + 3).kernel_mut_ptr::<u8>(),
+            feat,
+        );
     }
 
     // ACMD (command-table +0x40, 16 bytes): copy the SCSI CDB.
     // SAFETY: same DMA page.
     unsafe {
         for (i, &b) in cdb.iter().enumerate() {
-            core::ptr::write_volatile((cmd_tbl + 0x40 + i as u64) as *mut u8, b);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(cmd_tbl + 0x40 + i as u64).kernel_mut_ptr::<u8>(),
+                b,
+            );
         }
     }
 
     // PRDT entry 0 at cmd_tbl+0x80 (only if data transfer).
+    let prdt = cmd_tbl + 0x80;
     if dir != AtapiDmaDir::None && buf_bytes > 0 {
-        let prdt = cmd_tbl + 0x80;
         // SAFETY: same DMA page.
         unsafe {
-            core::ptr::write_volatile(prdt as *mut u64, buf_phys);
-            core::ptr::write_volatile((prdt + 8) as *mut u32, 0);
-            core::ptr::write_volatile((prdt + 12) as *mut u32, buf_bytes - 1);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt).kernel_mut_ptr::<u64>(),
+                buf_phys,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt + 8).kernel_mut_ptr::<u32>(),
+                0,
+            );
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(prdt + 12).kernel_mut_ptr::<u32>(),
+                buf_bytes - 1,
+            );
         }
     }
 
@@ -2079,7 +2419,10 @@ pub unsafe fn read_atapi_capacity(ahci: &Ahci, port_idx: u8) -> Result<(u32, u32
     // SAFETY: identity-mapped DMA.
     unsafe {
         for i in 0..8u64 {
-            core::ptr::write_volatile((data_buf + i) as *mut u8, 0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(data_buf + i).kernel_mut_ptr::<u8>(),
+                0,
+            );
         }
     }
 
@@ -2094,16 +2437,16 @@ pub unsafe fn read_atapi_capacity(ahci: &Ahci, port_idx: u8) -> Result<(u32, u32
     // SAFETY: identity-mapped DMA.
     let (last_lba, block_size) = unsafe {
         let last_lba = u32::from_be_bytes([
-            core::ptr::read_volatile(data_buf as *const u8),
-            core::ptr::read_volatile((data_buf + 1) as *const u8),
-            core::ptr::read_volatile((data_buf + 2) as *const u8),
-            core::ptr::read_volatile((data_buf + 3) as *const u8),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 1).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 2).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 3).kernel_ptr::<u8>()),
         ]);
         let block_size = u32::from_be_bytes([
-            core::ptr::read_volatile((data_buf + 4) as *const u8),
-            core::ptr::read_volatile((data_buf + 5) as *const u8),
-            core::ptr::read_volatile((data_buf + 6) as *const u8),
-            core::ptr::read_volatile((data_buf + 7) as *const u8),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 4).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 5).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 6).kernel_ptr::<u8>()),
+            core::ptr::read_volatile(narf_memory::PhysAddr::new(data_buf + 7).kernel_ptr::<u8>()),
         ]);
         (last_lba, block_size)
     };

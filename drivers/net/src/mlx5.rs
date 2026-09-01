@@ -656,7 +656,10 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                        b,
+                    );
                 }
             }
         }
@@ -667,7 +670,10 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for i in 0..MAILBOX_BLOCK_LEN {
-                    core::ptr::write_volatile((phys + i as u64) as *mut u8, 0);
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                        0,
+                    );
                 }
             }
         }
@@ -682,10 +688,16 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; offsets within block.
             unsafe {
                 for (j, &b) in h.to_be_bytes().iter().enumerate() {
-                    core::ptr::write_volatile((phys + 0x1F0 + j as u64) as *mut u8, b);
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(phys + 0x1F0 + j as u64).kernel_mut_ptr::<u8>(),
+                        b,
+                    );
                 }
                 for (j, &b) in l.to_be_bytes().iter().enumerate() {
-                    core::ptr::write_volatile((phys + 0x1F4 + j as u64) as *mut u8, b);
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(phys + 0x1F4 + j as u64).kernel_mut_ptr::<u8>(),
+                        b,
+                    );
                 }
             }
         }
@@ -752,7 +764,11 @@ impl Mlx5Hca {
                 // from `out_blocks`; `i < MAILBOX_BLOCK_LEN` bounds the read to
                 // that block.
                 // SAFETY: Valid MMIO bounds or trusted driver environment
-                *b = unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) };
+                *b = unsafe {
+                    core::ptr::read_volatile(
+                        narf_memory::PhysAddr::new(phys + i as u64).kernel_ptr::<u8>(),
+                    )
+                };
             }
             blocks.push(block);
         }
@@ -790,7 +806,10 @@ impl Mlx5Hca {
             // SAFETY: identity-mapped DMA; driver-owned buffer.
             unsafe {
                 for (i, &b) in block.iter().enumerate() {
-                    core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                    core::ptr::write_volatile(
+                        narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                        b,
+                    );
                 }
             }
         }
@@ -884,7 +903,11 @@ impl Mlx5Hca {
             // in-range entry offset and `i < eqe::EQE_LEN`, so the read stays
             // within the EQE.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *b = unsafe { core::ptr::read_volatile((phys + off as u64 + i as u64) as *const u8) };
+            *b = unsafe {
+                core::ptr::read_volatile(
+                    narf_memory::PhysAddr::new(phys + off as u64 + i as u64).kernel_ptr::<u8>(),
+                )
+            };
         }
         if eqe::is_hw_owned(&bytes) {
             return Ok(None);
@@ -1076,7 +1099,10 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA, exclusively owned by this QP.
         unsafe {
             for (i, &b) in wqe_bytes.iter().enumerate() {
-                core::ptr::write_volatile((dst + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(dst + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);
@@ -1107,7 +1133,10 @@ impl Mlx5Hca {
         // SAFETY: identity-mapped DMA, owned by this QP.
         unsafe {
             for (i, &b) in wqe_bytes.iter().enumerate() {
-                core::ptr::write_volatile((dst + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(dst + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);

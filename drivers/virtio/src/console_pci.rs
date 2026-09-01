@@ -438,7 +438,10 @@ impl VirtioConsolePci {
         // SAFETY: page-sized DMA buffer.
         unsafe {
             for (i, &b) in data.iter().enumerate() {
-                core::ptr::write_volatile((phys + i as u64) as *mut u8, b);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + i as u64).kernel_mut_ptr::<u8>(),
+                    b,
+                );
             }
         }
         // TX descriptor: device-readable (no F_WRITE).

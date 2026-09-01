@@ -140,7 +140,10 @@ impl Ring {
             // RING_SIZE_DW` was checked above, so `off` stays within the page.
             // SAFETY: Valid MMIO bounds or trusted driver environment
             unsafe {
-                core::ptr::write_volatile((phys + off) as *mut u32, w);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + off).kernel_mut_ptr::<u32>(),
+                    w,
+                );
             }
         }
         compiler_fence(Ordering::SeqCst);
