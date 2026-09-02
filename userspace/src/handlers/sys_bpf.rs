@@ -541,9 +541,18 @@ fn prog_load(attr_uptr: u64, size: usize) -> i64 {
     let context = match prog_type {
         BPF_PROG_TYPE_XDP | BPF_PROG_TYPE_RAW_TRACEPOINT | BPF_PROG_TYPE_TRACING => Context::Atomic,
         BPF_PROG_TYPE_SYSCALL => Context::Sleepable,
-        // LINUX-GAP: socket filters, cgroup hooks, LSM, struct_ops, and
-        // the rest arrive with their attach surfaces in Phase 5/6.
-        _ => return -ENOTSUP,
+        // LINUX-GAP: socket filters, cgroup hooks (CGROUP_DEVICE/CGROUP_SKB),
+        // LSM, struct_ops, and the rest arrive with their attach surfaces in
+        // Phase 5/6. Until then they are UNSUPPORTED prog types, and the errno
+        // must match what Linux gives an unregistered type: `find_prog_type()`
+        // (kernel/bpf/syscall.c) returns -EINVAL both for `type >= ARRAY_SIZE`
+        // and for a NULL `ops` slot. The kernel's BPF_PROG_LOAD never returns
+        // -EOPNOTSUPP for the prog-type check, so -ENOTSUP here was an errno
+        // Linux never emits — and systemd's BPF feature probes
+        // (bpf_devices_supported / bpf_firewall_supported), written against the
+        // real kernel errnos, rely on -EINVAL to conclude "prog type
+        // unsupported → degrade" rather than propagating an unexpected error.
+        _ => return -EINVAL,
     };
 
     if insn_cnt == 0 || insn_cnt > narf_bpf::prog::MAX_INSNS {

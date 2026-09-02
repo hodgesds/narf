@@ -2120,7 +2120,7 @@ const AT_REMOVEDIR: u64 = 0x200;
 /// — the udev-coldplug `/dev/<name>` path), falling back to a regular file on
 /// filesystems without device-node support; everything else is a regular file
 /// (see `sys_mknodat` docs). Never returns a bare -1 for a supported node type.
-fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
+fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
     const S_IFMT: u64 = 0o170000;
     const S_IFCHR: u64 = 0o020000;
     const S_IFBLK: u64 = 0o060000;
@@ -2152,12 +2152,11 @@ fn mknod_common(path_uptr: u64, mode: u64, dev: u64) -> SyscallReturn {
             _ => return SyscallReturn::ok((-22i64) as u64),        // -EINVAL
         }
     }
-    let path = match copy_user_cstr(path_uptr, 4096) {
-        Some(s) => s,
-        // `getname()` — an unreadable path is -EFAULT.
-        None => return SyscallReturn::ok((-14i64) as u64),
-    };
-    let path = resolve_cwd_path(current_task_id(), &path);
+    // `raw_path` is already the caller's path string; `sys_mknodat` has
+    // applied its dirfd so a relative path is resolved against the dirfd's
+    // directory, not the cwd. `resolve_cwd_path` then only normalises a
+    // cwd-relative `mknod(2)` path (absolute inputs pass through unchanged).
+    let path = resolve_cwd_path(current_task_id(), raw_path);
     let path_ref = {
         let t = path.trim_end_matches('/');
         if t.is_empty() {
