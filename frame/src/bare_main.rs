@@ -2198,7 +2198,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     );
                 } else {
                     // SAFETY: memory + LAPIC + IDT/GDT all initialised
-                    // above; identity map covers 0x8000.
+                    // above; PML4[0] still maps the trampoline at 0x8000.
                     // SAFETY: Valid memory or trusted environment
                     let started = unsafe { x86_64::smp::start_aps() };
                     let _ = writeln!(
@@ -2206,6 +2206,19 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         "  smp: started {} AP(s); {} CPU(s) online",
                         started,
                         narf_lib::smp::online_count()
+                    );
+
+                    // Every AP is past the trampoline by the time this
+                    // returns — `start_aps` spins on online flags the APs
+                    // set from high-half code — so the window has no users
+                    // left. Drop it: those two pages are RWX and, since the
+                    // kernel stopped identity-mapping RAM, the only thing in
+                    // the low half.
+                    // SAFETY: `start_aps` has returned.
+                    unsafe { narf_memory::mmu::drop_ap_trampoline_window() };
+                    let _ = writeln!(
+                        console::Writer,
+                        "  smp: AP trampoline window unmapped (low half empty)"
                     );
 
                     // Hybrid-CPU topology summary. Counts P-cores

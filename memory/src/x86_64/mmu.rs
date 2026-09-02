@@ -210,6 +210,55 @@ fn kernel_window_leaf_needs_exec(phys: u64, len: u64) -> bool {
 /// True if a leaf covering `[phys, phys + len)` must be executable through the
 /// *low identity* map. Same set as the kernel window plus the AP trampoline
 /// window, which only exists at an identity address.
+/// Unmap PML4[0] — the AP trampoline window — once SMP bring-up is done.
+///
+/// The window is mapped `PRESENT | WRITABLE` and executable, because an AP
+/// executes from it in real mode before it can reach any high-half address.
+/// That leaves two RWX pages at a fixed, well-known physical address
+/// (`AP_TRAMPOLINE_EXEC_BASE`) for the life of the boot — and since the
+/// kernel stopped identity-mapping RAM, they are the *only* thing in the low
+/// half, which makes them a precise target rather than a needle in 512 GiB.
+/// An arbitrary kernel write lands shellcode there and it is immediately
+/// executable, with no page-table manipulation needed: exactly the property
+/// `text_poke`'s W^X machinery exists to deny everywhere else.
+///
+/// Linux keeps its equivalent window and settles for splitting it — see
+/// `arch/x86/realmode/init.c::set_real_mode_permissions`, which marks the
+/// blob NX+RO and re-marks only its text executable — because it reuses the
+/// realmode trampoline for S3 resume. NARF does not: `s3_wake_entry` is a
+/// naked-asm function in the kernel image that firmware identity-maps during
+/// the wake handoff and which loads CR3 itself, so nothing needs this window
+/// after bring-up. That lets us drop the mapping outright instead.
+///
+/// Ordering: an AP touches the window only until it jumps to
+/// `_ap_start_rust` in the high half, and `start_aps` spins until every AP
+/// has marked itself online from inside that function. So once `start_aps`
+/// returns, no CPU can be executing here.
+///
+/// If CPU hotplug ever lands it will need this window back — re-establish it
+/// around the bring-up rather than keeping it mapped for the whole boot.
+///
+/// # Safety
+/// Call only after `start_aps` has returned. Unmapping while an AP is still
+/// in the trampoline triple-faults it.
+pub unsafe fn drop_ap_trampoline_window() {
+    use crate::paging::{PageTable, PageTableEntry};
+    // SAFETY: CPL=0; CR3 names the live kernel PML4.
+    let cr3 = unsafe { crate::paging::read_cr3() };
+    // SAFETY: the live PML4 is reachable through the direct map.
+    let pml4 = unsafe { &mut *cr3.kernel_mut_ptr::<PageTable>() };
+    if !pml4.entries[0].is_present() {
+        return;
+    }
+    pml4.entries[0] = PageTableEntry::from_raw(0);
+    // Every online CPU shares this PML4, so the stale top-level translation
+    // has to be dropped everywhere, not just here.
+    // SAFETY: invalidating a mapping we just removed.
+    unsafe {
+        crate::paging::invlpg_global(crate::VirtAddr::new(AP_TRAMPOLINE_EXEC_BASE));
+    }
+}
+
 fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
     kernel_window_leaf_needs_exec(phys, len)
         || overlaps(

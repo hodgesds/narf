@@ -14718,41 +14718,38 @@ kernel_test_in!("memory", smoke_kernel_window_alias_of_buddy_frame_is_nx);
 /// 2 MiB had been left executable — 256× more RWX than the SIPI vector needs,
 /// at a fixed and famous address.
 #[cfg(target_arch = "x86_64")]
-fn smoke_ap_trampoline_window_is_exactly_executable() -> TestResult {
+fn smoke_ap_trampoline_window_is_unmapped_after_smp() -> TestResult {
     use crate::mmu::{AP_TRAMPOLINE_EXEC_BASE, AP_TRAMPOLINE_EXEC_LEN};
     use crate::paging::{leaf_flags_at, read_cr3, PtFlags};
     use crate::VirtAddr;
 
+    // Tests run after `start_aps`, which is followed by
+    // `drop_ap_trampoline_window`. The window is mapped RWX while APs boot
+    // — an AP executes from it in real mode — so leaving it behind would
+    // park two writable-and-executable pages at a fixed address, and since
+    // the kernel stopped identity-mapping RAM they would be the only thing
+    // in the low half. By now PML4[0] should be empty.
+    //
+    // Checked across the whole window, not just its first page: a teardown
+    // that cleared one leaf and left the rest would satisfy a single probe.
     // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
     let cr3 = unsafe { read_cr3() };
-    // SAFETY: the live PML4 is identity-reachable.
-    let inside = unsafe { leaf_flags_at(cr3, VirtAddr::new(AP_TRAMPOLINE_EXEC_BASE)) };
-    let (flags, size) = match inside {
-        Some(v) => v,
-        None => return TestResult::Fail("AP trampoline page is not mapped at all"),
-    };
-    if size != 4096 {
-        return TestResult::Fail("AP trampoline page was not demoted to a 4 KiB leaf");
+    let mut page = AP_TRAMPOLINE_EXEC_BASE;
+    while page < AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN {
+        // SAFETY: the live PML4 is reachable through the direct map.
+        match unsafe { leaf_flags_at(cr3, VirtAddr::new(page)) } {
+            None => {}
+            Some((f, _)) if f.contains(PtFlags::NO_EXEC) && !f.contains(PtFlags::WRITABLE) => {}
+            Some(_) => {
+                return TestResult::Fail("AP trampoline window is still mapped writable+executable")
+            }
+        }
+        page += 4096;
     }
-    if flags.contains(PtFlags::NO_EXEC) {
-        return TestResult::Fail("AP trampoline page is NX — APs cannot reach long mode");
-    }
-
-    let past = AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN;
-    // SAFETY: as above.
-    // Unmapped is the expected state — PML4[0] now holds nothing but the
-    // trampoline pages — and is a strictly stronger guarantee than the
-    // present-but-NX leaf the low identity map used to provide here. Both
-    // satisfy the property under test: the executable window stops at the
-    // end of the trampoline.
-    match unsafe { leaf_flags_at(cr3, VirtAddr::new(past)) } {
-        None => TestResult::Pass,
-        Some((f, _)) if f.contains(PtFlags::NO_EXEC) => TestResult::Pass,
-        Some(_) => TestResult::Fail("the executable window is wider than the trampoline"),
-    }
+    TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_ap_trampoline_window_is_exactly_executable);
+kernel_test_in!("memory", smoke_ap_trampoline_window_is_unmapped_after_smp);
 
 /// The kernel's own text stays executable and its `.bss` does not.
 ///
