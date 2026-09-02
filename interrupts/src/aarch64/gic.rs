@@ -14,16 +14,103 @@ use narf_arch::aarch64::sysreg;
 
 /// QEMU virt GICv3 distributor MMIO base.
 const GICD_BASE: usize = 0x0800_0000;
+/// Distributor register frame size (GICv3 IHI0069H: 64 KiB).
+const GICD_LEN: usize = 0x1_0000;
 /// QEMU virt GICv3 CPU-0 redistributor MMIO base.
 const GICR_BASE: usize = 0x080A_0000;
 /// Per-CPU redistributor stride. GICv3 lays each CPU's RD frame
 /// 128 KiB apart on QEMU virt.
 const GICR_STRIDE: usize = 0x2_0000;
 
-/// Compute the GICR base for a given logical CPU index.
+/// Mapped kernel VA of the distributor window, resolved by [`map_gicd`].
+static GICD_VA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+/// Mapped kernel VA of each CPU's redistributor frame, resolved by
+/// [`map_gicr`] on the CPU that owns it.
+static GICR_VA: [core::sync::atomic::AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Map the distributor window. Called once, by the BSP.
+///
+/// The GIC is MMIO and the kernel no longer keeps a Device block over the
+/// low 1 GiB, so these registers have to be mapped like any other device.
+fn map_gicd() {
+    if GICD_VA.load(core::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    // SAFETY: the architectural GICv3 distributor window, owned by us.
+    if let Ok(m) = unsafe {
+        narf_memory::ioremap::ioremap(
+            GICD_BASE as u64,
+            GICD_LEN as u64,
+            narf_memory::ioremap::MmioAttrs::Device,
+        )
+    } {
+        GICD_VA.store(m.va() as usize, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Map `cpu_index`'s redistributor frame. Called on that CPU, before any
+/// redistributor access; mapping per CPU keeps us from mapping frames for
+/// CPUs the machine does not implement.
+fn map_gicr(cpu_index: u32) {
+    let slot = cpu_index as usize;
+    if slot >= narf_lib::percpu::MAX_CPUS
+        || GICR_VA[slot].load(core::sync::atomic::Ordering::Acquire) != 0
+    {
+        return;
+    }
+    let phys = GICR_BASE + slot * GICR_STRIDE;
+    // SAFETY: this CPU's architectural redistributor frame.
+    if let Ok(m) = unsafe {
+        narf_memory::ioremap::ioremap(
+            phys as u64,
+            GICR_STRIDE as u64,
+            narf_memory::ioremap::MmioAttrs::Device,
+        )
+    } {
+        GICR_VA[slot].store(m.va() as usize, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Base to reach the distributor through: the mapped VA once one exists,
+/// the physical base before that.
+///
+/// GIC init runs before the MMU handoff, so `ioremap` is not available yet
+/// and the boot tables' Device block is what makes the physical base work.
+/// [`remap_mmio`] switches this over at the handoff, before that block is
+/// dropped — the same shape as `console::remap_to_virtual`.
+#[inline]
+fn gicd_base() -> usize {
+    match GICD_VA.load(core::sync::atomic::Ordering::Acquire) {
+        0 => GICD_BASE,
+        va => va,
+    }
+}
+
+/// Base to reach `cpu_index`'s redistributor frame through: the mapped VA
+/// once one exists, the physical base before that. See [`gicd_base`].
 #[inline]
 pub fn gicr_base(cpu_index: u32) -> usize {
-    GICR_BASE + (cpu_index as usize) * GICR_STRIDE
+    let slot = cpu_index as usize;
+    let phys = GICR_BASE + slot * GICR_STRIDE;
+    if slot >= narf_lib::percpu::MAX_CPUS {
+        return phys;
+    }
+    match GICR_VA[slot].load(core::sync::atomic::Ordering::Acquire) {
+        0 => phys,
+        va => va,
+    }
+}
+
+/// Move the GIC off its physical bases and onto `ioremap` windows.
+///
+/// Must run after `init_mmu` (so `ioremap` works) and before the boot
+/// identity window is dropped (so the physical fallback still functions if a
+/// mapping fails). Maps the distributor and the calling CPU's redistributor;
+/// each AP maps its own in `init_per_cpu`, which by then runs post-handoff.
+pub fn remap_mmio(cpu_index: u32) {
+    map_gicd();
+    map_gicr(cpu_index);
 }
 
 // Distributor register offsets (SDM of GICv3: IHI0069H).
@@ -72,6 +159,8 @@ pub unsafe fn init_bsp() {
     // SAFETY: BSP-only init does both the CPU-shared distributor
     // and CPU 0's redistributor + cpu interface.
     // SAFETY: Valid memory or trusted environment
+    map_gicd();
+    // SAFETY: windows mapped above / by init_per_cpu.
     unsafe {
         init_distributor();
         init_per_cpu(0);
@@ -99,13 +188,16 @@ unsafe fn init_distributor() {
     // affinity routing.
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        write_u32((GICD_BASE + GICD_CTLR) as *mut u32, (1 << 4) | (1 << 1));
+        write_u32((gicd_base() + GICD_CTLR) as *mut u32, (1 << 4) | (1 << 1));
     }
 }
 
 /// CPU-private init: cpu interface (system registers) + the named
 /// CPU's redistributor + timer PPI.
 unsafe fn init_per_cpu(cpu_index: u32) {
+    // Map this CPU's redistributor before touching it. Runs on the owning
+    // CPU: the BSP for index 0, each AP for its own.
+    map_gicr(cpu_index);
     // ─── CPU interface (system registers) ───────────────────────
     // SAFETY: GICv3 presence verified by caller.
     unsafe {
@@ -124,7 +216,7 @@ unsafe fn init_per_cpu(cpu_index: u32) {
     let gicr = gicr_base(cpu_index);
     // Clear ProcessorSleep (bit 1 of GICR_WAKER). Then poll
     // ChildrenAsleep (bit 2) until 0.
-    // SAFETY: identity-mapped MMIO; gicr is per-CPU stride.
+    // SAFETY: mapped MMIO; gicr is this CPU's redistributor frame.
     unsafe {
         let waker = (gicr + GICR_WAKER) as *mut u32;
         let cur = read_u32(waker);

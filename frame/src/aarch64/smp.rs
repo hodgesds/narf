@@ -154,6 +154,14 @@ pub unsafe fn start_aps() -> u32 {
         // in .text, identity-mapped at low PA).
         let entry = (_ap_start as usize) as u64;
 
+        // Map this AP's GIC redistributor from the BSP, before the AP runs.
+        // The AP would otherwise have to `ioremap` its own frame inside
+        // `gic::init_ap`, which means allocating and taking the vmalloc locks
+        // on a CPU that is still mid-bring-up with interrupts masked. Doing it
+        // here keeps that work on the BSP and bounds it to CPUs that actually
+        // start, rather than pre-mapping all MAX_CPUS frames.
+        narf_interrupts::aarch64::gic::remap_mmio(logical);
+
         // SAFETY: PSCI HVC; arguments well-formed.
         match unsafe { cpu_on(target_aff, entry, logical as u64) } {
             Ok(()) => {

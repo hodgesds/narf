@@ -57,6 +57,66 @@ const GITS_BASER0: usize = ITS_BASE + 0x0100;
 /// Doorbell — the physical address devices write to deliver MSI.
 const GITS_TRANSLATER: usize = ITS_BASE + 0x10040;
 
+/// ITS frame length on QEMU virt. `GITS_TRANSLATER` sits at +0x10040, so the
+/// frame is larger than the 64 KiB a distributor gets.
+const ITS_LEN: usize = 0x2_0000;
+/// CPU-0 redistributor frame length (GICv3 lays them 128 KiB apart).
+const GICR_LEN: usize = 0x2_0000;
+
+/// Mapped VAs for the two MMIO frames this module touches. Zero until
+/// [`remap_mmio`] runs; see [`mmio`].
+static ITS_VA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static GICR0_VA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Resolve a register address in one of this module's two MMIO frames to the
+/// address the CPU should actually use.
+///
+/// Every register constant here is written `FRAME_BASE + offset` and every
+/// access goes through the accessors below, so resolving in one place beats
+/// rewriting each constant and call site. Before [`remap_mmio`] the frames
+/// are reached at their physical bases — which is what the boot tables'
+/// Device block provided, and what this module relied on.
+///
+/// `GITS_TRANSLATER` deliberately does not pass through here: it is handed to
+/// devices as an MSI destination, so it must stay a physical address.
+#[inline]
+fn mmio(addr: usize) -> usize {
+    let its = ITS_VA.load(core::sync::atomic::Ordering::Acquire);
+    if its != 0 && (ITS_BASE..ITS_BASE + ITS_LEN).contains(&addr) {
+        return its + (addr - ITS_BASE);
+    }
+    let gicr = GICR0_VA.load(core::sync::atomic::Ordering::Acquire);
+    if gicr != 0 && (GICR_BASE..GICR_BASE + GICR_LEN).contains(&addr) {
+        return gicr + (addr - GICR_BASE);
+    }
+    addr
+}
+
+/// Move the ITS and CPU-0 redistributor onto `ioremap` windows.
+///
+/// Must run after `init_mmu` and before the boot identity window is dropped,
+/// for the same reason as `gic::remap_mmio`.
+pub fn remap_mmio() {
+    for (base, len, slot) in [
+        (ITS_BASE, ITS_LEN, &ITS_VA),
+        (GICR_BASE, GICR_LEN, &GICR0_VA),
+    ] {
+        if slot.load(core::sync::atomic::Ordering::Acquire) != 0 {
+            continue;
+        }
+        // SAFETY: architectural GICv3 frames on this machine, owned by us.
+        if let Ok(m) = unsafe {
+            narf_memory::ioremap::ioremap(
+                base as u64,
+                len as u64,
+                narf_memory::ioremap::MmioAttrs::Device,
+            )
+        } {
+            slot.store(m.va() as usize, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 const GICR_CTLR: usize = GICR_BASE;
 const GICR_PROPBASER: usize = GICR_BASE + 0x0070;
 const GICR_PENDBASER: usize = GICR_BASE + 0x0078;
@@ -197,7 +257,7 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // started fresh.
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        write_u32(GITS_CTLR as *mut u32, 1);
+        write_u32(mmio(GITS_CTLR) as *mut u32, 1);
     }
 
     // ── 5. Program GICR_PROPBASER + GICR_PENDBASER ────────────────
@@ -230,8 +290,8 @@ pub unsafe fn init_bsp() -> Result<(), ItsError> {
     // GICR_CTLR.EnableLPIs (bit 0).
     // SAFETY: identity-mapped MMIO.
     unsafe {
-        let cur = read_u32(GICR_CTLR as *mut u32);
-        write_u32(GICR_CTLR as *mut u32, cur | 1);
+        let cur = read_u32(mmio(GICR_CTLR) as *mut u32);
+        write_u32(mmio(GICR_CTLR) as *mut u32, cur | 1);
     }
 
     INIT_DONE.store(true, Ordering::Release);
@@ -317,14 +377,16 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
     // Dereference the command-queue base via GITS_CBASER's stored
     // address. We re-read it from the register so this works even
     // across re-init (or for a Stage-4 multi-page queue).
-    // SAFETY: identity-mapped MMIO.
+    // SAFETY: MMIO resolved by `mmio()`.
     let cbaser = unsafe { read_u64(GITS_CBASER) };
     let queue_pa = cbaser & 0x000F_FFFF_FFFF_F000;
-    let entry = (queue_pa + off) as *mut u64;
+    // `queue_pa` came out of a hardware register, so it is physical; reach
+    // the DRAM page through the direct map rather than dereferencing it.
+    let entry = narf_memory::PhysAddr::new(queue_pa + off).kernel_mut_ptr::<u64>();
 
     // Write the four 8-byte command words. ITS commands are
     // little-endian; the architecture treats them as four `u64`s.
-    // SAFETY: identity-mapped DRAM page allocated by init_bsp.
+    // SAFETY: DRAM page allocated by init_bsp, via the direct map.
     unsafe {
         compiler_fence(Ordering::SeqCst);
         core::ptr::write_volatile(entry, cmd[0]);
@@ -372,7 +434,7 @@ unsafe fn submit_command(cmd: &[u64; 4]) -> Result<(), ItsError> {
 unsafe fn read_u64(addr: usize) -> u64 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable + 8-byte aligned.
-    let v = unsafe { core::ptr::read_volatile(addr as *const u64) };
+    let v = unsafe { core::ptr::read_volatile(mmio(addr) as *const u64) };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -382,7 +444,7 @@ unsafe fn write_u64(addr: usize, value: u64) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 8-byte aligned.
     unsafe {
-        core::ptr::write_volatile(addr as *mut u64, value);
+        core::ptr::write_volatile(mmio(addr) as *mut u64, value);
     }
     compiler_fence(Ordering::SeqCst);
 }
