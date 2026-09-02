@@ -74,6 +74,7 @@ pub mod cgroup;
 pub mod cpu_lifecycle;
 pub mod donation;
 pub mod numa;
+pub mod eevdf;
 pub mod policy;
 pub mod priority;
 pub mod stackful;
@@ -105,10 +106,12 @@ pub use donation::{
     DonationError, DonationPolicy, EnqueueDonee, HeadQueueDonation,
 };
 pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
+pub use eevdf::EevdfScheduler;
 pub use policy::{
-    cpu_state, current_scheduler_name, install_scheduler, ClassScheduler, CpuIdleMeta, CpuState,
-    CpuStateChange, FifoScheduler, PriorityScheduler, RunQueue, SchedPolicy, Scheduler,
-    SchedulerError, TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent,
+    cpu_state, current_scheduler_name, install_scheduler, set_default_policy, ClassScheduler,
+    CpuIdleMeta, CpuSchedContext, CpuState, CpuStateChange, CurrentTask, FifoScheduler,
+    PriorityScheduler, RunQueue, SchedPolicy, SchedRow, Scheduler, SchedulerError,
+    TaskDequeueReason, TaskEnqueueReason, TaskHandle, TaskMeta, TaskQueueEvent,
 };
 pub use priority::{Priority, SchedClass, SmtSharePolicy, WorkKind};
 pub use stackful::{preempt_count, preempt_disable, PreemptGuard};
@@ -453,6 +456,42 @@ pub fn hint_io_next(task: u64) {
     }
 }
 
+/// Wake-preemption (boot flag `wake_preempt`, debugfs `sched/wake_preempt`).
+///
+/// NARF's analogue of Linux `try_to_wake_up` → `wakeup_preempt` →
+/// `resched_curr`: when a wake makes a peer runnable, ask the currently-running
+/// task to cede at its next cooperative preemption point (syscall exit) so the
+/// wakee runs promptly, instead of only at the fair-quantum floor
+/// (`slice / FAIR_QUANTUM_DIV`). A spinning waker — stress-ng `--futex`'s tight
+/// `FUTEX_WAKE` loop that never blocks — otherwise monopolizes a single vCPU
+/// and a wait/wake handoff costs one quantum (~ms) instead of ~µs.
+///
+/// Off by default: it trades a little batching for handoff latency and lives in
+/// the same risk zone as [`WAKE_NEXT_ENABLED`] (reverted for de-batching redis
+/// pipelines, #235). Enable + A/B against redis/mt-echo before making default.
+///
+/// This is only the ENABLE gate; the per-CPU one-shot request flag and its
+/// syscall-exit consumer live next to the other own-stack yield machinery in
+/// `stackful` (see `note_wake_preempt`). The yield *policy* itself is decided in
+/// the pure, unit-testable `syscall_exit_yield_decision` — the seam a future
+/// pluggable `Scheduler` could own as a `wakeup_preempt` method.
+static WAKE_PREEMPT_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable wake-preemption. Opt-in (see [`WAKE_PREEMPT_ENABLED`]).
+pub fn enable_wake_preempt() {
+    WAKE_PREEMPT_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable wake-preemption.
+pub fn disable_wake_preempt() {
+    WAKE_PREEMPT_ENABLED.store(false, Ordering::Release);
+}
+
+/// Whether wake-preemption is currently enabled.
+pub fn wake_preempt_enabled() -> bool {
+    WAKE_PREEMPT_ENABLED.load(Ordering::Acquire)
+}
+
 /// Enable wake-next dispatch. Opt-in (see [`WAKE_NEXT_ENABLED`]).
 pub fn enable_wake_next() {
     WAKE_NEXT_ENABLED.store(true, Ordering::Release);
@@ -676,6 +715,151 @@ static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 /// lost wake).
 static NEED_RESCHED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+/// Per-CPU virtual-time floor (EEVDF-lite; see
+/// `specification/scheduling-policies.md` §4): the maximum `vruntime` this CPU
+/// has dispatched. Monotone (`fetch_max` at dispatch). A newly admitted task is
+/// placed here so it neither starves the queue (starting at 0 = infinite credit)
+/// nor jumps ahead; a long sleeper's negative lag is clamped to
+/// `vfloor - EEVDF_BASE_SLICE`, and cross-CPU origin skew after a steal is
+/// renormalised against it. Read-only to policies via the core helper below.
+/// Cache-line-padded per-CPU floor cell — each CPU bumps its own `VFLOOR` at
+/// every dispatch, so padding to 64 bytes stops one CPU's write from
+/// invalidating a neighbour's line (no false sharing).
+#[repr(align(64))]
+struct VFloorCell(AtomicU64);
+static VFLOOR: [VFloorCell; narf_lib::percpu::MAX_CPUS] =
+    [const { VFloorCell(AtomicU64::new(0)) }; narf_lib::percpu::MAX_CPUS];
+
+/// EEVDF virtual-deadline horizon and lag-clamp width, in TSC cycles. Derived
+/// from the existing time-slice constant rather than a new wall-clock magic
+/// number — `DEFAULT_SLICE_CYCLES / 16` is ~625 µs at the 10 ms default,
+/// comparable to Linux's `sysctl_sched_base_slice` (700 µs). This is the
+/// batching hysteresis a wake-preemption policy protects (Linux `RUN_TO_PARITY`
+/// + base slice); it is NOT a run-time floor. Tick/CPL3 slice preemption and the
+/// `FAIR_QUANTUM_DIV` fair-share floor remain the untouched backstops.
+pub(crate) const EEVDF_BASE_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 16;
+
+/// Wake-preemption granularity: how long a runner is protected from a
+/// same-class wake-preemption after dispatch (RUN_TO_PARITY window), in TSC
+/// cycles. NARF's analogue of Linux's classic `sched_wakeup_granularity_ns`.
+/// Smaller ⇒ faster producer/consumer handoff (futex wait/wake) but less IPC
+/// batching; larger ⇒ more batching but slower handoff. Tuned below the pick
+/// base slice so a wait/wake round-trip costs a fraction of a scheduling
+/// quantum while a cooperative pipe/msg waker (which blocks on its own next op
+/// within a few µs) still batches. `DEFAULT_SLICE_CYCLES / 32` ≈ 312 µs.
+pub(crate) const WAKE_PROTECT_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 32;
+
+/// Read a CPU's virtual-time floor (see [`VFLOOR`]). `0` before the CPU has
+/// dispatched anything.
+#[inline]
+pub(crate) fn vfloor(cpu: usize) -> u64 {
+    if cpu < VFLOOR.len() {
+        VFLOOR[cpu].0.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Advance a CPU's virtual-time floor to at least `v` (monotone). Called at
+/// dispatch with the picked task's `vruntime`.
+#[inline]
+fn bump_vfloor(cpu: usize, v: u64) {
+    if cpu < VFLOOR.len() {
+        VFLOOR[cpu].0.fetch_max(v, Ordering::Relaxed);
+    }
+}
+
+/// Per-CPU snapshot of the running task's scheduling identity, published ONCE at
+/// dispatch and reused by every wake-preemption check during that dispatch — so
+/// the check never rebuilds it from the (unreachable) `TaskSlot` or allocates.
+/// It exists because the check runs LATER, in the task's own-stack syscall-exit
+/// where the slot is detached. Publish and read are both on the SAME CPU and
+/// never concurrent (the read happens while the task is dispatched), so relaxed
+/// atomics plus an id guard (a mismatch = stale snapshot) suffice.
+#[repr(align(64))]
+struct CurrentSched {
+    id: core::sync::atomic::AtomicU64,
+    vruntime: core::sync::atomic::AtomicU64,
+    vdeadline: core::sync::atomic::AtomicU64,
+    class_rank: core::sync::atomic::AtomicU8,
+}
+static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
+    CurrentSched {
+        id: core::sync::atomic::AtomicU64::new(0),
+        vruntime: core::sync::atomic::AtomicU64::new(0),
+        vdeadline: core::sync::atomic::AtomicU64::new(0),
+        class_rank: core::sync::atomic::AtomicU8::new(0),
+    }
+}; narf_lib::percpu::MAX_CPUS];
+
+/// Publish the dispatched task's scheduling snapshot for this CPU (see
+/// [`CURRENT_SCHED`]). Four relaxed stores, once per dispatch — the cache the
+/// per-wake check reuses.
+#[inline]
+fn publish_current_sched(cpu: usize, slot: &TaskSlot) {
+    if cpu >= CURRENT_SCHED.len() {
+        return;
+    }
+    let s = &CURRENT_SCHED[cpu];
+    s.vruntime.store(slot.vruntime, Ordering::Relaxed);
+    s.vdeadline
+        .store(slot.vruntime.wrapping_add(EEVDF_BASE_SLICE), Ordering::Relaxed);
+    s.class_rank.store(slot.spec.class.rank(), Ordering::Relaxed);
+    // id LAST: a same-CPU reader that sees the matching id has, by program
+    // order, also seen the fields above.
+    s.id.store(slot.id.raw(), Ordering::Relaxed);
+}
+
+/// Ask the installed scheduler policy whether the running task (`current_id`)
+/// should cede because a wake made a peer runnable. Routed from
+/// `stackful::maybe_resched_syscall_exit`; the core owns the mechanism, the
+/// policy owns this decision (Linux `wakeup_preempt`). Allocation-free: it reads
+/// the cached [`CURRENT_SCHED`] snapshot (guarded by id — a mismatch means the
+/// snapshot is stale, so we decline) into a `Copy` `CurrentTask`, and scans the
+/// queue through the lean `iter_sched` projection. On policy-slot OR run-queue
+/// contention it returns `false` (keep running; the fair-quantum floor still
+/// bounds starvation — the deliberate opposite polarity to
+/// `has_other_runnable_work`, because the failure mode here is de-batching). No
+/// policy installed yet (early boot) falls back to the legacy term.
+pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu >= CURRENT_SCHED.len() {
+        return false;
+    }
+    let snap = &CURRENT_SCHED[cpu];
+    if snap.id.load(Ordering::Relaxed) != current_id {
+        return false;
+    }
+    // Publish the runner's dispatch vruntime + how long it has run (`elapsed`).
+    // The policy forms the runner's current clock as `vruntime + elapsed` and
+    // applies RUN_TO_PARITY protection using `elapsed` directly. See
+    // `EevdfScheduler::wakeup_preempt`.
+    let dispatch_vruntime = snap.vruntime.load(Ordering::Relaxed);
+    let ctx = policy::CpuSchedContext {
+        cpu: CpuId(cpu as u32),
+        vfloor: vfloor(cpu),
+        elapsed,
+        current: policy::CurrentTask {
+            id: TaskId(current_id),
+            class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
+            vruntime: dispatch_vruntime,
+            vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
+        },
+    };
+    let cpu_id = CpuId(cpu as u32);
+    policy::try_with_scheduler(cpu_id, |scheduler| match scheduler {
+        Some(s) => match READY[cpu].try_lock() {
+            Some(q) => q
+                .as_ref()
+                .map(|d| s.wakeup_preempt(&ctx, &policy::RunQueue::projected(d)))
+                .unwrap_or(false),
+            None => false,
+        },
+        None => has_other_runnable_work(current_id),
+    })
+    .unwrap_or(false)
+}
 
 // ── Wake→run race instrument (boot flag `wake_race`) ────────────────────
 // Nails the redis in-guest p99 tail: is a just-woken task's dispatch delayed
@@ -1134,6 +1318,15 @@ pub(crate) struct TaskSlot {
     /// Held purely for its `Drop` side-effect — never read, hence the allow.
     #[allow(dead_code)]
     nproc_guard: Option<NprocGuard>,
+    /// Accumulated virtual runtime in TSC cycles (EEVDF-lite; see
+    /// `specification/scheduling-policies.md` §4). Charged the `elapsed` a
+    /// dispatch ran, at the same charge sites as `account` — one 64-bit add, no
+    /// extra `rdtsc`. Frozen while the task is parked (not dispatched), which is
+    /// the sleeper credit an eligibility policy reads. Core-owned metadata
+    /// projected read-only to policies via `TaskMeta::vruntime`; a policy never
+    /// writes it. Initialised to the target CPU's `VFLOOR` at admission so a new
+    /// task gets no unbounded head-start.
+    pub(crate) vruntime: u64,
 }
 
 /// One in-flight time-slice donation handed to a task by
@@ -1947,7 +2140,21 @@ pub fn resched_ipi_drain() {
 }
 
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
-fn enqueue_on(cpu: usize, slot: TaskSlot, reason: policy::TaskEnqueueReason) {
+fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason) {
+    // EEVDF-lite: place a NEWLY ADMITTED task at the target CPU's virtual-time
+    // floor so it neither starts with unbounded credit (vruntime 0 would look
+    // infinitely starved) nor jumps ahead of resident work. Requeue/Migrate keep
+    // the task's accumulated vruntime (migration renormalises it separately).
+    if matches!(reason, policy::TaskEnqueueReason::Admitted) {
+        slot.vruntime = vfloor(cpu);
+    } else if matches!(reason, policy::TaskEnqueueReason::Migrated) {
+        // A migrated task's vruntime originated against its SOURCE CPU's floor;
+        // clamp it into one base slice around the destination floor so cross-CPU
+        // origin skew can neither grant unbounded credit nor bury the task.
+        let lo = vfloor(cpu).saturating_sub(EEVDF_BASE_SLICE);
+        let hi = vfloor(cpu).saturating_add(EEVDF_BASE_SLICE);
+        slot.vruntime = slot.vruntime.clamp(lo, hi);
+    }
     // Record the slot's home CPU so a cross-core waker knows where to
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
@@ -2132,6 +2339,7 @@ where
         domain_saved: None,
         rt_reservation: None,
         nproc_guard: None,
+        vruntime: 0,
     };
     let cpu = target_cpu(&spec);
     register_task_affinity(id, spec.affinity, false);
@@ -2193,6 +2401,7 @@ where
         domain_saved: None,
         rt_reservation: Some(reservation),
         nproc_guard: None,
+        vruntime: 0,
     };
     register_task_affinity(id, spec.affinity, true);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
@@ -2416,6 +2625,7 @@ where
         domain_saved: None,
         rt_reservation: None,
         nproc_guard: Some(NprocGuard::new()),
+        vruntime: 0,
     };
     let cpu = target_cpu(&spec);
     register_task_affinity(id, spec.affinity, false);
@@ -2730,6 +2940,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             runnable: d.awake.flag.load(Ordering::Acquire),
                             affinity: d.spec.affinity,
                             addr_space: d.addr_space.is_some(),
+                            vruntime: d.vruntime,
                         },
                         true,
                     )
@@ -2750,6 +2961,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             runnable: false,
                             affinity: crate::affinity::Affinity::any(),
                             addr_space: false,
+                            vruntime: 0,
                         },
                         false,
                     )
@@ -2771,6 +2983,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                         runnable: false,
                         affinity: crate::affinity::Affinity::any(),
                         addr_space: false,
+                        vruntime: 0,
                     },
                     false,
                 )
@@ -3117,6 +3330,11 @@ pub fn poll_one_round() -> usize {
         // Running on this CPU now — aim future wakes' reschedule IPI here
         // (the slot may have been work-stolen since it was enqueued).
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
+        // Advance this CPU's EEVDF virtual-time floor to the dispatched task's
+        // vruntime (monotone), then publish its scheduling snapshot so a later
+        // wake-preemption check can read it. See VFLOOR / CURRENT_SCHED.
+        bump_vfloor(cpu, slot.vruntime);
+        publish_current_sched(cpu, &slot);
         let waker = make_waker(slot.awake.clone());
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
@@ -3147,6 +3365,9 @@ pub fn poll_one_round() -> usize {
             .cycles_since(start)
             .saturating_sub(interrupt_elapsed);
         let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
+        // EEVDF-lite: charge the cycles this dispatch ran to the task's virtual
+        // runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`, one add.
+        slot.vruntime = slot.vruntime.wrapping_add(elapsed);
         let period_outcome = slot
             .account
             .charge_period(elapsed, &slot.spec.budget, borrowed);
@@ -3413,6 +3634,11 @@ pub fn run_until_empty() {
             // Running on this CPU now — aim future wakes' reschedule IPI
             // here (the slot may have been work-stolen since enqueue).
             slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
+            // Advance this CPU's EEVDF virtual-time floor to the dispatched
+            // task's vruntime (monotone), then publish its scheduling snapshot
+            // for a later wake-preemption check. See VFLOOR / CURRENT_SCHED.
+            bump_vfloor(cpu, slot.vruntime);
+            publish_current_sched(cpu, &slot);
 
             // Save the kernel per-AS register before activating
             // the user AS so we can swap back after `poll()`
@@ -3558,6 +3784,9 @@ pub fn run_until_empty() {
                 .cycles_since(start)
                 .saturating_sub(interrupt_elapsed);
             let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
+            // EEVDF-lite: charge the cycles this dispatch ran to the task's
+            // virtual runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`.
+            slot.vruntime = slot.vruntime.wrapping_add(elapsed);
             let period_outcome = slot
                 .account
                 .charge_period(elapsed, &slot.spec.budget, borrowed);

@@ -626,8 +626,11 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
     crate::__reset_queues_for_test();
 
     // Pretend CPU 1 is an online, idle-halted AP. Restored below. The
-    // fake setter keeps the ever-online record truthful for later tests.
+    // fake setter keeps the ever-online record truthful for later tests. A real
+    // halted, drain-ready AP is `Idle` (not the default `Offline`); the wake
+    // path's `target_drains` gate needs that to take the cross-core kick path.
     narf_lib::smp::__test_fake_online(1);
+    crate::policy::__test_set_cpu_state(CpuId(1), crate::policy::CpuState::Idle);
     crate::__test_set_cpu_halted(1, true);
 
     let spec = TaskSpec {
@@ -694,6 +697,10 @@ fn smoke_scheduler_wake_publishes_need_resched() -> TestResult {
 
     crate::__reset_queues_for_test();
     narf_lib::smp::__test_fake_online(1);
+    // A faked-online halted AP must also read as `Idle` so the wake path takes
+    // the cross-core kick branch (see `target_drains`), not the quiesced direct
+    // enqueue that skips the IPI + NEED_RESCHED publish.
+    crate::policy::__test_set_cpu_state(CpuId(1), crate::policy::CpuState::Idle);
 
     let spec = || TaskSpec {
         affinity: Affinity {
@@ -2659,6 +2666,183 @@ kernel_test_in!(
     "scheduler",
     smoke_scheduler_faulty_policy_cannot_strand_work
 );
+
+/// EEVDF-lite accounting (Phase 1): a task's `vruntime` is projected into
+/// `TaskMeta`, starts at the CPU's virtual-time floor on admission, and grows
+/// as the task consumes dispatch cycles. An observing policy records the
+/// vruntime it sees across the busy task's re-dispatches; the last observation
+/// must exceed the first (charged forward progress), and the first must be a
+/// bounded, non-garbage value (floor-initialised, not left at 0 with an
+/// unbounded head start relative to a warmed floor).
+fn smoke_scheduler_vruntime_accumulates_and_floor_inits() -> TestResult {
+    use crate::{
+        install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
+        TaskHandle,
+    };
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    static FIRST_VR: AtomicU64 = AtomicU64::new(u64::MAX);
+    static LAST_VR: AtomicU64 = AtomicU64::new(0);
+    static OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
+    // A FIFO-equivalent policy that snapshots the picked task's projected
+    // vruntime each dispatch. It must not otherwise change ordering.
+    #[derive(Copy, Clone, Debug)]
+    struct ObserveVruntime;
+    impl Scheduler for ObserveVruntime {
+        fn name(&self) -> &'static str {
+            "observe-vruntime"
+        }
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
+            let pick = queue
+                .iter_meta()
+                .find(|(_, m)| m.runnable)
+                .map(|(h, m)| (h, m.vruntime));
+            if let Some((handle, vr)) = pick {
+                FIRST_VR.fetch_min(vr, Ordering::Relaxed);
+                LAST_VR.store(vr, Ordering::Relaxed);
+                OBSERVED.fetch_add(1, Ordering::Relaxed);
+                return Some(handle);
+            }
+            queue.front()
+        }
+    }
+
+    FIRST_VR.store(u64::MAX, Ordering::Relaxed);
+    LAST_VR.store(0, Ordering::Relaxed);
+    OBSERVED.store(0, Ordering::Relaxed);
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ObserveVruntime).is_err() {
+        return TestResult::Fail("install_scheduler(ObserveVruntime) failed");
+    }
+
+    // A task that yields several times so it is re-dispatched (and re-charged)
+    // more than once, giving vruntime room to advance across observations.
+    spawn(async {
+        for _ in 0..8 {
+            crate::yield_now().await;
+        }
+    });
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if OBSERVED.load(Ordering::Relaxed) < 2 {
+        return TestResult::Fail("task was not re-dispatched enough to observe vruntime growth");
+    }
+    let first = FIRST_VR.load(Ordering::Relaxed);
+    let last = LAST_VR.load(Ordering::Relaxed);
+    if first == u64::MAX {
+        return TestResult::Fail("never observed a vruntime");
+    }
+    // Floor-init sanity: a freshly admitted task on a cold/warm floor must not
+    // read an absurd value; with the test's fresh queues the floor is small.
+    if first > crate::EEVDF_BASE_SLICE.saturating_mul(64) {
+        return TestResult::Fail("admitted vruntime not floor-initialised (too large)");
+    }
+    if last <= first {
+        return TestResult::Fail("vruntime did not advance across re-dispatches");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_vruntime_accumulates_and_floor_inits
+);
+
+/// EEVDF wake-preemption policy (`eevdf::eevdf_should_preempt`), the pure rule
+/// behind `EevdfScheduler::wakeup_preempt`. Pins the three behaviours that
+/// distinguish it from both the naive "preempt every wake" (which de-batched
+/// pipe/msg) and a flat run-time floor (which lost the futex win):
+///   - a starved sleeper (earlier `d_eff` than the runner's protected deadline)
+///     preempts — the futex wait/wake handoff;
+///   - a balanced peer (equal deadline) does NOT preempt — no de-batch;
+///   - a woken CPU hog (later deadline) does NOT preempt — no starvation of the
+///     runner; and class rank always dominates within the rule.
+fn smoke_eevdf_wakeup_preempt_rule() -> TestResult {
+    use crate::eevdf::eevdf_should_preempt as should;
+    use crate::priority::SchedClass;
+    use crate::EEVDF_BASE_SLICE as BASE;
+
+    // `runner_now` = the runner's CURRENT effective virtual runtime.
+    let runner_now: u64 = 10 * BASE;
+
+    // Starved sleeper: deadline a base slice before the runner's clock => preempt.
+    if !should(
+        SchedClass::Default,
+        runner_now,
+        SchedClass::Default,
+        runner_now - BASE,
+    ) {
+        return TestResult::Fail("starved sleeper (d_eff before runner_now) must preempt");
+    }
+    // Peer exactly caught up (equal): strict-less-than is false => no preempt.
+    if should(SchedClass::Default, runner_now, SchedClass::Default, runner_now) {
+        return TestResult::Fail("caught-up peer (equal) must NOT preempt");
+    }
+    // Briefly-blocked / not-yet-due peer: deadline after the runner's clock =>
+    // no preempt (this is what preserves pipe/msg batching until the runner has
+    // actually run ~a base slice).
+    if should(
+        SchedClass::Default,
+        runner_now,
+        SchedClass::Default,
+        runner_now + BASE,
+    ) {
+        return TestResult::Fail("not-yet-due peer (d_eff after runner_now) must NOT preempt");
+    }
+    // Class rank dominates both ways.
+    if !should(
+        SchedClass::Default,
+        runner_now,
+        SchedClass::Realtime,
+        runner_now + 100 * BASE,
+    ) {
+        return TestResult::Fail("higher-class wakee must preempt regardless of deadline");
+    }
+    if should(SchedClass::Default, runner_now, SchedClass::Idle, 0) {
+        return TestResult::Fail("lower-class wakee must never preempt");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_eevdf_wakeup_preempt_rule);
+
+/// `EevdfScheduler` installs and dispatches all runnable work (fairness
+/// ordering itself is covered by the pure pick comparator + the vruntime
+/// accounting test). Guards the pick-path plumbing under a live executor.
+fn smoke_eevdf_dispatches_runnable() -> TestResult {
+    use crate::{install_scheduler, ClassScheduler, EevdfScheduler, SchedPolicy};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    static RAN: AtomicUsize = AtomicUsize::new(0);
+    RAN.store(0, Ordering::Relaxed);
+
+    crate::__reset_queues_for_test();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, EevdfScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(EevdfScheduler) failed");
+    }
+    if crate::current_scheduler_name() != Some("eevdf") {
+        let _ = install_scheduler(&cap, ClassScheduler);
+        return TestResult::Fail("current_scheduler_name did not reflect eevdf install");
+    }
+    crate::spawn(async {
+        RAN.fetch_add(1, Ordering::Relaxed);
+    });
+    crate::spawn(async {
+        RAN.fetch_add(1, Ordering::Relaxed);
+    });
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if RAN.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("eevdf did not dispatch both runnable tasks");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_eevdf_dispatches_runnable);
 
 fn smoke_scheduler_honors_policy_pick_order() -> TestResult {
     use crate::{

@@ -1,5 +1,9 @@
 //! Pluggable scheduler-policy seam — Wave D of the modular-cores plan
-//! (`docs/PLUGGABILITY.md`). Mirrors `power::GovernorPolicy` shape:
+//! (`docs/PLUGGABILITY.md`). See
+//! [`specification/scheduling-policies.md`](../specification/scheduling-policies.md)
+//! for the policy-authoring guide (core/policy split, the method contract, the
+//! `vruntime` metadata, and the EEVDF-lite default with its Linux lineage).
+//! Mirrors `power::GovernorPolicy` shape:
 //!
 //! - `pub trait Scheduler: Send + Sync + 'static` defines the policy.
 //! - one generation-stamped CPU-local slot holds the active impl per CPU;
@@ -118,6 +122,12 @@ pub struct TaskMeta {
     /// refuses these unconditionally — a hard safety floor that holds
     /// even if a user task were mis-pinned to `Affinity::any()`.
     pub addr_space: bool,
+    /// Accumulated virtual runtime in TSC cycles (EEVDF-lite; see
+    /// `specification/scheduling-policies.md` §4). Frozen while parked, so a
+    /// long-slept task reads a low value relative to the CPU's `VFLOOR` — the
+    /// sleeper credit an eligibility policy (`EevdfScheduler`) uses to order
+    /// picks and decide wake-preemption. Read-only projection of core state.
+    pub vruntime: u64,
 }
 
 impl TaskMeta {
@@ -145,8 +155,68 @@ impl TaskMeta {
             runnable: slot.awake.flag.load(Ordering::Acquire),
             affinity: slot.spec.affinity,
             addr_space: slot.addr_space.is_some(),
+            vruntime: slot.vruntime,
         }
     }
+}
+
+/// Snapshot of the task currently running on a CPU, published by the core at
+/// dispatch and handed to [`Scheduler::wakeup_preempt`]. The running task's
+/// slot is detached from the queue during its poll, so this is how a policy
+/// sees the runner. `vdeadline` is the runner's EEVDF virtual-deadline
+/// protection horizon (`vruntime`-at-dispatch + base slice); an eligibility
+/// policy preempts a wake only when the wakee is more eligible than this. See
+/// `specification/scheduling-policies.md` §5.
+#[derive(Copy, Clone, Debug)]
+pub struct CurrentTask {
+    pub id: TaskId,
+    pub class: SchedClass,
+    /// Virtual runtime at dispatch, in TSC cycles.
+    pub vruntime: u64,
+    /// Protected virtual deadline = `vruntime`-at-dispatch + base slice.
+    pub vdeadline: u64,
+}
+
+/// Per-CPU scheduling context handed to a policy's decision hooks. Assembled by
+/// the core from cached per-CPU state (the dispatch-time [`CurrentTask`] snapshot
+/// + the CPU's virtual-time floor) — a `Copy` view, never a heap allocation and
+/// never rebuilt from the task slot. Bundling these means a policy reads
+/// `ctx.vfloor` / `ctx.current` directly instead of calling back into the core,
+/// and new per-CPU scheduling state can be added here without changing every
+/// hook signature.
+#[derive(Copy, Clone, Debug)]
+pub struct CpuSchedContext {
+    pub cpu: CpuId,
+    /// This CPU's EEVDF virtual-time floor (see
+    /// `specification/scheduling-policies.md` §4).
+    pub vfloor: u64,
+    /// Snapshot of the task currently running on `cpu`.
+    pub current: CurrentTask,
+    /// Cycles the running task has executed since its current dispatch. Lets a
+    /// policy apply RUN_TO_PARITY slice protection (don't preempt the runner
+    /// until it has consumed a base slice) — the batching guard that keeps a
+    /// cooperative producer/consumer from context-switching on every wake.
+    pub elapsed: u64,
+}
+
+/// Lean per-slot projection for eligibility policies (`EevdfScheduler`) — only
+/// the fields a dispatch/wake decision needs, WITHOUT materialising the full
+/// [`TaskMeta`] (which copies the budget, account, and view). Produced by
+/// [`RunQueue::iter_sched`], which computes each slot's eligibility tier once
+/// with a single shared timestamp, so an eligibility scan pays no per-slot
+/// budget/account copy. `Copy`, so a scan never allocates.
+#[derive(Copy, Clone, Debug)]
+pub struct SchedRow {
+    pub handle: TaskHandle,
+    pub class: SchedClass,
+    pub priority: Priority,
+    /// Core-computed periodic eligibility tier at scan time.
+    pub eligibility: BudgetEligibility,
+    pub runnable: bool,
+    /// True for user / process-bearing tasks (never stolen cross-CPU).
+    pub addr_space: bool,
+    /// Accumulated virtual runtime in TSC cycles (see `TaskMeta::vruntime`).
+    pub vruntime: u64,
 }
 
 /// Why a task entered a policy's CPU-local queue ownership.
@@ -281,6 +351,24 @@ impl<'a> RunQueue<'a> {
         })
     }
 
+    /// Lean projection for eligibility policies (see [`SchedRow`]). Like
+    /// [`iter_meta`](Self::iter_meta) but yields only the decision fields, with
+    /// NO per-slot `TaskMeta` (budget/account/view) copy — an EevdfScheduler
+    /// pick/preempt scan is O(n) in cheap `Copy` rows. One shared `now_cycles()`
+    /// for the whole scan. Does not allocate.
+    pub fn iter_sched(&self) -> impl Iterator<Item = SchedRow> + '_ {
+        let now = narf_time::now_cycles();
+        self.inner.iter().map(move |slot| SchedRow {
+            handle: TaskHandle::from_id(slot.id),
+            class: slot.spec.class,
+            priority: slot.spec.priority,
+            eligibility: slot.account.view(now, &slot.spec.budget).eligibility,
+            runnable: slot.awake.flag.load(Ordering::Acquire),
+            addr_space: slot.addr_space.is_some(),
+            vruntime: slot.vruntime,
+        })
+    }
+
     /// Handle for the front-most candidate, without detaching it.
     #[inline]
     pub fn front(&self) -> Option<TaskHandle> {
@@ -306,6 +394,23 @@ pub trait Scheduler: Send + Sync + 'static {
     /// the highest available eligibility tier; policy code cannot strand
     /// core-owned work or override throttling.
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle>;
+
+    /// Decide whether the task currently running on `cpu` (`current`) should
+    /// cede at its next cooperative preemption point because a wake just made a
+    /// peer in `queue` runnable. NARF's analogue of Linux
+    /// `check_preempt_wakeup_fair` (`kernel/sched/fair.c`). Consulted ONCE per
+    /// wake, at the waker's syscall-exit — never on a no-wake exit — so its cost
+    /// is paid only when a wake actually happened.
+    ///
+    /// Default `false`: a policy without an eligibility model (FIFO, priority,
+    /// strict-class) does not wake-preempt, preserving its batching. An
+    /// EEVDF-style policy overrides this to preempt iff the wakee is more
+    /// eligible than the runner's protected `vdeadline`. The core still owns the
+    /// mechanism (the sticky per-CPU request, the syscall-exit yield); this only
+    /// decides yes/no. See `specification/scheduling-policies.md` §5.
+    fn wakeup_preempt(&self, _ctx: &CpuSchedContext, _queue: &RunQueue<'_>) -> bool {
+        false
+    }
 
     /// Called once before this policy is published to any CPU. Constructors
     /// should perform fallible setup before `install_scheduler`; lifecycle
@@ -569,6 +674,19 @@ pub fn __reset_cpu_states_for_test() {
     }
 }
 
+/// Test hook: force a CPU's published scheduler state. A fixture that fakes a
+/// remote CPU online (`smp::__test_fake_online`) must also give it a realistic
+/// executor state — a halted, drain-ready AP is `Idle`, not the default
+/// `Offline` — or the wake path's `target_drains` gate (which mirrors Linux
+/// `ttwu_queue_cond`'s `cpu_active` check) treats it as quiesced and skips the
+/// cross-core kick.
+#[doc(hidden)]
+pub fn __test_set_cpu_state(cpu: CpuId, state: CpuState) {
+    if let Some(cell) = CPU_STATES.get(cpu.0 as usize) {
+        cell.store(state as u8, Ordering::Release);
+    }
+}
+
 /// Install a scheduler policy. Cap-gated on `Cap<SchedPolicy, Grant>`.
 /// Replaces the previous active policy; the displaced `Arc` is
 /// dropped.
@@ -606,12 +724,47 @@ pub fn current_scheduler_name() -> Option<&'static str> {
 /// Install the default strict-class scheduler if no scheduler is yet
 /// installed. Idempotent — re-calling after an explicit
 /// `install_scheduler` is a no-op. Called from `crate::init`.
+/// Which built-in policy [`install_default_if_unset`] installs at boot. Set
+/// before `narf_scheduler` init via [`set_default_policy`] (e.g. from a
+/// `sched_policy=` boot arg). Staged as `class` (the historical default) while
+/// `eevdf` is validated via the boot arg; the Phase-5 flip changes this initial
+/// value to `POLICY_EEVDF` so the robust eligibility policy is the default.
+static DEFAULT_POLICY: AtomicU8 = AtomicU8::new(POLICY_CLASS);
+const POLICY_EEVDF: u8 = 0;
+const POLICY_CLASS: u8 = 1;
+const POLICY_FIFO: u8 = 2;
+const POLICY_PRIORITY: u8 = 3;
+
+/// Choose the built-in policy installed as the boot default. Returns `false`
+/// for an unknown name (the current default is left unchanged). Must be called
+/// before scheduler init; after init, use [`install_scheduler`] to swap live.
+pub fn set_default_policy(name: &str) -> bool {
+    let v = match name {
+        "eevdf" => POLICY_EEVDF,
+        "class" => POLICY_CLASS,
+        "fifo" => POLICY_FIFO,
+        "priority" => POLICY_PRIORITY,
+        _ => return false,
+    };
+    DEFAULT_POLICY.store(v, Ordering::Release);
+    true
+}
+
+fn default_policy_boxed() -> Box<dyn Scheduler> {
+    match DEFAULT_POLICY.load(Ordering::Acquire) {
+        POLICY_CLASS => Box::new(ClassScheduler),
+        POLICY_FIFO => Box::new(FifoScheduler),
+        POLICY_PRIORITY => Box::new(PriorityScheduler),
+        _ => Box::new(crate::eevdf::EevdfScheduler),
+    }
+}
+
 pub(crate) fn install_default_if_unset() {
     if CPU_SCHEDULERS.iter().all(|slot| slot.lock().is_some()) {
         return;
     }
     let replacement = Arc::new(PolicyInstance {
-        policy: Box::new(ClassScheduler),
+        policy: default_policy_boxed(),
     });
     replacement.policy.on_install();
     let _ = publish_policy(replacement, true);

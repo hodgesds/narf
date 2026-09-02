@@ -2164,6 +2164,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     src
                 );
 
+                // Choose the boot default scheduler policy from the
+                // `sched_policy=<eevdf|class|fifo|priority>` cmdline arg, BEFORE
+                // `init` installs the default. Unknown/absent leaves the staged
+                // default. Runtime swaps go through `install_scheduler`.
+                if let Some(name) = narf_boot::args().value("sched_policy") {
+                    if narf_scheduler::set_default_policy(name) {
+                        let _ = writeln!(console::Writer, "  sched_policy: {name}");
+                    }
+                }
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
@@ -2441,6 +2450,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     );
                 }
 
+                // Choose the boot default scheduler policy from the
+                // `sched_policy=<eevdf|class|fifo|priority>` cmdline arg, BEFORE
+                // `init` installs the default. Unknown/absent leaves the staged
+                // default. Runtime swaps go through `install_scheduler`.
+                if let Some(name) = narf_boot::args().value("sched_policy") {
+                    if narf_scheduler::set_default_policy(name) {
+                        let _ = writeln!(console::Writer, "  sched_policy: {name}");
+                    }
+                }
                 // Initialise per-CPU scheduler queues *before* AP
                 // bring-up — APs jump straight into the scheduler
                 // run loop and need their own queue ready.
@@ -4112,6 +4130,20 @@ fn run_async_demo() -> ! {
             let _ = writeln!(
                 console::Writer,
                 "  io_next: narrow I/O directed wake ENABLED"
+            );
+        }
+        // Wake-preemption (Linux `wakeup_preempt`/`resched_curr`): a wake asks
+        // the running task to cede at its next syscall exit so the wakee runs
+        // promptly instead of after a fair quantum. Collapses producer/consumer
+        // handoff latency — stress-ng --futex's spinning FUTEX_WAKE loop
+        // otherwise monopolizes a single vCPU and the wait/wake handoff costs a
+        // whole quantum (~ms) instead of ~µs. Also flippable at runtime via
+        // debugfs `sched/wake_preempt`.
+        if narf_boot::args().has_flag("wake_preempt") {
+            narf_scheduler::enable_wake_preempt();
+            let _ = writeln!(
+                console::Writer,
+                "  wake_preempt: wake-preemption ENABLED"
             );
         }
         // Diagnostic: wake→run race — is a woken task's dispatch delayed by a

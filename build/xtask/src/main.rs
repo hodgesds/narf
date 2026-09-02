@@ -804,15 +804,28 @@ impl Arch {
                         },
                     ),
                 ];
-                // Optional accel override. Unset ⇒ QEMU auto-selects
-                // (KVM when /dev/kvm exists, else single-threaded TCG).
-                // Escape hatch: `XTASK_QEMU_ACCEL=tcg,thread=multi` runs
-                // each vCPU on its own host thread, so a BSP spinning on
-                // an AP's IPI ack doesn't starve the AP under TCG —
-                // needed only if a runner exposes x2APIC under TCG and
-                // the x2APIC-gated shootdown smokes actually run (CI's
-                // qemu64 falls back to xAPIC, so they Skip instead).
-                if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+                // Accelerator selection. QEMU's built-in default is TCG
+                // (pure emulation) even when /dev/kvm is present — it does
+                // NOT auto-select KVM. Emulation runs ~10-20x slower and
+                // silently invalidates any perf comparison (a pure-userspace
+                // control stressor reads ~0.05x instead of ~1.0x), so default
+                // to `kvm` whenever /dev/kvm is usable. CI runners have no
+                // /dev/kvm and correctly fall through to TCG.
+                // `XTASK_QEMU_ACCEL` overrides verbatim — e.g.
+                // `XTASK_QEMU_ACCEL=tcg` forces emulation (to exercise the
+                // xAPIC/InitialCount fallback paths), and
+                // `XTASK_QEMU_ACCEL=tcg,thread=multi` runs each vCPU on its
+                // own host thread so a BSP spinning on an AP's IPI ack
+                // doesn't starve the AP under TCG.
+                let accel = std::env::var("XTASK_QEMU_ACCEL").ok().or_else(|| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/kvm")
+                        .ok()
+                        .map(|_| "kvm".to_string())
+                });
+                if let Some(accel) = accel {
                     args.push("-accel".into());
                     args.push(accel);
                 }
@@ -5283,6 +5296,31 @@ fn boot_narf_redis(
 /// loader + an `/init` that brings up virtio-net and execs redis) and
 /// boot a stock Linux kernel under QEMU with the same hostfwd. Returns
 /// the QEMU child and a connected host `TcpStream`. This is the
+/// Resolve the QEMU accelerator for the perf benches (redis-bench, mt-echo).
+/// `XTASK_QEMU_ACCEL` overrides verbatim; otherwise default to `kvm` when
+/// `/dev/kvm` is usable. Bare QEMU does NOT auto-select KVM, and TCG inflates
+/// the guest ~10x AND distorts the profile — running a perf bench under TCG
+/// silently invalidates it (the redis-bench TCG-vs-KVM confound). Returns `None`
+/// only when no accelerator should be injected (no /dev/kvm, no override), i.e.
+/// QEMU's TCG default. `label()` renders the same choice for the banner.
+fn bench_accel() -> Option<String> {
+    if let Ok(a) = std::env::var("XTASK_QEMU_ACCEL") {
+        return Some(a);
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/kvm")
+        .ok()
+        .map(|_| "kvm".to_string())
+}
+
+/// The accelerator string for the bench banner — the real choice `bench_accel`
+/// makes, or `tcg (default)` when nothing is injected.
+fn bench_accel_label() -> String {
+    bench_accel().unwrap_or_else(|| "tcg (default)".into())
+}
+
 /// apples-to-apples Linux baseline: same redis binary, same QEMU +
 /// virtio-net + SLIRP, just a Linux kernel in place of NARF.
 fn boot_linux_redis(
@@ -5446,7 +5484,7 @@ fn boot_linux_redis(
         ),
     };
     cmd.args(["-netdev", &linux_netdev, "-device", &linux_dev]);
-    if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+    if let Some(accel) = bench_accel() {
         cmd.args(["-accel", accel.as_str()]);
     }
     cmd.stdin(Stdio::piped());
@@ -5695,7 +5733,7 @@ fn boot_linux_mt_echo(guest_port: u16, server_threads: usize) -> Result<std::pro
         "-device",
         &device,
     ]);
-    if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+    if let Some(accel) = bench_accel() {
         cmd.args(["-accel", accel.as_str()]);
     }
     cmd.stdin(Stdio::piped());
@@ -6092,7 +6130,7 @@ fn mt_echo_bench_cmd(args: &BuildArgs) -> Result<()> {
 
     let tap_mode = std::env::var_os("XTASK_QEMU_TAP").is_some();
     let queues = std::env::var("XTASK_QEMU_QUEUES").unwrap_or_else(|_| "1".into());
-    let accel = std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "tcg (default)".into());
+    let accel = bench_accel_label();
     let backend = if tap_mode {
         "tap (real NIC)"
     } else {
@@ -6231,7 +6269,7 @@ fn redis_bench_cmd(args: &BuildArgs) -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(100);
 
-    let accel = std::env::var("XTASK_QEMU_ACCEL").unwrap_or_else(|_| "tcg (default)".into());
+    let accel = bench_accel_label();
     println!(
         "xtask redis-bench: workload = {ops} pipelined ops (depth {pipeline}) SET + GET, \
          {lat_ops} sequential PINGs for latency\n\
