@@ -860,7 +860,7 @@ fn smoke_virtio_mmio_probe() -> TestResult {
     // probe will succeed. Re-probe every registry entry here to
     // exercise VirtioMmioDevice::probe directly.
     use narf_bus::{devices, BusKind};
-    use narf_drivers_virtio::VirtioMmioDevice;
+    use narf_drivers_virtio::{ProbeError, VirtioMmioDevice};
     // SAFETY: init tolerates a null/absent DTB by falling back to the
     // QEMU-virt default layout; identity-map covers the MMIO window.
     // SAFETY: Valid memory or trusted environment
@@ -881,14 +881,22 @@ fn smoke_virtio_mmio_probe() -> TestResult {
                 }
                 ok += 1;
             }
-            Err(_) => {
-                // The bus registry filters out empty (device_id == 0)
-                // MMIO slots before we see them, so a bus-registry
-                // entry that fails probe is a real anomaly — magic
-                // mismatch or unsupported version.
-                return TestResult::Fail(
-                    "unexpected probe error on bus-registry virtio-mmio entry",
-                );
+            // The bus registry filters out empty (device_id == 0) MMIO slots
+            // before we see them, so a bus-registry entry that fails probe is
+            // a real anomaly. Report *which* failure: collapsing them into one
+            // message made a genuine bug indistinguishable from a mapping
+            // failure when this finally ran.
+            Err(ProbeError::WrongMagic) => {
+                return TestResult::Fail("virtio-mmio entry read the wrong magic");
+            }
+            Err(ProbeError::UnsupportedVersion) => {
+                return TestResult::Fail("virtio-mmio entry reported a legacy version");
+            }
+            Err(ProbeError::MapFailed) => {
+                return TestResult::Fail("could not map the virtio-mmio register window");
+            }
+            Err(ProbeError::NotVirtioMmio) | Err(ProbeError::EmptySlot) => {
+                return TestResult::Fail("bus registry published a non-virtio-mmio entry");
             }
         }
     }

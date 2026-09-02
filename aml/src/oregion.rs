@@ -190,16 +190,17 @@ pub fn for_each_field<F: FnMut(&FieldInfo)>(mut f: F) {
 /// one window rather than leaking VA space.
 #[cfg(target_arch = "x86_64")]
 fn sysmem_ptr(phys: u64, width_bytes: usize) -> Option<*mut u8> {
-    let page_off = phys & 0xFFF;
-    let base = phys.checked_sub(page_off)?;
-    let len = ((width_bytes as u64) + page_off + 0xFFF) & !0xFFF;
     // SAFETY: the address comes from firmware's own OperationRegion
     // declaration; AML owns the window it describes.
     let mapping = unsafe {
-        narf_memory::ioremap::ioremap(base, len, narf_memory::ioremap::MmioAttrs::Device)
+        narf_memory::ioremap::ioremap(
+            phys,
+            width_bytes as u64,
+            narf_memory::ioremap::MmioAttrs::Device,
+        )
     }
     .ok()?;
-    Some((mapping.virt + page_off) as *mut u8)
+    Some(mapping.va() as *mut u8)
 }
 
 #[cfg(not(target_arch = "x86_64"))]

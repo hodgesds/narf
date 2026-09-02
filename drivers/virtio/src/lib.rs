@@ -196,14 +196,16 @@ use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 
 use narf_bus::{BusDevice, BusKind};
 use narf_drivers::{Driver, DriverEnv, DriverFuture};
-use narf_memory::PhysAddr;
 
 // ── VirtioMmioDevice ────────────────────────────────────────────────
 
 /// A probed virtio-mmio transport.
 #[derive(Debug)]
 pub struct VirtioMmioDevice {
-    base: PhysAddr,
+    /// Kernel VA of the mapped register window. The *physical* base stays
+    /// in the bus descriptor (`BusKind::VirtioMmio`), where it belongs; this
+    /// type only ever dereferences, so it stores only what it dereferences.
+    regs: u64,
     device_id: u32,
     vendor_id: u32,
     version: u32,
@@ -241,19 +243,33 @@ impl VirtioMmioDevice {
     /// Probe a bus device that claims to be a virtio-mmio transport.
     ///
     /// # Safety
-    /// `d.kind` must carry a `VirtioMmio { base, .. }` whose `base` is a live,
-    /// correctly mapped (identity-mapped on x86_64) virtio-mmio register
-    /// window; this reads the magic/version/device-id registers at that
-    /// address. An invalid base is undefined behaviour.
+    /// `d.kind` must carry a `VirtioMmio { base, len, .. }` describing a real
+    /// virtio-mmio register window; this maps it and reads the
+    /// magic/version/device-id registers.
     pub unsafe fn probe(d: &BusDevice) -> Result<Self, ProbeError> {
-        let BusKind::VirtioMmio { base, .. } = d.kind else {
+        let BusKind::VirtioMmio { base, len, .. } = d.kind else {
             return Err(ProbeError::NotVirtioMmio);
         };
-        // SAFETY: `base` came from the bus enumerator's VirtioMmio descriptor,
-        // and the caller's contract guarantees it is a live mapped register
-        // window, which is exactly probe_raw's requirement.
-        // SAFETY: Valid MMIO bounds or trusted driver environment
-        unsafe { Self::probe_raw(base.raw()) }
+        // The descriptor carries the window's *physical* address, which is
+        // what a bus descriptor should carry. Map it before touching it: the
+        // kernel does not identity-map MMIO, and the direct map is write-back
+        // where these registers need uncached Device memory. This used to
+        // dereference the physical address directly, which worked only
+        // because aarch64 still identity-maps and QEMU x86 presents virtio
+        // over PCI rather than MMIO.
+        // SAFETY: the bus enumerator reported this window from the firmware's
+        // own description of the device, and we own it while mapped.
+        // SAFETY: the bus enumerator reported this window from the firmware's
+        // own description of the device, and we own it while mapped.
+        // `ioremap` handles the sub-page length (a virtio-mmio window is 0x200
+        // bytes) and `va()` gives back the window's first byte.
+        let mapping = unsafe {
+            narf_memory::ioremap::ioremap(base.raw(), len, narf_memory::ioremap::MmioAttrs::Device)
+        }
+        .map_err(|_| ProbeError::MapFailed)?;
+        // SAFETY: `va()` is a live register window, which is exactly
+        // probe_raw's requirement.
+        unsafe { Self::probe_raw(mapping.va()) }
     }
 
     /// Probe a virtio-mmio transport at a raw physical/identity-mapped base.
@@ -297,7 +313,7 @@ impl VirtioMmioDevice {
                 core::ptr::read_volatile((base_raw + Self::REG_VENDOR_ID) as *const u32);
 
             Ok(Self {
-                base: PhysAddr::new(base_raw),
+                regs: base_raw,
                 device_id,
                 vendor_id,
                 version,
@@ -314,18 +330,20 @@ impl VirtioMmioDevice {
     pub fn version(&self) -> u32 {
         self.version
     }
-    pub fn mmio_base(&self) -> PhysAddr {
-        self.base
+    /// Kernel VA of the mapped register window. Not a physical address —
+    /// for that, read the `BusKind::VirtioMmio` descriptor.
+    pub fn regs_va(&self) -> u64 {
+        self.regs
     }
 
     #[inline]
     pub fn read_u32(&self, offset: u64) -> u32 {
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
+        // SAFETY: `self.regs` was validated by `probe_raw` to be a live mapped
         // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
         // within that window, so this volatile read targets valid MMIO.
         // SAFETY: Valid MMIO bounds or trusted driver environment
-        let val = unsafe { core::ptr::read_volatile((self.base.raw() + offset) as *const u32) };
+        let val = unsafe { core::ptr::read_volatile((self.regs + offset) as *const u32) };
         compiler_fence(Ordering::SeqCst);
         val
     }
@@ -333,12 +351,12 @@ impl VirtioMmioDevice {
     #[inline]
     pub fn write_u32(&self, offset: u64, val: u32) {
         compiler_fence(Ordering::SeqCst);
-        // SAFETY: `self.base` was validated by `probe_raw` to be a live mapped
+        // SAFETY: `self.regs` was validated by `probe_raw` to be a live mapped
         // virtio-mmio window; callers pass a 4-byte-aligned register `offset`
         // within that window, so this volatile write targets valid MMIO.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
-            core::ptr::write_volatile((self.base.raw() + offset) as *mut u32, val);
+            core::ptr::write_volatile((self.regs + offset) as *mut u32, val);
         }
         compiler_fence(Ordering::SeqCst);
     }
@@ -347,8 +365,18 @@ impl VirtioMmioDevice {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ProbeError {
     NotVirtioMmio,
+    /// The register window could not be mapped.
+    ///
+    /// Linux's `virtio_mmio_probe` propagates whatever
+    /// `devm_platform_ioremap_resource` returned here.
+    MapFailed,
+    /// MagicValue was not "virt". Linux returns `-ENODEV`.
     WrongMagic,
+    /// Version register outside the supported range. Linux accepts 1 or 2
+    /// (legacy and modern) and returns `-ENXIO` otherwise; NARF is
+    /// modern-only, so it also rejects version 1.
     UnsupportedVersion,
+    /// DeviceID 0 — an unpopulated transport slot. Linux returns `-ENODEV`.
     EmptySlot,
 }
 

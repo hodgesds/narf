@@ -1107,6 +1107,19 @@ impl Arch {
                     "-semihosting".into(),
                 ];
 
+                // Same diagnostic escape hatch the x86_64 arm has: append
+                // arbitrary QEMU args, whitespace-separated. Notably
+                // `NARF_QEMU_EXTRA="-device virtio-rng-device"` populates one
+                // of the `virt` machine's virtio-mmio transports, which exist
+                // in the DTB but sit empty by default — the only way to
+                // exercise `VirtioMmioDevice::probe`, since every virtio
+                // device in the standard flavours arrives over PCI instead.
+                if let Ok(extra) = std::env::var("NARF_QEMU_EXTRA") {
+                    for tok in extra.split_whitespace() {
+                        args.push(tok.to_string());
+                    }
+                }
+
                 let virtio = matches!(profile, HwProfile::Full | HwProfile::VirtioOnly);
                 let legacy = matches!(profile, HwProfile::Full | HwProfile::LegacyOnly);
 

@@ -97,14 +97,34 @@ impl From<MapError> for IoremapError {
 /// `iounmap` to tear it down.
 #[derive(Copy, Clone, Debug)]
 pub struct IoMapping {
+    /// Page-aligned physical base actually mapped.
     pub phys: u64,
+    /// Page-aligned virtual base of the mapping. Use [`IoMapping::va`] to
+    /// reach the byte the caller asked for.
     pub virt: u64,
+    /// Page-multiple length actually mapped.
     pub len: u64,
+    /// Distance from `phys`/`virt` to the address the caller requested.
+    /// Zero unless the request was not page-aligned.
+    pub offset: u64,
 }
 
-/// Map a phys range into kernel virtual space. The phys + len
-/// must be page-aligned + page-multiple; sub-page granularity is
-/// not supported.
+impl IoMapping {
+    /// Virtual address of the byte the caller asked `ioremap` for — this is
+    /// what Linux's `ioremap()` hands back. `virt` is the page-aligned base
+    /// that the mapping, and `iounmap`, are built on.
+    #[inline]
+    pub fn va(&self) -> u64 {
+        self.virt + self.offset
+    }
+}
+
+/// Map a phys range into kernel virtual space.
+///
+/// `phys` and `len` may be unaligned: whole pages are mapped and
+/// [`IoMapping::va`] gives back the requested byte, carrying the sub-page
+/// offset, exactly as Linux's `ioremap()` does. `virt`/`len` describe the
+/// page-aligned mapping that `iounmap` tears down.
 ///
 /// # Safety
 /// - `phys` must be a real device MMIO address the caller has
@@ -116,20 +136,32 @@ pub struct IoMapping {
 ///   on the BSP boot path or holding the appropriate cap to
 ///   mutate kernel mappings).
 pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
-    if phys & 0xFFF != 0 {
-        return Err(IoremapError::BadAlign);
-    }
-    if len & 0xFFF != 0 || len == 0 {
+    if len == 0 {
         return Err(IoremapError::BadLen);
     }
+    // Linux's `ioremap()` takes an unaligned address and size, maps whole
+    // pages, and returns a pointer carrying the sub-page offset. Match that.
+    // Rejecting sub-page requests only pushed the rounding into callers, and
+    // four had grown their own copy of it — one of which (virtio-mmio, whose
+    // register window is 0x200 bytes) just failed instead, unnoticed because
+    // no test flavour populated a virtio-mmio slot to exercise its probe.
+    let offset = phys & 0xFFF;
+    let base = phys - offset;
+    let map_len = len
+        .checked_add(offset)
+        .and_then(|v| v.checked_add(0xFFF))
+        .ok_or(IoremapError::BadLen)?
+        & !0xFFF;
 
     // Cache hit? Return the prior mapping. Avoids the per-test-
     // re-probe leak that otherwise eats vmalloc + PT frames.
-    if let Some(m) = cache_lookup(phys, len) {
-        return Ok(m);
+    if let Some(m) = cache_lookup(base, map_len) {
+        // The cached entry carries whichever offset first created it; this
+        // caller wants its own.
+        return Ok(IoMapping { offset, ..m });
     }
 
-    let range = vmalloc::alloc(len)?;
+    let range = vmalloc::alloc(map_len)?;
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let pml4_phys = unsafe { read_cr3() };
     // Per-attr PTE flags:
@@ -150,11 +182,11 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
 
     // Map page by page. On failure, walk back and unmap the
     // pages we did install so the address space stays clean.
-    let pages = (len >> 12) as usize;
+    let pages = (map_len >> 12) as usize;
     for i in 0..pages {
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(range.base + off);
-        let p = PhysAddr::new(phys + off);
+        let p = PhysAddr::new(base + off);
         // SAFETY: range.base + off is freshly-allocated VA (no
         // existing mapping); phys + off is per the caller's
         // exclusivity contract.
@@ -181,9 +213,10 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     }
 
     let m = IoMapping {
-        phys,
+        phys: base,
         virt: range.base,
-        len,
+        len: map_len,
+        offset,
     };
     cache_insert(m);
     Ok(m)

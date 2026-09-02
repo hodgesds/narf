@@ -225,12 +225,9 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
         phys
     } else {
         use narf_memory::ioremap::{ioremap, MmioAttrs};
-        // ioremap requires page-aligned phys + page-multiple len; a BAR
-        // base is naturally aligned to its size (>= 16 bytes) but not
-        // necessarily to a page, so map from the containing page.
-        let page_off = phys & 0xFFF;
-        let aligned_phys = phys - page_off;
-        let map_len = (bar.size + page_off + 0xFFF) & !0xFFF;
+        // A BAR base is naturally aligned to its size (>= 16 bytes) but not
+        // necessarily to a page. `ioremap` maps the containing pages and
+        // `va()` gives back this BAR's first byte.
         let attrs = match bar.kind {
             BarKind::Mmio32 { prefetchable: true } | BarKind::Mmio64 { prefetchable: true } => {
                 // Prefetchable window (framebuffer/ROM): write-combining on
@@ -248,10 +245,10 @@ pub unsafe fn map_bar(device: &BusDevice, idx: u8) -> Result<MmioRegion, BarErro
             _ => MmioAttrs::Device,
         };
         // SAFETY: `device` ownership is the caller's contract (see fn
-        // safety); `map_len` covers the full BAR window from its page
-        // base. ioremap installs the VA→phys PTEs with the right memtype.
-        match unsafe { ioremap(aligned_phys, map_len, attrs) } {
-            Ok(m) => m.virt + page_off,
+        // safety); ioremap installs the VA→phys PTEs with the right memtype
+        // and rounds the window out to whole pages.
+        match unsafe { ioremap(phys, bar.size, attrs) } {
+            Ok(m) => m.va(),
             Err(_) => phys,
         }
     };
