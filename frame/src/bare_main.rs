@@ -388,18 +388,14 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     //
     // Mapping also removes the 4 GiB ceiling: an `ioremap`'d FB is reachable
     // wherever firmware put it.
-    let page_off = phys & 0xFFF;
-    let map_len = ((end - phys) + page_off + 0xFFF) & !0xFFF;
     #[cfg(target_arch = "x86_64")]
     let fb_attrs = narf_memory::ioremap::MmioAttrs::WriteCombining;
     #[cfg(not(target_arch = "x86_64"))]
     let fb_attrs = narf_memory::ioremap::MmioAttrs::Device;
     // SAFETY: the FB region was published by the bootloader and is owned
     // exclusively kernel-side.
-    let mapped = match unsafe {
-        narf_memory::ioremap::ioremap(phys - page_off, map_len, fb_attrs)
-    } {
-        Ok(m) => m.virt + page_off,
+    let mapped = match unsafe { narf_memory::ioremap::ioremap(phys, end - phys, fb_attrs) } {
+        Ok(m) => m.va(),
         Err(_) => {
             // ioremap may not be serviceable this early on some paths; the
             // Late `fb-console-install` step maps it and installs there.

@@ -81,9 +81,26 @@ impl From<MapError> for IoremapError {
 
 #[derive(Copy, Clone, Debug)]
 pub struct IoMapping {
+    /// Page-aligned physical base actually mapped.
     pub phys: u64,
+    /// Page-aligned virtual base of the mapping. Use [`IoMapping::va`] to
+    /// reach the byte the caller asked for.
     pub virt: u64,
+    /// Page-multiple length actually mapped.
     pub len: u64,
+    /// Distance from `phys`/`virt` to the address the caller requested.
+    /// Zero unless the request was not page-aligned.
+    pub offset: u64,
+}
+
+impl IoMapping {
+    /// Virtual address of the byte the caller asked `ioremap` for — this is
+    /// what Linux's `ioremap()` hands back. `virt` is the page-aligned base
+    /// that the mapping, and `iounmap`, are built on.
+    #[inline]
+    pub fn va(&self) -> u64 {
+        self.virt + self.offset
+    }
 }
 
 /// Map a phys range into kernel virtual space via TTBR1.
@@ -93,18 +110,30 @@ pub struct IoMapping {
 /// MMIO address held exclusively by the caller; len must cover the
 /// driver-relevant window; the active TTBR1 root must be writable.
 pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping, IoremapError> {
-    if phys & 0xFFF != 0 {
-        return Err(IoremapError::BadAlign);
-    }
-    if len & 0xFFF != 0 || len == 0 {
+    if len == 0 {
         return Err(IoremapError::BadLen);
     }
+    // Linux's `ioremap()` takes an unaligned address and size, maps whole
+    // pages, and returns a pointer carrying the sub-page offset. Match that.
+    // Rejecting sub-page requests only pushed the rounding into callers, and
+    // four had grown their own copy of it — one of which (virtio-mmio, whose
+    // register window is 0x200 bytes) just failed instead, unnoticed because
+    // no test flavour populated a virtio-mmio slot to exercise its probe.
+    let offset = phys & 0xFFF;
+    let base = phys - offset;
+    let map_len = len
+        .checked_add(offset)
+        .and_then(|v| v.checked_add(0xFFF))
+        .ok_or(IoremapError::BadLen)?
+        & !0xFFF;
 
-    if let Some(m) = cache_lookup(phys, len) {
-        return Ok(m);
+    if let Some(m) = cache_lookup(base, map_len) {
+        // The cached entry carries whichever offset first created it; this
+        // caller wants its own.
+        return Ok(IoMapping { offset, ..m });
     }
 
-    let range = vmalloc::alloc(len)?;
+    let range = vmalloc::alloc(map_len)?;
     // SAFETY: `read_ttbr1_el1` only issues `MRS .., TTBR1_EL1`, which
     // is defined at EL1 with no precondition; we run at EL1 in the
     // kernel and use the returned root solely as the page-table base
@@ -122,11 +151,11 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     // We also UXN+PXN device memory to be safe (no-execute).
     let flags = attr_flag | PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
 
-    let pages = (len >> 12) as usize;
+    let pages = (map_len >> 12) as usize;
     for i in 0..pages {
         let off = (i as u64) * 4096;
         let v = VirtAddr::new(range.base + off);
-        let p = PhysAddr::new(phys + off);
+        let p = PhysAddr::new(base + off);
         // SAFETY: vmalloc-fresh VA; phys+off per caller's
         // exclusivity contract; root is the active TTBR1.
         // SAFETY: Valid memory or trusted environment
@@ -157,9 +186,10 @@ pub unsafe fn ioremap(phys: u64, len: u64, attrs: MmioAttrs) -> Result<IoMapping
     }
 
     let m = IoMapping {
-        phys,
+        phys: base,
         virt: range.base,
-        len,
+        len: map_len,
+        offset,
     };
     cache_insert(m);
     Ok(m)
