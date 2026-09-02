@@ -45,6 +45,18 @@ pub fn tx_always_kick() -> bool {
     TX_ALWAYS_KICK.load(Ordering::Relaxed)
 }
 
+/// NAPI RX interrupt suppression during sustained poll (boot param `rx_napi`).
+/// When set, the forwarder disables the RX used-ring callback while a burst is
+/// flowing (it polls the ring itself) and re-enables it before parking —
+/// mirroring Linux NAPI `disable_cb`/`enable_cb`. Cuts an MSI-per-frame VM-exit
+/// (and, under SLIRP, an irqfd crossing on the single-threaded host iothread).
+static RX_NAPI: AtomicBool = AtomicBool::new(false);
+
+/// Enable NAPI RX interrupt suppression (boot param `rx_napi`).
+pub fn set_rx_napi(on: bool) {
+    RX_NAPI.store(on, Ordering::Relaxed);
+}
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -1320,6 +1332,17 @@ impl VirtioNetPci {
         }
     }
 
+    /// NAPI: suppress RX used-ring interrupts while the forwarder sustained-polls
+    /// this pair (see `Virtqueue::disable_used_cb`). Re-armed at park via
+    /// `rx_arm_and_pending`.
+    pub fn rx_disable_cb(&self, pair_idx: usize) {
+        if let Some(pair) = self.pairs.get(pair_idx) {
+            if let Some(q) = pair.rx_queue.lock().as_mut() {
+                q.disable_used_cb();
+            }
+        }
+    }
+
     pub fn rx_take_on(&self, pair_idx: usize) -> Option<(DmaBuffer, u32)> {
         let pair = self.pairs.get(pair_idx)?;
         let elem = {
@@ -1751,6 +1774,13 @@ fn register_net_interface(idx: usize, name: alloc::string::String) {
                     if processed_any {
                         with_at(idx, |c| c.rx_notify(pair_idx));
                         idle_rounds = 0;
+                        // NAPI: a burst is flowing and we'll keep polling the
+                        // ring — suppress RX interrupts so the device stops
+                        // firing an MSI per frame. Re-armed by rx_arm_and_pending
+                        // before the park below once the burst drains.
+                        if RX_NAPI.load(Ordering::Relaxed) {
+                            with_at(idx, |c| c.rx_disable_cb(pair_idx));
+                        }
                     } else {
                         idle_rounds = idle_rounds.saturating_add(1);
                     }

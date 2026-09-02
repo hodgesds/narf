@@ -4031,6 +4031,15 @@ fn run_async_demo() -> ! {
                 "  tx_always_kick: latency-first TX ENABLED"
             );
         }
+        // NAPI RX interrupt suppression during sustained poll (concurrent
+        // throughput: cut the MSI-per-frame VM-exit + host irqfd crossing).
+        if narf_boot::args().has_flag("rx_napi") {
+            narf_drivers_virtio::net_pci::set_rx_napi(true);
+            let _ = writeln!(
+                console::Writer,
+                "  rx_napi: NAPI RX IRQ suppression ENABLED"
+            );
+        }
         // Narrow directed wake for I/O owners only (redis p99 ordering tail):
         // dispatch a just-woken socket owner ahead of queued maintenance tasks,
         // without the generic every-wake next-buddy thrash.

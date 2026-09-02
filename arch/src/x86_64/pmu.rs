@@ -28,7 +28,7 @@
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr, wrmsr_or_gp};
+use crate::x86_64::msr::{rdmsr, rdmsr_or_gp, wrmsr_or_gp};
 
 // ── Intel MSR map ──────────────────────────────────────────────────
 
@@ -914,6 +914,44 @@ fn apply_privilege_filter(mut sel: PerfEvtSel, os: bool, usr: bool) -> PerfEvtSe
 ///
 /// # Safety
 /// CPL = 0; `idx` < backend counter count.
+/// KVM vPMU ground-truth self-test (AMD). Programs counter 0 for retired
+/// instructions exactly as `alloc_counter`/`program_counter` do, runs a bounded
+/// busy loop, and returns `(perfmon_v2, ctl_readback, global_ctl_readback,
+/// counter_delta)`. A zero `counter_delta` with correct readbacks ⇒ the MSRs
+/// are backed but KVM isn't incrementing the counter (a host-side vPMU gap);
+/// a wrong readback ⇒ the write didn't stick. Diagnostic; clobbers counter 0.
+pub fn amd_kvm_selftest() -> (bool, u64, u64, u64) {
+    let Some(b) = detect() else {
+        return (false, 0, 0, 0);
+    };
+    if b.vendor != PmuVendor::Amd {
+        return (false, 0, 0, 0);
+    }
+    let v2 = amd_perfmon_v2();
+    let sel = match event_to_evtsel(PmuEvent::Instructions, PmuVendor::Amd) {
+        Ok(s) => apply_privilege_filter(s, true, true),
+        Err(_) => return (v2, 0, 0, 0),
+    };
+    // Counter 0 is programmed via the GP-safe MSR helpers (a #GP on an unbacked
+    // MSR is caught, not fatal), so no `unsafe` is needed. Must run at CPL=0.
+    let _ = wrmsr_or_gp(amd_ctr_msr(0), 0);
+    let _ = wrmsr_or_gp(amd_ctl_msr(0), sel.encode());
+    if v2 {
+        let g = rdmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_CTL).unwrap_or(0);
+        let _ = wrmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_CTL, g | 1);
+    }
+    let ctl_rb = rdmsr_or_gp(amd_ctl_msr(0)).unwrap_or(0);
+    let g_rb = rdmsr_or_gp(MSR_AMD64_PERF_CNTR_GLOBAL_CTL).unwrap_or(0);
+    let before = rdmsr_or_gp(amd_ctr_msr(0)).unwrap_or(0);
+    let mut x = 0u64;
+    for i in 0..500_000u64 {
+        x = x.wrapping_add(i.wrapping_mul(3));
+    }
+    core::hint::black_box(x);
+    let after = rdmsr_or_gp(amd_ctr_msr(0)).unwrap_or(0);
+    (v2, ctl_rb, g_rb, after.wrapping_sub(before))
+}
+
 unsafe fn program_counter(idx: u8, sel: PerfEvtSel, vendor: PmuVendor) {
     let encoded = sel.encode();
     // wrmsr_or_gp is safe (probe-armed); no inner unsafe block needed.

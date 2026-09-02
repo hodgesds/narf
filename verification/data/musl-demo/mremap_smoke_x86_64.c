@@ -1,10 +1,9 @@
 // mremap(2) smoke. Exercise real shrink, collision-driven MAYMOVE growth,
 // FIXED replacement, content preservation, lazy grown-tail backing, and the
-// explicitly unsupported DONTUNMAP contract. Success token "mremap-ok".
+// MREMAP_DONTUNMAP move-with-retained-fresh-source contract. Token "mremap-ok".
 //
 // Build: see REGEN_mremap_smoke.sh (musl-gcc, static-PIE).
 #define _GNU_SOURCE
-#include <errno.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <string.h>
@@ -66,14 +65,39 @@ int main(void) {
         }
     }
 
-    // DONTUNMAP cannot be approximated as an ordinary writable alias. NARF
-    // rejects it with EINVAL until userfaultfd-style old-range faults exist.
-    errno = 0;
-    if (mremap(q, 4 * pg, 4 * pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP) != MAP_FAILED
-        || errno != EINVAL) {
+    // MREMAP_DONTUNMAP (equal-length MAYMOVE): the pages MOVE to a fresh
+    // address, carrying their contents, while the OLD range stays mapped but
+    // faults fresh zero-fill backing (the pages were moved, not aliased).
+    char *moved = mremap(q, 4 * pg, 4 * pg, MREMAP_MAYMOVE | MREMAP_DONTUNMAP);
+    if (moved == MAP_FAILED || moved == q) {
         w("mremap-fail: dontunmap\n");
         return 1;
     }
+    // The moved mapping carries the original bytes: [A, B, G, G].
+    for (size_t page = 0; page < 4; page++) {
+        const char expected = page < 2 ? 'A' + (char)page : 'G';
+        for (size_t i = 0; i < pg; i++) {
+            if (moved[page * pg + i] != expected) {
+                w("mremap-fail: dontunmap moved content\n");
+                return 1;
+            }
+        }
+    }
+    // The retained source range reads back fresh zero-fill — moved, not aliased.
+    for (size_t i = 0; i < 4 * pg; i++) {
+        if (q[i] != 0) {
+            w("mremap-fail: dontunmap source not fresh\n");
+            return 1;
+        }
+    }
+    // …and is still writable fresh anonymous memory.
+    q[0] = 'Z';
+    if (q[0] != 'Z' || munmap(q, 4 * pg) != 0) {
+        w("mremap-fail: dontunmap source\n");
+        return 1;
+    }
+    // Continue with the moved mapping (it now holds [A, B, G, G]).
+    q = moved;
 
     // MREMAP_FIXED replaces an existing disjoint target and may resize while
     // moving. The first three pages must preserve their bytes.
