@@ -45,6 +45,9 @@ pub fn on_irq_with_user_state(
 );
 pub fn interrupted_user_state() -> Option<InterruptedUserState>;
 
+#[cfg(target_arch = "x86_64")]
+pub fn uses_hpet_fallback() -> bool; // x86_64::timer_pump diagnostic
+
 pub fn install_tlb_shootdown_bridge();
 
 #[cfg(target_arch = "x86_64")]
@@ -113,6 +116,10 @@ initialisation. Its input must come from firmware discovery.
 ### x86_64
 - Controllers: x2APIC for local, I/O APIC legacy path for devices that
   predate MSI/MSI-X. Prefer MSI-X where the device supports it.
+- Timer-wheel deadlines use the successfully probed reliable LAPIC
+  TSC-deadline clockevent exclusively. The HPET comparator/IOAPIC path remains
+  armed as a fallback only when that reliable primary is unavailable; the two
+  sources do not intentionally deliver the same deadline.
 - UIPI: `WRMSR IA32_UINTR_*` MSRs; UITT entries per driver; `SENDUIPI`
   instruction for driver-to-driver signalling.
 

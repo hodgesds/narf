@@ -67,6 +67,8 @@ pub unsafe fn set_current_user_context(context: *mut ());
 pub fn current_user_context() -> *mut ();
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
+/// Mark a dequeued synchronous waiter for an immediate local handoff.
+pub fn note_urgent_wake_preempt(woken: u64);
 pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool);
 pub fn dbg_slot_state(task: u64)
     -> Option<(bool, u32, usize, u64, u32, bool)>;
@@ -117,6 +119,15 @@ park/yield points. NARF now has a nestable CPU-local `preempt_disable()` guard,
 but syscall/driver critical regions have not completed the adoption audit;
 enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
+`note_urgent_wake_preempt` is a scheduling hint, not a direct switch. It is
+always available to synchronous wake paths while own-stack scheduling is live,
+but filters self-wakes and uses a nonblocking run-queue probe after a real waiter
+was dequeued. It bypasses the policy batching window only when the exact woken
+task is already dispatchable on the local CPU and names that waiter in a
+dedicated one-shot preferred-next slot. A remote, contended, or ineligible
+target declines the optimization. The executor revalidates the preference
+during selection, so the hint cannot bypass affinity, class, or budget
+eligibility. Generic every-wake preemption remains opt-in.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Forward-progress and remote-reschedule telemetry is cache-line-isolated per CPU
@@ -663,7 +674,7 @@ coherent domain-rights state from the first instruction.
 Task waking and IRQ integration follows
 `interrupts/spec` §8 (`wait_for_irq`'s waker contract).
 
-`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 2`.
+`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 3`.
 
 ## 10. Open implementation gates
 

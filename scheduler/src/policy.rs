@@ -179,8 +179,8 @@ pub struct CurrentTask {
 
 /// Per-CPU scheduling context handed to a policy's decision hooks. Assembled by
 /// the core from cached per-CPU state (the dispatch-time [`CurrentTask`] snapshot
-/// + the CPU's virtual-time floor) — a `Copy` view, never a heap allocation and
-/// never rebuilt from the task slot. Bundling these means a policy reads
+/// plus the CPU's virtual-time floor) — a `Copy` view, never a heap allocation
+/// and never rebuilt from the task slot. Bundling these means a policy reads
 /// `ctx.vfloor` / `ctx.current` directly instead of calling back into the core,
 /// and new per-CPU scheduling state can be added here without changing every
 /// hook signature.

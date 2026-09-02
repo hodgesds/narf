@@ -30,7 +30,7 @@
 
 use crate::affinity::CpuId;
 use crate::budget::BudgetEligibility;
-use crate::policy::{CpuSchedContext, RunQueue, Scheduler, SchedRow, TaskHandle};
+use crate::policy::{CpuSchedContext, RunQueue, SchedRow, Scheduler, TaskHandle};
 use crate::priority::SchedClass;
 use crate::EEVDF_BASE_SLICE;
 
@@ -61,30 +61,31 @@ fn tier(e: BudgetEligibility) -> u8 {
     }
 }
 
+/// Comparison key for a pick candidate: eligibility tier, class, virtual
+/// deadline, and nice priority — the fields `better_pick` orders by.
+#[derive(Copy, Clone)]
+struct PickKey {
+    tier: u8,
+    class: SchedClass,
+    deadline: u64,
+    prio: i8,
+}
+
 /// Is `a` a strictly better *pick* than `b`? Ordering: higher eligibility tier,
 /// then higher class rank, then earlier `d_eff`, then lower nice priority. Pure
 /// so the pick order is unit-testable without a live executor.
 #[inline]
-fn better_pick(
-    a_tier: u8,
-    a_class: SchedClass,
-    a_deadline: u64,
-    a_prio: i8,
-    b_tier: u8,
-    b_class: SchedClass,
-    b_deadline: u64,
-    b_prio: i8,
-) -> bool {
-    if a_tier != b_tier {
-        return a_tier > b_tier;
+fn better_pick(a: PickKey, b: PickKey) -> bool {
+    if a.tier != b.tier {
+        return a.tier > b.tier;
     }
-    if a_class.rank() != b_class.rank() {
-        return a_class.rank() > b_class.rank();
+    if a.class.rank() != b.class.rank() {
+        return a.class.rank() > b.class.rank();
     }
-    if a_deadline != b_deadline {
-        return a_deadline < b_deadline;
+    if a.deadline != b.deadline {
+        return a.deadline < b.deadline;
     }
-    a_prio < b_prio
+    a.prio < b.prio
 }
 
 /// The wake-preemption rule (Linux `check_preempt_wakeup_fair`), pulled out as a
@@ -129,22 +130,23 @@ impl Scheduler for EevdfScheduler {
 
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>) -> Option<TaskHandle> {
         let vfloor = crate::vfloor(cpu.0 as usize);
-        let mut best: Option<(TaskHandle, u8, SchedClass, u64, i8)> = None;
+        let mut best: Option<(TaskHandle, PickKey)> = None;
         for row in queue.iter_sched() {
             if !candidate(&row) {
                 continue;
             }
-            let t = tier(row.eligibility);
-            let dl = d_eff(row.vruntime, vfloor);
-            let p = row.priority.0;
+            let key = PickKey {
+                tier: tier(row.eligibility),
+                class: row.class,
+                deadline: d_eff(row.vruntime, vfloor),
+                prio: row.priority.0,
+            };
             let take = match best {
                 None => true,
-                Some((_, bt, bc, bd, bp)) => {
-                    better_pick(t, row.class, dl, p, bt, bc, bd, bp)
-                }
+                Some((_, bkey)) => better_pick(key, bkey),
             };
             if take {
-                best = Some((row.handle, t, row.class, dl, p));
+                best = Some((row.handle, key));
             }
         }
         // Core validates the handle and falls back to the top tier if we somehow

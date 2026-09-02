@@ -446,6 +446,5 @@ pub fn invpcid_supported() -> bool {
 /// tagged INVPCID must check this on the executing CPU first.
 #[inline]
 pub fn pcide_enabled() -> bool {
-    // SAFETY: reading CR4 at CPL=0 is always defined.
-    unsafe { cr::read_cr4() & cr::CR4_PCIDE != 0 }
+    cr::cached_cr4() & cr::CR4_PCIDE != 0
 }

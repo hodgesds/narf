@@ -996,12 +996,32 @@ impl KernelTask {
             // itself activates the AS and publishes it via set_current_user_cr3.
             let cr3 = self.user_cr3.load(Ordering::Acquire);
             if cr3 != 0 {
-                // SAFETY: `cr3` is a CR3 value snapshotted from a prior
-                // `address_space.activate()` of this task's live AS; reloading it
-                // restores that mapping (kernel half is global in every AS).
+                // The outer scheduler normally activated this same address
+                // space before polling the adapter. MOV CR3 remains
+                // serialising even when the value is unchanged, so compare
+                // the live root+PCID first. Bit 63 is a write-only NOFLUSH
+                // hint and is therefore excluded from the identity test.
+                let current: u64;
+                // SAFETY: ring-0 CR3 read with no memory operand.
                 unsafe {
-                    core::arch::asm!("mov cr3, {v}", v = in(reg) cr3,
-                        options(nostack, preserves_flags));
+                    core::arch::asm!(
+                        "mov {v}, cr3",
+                        v = out(reg) current,
+                        options(nomem, nostack, preserves_flags),
+                    );
+                }
+                if (current & !(1u64 << 63)) != (cr3 & !(1u64 << 63)) {
+                    // SAFETY: `cr3` is a CR3 value snapshotted from a prior
+                    // `address_space.activate()` of this task's live AS;
+                    // reloading it restores that mapping (kernel half is
+                    // global in every AS).
+                    unsafe {
+                        core::arch::asm!(
+                            "mov cr3, {v}",
+                            v = in(reg) cr3,
+                            options(nostack, preserves_flags),
+                        );
+                    }
                 }
             }
             // Restore the task's user FS_BASE (TLS) MSR too — same resume-bypass
@@ -2056,6 +2076,14 @@ static WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
     inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
 };
 
+/// Per-CPU one-shot override for a wake that represents a synchronous handoff
+/// rather than ordinary readiness. Unlike [`WAKE_PREEMPT`], this bypasses the
+/// policy's batching window, but only when another task is actually runnable
+/// on this CPU at the syscall-exit check.
+static URGENT_WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
+    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+};
+
 /// Ask the running task to cede at its next syscall exit because `woken` just
 /// became runnable on this CPU (Linux `wakeup_preempt`). No-op unless the
 /// `wake_preempt` feature is enabled, own-stack scheduling is live, and there is
@@ -2078,6 +2106,37 @@ pub fn note_wake_preempt(woken: u64) {
         return;
     }
     WAKE_PREEMPT.inner[cpu].store(true, Ordering::Release);
+}
+
+/// Record an urgent synchronous handoff to `woken`.
+///
+/// This is the Linux-style wakeup-preemption hint for operations such as a
+/// successful `FUTEX_WAKE`: the caller has dequeued a real blocked waiter, so
+/// protecting the syscall-dense waker for the normal RUN_TO_PARITY batching
+/// window only adds handoff latency. Unlike generic wake-preemption, this
+/// narrow path is always live: it ignores self-wakes and yields only if the
+/// exact dequeued waiter is runnable locally. Remote wakes therefore do not
+/// idle the caller's CPU.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn note_urgent_wake_preempt(woken: u64) {
+    if !USE_OWN_STACK.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = this_cpu();
+    if CURRENT_STACKFUL_TASK.inner[cpu]
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        return;
+    }
+    if crate::current_task_id().raw() == woken {
+        return;
+    }
+    if !crate::task_runnable_on_current_cpu(woken) {
+        return;
+    }
+    URGENT_WAKE_PREEMPT.inner[cpu].store(true, Ordering::Release);
+    crate::hint_urgent_next(woken);
 }
 
 /// Divisor of a task's time slice at which it becomes eligible for an EARLY
@@ -2109,6 +2168,7 @@ fn syscall_exit_yield_decision(
     backpressure: bool,
     sibling_waiting: bool,
     wake_preempt_sibling: bool,
+    urgent_wake_sibling: bool,
 ) -> bool {
     if backpressure {
         return true;
@@ -2125,7 +2185,7 @@ fn syscall_exit_yield_decision(
     // runnable" guard (computed by the caller like `sibling_waiting`), so a wake
     // whose target already ran, or that raced a requeue, still runs the runner
     // to its fair quantum rather than yielding to an empty queue.
-    if wake_preempt_sibling {
+    if urgent_wake_sibling || wake_preempt_sibling {
         return true;
     }
     elapsed >= slice / FAIR_QUANTUM_DIV && sibling_waiting
@@ -2171,6 +2231,10 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // decision fn. Sticky until an actual yield (cleared below) so a spinning
     // waker's request isn't dropped before the policy fires.
     let wake_preempt = WAKE_PREEMPT.inner[cpu].load(Ordering::Acquire);
+    // Urgent handoffs are one-shot. Consume the hint at this syscall exit; a
+    // remote wake or a wakee that already ran must not leak urgency into a
+    // later unrelated syscall.
+    let urgent_wake = URGENT_WAKE_PREEMPT.inner[cpu].swap(false, Ordering::AcqRel);
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
@@ -2199,9 +2263,13 @@ pub unsafe fn maybe_resched_syscall_exit() {
         // POLICY (EEVDF) whether the wakee is eligible to preempt the runner now.
         // Only consulted inside the wake window (a wake is pending, slice not up),
         // so the common no-wake syscall exit pays nothing here.
-        let wake_window = wake_preempt && !backpressure && started != 0 && elapsed < slice;
-        let wake_preempt_sibling =
-            wake_window && crate::wake_preempt_policy_check(current_id, elapsed);
+        let wake_window =
+            (wake_preempt || urgent_wake) && !backpressure && started != 0 && elapsed < slice;
+        let urgent_wake_sibling =
+            wake_window && urgent_wake && crate::has_other_runnable_work(current_id);
+        let wake_preempt_sibling = !urgent_wake_sibling
+            && wake_window
+            && crate::wake_preempt_policy_check(current_id, elapsed);
         if !syscall_exit_yield_decision(
             started,
             slice,
@@ -2209,6 +2277,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
             backpressure,
             sibling_waiting,
             wake_preempt_sibling,
+            urgent_wake_sibling,
         ) {
             return;
         }
@@ -3494,52 +3563,60 @@ pub mod tests {
         let slice = 40_000u64;
         let q = slice / FAIR_QUANTUM_DIV; // fair-quantum threshold
                                           // Back-pressure always yields, even with the clock unstamped.
-        if !decide(0, slice, 0, true, false, false) {
+        if !decide(0, slice, 0, true, false, false, false) {
             return TestResult::Fail("back-pressure must yield regardless");
         }
         // Unstamped slice clock never yields (absent back-pressure).
-        if decide(0, slice, slice * 2, false, true, false) {
+        if decide(0, slice, slice * 2, false, true, false, false) {
             return TestResult::Fail("started==0 must not yield");
         }
         // Full slice spent always yields, even with no sibling waiting.
-        if !decide(1, slice, slice, false, false, false) {
+        if !decide(1, slice, slice, false, false, false, false) {
             return TestResult::Fail("full slice must yield");
         }
         // Below the fair quantum: never yield, even with a sibling waiting.
-        if decide(1, slice, q - 1, false, true, false) {
+        if decide(1, slice, q - 1, false, true, false, false) {
             return TestResult::Fail("below fair quantum must not yield");
         }
         // At the fair quantum but no sibling: keep running to the full slice.
-        if decide(1, slice, q, false, false, false) {
+        if decide(1, slice, q, false, false, false, false) {
             return TestResult::Fail("fair quantum without a sibling must not yield");
         }
         // At the fair quantum WITH a sibling waiting: yield early.
-        if !decide(1, slice, q, false, true, false) {
+        if !decide(1, slice, q, false, true, false, false) {
             return TestResult::Fail("fair quantum + sibling must yield early");
         }
         // Wake-preemption: a fresh wake with a runnable sibling yields
         // IMMEDIATELY — below the fair quantum, where the fair-share path alone
         // would keep running. This is the futex wait/wake handoff collapse.
-        if !decide(1, slice, q - 1, false, false, true) {
+        if !decide(1, slice, q - 1, false, false, true, false) {
             return TestResult::Fail("wake-preempt + sibling must yield below fair quantum");
         }
         // Even at elapsed 1 (just started): a wake with a runnable peer cedes.
-        if !decide(1, slice, 1, false, false, true) {
+        if !decide(1, slice, 1, false, false, true, false) {
             return TestResult::Fail("wake-preempt must yield right after slice start");
         }
         // Wake-preempt WITHOUT a runnable sibling (caller ANDs in
         // has_other_runnable_work, so the term arrives false): do NOT yield to an
         // empty queue below the fair quantum.
-        if decide(1, slice, q - 1, false, false, false) {
+        if decide(1, slice, q - 1, false, false, false, false) {
             return TestResult::Fail("wake-preempt without a sibling must not yield early");
         }
         // A wake-preempt request that arrives AFTER the full slice still yields
         // (full-slice branch), and one with started==0 never does.
-        if !decide(1, slice, slice, false, false, true) {
+        if !decide(1, slice, slice, false, false, true, false) {
             return TestResult::Fail("full slice must yield even without wake-preempt");
         }
-        if decide(0, slice, 10, false, false, true) {
+        if decide(0, slice, 10, false, false, true, false) {
             return TestResult::Fail("started==0 must not yield even on wake-preempt");
+        }
+        // An urgent synchronous handoff bypasses policy batching when a local
+        // peer is runnable, but remains subject to the same stamped-slice gate.
+        if !decide(1, slice, 1, false, false, false, true) {
+            return TestResult::Fail("urgent wake handoff must yield immediately");
+        }
+        if decide(0, slice, 1, false, false, false, true) {
+            return TestResult::Fail("unstamped urgent wake must not yield");
         }
         TestResult::Pass
     }

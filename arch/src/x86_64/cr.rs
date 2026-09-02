@@ -8,6 +8,8 @@
 use core::arch::asm;
 use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 
+use narf_lib::percpu::MAX_CPUS;
+
 /// Cached copy of CR4, maintained by [`write_cr4`]. The trap/syscall entry
 /// prologue reads this from MEMORY instead of executing `mov rax, cr4` to test
 /// CR4.PKS (bit 24) / CR4.PCIDE (bit 17) and decide whether to enter a FRAME
@@ -20,6 +22,26 @@ use core::sync::atomic::{compiler_fence, AtomicU64, Ordering};
 /// architecture ABI, like `NARF_X86_FRAME_PML4`).
 #[unsafe(no_mangle)]
 pub static NARF_X86_CACHED_CR4: AtomicU64 = AtomicU64::new(0);
+
+/// CPU-local CR4 snapshots for Rust hot paths. CR4 is architecturally
+/// per-CPU, so the linker-visible scalar above is suitable only for entry
+/// assembly on systems whose boot policy keeps the relevant bits identical.
+/// Rust code that needs the exact executing CPU's value must use
+/// [`cached_cr4`] instead.
+static PER_CPU_CACHED_CR4: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Last CR4 value written through [`write_cr4`] on the executing CPU.
+///
+/// All post-bootstrap CR4 mutations are required to use `write_cr4`, so this
+/// avoids a serialising/intercepted `MOV from CR4` without weakening a
+/// CPU-local feature gate. During early boot the zero initial value is the
+/// conservative answer: no optional CR4-backed operation may execute.
+#[inline]
+pub fn cached_cr4() -> u64 {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    debug_assert!(cpu < MAX_CPUS, "CPU id out of CR4 cache range");
+    PER_CPU_CACHED_CR4[if cpu < MAX_CPUS { cpu } else { 0 }].load(Ordering::Acquire)
+}
 
 /// CR4 bit: PKS (bit 24). Enables supervisor protection keys
 /// (IA32_PKRS-based domain rights).
@@ -67,6 +89,9 @@ pub unsafe fn write_cr4(value: u64) {
     // trap/syscall path can test CR4.PKS/PCIDE from memory (no VMEXIT). Stored
     // AFTER the write so a concurrent entry reads either the old or new value,
     // never a torn one; feature bits change only during boot/AP bringup.
+    let cpu = crate::current_cpu_id().raw() as usize;
+    debug_assert!(cpu < MAX_CPUS, "CPU id out of CR4 cache range");
+    PER_CPU_CACHED_CR4[if cpu < MAX_CPUS { cpu } else { 0 }].store(value, Ordering::Release);
     NARF_X86_CACHED_CR4.store(value, Ordering::Release);
     compiler_fence(Ordering::SeqCst);
 }

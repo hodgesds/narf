@@ -1,10 +1,11 @@
-//! HPET-driven timer wheel pump.
+//! x86 timer-wheel pump.
 //!
 //! Bridges `narf_time::timer_wheel` (a passive deadline registry)
-//! to real hardware: at boot, allocate one IDT vector + one IOAPIC
-//! redirection for HPET comparator 0. After that, every wheel
-//! re-arm just reprograms the comparator — the IDT vector and the
-//! IOAPIC entry stay live forever. This is the contrast with
+//! to the selected clockevent. Reliable LAPIC TSC-deadline is the
+//! primary path; HPET comparator 0 remains the fallback when the
+//! selected LAPIC is not a reliable one-shot source. At boot the
+//! fallback allocates one IDT vector + one IOAPIC redirection. This
+//! is the contrast with
 //! [`crate::x86_64::hpet_oneshot`], which leaks a fresh vector on
 //! every arm and is fine for one-shot calibration use but would
 //! exhaust the 240-slot IDT bitmap if we used it as the executor's
@@ -72,6 +73,13 @@ static STATE: PumpState = PumpState {
     dest_apic: AtomicU8::new(0),
 };
 
+/// Whether wheel arms also need the HPET fallback. A working TSC-deadline
+/// clockevent already targets the same absolute deadline; programming HPET as
+/// well causes two interrupts and several intercepted MMIO accesses per
+/// deadline under KVM. Default to `true` until [`init`] has positively
+/// identified the reliable LAPIC primary.
+static USE_HPET_FALLBACK: AtomicBool = AtomicBool::new(true);
+
 /// Pick a GSI in `mask`. Tries the high range first (>= `min_gsi`,
 /// typically 16, to stay out of legacy ISA territory), then falls
 /// back to lower GSIs skipping the well-known legacy allocations
@@ -133,8 +141,11 @@ fn wheel_arm(deadline_cycles: u64) {
     // HPET one-shot IRQ isn't promptly delivered). Unconditional — must run
     // even before the HPET pump's STATE.initialised is set.
     crate::x86_64::apic::arm_tsc_deadline_if_earlier(deadline_cycles);
-    // Secondary: HPET one-shot (some bare-metal configs); skip if pump uninit.
-    if !STATE.initialised.load(Ordering::Acquire) {
+    // Secondary: HPET one-shot only when the selected primary is not reliable
+    // TSC-deadline. The clockevent probe is the authority here: preserving an
+    // always-on HPET duplicate after LAPIC passed merely delivers the same
+    // deadline twice.
+    if !STATE.initialised.load(Ordering::Acquire) || !USE_HPET_FALLBACK.load(Ordering::Acquire) {
         return;
     }
     let gsi = STATE.gsi.load(Ordering::Relaxed);
@@ -253,6 +264,14 @@ pub fn init() -> Result<(), TimerPumpInitError> {
     STATE.gsi.store(gsi, Ordering::Release);
     STATE.dest_apic.store(dest_apic, Ordering::Release);
 
+    // Linux-style single clockevent ownership: once the boot probe selected a
+    // reliable LAPIC one-shot, it alone drives wheel deadlines. Retain HPET for
+    // a failed LAPIC probe, an HPET primary, or the unreliable legacy LAPIC
+    // InitialCount mode.
+    let reliable_lapic = narf_time::clockevent::primary().is_some_and(|dev| dev.name() == "lapic")
+        && narf_time::tick_reliable();
+    USE_HPET_FALLBACK.store(!reliable_lapic, Ordering::Release);
+
     // Install the wheel callback last — it's the gate that lets
     // future `register` calls actually program HPET. Anything
     // installed before this point would race against an
@@ -271,6 +290,12 @@ pub fn init() -> Result<(), TimerPumpInitError> {
 #[inline]
 pub fn is_initialised() -> bool {
     STATE.initialised.load(Ordering::Acquire)
+}
+
+/// Diagnostic: `true` when wheel deadlines are duplicated onto HPET because
+/// no reliable LAPIC TSC-deadline primary was selected.
+pub fn uses_hpet_fallback() -> bool {
+    USE_HPET_FALLBACK.load(Ordering::Acquire)
 }
 
 #[doc(hidden)]

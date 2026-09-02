@@ -9090,9 +9090,7 @@ mod dma_addr_source_guard {
             // Over-approximating is right here — a false positive is a code
             // review, a false negative is silent DMA corruption.
             let split = |t: &str| -> Vec<String> {
-                t.split(|c| c == ';' || c == '}' || c == '{')
-                    .map(|s| s.to_string())
-                    .collect()
+                t.split([';', '}', '{']).map(|s| s.to_string()).collect()
             };
             let mut tainted: Vec<String> = Vec::new();
             for stmt in split(&text) {
