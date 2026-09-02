@@ -2043,6 +2043,43 @@ pub fn request_syscall_backpressure_yield() {
     BACKPRESSURE_YIELD.inner[cpu].store(true, Ordering::Release);
 }
 
+/// Per-CPU one-shot wake-preemption request. Set by [`note_wake_preempt`] when a
+/// wake on this CPU makes a task OTHER than the runner runnable; consumed
+/// (swapped false) at the runner's next syscall exit in
+/// [`maybe_resched_syscall_exit`].
+///
+/// Distinct from [`BACKPRESSURE_YIELD`] (a self-throttle: "I produced too much")
+/// and from the cross-CPU `NEED_RESCHED` (the halt-commit Dekker channel): this
+/// is the LOCAL "a peer just woke, cede to it" hint — the own-stack analogue of
+/// Linux setting `TIF_NEED_RESCHED` on the current rq inside `resched_curr`.
+static WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
+    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+};
+
+/// Ask the running task to cede at its next syscall exit because `woken` just
+/// became runnable on this CPU (Linux `wakeup_preempt`). No-op unless the
+/// `wake_preempt` feature is enabled, own-stack scheduling is live, and there is
+/// a running task. A SELF-wake (the runner woke itself) is filtered — a task
+/// must not preempt itself, and self-wakes are how a park loop re-checks its own
+/// predicate. Cheap and IRQ-safe: a gated load plus one atomic store.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn note_wake_preempt(woken: u64) {
+    if !crate::wake_preempt_enabled() || !USE_OWN_STACK.load(Ordering::Acquire) {
+        return;
+    }
+    let cpu = this_cpu();
+    if CURRENT_STACKFUL_TASK.inner[cpu]
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        return;
+    }
+    if crate::current_task_id().raw() == woken {
+        return;
+    }
+    WAKE_PREEMPT.inner[cpu].store(true, Ordering::Release);
+}
+
 /// Divisor of a task's time slice at which it becomes eligible for an EARLY
 /// fair-share yield — but only when a sibling is actually waiting. At the
 /// default 10 ms slice this is ≈2.5 ms. A task with no sibling waiting still
@@ -2071,6 +2108,7 @@ fn syscall_exit_yield_decision(
     elapsed: u64,
     backpressure: bool,
     sibling_waiting: bool,
+    wake_preempt_sibling: bool,
 ) -> bool {
     if backpressure {
         return true;
@@ -2079,6 +2117,15 @@ fn syscall_exit_yield_decision(
         return false;
     }
     if elapsed >= slice {
+        return true;
+    }
+    // Wake-preemption (Linux `wakeup_preempt`): a fresh wake made a peer
+    // runnable, so cede IMMEDIATELY — collapsing the `FAIR_QUANTUM_DIV` floor to
+    // zero. `wake_preempt_sibling` already carries the "a sibling is actually
+    // runnable" guard (computed by the caller like `sibling_waiting`), so a wake
+    // whose target already ran, or that raced a requeue, still runs the runner
+    // to its fair quantum rather than yielding to an empty queue.
+    if wake_preempt_sibling {
         return true;
     }
     elapsed >= slice / FAIR_QUANTUM_DIV && sibling_waiting
@@ -2118,6 +2165,12 @@ pub unsafe fn maybe_resched_syscall_exit() {
         return;
     }
     let backpressure = BACKPRESSURE_YIELD.inner[cpu].swap(false, Ordering::AcqRel);
+    // Wake-preemption request (gated `wake_preempt`; set by `note_wake_preempt`
+    // when this task woke a peer). The eligibility-correct policy lives in the
+    // EEVDF scheduler; this consume site only carries the request into the pure
+    // decision fn. Sticky until an actual yield (cleared below) so a spinning
+    // waker's request isn't dropped before the policy fires.
+    let wake_preempt = WAKE_PREEMPT.inner[cpu].load(Ordering::Acquire);
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
@@ -2130,19 +2183,38 @@ pub unsafe fn maybe_resched_syscall_exit() {
         let started = (*p).tsc_started.load(Ordering::Acquire);
         let slice = (*p).slice_cycles.load(Ordering::Acquire);
         let elapsed = narf_time::now_cycles().saturating_sub(started);
-        // Only consult the (slightly more expensive) run-queue scan once a fair
-        // quantum is spent and the full slice is NOT yet up — the two cheap
-        // cases (back-pressure, full-slice) are decided by the policy fn without
-        // it. A normal, uncontended syscall exit therefore pays only the two
-        // atomic loads + one TSC read above.
-        let sibling_waiting = !backpressure
-            && started != 0
-            && elapsed >= slice / FAIR_QUANTUM_DIV
-            && elapsed < slice
-            && crate::has_other_runnable_work(crate::current_task_id().raw());
-        if !syscall_exit_yield_decision(started, slice, elapsed, backpressure, sibling_waiting) {
+        // The run-queue scan is the only "expensive" step, so run it lazily —
+        // only when a branch that needs it could actually fire: the fair-quantum
+        // branch (quantum spent, slice not up) OR a fresh wake-preemption request
+        // (slice not up). The cheap cases (back-pressure, full-slice, idle exit)
+        // decide without it, so a normal uncontended syscall exit still pays only
+        // the atomic loads + one TSC read above.
+        let current_id = crate::current_task_id().raw();
+        let quantum_spent = started != 0 && elapsed >= slice / FAIR_QUANTUM_DIV && elapsed < slice;
+        // Fair-share floor: cede after a fair quantum when a sibling is simply
+        // runnable (the cheap, policy-independent starvation bound).
+        let sibling_waiting =
+            !backpressure && quantum_spent && crate::has_other_runnable_work(current_id);
+        // Wake-preemption: a fresh wake made a peer runnable — ask the INSTALLED
+        // POLICY (EEVDF) whether the wakee is eligible to preempt the runner now.
+        // Only consulted inside the wake window (a wake is pending, slice not up),
+        // so the common no-wake syscall exit pays nothing here.
+        let wake_window = wake_preempt && !backpressure && started != 0 && elapsed < slice;
+        let wake_preempt_sibling =
+            wake_window && crate::wake_preempt_policy_check(current_id, elapsed);
+        if !syscall_exit_yield_decision(
+            started,
+            slice,
+            elapsed,
+            backpressure,
+            sibling_waiting,
+            wake_preempt_sibling,
+        ) {
             return;
         }
+        // We are ceding: clear the sticky wake-preemption request so it doesn't
+        // carry into the next slice / a different task on this CPU.
+        WAKE_PREEMPT.inner[cpu].store(false, Ordering::Release);
         // Re-arm the slot waker so the executor keeps us Ready and re-polls us
         // after the siblings run (mirrors try_preempt_user's pre-yield re-arm).
         {
@@ -3422,28 +3494,52 @@ pub mod tests {
         let slice = 40_000u64;
         let q = slice / FAIR_QUANTUM_DIV; // fair-quantum threshold
                                           // Back-pressure always yields, even with the clock unstamped.
-        if !decide(0, slice, 0, true, false) {
+        if !decide(0, slice, 0, true, false, false) {
             return TestResult::Fail("back-pressure must yield regardless");
         }
         // Unstamped slice clock never yields (absent back-pressure).
-        if decide(0, slice, slice * 2, false, true) {
+        if decide(0, slice, slice * 2, false, true, false) {
             return TestResult::Fail("started==0 must not yield");
         }
         // Full slice spent always yields, even with no sibling waiting.
-        if !decide(1, slice, slice, false, false) {
+        if !decide(1, slice, slice, false, false, false) {
             return TestResult::Fail("full slice must yield");
         }
         // Below the fair quantum: never yield, even with a sibling waiting.
-        if decide(1, slice, q - 1, false, true) {
+        if decide(1, slice, q - 1, false, true, false) {
             return TestResult::Fail("below fair quantum must not yield");
         }
         // At the fair quantum but no sibling: keep running to the full slice.
-        if decide(1, slice, q, false, false) {
+        if decide(1, slice, q, false, false, false) {
             return TestResult::Fail("fair quantum without a sibling must not yield");
         }
         // At the fair quantum WITH a sibling waiting: yield early.
-        if !decide(1, slice, q, false, true) {
+        if !decide(1, slice, q, false, true, false) {
             return TestResult::Fail("fair quantum + sibling must yield early");
+        }
+        // Wake-preemption: a fresh wake with a runnable sibling yields
+        // IMMEDIATELY — below the fair quantum, where the fair-share path alone
+        // would keep running. This is the futex wait/wake handoff collapse.
+        if !decide(1, slice, q - 1, false, false, true) {
+            return TestResult::Fail("wake-preempt + sibling must yield below fair quantum");
+        }
+        // Even at elapsed 1 (just started): a wake with a runnable peer cedes.
+        if !decide(1, slice, 1, false, false, true) {
+            return TestResult::Fail("wake-preempt must yield right after slice start");
+        }
+        // Wake-preempt WITHOUT a runnable sibling (caller ANDs in
+        // has_other_runnable_work, so the term arrives false): do NOT yield to an
+        // empty queue below the fair quantum.
+        if decide(1, slice, q - 1, false, false, false) {
+            return TestResult::Fail("wake-preempt without a sibling must not yield early");
+        }
+        // A wake-preempt request that arrives AFTER the full slice still yields
+        // (full-slice branch), and one with started==0 never does.
+        if !decide(1, slice, slice, false, false, true) {
+            return TestResult::Fail("full slice must yield even without wake-preempt");
+        }
+        if decide(0, slice, 10, false, false, true) {
+            return TestResult::Fail("started==0 must not yield even on wake-preempt");
         }
         TestResult::Pass
     }

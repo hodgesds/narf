@@ -16,6 +16,11 @@
 //!   `SCHED_FEAT(NEXT_BUDDY)`): whether a just-woken task is dispatched ahead
 //!   of the tasks already queued in front of it (its home CPU's "next buddy").
 //!   Off by default (favors latency over strict-FIFO fairness).
+//! - `wake_preempt` (rw) — a CORE executor feature flag (à la Linux
+//!   `wakeup_preempt`/`resched_curr`): whether a wake asks the running task to
+//!   cede at its next syscall exit so the wakee runs promptly instead of after a
+//!   fair quantum. Off by default. Collapses producer/consumer handoff latency
+//!   (stress-ng `--futex`) at some cost to batching.
 //! - `policy` (ro) — the installed [`Scheduler`] name. The `wake_placement`
 //!   flag's EFFECT depends on the loaded strategy (a strategy whose
 //!   `select_wake_cpu` returns `None` makes the flag a no-op), so an operator
@@ -75,6 +80,25 @@ static SCHED_KNOBS: &[SchedKnob] = &[
                 match b {
                     b'1' | b'y' | b'Y' | b't' | b'T' => narf_scheduler::enable_wake_next(),
                     b'0' | b'n' | b'N' | b'f' | b'F' => narf_scheduler::disable_wake_next(),
+                    _ => {}
+                }
+            }
+        }),
+    },
+    SchedKnob {
+        name: "wake_preempt",
+        read: || {
+            if narf_scheduler::wake_preempt_enabled() {
+                String::from("1\n")
+            } else {
+                String::from("0\n")
+            }
+        },
+        write: Some(|buf| {
+            if let Some(&b) = buf.iter().find(|b| !b.is_ascii_whitespace()) {
+                match b {
+                    b'1' | b'y' | b'Y' | b't' | b'T' => narf_scheduler::enable_wake_preempt(),
+                    b'0' | b'n' | b'N' | b'f' | b'F' => narf_scheduler::disable_wake_preempt(),
                     _ => {}
                 }
             }

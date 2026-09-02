@@ -51,6 +51,20 @@ impl SchedClass {
             Self::Realtime => 4,
         }
     }
+
+    /// Inverse of [`rank`](Self::rank): reconstruct a class from its rank. Used
+    /// to rehydrate a class published as a compact rank in the per-CPU running
+    /// snapshot (`CurrentTask`). An out-of-range rank maps to `Default`.
+    #[inline]
+    pub const fn from_rank(rank: u8) -> Self {
+        match rank {
+            0 => Self::Idle,
+            1 => Self::Batch,
+            3 => Self::Interactive,
+            4 => Self::Realtime,
+            _ => Self::Default,
+        }
+    }
 }
 
 /// Nice-style priority within a scheduling class. `0` is the default;

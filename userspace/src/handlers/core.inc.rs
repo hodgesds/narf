@@ -253,6 +253,13 @@ pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
         uctx.sleep_deadline_ns.store(0, Ordering::Release);
     });
     w.wake();
+    // Wake-preemption (Linux `wakeup_preempt`): this readiness/futex/IPC wake
+    // just made `task_id` runnable, so ask the running task to cede at its next
+    // syscall exit and let the wakee run promptly instead of after a fair
+    // quantum. Gated by the `wake_preempt` feature and self-wake-filtered inside;
+    // a no-op (one gated atomic load) when the feature is off.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    narf_scheduler::stackful::note_wake_preempt(task_id);
 }
 
 /// The net readiness hook. `key` is the kernel TCB id of the socket that

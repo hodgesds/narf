@@ -804,15 +804,28 @@ impl Arch {
                         },
                     ),
                 ];
-                // Optional accel override. Unset ⇒ QEMU auto-selects
-                // (KVM when /dev/kvm exists, else single-threaded TCG).
-                // Escape hatch: `XTASK_QEMU_ACCEL=tcg,thread=multi` runs
-                // each vCPU on its own host thread, so a BSP spinning on
-                // an AP's IPI ack doesn't starve the AP under TCG —
-                // needed only if a runner exposes x2APIC under TCG and
-                // the x2APIC-gated shootdown smokes actually run (CI's
-                // qemu64 falls back to xAPIC, so they Skip instead).
-                if let Ok(accel) = std::env::var("XTASK_QEMU_ACCEL") {
+                // Accelerator selection. QEMU's built-in default is TCG
+                // (pure emulation) even when /dev/kvm is present — it does
+                // NOT auto-select KVM. Emulation runs ~10-20x slower and
+                // silently invalidates any perf comparison (a pure-userspace
+                // control stressor reads ~0.05x instead of ~1.0x), so default
+                // to `kvm` whenever /dev/kvm is usable. CI runners have no
+                // /dev/kvm and correctly fall through to TCG.
+                // `XTASK_QEMU_ACCEL` overrides verbatim — e.g.
+                // `XTASK_QEMU_ACCEL=tcg` forces emulation (to exercise the
+                // xAPIC/InitialCount fallback paths), and
+                // `XTASK_QEMU_ACCEL=tcg,thread=multi` runs each vCPU on its
+                // own host thread so a BSP spinning on an AP's IPI ack
+                // doesn't starve the AP under TCG.
+                let accel = std::env::var("XTASK_QEMU_ACCEL").ok().or_else(|| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/dev/kvm")
+                        .ok()
+                        .map(|_| "kvm".to_string())
+                });
+                if let Some(accel) = accel {
                     args.push("-accel".into());
                     args.push(accel);
                 }
