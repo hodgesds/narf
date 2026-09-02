@@ -635,7 +635,7 @@ impl Igc {
         // Publish MMIO base for the static ISR before installing the
         // handler so an early MSI-X delivery can't find a zero base.
         if irq_vector.is_some() {
-            ISR_MMIO_BASE.store(mmio.phys.raw(), Ordering::Release);
+            ISR_MMIO_BASE.store(mmio.virt, Ordering::Release);
         }
         if let Some(v) = irq_vector {
             narf_interrupts::install_handler(v, igc_isr);

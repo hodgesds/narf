@@ -279,7 +279,7 @@ fn smoke_intel_lpss_data_path_smokes() -> TestResult {
     }
 
     // Inspect synthetic MMIO.
-    let base = phys.raw() as *const u32;
+    let base = phys.kernel_ptr::<u32>();
     // Clock gate @ 0x838 should be 0x3.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let gate = unsafe { core::ptr::read_volatile(base.add(0x838 / 4)) };

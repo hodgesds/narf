@@ -545,7 +545,12 @@ pub fn msix_entry_words(target: u32, vector_or_event: u8) -> [u32; 4] {
 unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller promises the word is readable + aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u16) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u16),
+            None => u16::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -560,7 +565,12 @@ unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller promises the dword is readable + aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -576,7 +586,9 @@ unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller promises the slot is writable + aligned.
     unsafe {
-        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p as *mut u16, value);
+        };
     }
     compiler_fence(Ordering::SeqCst);
 }

@@ -2668,8 +2668,12 @@ fn smoke_amdgpu_gfx_pm4_write_data_lands_in_ring() -> TestResult {
     // dwords should appear at the ring base.
     let phys = ring.phys_addr();
     for (i, &expected) in staging.iter().enumerate() {
-        // SAFETY: identity-mapped DMA-coherent page, ring is owned.
-        let got = unsafe { core::ptr::read_volatile((phys + (i * 4) as u64) as *const u32) };
+        // SAFETY: DMA-coherent page via the direct map, ring is owned.
+        let got = unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(phys + (i * 4) as u64).kernel_ptr::<u32>(),
+            )
+        };
         if got != expected {
             return TestResult::Fail("ring dword mismatch after submit");
         }
@@ -2739,7 +2743,11 @@ fn smoke_amdgpu_gfx_pm4_multi_packet_ib_lands_in_ring() -> TestResult {
     let phys = ring.phys_addr();
     let read_dw = |i: usize| -> u32 {
         // SAFETY: identity-mapped DMA backing, ring owned.
-        unsafe { core::ptr::read_volatile((phys + (i * 4) as u64) as *const u32) }
+        unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(phys + (i * 4) as u64).kernel_ptr::<u32>(),
+            )
+        }
     };
     // NOP at offset 0: opcode 0x10 in header bits[15:8].
     if ((read_dw(0) >> 8) & 0xFF) != 0x10 {
@@ -2847,7 +2855,11 @@ fn smoke_amdgpu_gfx_context_submit_ib_ring_contents() -> TestResult {
     // packet pair: INDIRECT_BUFFER (4 dw) + WRITE_DATA (5 dw).
     let read_dw = |i: usize| -> u32 {
         // SAFETY: identity-mapped DMA backing, owned by ctx.
-        unsafe { core::ptr::read_volatile((ring_phys + (i * 4) as u64) as *const u32) }
+        unsafe {
+            core::ptr::read_volatile(
+                narf_memory::PhysAddr::new(ring_phys + (i * 4) as u64).kernel_ptr::<u32>(),
+            )
+        }
     };
 
     // dword 0: INDIRECT_BUFFER header (opcode 0x3F).

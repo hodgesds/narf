@@ -63,11 +63,8 @@ extern "C" {
     /// Patched parameters inside the trampoline (linker symbols
     /// pointing into `.text.ap_trampoline`).
     static mut ap_param_cr3: u64;
-    static mut ap_param_gdt_limit: u16;
-    static mut ap_param_gdt_base: u32;
     static mut ap_param_stacks: u64;
     static mut ap_param_rust_entry: u64;
-    static mut ap_param_gdt32_base: u32;
 }
 
 /// Copy the trampoline blob to phys 0x8000 and patch its parameter
@@ -124,21 +121,9 @@ unsafe fn install_trampoline() {
         asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack, preserves_flags));
         let p_cr3 = phys_addr(core::ptr::addr_of!(ap_param_cr3) as u64);
         (p_cr3 as *mut u64).write_unaligned(cr3);
-
-        // GDT (m16&32 descriptor): limit (u16) + low 32 bits of *phys*
-        // base. The 32-bit lgdt zero-extends the base; if we passed
-        // the virt high-half address, the page-walk after CR0.PG=1
-        // would fault since the high-half mapping is at canonical
-        // 0xFFFF_FFFF_8000_0000+, not at 0x8000_0000+ (the truncation
-        // of those high bits). Instead we pass the kernel-image phys
-        // (virt - KERNEL_VIRT_BASE), which the identity map covers.
-        const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
-        let gdt_phys = super::gdt::gdt_base() - KERNEL_VIRT_BASE;
-        let gdt_limit = super::gdt::gdt_limit();
-        let p_lim = phys_addr(core::ptr::addr_of!(ap_param_gdt_limit) as u64);
-        let p_gdt = phys_addr(core::ptr::addr_of!(ap_param_gdt_base) as u64);
-        (p_lim as *mut u16).write_unaligned(gdt_limit);
-        (p_gdt as *mut u32).write_unaligned(gdt_phys as u32);
+        // The trampoline carries its own GDT (including a 64-bit code
+        // descriptor at 0x08), so nothing here has to hand the AP the
+        // kernel GDT's physical address any more.
 
         // AP_STACKS array virt addr.
         let p_stk = phys_addr(core::ptr::addr_of!(ap_param_stacks) as u64);
@@ -147,13 +132,6 @@ unsafe fn install_trampoline() {
         // Rust entry pointer.
         let p_rs = phys_addr(core::ptr::addr_of!(ap_param_rust_entry) as u64);
         (p_rs as *mut u64).write_unaligned(_ap_start_rust as usize as u64);
-
-        // gdt32_ptr base. The 32-bit GDT lives 24 bytes before the
-        // gdt32_ptr's limit field, and limit is 2 bytes before
-        // ap_param_gdt32_base. So gdt32_start_phys = ap_param_gdt32_base_phys - 2 - 24.
-        let p_gdt32 = phys_addr(core::ptr::addr_of!(ap_param_gdt32_base) as u64);
-        let gdt32_start_phys = p_gdt32 - 2 - 24;
-        (p_gdt32 as *mut u32).write_unaligned(gdt32_start_phys as u32);
     }
 
     compiler_fence(Ordering::SeqCst);

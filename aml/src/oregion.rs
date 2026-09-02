@@ -173,11 +173,51 @@ pub fn for_each_field<F: FnMut(&FieldInfo)>(mut f: F) {
 
 // ── Hardware read helpers ─────────────────────────────────────────────────────
 
+/// Map a `SystemMemory` OperationRegion address for CPU access.
+///
+/// AML `SystemMemory` regions were reached by casting the physical address
+/// straight to a pointer, which only worked because the kernel identity-mapped
+/// low memory. That map is going away, and AML is evaluated at RUNTIME (EC
+/// hotkeys, thermal zones) — potentially with a user CR3 active — so these
+/// accesses must go through a mapping that exists in every address space.
+///
+/// Mapped `Device` (uncached): a SystemMemory region may be real MMIO, and
+/// treating device registers as write-back cacheable would be wrong. A region
+/// that is genuinely RAM is merely slower this way, which is the right trade
+/// for a path evaluated a handful of times per event.
+///
+/// `ioremap` caches by range, so repeated evaluations of the same region reuse
+/// one window rather than leaking VA space.
+#[cfg(target_arch = "x86_64")]
+fn sysmem_ptr(phys: u64, width_bytes: usize) -> Option<*mut u8> {
+    let page_off = phys & 0xFFF;
+    let base = phys.checked_sub(page_off)?;
+    let len = ((width_bytes as u64) + page_off + 0xFFF) & !0xFFF;
+    // SAFETY: the address comes from firmware's own OperationRegion
+    // declaration; AML owns the window it describes.
+    let mapping = unsafe {
+        narf_memory::ioremap::ioremap(base, len, narf_memory::ioremap::MmioAttrs::Device)
+    }
+    .ok()?;
+    Some((mapping.virt + page_off) as *mut u8)
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn sysmem_ptr(phys: u64, _width_bytes: usize) -> Option<*mut u8> {
+    Some(phys as *mut u8)
+}
+
 /// MMIO read of `width_bytes` at physical address `phys`.
 ///
 /// # Safety
-/// `phys` must be a valid, identity-mapped physical address.
+/// `phys` must be a valid physical address; it is mapped here.
 unsafe fn mmio_read(phys: u64, width_bytes: usize) -> u64 {
+    // Unmappable region reads as all-ones — the ACPI convention for absent
+    // hardware, and far better than dereferencing a raw physical address.
+    let Some(base) = sysmem_ptr(phys, width_bytes) else {
+        return u64::MAX;
+    };
+    let phys = base as u64;
     // SAFETY: caller guarantees mapping.
     unsafe {
         match width_bytes {
@@ -246,8 +286,14 @@ unsafe fn io_in(_port: u16, _width_bytes: usize) -> u64 {
 /// MMIO write of `width_bytes` at physical address `phys`.
 ///
 /// # Safety
-/// `phys` must be a valid, identity-mapped physical address.
+/// `phys` must be a valid physical address; it is mapped here.
 unsafe fn mmio_write(phys: u64, width_bytes: usize, val: u64) {
+    // An unmappable region drops the write rather than scribbling on a raw
+    // physical address.
+    let Some(base) = sysmem_ptr(phys, width_bytes) else {
+        return;
+    };
+    let phys = base as u64;
     // SAFETY: caller guarantees mapping.
     unsafe {
         match width_bytes {

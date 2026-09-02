@@ -55,6 +55,12 @@ pub unsafe fn enumerate_n(ecam_base: PhysAddr, n_buses: u16) -> Vec<BusDevice> {
 /// `ecam_base + n_buses * 0x10_0000` must lie inside the kernel's
 /// identity map of MMIO-tolerant memory.
 pub unsafe fn enumerate_segment(ecam_base: PhysAddr, n_buses: u16, segment: u16) -> Vec<BusDevice> {
+    // Config space is MMIO and must be ioremap'd before any access — the low
+    // identity map that used to make `phys as *const u32` work is gone.
+    // SAFETY: caller's contract that this names a real ECAM window.
+    if !unsafe { crate::ecam::map_segment(ecam_base, (n_buses as u64) * 0x10_0000) } {
+        return Vec::new();
+    }
     let mut devices = Vec::new();
 
     for bus in 0..n_buses {
@@ -139,12 +145,16 @@ pub unsafe fn enumerate_segment(ecam_base: PhysAddr, n_buses: u16, segment: u16)
 #[inline]
 unsafe fn ecam_read32(addr: PhysAddr) -> u32 {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: caller asserts `addr` is a readable 4-byte MMIO slot.
-    //
-    // Deliberately NOT `kernel_ptr`: ECAM is device MMIO, and the kernel
-    // direct map is write-back cacheable. MMIO reaches the kernel through
-    // the identity window / `ioremap`, not the RAM direct map.
-    let v = unsafe { core::ptr::read_volatile(addr.raw() as *const u32) };
+    // SAFETY: caller asserts `addr` is a readable 4-byte MMIO slot inside a
+    // mapped ECAM segment. An unmapped address reads as all-ones, which is
+    // exactly how config space reports "no device" — far better than the
+    // wild dereference a raw physical cast would produce.
+    let Some(p) = crate::ecam::ptr_for(addr, 0) else {
+        return u32::MAX;
+    };
+    // SAFETY: `p` is inside the mapped ECAM window resolved above, and the
+    // caller asserts the slot is a 4-byte-aligned config register.
+    let v = unsafe { core::ptr::read_volatile(p as *const u32) };
     compiler_fence(Ordering::SeqCst);
     v
 }

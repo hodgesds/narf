@@ -149,7 +149,12 @@ impl Iterator for CapIter {
 unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the byte is readable.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u8),
+            None => u8::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -158,7 +163,12 @@ unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
 unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the word is readable + 2-byte aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u16) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u16),
+            None => u16::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }

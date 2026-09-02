@@ -1048,6 +1048,34 @@ x86_64 is rejected at runtime.
   the folio must be order ≥ 9 (2 MiB) or order ≥ 18 (1 GiB) and the
   head frame must be naturally aligned to the target size.
 
+- **Kernel address space (PML4 slots):**
+
+  | Slot(s)  | Base                  | Contents                              |
+  | -------- | --------------------- | ------------------------------------- |
+  | 0        | `0x0`                 | AP trampoline pages *only* — see below |
+  | 1        | `0x0000_0080_0000_0000` | high MMIO window; never maps RAM    |
+  | 272      | `0xFFFF_8800_0000_0000` | `vmalloc` / `ioremap`               |
+  | 384..510 | `0xFFFF_C000_0000_0000` (`KERNEL_DIRECT_MAP_BASE`) | direct map of RAM |
+  | 511      | `0xFFFF_FFFF_8000_0000` (`KERNEL_VIRT_BASE`) | kernel image        |
+
+  **The kernel does not identity-map RAM.** PML4[0] retains only
+  `[AP_TRAMPOLINE_EXEC_BASE, + AP_TRAMPOLINE_EXEC_LEN)` (`0x8000..0xA000`)
+  — the pages an AP executes between its SIPI vector and the jump to
+  high-half code — and the buddy excludes them. Consequences:
+
+  - Reaching RAM by a physical address requires `PhysAddr::kernel_ptr` /
+    `kernel_mut_ptr`; a bare `phys as *mut T` is only correct before
+    `direct_map_activate()`, where the offset is still 0.
+  - MMIO goes through `ioremap` (uncached), never the direct map, which
+    is write-back. A BAR is reached via `MmioRegion::virt`, not
+    `.phys`; PCI config space via the segment's ECAM window.
+  - Crates below `narf-memory` in the dependency graph (`narf-arch`,
+    `narf-firmware`, `narf-initramfs`, `narf-fdt`) cannot call
+    `kernel_ptr`; they read the same offset from `narf_lib::directmap`,
+    which `narf-memory` publishes once the direct map is live.
+  - `text_poke` closes the *writable aliases* of a physical page. The
+    identity VA is no longer one of them; see `alias_vas`.
+
 ### aarch64
 - Paging: 4-level, 4 KiB granule (default) or 16 KiB / 64 KiB granules
   on platforms that prefer them, 48-bit VA.
@@ -1138,7 +1166,7 @@ flip.
 
 ## 7. Stage assignment
 
-Stage 1: buddy + page tables + identity map for the Frame.
+Stage 1: buddy + page tables + direct map for the Frame.
 Stage 2: domain manager, PKS/MTE enable, per-domain slab allocator.
 
 **Status (2026-05-10)** — Stage 1 heap migration largely

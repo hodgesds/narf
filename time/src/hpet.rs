@@ -570,13 +570,15 @@ impl Hpet {
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn read_u64(phys: u64) -> u64 {
-    // SAFETY: caller-asserted identity-mapped MMIO.
+    // SAFETY: caller-asserted MMIO; `phys` is already the ioremap VA
+    // published via `set_base_phys`.
     unsafe { core::ptr::read_volatile(phys as *const u64) }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_u64(phys: u64, v: u64) {
-    // SAFETY: caller-asserted identity-mapped MMIO.
+    // SAFETY: caller-asserted MMIO; `phys` is already the ioremap VA
+    // published via `set_base_phys`.
     unsafe {
         core::ptr::write_volatile(phys as *mut u64, v);
     }

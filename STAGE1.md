@@ -57,7 +57,7 @@ These three are cyclically coupled by the MMU-handoff protocol
 6. **`memory/` (Stage 1 subset)** — buddy frame allocator,
    `PhysFrame` / `VirtAddr` types, `Folio { order, head }`
    primitive, page-table manipulation (4 KiB + 2 MiB + 1 GiB on
-   x86_64; 4 KiB + 2 MiB + 1 GiB on aarch64), identity map for the
+   x86_64; 4 KiB + 2 MiB + 1 GiB on aarch64), direct map for the
    Frame, `DomainId::*` reserved constants, slab-cache header type
    (real cache + magazines land in Stage 2).
    **MMU bring-up calls `console::remap_to_virtual` inside the

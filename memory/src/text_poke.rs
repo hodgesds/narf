@@ -248,26 +248,26 @@ unsafe fn set_alias_writable(phys: u64, len: u64, writable: bool) -> Result<(), 
 /// Every kernel VA at which `phys` is reachable, derived from the same rules
 /// `init_mmu` builds the windows by rather than from a guess:
 ///
-/// * `phys` itself — PML4[0] identity-maps 0..512 GiB unconditionally.
 /// * `KERNEL_VIRT_BASE + phys` — PML4[511]/PDPT[510] aliases phys 0..1 GiB,
-///   which is where a small-RAM boot does all of its buddy allocation. Closing
-///   only the identity map would leave this as a complete replacement for it;
-///   `mmu.rs` says so in as many words.
-/// * `KERNEL_DIRECT_MAP_BASE | phys` — only built on machines with more than
-///   512 GiB of RAM, hence gated on `direct_map_live()`.
+///   which is where a small-RAM boot does all of its buddy allocation.
+/// * `KERNEL_DIRECT_MAP_BASE | phys` — the direct map, once `init_mmu` has
+///   activated it.
+///
+/// `phys` itself is **not** a candidate. PML4[0] used to identity-map
+/// 0..512 GiB unconditionally, and this function used to return the identity
+/// VA for that reason; the kernel's low map is now reduced to the AP
+/// trampoline pages, which are excluded from the buddy and can never back a
+/// text pack. Returning it anyway would hand `set_range_writable` a VA with no
+/// present leaf, failing every seal.
 ///
 /// PML4[1] (512 GiB..1 TiB) is the high-MMIO identity window and never maps
-/// RAM, so it is not a candidate.
+/// RAM, so it is not a candidate either.
 #[cfg(target_arch = "x86_64")]
-fn alias_vas(phys: u64) -> ([u64; 3], usize) {
+fn alias_vas(phys: u64) -> ([u64; 2], usize) {
     const KERNEL_VIRT_BASE: u64 = 0xFFFF_FFFF_8000_0000;
     const KERNEL_WINDOW_SPAN: u64 = 1 << 30;
-    let mut out = [0u64; 3];
+    let mut out = [0u64; 2];
     let mut n = 0;
-    if phys < crate::addr::LOW_IDENTITY_LIMIT {
-        out[n] = phys;
-        n += 1;
-    }
     if phys < KERNEL_WINDOW_SPAN {
         out[n] = KERNEL_VIRT_BASE.wrapping_add(phys);
         n += 1;
@@ -345,7 +345,8 @@ pub fn alias_is_writable(phys: u64) -> Option<bool> {
 unsafe fn leaf_is_writable(root: PhysAddr, va: u64) -> Option<bool> {
     use crate::x86_64::paging::{PageTable, PtFlags, WalkIndices};
     let idx = WalkIndices::from_virt(VirtAddr::new(va));
-    // SAFETY: read-only walk of live, identity-reachable page tables.
+    // SAFETY: read-only walk of live page tables, reached through the
+    // direct map.
     unsafe {
         let pml4 = &*root.kernel_ptr::<PageTable>();
         let e = pml4.entries[idx.pml4];
@@ -442,9 +443,9 @@ unsafe fn set_leaf_writable(
     // At most two demotions (1 GiB → 2 MiB → 4 KiB), so this cannot spin.
     loop {
         let idx = WalkIndices::from_virt(VirtAddr::new(va));
-        // SAFETY: `root` is the live kernel root; page tables live in
-        // identity-reachable RAM and every level below the top was built by
-        // `init_mmu` or by `split_leaf` below.
+        // SAFETY: `root` is the live kernel root; page tables live in RAM
+        // reached through the direct map, and every level below the top was
+        // built by `init_mmu` or by `split_leaf` below.
         unsafe {
             let pml4 = &mut *root.kernel_mut_ptr::<PageTable>();
             let e = pml4.entries[idx.pml4];
@@ -540,8 +541,8 @@ unsafe fn split_leaf(
         flags & !PtFlags::HUGE_PAGE.bits()
     };
 
-    // SAFETY: a frame the buddy just handed us exclusively, identity-reachable
-    // like every other page table in this tree.
+    // SAFETY: a frame the buddy just handed us exclusively, reached through
+    // the direct map like every other page table in this tree.
     unsafe {
         let t = &mut *table.kernel_mut_ptr::<PageTable>();
         for (i, slot) in t.entries.iter_mut().enumerate() {

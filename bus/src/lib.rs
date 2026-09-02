@@ -39,6 +39,7 @@ pub mod bar;
 pub mod cxl;
 pub mod device;
 pub mod driver_match;
+pub mod ecam;
 pub mod hotplug;
 pub mod msi;
 pub mod msix;

@@ -394,7 +394,9 @@ pub struct IntelHda {
 /// guarding the controller (which a CORB submitter may be holding).
 ///
 /// Zero means "no controller bound yet" — the ISR returns early.
-static HDA_BAR0_PHYS: AtomicU64 = AtomicU64::new(0);
+/// The BAR0 register window's mapped kernel VA, not its physical
+/// address: the sync ISR dereferences it directly to W1C RIRBSTS.
+static HDA_BAR0_VA: AtomicU64 = AtomicU64::new(0);
 
 /// Sync IRQ handler — runs in IRQ context. Reads INTSTS to confirm
 /// our line, then clears RIRBSTS bits W1C so the level-triggered INTx
@@ -403,7 +405,7 @@ static HDA_BAR0_PHYS: AtomicU64 = AtomicU64::new(0);
 /// awaiting task drains the RIRB ring itself — keeping this handler
 /// minimal lets it coexist with `IrqSafeSpinLock`-protected senders.
 fn hda_isr() {
-    let base = HDA_BAR0_PHYS.load(Ordering::Acquire);
+    let base = HDA_BAR0_VA.load(Ordering::Acquire);
     if base == 0 {
         return;
     }
@@ -808,9 +810,9 @@ impl IntelHda {
         // Write entry 0 pointing at the silence buffer; entry 1 is a
         // mirror so LVI=1 produces a 2-period wraparound (the
         // controller refuses LVI < 1).
-        // SAFETY: identity-mapped DMA, 4 KiB page.
+        // SAFETY: DMA buffer, reached through the direct map, 4 KiB page.
         unsafe {
-            let p = bdl_phys as *mut u32;
+            let p = narf_memory::PhysAddr::new(bdl_phys).kernel_mut_ptr::<u32>();
             // entry 0
             p.add(0).write_volatile((silence_phys & 0xFFFF_FFFF) as u32);
             p.add(1).write_volatile((silence_phys >> 32) as u32);
@@ -853,7 +855,7 @@ impl IntelHda {
         // unmasks the line. The ISR returns early on a zero base,
         // but once a route is live the next IRQ must find a valid
         // base to W1C RIRBSTS (otherwise INTx storms).
-        HDA_BAR0_PHYS.store(bar0.phys.raw(), Ordering::Release);
+        HDA_BAR0_VA.store(bar0.virt, Ordering::Release);
 
         // Clear any latched RIRBSTS state from bring-up so the first
         // armed IRQ reflects only fresh activity.
@@ -1363,15 +1365,21 @@ impl IntelHda {
     pub fn load_period(&self, samples: &[i16]) -> usize {
         let n = samples.len().min(self.period_samples());
         let phys = self.period.phys_addr().raw();
-        // SAFETY: identity-mapped DMA page; n × 2 ≤ period_bytes().
+        // SAFETY: DMA buffer, reached through the direct map page; n × 2 ≤ period_bytes().
         unsafe {
             for (i, &s) in samples[..n].iter().enumerate() {
-                core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, s);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + (i * 2) as u64).kernel_mut_ptr::<i16>(),
+                    s,
+                );
             }
             // Pad the tail with zeroes so a short load doesn't leak
             // stale samples from a prior period.
             for i in n..self.period_samples() {
-                core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, 0);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + (i * 2) as u64).kernel_mut_ptr::<i16>(),
+                    0,
+                );
             }
         }
         n
@@ -1402,12 +1410,15 @@ impl IntelHda {
             buf.push(s); // left
             buf.push(s); // right
         }
-        // SAFETY: identity-mapped DMA page; buf length matches
+        // SAFETY: DMA buffer, reached through the direct map page; buf length matches
         // period_samples by construction.
         // SAFETY: Valid memory or trusted environment
         unsafe {
             for (i, &s) in buf.iter().enumerate() {
-                core::ptr::write_volatile((phys + (i * 2) as u64) as *mut i16, s);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys + (i * 2) as u64).kernel_mut_ptr::<i16>(),
+                    s,
+                );
             }
         }
         buf.len()
@@ -1522,11 +1533,12 @@ impl IntelHda {
             n
         };
 
-        // 2. Place verb in CORB[next]. SAFETY: identity-mapped DMA,
+        // 2. Place verb in CORB[next]. SAFETY: DMA buffer, reached through the direct map,
         //    slot inside the 1 KiB ring.
         // SAFETY: Valid memory or trusted environment
         unsafe {
-            let slot = (self.corb_phys + (next as u64) * 4) as *mut u32;
+            let slot = narf_memory::PhysAddr::new(self.corb_phys + (next as u64) * 4)
+                .kernel_mut_ptr::<u32>();
             slot.write_volatile(verb);
         }
         compiler_fence(Ordering::SeqCst);
@@ -1564,9 +1576,10 @@ impl IntelHda {
                 let mut g = self.rirb_rp.lock();
                 *g = next;
             }
-            // SAFETY: identity-mapped DMA, slot inside 2 KiB ring.
+            // SAFETY: DMA buffer, reached through the direct map, slot inside 2 KiB ring.
             let resp = unsafe {
-                let slot = (self.rirb_phys + (next as u64) * 8) as *const u32;
+                let slot = narf_memory::PhysAddr::new(self.rirb_phys + (next as u64) * 8)
+                    .kernel_ptr::<u32>();
                 slot.read_volatile()
             };
             return Ok(resp);
@@ -1632,9 +1645,10 @@ unsafe fn send_verb_polled(
         *g = n;
         n
     };
-    // SAFETY: identity-mapped DMA, slot inside the 1 KiB ring.
+    // SAFETY: DMA buffer, reached through the direct map, slot inside the 1 KiB ring.
     unsafe {
-        let slot = (corb_phys + (next as u64) * 4) as *mut u32;
+        let slot =
+            narf_memory::PhysAddr::new(corb_phys + (next as u64) * 4).kernel_mut_ptr::<u32>();
         slot.write_volatile(verb);
     }
     compiler_fence(Ordering::SeqCst);
@@ -1663,9 +1677,9 @@ unsafe fn send_verb_polled(
     let rwp = unsafe { bar0.read16(REG_RIRBWP) };
     let mut g = rirb_rp.lock();
     *g = rwp;
-    // SAFETY: identity-mapped DMA, slot inside the 2 KiB ring.
+    // SAFETY: DMA buffer, reached through the direct map, slot inside the 2 KiB ring.
     let resp = unsafe {
-        let slot = (rirb_phys + (rwp as u64) * 8) as *const u32;
+        let slot = narf_memory::PhysAddr::new(rirb_phys + (rwp as u64) * 8).kernel_ptr::<u32>();
         slot.read_volatile()
     };
     Ok(resp)

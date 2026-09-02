@@ -5088,7 +5088,13 @@ pub mod tests {
         // Strand slot 0, the current CPU, and the last slot; leave a
         // decoy pointer in another slot to prove only matching slots
         // are cleared.
-        let decoy = 0xdead_beef_usize as *mut KernelTask;
+        // The decoy is parked in *another* CPU's live slot, so that CPU can
+        // take a preempt tick and dereference it before the cleanup below.
+        // It therefore has to be a real, live `KernelTask`: a poison constant
+        // only survived because the low identity map made `0xdead_beef`
+        // readable, and dereferencing it now faults.
+        let decoy_task = KernelTask::new(ReadyImmediately);
+        let decoy = &*decoy_task as *const KernelTask as *mut KernelTask;
         CURRENT_STACKFUL_TASK.inner[0].store(task_ptr, Ordering::Release);
         CURRENT_STACKFUL_TASK.inner[this_cpu() % n].store(task_ptr, Ordering::Release);
         CURRENT_STACKFUL_TASK.inner[n - 1].store(task_ptr, Ordering::Release);

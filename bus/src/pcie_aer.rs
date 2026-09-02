@@ -34,6 +34,8 @@
 //! `Severity` chooses Severe vs Non-Fatal for each Uncorrectable
 //! bit at runtime.
 
+use narf_memory::PhysAddr;
+
 extern crate alloc;
 
 /// PCIe Extended Capability ID for AER.
@@ -226,6 +228,10 @@ impl HeaderLog {
 /// region the CPU can reach (the same shape ECAM enumeration
 /// produces). The walk is read-only.
 pub unsafe fn find_aer_cap_offset(cfg_phys: u64) -> Option<u16> {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     let mut off: u16 = 0x100;
     // Bound the walk so a corrupted next-pointer can't loop us
     // forever; the extended config space is at most 4 KiB.
@@ -306,6 +312,10 @@ pub const DEFAULT_UE_SEVERITY: u32 = ue::DATA_LINK_PROTOCOL_ERROR
 /// `aer_off` must be the offset returned by `find_aer_cap_offset`.
 /// Caller owns the device exclusively during the write window.
 pub unsafe fn configure_aer_defaults(cfg_phys: u64, aer_off: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         // Correctable Mask — suppress Advisory Non-Fatal.
@@ -334,6 +344,10 @@ pub unsafe fn configure_aer_defaults(cfg_phys: u64, aer_off: u16) {
 /// # Safety
 /// Same as `configure_aer_defaults`.
 pub unsafe fn enable_root_error_reporting(cfg_phys: u64, aer_off: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         let cmd = root_cmd::CORRECTABLE_ERROR_REPORTING_ENABLE
@@ -423,6 +437,10 @@ impl RootErrorStatus {
 /// # Safety
 /// `cfg_phys` live 4 KiB PCIe config; `aer_off` from walker.
 pub unsafe fn read_and_clear_root_error_status(cfg_phys: u64, aer_off: u16) -> RootErrorStatus {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     let raw = unsafe {
         core::ptr::read_volatile(
@@ -497,6 +515,10 @@ impl DpcCapability {
 /// # Safety
 /// `cfg_phys` must point at a live 4 KiB PCIe config page.
 pub unsafe fn find_dpc_capability(cfg_phys: u64) -> Option<DpcCapability> {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // Walk the extended cap list from 0x100.
     let mut off: u16 = 0x100;
     for _ in 0..256 {

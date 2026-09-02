@@ -229,7 +229,7 @@ fn smoke_fb_tag_blit_via_shmem() -> TestResult {
     };
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel-side test, sole producer.
-        unsafe { SharedProducer::from_raw(phys_ring as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(narf_memory::PhysAddr::new(phys_ring).kernel_mut_ptr::<DrawRing>()) };
 
     // Source shmem: 64 bytes (4 × 4 × 4). Fill with a checker.
     let buf = match shmem_create(pid, 64) {
@@ -246,9 +246,12 @@ fn smoke_fb_tag_blit_via_shmem() -> TestResult {
             let off_b = row * 16 + col * 4;
             let pix = if (row + col) % 2 == 0 { on } else { off };
             let phys = phys_at(buf, off_b as u64).expect("phys");
-            // SAFETY: identity-mapped fresh shmem frame.
+            // SAFETY: fresh shmem frame, via the direct map.
             unsafe {
-                core::ptr::write_volatile(phys as *mut u32, pix);
+                core::ptr::write_volatile(
+                    narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u32>(),
+                    pix,
+                );
             }
         }
     }
@@ -620,7 +623,7 @@ fn smoke_fb_registry_drain_all_executes_per_process() -> TestResult {
 
     // Build a producer over A's ring (treating its phys as a
     // kernel-side pointer — identity-mapped low memory).
-    let ring_ptr = phys_a as *mut DrawRing;
+    let ring_ptr = narf_memory::PhysAddr::new(phys_a).kernel_mut_ptr::<DrawRing>();
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel side only constructs the
         // producer here; the consumer was retained by the registry
@@ -666,7 +669,7 @@ fn smoke_fb_drain_once_advances_counters() -> TestResult {
     let phys = registry::ring_phys(h).expect("ring_phys");
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel-side test.
-        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<DrawRing>()) };
     let cmd = DrawCmd::fill(Rect::new(0, 0, 2, 2), Pixel32::rgb(0xDE, 0xAD, 0xBE).raw());
     if cmd_ring::try_send(&mut producer, cmd).is_err() {
         return TestResult::Fail("send");
@@ -723,7 +726,7 @@ fn smoke_fb_e2e_via_test_scanout() -> TestResult {
     };
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract.
-        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<DrawRing>()) };
     let target_pix = Pixel32::rgb(0xCA, 0xFE, 0x42);
     if cmd_ring::try_send(
         &mut producer,
@@ -814,7 +817,7 @@ fn smoke_fb_userspace_chain_against_real_backend() -> TestResult {
     // mapped phys = identity-VA in low 4 GiB).
     let mut producer: SharedProducer<DrawCmd, RING_DEPTH> =
         // SAFETY: SPSC contract — kernel-side test, sole producer.
-        unsafe { SharedProducer::from_raw(phys as *mut DrawRing) };
+        unsafe { SharedProducer::from_raw(narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<DrawRing>()) };
     let pix = Pixel32::rgb(0x55, 0xAA, 0x55).raw();
     if cmd_ring::try_send(&mut producer, DrawCmd::fill(Rect::new(0, 0, 4, 4), pix)).is_err() {
         registry::__reset_for_test();

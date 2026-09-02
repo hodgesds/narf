@@ -115,6 +115,6 @@ pub unsafe fn disable() {
 /// # Safety
 /// `page_phys` is the previously-installed page.
 pub unsafe fn read_timestamp(page_phys: u64) -> u32 {
-    // SAFETY: caller-asserted; identity-mapped DMA-coherent page.
-    unsafe { core::ptr::read_volatile(page_phys as *const u32) }
+    // SAFETY: caller-asserted; DMA-coherent page, reached through the direct map.
+    unsafe { core::ptr::read_volatile(narf_lib::directmap::pv_ptr::<u32>(page_phys).cast_const()) }
 }

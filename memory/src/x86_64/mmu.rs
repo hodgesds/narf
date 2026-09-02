@@ -355,12 +355,22 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         // is the only one that gets demoted. Slots 1..512 stay 1-GiB NX
         // leaves: 511 huge pages, one iTLB-irrelevant entry each, exactly as
         // before except for bit 63.
-        for gib in 1u64..512 {
-            let phys = PhysAddr::new(gib << 30);
-            let entry = PageTableEntry::new(phys, flags_1gb);
-            let slot = PhysAddr::new(pdpt_lo_addr.raw() + gib * 8);
-            write_identity::<PageTableEntry>(slot, entry);
-        }
+        // PDPT[1..512] are left EMPTY. They used to identity-map
+        // 1 GiB..512 GiB of RAM, which is what made `phys as *mut T` work
+        // anywhere in the kernel and hid a whole class of bug: a physical
+        // address dereferenced by the CPU still "worked" on the kernel CR3,
+        // so it only failed once a user address space was active. The
+        // virtqueue ring accessors survived four grep sweeps, a newtype, two
+        // code reviews and a CI guard exactly that way.
+        //
+        // Kernel access to RAM goes through the high-half direct map
+        // (KERNEL_DIRECT_MAP_BASE). With these slots gone, a leftover
+        // identity deref faults IMMEDIATELY, in any context, so the existing
+        // test suite finds it instead of a userspace-driven CI job.
+        //
+        // Linux has no identity map of RAM at all for the same reason;
+        // `__va()` is the only way there.
+        let _ = flags_1gb;
 
         // ── Demotion, level 1: identity 0..1 GiB, 1 GiB → 512 × 2 MiB ──
         //
@@ -380,15 +390,8 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
         );
         // PD[0] is demoted again (below); PD[1..512] are 2-MiB leaves,
         // executable only where the kernel image's text lives.
-        for two_mb in 1u64..512 {
-            let phys = two_mb << 21;
-            let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::HUGE_PAGE;
-            if !identity_leaf_needs_exec(phys, 1 << 21) {
-                flags |= PtFlags::NO_EXEC;
-            }
-            let slot = PhysAddr::new(pd_lo_0_addr.raw() + two_mb * 8);
-            write_identity::<PageTableEntry>(slot, PageTableEntry::new(PhysAddr::new(phys), flags));
-        }
+        // PD[1..512] are left EMPTY — see the PDPT comment above. Only the
+        // first 2 MiB survives, and only for the AP trampoline.
 
         // ── Demotion, level 2: identity 0..2 MiB, 2 MiB → 512 × 4 KiB ──
         //
@@ -400,7 +403,18 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
             pd_lo_0_addr,
             PageTableEntry::new(pt_lo_0_addr, flags_ptr),
         );
-        for page in 0u64..512 {
+        // ONLY the AP trampoline pages are mapped. An AP starts in real mode
+        // at the SIPI vector, enables paging with THIS PML4 in CR3, and keeps
+        // fetching from `AP_TRAMPOLINE_EXEC_BASE + off` until the far jump —
+        // so those pages must be identity-mapped and executable. Linux keeps
+        // a dedicated trampoline PGD entry for exactly this reason.
+        //
+        // Every other page of the first 2 MiB is left unmapped, so the low
+        // half of the kernel address space now contains nothing but the
+        // trampoline.
+        let tramp_first = AP_TRAMPOLINE_EXEC_BASE >> 12;
+        let tramp_last = (AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN - 1) >> 12;
+        for page in tramp_first..=tramp_last {
             let phys = page << 12;
             let mut flags = PtFlags::PRESENT | PtFlags::WRITABLE;
             if !identity_leaf_needs_exec(phys, 1 << 12) {
@@ -565,6 +579,12 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // reached at `phys == virt` through the low identity map.
     if build_direct_map {
         crate::addr::direct_map_activate();
+        // `narf-arch` cannot call `kernel_ptr` (narf-memory depends on it, so
+        // the reverse would be a cycle), and its ACPI table parser can no
+        // longer rely on a low identity map — that is gone as of this
+        // function, bar the AP trampoline. Hand it the same offset the kernel
+        // accessors use, before any table is touched.
+        narf_lib::directmap::set_offset(crate::addr::KERNEL_DIRECT_MAP_BASE);
     }
 
     // Step 5: *caller* notifies the console with a post-switch

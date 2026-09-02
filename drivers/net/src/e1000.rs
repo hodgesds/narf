@@ -1044,7 +1044,7 @@ impl E1000 {
         // handler — otherwise an early INTx could race and find a
         // zero base.
         if irq_vector.is_some() {
-            ISR_MMIO_BASE.store(mmio.phys.raw(), Ordering::Release);
+            ISR_MMIO_BASE.store(mmio.virt, Ordering::Release);
         }
         if let Some(v) = irq_vector {
             narf_interrupts::install_handler(v, e1000_isr);

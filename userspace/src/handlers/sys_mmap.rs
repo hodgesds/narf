@@ -330,9 +330,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         };
         for frame in &frames {
             // SAFETY: a newly allocated huge frame is exclusively owned and
-            // identity-reachable under the kernel's direct mapping.
+            // reached through the kernel's direct mapping.
             unsafe {
-                core::ptr::write_bytes(frame.phys() as *mut u8, 0, frame.size_bytes() as usize);
+                core::ptr::write_bytes(
+                    narf_memory::PhysAddr::new(frame.phys()).kernel_mut_ptr::<u8>(),
+                    0,
+                    frame.size_bytes() as usize,
+                );
             }
         }
         let mapped = as_ref.with_vma_transaction(|| {

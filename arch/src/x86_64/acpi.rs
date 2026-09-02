@@ -140,7 +140,8 @@ pub fn set_rsdp_phys(phys: u64) {
 /// BIOS read-only area.
 ///
 /// # Safety
-/// Caller asserts low memory `0x000..0xFFFFF` is identity-mapped
+/// Caller asserts low memory `0x000..0xFFFFF` is readable through the
+/// direct map (see [`pv`])
 /// (true on x86_64 boot).
 pub unsafe fn find_rsdp() -> Result<u64, AcpiError> {
     let over = RSDP_OVERRIDE.load(Ordering::Acquire);
@@ -151,8 +152,8 @@ pub unsafe fn find_rsdp() -> Result<u64, AcpiError> {
         }
     }
     // EBDA pointer (segment, shifted left 4).
-    // SAFETY: low-memory phys is identity-mapped.
-    let ebda_seg = unsafe { core::ptr::read_volatile(EBDA_PTR_PHYS as *const u16) } as u64;
+    // SAFETY: low-memory phys, reached through the direct map.
+    let ebda_seg = unsafe { core::ptr::read_volatile(pv(EBDA_PTR_PHYS) as *const u16) } as u64;
     let ebda_base = ebda_seg << 4;
     if ebda_base != 0 {
         // SAFETY: same.
@@ -171,7 +172,8 @@ pub unsafe fn find_rsdp() -> Result<u64, AcpiError> {
 unsafe fn scan_for_rsdp(lo: u64, hi: u64) -> Option<u64> {
     let mut p = lo & !0xF; // 16-byte aligned
     while p < hi {
-        // SAFETY: low-memory range identity-mapped.
+        // SAFETY: low-memory range, reached through the direct map by
+        // `check_rsdp`.
         if unsafe { check_rsdp(p) } {
             return Some(p);
         }
@@ -180,12 +182,29 @@ unsafe fn scan_for_rsdp(lo: u64, hi: u64) -> Option<u64> {
     None
 }
 
+/// Kernel-reachable pointer for a physical address.
+///
+/// `narf-memory` depends on `narf-arch`, so this crate cannot call
+/// `PhysAddr::kernel_ptr` — it would be a dependency cycle. The offset
+/// lives in `narf-lib`, which both crates depend on; `narf-memory`
+/// publishes it there once the direct map is live.
+///
+/// Zero until published: before the MMU handoff, boot.S identity-maps low
+/// memory so `phys == virt` and the early scan works unchanged. Afterwards the
+/// kernel's low identity map is gone — only the AP trampoline survives — so
+/// every ACPI table access has to go through the direct map or fault. The RSDP
+/// scan over the BIOS area at 0xE0000 was the first thing to do so.
+#[inline]
+fn pv(phys: u64) -> u64 {
+    narf_lib::directmap::pv(phys)
+}
+
 unsafe fn check_rsdp(phys: u64) -> bool {
     // SAFETY: caller-asserted readable.
     let sig = unsafe {
         let mut s = [0u8; 8];
         for (i, byte) in s.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile((phys + i as u64) as *const u8);
+            *byte = core::ptr::read_volatile(pv(phys + i as u64) as *const u8);
         }
         s
     };
@@ -198,14 +217,15 @@ unsafe fn check_rsdp(phys: u64) -> bool {
         // SAFETY: the signature matched above, so `phys` points at an RSDP whose
         // first 20 bytes (the revision-1 structure) are readable; `i < 20`.
         // SAFETY: Valid memory or trusted environment
-        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
+        sum =
+            sum.wrapping_add(unsafe { core::ptr::read_volatile(pv(phys + i as u64) as *const u8) });
     }
     if sum != 0 {
         return false;
     }
     // For revision >= 2, also verify the 36-byte checksum.
     // SAFETY: byte 15 (revision) is within the already-validated 20-byte RSDP.
-    let rev = unsafe { core::ptr::read_volatile((phys + 15) as *const u8) };
+    let rev = unsafe { core::ptr::read_volatile(pv(phys + 15) as *const u8) };
     if rev >= 2 {
         let mut sum: u8 = 0;
         for i in 0..36 {
@@ -213,7 +233,9 @@ unsafe fn check_rsdp(phys: u64) -> bool {
                 // SAFETY: revision >= 2 means the RSDP is the 36-byte extended
                 // form, so bytes 0..36 at `phys` are all readable; `i < 36`.
                 // SAFETY: Valid memory or trusted environment
-                .wrapping_add(unsafe { core::ptr::read_volatile((phys + i as u64) as *const u8) });
+                .wrapping_add(unsafe {
+                    core::ptr::read_volatile(pv(phys + i as u64) as *const u8)
+                });
         }
         if sum != 0 {
             return false;
@@ -228,19 +250,19 @@ unsafe fn check_rsdp(phys: u64) -> bool {
 /// Caller asserts `phys` is a validated RSDP (`check_rsdp`-passed).
 pub unsafe fn decode_rsdp(phys: u64) -> Rsdp {
     // SAFETY: caller-asserted.
-    let revision = unsafe { core::ptr::read_volatile((phys + 15) as *const u8) };
+    let revision = unsafe { core::ptr::read_volatile(pv(phys + 15) as *const u8) };
     let mut oem_id = [0u8; 6];
     for (i, byte) in oem_id.iter_mut().enumerate() {
         // SAFETY: `check_rsdp` validated this RSDP, so bytes 9..15 (the 6-byte
         // OEMID field) lie within the readable RSDP region at `phys`.
         // SAFETY: Valid memory or trusted environment
-        *byte = unsafe { core::ptr::read_volatile((phys + 9 + i as u64) as *const u8) };
+        *byte = unsafe { core::ptr::read_volatile(pv(phys + 9 + i as u64) as *const u8) };
     }
     // SAFETY: same.
-    let rsdt_address = unsafe { core::ptr::read_volatile((phys + 16) as *const u32) };
+    let rsdt_address = unsafe { core::ptr::read_volatile(pv(phys + 16) as *const u32) };
     let xsdt_address = if revision >= 2 {
         // SAFETY: same.
-        unsafe { core::ptr::read_volatile((phys + 24) as *const u64) }
+        unsafe { core::ptr::read_volatile(pv(phys + 24) as *const u64) }
     } else {
         0
     };
@@ -260,16 +282,16 @@ unsafe fn read_sdt_header(phys: u64) -> SdtHeader {
     // SAFETY: caller-asserted SDT phys.
     unsafe {
         for (i, byte) in signature.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile((phys + i as u64) as *const u8);
+            *byte = core::ptr::read_volatile(pv(phys + i as u64) as *const u8);
         }
         for (i, byte) in oem_id.iter_mut().enumerate() {
-            *byte = core::ptr::read_volatile((phys + 10 + i as u64) as *const u8);
+            *byte = core::ptr::read_volatile(pv(phys + 10 + i as u64) as *const u8);
         }
     }
     // SAFETY: same.
-    let length = unsafe { core::ptr::read_volatile((phys + 4) as *const u32) };
+    let length = unsafe { core::ptr::read_volatile(pv(phys + 4) as *const u32) };
     // SAFETY: same.
-    let revision = unsafe { core::ptr::read_volatile((phys + 9) as *const u8) };
+    let revision = unsafe { core::ptr::read_volatile(pv(phys + 9) as *const u8) };
     SdtHeader {
         signature,
         length,
@@ -283,7 +305,7 @@ unsafe fn checksum_ok(phys: u64, length: u32) -> bool {
     // SAFETY: caller-asserted readable + bounded.
     for i in 0..length as u64 {
         // SAFETY: MMIO access to the device's mapped register block; the offset lies within the mapped BAR.
-        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile((phys + i) as *const u8) });
+        sum = sum.wrapping_add(unsafe { core::ptr::read_volatile(pv(phys + i) as *const u8) });
     }
     sum == 0
 }
@@ -308,7 +330,7 @@ pub unsafe fn parse_xsdt(phys: u64) -> Result<Tables, AcpiError> {
     for i in 0..entries {
         let sdt_phys =
             // SAFETY: same.
-            unsafe { core::ptr::read_volatile((phys + 36 + (i * 8) as u64) as *const u64) };
+            unsafe { core::ptr::read_volatile(pv(phys + 36 + (i * 8) as u64) as *const u64) };
         // SAFETY: caller-trusted XSDT entry.
         let sh = unsafe { read_sdt_header(sdt_phys) };
         // Bad checksum on a child table is non-fatal — skip it.
@@ -339,14 +361,14 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
         return;
     }
     // SAFETY: caller-asserted SDT phys.
-    let lapic_addr = unsafe { core::ptr::read_volatile((phys + 36) as *const u32) };
+    let lapic_addr = unsafe { core::ptr::read_volatile(pv(phys + 36) as *const u32) };
     t.local_apic_base = Some(lapic_addr as u64);
     let mut off: u64 = 44;
     while (off as u32) + 2 <= length {
         // SAFETY: same.
-        let kind = unsafe { core::ptr::read_volatile((phys + off) as *const u8) };
+        let kind = unsafe { core::ptr::read_volatile(pv(phys + off) as *const u8) };
         // SAFETY: same.
-        let len = unsafe { core::ptr::read_volatile((phys + off + 1) as *const u8) } as u64;
+        let len = unsafe { core::ptr::read_volatile(pv(phys + off + 1) as *const u8) } as u64;
         if len < 2 {
             break;
         }
@@ -354,11 +376,11 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
             0 if len >= 8 => {
                 // Local APIC entry.
                 // SAFETY: same.
-                let pid = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let pid = unsafe { core::ptr::read_volatile(pv(phys + off + 2) as *const u8) };
                 // SAFETY: same.
-                let aid = unsafe { core::ptr::read_volatile((phys + off + 3) as *const u8) };
+                let aid = unsafe { core::ptr::read_volatile(pv(phys + off + 3) as *const u8) };
                 // SAFETY: same.
-                let flags = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 t.local_apics.push(MadtEntry::LocalApic {
                     processor_uid: pid,
                     apic_id: aid,
@@ -368,11 +390,11 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
             1 if len >= 12 => {
                 // IOAPIC entry.
                 // SAFETY: same.
-                let id = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let id = unsafe { core::ptr::read_volatile(pv(phys + off + 2) as *const u8) };
                 // SAFETY: same.
-                let addr = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let addr = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 // SAFETY: same.
-                let gsi = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u32) };
+                let gsi = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u32) };
                 t.io_apics.push(MadtEntry::IoApic {
                     id,
                     address: addr,
@@ -382,13 +404,13 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
             2 if len >= 10 => {
                 // Interrupt Source Override.
                 // SAFETY: same.
-                let bus = unsafe { core::ptr::read_volatile((phys + off + 2) as *const u8) };
+                let bus = unsafe { core::ptr::read_volatile(pv(phys + off + 2) as *const u8) };
                 // SAFETY: same.
-                let source = unsafe { core::ptr::read_volatile((phys + off + 3) as *const u8) };
+                let source = unsafe { core::ptr::read_volatile(pv(phys + off + 3) as *const u8) };
                 // SAFETY: same.
-                let gsi = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let gsi = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 // SAFETY: same.
-                let flags = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
+                let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u16) };
                 t.overrides.push(MadtEntry::IntOverride {
                     bus,
                     source,
@@ -399,11 +421,11 @@ unsafe fn parse_madt(phys: u64, length: u32, t: &mut Tables) {
             9 if len >= 16 => {
                 // Local x2APIC entry.
                 // SAFETY: same.
-                let xid = unsafe { core::ptr::read_volatile((phys + off + 4) as *const u32) };
+                let xid = unsafe { core::ptr::read_volatile(pv(phys + off + 4) as *const u32) };
                 // SAFETY: same.
-                let flags = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u32) };
+                let flags = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u32) };
                 // SAFETY: same.
-                let pid = unsafe { core::ptr::read_volatile((phys + off + 12) as *const u32) };
+                let pid = unsafe { core::ptr::read_volatile(pv(phys + off + 12) as *const u32) };
                 t.local_apics.push(MadtEntry::LocalX2Apic {
                     x2apic_id: xid,
                     flags,
@@ -426,7 +448,7 @@ unsafe fn parse_hpet(phys: u64, length: u32, t: &mut Tables) {
     // The 64-bit base lives in the GAS at offset 44, address field
     // at +4 within the GAS.
     // SAFETY: caller-asserted.
-    let base = unsafe { core::ptr::read_volatile((phys + 44 + 4) as *const u64) };
+    let base = unsafe { core::ptr::read_volatile(pv(phys + 44 + 4) as *const u64) };
     t.hpet_base = Some(base);
 }
 
@@ -440,13 +462,13 @@ unsafe fn parse_mcfg(phys: u64, length: u32, t: &mut Tables) {
     let mut off: u64 = 44;
     while (off as u32) + 16 <= length {
         // SAFETY: caller-asserted.
-        let base = unsafe { core::ptr::read_volatile((phys + off) as *const u64) };
+        let base = unsafe { core::ptr::read_volatile(pv(phys + off) as *const u64) };
         // SAFETY: same.
-        let seg = unsafe { core::ptr::read_volatile((phys + off + 8) as *const u16) };
+        let seg = unsafe { core::ptr::read_volatile(pv(phys + off + 8) as *const u16) };
         // SAFETY: same.
-        let start_b = unsafe { core::ptr::read_volatile((phys + off + 10) as *const u8) };
+        let start_b = unsafe { core::ptr::read_volatile(pv(phys + off + 10) as *const u8) };
         // SAFETY: same.
-        let end_b = unsafe { core::ptr::read_volatile((phys + off + 11) as *const u8) };
+        let end_b = unsafe { core::ptr::read_volatile(pv(phys + off + 11) as *const u8) };
         t.mcfg_segments.push((base, seg, start_b, end_b));
         off += 16;
     }
@@ -460,7 +482,7 @@ unsafe fn parse_fadt(phys: u64, length: u32, t: &mut Tables) {
         return;
     }
     // SAFETY: caller-asserted.
-    let flags = unsafe { core::ptr::read_volatile((phys + 109) as *const u16) };
+    let flags = unsafe { core::ptr::read_volatile(pv(phys + 109) as *const u16) };
     t.iapc_boot_flags = Some(flags);
 }
 
@@ -471,7 +493,7 @@ unsafe fn parse_fadt(phys: u64, length: u32, t: &mut Tables) {
 ///
 /// # Safety
 /// Caller asserts low memory + the SDT physical addresses are
-/// identity-mapped (always true at boot on x86_64 below 4 GiB).
+/// reachable through the direct map (see [`pv`]).
 pub unsafe fn discover() -> Result<Tables, AcpiError> {
     // SAFETY: caller-asserted.
     let rsdp_phys = unsafe { find_rsdp() }?;

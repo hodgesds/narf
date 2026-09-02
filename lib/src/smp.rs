@@ -221,7 +221,7 @@ pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
     if dtb_phys == 0 {
         return 0;
     }
-    let base = dtb_phys as *const u8;
+    let base = crate::directmap::pv_ptr::<u8>(dtb_phys).cast_const();
     // SAFETY: caller-asserted pointer; reads bounded to the FDT
     // header (40 bytes) before trusting offsets.
     // SAFETY: Valid memory or trusted environment

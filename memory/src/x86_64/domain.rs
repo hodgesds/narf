@@ -141,8 +141,8 @@ pub unsafe fn init_per_domain_pdpts() -> Result<u8, DomainMapError> {
         }
         let slot_idx = PRIVATE_PML4_BASE + domain as usize;
 
-        // SAFETY: PML4 phys is identity-mapped (low 4 GiB).
-        let pml4 = unsafe { &mut *(pml4_phys as *mut PageTable) };
+        // SAFETY: the PML4 page is reached through the direct map.
+        let pml4 = unsafe { &mut *PhysAddr::new(pml4_phys).kernel_mut_ptr::<PageTable>() };
         if pml4.entries[slot_idx].is_present() {
             // Already installed — count it for the boot banner.
             installed += 1;
@@ -198,7 +198,7 @@ pub unsafe fn map_domain_private(
     // lies in this domain's slot, so the walk will hit the
     // domain-private PDPT subtree.
     // SAFETY: Valid memory or trusted environment
-    let pml4 = unsafe { &*(pml4_phys as *const PageTable) };
+    let pml4 = unsafe { &*PhysAddr::new(pml4_phys).kernel_ptr::<PageTable>() };
     let slot_idx = PRIVATE_PML4_BASE + domain as usize;
     if !pml4.entries[slot_idx].is_present() {
         return Err(DomainMapError::PdptNotInstalled);
@@ -223,7 +223,7 @@ pub fn private_slot_status() -> [(u8, bool); NUM_DOMAINS as usize] {
         let pml4_phys = pcid::get_domain_pml4(d);
         let present = if pml4_phys != 0 {
             // SAFETY: pml4_phys identity-mapped; read-only.
-            let pml4 = unsafe { &*(pml4_phys as *const PageTable) };
+            let pml4 = unsafe { &*PhysAddr::new(pml4_phys).kernel_ptr::<PageTable>() };
             pml4.entries[PRIVATE_PML4_BASE + d as usize].is_present()
         } else {
             false
@@ -246,6 +246,6 @@ pub fn cross_domain_slot_present(inspector: u8, target_domain: u8) -> Option<boo
         return None;
     }
     // SAFETY: pml4_phys identity-mapped; read-only.
-    let pml4 = unsafe { &*(pml4_phys as *const PageTable) };
+    let pml4 = unsafe { &*PhysAddr::new(pml4_phys).kernel_ptr::<PageTable>() };
     Some(pml4.entries[PRIVATE_PML4_BASE + target_domain as usize].is_present())
 }

@@ -495,7 +495,9 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 4-byte aligned.
     unsafe {
-        core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p as *mut u32, value);
+        };
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -506,7 +508,12 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable + 4-byte aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }

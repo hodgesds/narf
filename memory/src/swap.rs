@@ -1470,7 +1470,8 @@ fn walk_to_leaf(pml4_phys: PhysAddr, virt: crate::VirtAddr) -> Option<*mut u64> 
         }
         let pt_phys = e.addr();
         // The leaf slot's address within the PT page.
-        let leaf = (pt_phys.raw() + (idx.pt as u64) * 8) as *mut u64;
+        let leaf =
+            crate::PhysAddr::new(pt_phys.raw() + (idx.pt as u64) * 8).kernel_mut_ptr::<u64>();
         Some(leaf)
     }
 }

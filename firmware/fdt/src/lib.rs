@@ -1000,14 +1000,18 @@ pub unsafe fn discover(phys: usize, max_len: usize) -> Option<&'static [u8]> {
     if max_len < HEADER_LEN {
         return None;
     }
-    // SAFETY: caller-asserted identity-mapped readable at least HEADER_LEN.
+    // Rebase onto the direct map once; both slices below follow. Before
+    // the direct map is live the offset is 0, which is the identity
+    // address early boot expects.
+    let phys = narf_lib::directmap::pv(phys as u64) as usize;
+    // SAFETY: caller-asserted readable at least HEADER_LEN.
     let head = unsafe { core::slice::from_raw_parts(phys as *const u8, HEADER_LEN) };
     let hdr = parse_header(head)?;
     let total = hdr.totalsize as usize;
     if total < HEADER_LEN || total > max_len {
         return None;
     }
-    // SAFETY: caller-asserted identity-mapped readable for the entire totalsize.
+    // SAFETY: caller-asserted readable for the entire totalsize.
     Some(unsafe { core::slice::from_raw_parts(phys as *const u8, total) })
 }
 
