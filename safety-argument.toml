@@ -237,6 +237,22 @@ argument = "Removing BuddyZone::free's vestigial overlap scan changes only the c
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
+argument = "The futex urgent-handoff hint remains inside the existing scheduler executor TCB and changes only when a running syscall continuation voluntarily returns to the executor. It adds no trusted subsystem, capability, domain right, mapping, or authority path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A successful futex wake releases the futex wait-queue lock before probing the local run queue with try_lock and publishing the per-CPU urgent hint. Contention or remote placement declines the optimization. The hint is consumed only at the established syscall-exit safe point with no futex or run-queue lock held, and the normal executor path still validates budget eligibility and affinity and restores the selected task's saved domain state before resumption."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The x86_64 kernel-switch fast path omits a privileged write only after exact comparison with the neutral FRAME state: PKRS must be zero, or CR3 must equal the FRAME root plus FRAME PCID. It records that already-neutral state as inactive, while every non-neutral outgoing state retains the original save-then-neutralize sequence and every non-neutral incoming state retains the final restore after all context loads. Reading the boot-maintained CR4 cache changes no protection state, and interrupt masking and switch ordering are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The PCID hot-path gate now reads the executing CPU's architecture-maintained CR4 snapshot instead of issuing MOV from CR4. The fenced write_cr4 helper publishes that CPU's snapshot only after the hardware write succeeds, and every post-bootstrap CR4 mutation continues to flow through that helper. A CPU that did not enable PCIDE therefore remains disabled in its own slot; save, restore, enter_domain, and tagged shootdown retain their existing per-CPU gate and all CR3/domain transitions. The cache is observational and grants no capability, mapping, or domain authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
 argument = "The x86_64 trap-entry edit remains inside the existing frame TCB and only normalizes the live direction flag before compiler-generated kernel code executes. It adds no trusted subsystem, authority, domain transition, mapping, or ownership path."
 
 [[invariants_preserved]]

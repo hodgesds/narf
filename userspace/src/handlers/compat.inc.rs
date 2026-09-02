@@ -5924,7 +5924,7 @@ pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
     };
     let count = drained.len();
     for (tid, w) in drained {
-        wake_one(tid, w);
+        wake_one_urgent(tid, w);
     }
     count
 }

@@ -4141,10 +4141,7 @@ fn run_async_demo() -> ! {
         // debugfs `sched/wake_preempt`.
         if narf_boot::args().has_flag("wake_preempt") {
             narf_scheduler::enable_wake_preempt();
-            let _ = writeln!(
-                console::Writer,
-                "  wake_preempt: wake-preemption ENABLED"
-            );
+            let _ = writeln!(console::Writer, "  wake_preempt: wake-preemption ENABLED");
         }
         // Diagnostic: wake→run race — is a woken task's dispatch delayed by a
         // lost-wakeup (executor HLTed with it runnable) or pure round-robin
@@ -4176,7 +4173,12 @@ fn run_async_demo() -> ! {
     {
         match narf_interrupts::x86_64::timer_pump::init() {
             Ok(()) => {
-                let _ = writeln!(console::Writer, "  timer_pump: HPET wheel armed");
+                let backend = if narf_interrupts::x86_64::timer_pump::uses_hpet_fallback() {
+                    "HPET fallback"
+                } else {
+                    "TSC-deadline"
+                };
+                let _ = writeln!(console::Writer, "  timer_pump: {backend} wheel armed");
             }
             Err(e) => {
                 let _ = writeln!(

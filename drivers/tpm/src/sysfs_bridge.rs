@@ -70,10 +70,6 @@ const PT_VENDOR_STRING_4: u32 = 0x0000_0109;
 /// `TPM_PT_PERMANENT` — TPMA_PERMANENT flags. Bit 2 = ownerAuthSet.
 const PT_PERMANENT: u32 = 0x0000_010E;
 
-// ── SHA-1 digest size ──────────────────────────────────────────────────
-const SHA1_SIZE: usize = 20;
-const SHA256_SIZE: usize = 32;
-
 // ── Response parsing helpers ──────────────────────────────────────────
 
 /// Parse a `TPM2_GetCapability(TPM_CAP_TPM_PROPERTIES, property, 1)`

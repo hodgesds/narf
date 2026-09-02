@@ -162,6 +162,10 @@ rating that's also monotonic. Record the decision for telemetry.
   for ordering. Fallback: HPET, then PM timer.
 - **Clockevent:** TSC-deadline (`CPUID.01H:ECX[24]`); fallback to
   LAPIC timer in one-shot mode.
+- A successfully probed, reliable TSC-deadline clockevent exclusively owns
+  timer-wheel deadline delivery. HPET is not armed for the same deadline;
+  it remains the fallback when LAPIC selection fails or only the unreliable
+  legacy InitialCount mode is available.
 - **Boot calibration:** TSC ↔ PM timer or HPET cross-check to get
   frequency; CPUID leaf `0x15` on supported silicon.
 - **SMP sync:** TSC is architecturally synchronised across cores on

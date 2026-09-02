@@ -246,7 +246,7 @@ pub fn drop_io_waiter(task_id: u64) {
 /// instead of re-parking on the stale deadline.
 /// Clear a task's finite sleep deadline (so its re-poll re-checks
 /// readiness) and fire its waker.
-pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
+fn wake_one_inner(task_id: u64, w: core::task::Waker, urgent_handoff: bool) {
     // Deref under the registry lock (see `with_user_task_ctx`) so a concurrent
     // task-exit + box-drop can't free the ctx mid-deref.
     crate::user_task::with_user_task_ctx(task_id, |uctx| {
@@ -259,7 +259,22 @@ pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
     // quantum. Gated by the `wake_preempt` feature and self-wake-filtered inside;
     // a no-op (one gated atomic load) when the feature is off.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    narf_scheduler::stackful::note_wake_preempt(task_id);
+    if urgent_handoff {
+        narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+    } else {
+        narf_scheduler::stackful::note_wake_preempt(task_id);
+    }
+}
+
+pub(crate) fn wake_one(task_id: u64, w: core::task::Waker) {
+    wake_one_inner(task_id, w, false);
+}
+
+/// Wake a task as the direct consumer of the current syscall's successful
+/// synchronous handoff. The scheduler may bypass its ordinary batching window
+/// when local work is runnable; a remote wakee does not force an empty yield.
+pub(crate) fn wake_one_urgent(task_id: u64, w: core::task::Waker) {
+    wake_one_inner(task_id, w, true);
 }
 
 /// The net readiness hook. `key` is the kernel TCB id of the socket that

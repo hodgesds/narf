@@ -415,6 +415,13 @@ static WAKE_NEXT_ENABLED: AtomicBool = AtomicBool::new(false);
 static WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
 
+/// Futex-style synchronous handoffs have their own always-live next-buddy
+/// slot. They are narrower than the opt-in generic wake-next policy: a value is
+/// published only after a real waiter was removed from its wait queue and was
+/// observed runnable on this CPU.
+static URGENT_WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+
 /// Narrow directed wake for I/O owners only (boot flag `io_next`). The generic
 /// `WAKE_NEXT` path names EVERY wake its CPU's next-buddy and was measured to
 /// thrash this cooperative executor (redis throughput halved, #235). This
@@ -453,6 +460,20 @@ pub fn hint_io_next(task: u64) {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu < WAKE_NEXT.len() {
         WAKE_NEXT[cpu].store(task, Ordering::Release);
+    }
+}
+
+/// Name the target of an urgent synchronous handoff as this CPU's one-shot
+/// next-buddy. Unlike the opt-in generic wake-next experiment, only a wake path
+/// that dequeued a real waiter may use it. A remote target simply fails to
+/// match the local queue and the normal policy chooses instead.
+pub(crate) fn hint_urgent_next(task: u64) {
+    if task == 0 {
+        return;
+    }
+    let cpu = narf_lib::percpu::current_cpu();
+    if cpu < URGENT_WAKE_NEXT.len() {
+        URGENT_WAKE_NEXT[cpu].store(task, Ordering::Release);
     }
 }
 
@@ -522,11 +543,19 @@ fn record_wake_next(cpu: u32, task: u64) {
 /// this once per pick; clearing on read makes the boost a one-shot so a buddy
 /// that turns out not to be top-tier does not stick.
 pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+    if (cpu as usize) >= WAKE_NEXT.len() {
+        return 0;
+    }
+    // A successful synchronous wake is Linux's set-next-buddy case and is not
+    // an experimental every-wake policy. Avoid an unconditional atomic RMW on
+    // ordinary picks: the common empty slot costs one read only.
+    let urgent = URGENT_WAKE_NEXT[cpu as usize].load(Ordering::Acquire);
+    if urgent != 0 {
+        return URGENT_WAKE_NEXT[cpu as usize].swap(0, Ordering::AcqRel);
+    }
     // Honored when EITHER the generic every-wake path or the narrow I/O-owner
     // path is enabled; both feed the same single-slot hint.
-    if (!WAKE_NEXT_ENABLED.load(Ordering::Acquire) && !IO_NEXT_ENABLED.load(Ordering::Acquire))
-        || (cpu as usize) >= WAKE_NEXT.len()
-    {
+    if !WAKE_NEXT_ENABLED.load(Ordering::Acquire) && !IO_NEXT_ENABLED.load(Ordering::Acquire) {
         return 0;
     }
     WAKE_NEXT[cpu as usize].swap(0, Ordering::AcqRel)
@@ -1374,12 +1403,25 @@ impl core::fmt::Debug for TaskSlot {
 fn poll_with_domain(slot: &mut TaskSlot, ctx: &mut Context<'_>) -> Poll<()> {
     let executor_domain = narf_memory::save_domain_state();
     let task_domain = slot.domain_saved.unwrap_or(executor_domain);
-    narf_memory::restore_domain_state(&task_domain);
+    // Avoid an identity restore.  On the stackful user path the outer
+    // scheduler has already activated this task's address space, so the
+    // initial task state normally equals the live executor state.  A PCID
+    // restore is a serialising MOV CR3 even with NOFLUSH and was paid twice
+    // per futex handoff for no state change.
+    if task_domain != executor_domain {
+        narf_memory::restore_domain_state(&task_domain);
+    }
 
     let result = slot.task.as_mut().poll(ctx);
 
     let returned_task_domain = narf_memory::save_domain_state();
-    narf_memory::restore_domain_state(&executor_domain);
+    // A stackful task's kernel_switch restores the suspended executor domain
+    // before poll returns.  Preserve the generic future case (which may have
+    // changed domains during poll), but do not serialise the CPU when the
+    // exact saved state is already live.
+    if returned_task_domain != executor_domain {
+        narf_memory::restore_domain_state(&executor_domain);
+    }
     slot.domain_saved = Some(returned_task_domain);
     result
 }
@@ -4338,6 +4380,26 @@ pub fn has_other_runnable_work(current: u64) -> bool {
             .unwrap_or(false),
         None => true,
     }
+}
+
+/// Is the exact task `task_id` queued and dispatchable on the calling CPU?
+///
+/// Used by synchronous handoff hints after the task's waker has fired. A
+/// nonblocking queue probe avoids taking a scheduler lock from the syscall
+/// wake path; contention declines the optimization and leaves the ordinary
+/// wake-preemption request in force.
+pub(crate) fn task_runnable_on_current_cpu(task_id: u64) -> bool {
+    let cpu = narf_lib::percpu::current_cpu();
+    let now = narf_time::now_cycles();
+    let Some(q) = READY[cpu].try_lock() else {
+        return false;
+    };
+    q.as_ref()
+        .map(|d| {
+            d.iter()
+                .any(|s| s.id.raw() == task_id && slot_is_dispatchable(s, now))
+        })
+        .unwrap_or(false)
 }
 
 /// Snapshot per-CPU ready-queue depths. Returns one entry per

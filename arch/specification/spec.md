@@ -341,6 +341,18 @@ pub mod xsave {
   MSR accesses (`RDMSR` / `WRMSR IA32_PKRS`). `assign` edits PTE PK
   bits and invalidates the TLB entry (typically via per-page INVLPG,
   batched where possible). `set_rights` is one `WRMSR`.
+- The private `kernel_switch` reads boot-stable PKS/PCIDE enablement from the
+  architecture-maintained CR4 cache. An outgoing context already in the exact
+  neutral FRAME state (`PKRS == 0`, or the FRAME root with FRAME PCID) is
+  represented by inactive opaque domain state and does not rewrite the same
+  privileged register. Non-neutral state still enters FRAME before the first
+  outgoing-context store and is restored after the last incoming-context load.
+- Rust PCID domain primitives consult a CPU-local CR4 snapshot maintained after
+  every fenced `write_cr4`, rather than executing `MOV from CR4` in the hot
+  path. A CPU whose PCIDE enable was skipped retains a zero/disabled snapshot,
+  so the cache cannot authorize PCID-tagged CR3 or INVPCID operations on that
+  CPU. The live control register remains the enforcement mechanism; the cache
+  only avoids a read-side virtualization exit.
 
 ### aarch64
 

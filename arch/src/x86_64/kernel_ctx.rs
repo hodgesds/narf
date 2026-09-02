@@ -192,8 +192,10 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "cli",
         // Capture task-local domain rights and enter neutral FRAME state before
         // writing `out`. This ordering lets a confined task yield safely even
-        // when its current rights deny scheduler/arch storage.
-        "mov rax, cr4",
+        // when its current rights deny scheduler/arch storage. CR4.PKS/PCIDE
+        // are boot-stable; use the maintained cache because a live CR4 read
+        // exits under KVM/SVM.
+        "mov rax, qword ptr [rip + NARF_X86_CACHED_CR4]",
         "bt rax, 24",
         "jc 3f",
         "bt rax, 17",
@@ -203,6 +205,11 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "jz 5f",
         "mov r9, cr3",
         "or r8, 1",
+        // Syscall/trap entry normally put the continuation in this exact
+        // FRAME root+PCID before it can yield. Canonicalise that already-neutral
+        // state as kind 0 instead of issuing a serialising same-value CR3 write.
+        "cmp r9, r8",
+        "je 5f",
         "bts r8, 63",
         "mov cr3, r8",
         "mov [rdi + 72], r9",
@@ -214,6 +221,10 @@ pub unsafe extern "C" fn kernel_switch(out: *mut KernelContext, incoming: *const
         "shl rdx, 32",
         "or rax, rdx",
         "mov r8, rax",
+        // PKRS=0 is the neutral FRAME state. As with an identical FRAME CR3,
+        // kind 0 accurately records that no restore is needed on resume.
+        "test r8, r8",
+        "jz 5f",
         "xor eax, eax",
         "xor edx, edx",
         "wrmsr",
