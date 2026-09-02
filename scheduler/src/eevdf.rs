@@ -153,17 +153,19 @@ impl Scheduler for EevdfScheduler {
     }
 
     fn wakeup_preempt(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> bool {
-        let vfloor = ctx.vfloor;
         let current = &ctx.current;
-        // Best runnable sibling (highest class, then earliest d_eff). The runner
-        // is detached during its poll, so the queue holds only waiters; the id
-        // guard is belt-and-suspenders.
+        // Best runnable sibling (highest class, then earliest deadline). The
+        // runner is detached during its poll, so the queue holds only waiters;
+        // the id guard is belt-and-suspenders. The wakee deadline uses the RAW
+        // vruntime (not the clamped `d_eff` `pick_next` uses): the clamp bounds a
+        // long sleeper's credit for pick FAIRNESS, but in the preempt decision it
+        // would make every blocked peer look maximally starved.
         let mut best: Option<(SchedClass, u64)> = None;
         for row in queue.iter_sched() {
             if !candidate(&row) || row.handle.task_id() == current.id {
                 continue;
             }
-            let dl = d_eff(row.vruntime, vfloor);
+            let dl = row.vruntime.saturating_add(EEVDF_BASE_SLICE);
             let take = match best {
                 None => true,
                 Some((bc, bd)) => {
@@ -174,14 +176,30 @@ impl Scheduler for EevdfScheduler {
                 best = Some((row.class, dl));
             }
         }
-        match best {
-            None => false,
-            // `current.vruntime` here is the runner's CURRENT effective virtual
-            // runtime (dispatch + elapsed), assembled by the core in
-            // `wake_preempt_policy_check`.
-            Some((wclass, wd)) => {
-                eevdf_should_preempt(current.class, current.vruntime, wclass, wd)
-            }
+        let Some((wclass, wd)) = best else {
+            return false;
+        };
+        // A higher-scheduling-class wakee always preempts (Linux: a non-idle task
+        // preempts an idle one; RT preempts fair).
+        if wclass.rank() > current.class.rank() {
+            return true;
         }
+        if wclass.rank() < current.class.rank() {
+            return false;
+        }
+        // Same class: RUN_TO_PARITY slice protection over the wake-preemption
+        // granularity window. Do NOT preempt the runner until it has run for
+        // `WAKE_PROTECT_SLICE` this dispatch — a cooperative producer/consumer
+        // (pipe/msg/switch) blocks on its own next op well before that, so it is
+        // never force-switched and keeps batching. A never-blocking spinner (the
+        // futex FUTEX_WAKE child) crosses the window and, if the wakee is more
+        // eligible, cedes then.
+        if ctx.elapsed < crate::WAKE_PROTECT_SLICE {
+            return false;
+        }
+        // Protection lapsed: cede iff the wakee is genuinely more eligible than
+        // the runner's current clock (dispatch vruntime + what it has run).
+        let runner_now = current.vruntime.saturating_add(ctx.elapsed);
+        eevdf_should_preempt(current.class, runner_now, wclass, wd)
     }
 }

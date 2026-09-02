@@ -626,8 +626,11 @@ fn smoke_scheduler_spawn_kicks_halted_remote_cpu() -> TestResult {
     crate::__reset_queues_for_test();
 
     // Pretend CPU 1 is an online, idle-halted AP. Restored below. The
-    // fake setter keeps the ever-online record truthful for later tests.
+    // fake setter keeps the ever-online record truthful for later tests. A real
+    // halted, drain-ready AP is `Idle` (not the default `Offline`); the wake
+    // path's `target_drains` gate needs that to take the cross-core kick path.
     narf_lib::smp::__test_fake_online(1);
+    crate::policy::__test_set_cpu_state(CpuId(1), crate::policy::CpuState::Idle);
     crate::__test_set_cpu_halted(1, true);
 
     let spec = TaskSpec {
@@ -694,6 +697,10 @@ fn smoke_scheduler_wake_publishes_need_resched() -> TestResult {
 
     crate::__reset_queues_for_test();
     narf_lib::smp::__test_fake_online(1);
+    // A faked-online halted AP must also read as `Idle` so the wake path takes
+    // the cross-core kick branch (see `target_drains`), not the quiesced direct
+    // enqueue that skips the IPI + NEED_RESCHED publish.
+    crate::policy::__test_set_cpu_state(CpuId(1), crate::policy::CpuState::Idle);
 
     let spec = || TaskSpec {
         affinity: Affinity {

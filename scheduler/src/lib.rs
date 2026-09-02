@@ -740,6 +740,16 @@ static VFLOOR: [VFloorCell; narf_lib::percpu::MAX_CPUS] =
 /// `FAIR_QUANTUM_DIV` fair-share floor remain the untouched backstops.
 pub(crate) const EEVDF_BASE_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 16;
 
+/// Wake-preemption granularity: how long a runner is protected from a
+/// same-class wake-preemption after dispatch (RUN_TO_PARITY window), in TSC
+/// cycles. NARF's analogue of Linux's classic `sched_wakeup_granularity_ns`.
+/// Smaller ⇒ faster producer/consumer handoff (futex wait/wake) but less IPC
+/// batching; larger ⇒ more batching but slower handoff. Tuned below the pick
+/// base slice so a wait/wake round-trip costs a fraction of a scheduling
+/// quantum while a cooperative pipe/msg waker (which blocks on its own next op
+/// within a few µs) still batches. `DEFAULT_SLICE_CYCLES / 32` ≈ 312 µs.
+pub(crate) const WAKE_PROTECT_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 32;
+
 /// Read a CPU's virtual-time floor (see [`VFLOOR`]). `0` before the CPU has
 /// dispatched anything.
 #[inline]
@@ -821,21 +831,20 @@ pub fn wake_preempt_policy_check(current_id: u64, elapsed: u64) -> bool {
     if snap.id.load(Ordering::Relaxed) != current_id {
         return false;
     }
-    // The runner's CURRENT virtual runtime = its vruntime at dispatch plus what
-    // it has run since (`elapsed`). Comparing the wakee's deadline against this
-    // GROWING clock — not the fixed dispatch deadline — is what separates a
-    // deeply-starved sleeper (preempts at once) from a briefly-blocked peer
-    // (batches until the runner has actually run ~a base slice). See
-    // `eevdf::eevdf_should_preempt`.
-    let cur_vruntime = snap.vruntime.load(Ordering::Relaxed).wrapping_add(elapsed);
+    // Publish the runner's dispatch vruntime + how long it has run (`elapsed`).
+    // The policy forms the runner's current clock as `vruntime + elapsed` and
+    // applies RUN_TO_PARITY protection using `elapsed` directly. See
+    // `EevdfScheduler::wakeup_preempt`.
+    let dispatch_vruntime = snap.vruntime.load(Ordering::Relaxed);
     let ctx = policy::CpuSchedContext {
         cpu: CpuId(cpu as u32),
         vfloor: vfloor(cpu),
+        elapsed,
         current: policy::CurrentTask {
             id: TaskId(current_id),
             class: crate::priority::SchedClass::from_rank(snap.class_rank.load(Ordering::Relaxed)),
-            vruntime: cur_vruntime,
-            vdeadline: cur_vruntime.wrapping_add(EEVDF_BASE_SLICE),
+            vruntime: dispatch_vruntime,
+            vdeadline: dispatch_vruntime.wrapping_add(EEVDF_BASE_SLICE),
         },
     };
     let cpu_id = CpuId(cpu as u32);

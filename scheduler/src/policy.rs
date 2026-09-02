@@ -192,6 +192,11 @@ pub struct CpuSchedContext {
     pub vfloor: u64,
     /// Snapshot of the task currently running on `cpu`.
     pub current: CurrentTask,
+    /// Cycles the running task has executed since its current dispatch. Lets a
+    /// policy apply RUN_TO_PARITY slice protection (don't preempt the runner
+    /// until it has consumed a base slice) — the batching guard that keeps a
+    /// cooperative producer/consumer from context-switching on every wake.
+    pub elapsed: u64,
 }
 
 /// Lean per-slot projection for eligibility policies (`EevdfScheduler`) — only
@@ -666,6 +671,19 @@ pub fn __reset_cpu_states_for_test() {
             CpuState::Offline
         };
         state.store(reset as u8, Ordering::Release);
+    }
+}
+
+/// Test hook: force a CPU's published scheduler state. A fixture that fakes a
+/// remote CPU online (`smp::__test_fake_online`) must also give it a realistic
+/// executor state — a halted, drain-ready AP is `Idle`, not the default
+/// `Offline` — or the wake path's `target_drains` gate (which mirrors Linux
+/// `ttwu_queue_cond`'s `cpu_active` check) treats it as quiesced and skips the
+/// cross-core kick.
+#[doc(hidden)]
+pub fn __test_set_cpu_state(cpu: CpuId, state: CpuState) {
+    if let Some(cell) = CPU_STATES.get(cpu.0 as usize) {
+        cell.store(state as u8, Ordering::Release);
     }
 }
 
