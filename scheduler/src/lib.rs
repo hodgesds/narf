@@ -73,8 +73,8 @@ pub mod budget;
 pub mod cgroup;
 pub mod cpu_lifecycle;
 pub mod donation;
-pub mod numa;
 pub mod eevdf;
+pub mod numa;
 pub mod policy;
 pub mod priority;
 pub mod stackful;
@@ -105,8 +105,8 @@ pub use donation::{
     current_donation_policy_name, install_donation_policy, BackQueueDonation, Donation,
     DonationError, DonationPolicy, EnqueueDonee, HeadQueueDonation,
 };
-pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
 pub use eevdf::EevdfScheduler;
+pub use numa::{clear_task_mems_allowed, set_task_mems_allowed, task_mems_allowed, ALL_NUMA_NODES};
 pub use policy::{
     cpu_state, current_scheduler_name, install_scheduler, set_default_policy, ClassScheduler,
     CpuIdleMeta, CpuSchedContext, CpuState, CpuStateChange, CurrentTask, FifoScheduler,
@@ -765,8 +765,8 @@ static VFLOOR: [VFloorCell; narf_lib::percpu::MAX_CPUS] =
 /// number — `DEFAULT_SLICE_CYCLES / 16` is ~625 µs at the 10 ms default,
 /// comparable to Linux's `sysctl_sched_base_slice` (700 µs). This is the
 /// batching hysteresis a wake-preemption policy protects (Linux `RUN_TO_PARITY`
-/// + base slice); it is NOT a run-time floor. Tick/CPL3 slice preemption and the
-/// `FAIR_QUANTUM_DIV` fair-share floor remain the untouched backstops.
+/// with the base slice); it is NOT a run-time floor. Tick/CPL3 slice preemption
+/// and the `FAIR_QUANTUM_DIV` fair-share floor remain the untouched backstops.
 pub(crate) const EEVDF_BASE_SLICE: u64 = stackful::DEFAULT_SLICE_CYCLES / 16;
 
 /// Wake-preemption granularity: how long a runner is protected from a
@@ -832,9 +832,12 @@ fn publish_current_sched(cpu: usize, slot: &TaskSlot) {
     }
     let s = &CURRENT_SCHED[cpu];
     s.vruntime.store(slot.vruntime, Ordering::Relaxed);
-    s.vdeadline
-        .store(slot.vruntime.wrapping_add(EEVDF_BASE_SLICE), Ordering::Relaxed);
-    s.class_rank.store(slot.spec.class.rank(), Ordering::Relaxed);
+    s.vdeadline.store(
+        slot.vruntime.wrapping_add(EEVDF_BASE_SLICE),
+        Ordering::Relaxed,
+    );
+    s.class_rank
+        .store(slot.spec.class.rank(), Ordering::Relaxed);
     // id LAST: a same-CPU reader that sees the matching id has, by program
     // order, also seen the fields above.
     s.id.store(slot.id.raw(), Ordering::Relaxed);

@@ -2778,7 +2778,12 @@ fn smoke_eevdf_wakeup_preempt_rule() -> TestResult {
         return TestResult::Fail("starved sleeper (d_eff before runner_now) must preempt");
     }
     // Peer exactly caught up (equal): strict-less-than is false => no preempt.
-    if should(SchedClass::Default, runner_now, SchedClass::Default, runner_now) {
+    if should(
+        SchedClass::Default,
+        runner_now,
+        SchedClass::Default,
+        runner_now,
+    ) {
         return TestResult::Fail("caught-up peer (equal) must NOT preempt");
     }
     // Briefly-blocked / not-yet-due peer: deadline after the runner's clock =>
