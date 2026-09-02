@@ -833,8 +833,16 @@ fn smoke_bpf_sleepable_confinement_is_per_poll() -> TestResult {
     use narf_arch::DomainPrimitive;
     use narf_lib::id::DomainId;
 
-    if !pks::is_active() && !pcid::is_active() {
-        return TestResult::Skip("no x86 hardware-domain backend is active");
+    // `is_active()` is not enough for PCID: `enter_domain` also requires
+    // CR4.PCIDE on the *executing* CPU, and it declines when that is clear —
+    // so no CR3 swap happens and there is no confinement to observe. That is
+    // reachable in practice: under QEMU `-cpu max` + KVM the BSP sees
+    // CPUID(1).ECX[17]=1 while APs see 0, so `enable_pcide` no-ops on them and
+    // CR4.PCIDE stays 0 (see `pcid::pcide_enabled`). This smoke can land on
+    // such a CPU, where the assertion is about the hypervisor, not the kernel.
+    let confinable = pks::is_active() || (pcid::is_active() && pcid::pcide_enabled());
+    if !confinable {
+        return TestResult::Skip("no domain backend can confine on this CPU");
     }
 
     fn is_bpf_confined() -> bool {
@@ -845,7 +853,8 @@ fn smoke_bpf_sleepable_confinement_is_per_poll() -> TestResult {
             let caps = unsafe { pks::get_rights(DomainId::CAPS.raw()) };
             bpf == pks::DomainRights::ALLOW_ALL && caps.no_access
         } else {
-            // PCID(domain) = domain + 1.
+            // `PCID(domain) = domain + 1` — see `pcid::cr3_for_domain`.
+            // Reachable only on a CPU without PKS, which CI does not have.
             // SAFETY: this smoke runs at CPL0 after the PCID backend is live.
             (unsafe { narf_arch::x86_64::cr::read_cr3() } & 0xfff) == DomainId::BPF.raw() as u64 + 1
         }

@@ -1670,6 +1670,16 @@ pub fn __reset_queues_for_test() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
     }
+    // Reset the per-CPU virtual-time floors too. `bump_vfloor` advances them
+    // monotonically at every dispatch, so without this they accumulate across
+    // the whole suite — and since a newly admitted task is initialised to the
+    // floor, a test that spawns late inherits whatever every earlier test left
+    // behind. `smoke_scheduler_vruntime_accumulates_and_floor_inits` asserts
+    // the admitted vruntime is small "with the test's fresh queues", which is
+    // only true if the floor is part of what gets freshened.
+    for cell in VFLOOR.iter() {
+        cell.0.store(0, Ordering::Release);
+    }
 }
 
 /// Authoritative affinity for every live scheduler task.
