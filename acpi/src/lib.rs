@@ -167,9 +167,10 @@ fn checksum(bytes: &[u8]) -> u8 {
 /// window as a fallback.
 ///
 /// # Safety
-/// The scanned range (0xE_0000..0x10_0000) is identity-mapped low
-/// RAM on every PC firmware path the kernel boots through; reads
-/// are 8-byte-bounded against the upper limit.
+/// The scanned range (0xE_0000..0x10_0000) is firmware ROM shadow, reached
+/// through the kernel direct map — the low identity map that used to cover it
+/// is gone (only the AP trampoline page survives in PML4[0]). Reads are
+/// 8-byte-bounded against the upper limit.
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn scan_bios_for_rsdp() -> Option<PhysAddr> {
     const SIG: &[u8; 8] = b"RSD PTR ";
@@ -177,16 +178,17 @@ pub unsafe fn scan_bios_for_rsdp() -> Option<PhysAddr> {
     const END: u64 = 0x0010_0000;
     let mut p = START;
     while p + 20 <= END {
-        // SAFETY: identity-mapped low ROM; 8-byte read at 16-byte
+        // SAFETY: direct-mapped low ROM; 8-byte read at 16-byte
         // alignment is defined.
         // SAFETY: Valid memory or trusted environment
-        let bytes = unsafe { core::slice::from_raw_parts(p as *const u8, 8) };
+        let bytes = unsafe { core::slice::from_raw_parts(PhysAddr::new(p).kernel_ptr::<u8>(), 8) };
         if bytes == SIG {
             // Verify checksum before declaring victory; firmware
             // sometimes lays down a stale "RSD PTR " marker that
             // doesn't validate.
             // SAFETY: 20-byte read at p; bounded by END check above.
-            let v1 = unsafe { core::slice::from_raw_parts(p as *const u8, 20) };
+            let v1 =
+                unsafe { core::slice::from_raw_parts(PhysAddr::new(p).kernel_ptr::<u8>(), 20) };
             if checksum(v1) == 0 {
                 return Some(PhysAddr::new(p));
             }
@@ -247,7 +249,7 @@ pub unsafe fn walk_xsdt<F>(phys: u64, mut f: F) -> Result<(), AcpiError>
 where
     F: FnMut(u64, &SdtHeader),
 {
-    let p = phys as *const u8;
+    let p = narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>();
     // SAFETY: caller-asserted readable region.
     let hdr = unsafe { (p as *const SdtHeader).read_unaligned() };
     let is_xsdt = &hdr.signature == b"XSDT";
@@ -282,7 +284,9 @@ where
             continue;
         }
         // SAFETY: caller-asserted: every XSDT entry is identity-mapped.
-        let child = unsafe { (phys as *const SdtHeader).read_unaligned() };
+        let child = unsafe {
+            (narf_memory::PhysAddr::new(phys).kernel_ptr::<SdtHeader>()).read_unaligned()
+        };
         f(phys, &child);
     }
     Ok(())
@@ -317,12 +321,18 @@ pub unsafe fn parse_srat(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     let srat = srat.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion: SRAT is identity-mapped.
-    let total = unsafe { (srat as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(srat).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(srat as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(srat).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -602,12 +612,18 @@ pub unsafe fn parse_madt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     let madt = madt.ok_or(AcpiError::NoSrat)?; // reuse error variant — narrow.
 
     // SAFETY: caller assertion.
-    let total = unsafe { (madt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(madt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 8 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(madt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(madt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -801,13 +817,19 @@ pub unsafe fn parse_mcfg(rsdp_phys: PhysAddr) -> Result<u64, AcpiError> {
     let mcfg = mcfg.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (mcfg as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(mcfg).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     let body_end = SDT_HEADER_SIZE + 8 + 16; // header + reserved + 1 entry
     if total < body_end {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(mcfg as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(mcfg).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -867,12 +889,18 @@ pub unsafe fn parse_fadt_for_dsdt(rsdp_phys: PhysAddr) -> Result<u64, AcpiError>
     let fadt = fadt.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(fadt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < 44 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(fadt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -1087,12 +1115,18 @@ pub unsafe fn parse_hmat(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     let hmat = hmat.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (hmat as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(hmat).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(hmat as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(hmat).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -1343,12 +1377,18 @@ pub unsafe fn parse_pmtt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     let pmtt = pmtt.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (pmtt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(pmtt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(pmtt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(pmtt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -1542,13 +1582,19 @@ pub unsafe fn parse_gpe_blocks(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     let fadt = fadt.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(fadt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     // Need at least offset 96 (past GPE1_BASE at byte 95).
     if total < 96 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(fadt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -1744,12 +1790,18 @@ pub unsafe fn parse_fadt_pm(rsdp_phys: PhysAddr) -> Result<FadtPm, AcpiError> {
     let fadt = fadt.ok_or(AcpiError::NoSrat)?;
 
     // SAFETY: caller assertion.
-    let total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(fadt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < 90 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(fadt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(fadt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -2210,7 +2262,11 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // only yields it after confirming an `SdtHeader` is readable there;
     // `read_unaligned` tolerates any alignment of the firmware-placed table.
     // SAFETY: Valid memory or trusted environment
-    let total = unsafe { (ecdt_phys as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(ecdt_phys).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 29 {
         return Err(AcpiError::BadXsdtSignature);
     }
@@ -2218,7 +2274,12 @@ pub unsafe fn parse_ecdt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // guarantees the ECDT is identity-mapped for that full span, so the
     // `[u8; total]` slice stays within the mapped table.
     // SAFETY: Valid memory or trusted environment
-    let body = unsafe { core::slice::from_raw_parts(ecdt_phys as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(ecdt_phys).kernel_ptr::<u8>(),
+            total,
+        )
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -2480,12 +2541,18 @@ pub unsafe fn parse_pptt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let pptt = pptt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (pptt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(pptt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(pptt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(pptt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -2653,12 +2720,18 @@ pub unsafe fn parse_iort(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let iort = iort.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (iort as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(iort).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(iort as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(iort).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -2787,12 +2860,18 @@ pub unsafe fn parse_dmar(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let dmar = dmar.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (dmar as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(dmar).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(dmar as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(dmar).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -2917,12 +2996,18 @@ pub unsafe fn parse_ivrs(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let ivrs = ivrs.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (ivrs as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(ivrs).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(ivrs as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(ivrs).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3031,12 +3116,18 @@ pub unsafe fn parse_spcr(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let spcr = spcr.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (spcr as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(spcr).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 36 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(spcr as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(spcr).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3231,12 +3322,18 @@ pub unsafe fn parse_hest(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let hest = hest.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (hest as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(hest).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(hest as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(hest).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3388,12 +3485,18 @@ pub unsafe fn parse_pcct(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let pcct = pcct.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (pcct as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(pcct).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(pcct as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(pcct).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3490,12 +3593,18 @@ pub unsafe fn parse_slit(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let slit = slit.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (slit as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(slit).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 8 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(slit as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(slit).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3713,12 +3822,18 @@ pub unsafe fn parse_cedt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let cedt = cedt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (cedt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(cedt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(cedt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(cedt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3812,12 +3927,18 @@ pub unsafe fn parse_bert(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let bert = bert.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (bert as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(bert).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(bert as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(bert).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3928,12 +4049,18 @@ pub unsafe fn parse_aest(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let aest = aest.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (aest as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(aest).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(aest as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(aest).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -3984,12 +4111,18 @@ pub unsafe fn parse_sdei(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let sdei = sdei.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (sdei as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(sdei).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(sdei as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(sdei).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4090,12 +4223,18 @@ pub unsafe fn parse_wddt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let wddt = wddt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (wddt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(wddt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(wddt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(wddt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4234,12 +4373,18 @@ pub unsafe fn parse_lpit(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let lpit = lpit.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (lpit as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(lpit).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(lpit as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(lpit).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4375,12 +4520,18 @@ pub unsafe fn parse_nfit(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let nfit = nfit.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (nfit as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(nfit).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(nfit as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(nfit).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4599,12 +4750,18 @@ pub unsafe fn parse_erst(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let erst = erst.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (erst as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(erst).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(erst as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(erst).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4629,12 +4786,18 @@ pub unsafe fn parse_einj(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let einj = einj.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (einj as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(einj).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(einj as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(einj).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4743,12 +4906,18 @@ pub unsafe fn parse_tpm2(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let tpm2 = tpm2.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (tpm2 as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(tpm2).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 16 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(tpm2 as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(tpm2).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4846,12 +5015,18 @@ pub unsafe fn parse_bgrt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let bgrt = bgrt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (bgrt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(bgrt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 20 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(bgrt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(bgrt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -4986,12 +5161,18 @@ pub unsafe fn parse_dbg2(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let dbg2 = dbg2.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (dbg2 as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(dbg2).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 8 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(dbg2 as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(dbg2).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5071,12 +5252,18 @@ pub unsafe fn parse_wsmt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let wsmt = wsmt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (wsmt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(wsmt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(wsmt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(wsmt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5148,12 +5335,18 @@ pub unsafe fn parse_waet(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let waet = waet.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (waet as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(waet).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(waet as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(waet).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5250,12 +5443,18 @@ pub unsafe fn parse_hpet(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let hpet = hpet.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (hpet as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(hpet).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 20 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(hpet as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(hpet).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5397,12 +5596,21 @@ pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // SAFETY: caller assertion. FADT body — we only need
     // FirmwareCtrl @ 36 (32-bit) or X_FirmwareCtrl @ 132 (64-bit).
     // SAFETY: Valid memory or trusted environment
-    let fadt_total = unsafe { (fadt as *const SdtHeader).read_unaligned().length as usize };
+    let fadt_total = unsafe {
+        (narf_memory::PhysAddr::new(fadt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if fadt_total < 44 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let fbody = unsafe { core::slice::from_raw_parts(fadt as *const u8, fadt_total) };
+    let fbody = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(fadt).kernel_ptr::<u8>(),
+            fadt_total,
+        )
+    };
     let fw32 = u32::from_le_bytes([fbody[36], fbody[37], fbody[38], fbody[39]]) as u64;
     let fw64 = if fadt_total >= 140 {
         u64::from_le_bytes([
@@ -5420,12 +5628,23 @@ pub unsafe fn parse_facs(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     // SAFETY: caller assertion. FACS lacks an SDT header — it
     // begins with its own 4-byte "FACS" signature + 4-byte length.
     // SAFETY: Valid memory or trusted environment
-    let facs_len = unsafe { (facs as *const u8).add(4).cast::<u32>().read_unaligned() } as usize;
+    let facs_len = unsafe {
+        narf_memory::PhysAddr::new(facs)
+            .kernel_ptr::<u8>()
+            .add(4)
+            .cast::<u32>()
+            .read_unaligned()
+    } as usize;
     if facs_len < 64 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(facs as *const u8, facs_len) };
+    let body = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(facs).kernel_ptr::<u8>(),
+            facs_len,
+        )
+    };
     if &body[0..4] != b"FACS" {
         return Err(AcpiError::BadXsdtSignature);
     }
@@ -5554,12 +5773,15 @@ pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorErro
     }
     // 64-bit `XFirmwareWakingVector` at +24 — the only slot that can
     // hold a long-mode entry.
-    // SAFETY: FACS is identity-mapped at `facs`, `Length` was checked
-    // to cover +24..32, and the ACPI-mandated FACS alignment makes
-    // `facs + 24` 8-aligned.
+    // SAFETY: `facs` is the FACS physical base, reached through the direct
+    // map; `Length` was checked to cover +24..32, and the ACPI-mandated FACS
+    // alignment makes `facs + 24` 8-aligned.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile((facs + 24) as *mut u64, entry_phys);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(facs + 24).kernel_mut_ptr::<u64>(),
+            entry_phys,
+        );
     }
     // 32-bit `FirmwareWakingVector` at +12 stays ZERO. It is a
     // real-mode entry point; `entry_phys as u32` would be a
@@ -5567,7 +5789,10 @@ pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorErro
     // SAFETY: as above, for +12..16.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile((facs + 12) as *mut u32, 0u32);
+        core::ptr::write_volatile(
+            narf_memory::PhysAddr::new(facs + 12).kernel_mut_ptr::<u32>(),
+            0u32,
+        );
     }
     // `OspmFlags` at +36: assert 64BIT_WAKE_F so firmware knows to
     // take the 64-bit vector. Read-modify-write — the field is
@@ -5575,7 +5800,7 @@ pub unsafe fn arm_s3_waking_vector(entry_phys: u64) -> Result<(), WakeVectorErro
     // SAFETY: as above, for +36..40.
     // SAFETY: Valid memory or trusted environment
     let ospm_flags = unsafe {
-        let p = (facs + 36) as *mut u32;
+        let p = narf_memory::PhysAddr::new(facs + 36).kernel_mut_ptr::<u32>();
         let updated = core::ptr::read_volatile(p) | FACS_OSPM_FLAG_64BIT_WAKE;
         core::ptr::write_volatile(p, updated);
         updated
@@ -5716,12 +5941,18 @@ pub unsafe fn parse_prmt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let prmt = prmt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (prmt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(prmt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 24 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(prmt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(prmt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5821,12 +6052,18 @@ pub unsafe fn parse_ccel(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let ccel = ccel.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (ccel as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(ccel).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 20 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(ccel as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(ccel).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -5953,12 +6190,18 @@ pub unsafe fn parse_mpst(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let mpst = mpst.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (mpst as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(mpst).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 8 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(mpst as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(mpst).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6062,12 +6305,18 @@ pub unsafe fn parse_sdev(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let sdev = sdev.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (sdev as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(sdev).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(sdev as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(sdev).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6148,12 +6397,18 @@ pub unsafe fn parse_sbst(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let sbst = sbst.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (sbst as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(sbst).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(sbst as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(sbst).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6258,12 +6513,18 @@ pub unsafe fn parse_ras2(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let ras2 = ras2.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (ras2 as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(ras2).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(ras2 as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(ras2).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6396,12 +6657,18 @@ pub unsafe fn parse_nhlt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let nhlt = nhlt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (nhlt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(nhlt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 1 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(nhlt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(nhlt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6516,12 +6783,18 @@ pub unsafe fn parse_ibft(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let ibft = ibft.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (ibft as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(ibft).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 12 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(ibft as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(ibft).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6628,12 +6901,18 @@ pub unsafe fn parse_csrt(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let csrt = csrt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (csrt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(csrt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(csrt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(csrt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6721,12 +7000,18 @@ pub unsafe fn parse_agdi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let agdi = agdi.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (agdi as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(agdi).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 16 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(agdi as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(agdi).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6787,12 +7072,18 @@ pub unsafe fn parse_boot(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let boot = boot.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (boot as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(boot).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 4 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(boot as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(boot).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6875,12 +7166,18 @@ pub unsafe fn parse_dbgp(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let dbgp = dbgp.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (dbgp as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(dbgp).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 16 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(dbgp as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(dbgp).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -6968,12 +7265,18 @@ pub unsafe fn parse_wpbt(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let wpbt = wpbt.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (wpbt as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(wpbt).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 16 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(wpbt as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(wpbt).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7117,12 +7420,18 @@ pub unsafe fn parse_msct(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let msct = msct.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (msct as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(msct).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 20 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(msct as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(msct).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7230,12 +7539,18 @@ pub unsafe fn parse_xenv(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let xenv = xenv.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (xenv as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(xenv).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 24 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(xenv as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(xenv).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7318,12 +7633,18 @@ pub unsafe fn parse_tcpa(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let tcpa = tcpa.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (tcpa as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(tcpa).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 14 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(tcpa as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(tcpa).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7421,12 +7742,18 @@ pub unsafe fn parse_mchi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let mchi = mchi.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (mchi as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(mchi).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 28 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(mchi as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(mchi).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7529,12 +7856,18 @@ pub unsafe fn parse_phat(rsdp_phys: PhysAddr) -> Result<u32, AcpiError> {
     }
     let phat = phat.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (phat as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(phat).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(phat as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(phat).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7600,12 +7933,18 @@ pub unsafe fn parse_stao(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let stao = stao.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (stao as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(stao).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 1 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(stao as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(stao).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }
@@ -7675,12 +8014,18 @@ pub unsafe fn parse_uefi(rsdp_phys: PhysAddr) -> Result<(), AcpiError> {
     }
     let uefi = uefi.ok_or(AcpiError::NoSrat)?;
     // SAFETY: caller assertion.
-    let total = unsafe { (uefi as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(uefi).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total < SDT_HEADER_SIZE + 18 {
         return Err(AcpiError::BadXsdtSignature);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(uefi as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(uefi).kernel_ptr::<u8>(), total)
+    };
     if checksum(body) != 0 {
         return Err(AcpiError::BadTableChecksum);
     }

@@ -63,12 +63,12 @@ impl I801Smbus {
 
     unsafe fn read8(&self, off: u32) -> u8 {
         // SAFETY: MMIO access is valid
-        unsafe { narf_arch::mmio::read8(self.mmio.phys.raw() + off as u64) }
+        unsafe { narf_arch::mmio::read8(self.mmio.virt + off as u64) }
     }
 
     unsafe fn write8(&self, off: u32, val: u8) {
         // SAFETY: MMIO access is valid
-        unsafe { narf_arch::mmio::write8(self.mmio.phys.raw() + off as u64, val) }
+        unsafe { narf_arch::mmio::write8(self.mmio.virt + off as u64, val) }
     }
 
     fn check_status(&self) -> Result<(), I2cError> {

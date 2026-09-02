@@ -190,7 +190,12 @@ fn pcie_cfg_phys(device: &BusDevice) -> Result<PhysAddr, PciError> {
 unsafe fn cfg_read16(cfg: PhysAddr, off: u64) -> u16 {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is readable + 2-byte aligned.
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u16) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u16),
+            None => u16::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -200,7 +205,9 @@ unsafe fn cfg_write16(cfg: PhysAddr, off: u64, value: u16) {
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller asserts the slot is writable + 2-byte aligned.
     unsafe {
-        core::ptr::write_volatile((cfg.raw() + off) as *mut u16, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p as *mut u16, value);
+        };
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -335,7 +342,12 @@ unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
     // base and `off` is within that device's config window, so `cfg.raw() + off`
     // is a readable MMIO address correctly aligned for a u8.
     // SAFETY: Valid memory or trusted environment
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u8) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u8),
+            None => u8::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -347,7 +359,12 @@ unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
     // base and `off` is a dword-aligned offset within that device's config
     // window, so `cfg.raw() + off` is a readable MMIO address valid for a u32.
     // SAFETY: Valid memory or trusted environment
-    let v = unsafe { core::ptr::read_volatile((cfg.raw() + off) as *const u32) };
+    let v = unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    };
     compiler_fence(Ordering::SeqCst);
     v
 }
@@ -360,7 +377,9 @@ unsafe fn cfg_write8(cfg: PhysAddr, off: u64, value: u8) {
     // so `cfg.raw() + off` is a writable MMIO address correctly aligned for a u8.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile((cfg.raw() + off) as *mut u8, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p, value);
+        };
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -374,7 +393,9 @@ unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
     // valid for a u32.
     // SAFETY: Valid memory or trusted environment
     unsafe {
-        core::ptr::write_volatile((cfg.raw() + off) as *mut u32, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p as *mut u32, value);
+        };
     }
     compiler_fence(Ordering::SeqCst);
 }
@@ -399,7 +420,12 @@ pub fn read_intx_pin(cap: &Cap<BusDeviceCap, Write>, device: &BusDevice) -> Resu
     // the BusDevice; offset 0x3D is well inside the type-0
     // header.
     // SAFETY: Valid memory or trusted environment
-    Ok(unsafe { core::ptr::read_volatile((cfg.raw() + INTERRUPT_PIN_OFFSET) as *const u8) })
+    Ok(unsafe {
+        match crate::ecam::ptr_for(cfg, INTERRUPT_PIN_OFFSET) {
+            Some(p) => core::ptr::read_volatile(p as *const u8),
+            None => u8::MAX,
+        }
+    })
 }
 
 /// Compute the GIC ITS DeviceID for a PCIe function. ITS uses the

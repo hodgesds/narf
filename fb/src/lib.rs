@@ -123,8 +123,10 @@ impl FbScanout for BochsScanout {
         // written. No host-side blit needed.
     }
     fn phys_base(&self) -> Option<u64> {
-        // BAR0 phys; `fb_reachable()` already proved it's <4 GiB and
-        // thus covered by the x86_64 identity map.
+        // BAR0 phys, which is what a `/dev/fb0` mmap wants — this is one of
+        // the few places a physical address is the right answer. The
+        // `fb_reachable()` gate is a sub-4-GiB policy check, not a claim
+        // about the kernel identity map, which no longer maps RAM.
         narf_graphics_driver::bochs::with_controller(|d| {
             if d.fb_reachable() {
                 Some(d.fb_phys())
@@ -374,8 +376,10 @@ impl FbScanout for IntelGpuScanout {
     unsafe fn framebuffer(&self) -> Framebuffer {
         narf_drivers_gpu::intel_gpu::with_controller(|d| {
             let mode = d.current_mode().expect("intel-gpu scanout without mode");
-            // GMADR is mapped in the CPU, we offset it by the active scanout offset.
-            let base = (d.gmadr.phys.as_u64() + mode.gtt_offset as u64) as *mut u32;
+            // GMADR is mapped in the CPU, we offset it by the active scanout
+            // offset. `virt` is the dereferenceable kernel VA for the
+            // aperture (an ioremap VA for above-map BARs).
+            let base = (d.gmadr.virt + mode.gtt_offset as u64) as *mut u32;
             // SAFETY: `base` points into the CPU-mapped GMADR aperture at the
             // active scanout's `gtt_offset`; the aperture is 4-byte aligned and
             // covers `width*height` pixels at `stride_bytes/4` pixels per row.

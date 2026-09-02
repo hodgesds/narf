@@ -373,9 +373,11 @@ fn smoke_arch_mmio_round_trip() -> TestResult {
         Ok(f) => f,
         Err(_) => return TestResult::Fail("alloc_frame"),
     };
-    let va = frame.start_address().raw();
+    // The frame is ordinary RAM: reach it through the direct map, not
+    // its physical address.
+    let va = frame.start_address().kernel_ptr::<u8>() as u64;
     // 32-bit round trip.
-    // SAFETY: identity-mapped frame; we own it.
+    // SAFETY: direct-mapped frame; we own it.
     unsafe {
         narf_arch::mmio::write32(va, 0xDEAD_BEEF);
     }

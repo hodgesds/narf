@@ -97,12 +97,12 @@ pub unsafe fn install_topa(topa_phys: u64, ring_phys: u64, ring_size_log2: u8) {
     unsafe {
         // Entry 0: ring buffer.
         core::ptr::write_volatile(
-            topa_phys as *mut u64,
+            narf_lib::directmap::pv_ptr::<u64>(topa_phys),
             topa_entry(ring_phys, ring_size_log2, false, false),
         );
         // Entry 1: END pointer back to topa_phys.
         core::ptr::write_volatile(
-            (topa_phys + 8) as *mut u64,
+            narf_lib::directmap::pv_ptr::<u64>(topa_phys + 8),
             topa_entry(topa_phys, 12, true, false),
         );
     }

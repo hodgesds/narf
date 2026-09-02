@@ -494,12 +494,24 @@ pub unsafe fn enable_msix_rx_queues(
 
 #[inline]
 unsafe fn cfg_read8(cfg: PhysAddr, off: u64) -> u8 {
-    // SAFETY: caller asserts the slot is readable.
-    unsafe { narf_arch::mmio::read8(cfg.raw() + off) }
+    // SAFETY: caller asserts the slot is readable; reached through
+    // the segment's ECAM window, not a raw physical address.
+    unsafe {
+        match narf_bus::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u8),
+            None => u8::MAX,
+        }
+    }
 }
 
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
-    // SAFETY: caller asserts the slot is readable + 4-byte aligned.
-    unsafe { narf_arch::mmio::read32(cfg.raw() + off) }
+    // SAFETY: caller asserts the slot is readable + 4-byte aligned;
+    // reached through the segment's ECAM window.
+    unsafe {
+        match narf_bus::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    }
 }

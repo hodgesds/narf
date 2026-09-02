@@ -2784,6 +2784,8 @@ static AHCI_IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
 /// can reach it without locking (the ISR runs in IRQ context where
 /// taking `IrqSafeSpinLock` would deadlock if the lock was already
 /// held by the path that triggered the IRQ).
+/// The ABAR's mapped kernel VA (not its physical address): the ISR
+/// dereferences it with no further translation step.
 static AHCI_MMIO_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// MSI-X table backing — kept alive for the life of the controller
@@ -2803,8 +2805,8 @@ fn ahci_isr() {
     if base == 0 {
         return;
     }
-    // SAFETY: identity-mapped MMIO; `base` is the ABAR PA stored
-    // post-bring-up, owned by the AHCI driver.
+    // SAFETY: `base` is the ABAR's mapped kernel VA, stashed
+    // post-bring-up and owned by the AHCI driver.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let is = unsafe { core::ptr::read_volatile((base as u64 + HBA_IS) as *const u32) };
     if is == 0 {
@@ -2959,7 +2961,10 @@ pub fn probe(device: BusDevice, cap: Cap<BusDeviceCap, Write>) -> Result<(), nar
         Err(_) => return Err(narf_bus::ProbeError::BadDevice),
     };
     // Stash MMIO base for the ISR before any IRQ can fire.
-    AHCI_MMIO_BASE.store(dev.mmio.phys.raw() as usize, Ordering::Release);
+    // The ISR dereferences this directly, so stash the mapped VA, not the
+    // BAR's physical address — `MmioRegion::virt` is the ioremap window for
+    // above-map BARs and equals the PA only for identity-mapped ones.
+    AHCI_MMIO_BASE.store(dev.mmio.virt as usize, Ordering::Release);
     // Negotiate IRQ delivery (MSI-X → MSI → INTx). Best-effort —
     // failure leaves the driver in sync-poll mode.
     try_setup_irq(&cap, &device);

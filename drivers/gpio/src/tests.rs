@@ -114,7 +114,7 @@ fn smoke_gpio_set_pin_requires_output_enable() -> TestResult {
     }
     // Manually flip Output Enable in the synthetic backing so set_pin
     // can succeed.
-    let base = p.raw() as *mut u32;
+    let base = p.kernel_mut_ptr::<u32>();
     // SAFETY: `base` points at the 256-dword buffer from
     // `make_synthetic_mmio`; index 7 < 256 is in-bounds and the buffer
     // is leaked, so the pointer stays valid for the whole test.
@@ -137,7 +137,7 @@ kernel_test_in!("drivers-gpio", smoke_gpio_set_pin_requires_output_enable);
 fn smoke_gpio_read_pin_reports_status_bit() -> TestResult {
     let (p, l) = make_synthetic_mmio();
     let drv = AmdFchGpio::new("read".to_string(), p, l, None);
-    let base = p.raw() as *mut u32;
+    let base = p.kernel_mut_ptr::<u32>();
     // Set PinSts (bit 16) on pin 3.
     // SAFETY: Valid MMIO bounds or trusted driver environment
     unsafe {
@@ -175,7 +175,7 @@ fn smoke_gpio_register_irq_programs_pin_register() -> TestResult {
     if r.is_err() {
         return TestResult::Fail("register_irq returned error");
     }
-    let base = p.raw() as *const u32;
+    let base = p.kernel_ptr::<u32>();
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let v = unsafe { core::ptr::read_volatile(base.add(17)) };
     // Should have INTR_ENABLE (28) + INTR_DELIVERY (29) + PULL_UP (19) + INTR_STATUS clear-write (11)
@@ -248,7 +248,7 @@ fn smoke_gpio_unregister_irq_clears_bits() -> TestResult {
     )
     .unwrap();
     drv.unregister_irq(9);
-    let base = p.raw() as *const u32;
+    let base = p.kernel_ptr::<u32>();
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let v = unsafe { core::ptr::read_volatile(base.add(9)) };
     if v & (1 << 28) != 0 || v & (1 << 29) != 0 {
@@ -304,7 +304,7 @@ fn smoke_gpio_isr_dispatch_fires_handler_and_clears_status() -> TestResult {
     // shared ISR. Synthetic backing doesn't model RW1C, so we
     // manually clear the bit between dispatches to simulate what
     // real hardware does in response to the driver's write-back.
-    let base = p.raw() as *mut u32;
+    let base = p.kernel_mut_ptr::<u32>();
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let prev = unsafe { core::ptr::read_volatile(base.add(42)) };
     // SAFETY: Valid MMIO bounds or trusted driver environment
@@ -499,7 +499,7 @@ fn smoke_intel_pch_read_pin_reports_rx_state() -> TestResult {
         128,
         true,
     ));
-    let base = phys.raw() as *mut u32;
+    let base = phys.kernel_mut_ptr::<u32>();
     // Set GPIORXSTATE (bit 1) on pin 5.
     // PADCFG0 for pin 5 is at padbar + 5 * 16.
     let off = (padbar as usize + 5 * 16) / 4;
@@ -534,7 +534,7 @@ fn smoke_intel_pch_set_pin_updates_tx_state() -> TestResult {
         128,
         true,
     ));
-    let base = phys.raw() as *mut u32;
+    let base = phys.kernel_mut_ptr::<u32>();
     let off = (padbar as usize + 7 * 16) / 4;
 
     // Initial state: ensure TXDIS is set.
@@ -585,7 +585,7 @@ fn smoke_intel_pch_register_irq_programs_pad_and_ie() -> TestResult {
 
     drv.register_irq(12, GpioPull::Up, cfg, dummy).unwrap();
 
-    let base = phys.raw() as *const u32;
+    let base = phys.kernel_ptr::<u32>();
     let off0 = (padbar as usize + 12 * 16) / 4;
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let v0 = unsafe { core::ptr::read_volatile(base.add(off0)) };
@@ -651,7 +651,7 @@ fn smoke_intel_pch_dispatch_irq_fires_handler_and_acks() -> TestResult {
     )
     .unwrap();
 
-    let base = phys.raw() as *mut u32;
+    let base = phys.kernel_mut_ptr::<u32>();
     // Set status bit in group 1 (pin 42).
     // is_offset = 0x200. Group 1 = 0x200 + 4 = 0x204.
     // SAFETY: Valid MMIO bounds or trusted driver environment

@@ -14640,8 +14640,9 @@ fn expect_nx_fault(caught: narf_arch::x86_64::probe::Caught, what: &'static str)
 /// code. If someone drops `NO_EXEC` from `init_mmu`'s leaf flags, or the
 /// 1 GiB → 2 MiB → 4 KiB demotion stops covering the address, this goes red.
 #[cfg(target_arch = "x86_64")]
-fn smoke_identity_alias_of_buddy_frame_is_nx() -> TestResult {
-    use crate::{alloc_frame, free_frame, FrameAllocError};
+fn smoke_identity_alias_of_buddy_frame_is_not_executable() -> TestResult {
+    use crate::paging::{leaf_flags_at, read_cr3, PtFlags};
+    use crate::{alloc_frame, free_frame, FrameAllocError, VirtAddr};
 
     let frame = match alloc_frame() {
         Ok(f) => f,
@@ -14651,18 +14652,28 @@ fn smoke_identity_alias_of_buddy_frame_is_nx() -> TestResult {
         Err(_) => return TestResult::Fail("alloc_frame failed"),
     };
     let phys = frame.start_address().raw();
-    if phys >= crate::addr::LOW_IDENTITY_LIMIT {
-        free_frame(frame);
-        return TestResult::Skip("frame is above the low identity map");
-    }
 
-    // SAFETY: `phys` is the identity alias of a frame we exclusively own.
-    let caught = unsafe { probe_fetch_at(phys) };
+    // The kernel no longer identity-maps RAM, so the expected answer is that
+    // there is no identity alias at all. Assert the absence of a mapping
+    // rather than probing for an NX fault: `probe_fetch_at` has to write its
+    // stub through the address first, and that write faults when nothing is
+    // mapped there.
+    // SAFETY: CR3 is readable at CPL=0 and names the live kernel PML4.
+    let cr3 = unsafe { read_cr3() };
+    // SAFETY: the live PML4 is reachable through the direct map.
+    let flags = unsafe { leaf_flags_at(cr3, VirtAddr::new(phys)) };
     free_frame(frame);
-    expect_nx_fault(caught, "identity alias of a buddy frame was executable")
+    match flags {
+        None => TestResult::Pass,
+        Some((f, _)) if f.contains(PtFlags::NO_EXEC) => TestResult::Pass,
+        Some(_) => TestResult::Fail("buddy frame is executable at its identity address"),
+    }
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("memory", smoke_identity_alias_of_buddy_frame_is_nx);
+kernel_test_in!(
+    "memory",
+    smoke_identity_alias_of_buddy_frame_is_not_executable
+);
 
 /// The same question asked of the higher-half kernel window, which is the
 /// answer the identity map alone does not give.
@@ -14729,8 +14740,13 @@ fn smoke_ap_trampoline_window_is_exactly_executable() -> TestResult {
 
     let past = AP_TRAMPOLINE_EXEC_BASE + AP_TRAMPOLINE_EXEC_LEN;
     // SAFETY: as above.
+    // Unmapped is the expected state — PML4[0] now holds nothing but the
+    // trampoline pages — and is a strictly stronger guarantee than the
+    // present-but-NX leaf the low identity map used to provide here. Both
+    // satisfy the property under test: the executable window stops at the
+    // end of the trampoline.
     match unsafe { leaf_flags_at(cr3, VirtAddr::new(past)) } {
-        None => TestResult::Fail("the page past the trampoline window is unmapped"),
+        None => TestResult::Pass,
         Some((f, _)) if f.contains(PtFlags::NO_EXEC) => TestResult::Pass,
         Some(_) => TestResult::Fail("the executable window is wider than the trampoline"),
     }

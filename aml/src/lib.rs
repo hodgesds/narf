@@ -944,12 +944,18 @@ pub unsafe fn parse_namespace(rsdp_phys: PhysAddr) -> Result<u32, AmlError> {
 /// so `method_body` offsets are stable references into that store.
 unsafe fn walk_aml_table(phys: u64, root_path: &str) -> Result<u32, AmlError> {
     // SAFETY: caller assertion.
-    let total = unsafe { (phys as *const SdtHeader).read_unaligned().length as usize };
+    let total = unsafe {
+        (narf_memory::PhysAddr::new(phys).kernel_ptr::<SdtHeader>())
+            .read_unaligned()
+            .length as usize
+    };
     if total <= 36 {
         return Ok(0);
     }
     // SAFETY: caller assertion.
-    let body = unsafe { core::slice::from_raw_parts(phys as *const u8, total) };
+    let body = unsafe {
+        core::slice::from_raw_parts(narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(), total)
+    };
     let aml_slice = &body[36..];
 
     // Append into the global AML store, remember the base offset so

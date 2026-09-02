@@ -307,15 +307,26 @@ kernel_test_in!("aml/e2e", e2e_aml_while_loop_sum);
 // oregion::read_field → mmio_read path without touching hardware.
 
 fn e2e_aml_sysmem_opregion_via_method() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
     // Backing: 8-byte buffer, byte 0 = 0xAB.
-    let mut backing: Box<[u8; 8]> = Box::new([0u8; 8]);
-    backing[0] = 0xAB;
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u8>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
+    // SAFETY: as above.
+    unsafe { *backing = 0xAB };
 
     // OpRegion(\E7RG, SystemMemory, phys, 8)
     let rgn = op_region_qword(b"E7RG", 0x00, phys, 8);
@@ -349,26 +360,27 @@ fn e2e_aml_sysmem_opregion_via_method() -> TestResult {
         Ok(crate::Value::Integer(0xAB)) => {}
         Ok(crate::Value::Integer(v)) => {
             let _ = v;
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E07: RD returned wrong value (expected 0xAB)");
         }
         Ok(_) => {
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E07: RD returned non-integer");
         }
         Err(_) => {
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E07: evaluate_method RD failed");
         }
     }
 
     // Write 0xCD via write_field (the direct accessor — tests the WR path).
     if crate::oregion::write_field("\\E7F0", 0xCD).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E07: write_field failed");
     }
-    let got = backing[0];
-    drop(backing);
+    // SAFETY: same frame, via the direct map.
+    let got = unsafe { *backing };
+    narf_memory::frame::free_frame(frame);
     if got != 0xCD {
         return TestResult::Fail("E07: backing byte 0 not 0xCD after write");
     }
@@ -388,14 +400,25 @@ kernel_test_in!("aml/e2e", e2e_aml_sysmem_opregion_via_method);
 //   Method(\E8W, 1) { Store(Arg0, \E8F0) }
 
 fn e2e_aml_sysmem_read_write_methods() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let mut backing: Box<[u8; 8]> = Box::new([0u8; 8]);
-    backing[0] = 0x11;
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u8>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
+    // SAFETY: as above.
+    unsafe { *backing = 0x11 };
 
     let rgn = op_region_qword(b"E8RG", 0x00, phys, 8);
     let fld = field_byte_acc(b"E8RG", b"E8F0", 8);
@@ -417,7 +440,7 @@ fn e2e_aml_sysmem_read_write_methods() -> TestResult {
     blob.extend_from_slice(&wr_meth);
 
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E08: parse failed");
     }
 
@@ -425,20 +448,21 @@ fn e2e_aml_sysmem_read_write_methods() -> TestResult {
     match crate::eval::evaluate_method("\\E8R", &[]) {
         Ok(crate::Value::Integer(0x11)) => {}
         _ => {
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E08: RD expected 0x11");
         }
     }
 
     // Write 0xBE via the method.
     if crate::eval::evaluate_method("\\E8W", &[crate::Value::Integer(0xBE)]).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E08: WR method failed");
     }
 
     // Verify backing was updated.
-    let got = backing[0];
-    drop(backing);
+    // SAFETY: same frame, via the direct map.
+    let got = unsafe { *backing };
+    narf_memory::frame::free_frame(frame);
     if got != 0xBE {
         return TestResult::Fail("E08: backing byte != 0xBE after WR method");
     }
@@ -701,13 +725,23 @@ kernel_test_in!("aml/e2e", e2e_aml_ec_opregion_registration);
 // Ref: Linux exfield.c AcpiExExtractFromField bit-packing.
 
 fn e2e_aml_field_sub_byte_cross_byte_packing() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let backing: Box<[u8; 8]> = Box::new([0u8; 8]);
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u8>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
 
     let rgn = op_region_qword(b"ECRG", 0x00, phys, 8);
 
@@ -730,7 +764,7 @@ fn e2e_aml_field_sub_byte_cross_byte_packing() -> TestResult {
     blob.extend_from_slice(&fld);
 
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E12: parse failed");
     }
 
@@ -738,36 +772,36 @@ fn e2e_aml_field_sub_byte_cross_byte_packing() -> TestResult {
     let f4 = match crate::oregion::field_for("\\ECF4") {
         Some(f) => f,
         None => {
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E12: ECF4 not registered");
         }
     };
     if f4.bit_offset != 0 || f4.bit_length != 4 {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E12: ECF4 bit_offset/length mismatch");
     }
 
     let f12 = match crate::oregion::field_for("\\ECF2") {
         Some(f) => f,
         None => {
-            drop(backing);
+            narf_memory::frame::free_frame(frame);
             return TestResult::Fail("E12: ECF2 not registered");
         }
     };
     if f12.bit_offset != 4 || f12.bit_length != 12 {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E12: ECF2 bit_offset/length mismatch");
     }
 
     // Write F4 = 0xA.
     if crate::oregion::write_field("\\ECF4", 0xA).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E12: write_field ECF4 failed");
     }
 
     // Write F12 = 0x123.
     if crate::oregion::write_field("\\ECF2", 0x123).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E12: write_field ECF2 failed");
     }
 
@@ -775,9 +809,11 @@ fn e2e_aml_field_sub_byte_cross_byte_packing() -> TestResult {
     let rb4 = crate::oregion::read_field("\\ECF4");
     let rb12 = crate::oregion::read_field("\\ECF2");
 
-    let b0 = backing[0];
-    let b1 = backing[1];
-    drop(backing);
+    // SAFETY: same frame, via the direct map.
+    let b0 = unsafe { *backing };
+    // SAFETY: as above; byte 1 is inside the 8-byte region.
+    let b1 = unsafe { *backing.add(1) };
+    narf_memory::frame::free_frame(frame);
 
     match rb4 {
         Ok(0xA) => {}
@@ -1018,14 +1054,25 @@ kernel_test_in!("aml/e2e", e2e_aml_concatenate_buffers);
 // Backing byte 0 = 0x10 → after method → byte 0 = 0x20.
 
 fn e2e_aml_method_reads_field_arithmetic_writes_back() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let mut backing: Box<[u8; 8]> = Box::new([0u8; 8]);
-    backing[0] = 0x10;
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u8>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
+    // SAFETY: as above.
+    unsafe { *backing = 0x10 };
 
     let rgn = op_region_qword(b"EFRG", 0x00, phys, 8);
     let fld = field_byte_acc(b"EFRG", b"EFFV", 8);
@@ -1049,17 +1096,18 @@ fn e2e_aml_method_reads_field_arithmetic_writes_back() -> TestResult {
     blob.extend_from_slice(&meth);
 
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E16: parse failed");
     }
 
     if crate::eval::evaluate_method("\\E16", &[]).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E16: evaluate_method failed");
     }
 
-    let got = backing[0];
-    drop(backing);
+    // SAFETY: same frame, via the direct map.
+    let got = unsafe { *backing };
+    narf_memory::frame::free_frame(frame);
 
     if got == 0x20 {
         TestResult::Pass
@@ -1077,13 +1125,23 @@ kernel_test_in!("aml/e2e", e2e_aml_method_reads_field_arithmetic_writes_back);
 // Tests the 4-byte access-unit path (ByteAcc smokes already done).
 
 fn e2e_aml_dword_acc_field_round_trip() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let backing: Box<[u64; 1]> = Box::new([0u64]);
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u64>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
 
     let rgn = op_region_qword(b"EDRG", 0x00, phys, 8);
 
@@ -1103,18 +1161,19 @@ fn e2e_aml_dword_acc_field_round_trip() -> TestResult {
     blob.extend_from_slice(&fld);
 
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E17: parse failed");
     }
 
     if crate::oregion::write_field("\\EDFD", 0xDEAD_BEEF).is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E17: write_field failed");
     }
 
     let rb = crate::oregion::read_field("\\EDFD");
-    let raw = backing[0];
-    drop(backing);
+    // SAFETY: same frame, via the direct map.
+    let raw = unsafe { *backing };
+    narf_memory::frame::free_frame(frame);
 
     match rb {
         Ok(0xDEAD_BEEF) => {}
@@ -1190,14 +1249,25 @@ kernel_test_in!("aml/e2e", e2e_aml_mutex_critical_section);
 // backing[0] = 0x0F → E9GV returns 0x0F → E9DV returns 0x10.
 
 fn e2e_aml_nested_method_calls_with_field_read() -> TestResult {
-    use alloc::boxed::Box;
-
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let mut backing: Box<[u8; 8]> = Box::new([0u8; 8]);
-    backing[0] = 0x0F;
-    let phys = backing.as_ptr() as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so back
+    // this region with a real frame rather than a heap buffer. Freed on each
+    // exit path, where the test previously dropped the boxed buffer.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let base = frame.start_address();
+    let phys = base.raw();
+    // The frame is exclusively ours, reached through the direct map; the
+    // region covers 8 bytes of it.
+    let backing = base.kernel_mut_ptr::<u8>();
+    // SAFETY: as above.
+    unsafe { core::ptr::write_bytes(base.kernel_mut_ptr::<u8>(), 0, 8) };
+    // SAFETY: as above.
+    unsafe { *backing = 0x0F };
 
     let rgn = op_region_qword(b"E9RG", 0x00, phys, 8);
     let fld = field_byte_acc(b"E9RG", b"E9BV", 8);
@@ -1225,12 +1295,12 @@ fn e2e_aml_nested_method_calls_with_field_read() -> TestResult {
     blob.extend_from_slice(&doubler);
 
     if crate::__parse_body_for_test(&blob, "\\").is_err() {
-        drop(backing);
+        narf_memory::frame::free_frame(frame);
         return TestResult::Fail("E19: parse failed");
     }
 
     let result = crate::eval::evaluate_method("\\E9DV", &[]);
-    drop(backing);
+    narf_memory::frame::free_frame(frame);
 
     match result {
         Ok(crate::Value::Integer(0x10)) => TestResult::Pass,

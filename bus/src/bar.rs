@@ -363,15 +363,24 @@ impl MmioRegion {
 
 #[inline]
 unsafe fn cfg_read32(cfg: PhysAddr, off: u64) -> u32 {
-    // SAFETY: caller asserts the slot is readable.
-    unsafe { narf_arch::mmio::read32(cfg.raw() + off) }
+    // SAFETY: caller asserts the slot is readable; reached through the
+    // segment's ECAM window rather than a raw physical address.
+    unsafe {
+        match crate::ecam::ptr_for(cfg, off) {
+            Some(p) => core::ptr::read_volatile(p as *const u32),
+            None => u32::MAX,
+        }
+    }
 }
 
 #[inline]
 unsafe fn cfg_write32(cfg: PhysAddr, off: u64, value: u32) {
-    // SAFETY: caller asserts the slot is writable.
+    // SAFETY: caller asserts the slot is writable; reached through the
+    // segment's ECAM window rather than a raw physical address.
     unsafe {
-        narf_arch::mmio::write32(cfg.raw() + off, value);
+        if let Some(p) = crate::ecam::ptr_for(cfg, off) {
+            core::ptr::write_volatile(p as *mut u32, value);
+        }
     }
 }
 

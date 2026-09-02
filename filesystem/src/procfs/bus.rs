@@ -33,6 +33,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_bus::{registry, BusKind};
 use narf_input::evdev;
+use narf_memory::PhysAddr;
 
 use super::{register_proc, ProcFile};
 
@@ -118,6 +119,9 @@ impl ProcFile for PciDevicesFile {
                 BusKind::Pcie { cfg_phys, .. } => cfg_phys.raw(),
                 _ => 0,
             };
+            // Config space is reached through the segment's mapped ECAM
+            // window, not its physical address.
+            let cfg_phys = narf_bus::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
 
             // BDF packed as Linux: (bus<<8)|(dev<<3)|fn.
             let bdf = ((pcie_addr.bus as u32) << 8)
@@ -130,7 +134,7 @@ impl ProcFile for PciDevicesFile {
             let irq: u8 = if cfg_phys != 0 {
                 // SAFETY: cfg_phys is the ECAM window (set by the bus
                 // enumerator).  Offset 0x3C is within the 256-byte type-0
-                // standard header which is always readable.  Identity-mapped.
+                // standard header which is always readable.
                 // SAFETY: Valid memory or trusted environment
                 unsafe { core::ptr::read_volatile((cfg_phys + 0x3C) as *const u8) }
             } else {
@@ -198,14 +202,16 @@ pub struct PciCfgSpaceFile {
 impl ProcFile for PciCfgSpaceFile {
     fn read(&self) -> Vec<u8> {
         const CFG_SIZE: usize = 256;
+        let cfg_phys =
+            narf_bus::ecam::va_for(PhysAddr::new(self.cfg_phys)).unwrap_or(self.cfg_phys);
         if self.cfg_phys == 0 {
             return alloc::vec![0u8; CFG_SIZE];
         }
         let mut out = Vec::with_capacity(CFG_SIZE);
         for off in 0..CFG_SIZE {
             let val =
-                // SAFETY: cfg_phys is the ECAM window; identity-mapped.
-                unsafe { core::ptr::read_volatile((self.cfg_phys as usize + off) as *const u8) };
+                // SAFETY: cfg_phys is the mapped ECAM window.
+                unsafe { core::ptr::read_volatile((cfg_phys as usize + off) as *const u8) };
             out.push(val);
         }
         out

@@ -31,6 +31,8 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use narf_lib::sync::IrqSafeSpinLock;
 
 /// IOREGSEL offset — write the register index you want to touch.
@@ -70,8 +72,9 @@ const DEST_MODE_PHYS: u32 = 0 << 11;
 /// is keyed off the static.
 #[derive(Copy, Clone, Debug)]
 pub struct IoApicHandle {
-    /// MMIO base — physical address. Identity-mapped on x86_64
-    /// in the legacy MMIO hole below 4 GiB.
+    /// MMIO base — physical address, in the legacy MMIO hole below
+    /// 4 GiB. Reached through the uncached `ioremap` window that
+    /// [`mmio_base`] resolves on first use.
     pub base_phys: u64,
     /// First Global System Interrupt this IOAPIC owns.
     pub gsi_base: u32,
@@ -174,23 +177,73 @@ pub unsafe fn mask(h: &IoApicHandle, gsi: u32) {
 //
 // Internal helpers — caller must hold `IOAPIC_LOCK`.
 
+// ── MMIO windows ───────────────────────────────────────────────────
+//
+// The register window used to be reachable at its physical address
+// through the low identity map. That mapping is gone, and MMIO must
+// not be reached through the write-back direct map either, so each
+// IOAPIC gets an uncached `ioremap` window, resolved on first use and
+// cached here. Every caller holds `IOAPIC_LOCK`, so this table is
+// only ever touched serially.
+
+const MAX_IOAPICS: usize = 8;
+static MMIO_PHYS: [AtomicU64; MAX_IOAPICS] = [const { AtomicU64::new(0) }; MAX_IOAPICS];
+static MMIO_VIRT: [AtomicU64; MAX_IOAPICS] = [const { AtomicU64::new(0) }; MAX_IOAPICS];
+
+/// Virtual base of `base_phys`'s register window, mapping it on first
+/// use. Returns 0 if the mapping fails or the table is full; callers
+/// degrade to a no-op rather than touch a bad pointer.
+fn mmio_base(base_phys: u64) -> u64 {
+    for slot in 0..MAX_IOAPICS {
+        match MMIO_PHYS[slot].load(Ordering::Relaxed) {
+            p if p == base_phys => return MMIO_VIRT[slot].load(Ordering::Relaxed),
+            0 => {
+                // SAFETY: an IOAPIC register window reported by the MADT,
+                // owned by us and mapped uncached.
+                let Ok(m) = (unsafe {
+                    narf_memory::ioremap::ioremap(
+                        base_phys,
+                        0x1000,
+                        narf_memory::ioremap::MmioAttrs::Device,
+                    )
+                }) else {
+                    return 0;
+                };
+                MMIO_VIRT[slot].store(m.virt, Ordering::Relaxed);
+                MMIO_PHYS[slot].store(base_phys, Ordering::Relaxed);
+                return m.virt;
+            }
+            _ => {}
+        }
+    }
+    0
+}
+
 #[inline]
 unsafe fn read_reg_locked(base_phys: u64, index: u32) -> u32 {
-    // SAFETY: caller-asserted live IOAPIC + locked. REGSEL +
-    // IOWIN are both naturally aligned 32-bit MMIO registers.
-    // SAFETY: Valid memory or trusted environment
+    let base = mmio_base(base_phys);
+    if base == 0 {
+        return 0;
+    }
+    // SAFETY: caller-asserted live IOAPIC + locked. REGSEL + IOWIN are both
+    // naturally aligned 32-bit MMIO registers inside the mapped window.
     unsafe {
-        core::ptr::write_volatile((base_phys + REG_IOREGSEL) as *mut u32, index);
-        core::ptr::read_volatile((base_phys + REG_IOWIN) as *const u32)
+        core::ptr::write_volatile((base + REG_IOREGSEL) as *mut u32, index);
+        core::ptr::read_volatile((base + REG_IOWIN) as *const u32)
     }
 }
 
 #[inline]
 unsafe fn write_reg_locked(base_phys: u64, index: u32, value: u32) {
-    // SAFETY: caller-asserted live IOAPIC + locked.
+    let base = mmio_base(base_phys);
+    if base == 0 {
+        return;
+    }
+    // SAFETY: caller-asserted live IOAPIC + locked; both registers are
+    // naturally aligned inside the mapped window.
     unsafe {
-        core::ptr::write_volatile((base_phys + REG_IOREGSEL) as *mut u32, index);
-        core::ptr::write_volatile((base_phys + REG_IOWIN) as *mut u32, value);
+        core::ptr::write_volatile((base + REG_IOREGSEL) as *mut u32, index);
+        core::ptr::write_volatile((base + REG_IOWIN) as *mut u32, value);
     }
 }
 

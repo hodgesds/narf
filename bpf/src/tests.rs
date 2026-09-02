@@ -5479,13 +5479,15 @@ use narf_filesystem::{FileOps, FsError, POLL_IN};
 fn mapped_u64(phys: u64) -> u64 {
     // SAFETY: `phys` is a frame address `mmap_frames` returned; offset 0 is the
     // naturally aligned position cell, live for the map's lifetime.
-    unsafe { core::ptr::read_volatile(phys as *const u64) }
+    unsafe { core::ptr::read_volatile(narf_memory::PhysAddr::new(phys).kernel_ptr::<u64>()) }
 }
 
 /// One byte of a mapped data page.
 fn mapped_byte(phys: u64, off: usize) -> u8 {
     // SAFETY: `phys + off` is inside a data frame `mmap_frames` returned.
-    unsafe { core::ptr::read_volatile((phys as usize + off) as *const u8) }
+    unsafe {
+        core::ptr::read_volatile(narf_memory::PhysAddr::new(phys + off as u64).kernel_ptr::<u8>())
+    }
 }
 
 fn smoke_bpf_ringbuf_mmap_frames_are_live_backing() -> TestResult {
@@ -5545,7 +5547,12 @@ fn smoke_bpf_ringbuf_mmap_frames_are_live_backing() -> TestResult {
         // A userspace consumer advances consumer_pos by writing the mapped cell.
         // The kernel side then agrees the ring is drained.
         // SAFETY: consumer page offset 0 is the shared consumer position cell.
-        unsafe { core::ptr::write_volatile(consumer_page as *mut u64, 16) };
+        unsafe {
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(consumer_page).kernel_mut_ptr::<u64>(),
+                16,
+            )
+        };
         if rb.available_data() != 0 || rb.consumer_pos() != 16 {
             return Err("advancing the mapped consumer position did not drain the ring");
         }

@@ -69,7 +69,7 @@ _ap_trampoline_start:
      * the offset field of an `ljmp` mnemonic. */
     .byte 0x66, 0xEA            /* operand-size override + ljmp */
     .long _ap_protected_start - _ap_trampoline_start + TRAMPOLINE_PHYS
-    .word 0x08
+    .word 0x18
 
 /* ─── 32-bit protected mode ──────────────────────────────────────── */
 .code32
@@ -117,8 +117,6 @@ _ap_protected_start:
     /* Long-mode-compat now active. Load the kernel GDT — the param
      * block holds a 6-byte m16&32 descriptor (limit + 32-bit phys
      * base). */
-    mov ebx, offset AP_PARAM_GDT_LIMIT_OFF
-    lgdt [ebx + TRAMPOLINE_PHYS]
 
     /* Far jump to selector 0x08 (kernel 64-bit code). LLVM IAS rejects
      * two-symbol arithmetic in the `ljmp imm32, imm16` operand, so we
@@ -165,10 +163,6 @@ _ap_long_mode_start:
 ap_param_cr3:
     .quad 0                         /* CR3 = PML4 phys */
 
-ap_param_gdt_limit:
-    .word 0                         /* limit (2 bytes) */
-ap_param_gdt_base:
-    .long 0                         /* phys base low 32 bits (lgdt m16&32) */
 
 .balign 8
 ap_param_stacks:
@@ -177,19 +171,34 @@ ap_param_stacks:
 ap_param_rust_entry:
     .quad 0                         /* absolute virt &_ap_start_rust */
 
-/* ─── 32-bit GDT (used during 16→32 transition only) ─────────────── */
+/* ─── Trampoline-local GDT ────────────────────────────────────────
+ * Carries its own 64-bit code descriptor so the AP never has to reach
+ * the kernel image's GDT through the low identity map — that mapping
+ * no longer exists. (Linux's realmode trampoline keeps its own
+ * `tr_gdt` for the same reason.)
+ *
+ * Selector 0x08 is the 64-bit code descriptor so it matches the
+ * kernel GDT layout: `gdt::init_ap` reloads the data segments but
+ * NOT CS, so whatever CS the long-mode jump installs has to stay
+ * valid across that LGDT. The 32-bit code descriptor moves to 0x18
+ * and is used only for the 16→32 hop.
+ */
 .balign 8
 gdt32_start:
-    .quad 0                                 /* null */
-    .quad 0x00CF9A000000FFFF                /* 32-bit code: G=1 D=1 type=0xA */
-    .quad 0x00CF92000000FFFF                /* 32-bit data: type=0x2 */
+    .quad 0                                 /* null                      */
+    .quad 0x00AF9A000000FFFF                /* 0x08 64-bit code: L=1     */
+    .quad 0x00CF92000000FFFF                /* 0x10 32-bit data: type=0x2 */
+    .quad 0x00CF9A000000FFFF                /* 0x18 32-bit code: G=1 D=1 */
 gdt32_end:
 
 .balign 4
 gdt32_ptr:
     .word gdt32_end - gdt32_start - 1
 ap_param_gdt32_base:
-    .long 0                                 /* base, patched by Rust */
+    /* Intra-section arithmetic folds to an integer at assembly time
+     * (same trick as the ljmp targets below), so Rust neither patches
+     * this nor hardcodes the table's size in order to find it. */
+    .long gdt32_start - _ap_trampoline_start + TRAMPOLINE_PHYS
 
 _ap_trampoline_end:
 .size _ap_trampoline_start, _ap_trampoline_end - _ap_trampoline_start
@@ -197,4 +206,3 @@ _ap_trampoline_end:
 /* ─── Pre-computed offsets (intra-section, foldable to integers) ── */
 .equ GDT32_PTR_OFF,           gdt32_ptr           - _ap_trampoline_start
 .equ AP_PARAM_CR3_OFF,        ap_param_cr3        - _ap_trampoline_start
-.equ AP_PARAM_GDT_LIMIT_OFF,  ap_param_gdt_limit  - _ap_trampoline_start

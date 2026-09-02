@@ -107,7 +107,7 @@ pub unsafe fn stage_from_phys(
     // SAFETY: caller-asserted readability + kernel-wide mapping.
     let archive: &'static [u8] =
         // SAFETY: Valid memory or trusted environment
-        unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+        unsafe { core::slice::from_raw_parts(narf_lib::directmap::pv_ptr::<u8>(phys).cast_const(), len as usize) };
     let fs = Initramfs::from_cpio(name, archive)?;
     let leaked: &'static Initramfs = alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
     if replacing {

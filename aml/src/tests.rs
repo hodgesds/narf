@@ -688,14 +688,23 @@ fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
     // The buffer holds 0xCAFEBABE_DEADBEEF (little-endian u64).
     // F0 covers bits [0..32), so read_field("\\F0") should return the
     // low 32 bits = 0xDEADBEEF.
-    use alloc::boxed::Box;
 
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
     // Allocate buffer and fill.
-    let buf: Box<[u64; 1]> = Box::new([0xCAFEBABE_DEADBEEF_u64]);
-    let addr = &buf[0] as *const u64 as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so
+    // back this region with a real frame instead of a heap buffer. The
+    // kernel's low identity map is gone, and `oregion` now maps whatever
+    // address it is handed — a heap VA would map the wrong page.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0xCAFEBABE_DEADBEEF_u64) };
 
     // Build the AML body.
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -729,7 +738,7 @@ fn smoke_aml_oregion_sysmem_dword_field() -> TestResult {
     let _ = crate::__parse_body_for_test(&body, "\\");
 
     let result = crate::oregion::read_field("\\F0");
-    drop(buf);
+    narf_memory::frame::free_frame(frame);
 
     match result {
         Ok(v) => {
@@ -757,13 +766,22 @@ fn smoke_aml_oregion_bit_fields() -> TestResult {
     // Bit-level field test: SystemMemory region over a u64 = 0xFF.
     // Declare three 1-bit fields F0/F1/F2 at bit offsets 0/1/2.
     // Each should read back as 1 (all bits in 0xFF are set).
-    use alloc::boxed::Box;
 
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let buf: Box<[u64; 1]> = Box::new([0xFF_u64]);
-    let addr = &buf[0] as *const u64 as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so
+    // back this region with a real frame instead of a heap buffer. The
+    // kernel's low identity map is gone, and `oregion` now maps whatever
+    // address it is handed — a heap VA would map the wrong page.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0xFF_u64) };
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 
@@ -797,7 +815,7 @@ fn smoke_aml_oregion_bit_fields() -> TestResult {
     let r0 = crate::oregion::read_field("\\F0");
     let r1 = crate::oregion::read_field("\\F1");
     let r2 = crate::oregion::read_field("\\F2");
-    drop(buf);
+    narf_memory::frame::free_frame(frame);
 
     match (r0, r1, r2) {
         (Ok(0), _, _) => TestResult::Fail("\\F0 bit=0 from 0xFF buffer"),
@@ -946,13 +964,22 @@ fn smoke_aml_oregion_bank_field_writes_selector() -> TestResult {
     // 0x42) exposing the second byte as "BFLD". Reading or
     // writing BFLD must pre-write 0x42 to BSEL — verified by
     // inspecting the buffer after the access.
-    use alloc::boxed::Box;
 
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let buf: Box<[u64; 1]> = Box::new([0u64]);
-    let addr = &buf[0] as *const u64 as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so
+    // back this region with a real frame instead of a heap buffer. The
+    // kernel's low identity map is gone, and `oregion` now maps whatever
+    // address it is handed — a heap VA would map the wrong page.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0u64) };
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 
@@ -1023,8 +1050,9 @@ fn smoke_aml_oregion_bank_field_writes_selector() -> TestResult {
         return TestResult::Fail("write_field BFLD returned Err");
     }
 
-    let raw = buf[0];
-    drop(buf);
+    // SAFETY: same frame, read back through the direct map.
+    let raw = unsafe { *phys.kernel_ptr::<u64>() };
+    narf_memory::frame::free_frame(frame);
 
     let sel_byte = (raw & 0xff) as u8;
     let fld_byte = ((raw >> 8) & 0xff) as u8;
@@ -1049,13 +1077,22 @@ fn smoke_aml_oregion_update_rule_write_as_ones() -> TestResult {
     //   bits 2-5: 0xA (1010)
     //   bits 6-7: 1 1 (from WriteAsOnes)
     // = 0b11_1010_11 = 0xEB.
-    use alloc::boxed::Box;
 
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let buf: Box<[u64; 1]> = Box::new([0u64]);
-    let addr = &buf[0] as *const u64 as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so
+    // back this region with a real frame instead of a heap buffer. The
+    // kernel's low identity map is gone, and `oregion` now maps whatever
+    // address it is handed — a heap VA would map the wrong page.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0u64) };
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     // OpRegion(URGN, SystemMemory, addr, 8)
@@ -1096,8 +1133,9 @@ fn smoke_aml_oregion_update_rule_write_as_ones() -> TestResult {
     if crate::oregion::write_field("\\UFLD", 0xA).is_err() {
         return TestResult::Fail("write_field UFLD returned Err");
     }
-    let raw = buf[0];
-    drop(buf);
+    // SAFETY: same frame, read back through the direct map.
+    let raw = unsafe { *phys.kernel_ptr::<u64>() };
+    narf_memory::frame::free_frame(frame);
     let byte0 = (raw & 0xff) as u8;
     if byte0 != 0xEB {
         return TestResult::Fail("UFLD WriteAsOnes byte0 mismatch");
@@ -1110,13 +1148,22 @@ fn smoke_aml_oregion_update_rule_write_as_zeros() -> TestResult {
     // UpdateRule = WriteAsZeros (2): writing a 4-bit field in
     // the middle of a 0xFF byte should clear the surrounding
     // bits to 0.
-    use alloc::boxed::Box;
 
     crate::__reset_for_test();
     crate::oregion::__reset_for_test();
 
-    let buf: Box<[u64; 1]> = Box::new([0xFFu64]);
-    let addr = &buf[0] as *const u64 as u64;
+    // A SystemMemory OperationRegion address is a *physical* address, so
+    // back this region with a real frame instead of a heap buffer. The
+    // kernel's low identity map is gone, and `oregion` now maps whatever
+    // address it is handed — a heap VA would map the wrong page.
+    let frame = match narf_memory::frame::alloc_frame() {
+        Ok(f) => f,
+        Err(_) => return TestResult::Fail("alloc_frame"),
+    };
+    let phys = frame.start_address();
+    let addr = phys.raw();
+    // SAFETY: the frame is exclusively ours; seed it through the direct map.
+    unsafe { phys.kernel_mut_ptr::<u64>().write(0xFFu64) };
 
     let mut body: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     body.push(0x5B);
@@ -1154,8 +1201,9 @@ fn smoke_aml_oregion_update_rule_write_as_zeros() -> TestResult {
     if crate::oregion::write_field("\\ZFLD", 0xA).is_err() {
         return TestResult::Fail("write_field ZFLD returned Err");
     }
-    let raw = buf[0];
-    drop(buf);
+    // SAFETY: same frame, read back through the direct map.
+    let raw = unsafe { *phys.kernel_ptr::<u64>() };
+    narf_memory::frame::free_frame(frame);
     let byte0 = (raw & 0xff) as u8;
     // Expected: only bits 2-5 set = 0xA shifted left 2 = 0b00_1010_00 = 0x28
     if byte0 != 0x28 {

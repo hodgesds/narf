@@ -20,6 +20,7 @@
 extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use narf_memory::PhysAddr;
 
 use crate::pcie_aer::DPC_CAP_ID;
 
@@ -210,6 +211,10 @@ pub static DPC_LINK_DOWN_COUNT: AtomicU64 = AtomicU64::new(0);
 /// `cfg_phys` must point at a live, 4-KiB PCIe config page; the walk
 /// only issues volatile reads.
 pub unsafe fn find_dpc_cap_offset(cfg_phys: u64) -> Option<u16> {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     let mut off: u16 = 0x100;
     for _ in 0..256 {
         if !(0x100..0x1000).contains(&off) {
@@ -243,6 +248,10 @@ pub unsafe fn find_dpc_cap_offset(cfg_phys: u64) -> Option<u16> {
 /// # Safety
 /// `cfg_phys` live PCIe config; `dpc_off` from `find_dpc_cap_offset`.
 pub unsafe fn read_and_clear_status(cfg_phys: u64, dpc_off: u16) -> DpcStatus {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     let ptr = (cfg_phys + dpc_off as u64 + regs::STATUS as u64) as *mut u16;
     // SAFETY: caller-asserted.
     let raw = unsafe { core::ptr::read_volatile(ptr as *const u16) };
@@ -263,6 +272,10 @@ pub unsafe fn read_and_clear_status(cfg_phys: u64, dpc_off: u16) -> DpcStatus {
 /// # Safety
 /// Same as `read_and_clear_status`.
 pub unsafe fn read_source_id(cfg_phys: u64, dpc_off: u16) -> u16 {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         core::ptr::read_volatile((cfg_phys + dpc_off as u64 + regs::SOURCE_ID as u64) as *const u16)
@@ -281,6 +294,10 @@ pub unsafe fn read_source_id(cfg_phys: u64, dpc_off: u16) -> u16 {
 /// # Safety
 /// `cfg_phys` live PCIe config; `dpc_off` from walker.
 pub unsafe fn configure_dpc(cfg_phys: u64, dpc_off: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         // Clear pending INTERRUPT so a stale state doesn't fire as
@@ -307,6 +324,10 @@ pub unsafe fn configure_dpc(cfg_phys: u64, dpc_off: u16) {
 /// # Safety
 /// Same as `configure_dpc`.
 pub unsafe fn disable_dpc(cfg_phys: u64, dpc_off: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         let ctl_ptr = (cfg_phys + dpc_off as u64 + regs::CONTROL as u64) as *mut u16;
@@ -323,6 +344,10 @@ pub unsafe fn disable_dpc(cfg_phys: u64, dpc_off: u16) {
 /// # Safety
 /// Same as `configure_dpc`.
 pub unsafe fn clear_triggered(cfg_phys: u64, dpc_off: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted.
     unsafe {
         core::ptr::write_volatile(

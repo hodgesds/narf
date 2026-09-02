@@ -16,6 +16,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::fmt;
+use narf_memory::PhysAddr;
 
 use narf_capabilities::{Cap, CapError, Grant};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -374,6 +375,10 @@ impl SlotCaps {
 /// `cfg_phys` must point at a 256-byte (or 4 KiB) PCI config
 /// region the CPU can reach.
 pub unsafe fn find_pcie_cap_offset(cfg_phys: u64) -> Option<u8> {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller-asserted live config space; offset 0x34 is
     // the standard Capabilities Pointer.
     // SAFETY: Valid memory or trusted environment
@@ -405,6 +410,10 @@ pub unsafe fn find_pcie_cap_offset(cfg_phys: u64) -> Option<u8> {
 /// # Safety
 /// Caller-asserted live config space + valid PCIe cap offset.
 pub unsafe fn read_slot_capabilities(cfg_phys: u64, pcie_off: u8) -> u32 {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     unsafe {
         core::ptr::read_volatile(
@@ -419,6 +428,10 @@ pub unsafe fn read_slot_capabilities(cfg_phys: u64, pcie_off: u8) -> u32 {
 /// # Safety
 /// Caller-asserted live config space + valid PCIe cap offset.
 pub unsafe fn read_and_clear_slot_status(cfg_phys: u64, pcie_off: u8) -> u16 {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     let sts = unsafe {
         core::ptr::read_volatile(
@@ -445,6 +458,10 @@ pub unsafe fn read_and_clear_slot_status(cfg_phys: u64, pcie_off: u8) -> u16 {
 /// Caller-asserted live config space + valid PCIe cap offset
 /// + caller owns the device exclusively.
 pub unsafe fn enable_slot_irqs(cfg_phys: u64, pcie_off: u8, bits: u16) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     unsafe {
         let cur = core::ptr::read_volatile(
@@ -536,6 +553,10 @@ pub static HOTPLUG_EVENT_COUNT: core::sync::atomic::AtomicU64 =
 /// Caller-asserted live config space + valid PCIe cap offset
 /// + caller owns the device exclusively.
 pub unsafe fn slot_power_on(cfg_phys: u64, pcie_off: u8) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     unsafe {
         let addr = (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *mut u16;
@@ -554,6 +575,10 @@ pub unsafe fn slot_power_on(cfg_phys: u64, pcie_off: u8) {
 /// # Safety
 /// Same as `slot_power_on`.
 pub unsafe fn slot_power_off(cfg_phys: u64, pcie_off: u8) {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     unsafe {
         let addr = (cfg_phys + pcie_off as u64 + pcie_cap::SLOT_CONTROL as u64) as *mut u16;
@@ -573,6 +598,10 @@ pub unsafe fn slot_power_off(cfg_phys: u64, pcie_off: u8) {
 /// # Safety
 /// Caller-asserted live config space + valid PCIe cap offset.
 pub unsafe fn slot_presence_detected(cfg_phys: u64, pcie_off: u8) -> bool {
+    // Config space is reached through the segment's mapped ECAM
+    // window; falls back to the raw address when no segment is
+    // registered (unit tests hand us an ordinary buffer).
+    let cfg_phys = crate::ecam::va_for(PhysAddr::new(cfg_phys)).unwrap_or(cfg_phys);
     // SAFETY: caller assertion.
     let sts = unsafe {
         core::ptr::read_volatile(

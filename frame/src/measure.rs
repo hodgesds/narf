@@ -272,7 +272,12 @@ pub async fn measure_phys(
     len: u64,
 ) -> Result<(), TpmError> {
     // SAFETY: caller asserts range is identity-mapped readable.
-    let slice = unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+    let slice = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+            len as usize,
+        )
+    };
     measure(pcr, label, slice).await
 }
 
@@ -314,7 +319,12 @@ pub async unsafe fn measure_initramfs(phys: u64, len: u64) -> Result<(), TpmErro
         return Ok(());
     }
     // SAFETY: forwarded from caller.
-    let slice = unsafe { core::slice::from_raw_parts(phys as *const u8, len as usize) };
+    let slice = unsafe {
+        core::slice::from_raw_parts(
+            narf_memory::PhysAddr::new(phys).kernel_ptr::<u8>(),
+            len as usize,
+        )
+    };
     measure_with_type(6, EV_IPL, "initramfs", slice).await
 }
 

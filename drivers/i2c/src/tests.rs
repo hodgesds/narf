@@ -171,7 +171,7 @@ fn smoke_amd_fch_enable_writes_expected_regs() -> TestResult {
     // Inspect the synthetic backing by re-reading via raw ptr.
     // SAFETY: we know the buffer is a leaked Box<[u32; 64]>; phys
     // is the address of the first element.
-    let base = phys.raw() as *const u32;
+    let base = phys.kernel_ptr::<u32>();
     // IC_CON @ offset 0 (u32 index 0) — should have MASTER + SPEED_FAST + SLAVE_DIS + RESTART_EN
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_con = unsafe { core::ptr::read_volatile(base) };
@@ -281,7 +281,7 @@ fn smoke_lpss_i2c_probe_accepts_good_mmio_and_ungates() -> TestResult {
         Ok(()) => {
             // Check that the ungate sequence touched the private regs.
             // LPSS_PRIV_RESETS is at 0x204.
-            let base = phys.raw() as *const u32;
+            let base = phys.kernel_ptr::<u32>();
             // SAFETY: Valid MMIO bounds or trusted driver environment
             let resets = unsafe { core::ptr::read_volatile(base.add(0x204 / 4)) };
             if resets != 0x7 {
@@ -303,7 +303,7 @@ fn smoke_lpss_i2c_enable_writes_expected_regs() -> TestResult {
     if drv.enable().is_err() {
         return TestResult::Fail("LPSS enable() failed unexpectedly");
     }
-    let base = phys.raw() as *const u32;
+    let base = phys.kernel_ptr::<u32>();
     // SAFETY: Valid MMIO bounds or trusted driver environment
     let ic_con = unsafe { core::ptr::read_volatile(base) };
     let want = 1u32 | (0b10 << 1) | (1 << 6) | (1 << 5);

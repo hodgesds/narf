@@ -282,8 +282,13 @@ fn io_bar4(device: &BusDevice) -> Option<u16> {
         BusKind::Pcie { cfg_phys, .. } => cfg_phys,
         _ => return None,
     };
-    // SAFETY: identity-mapped cfg space; offset 0x10 + 4*4 = 0x20.
-    let raw = unsafe { core::ptr::read_volatile((cfg.raw() + 0x20) as *const u32) };
+    // BAR4 lives at 0x10 + 4*4 = 0x20, reached through the segment's mapped
+    // ECAM window rather than the raw physical config address.
+    let raw = match narf_bus::ecam::ptr_for(cfg, 0x20) {
+        // SAFETY: a mapped ECAM window for this device's config space.
+        Some(p) => unsafe { core::ptr::read_volatile(p as *const u32) },
+        None => return None,
+    };
     if raw & 1 == 0 {
         return None;
     }

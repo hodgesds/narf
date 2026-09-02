@@ -86,13 +86,22 @@ pub unsafe fn install_ds(ds_area_phys: u64, pebs: PebsBuffer) {
     // 0x20..0x40 per SDM §19.6.1.1).
     // SAFETY: caller-asserted DS area mapping.
     unsafe {
-        core::ptr::write_volatile((ds_area_phys + 0x20) as *mut u64, pebs.base);
-        core::ptr::write_volatile((ds_area_phys + 0x28) as *mut u64, pebs.base);
         core::ptr::write_volatile(
-            (ds_area_phys + 0x30) as *mut u64,
+            narf_lib::directmap::pv_ptr::<u64>(ds_area_phys + 0x20),
+            pebs.base,
+        );
+        core::ptr::write_volatile(
+            narf_lib::directmap::pv_ptr::<u64>(ds_area_phys + 0x28),
+            pebs.base,
+        );
+        core::ptr::write_volatile(
+            narf_lib::directmap::pv_ptr::<u64>(ds_area_phys + 0x30),
             pebs.base + (pebs.capacity_records as u64 * pebs.record_size as u64),
         );
-        core::ptr::write_volatile((ds_area_phys + 0x38) as *mut u64, pebs.interrupt_threshold);
+        core::ptr::write_volatile(
+            narf_lib::directmap::pv_ptr::<u64>(ds_area_phys + 0x38),
+            pebs.interrupt_threshold,
+        );
     }
     // wrmsr_or_gp: defense-in-depth for the case where CPUID
     // reports DS save area present but the hypervisor masked it.
@@ -128,5 +137,9 @@ pub unsafe fn disable() {
 /// `ds_area_phys` is a previously-installed DS save area.
 pub unsafe fn current_index(ds_area_phys: u64) -> u64 {
     // SAFETY: caller-asserted.
-    unsafe { core::ptr::read_volatile((ds_area_phys + 0x28) as *const u64) }
+    unsafe {
+        core::ptr::read_volatile(
+            narf_lib::directmap::pv_ptr::<u64>(ds_area_phys + 0x28).cast_const(),
+        )
+    }
 }

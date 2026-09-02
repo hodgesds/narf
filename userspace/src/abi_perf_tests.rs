@@ -918,7 +918,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         // SAFETY: the first 104-byte record starts at the beginning of data page 0.
         let record = unsafe {
-            core::slice::from_raw_parts(sample_frames[1] as *const u8, data_head as usize)
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(sample_frames[1]).kernel_ptr::<u8>(),
+                data_head as usize,
+            )
         };
         if u32::from_ne_bytes(record[0..4].try_into().unwrap()) != 9
             || u16::from_ne_bytes(record[6..8].try_into().unwrap()) != 104
@@ -1031,8 +1034,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             let ring_offset = absolute as usize & (2 * 4096 - 1);
             // SAFETY: the selected byte is inside one of the two data frames.
             unsafe {
-                *((sample_frames[1 + ring_offset / 4096] as usize + ring_offset % 4096)
-                    as *const u8)
+                *narf_memory::PhysAddr::new(
+                    sample_frames[1 + ring_offset / 4096] + (ring_offset % 4096) as u64,
+                )
+                .kernel_ptr::<u8>()
             }
         };
         let ring_u32 = |absolute: u64| {
@@ -1113,7 +1118,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         // SAFETY: all three records fit contiguously in the first data page.
         let records = unsafe {
-            core::slice::from_raw_parts(metadata_frames[1] as *const u8, metadata_head as usize)
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(metadata_frames[1]).kernel_ptr::<u8>(),
+                metadata_head as usize,
+            )
         };
         let header = |offset: usize| {
             (
@@ -1333,7 +1341,10 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
         }
         // SAFETY: the committed record occupies the first data-ring bytes.
         let trace_record = unsafe {
-            core::slice::from_raw_parts(trace_frames[1] as *const u8, trace_head as usize)
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(trace_frames[1]).kernel_ptr::<u8>(),
+                trace_head as usize,
+            )
         };
         if u32::from_ne_bytes(trace_record[0..4].try_into().unwrap()) != 9
             || u32::from_ne_bytes(trace_record[8..12].try_into().unwrap()) != 3
@@ -1353,8 +1364,12 @@ fn smoke_abi_perf_event_open_validation() -> TestResult {
             return Err("dynamic probe did not emit a perf raw sample");
         }
         // SAFETY: the second record starts immediately after the 16-byte event.
-        let probe_record =
-            unsafe { core::slice::from_raw_parts((trace_frames[1] + 16) as *const u8, 48) };
+        let probe_record = unsafe {
+            core::slice::from_raw_parts(
+                narf_memory::PhysAddr::new(trace_frames[1] + 16).kernel_ptr::<u8>(),
+                48,
+            )
+        };
         if u32::from_ne_bytes(probe_record[8..12].try_into().unwrap()) != 32
             || u64::from_ne_bytes(probe_record[12..20].try_into().unwrap()) != 0x11
             || u64::from_ne_bytes(probe_record[20..28].try_into().unwrap()) != 0x22

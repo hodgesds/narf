@@ -144,9 +144,13 @@ pub fn prepare_i2s0_tx() -> Result<(), PcmError> {
 
         // Zero the ring so a partial buffer doesn't leak stale data
         // onto the wire if the engine wraps before `play_pcm` writes.
-        // SAFETY: identity-mapped DMA page, `ring.len()` bytes.
+        // SAFETY: DMA buffer, reached through the direct map page, `ring.len()` bytes.
         unsafe {
-            core::ptr::write_bytes(ring_phys as *mut u8, 0, RING_BYTES as usize);
+            core::ptr::write_bytes(
+                narf_memory::PhysAddr::new(ring_phys).kernel_mut_ptr::<u8>(),
+                0,
+                RING_BYTES as usize,
+            );
         }
 
         program_dma_registers(dev, ring_phys, RING_BYTES);
@@ -276,19 +280,25 @@ pub fn play_pcm(samples: &[i16]) -> Result<usize, PcmError> {
     let mut guard = STREAM.lock();
     let stream = guard.as_mut().ok_or(PcmError::NoController)?;
 
-    // Copy samples into the ring. The ring is identity-mapped DMA
+    // Copy samples into the ring. The ring is DMA buffer, reached through the direct map
     // memory — volatile writes guarantee the device sees them in
     // order. Same shape as `hda::load_period`.
     let ring_phys = stream.ring_phys;
-    // SAFETY: identity-mapped DMA page; n × 2 ≤ ring.len().
+    // SAFETY: DMA buffer, reached through the direct map page; n × 2 ≤ ring.len().
     unsafe {
         for (i, &s) in samples[..n].iter().enumerate() {
-            core::ptr::write_volatile((ring_phys + (i * 2) as u64) as *mut i16, s);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ring_phys + (i * 2) as u64).kernel_mut_ptr::<i16>(),
+                s,
+            );
         }
         // Zero the tail so a short buffer doesn't replay stale
         // samples from a previous load.
         for i in n..period_samples() {
-            core::ptr::write_volatile((ring_phys + (i * 2) as u64) as *mut i16, 0);
+            core::ptr::write_volatile(
+                narf_memory::PhysAddr::new(ring_phys + (i * 2) as u64).kernel_mut_ptr::<i16>(),
+                0,
+            );
         }
     }
     compiler_fence(Ordering::SeqCst);

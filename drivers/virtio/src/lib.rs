@@ -260,13 +260,21 @@ impl VirtioMmioDevice {
     ///
     /// # Safety
     /// `base_raw` must be the base of a live, mapped virtio-mmio register
-    /// window at least `REG_VENDOR_ID + 4` bytes long. This performs volatile
+    /// window at least `REG_VENDOR_ID + 4` bytes long, or 0, which is
+    /// rejected without any dereference. This performs volatile
     /// reads at `base_raw + {0, REG_VERSION, REG_DEVICE_ID, REG_VENDOR_ID}`.
     pub unsafe fn probe_raw(base_raw: u64) -> Result<Self, ProbeError> {
         // SAFETY: caller guarantees `base_raw` is a live, mapped virtio-mmio
         // window large enough for the four 4-byte register reads below; each
         // offset (0, REG_VERSION, REG_DEVICE_ID, REG_VENDOR_ID) is a 4-byte
         // aligned MMIO register defined by the virtio-mmio layout.
+        // A null base is never a live register window. Callers probe with
+        // `probe_raw(0)` to mean "no virtio-mmio device here"; that must not
+        // depend on physical address 0 happening to be mapped, which is no
+        // longer true now that the kernel's low identity map is gone.
+        if base_raw == 0 {
+            return Err(ProbeError::WrongMagic);
+        }
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             let magic = core::ptr::read_volatile(base_raw as *const u32);

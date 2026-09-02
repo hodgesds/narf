@@ -210,7 +210,9 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
     };
     let argc = match read_u64(new_rsp) {
         Some(v) => v,
@@ -237,12 +239,14 @@ fn smoke_userspace_load_user_process_with_argv() -> TestResult {
         let p = match unsafe {
             paging::translate(proc.address_space.root, VirtAddr::new(v & !0xFFF))
         } {
-            Some(p) => p.as_u64() | (v & 0xFFF),
+            Some(p) => {
+                narf_memory::PhysAddr::new(p.as_u64() | (v & 0xFFF)).kernel_ptr::<u8>() as u64
+            }
             None => return false,
         };
         let want_b = want.as_bytes();
         for (i, &b) in want_b.iter().enumerate() {
-            // SAFETY: `p` is the physical/identity-mapped address that `translate`
+            // SAFETY: `p` is the direct-map address for the frame `translate`
             // returned for this user `VirtAddr`, so it points at the mapped page;
             // `i < want_b.len()` keeps the read within the resolved string buffer.
             // SAFETY: Valid memory or trusted environment
@@ -476,7 +480,9 @@ fn smoke_userspace_load_user_process_with_interp() -> TestResult {
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
     };
     let rsp = proc.stack_top.as_u64();
     let argc = read_u64(rsp).unwrap_or(0xDEAD);
@@ -829,7 +835,9 @@ fn smoke_userspace_apply_relative_relocations() -> TestResult {
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
     };
     let got = match read_u64(RELOC_VA) {
         Some(v) => v,
@@ -1025,7 +1033,9 @@ fn smoke_userspace_apply_relr_relocations() -> TestResult {
         // SAFETY: `p` is the phys frame just resolved; OR-ing the in-page offset
         // stays within it and the `u64` read is 8-aligned by construction.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
     };
 
     // Each covered slot must be link_time_value + BIAS, applied once.
@@ -1186,7 +1196,9 @@ fn smoke_userspace_apply_symbol_relocations() -> TestResult {
         // OR-ing the in-page offset stays within that identity-mapped frame, and the
         // `u64` read is aligned because callers pass 8-byte-aligned `vaddr`s.
         // SAFETY: Valid memory or trusted environment
-        Some(unsafe { *((p.as_u64() | (vaddr & 0xFFF)) as *const u64) })
+        Some(unsafe {
+            *narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u64>()
+        })
     };
     let got = match read_u64(RELOC_VA) {
         Some(v) => v,
@@ -1495,7 +1507,9 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         // as `translate` requires; only walks its tables for the page-aligned vaddr.
         // SAFETY: Valid memory or trusted environment
         let p = unsafe { paging::translate(as_.root, VirtAddr::new(vaddr & !0xFFF)) }
-            .map(|p| p.as_u64() | (vaddr & 0xFFF))
+            .map(|p| {
+                narf_memory::PhysAddr::new(p.as_u64() | (vaddr & 0xFFF)).kernel_ptr::<u8>() as u64
+            })
             .unwrap();
         // SAFETY: `p` is the identity-mapped phys for that mapped stack page; the
         // helper writes 8-byte-aligned words there, so this `u64` read is aligned
@@ -1556,7 +1570,9 @@ fn smoke_userspace_init_sysv_stack_layout() -> TestResult {
         // `VirtAddr`, reading table entries with no aliasing.
         // SAFETY: Valid memory or trusted environment
         let kp = match unsafe { paging::translate(as_.root, VirtAddr::new(user_p & !0xFFF)) } {
-            Some(p) => p.as_u64() | (user_p & 0xFFF),
+            Some(p) => {
+                narf_memory::PhysAddr::new(p.as_u64() | (user_p & 0xFFF)).kernel_ptr::<u8>() as u64
+            }
             None => return false,
         };
         let ebytes = expected.as_bytes();
@@ -1661,8 +1677,8 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
         Some(p) => p,
         None => return TestResult::Fail("translate found no mapping for segment base"),
     };
-    // Read back via identity map.
-    // SAFETY: `phys` is the identity-mapped frame `translate` resolved for the
+    // Read back through the direct map.
+    // SAFETY: `phys` is the frame `translate` resolved, via the direct map for the
     // segment base; the loader copied the segment there, so reading the leading
     // 7 bytes is in-bounds, and a `[u8; 7]` has alignment 1.
     // SAFETY: Valid memory or trusted environment
@@ -1778,7 +1794,7 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
             Some(p) => p,
             None => return TestResult::Fail("translate returned None for a mapped page"),
         };
-        // SAFETY: `phys` is the identity-mapped frame `translate` resolved; the
+        // SAFETY: `phys` is the frame `translate` resolved, via the direct map; the
         // loader stored the per-page sentinel byte there, so a 1-byte read is valid.
         // SAFETY: Valid memory or trusted environment
         let got: u8 = unsafe { core::ptr::read_volatile(phys.kernel_ptr::<u8>()) };
@@ -1796,13 +1812,13 @@ fn smoke_userspace_load_multi_segment() -> TestResult {
     // SAFETY: Valid memory or trusted environment
     let data_p1_phys = unsafe { paging::translate(root, VirtAddr::new(DATA_VADDR + 0x1000)) }
         .expect("data page 1 mapped");
-    // SAFETY: `data_p1_phys` is the identity-mapped frame for that mapped R+W page;
+    // SAFETY: `data_p1_phys` is the direct-map pointer for that mapped R+W page;
     // it is 4 KiB-aligned so a `u32` write at offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
     unsafe {
         core::ptr::write_volatile(data_p1_phys.kernel_mut_ptr::<u32>(), 0xCAFEBABE);
     }
-    // SAFETY: re-translating the same vaddr yields the identity-mapped phys of the
+    // SAFETY: re-translating the same vaddr yields the direct-map pointer for the
     // page just written; reading the `u32` back at offset 0 is aligned and in-bounds.
     // SAFETY: Valid memory or trusted environment
     let echo: u32 = unsafe {

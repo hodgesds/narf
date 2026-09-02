@@ -143,12 +143,15 @@ async fn poll_yielding_until<F: FnMut() -> bool>(
 pub struct Tpm {
     base: u64,
     kind: TpmKind,
-    /// CRB command-buffer phys (read from CRB_CMD_PA_*).
-    cmd_phys: u64,
+    /// Kernel VA of the CRB command buffer, whose physical address was
+    /// read from CRB_CMD_PA_*. The buffer is firmware-published memory
+    /// outside our allocator, so it is reached through an uncached
+    /// `ioremap` window rather than a raw physical address.
+    cmd_va: u64,
     /// CRB command buffer max size (CRB_CMD_SIZE).
     cmd_size: u32,
-    /// CRB response-buffer phys.
-    rsp_phys: u64,
+    /// Kernel VA of the CRB response buffer.
+    rsp_va: u64,
     rsp_size: u32,
 }
 
@@ -173,9 +176,9 @@ impl Tpm {
             return Ok(Self {
                 base,
                 kind: TpmKind::Tis,
-                cmd_phys: 0,
+                cmd_va: 0,
                 cmd_size: 0,
-                rsp_phys: 0,
+                rsp_va: 0,
                 rsp_size: 0,
             });
         }
@@ -220,21 +223,42 @@ impl Tpm {
                 if cmd_phys == 0 || rsp_phys == 0 || cmd_size == 0 {
                     return Err(TpmError::NoCommandBuffer);
                 }
+                // Map both windows once, here: the buffers live in
+                // firmware-published memory that the kernel never mapped.
+                // SAFETY: addresses and sizes come from the chip's own CRB
+                // registers, which describe buffers it owns.
+                let (cmd_map, rsp_map) = unsafe {
+                    (
+                        narf_memory::ioremap::ioremap(
+                            cmd_phys,
+                            cmd_size as u64,
+                            narf_memory::ioremap::MmioAttrs::Device,
+                        ),
+                        narf_memory::ioremap::ioremap(
+                            rsp_phys,
+                            rsp_size as u64,
+                            narf_memory::ioremap::MmioAttrs::Device,
+                        ),
+                    )
+                };
+                let (Ok(cmd_map), Ok(rsp_map)) = (cmd_map, rsp_map) else {
+                    return Err(TpmError::NoCommandBuffer);
+                };
                 Ok(Self {
                     base,
                     kind: TpmKind::Crb,
-                    cmd_phys,
+                    cmd_va: cmd_map.virt,
                     cmd_size,
-                    rsp_phys,
+                    rsp_va: rsp_map.virt,
                     rsp_size,
                 })
             }
             TpmKind::Tis => Ok(Self {
                 base,
                 kind: TpmKind::Tis,
-                cmd_phys: 0,
+                cmd_va: 0,
                 cmd_size: 0,
-                rsp_phys: 0,
+                rsp_va: 0,
                 rsp_size: 0,
             }),
         }
@@ -292,10 +316,11 @@ impl Tpm {
         )
         .await;
         // 2. Write command into the command buffer.
-        // SAFETY: command buffer phys was published by firmware/ACPI.
+        // SAFETY: command buffer was published by firmware/ACPI and
+        // mapped at construction.
         unsafe {
             for (i, b) in cmd.iter().enumerate() {
-                core::ptr::write_volatile((self.cmd_phys + i as u64) as *mut u8, *b);
+                core::ptr::write_volatile((self.cmd_va + i as u64) as *mut u8, *b);
             }
         }
         // 3. Kick CRB_CTRL_START.GO.
@@ -319,14 +344,14 @@ impl Tpm {
         // 5. Read response. The size lives in bytes [2..6] of the
         //    response header (TPM2 §5.6 paragraphSize).
         let mut header = [0u8; 10];
-        // SAFETY: rsp_phys is the CRB response buffer physical address
+        // SAFETY: rsp_va is the mapped CRB response buffer
         // published by firmware (REG_CRB_RSP_LO/HI), identity-mapped at boot,
         // and rsp_size >= 10 was checked when the buffer was set up, so
-        // rsp_phys..rsp_phys+10 are valid readable MMIO/DMA bytes.
+        // rsp_va..rsp_va+10 are valid readable MMIO/DMA bytes.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         unsafe {
             for (i, byte) in header.iter_mut().enumerate() {
-                *byte = core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8);
+                *byte = core::ptr::read_volatile((self.rsp_va + i as u64) as *const u8);
             }
         }
         let resp_size = u32::from_be_bytes([header[2], header[3], header[4], header[5]]);
@@ -336,10 +361,10 @@ impl Tpm {
         let mut out = alloc::vec![0u8; resp_size as usize];
         for (i, byte) in out.iter_mut().enumerate() {
             // SAFETY: resp_size <= self.rsp_size was checked above, so every
-            // i in 0..resp_size addresses a byte inside the firmware-published,
-            // identity-mapped CRB response buffer at rsp_phys.
+            // i in 0..resp_size addresses a byte inside the firmware-published
+            // CRB response buffer mapped at rsp_va.
             // SAFETY: Valid MMIO bounds or trusted driver environment
-            *byte = unsafe { core::ptr::read_volatile((self.rsp_phys + i as u64) as *const u8) };
+            *byte = unsafe { core::ptr::read_volatile((self.rsp_va + i as u64) as *const u8) };
         }
         Ok(out)
     }
@@ -548,31 +573,85 @@ pub fn __reset_for_test() {
 
 // ── helpers ─────────────────────────────────────────────────────────
 
+/// ioremap'd base of the locality-0 register block, or 0 before the first
+/// access. The TPM sits at a fixed low MMIO address (0xFED4_0000) that used
+/// to be reachable through the kernel identity map; that map is being removed,
+/// so the block is mapped Device (uncached) on first touch and every accessor
+/// translates through it.
+#[cfg(target_arch = "x86_64")]
+static TPM_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// One locality is 4 KiB (PC Client PTP §5.2); we only ever use locality 0.
+#[cfg(target_arch = "x86_64")]
+const TPM_LOCALITY_LEN: u64 = 0x1000;
+
+/// Translate a TPM register's physical address to its mapped VA, mapping the
+/// block on first use. Returns `None` if the window cannot be mapped or the
+/// address falls outside locality 0 — callers then read all-ones / skip the
+/// write rather than touching a raw physical address.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn tpm_ptr(phys: u64) -> Option<*mut u8> {
+    use core::sync::atomic::Ordering;
+    let offset = phys.checked_sub(TPM_BASE_LOCALITY_0)?;
+    if offset >= TPM_LOCALITY_LEN {
+        return None;
+    }
+    let mut va = TPM_VA.load(Ordering::Acquire);
+    if va == 0 {
+        // SAFETY: the architectural TPM locality-0 window, owned by us.
+        let mapped = unsafe {
+            narf_memory::ioremap::ioremap(
+                TPM_BASE_LOCALITY_0,
+                TPM_LOCALITY_LEN,
+                narf_memory::ioremap::MmioAttrs::Device,
+            )
+        }
+        .ok()?;
+        // A racing mapper wins; ioremap caches by range so both see one window.
+        match TPM_VA.compare_exchange(0, mapped.virt, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => va = mapped.virt,
+            Err(existing) => va = existing,
+        }
+    }
+    Some((va + offset) as *mut u8)
+}
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn read32(phys: u64) -> u32 {
-    // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe { core::ptr::read_volatile(phys as *const u32) }
+    match tpm_ptr(phys) {
+        // SAFETY: caller-asserted register, reached through the ioremap window.
+        Some(p) => unsafe { core::ptr::read_volatile(p as *const u32) },
+        None => u32::MAX,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn write32(phys: u64, v: u32) {
-    // SAFETY: caller-asserted identity-mapped MMIO.
-    unsafe {
-        core::ptr::write_volatile(phys as *mut u32, v);
+    if let Some(p) = tpm_ptr(phys) {
+        // SAFETY: as above.
+        unsafe {
+            core::ptr::write_volatile(p as *mut u32, v);
+        }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn read8(phys: u64) -> u8 {
-    // SAFETY: same.
-    unsafe { core::ptr::read_volatile(phys as *const u8) }
+    match tpm_ptr(phys) {
+        // SAFETY: as above.
+        Some(p) => unsafe { core::ptr::read_volatile(p) },
+        None => u8::MAX,
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
 unsafe fn write8(phys: u64, v: u8) {
-    // SAFETY: same.
-    unsafe {
-        core::ptr::write_volatile(phys as *mut u8, v);
+    if let Some(p) = tpm_ptr(phys) {
+        // SAFETY: as above.
+        unsafe {
+            core::ptr::write_volatile(p, v);
+        }
     }
 }
 
