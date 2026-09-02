@@ -177,7 +177,8 @@ pub fn for_each_field<F: FnMut(&FieldInfo)>(mut f: F) {
 ///
 /// AML `SystemMemory` regions were reached by casting the physical address
 /// straight to a pointer, which only worked because the kernel identity-mapped
-/// low memory. That map is going away, and AML is evaluated at RUNTIME (EC
+/// low memory. Both architectures have now dropped that map — aarch64 kept
+/// this passthrough until its boot identity window went away, and AML is evaluated at RUNTIME (EC
 /// hotkeys, thermal zones) — potentially with a user CR3 active — so these
 /// accesses must go through a mapping that exists in every address space.
 ///
@@ -188,7 +189,6 @@ pub fn for_each_field<F: FnMut(&FieldInfo)>(mut f: F) {
 ///
 /// `ioremap` caches by range, so repeated evaluations of the same region reuse
 /// one window rather than leaking VA space.
-#[cfg(target_arch = "x86_64")]
 fn sysmem_ptr(phys: u64, width_bytes: usize) -> Option<*mut u8> {
     // SAFETY: the address comes from firmware's own OperationRegion
     // declaration; AML owns the window it describes.
@@ -201,11 +201,6 @@ fn sysmem_ptr(phys: u64, width_bytes: usize) -> Option<*mut u8> {
     }
     .ok()?;
     Some(mapping.va() as *mut u8)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn sysmem_ptr(phys: u64, _width_bytes: usize) -> Option<*mut u8> {
-    Some(phys as *mut u8)
 }
 
 /// MMIO read of `width_bytes` at physical address `phys`.

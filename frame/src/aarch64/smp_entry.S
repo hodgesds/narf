@@ -85,6 +85,24 @@ _ap_start:
     /* Jump to virtual entry. The stack pointer set above is a
      * physical address inside lo_L1[1]'s identity map, so it
      * stays valid post-MMU. We pass logical_id in x0 per AAPCS64. */
+    /* Rebase SP onto the high half.
+     *
+     * SP was set to the stack's *physical* top above, which is what the AP
+     * needs while the MMU is off. Once TTBR1 is live the kernel reaches that
+     * memory at `phys | KERNEL_PHYS_OFFSET`, and the low identity window is
+     * dropped after bring-up -- leaving the AP running on a stack nothing
+     * maps. The fault that follows cannot even be reported, because the
+     * exception handler needs the stack it just lost.
+     *
+     * Safe here: the stack is empty (nothing pushed since `mov sp, x1`), and
+     * the rebase names the same physical memory through the kernel window.
+     * The x86_64 boot path does the same thing after enabling paging. */
+    mov  x1, #0xFFFFFF8000000000 >> 32
+    lsl  x1, x1, #32            /* KERNEL_PHYS_OFFSET */
+    mov  x2, sp
+    add  x2, x2, x1
+    mov  sp, x2
+
     mov  x0, x19
     ldr  x1, =_ap_start_rust
     br   x1

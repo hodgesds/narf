@@ -105,7 +105,7 @@ pub unsafe fn enumerate(dtb: Option<PhysAddr>) -> Vec<BusDevice> {
     const VIRT_MMIO_COUNT: u64 = 32;
     for slot in 0..VIRT_MMIO_COUNT {
         let base_addr = VIRT_MMIO_BASE + slot * VIRT_MMIO_STRIDE;
-        // SAFETY: virt-machine virtio-mmio region is identity-mapped.
+        // SAFETY: probe_virtio_mmio maps the window it reads.
         if let Some(dev) = unsafe { probe_virtio_mmio(base_addr, VIRT_MMIO_STRIDE) } {
             out.push(dev);
         }
@@ -506,13 +506,25 @@ fn is_pcie_node(name: &[u8]) -> bool {
 /// Probe a virtio-mmio transport: check the magic, read the device-id
 /// register, and build a `BusDevice` iff the slot is populated.
 ///
+/// The descriptor records the *physical* base, which is what a bus
+/// descriptor should carry and what `VirtioMmioDevice::probe` maps later;
+/// the registers are read here through a mapping of our own.
+///
 /// # Safety
-/// `base` must be an identity-mapped MMIO region at least `len` bytes
-/// long. On QEMU virt the virtio-mmio region at 0x0a00_0000 is
-/// always identity-mapped in the low-RAM identity window set up by
-/// the MMU init.
+/// `base_addr` must name a real virtio-mmio transport window at least `len`
+/// bytes long. It used to have to be identity-mapped as well -- the boot
+/// tables left a Device block over 0..1 GiB and this read straight through
+/// it -- but the kernel no longer keeps that window.
 unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
-    let base_ptr = base_addr as *const u32;
+    // A transport slot is 0x200 bytes; `ioremap` rounds sub-page requests up
+    // and caches by range, so the 32 slots sharing a page share one mapping.
+    // SAFETY: a virtio-mmio window the machine describes; ours while mapped.
+    let mapping = unsafe {
+        narf_memory::ioremap::ioremap(base_addr, len, narf_memory::ioremap::MmioAttrs::Device)
+    }
+    .ok()?;
+    let regs = mapping.va();
+    let base_ptr = regs as *const u32;
     compiler_fence(Ordering::SeqCst);
     // SAFETY: caller-asserted MMIO window.
     let magic = unsafe { core::ptr::read_volatile(base_ptr) };
@@ -524,7 +536,7 @@ unsafe fn probe_virtio_mmio(base_addr: u64, len: u64) -> Option<BusDevice> {
     compiler_fence(Ordering::SeqCst);
     let device_id =
         // SAFETY: same region, +0x08 is still inside the 0x200-byte window.
-        unsafe { core::ptr::read_volatile((base_addr + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
+        unsafe { core::ptr::read_volatile((regs + VIRTIO_MMIO_DEVICE_ID) as *const u32) };
     compiler_fence(Ordering::SeqCst);
     if device_id == 0 {
         return None;

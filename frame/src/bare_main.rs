@@ -2301,6 +2301,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, TTBR0 @ {:?}, console remapped",
                             ttbr0
                         );
+                        // Move the GIC onto ioremap windows before the
+                        // identity block goes: it was brought up long before
+                        // the handoff, when `ioremap` did not yet exist, so
+                        // until now it has been reaching its registers at
+                        // their physical bases through that block.
+                        narf_interrupts::aarch64::gic::remap_mmio(0);
+                        narf_interrupts::aarch64::its::remap_mmio();
+                        let _ = writeln!(
+                            console::Writer,
+                            "  gic: distributor + redistributor remapped"
+                        );
                     }
                     Err(e) => {
                         let _ = writeln!(console::Writer, "  mmu: init failed: {e:?}");
@@ -2447,6 +2458,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     "  smp: started {} AP(s); {} CPU(s) online",
                     started,
                     narf_lib::smp::online_count()
+                );
+                // `boot.S` leaves a 2 GiB identity window in TTBR0 (Device at
+                // 0x0, Normal RAM at 0x4000_0000) that nothing replaces
+                // outside a user address space or a domain root, so
+                // kernel-context code can still dereference physical
+                // addresses — the hazard the x86_64 side removed.
+                //
+                // It has to survive until here, not just to the MMU handoff:
+                // APs come up via PSCI with the MMU off and reach `.boot`
+                // data (`AP_STACKS`) at its physical address, exactly as the
+                // x86_64 trampoline window must outlive `start_aps`. By now
+                // every AP is online and on high-half addresses.
+                // SAFETY: `start_aps` has returned; RAM reaches TTBR1 through
+                // `kernel_ptr` and MMIO is behind `ioremap`.
+                unsafe {
+                    narf_memory::mmu::drop_boot_identity_map();
+                }
+                let _ = writeln!(
+                    console::Writer,
+                    "  mmu: boot identity window dropped from TTBR0"
                 );
                 #[cfg(not(feature = "kernel-test"))]
                 if started > 0 {
