@@ -273,7 +273,7 @@ fn alias_vas(phys: u64) -> ([u64; 2], usize) {
         n += 1;
     }
     if crate::addr::direct_map_live() {
-        out[n] = phys | crate::addr::KERNEL_DIRECT_MAP_BASE;
+        out[n] = phys | crate::addr::direct_map_base();
         n += 1;
     }
     (out, n)

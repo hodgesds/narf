@@ -94,11 +94,7 @@ impl PhysAddr {
             // The `direct_map_live()` fallback still yields identity
             // before `init_mmu` installs the map, which is what early
             // boot (running on boot.S's identity CR3) needs.
-            if direct_map_live() {
-                (self.0 | KERNEL_DIRECT_MAP_BASE) as *mut T
-            } else {
-                self.0 as *mut T
-            }
+            (self.0 | direct_map_base()) as *mut T
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -110,17 +106,20 @@ impl PhysAddr {
         }
     }
 
+    /// Invertibility bound: this is `phys | base`, and the base owns PML4
+    /// slot bits (39 and up), so [`PhysAddr::from_kernel_ptr`] recovers
+    /// `phys` only while the two are disjoint — i.e. `phys` below the
+    /// alignment `init_mmu` chose for the slot (512 GiB for a single-chunk
+    /// map). Beyond that the map does not cover the address anyway; a fixed
+    /// base merely made the arithmetic look right.
+    ///
     /// Const-pointer counterpart to [`Self::kernel_mut_ptr`].
     #[inline]
     pub fn kernel_ptr<T>(self) -> *const T {
         #[cfg(target_arch = "x86_64")]
         {
             // See `kernel_mut_ptr`: all frames take the offset once live.
-            if direct_map_live() {
-                (self.0 | KERNEL_DIRECT_MAP_BASE) as *const T
-            } else {
-                self.0 as *const T
-            }
+            (self.0 | direct_map_base()) as *const T
         }
         #[cfg(target_arch = "aarch64")]
         {
@@ -167,12 +166,13 @@ impl PhysAddr {
             // call — `virt_to_phys` on a vmalloc address is a classic bug,
             // which CONFIG_DEBUG_VIRTUAL turns into a BUG() rather than a
             // plausible-looking wrong answer.
-            if crate::addr::direct_map_live() {
+            let base = crate::addr::direct_map_base();
+            if base != 0 {
                 assert!(
-                    v >= KERNEL_DIRECT_MAP_BASE,
+                    v >= base,
                     "from_kernel_ptr on a pointer outside the direct map                      ({v:#x}) — a vmalloc/ioremap VA has no physical address                      to recover; the caller must resolve it through its own                      mapping (e.g. vmalloc::vfree) instead"
                 );
-                PhysAddr::new(v & !KERNEL_DIRECT_MAP_BASE)
+                PhysAddr::new(v & !base)
             } else {
                 PhysAddr::new(v)
             }
@@ -206,6 +206,9 @@ impl PhysAddr {
 /// PML4[384..510] (127 slots = 63.5 TiB), sized at boot to installed
 /// RAM. `init_mmu` builds it and calls [`direct_map_activate`] after
 /// the CR3 swap.
+/// The map is built at a slot chosen at boot (see `init_mmu`), so this is
+/// the *lowest* legal base rather than the live one — read
+/// [`direct_map_base`] for that.
 #[cfg(target_arch = "x86_64")]
 pub const KERNEL_DIRECT_MAP_BASE: u64 = 0xFFFF_C000_0000_0000;
 
@@ -233,23 +236,36 @@ pub const KERNEL_DIRECT_MAP_PML4_SLOTS: usize = 127;
 /// identity window. Flipping to offset addressing only after the map is
 /// live keeps the accessor valid across the whole boot, without a
 /// separate early/late code path at each of its ~50 call sites.
+/// Live base of the direct map, or 0 before `init_mmu` installs it.
+///
+/// Zero is load-bearing rather than a sentinel: `phys | 0 == phys`, so the
+/// early-boot identity behaviour falls out of the same OR the live path uses.
+/// That removes the `direct_map_live()` test — an atomic load *and* a branch —
+/// from the hottest accessor in the kernel, leaving one load and an OR.
 #[cfg(target_arch = "x86_64")]
-static DIRECT_MAP_LIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static DIRECT_MAP_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Publish that the high-half direct map is installed. Called once by
-/// `init_mmu` immediately after the CR3 swap.
+/// Publish the direct map's base. Called once by `init_mmu` immediately
+/// after the CR3 swap, with the (possibly randomized) base the map was
+/// actually built at.
 #[cfg(target_arch = "x86_64")]
 #[inline]
-pub fn direct_map_activate() {
-    DIRECT_MAP_LIVE.store(true, core::sync::atomic::Ordering::Release);
+pub fn direct_map_activate_at(base: u64) {
+    DIRECT_MAP_BASE.store(base, core::sync::atomic::Ordering::Release);
 }
 
-/// Whether the high-half direct map is live. Used by the kernel RAM
-/// accessors to pick the offset vs. identity window.
+/// Base the direct map is live at, or 0 while it is not.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+pub fn direct_map_base() -> u64 {
+    DIRECT_MAP_BASE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Whether the high-half direct map is live.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 pub fn direct_map_live() -> bool {
-    DIRECT_MAP_LIVE.load(core::sync::atomic::Ordering::Acquire)
+    direct_map_base() != 0
 }
 
 impl VirtAddr {
