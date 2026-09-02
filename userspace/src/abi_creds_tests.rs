@@ -1083,6 +1083,80 @@ fn smoke_abi_caps_capset_drop_is_irreversible() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_caps_capset_drop_is_irreversible);
 
+// ── keepcaps: SECURE_KEEP_CAPS retention across a setuid drop ─────────
+//
+// `security/commoncap.c::cap_emulate_setxuid` clears the permitted and
+// effective sets when a task drops off root — UNLESS `issecure(
+// SECURE_KEEP_CAPS)`, the securebit that `PR_SET_KEEPCAPS` toggles. This
+// is the exact dance `dbus-broker-launch --audit` runs to hand the broker
+// one retained capability across a drop to the `messagebus` uid:
+//
+//   prctl(PR_SET_KEEPCAPS, 1); capset(...); setresgid/setresuid(nonroot);
+//   prctl(PR_SET_KEEPCAPS, 0); capset(...)   // re-raise from retained pP
+//
+// NARF used to ignore keepcaps and always empty pP, so the second capset
+// hit `!cap_issubset(*permitted, old->cap_permitted)` and returned EPERM,
+// the broker child aborted, the system bus never started, and logind
+// fail-looped — no graphical session. cap_emulate_setxuid is driven
+// directly here: a real setresuid would strand FAKE_TASK at a non-root uid
+// for every later test.
+
+fn smoke_abi_caps_keepcaps_retains_permitted_across_setuid() -> TestResult {
+    with_setup(|| {
+        const PR_SET_KEEPCAPS: u64 = 8;
+        set_caps(CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        let _ = call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS, 1));
+        // root (euid 0) -> messagebus (uid == euid == suid == 81).
+        crate::handlers::__test_cap_emulate_setxuid(FAKE_TASK, (0, 0, 0), (81, 81, 81));
+        let got = do_capget();
+        // The retained permitted set is what lets the SECOND capset re-raise
+        // effective — the call that used to fail EPERM.
+        let reraise = do_capset(CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT, 0);
+        // Restore keepcaps so no later setuid test inherits it (the prctl
+        // table is not reset between tests). Runs before any early return.
+        let _ = call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS, 0));
+        // pP survives; pE is cleared by the euid drop even under keepcaps.
+        match got? {
+            (0, p, 0) if p == CAP_SYS_ADMIN_BIT => {}
+            _ => return Err("keepcaps did not retain the permitted set across setuid"),
+        }
+        match reraise {
+            Some(0) => Ok(()),
+            Some(-1) => Err("capset after a keepcaps setuid was refused EPERM"),
+            _ => Err("capset after a keepcaps setuid: want 0"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_keepcaps_retains_permitted_across_setuid
+);
+
+fn smoke_abi_caps_no_keepcaps_clears_permitted_across_setuid() -> TestResult {
+    with_setup(|| {
+        // The guard the fix must not break: WITHOUT keepcaps, dropping off
+        // root still empties pP/pE, so a re-raise is refused. This is what
+        // makes an ordinary `setuid(nonroot)` actually shed privilege.
+        const PR_SET_KEEPCAPS: u64 = 8;
+        set_caps(CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
+        let _ = call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS, 0));
+        crate::handlers::__test_cap_emulate_setxuid(FAKE_TASK, (0, 0, 0), (81, 81, 81));
+        match do_capget()? {
+            (0, 0, 0) => {}
+            _ => return Err("setuid off root without keepcaps left capabilities behind"),
+        }
+        match do_capset(CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT, 0) {
+            Some(-1) => Ok(()),
+            Some(0) => Err("re-raised a capability that the setuid drop should have removed"),
+            _ => Err("capset with an emptied permitted set: want -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_caps_no_keepcaps_clears_permitted_across_setuid
+);
+
 fn smoke_abi_caps_capset_effective_must_be_within_permitted() -> TestResult {
     with_setup(|| {
         // `if (!cap_issubset(*effective, *permitted)) return -EPERM;`

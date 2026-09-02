@@ -4392,17 +4392,33 @@ pub(crate) fn capable_in_own_ns(cap: u32) -> bool {
 /// restores effective from permitted, which is how a set-uid-root helper
 /// regains its powers after temporarily dropping them.
 ///
-/// LINUX-GAP: `SECURE_KEEP_CAPS` and `SECURE_NO_SETUID_FIXUP` (the
-/// securebits that suppress this) are not modelled, so the fixup always
-/// runs. Both default to off in Linux, so this matches the default.
+/// `SECURE_KEEP_CAPS` is honored through the per-task `keep_caps` flag that
+/// `PR_SET_KEEPCAPS` maintains: a task that asked to keep its capabilities
+/// across a uid change retains its permitted/effective sets, exactly as
+/// `!issecure(SECURE_KEEP_CAPS)` gates the clear in Linux. Ambient is
+/// cleared regardless, matching `cap_clear(new->cap_ambient)` which sits
+/// OUTSIDE the securebit test.
+///
+/// This is the privilege-drop dance a launcher like `dbus-broker-launch`
+/// runs — `PR_SET_KEEPCAPS(1); capset; setresuid(nonroot);
+/// PR_SET_KEEPCAPS(0); capset` — to hand the broker a single retained
+/// capability (CAP_AUDIT_WRITE under `--audit`). Without the gate the
+/// second `capset` saw an emptied permitted set and returned EPERM, so the
+/// broker child aborted, the system bus never came up, and logind
+/// fail-looped — no graphical session.
+///
+/// LINUX-GAP: `SECURE_NO_SETUID_FIXUP` (which suppresses this fixup
+/// entirely) is not modelled; it defaults off, so the fixup still runs.
 fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     let was_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
     let is_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
     let mut caps = read_caps(task);
     let mut changed = false;
     if was_root && !is_root {
-        caps.permitted = 0;
-        caps.effective = 0;
+        if !read_prctl(task).keep_caps {
+            caps.permitted = 0;
+            caps.effective = 0;
+        }
         caps.ambient = 0;
         changed = true;
     }
@@ -4507,6 +4523,22 @@ pub fn __test_set_uidgid_euid(task: u64, euid: u32) {
 #[doc(hidden)]
 pub fn __test_cap_fork(parent: u64, child: u64) {
     cap_fork(parent, child);
+}
+
+/// Test-only: run the setuid capability fixup with explicit `(uid, euid,
+/// suid)` old/new credentials. A real `setresuid` would strand FAKE_TASK
+/// at a non-root uid for every later test; this drives the fixup directly
+/// (it only writes the caps table) so the KEEP_CAPS retention path is
+/// exercisable in isolation.
+#[doc(hidden)]
+pub fn __test_cap_emulate_setxuid(task: u64, old: (u32, u32, u32), new: (u32, u32, u32)) {
+    let mk = |t: (u32, u32, u32)| UidGid {
+        uid: t.0,
+        euid: t.1,
+        suid: t.2,
+        ..Default::default()
+    };
+    cap_emulate_setxuid(task, mk(old), mk(new));
 }
 
 /// Test-only: [`task_capable`] for an explicit task.
