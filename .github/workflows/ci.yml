@@ -742,6 +742,29 @@ jobs:
             cargo xtask test --arch=${{ matrix.arch }} --features cgroup-all,container
           fi
 
+      # QEMU's `virt` machine carries virtio-mmio transports in its DTB but
+      # leaves them empty, and every standard flavour presents virtio over
+      # PCI instead — so `smoke_virtio_mmio_probe` skips, and the probe path
+      # went unexercised for its whole life. It was broken that entire time
+      # (PR #253): it dereferenced a raw physical address, and no suite ever
+      # ran it. Populate one transport so the path stays guarded.
+      #
+      # `force-legacy` defaults true and NARF is modern-only, so without it
+      # the probe rejects the transport as legacy (version 1).
+      #
+      # Scoped to the one subsystem that covers it — this is a guard against
+      # regression, not a second full run. aarch64 only: x86_64's q35 has no
+      # virtio-mmio bus to populate.
+      - name: cargo xtask test — virtio-mmio transport populated
+        if: matrix.arch == 'aarch64'
+        env:
+          XTASK_QEMU_TIMEOUT_SECS: "2400"
+          XTASK_BOOT_SMOKE_TIMEOUT_SECS: "1200"
+          NARF_QEMU_EXTRA: "-device virtio-rng-device -global virtio-mmio.force-legacy=false"
+        run: |
+          cargo xtask test --arch=aarch64 --features cgroup-all,container \
+            --subsystem verification
+
   feature-matrix:
     name: feature-check / ${{ matrix.features }}
     needs: changes
