@@ -253,12 +253,29 @@ fn smoke_abi_bpf_prog_load_neg() -> TestResult {
         if load_prog(BPF_PROG_TYPE_TRACING, &no_exit) != Some(EINVAL) {
             return Err("BPF_PROG_LOAD accepted a program with no exit");
         }
-        // A program type whose attach surface does not exist yet.
-        if load_prog(BPF_PROG_TYPE_SOCKET_FILTER, &ret_imm(0)) != Some(EOPNOTSUPP) {
-            return Err("an unimplemented prog_type did not return EOPNOTSUPP");
+        // A prog type NARF has no surface for. Linux's `find_prog_type()`
+        // (kernel/bpf/syscall.c) returns -EINVAL for ANY type not backed by a
+        // registered ops slot -- both `type >= ARRAY_SIZE` and a NULL ops entry
+        // (a type the kernel's ABI defines but this build did not compile in).
+        // NARF is exactly that "in the ABI, absent from this build" case, so the
+        // errno must be EINVAL, not EOPNOTSUPP -- the kernel's BPF_PROG_LOAD
+        // never emits EOPNOTSUPP for the prog-type check. systemd's BPF feature
+        // probes (bpf_devices_supported / bpf_firewall_supported) load a
+        // CGROUP_DEVICE / CGROUP_SKB program precisely to read this errno; an
+        // unexpected EOPNOTSUPP made them mishandle "unsupported" and abort the
+        // unit (systemd-logind, NetworkManager, which set DeviceAllow=/
+        // IPAddressDeny=) instead of degrading to best-effort.
+        if load_prog(BPF_PROG_TYPE_SOCKET_FILTER, &ret_imm(0)) != Some(EINVAL) {
+            return Err("an unimplemented prog_type did not return EINVAL");
         }
-        if load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, &ret_imm(0)) != Some(EOPNOTSUPP) {
-            return Err("writable raw tracepoints were accepted without writable ctx support");
+        if load_prog(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, &ret_imm(0)) != Some(EINVAL) {
+            return Err("an unimplemented prog_type did not return EINVAL");
+        }
+        // BPF_PROG_TYPE_CGROUP_DEVICE (15) -- the DeviceAllow= filter systemd
+        // probes for. Same code path, same required errno.
+        const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
+        if load_prog(BPF_PROG_TYPE_CGROUP_DEVICE, &ret_imm(0)) != Some(EINVAL) {
+            return Err("CGROUP_DEVICE prog load did not return EINVAL");
         }
         Ok(())
     })
