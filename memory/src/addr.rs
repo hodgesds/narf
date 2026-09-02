@@ -145,10 +145,33 @@ impl PhysAddr {
         let v = ptr as u64;
         #[cfg(target_arch = "x86_64")]
         {
-            // A direct-map pointer is >= KERNEL_DIRECT_MAP_BASE; anything
-            // below that is a low identity pointer (ptr == phys). This
-            // mirrors `kernel_mut_ptr`'s LOW_IDENTITY_LIMIT gate.
-            if v >= KERNEL_DIRECT_MAP_BASE {
+            // Mirror `kernel_mut_ptr` exactly: once the direct map is live it
+            // applies the offset to *every* frame, so the inverse strips it
+            // from every pointer. Before activation the accessor is the
+            // identity, and so is this.
+            //
+            // The old form discriminated on `v >= KERNEL_DIRECT_MAP_BASE` and
+            // treated anything lower as an identity pointer, which was a
+            // faithful mirror only while `kernel_mut_ptr` had a
+            // LOW_IDENTITY_LIMIT gate. That gate is gone and the kernel no
+            // longer identity-maps RAM, so a lower pointer is not an identity
+            // pointer — it is a vmalloc/ioremap VA (x86_64 vmalloc starts at
+            // 0xFFFF_8800_0000_0000, *below* the direct map) and there is no
+            // physical address to recover from it. Returning one anyway hands
+            // the caller a frame it does not own; `slab::dealloc_large` is
+            // safe only because it checks `is_valloc_ptr` first, i.e. the
+            // invariant lived in the callers rather than here.
+            //
+            // `assert!`, not `debug_assert!`: the builds where a wrong frame
+            // reaches the buddy are release builds. Linux makes the same
+            // call — `virt_to_phys` on a vmalloc address is a classic bug,
+            // which CONFIG_DEBUG_VIRTUAL turns into a BUG() rather than a
+            // plausible-looking wrong answer.
+            if crate::addr::direct_map_live() {
+                assert!(
+                    v >= KERNEL_DIRECT_MAP_BASE,
+                    "from_kernel_ptr on a pointer outside the direct map                      ({v:#x}) — a vmalloc/ioremap VA has no physical address                      to recover; the caller must resolve it through its own                      mapping (e.g. vmalloc::vfree) instead"
+                );
                 PhysAddr::new(v & !KERNEL_DIRECT_MAP_BASE)
             } else {
                 PhysAddr::new(v)
