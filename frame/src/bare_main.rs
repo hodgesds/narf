@@ -331,19 +331,8 @@ pub fn narf_cpu_node_opt(cpu: u32) -> u32 {
 fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     use narf_graphics::{FbConsole, Pixel32};
 
-    // Identity map covers 0..=4 GiB. UEFI sometimes maps the GOP
-    // FB above 4 GiB; defer those to the Late install path which
-    // runs after `ioremap`-style high-mem mapping.
     let phys = fb_info.addr.raw();
     let end = phys.saturating_add(fb_info.height as u64 * fb_info.pitch as u64);
-    if end > (4u64 << 30) {
-        let _ = writeln!(
-            console::Writer,
-            "  early-fb: skipping — FB at {:#x} above 4 GiB identity map",
-            phys
-        );
-        return;
-    }
 
     // The bootloader gave us an FB. Wrap it in a generic scanout
     // and ask narf_fb to surface it. select_active() then returns
@@ -388,8 +377,43 @@ fn try_install_early_fb_console(fb_info: narf_boot::info::FramebufferInfo) {
     let wc_slot: Option<u32> = None;
     let _ = mtrr_phys;
 
-    // SAFETY: BSP, no concurrent draw; FB phys is identity-mapped
-    // (verified above to be < 4 GiB).
+    // Map the framebuffer before the console writes a single pixel.
+    //
+    // This used to install the console straight onto the FB's *physical*
+    // address and rely on PML4[0] covering 0..4 GiB — which is why the only
+    // guard here was a "skip FBs above 4 GiB" check. The kernel no longer
+    // identity-maps anything, so a UEFI GOP framebuffer at 0x8000_0000 sailed
+    // through that check and then #PF'd on the first glyph. BIOS boot never
+    // reaches this path (it uses bochs/virtio-gpu), so no local suite saw it.
+    //
+    // Mapping also removes the 4 GiB ceiling: an `ioremap`'d FB is reachable
+    // wherever firmware put it.
+    let page_off = phys & 0xFFF;
+    let map_len = ((end - phys) + page_off + 0xFFF) & !0xFFF;
+    #[cfg(target_arch = "x86_64")]
+    let fb_attrs = narf_memory::ioremap::MmioAttrs::WriteCombining;
+    #[cfg(not(target_arch = "x86_64"))]
+    let fb_attrs = narf_memory::ioremap::MmioAttrs::Device;
+    // SAFETY: the FB region was published by the bootloader and is owned
+    // exclusively kernel-side.
+    let mapped = match unsafe {
+        narf_memory::ioremap::ioremap(phys - page_off, map_len, fb_attrs)
+    } {
+        Ok(m) => m.virt + page_off,
+        Err(_) => {
+            // ioremap may not be serviceable this early on some paths; the
+            // Late `fb-console-install` step maps it and installs there.
+            let _ = writeln!(
+                console::Writer,
+                "  early-fb: deferring — could not map FB at {phys:#x} yet"
+            );
+            return;
+        }
+    };
+    narf_fb::rebase_generic(mapped);
+
+    // SAFETY: BSP, no concurrent draw; the scanout now points at the mapped
+    // window installed just above.
     // SAFETY: Valid memory or trusted environment
     let fb = unsafe { scanout.framebuffer() };
     let con = FbConsole::new(fb, Pixel32::NARF_FG, Pixel32::NARF_BG);

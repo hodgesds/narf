@@ -404,7 +404,17 @@ static GENERIC_FB: narf_lib::sync::IrqSafeSpinLock<
     Option<narf_graphics_driver::generic::GenericFb>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Bus-physical base recorded when the generic FB was registered.
+///
+/// Kept separate from `GenericFb::addr` because [`rebase_generic`]
+/// overwrites that with a mapped VA, while both the early console install
+/// and the Late WC remap need the *physical* address to `ioremap`. Reading
+/// it out of the live struct made "read this before rebasing" a caller
+/// obligation, which is the kind of ordering rule that quietly breaks.
+static GENERIC_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn register_generic(fb: narf_graphics_driver::generic::GenericFb) {
+    GENERIC_PHYS.store(fb.addr, core::sync::atomic::Ordering::Release);
     *GENERIC_FB.lock() = Some(fb);
 }
 
@@ -421,12 +431,14 @@ pub fn rebase_generic(new_addr: u64) {
     }
 }
 
-/// Original bus-phys of the generic FB, before any rebase.
-/// Returns `None` if no GenericFb is registered, or if rebase
-/// already happened (caller's responsibility to read this BEFORE
-/// calling `rebase_generic`).
+/// Bus-physical base of the generic FB, as registered. Unaffected by
+/// [`rebase_generic`], so it stays correct however many times the mapping
+/// is rebased. `None` when no GenericFb is registered.
 pub fn generic_phys() -> Option<u64> {
-    GENERIC_FB.lock().as_ref().map(|f| f.addr)
+    match GENERIC_PHYS.load(core::sync::atomic::Ordering::Acquire) {
+        0 => None,
+        p => Some(p),
+    }
 }
 
 /// Backend-agnostic scanout view for the boot-provided linear FB.
