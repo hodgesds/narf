@@ -1019,6 +1019,52 @@ fn smoke_abi_path_mknodat_enoent() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_enoent);
 
+// mknodat MUST resolve a relative pathname against its dirfd, not the cwd —
+// exactly like mkdirat/openat. systemd builds the per-boot sandbox nodes
+// /run/systemd/inaccessible/{reg,chr,blk,fifo,sock} with
+// `mknodat(fd_of_inaccessible_dir, "sock", …)`; dropping the dirfd created them
+// under the cwd, so every ProtectKernelLogs=/ProtectClock=/… service's bind
+// SOURCE was missing and its namespace setup failed 226/EXIT_NAMESPACE
+// (systemd-logind, NetworkManager, systemd-resolved — the seat/desktop gate).
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_path_mknodat_honors_dirfd() -> TestResult {
+    with_memfs("/p", "p", &[], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_DIRECTORY: u64 = 0o200000;
+        const S_IFSOCK: u64 = 0o140000;
+        // A dirfd for /p, then a RELATIVE "sock" under it.
+        let dir = b"/p\0";
+        let dirfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_PATH | O_DIRECTORY, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open /p as a dirfd"),
+        };
+        let rel = b"sock\0";
+        match call(
+            Syscall::Mknodat.raw(),
+            a3(dirfd, rel.as_ptr() as u64, S_IFSOCK | 0o600, 0),
+        ) {
+            Some(0) => {}
+            _ => return Err("mknodat(dirfd, relative) did not return 0"),
+        }
+        // The node must exist at /p/sock (the dirfd's directory). The old
+        // dropped-dirfd bug resolved "sock" against the cwd instead, so
+        // /p/sock would be absent.
+        let abs = b"/p/sock\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, abs.as_ptr() as u64, O_PATH, 0),
+        ) {
+            Some(fd) if fd >= 0 => Ok(()),
+            _ => Err("mknodat did not create the node under its dirfd (/p/sock)"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_path_mknodat_honors_dirfd);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_abi_path_mknod_legacy_alias() -> TestResult {
     with_memfs("/p", "p", &[], || {
