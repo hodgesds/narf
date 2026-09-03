@@ -219,8 +219,23 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
             }
         }
         let mut staging = alloc::vec![0u8; want];
-        let outcome = poll_blocking(endpoint.ops.read(offset, &mut staging))
-            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+        // A non-blocking read on a stream/char device must never park: poll the
+        // read future once and map Pending to WouldBlock, so the O_NONBLOCK /
+        // nonblock_read_eagain path below returns EAGAIN. An ops whose read()
+        // future returns Pending-when-empty (e.g. an evdev node libinput reads
+        // O_NONBLOCK) would otherwise park in `poll_blocking` BEFORE that check,
+        // bypassing it — hanging a compositor's input loop (kwin never returns
+        // to its event loop, so it never presents a frame). Regular files are
+        // excluded: they never EAGAIN on read, and their read future may need
+        // several non-parking polls to fill from the page cache.
+        let nonblock_stream = endpoint.nonblocking()
+            && (endpoint.ops.is_stream() || endpoint.ops.nonblock_read_eagain());
+        let read_fut = endpoint.ops.read(offset, &mut staging);
+        let outcome = if nonblock_stream {
+            poll_once(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+        } else {
+            poll_blocking(read_fut).unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+        };
         match outcome {
             Ok(0) => break,
             Ok(read) if read <= staging.len() => {
