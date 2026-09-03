@@ -2632,8 +2632,15 @@ pub mod tests {
 
         static RESUMED_CONFINED: AtomicBool = AtomicBool::new(false);
 
-        if !pks::is_active() && !pcid::is_active() {
-            return TestResult::Skip("no x86 hardware-domain backend is active");
+        // The body drives `Pks::` primitives directly, so it needs the PKS
+        // backend specifically — not merely *some* domain backend. Accepting
+        // PCID here let the test run on a CPU without PKS, where those calls
+        // are inert: the confinement it then asserts could never be observed.
+        // A PCID equivalent would have to compare CR3/PCID across the switch;
+        // there is no such test yet.
+        if !pks::is_active() {
+            let _ = pcid::is_active();
+            return TestResult::Skip("PKS backend not active (this test drives PKS directly)");
         }
 
         struct DomainYield {
