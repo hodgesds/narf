@@ -541,11 +541,13 @@ calling task's accumulated user and kernel accounting.
 `sched_setscheduler(2)` accepts Linux's `SCHED_RESET_ON_FORK` modifier on every
 otherwise-supported policy; the cooperative scheduler retains compatibility
 state without assigning Linux real-time scheduling authority.
-`sched_yield(2)` returns success after checking pending signals. An own-stack
-task transfers to the executor when another runnable task, deferred wake, due
-timer, or staged cross-CPU wake can use the CPU; when the caller is the sole
-runnable task it returns directly because an executor round could only select
-that same task. Queue contention conservatively preserves the transfer.
+`sched_yield(2)` returns success and then uses the common completed-syscall
+return path to deliver any pending signal; it is not interrupted with
+`EINTR`. An own-stack task transfers to the executor when another runnable
+task, deferred wake, due timer, or staged cross-CPU wake can use the CPU; when
+the caller is the sole runnable task it returns directly because an executor
+round could only select that same task. Queue contention conservatively
+preserves the transfer.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
@@ -589,6 +591,14 @@ On both architectures, each user task enters and resumes EL0/CPL3 with a
 dedicated scheduler-owned kernel stack. Timer preemption retains the complete
 trap continuation, FP/SIMD image, address space, and TLS value; a TLS value of
 zero is restored explicitly rather than treated as an unpublished sentinel.
+Each live `Task` also owns atomic user/kernel CPU-time counters. The current
+own-stack task folds scheduler slices and syscall spans directly through its
+published task pointer, while compatibility ledgers remain only as a fallback
+for legacy/test contexts and are included in read/reset operations. A task
+never charges another task through this pointer: an expected TID must match.
+`CLONE_THREAD` children inherit the creator CPU as a soft initial preference
+while retaining the full allowed affinity mask, preserving shared-mm locality
+without preventing idle-CPU stealing.
 On aarch64, switch-out reads live `TPIDR_EL0` because EL0 may update it without
 a syscall, fork/clone inherit that live value and FPSIMD image, and exec clears
 both in line with Linux arm64 `copy_thread`/`flush_thread` semantics.

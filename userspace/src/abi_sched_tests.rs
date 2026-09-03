@@ -959,6 +959,53 @@ fn smoke_abi_sched_yield_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi/sched_yield", smoke_abi_sched_yield_pos);
 
+// A pending signal does not interrupt sched_yield. Linux completes the yield
+// with return value 0, then delivers the signal from the common return-to-user
+// path. In particular, SA_RESTART must not replay an already-completed yield.
+// This exercises the real `syscall`-instruction entry with a UserState snapshot
+// so the completion hook can build the signal frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_sched_yield_pending_signal_still_returns_zero() -> TestResult {
+    with_setup(|| {
+        let task = FAKE_TASK;
+        crate::handlers::__test_set_sigaction_flags(
+            task,
+            10,
+            0xDEAD_BEEF,
+            crate::handlers::SA_RESTART | crate::handlers::SA_NODEFER,
+        );
+        crate::handlers::raise_signal_pending(task, 10);
+
+        let mut user_stack = [0u8; 512];
+        let mut state = narf_scheduler::UserState {
+            rax: Syscall::Yield.raw() as u64,
+            rip: 0x4000,
+            rflags: 0x202,
+            rsp: user_stack.as_mut_ptr() as u64 + user_stack.len() as u64,
+            valid: 1,
+            ..Default::default()
+        };
+        let ret = crate::kernel_syscall_entry_plain_with_state(
+            Syscall::Yield.raw(),
+            &SyscallArgs::default(),
+            &mut state as *mut _ as *mut u8,
+        );
+
+        if ret.status != SyscallReturn::OK || ret.value != 0 {
+            return Err("pending signal interrupted sched_yield instead of returning 0");
+        }
+        if state.rip != 0xDEAD_BEEF {
+            return Err("pending signal was not delivered after sched_yield completed");
+        }
+        Ok(())
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "syscall_abi/sched_yield",
+    smoke_abi_sched_yield_pending_signal_still_returns_zero
+);
+
 // ─────────────────────────────────────────────────────────────────────
 // PRIO_PGRP / PRIO_USER and IOPRIO_WHO_PGRP / IOPRIO_WHO_USER
 //

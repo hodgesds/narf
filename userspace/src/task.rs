@@ -54,6 +54,13 @@ pub struct Task {
     /// Raw wstatus staged at exit (also mirrored in the pending-
     /// termination table until the reap plumbing migrates here).
     pub exit_code: AtomicI32,
+    /// User-mode/on-task CPU time folded at each scheduler slice boundary.
+    /// The current task is the sole writer at any instant; an atomic keeps
+    /// cold `/proc`, rusage, and perf readers lock-free across CPU migration.
+    user_cpu_ns: AtomicU64,
+    /// Time spent executing syscall continuations for this task. Kept beside
+    /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
+    kernel_cpu_ns: AtomicU64,
     /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
     /// thread group is terminating. Consulted so a sibling that races
     /// the group exit reports the group's status.
@@ -108,6 +115,8 @@ impl Task {
             pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
             exit_code: AtomicI32::new(0),
+            user_cpu_ns: AtomicU64::new(0),
+            kernel_cpu_ns: AtomicU64::new(0),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
@@ -167,6 +176,73 @@ pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {
         }
     }
     task_get(tid)
+}
+
+/// Charge CPU time to the currently-published stackful user task without
+/// cloning its `Arc` or consulting the global task registry. The scheduler's
+/// opaque context points at the `Task` owned by the in-flight future, so it is
+/// stable for this complete call.
+#[inline]
+pub(crate) fn account_current_cpu_ns(expected_tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return false;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
+    let task = unsafe { &*ptr };
+    if expected_tid != 0 && task.tid != expected_tid {
+        return false;
+    }
+    if user_ns != 0 {
+        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
+    }
+    if kernel_ns != 0 {
+        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
+    }
+    true
+}
+
+#[inline]
+pub(crate) fn current_task_is(tid: u64) -> bool {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    // SAFETY: same publication/lifetime contract as `account_current_cpu_ns`.
+    !ptr.is_null() && unsafe { (*ptr).tid == tid }
+}
+
+#[inline]
+pub(crate) fn cpu_times(tid: u64) -> (u64, u64) {
+    task_get(tid).map_or((0, 0), |task| {
+        (
+            task.user_cpu_ns.load(Ordering::Relaxed),
+            task.kernel_cpu_ns.load(Ordering::Relaxed),
+        )
+    })
+}
+
+/// Non-blocking form for timer-trap diagnostics. `None` means registry lock
+/// contention; an absent task is a successful zero snapshot.
+#[cfg(feature = "unix-latency-trace")]
+pub(crate) fn cpu_times_try(tid: u64) -> Option<(u64, u64)> {
+    let tasks = TASKS.try_lock()?;
+    Some(tasks.get(&tid).map_or((0, 0), |task| {
+        (
+            task.user_cpu_ns.load(Ordering::Relaxed),
+            task.kernel_cpu_ns.load(Ordering::Relaxed),
+        )
+    }))
+}
+
+#[doc(hidden)]
+pub(crate) fn reset_cpu_times(tid: u64, user: bool, kernel: bool) {
+    if let Some(task) = task_get(tid) {
+        if user {
+            task.user_cpu_ns.store(0, Ordering::Relaxed);
+        }
+        if kernel {
+            task.kernel_cpu_ns.store(0, Ordering::Relaxed);
+        }
+    }
 }
 
 // ── `unix-latency-trace`: user-mode sampling profiler ────────────────

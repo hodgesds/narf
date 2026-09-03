@@ -58,6 +58,62 @@ pub const CR4_FSGSBASE: u64 = 1 << 16;
 /// CR4 bit: OSXSAVE (bit 18). Enables XSAVE and processor extended states.
 pub const CR4_OSXSAVE: u64 = 1 << 18;
 
+/// CR0 bit: task switched. While set, an x87/MMX/SSE/AVX instruction raises
+/// `#NM`; kernels use that fault to defer restoring a task's FP/SIMD image
+/// until the task actually consumes the register file.
+pub const CR0_TS: u64 = 1 << 3;
+
+/// Read CR0.
+///
+/// # Safety
+/// `MOV from CR0` is legal at CPL=0.
+#[inline]
+pub unsafe fn read_cr0() -> u64 {
+    let value: u64;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller guarantees CPL=0.
+    unsafe {
+        asm!("mov {value}, cr0", value = out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+
+/// Set CR0.TS so the next FP/SIMD instruction raises `#NM`.
+///
+/// # Safety
+/// Must run at CPL=0. The caller must provide a `#NM` handler before returning
+/// to code that may execute FP/SIMD instructions.
+#[inline]
+pub unsafe fn set_task_switched() {
+    // SAFETY: forwarded CPL=0 contract.
+    let value = unsafe { read_cr0() };
+    if value & CR0_TS != 0 {
+        return;
+    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: setting the architecturally-defined TS bit preserves every
+    // other CR0 bit read immediately above.
+    unsafe {
+        asm!("mov cr0, {value}", value = in(reg) (value | CR0_TS), options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// Clear CR0.TS before restoring or using the current FP/SIMD register file.
+///
+/// # Safety
+/// `CLTS` is privileged and therefore requires CPL=0.
+#[inline]
+pub unsafe fn clear_task_switched() {
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: caller guarantees CPL=0.
+    unsafe {
+        asm!("clts", options(nomem, nostack, preserves_flags));
+    }
+    compiler_fence(Ordering::SeqCst);
+}
+
 /// Read CR4.
 ///
 /// # Safety

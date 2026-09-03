@@ -101,6 +101,11 @@ shared type directly; it does not define or cast a mirror layout.
 
   Without step 2–3 the Frame would execute trap handling under the
   faulting domain's rights — a privilege-escalation pathway.
+- **User x86 `#NM` is the deferred FP/SIMD restore boundary.** After the common
+  prologue has entered Frame state, vector 7 from CPL3 asks the scheduler to
+  restore only the currently published own-stack task image and returns to
+  retry the faulting instruction. Vector 7 from CPL0, or without a matching
+  published task/image, remains on the fatal exception path.
 - **NMI / double-fault / machine-check paths have their own IST-backed
   trap frames** and perform the same save/restore independently. They
   must not assume GS / TPIDR_EL1 is valid.

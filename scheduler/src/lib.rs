@@ -639,9 +639,10 @@ pub fn current_task_id() -> TaskId {
 
 fn publish_budget_window(cpu: usize, started: u64, view: BudgetView, budget: &ResourceBudget) {
     let Some(period) = budget.period else {
-        CURRENT_BUDGET_SOFT_END[cpu].store(0, Ordering::Release);
-        CURRENT_BUDGET_HARD_END[cpu].store(0, Ordering::Release);
-        CURRENT_BUDGET_BORROWING[cpu].store(false, Ordering::Release);
+        // Every period-budgeted dispatch clears its window before returning
+        // to the executor. An unthrottled dispatch therefore inherits the
+        // already-clear state and need not dirty three per-CPU atomics twice
+        // per context switch.
         return;
     };
     let borrow_available = if period.exhaustion == ExhaustionPolicy::IdleBorrow {
@@ -821,6 +822,35 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
         class_rank: core::sync::atomic::AtomicU8::new(0),
     }
 }; narf_lib::percpu::MAX_CPUS];
+
+/// O(1) hint that the currently-dispatched task has a runnable peer on this
+/// CPU. The core refreshes it from the authoritative dispatch scan; wake and
+/// enqueue paths may only change it false->true. A stale true costs one
+/// harmless executor round, while a wake can never be hidden behind a stale
+/// false as long as every false->true runnable transition calls
+/// `note_runnable_peer`.
+static RUNNABLE_PEER: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+
+#[inline]
+pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
+    if cpu < RUNNABLE_PEER.len() {
+        RUNNABLE_PEER[cpu].store(present, Ordering::Release);
+    }
+}
+
+/// A task became runnable on `home`. Do not count a wake of the task already
+/// executing there as a peer; its own cooperative re-arm is the hot case.
+#[inline]
+fn note_runnable_peer(home: u32, task: u64) {
+    let cpu = home as usize;
+    if cpu >= RUNNABLE_PEER.len() {
+        return;
+    }
+    if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != task {
+        RUNNABLE_PEER[cpu].store(true, Ordering::Release);
+    }
+}
 
 /// Publish the dispatched task's scheduling snapshot for this CPU (see
 /// [`CURRENT_SCHED`]). Four relaxed stores, once per dispatch — the cache the
@@ -1327,6 +1357,10 @@ pub(crate) struct TaskSlot {
     /// `RunQueue` projection can read its `priority`/`class`/
     /// `affinity` fields.
     pub(crate) spec: TaskSpec,
+    /// Last affinity-registry generation folded into `spec.affinity`. Most
+    /// dispatches only compare this against one shard-local atomic; the
+    /// registry lock is taken only after an actual affinity update.
+    affinity_generation: u64,
     account: BudgetAccount,
     /// Optional per-process address space (Stage 4). `None` for
     /// kernel-only tasks; `Some` for a user-mode task that shares
@@ -1631,8 +1665,9 @@ pub fn init() {
         // call `__reset_queues_for_test` explicitly.
         panic!("narf_scheduler::init() called twice — would wipe spawned tasks; use __reset_queues_for_test in tests");
     }
-    for q in READY.iter() {
+    for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
+        RUNNABLE_PEER[cpu].store(false, Ordering::Release);
     }
     // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
@@ -1658,10 +1693,11 @@ pub fn init() {
 /// touching the one-shot `INITIALIZED` flag in `init`.
 #[doc(hidden)]
 pub fn __reset_queues_for_test() {
-    for q in READY.iter() {
+    for (cpu, q) in READY.iter().enumerate() {
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
+        RUNNABLE_PEER[cpu].store(false, Ordering::Release);
     }
     // Clear any tasks left staged on the per-CPU wake inboxes so they don't
     // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
@@ -1698,26 +1734,32 @@ const NEW_TASK_AFFINITY_SHARD: IrqSafeSpinLock<alloc::vec::Vec<TaskAffinityEntry
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 static TASK_AFFINITY: [IrqSafeSpinLock<alloc::vec::Vec<TaskAffinityEntry>>;
     narf_lib::percpu::MAX_CPUS] = [NEW_TASK_AFFINITY_SHARD; narf_lib::percpu::MAX_CPUS];
+static TASK_AFFINITY_GENERATION: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicU64::new(1) }; narf_lib::percpu::MAX_CPUS];
 
 #[inline]
 fn task_affinity_shard(id: TaskId) -> usize {
     id.raw() as usize % narf_lib::percpu::MAX_CPUS
 }
 
-fn register_task_affinity(id: TaskId, affinity: Affinity, realtime_pinned: bool) {
-    let mut entries = TASK_AFFINITY[task_affinity_shard(id)].lock();
+fn register_task_affinity(id: TaskId, affinity: Affinity, realtime_pinned: bool) -> u64 {
+    let shard = task_affinity_shard(id);
+    let mut entries = TASK_AFFINITY[shard].lock();
     entries.retain(|entry| entry.id != id);
     entries.push(TaskAffinityEntry {
         id,
         affinity,
         realtime_pinned,
     });
+    TASK_AFFINITY_GENERATION[shard]
+        .fetch_add(1, Ordering::Release)
+        .wrapping_add(1)
 }
 
 fn unregister_task_affinity(id: TaskId) {
-    TASK_AFFINITY[task_affinity_shard(id)]
-        .lock()
-        .retain(|entry| entry.id != id);
+    let shard = task_affinity_shard(id);
+    TASK_AFFINITY[shard].lock().retain(|entry| entry.id != id);
+    TASK_AFFINITY_GENERATION[shard].fetch_add(1, Ordering::Release);
 }
 
 /// Snapshot the online CPU set used by Linux affinity syscalls and cgroups.
@@ -1761,8 +1803,9 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
         allowed,
         preferred: lowest_allowed_cpu(allowed),
     };
-    {
-        let mut entries = TASK_AFFINITY[task_affinity_shard(id)].lock();
+    let affinity_generation = {
+        let shard = task_affinity_shard(id);
+        let mut entries = TASK_AFFINITY[shard].lock();
         let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) else {
             return Err(SetAffinityError::TaskNotFound);
         };
@@ -1770,7 +1813,10 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             return Err(SetAffinityError::RealtimePinned);
         }
         entry.affinity = affinity;
-    }
+        TASK_AFFINITY_GENERATION[shard]
+            .fetch_add(1, Ordering::Release)
+            .wrapping_add(1)
+    };
 
     // If the task is parked, update and (when its old queue is no longer
     // allowed) move it before it can dispatch again. At most one READY lock is
@@ -1783,11 +1829,15 @@ pub fn set_task_affinity(id: TaskId, requested: CpuSet) -> Result<(), SetAffinit
             let pos = queue.iter().position(|slot| slot.id == id)?;
             if allowed.contains(CpuId(cpu as u32)) {
                 queue[pos].spec.affinity = affinity;
+                queue[pos].affinity_generation = affinity_generation;
                 return Some(None);
             }
             let mut slot = queue.remove(pos).expect("affinity slot disappeared");
             slot.spec.affinity = affinity;
-            if let Some(scheduler) = scheduler {
+            slot.affinity_generation = affinity_generation;
+            if let Some(scheduler) =
+                scheduler.filter(|policy| policy::observes_queue_events(*policy))
+            {
                 scheduler.on_task_queue_event(
                     cpu_id,
                     policy::TaskQueueEvent::Dequeued {
@@ -1823,9 +1873,15 @@ fn registered_affinity(id: TaskId) -> Option<Affinity> {
 }
 
 fn refresh_slot_affinity(slot: &mut TaskSlot) {
+    let shard = task_affinity_shard(slot.id);
+    let generation = TASK_AFFINITY_GENERATION[shard].load(Ordering::Acquire);
+    if slot.affinity_generation == generation {
+        return;
+    }
     if let Some(affinity) = registered_affinity(slot.id) {
         slot.spec.affinity = affinity;
     }
+    slot.affinity_generation = generation;
 }
 
 fn lowest_allowed_cpu(set: CpuSet) -> Option<CpuId> {
@@ -1948,7 +2004,9 @@ pub(crate) fn drain_cpu_queue(cpu: CpuId) -> bool {
             destinations.push(target);
         }
         for (slot, target) in queue.drain(..).zip(destinations) {
-            if let Some(scheduler) = scheduler {
+            if let Some(scheduler) =
+                scheduler.filter(|policy| policy::observes_queue_events(*policy))
+            {
                 scheduler.on_task_queue_event(
                     cpu,
                     policy::TaskQueueEvent::Dequeued {
@@ -2160,17 +2218,28 @@ fn drain_wake_list(cpu: usize) {
         // lock (the dispatch path already owns the round on this CPU) and
         // attributes the Enqueued event to this CPU.
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-        let meta = policy::TaskMeta::from_slot(&slot);
+        if slot.awake.flag.load(Ordering::Acquire) {
+            note_runnable_peer(cpu as u32, slot.id.raw());
+        }
         policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
             let mut ready = READY[cpu].lock();
             ready
                 .as_mut()
                 .expect("scheduler: wake-inbox drain before init")
                 .push_back(slot);
-            if let Some(scheduler) = scheduler {
+            if let Some(scheduler) =
+                scheduler.filter(|policy| policy::observes_queue_events(*policy))
+            {
+                let slot = ready
+                    .as_ref()
+                    .and_then(|queue| queue.back())
+                    .expect("wake-inbox slot was just enqueued");
                 scheduler.on_task_queue_event(
                     CpuId(cpu as u32),
-                    policy::TaskQueueEvent::Enqueued { task: meta, reason },
+                    policy::TaskQueueEvent::Enqueued {
+                        task: policy::TaskMeta::from_slot(slot),
+                        reason,
+                    },
                 );
             }
         });
@@ -2198,6 +2267,9 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     // polled (it may have been work-stolen onto a different CPU).
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
     let awake = slot.awake.flag.load(Ordering::Acquire);
+    if awake {
+        note_runnable_peer(cpu as u32, slot.id.raw());
+    }
     let me = narf_lib::percpu::current_cpu();
 
     // REMOTE target off-load: stage onto the target's lock-free wake list (Linux
@@ -2240,16 +2312,22 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     // remote target the slot is uncontended. No cross-core IPI is needed for the
     // local case (`resched_remote` no-ops for the current CPU); a quiesced remote
     // target is driven by its lifecycle controller, not a wake kick.
-    let meta = policy::TaskMeta::from_slot(&slot);
     policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
         let mut q = READY[cpu].lock();
         q.as_mut()
             .expect("scheduler: spawn before init")
             .push_back(slot);
-        if let Some(scheduler) = scheduler {
+        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
+            let slot = q
+                .as_ref()
+                .and_then(|queue| queue.back())
+                .expect("scheduler slot was just enqueued");
             scheduler.on_task_queue_event(
                 CpuId(cpu as u32),
-                policy::TaskQueueEvent::Enqueued { task: meta, reason },
+                policy::TaskQueueEvent::Enqueued {
+                    task: policy::TaskMeta::from_slot(slot),
+                    reason,
+                },
             );
         }
     });
@@ -2356,6 +2434,8 @@ where
     }
     spec.affinity = normalize_spawn_affinity(spec.affinity);
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let cpu = target_cpu(&spec);
+    let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let slot = TaskSlot {
         task: Box::pin(f),
         awake: Arc::new(WakeCell {
@@ -2367,6 +2447,7 @@ where
         }),
         id,
         spec,
+        affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
         donation: None,
@@ -2375,8 +2456,6 @@ where
         nproc_guard: None,
         vruntime: 0,
     };
-    let cpu = target_cpu(&spec);
-    register_task_affinity(id, spec.affinity, false);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
 }
@@ -2418,6 +2497,7 @@ where
     spec.budget_cap = Some(*authority);
     spec.work_kind = WorkKind::KernelThread;
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
+    let affinity_generation = register_task_affinity(id, spec.affinity, true);
     let slot = TaskSlot {
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
         awake: Arc::new(WakeCell {
@@ -2429,6 +2509,7 @@ where
         }),
         id,
         spec,
+        affinity_generation,
         addr_space: None,
         account: BudgetAccount::new(),
         donation: None,
@@ -2437,7 +2518,6 @@ where
         nproc_guard: None,
         vruntime: 0,
     };
-    register_task_affinity(id, spec.affinity, true);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     Ok(id)
 }
@@ -2642,6 +2722,8 @@ where
     ));
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let task: BoxedTask = Box::pin(f);
+    let cpu = target_cpu(&spec);
+    let affinity_generation = register_task_affinity(id, spec.affinity, false);
     let slot = TaskSlot {
         task,
         awake: Arc::new(WakeCell {
@@ -2653,6 +2735,7 @@ where
         }),
         id,
         spec,
+        affinity_generation,
         addr_space: Some(addr_space),
         account: BudgetAccount::new(),
         donation: None,
@@ -2661,8 +2744,6 @@ where
         nproc_guard: Some(NprocGuard::new()),
         vruntime: 0,
     };
-    let cpu = target_cpu(&spec);
-    register_task_affinity(id, spec.affinity, false);
     enqueue_on(cpu, slot, policy::TaskEnqueueReason::Admitted);
     id
 }
@@ -2777,6 +2858,7 @@ pub fn replace_address_space(id: TaskId, new_arc: Arc<AddressSpace>) -> Option<A
             .map(|(_, v)| v.clone());
         p.retain(|(k, _)| *k != id.raw());
         p.push((id.raw(), new_arc));
+        PENDING_SLOT_AS_LEN[task_affinity_shard(id)].store(p.len(), Ordering::Release);
         return prev;
     }
     for q in READY.iter() {
@@ -2805,15 +2887,22 @@ const NEW_PENDING_SLOT_AS_SHARD: PendingAddressSpaceShard =
     IrqSafeSpinLock::new(alloc::vec::Vec::new());
 static PENDING_SLOT_AS: [PendingAddressSpaceShard; narf_lib::percpu::MAX_CPUS] =
     [NEW_PENDING_SLOT_AS_SHARD; narf_lib::percpu::MAX_CPUS];
+static PENDING_SLOT_AS_LEN: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
 /// Drain `PENDING_SLOT_AS` for the given task id, returning the
 /// pending AS if any. Called by `poll_one_round` after popping a
 /// slot — the caller assigns the override into `slot.addr_space`
 /// so the activate + ACTIVE_USER_AS publication see the new AS.
 fn take_pending_slot_as(id: TaskId) -> Option<Arc<AddressSpace>> {
-    let mut p = PENDING_SLOT_AS[task_affinity_shard(id)].lock();
+    let shard = task_affinity_shard(id);
+    if PENDING_SLOT_AS_LEN[shard].load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let mut p = PENDING_SLOT_AS[shard].lock();
     let pos = p.iter().position(|(k, _)| *k == id.raw())?;
     let (_, v) = p.swap_remove(pos);
+    PENDING_SLOT_AS_LEN[shard].store(p.len(), Ordering::Release);
     Some(v)
 }
 
@@ -2845,6 +2934,8 @@ const NEW_PENDING_DONOR_SHARD: IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONAT
     IrqSafeSpinLock::new([(TaskId::NONE, 0); MAX_PENDING_DONATIONS]);
 static PENDING_DONOR_DEBITS: [IrqSafeSpinLock<[(TaskId, u64); MAX_PENDING_DONATIONS]>;
     narf_lib::percpu::MAX_CPUS] = [NEW_PENDING_DONOR_SHARD; narf_lib::percpu::MAX_CPUS];
+static PENDING_DONOR_DEBIT_COUNT: [AtomicUsize; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicUsize::new(0) }; narf_lib::percpu::MAX_CPUS];
 
 #[inline]
 fn donor_shard(donor: TaskId) -> usize {
@@ -2852,10 +2943,12 @@ fn donor_shard(donor: TaskId) -> usize {
 }
 
 fn stage_donor_debit(donor: TaskId, cycles: u64) {
-    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
+    let shard = donor_shard(donor);
+    let mut t = PENDING_DONOR_DEBITS[shard].lock();
     for slot in t.iter_mut() {
         if slot.0 == TaskId::NONE {
             *slot = (donor, cycles);
+            PENDING_DONOR_DEBIT_COUNT[shard].fetch_add(1, Ordering::Release);
             return;
         }
     }
@@ -2866,24 +2959,35 @@ fn drain_donor_debit(donor: TaskId) -> u64 {
     if donor == TaskId::NONE {
         return 0;
     }
-    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
+    let shard = donor_shard(donor);
+    if PENDING_DONOR_DEBIT_COUNT[shard].load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let mut t = PENDING_DONOR_DEBITS[shard].lock();
     let mut total = 0u64;
+    let mut removed = 0usize;
     for slot in t.iter_mut() {
         if slot.0 == donor {
             total = total.saturating_add(slot.1);
             *slot = (TaskId::NONE, 0);
+            removed += 1;
         }
+    }
+    if removed != 0 {
+        PENDING_DONOR_DEBIT_COUNT[shard].fetch_sub(removed, Ordering::AcqRel);
     }
     total
 }
 
 fn cancel_donor_debit(donor: TaskId, cycles: u64) {
-    let mut t = PENDING_DONOR_DEBITS[donor_shard(donor)].lock();
+    let shard = donor_shard(donor);
+    let mut t = PENDING_DONOR_DEBITS[shard].lock();
     for slot in t.iter_mut() {
         if slot.0 == donor {
             let new = slot.1.saturating_sub(cycles);
             if new == 0 {
                 *slot = (TaskId::NONE, 0);
+                PENDING_DONOR_DEBIT_COUNT[shard].fetch_sub(1, Ordering::AcqRel);
             } else {
                 slot.1 = new;
             }
@@ -2910,8 +3014,9 @@ fn refund_donor(donor: TaskId, cycles: u64) {
 
 #[doc(hidden)]
 pub fn __reset_donations_for_test() {
-    for shard in &PENDING_DONOR_DEBITS {
+    for (index, shard) in PENDING_DONOR_DEBITS.iter().enumerate() {
         *shard.lock() = [(TaskId::NONE, 0); MAX_PENDING_DONATIONS];
+        PENDING_DONOR_DEBIT_COUNT[index].store(0, Ordering::Release);
     }
 }
 
@@ -2945,7 +3050,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
     let donor_id = current_task_id();
     let mut any_initialised = false;
 
-    for q in READY.iter() {
+    for (cpu, q) in READY.iter().enumerate() {
         let mut g = q.lock();
         let ready = match g.as_mut() {
             Some(r) => r,
@@ -3077,7 +3182,10 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                     stage_donor_debit(donor_id, donor_remaining);
                 }
             }
-            slot.awake.flag.store(true, Ordering::Release);
+            let was_awake = slot.awake.flag.swap(true, Ordering::AcqRel);
+            if !was_awake {
+                note_runnable_peer(cpu as u32, slot.id.raw());
+            }
             match placement {
                 crate::donation::EnqueueDonee::HeadOfQueue => ready.push_front(slot),
                 crate::donation::EnqueueDonee::BackOfQueue => ready.push_back(slot),
@@ -3163,6 +3271,7 @@ unsafe fn wake_raw(data: *const ()) {
     let home = arc.cpu.load(Ordering::Acquire);
     if !prev_awake {
         wake_race_stamp(&arc, home);
+        note_runnable_peer(home, arc.task);
     }
     // Name this task its home CPU's next-buddy so the dispatch picks it ahead
     // of the tasks already queued in front of it (Linux `set_next_buddy`).
@@ -3183,6 +3292,7 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     if !prev_awake {
         // SAFETY: the caller holds a live Waker, so `ptr`'s WakeCell is valid.
         unsafe { wake_race_stamp(&*ptr, home) };
+        note_runnable_peer(home, task);
     }
     // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
     record_wake_next(home, task);
@@ -3348,11 +3458,12 @@ pub fn poll_one_round() -> usize {
                 continue;
             }
         }
-        if slot
-            .account
-            .view(narf_time::now_cycles(), &slot.spec.budget)
-            .eligibility
-            == BudgetEligibility::Throttled
+        if slot.spec.budget.period.is_some()
+            && slot
+                .account
+                .view(narf_time::now_cycles(), &slot.spec.budget)
+                .eligibility
+                == BudgetEligibility::Throttled
         {
             enqueue_after_poll(cpu, slot);
             continue;
@@ -3373,8 +3484,11 @@ pub fn poll_one_round() -> usize {
         let mut ctx = Context::from_waker(&waker);
         let start = Instant::now();
         let interrupt_start = accounting::interrupt_cycles(cpu);
-        let budget_dispatch = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
-        publish_budget_window(cpu, start.as_cycles(), budget_dispatch, &slot.spec.budget);
+        let budget_dispatch = slot.spec.budget.period.map(|_| {
+            let view = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
+            publish_budget_window(cpu, start.as_cycles(), view, &slot.spec.budget);
+            view
+        });
         // Save + restore identity around the inner poll. We're
         // running INSIDE another task's poll (the user-mode
         // syscall handler that called sleep_pumps); a blunt
@@ -3390,8 +3504,9 @@ pub fn poll_one_round() -> usize {
         // No `*active_user_as_slot().lock() = ...` here because kernel
         // tasks have `addr_space.is_none()` (we filtered above).
         let poll_result = poll_with_domain(&mut slot, &mut ctx);
-        let borrowed = clear_budget_window(cpu)
-            || budget_dispatch.eligibility == BudgetEligibility::Borrowable;
+        let borrowed = budget_dispatch.is_some_and(|view| {
+            clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
+        });
         current_task_slot().store(outer_task, Ordering::Release);
         *active_user_as_slot().lock() = outer_as;
         let interrupt_elapsed = accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
@@ -3402,9 +3517,12 @@ pub fn poll_one_round() -> usize {
         // EEVDF-lite: charge the cycles this dispatch ran to the task's virtual
         // runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`, one add.
         slot.vruntime = slot.vruntime.wrapping_add(elapsed);
-        let period_outcome = slot
-            .account
-            .charge_period(elapsed, &slot.spec.budget, borrowed);
+        let period_outcome = if budget_dispatch.is_some() {
+            slot.account
+                .charge_period(elapsed, &slot.spec.budget, borrowed)
+        } else {
+            crate::budget::ChargeOutcome::Continue
+        };
         let outcome = if burst_outcome == crate::budget::ChargeOutcome::Continue {
             period_outcome
         } else {
@@ -3612,7 +3730,11 @@ impl AddressSpaceHandoff {
     /// live root while `self.active` still names the pre-exec root. Restore the
     /// executor root before either owner is dropped so a same-MM successor can
     /// never mistake the stale bookkeeping for the hardware state.
-    fn finish_poll(&mut self, observed: Option<Arc<AddressSpace>>, cpu: usize) {
+    fn finish_poll(
+        &mut self,
+        observed: Option<Arc<AddressSpace>>,
+        cpu: usize,
+    ) -> Option<Arc<AddressSpace>> {
         let unchanged = match (self.active.as_ref(), observed.as_ref()) {
             (Some(active), Some(observed)) => Arc::ptr_eq(active, observed),
             (None, None) => true,
@@ -3621,7 +3743,7 @@ impl AddressSpaceHandoff {
         if !unchanged {
             self.restore(cpu);
         }
-        drop(observed);
+        observed
     }
 }
 
@@ -3674,6 +3796,8 @@ pub fn run_until_empty() {
     } else {
         0
     };
+    #[cfg(target_arch = "x86_64")]
+    let _fpu_trap_scope = stackful::executor_fpu_trap_guard();
 
     // Forced-pump fallback: when a runnable slot lets us skip the per-round
     // sleep_pumps on the wake→repoll fast path (below), a *perpetual*
@@ -3772,11 +3896,12 @@ pub fn run_until_empty() {
                 }
             }
 
-            if slot
-                .account
-                .view(narf_time::now_cycles(), &slot.spec.budget)
-                .eligibility
-                == BudgetEligibility::Throttled
+            if slot.spec.budget.period.is_some()
+                && slot
+                    .account
+                    .view(narf_time::now_cycles(), &slot.spec.budget)
+                    .eligibility
+                    == BudgetEligibility::Throttled
             {
                 enqueue_after_poll(cpu, slot);
                 continue;
@@ -3824,8 +3949,11 @@ pub fn run_until_empty() {
             let mut ctx = Context::from_waker(&waker);
             let start = Instant::now();
             let interrupt_start = accounting::interrupt_cycles(cpu);
-            let budget_dispatch = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
-            publish_budget_window(cpu, start.as_cycles(), budget_dispatch, &slot.spec.budget);
+            let budget_dispatch = slot.spec.budget.period.map(|_| {
+                let view = slot.account.prepare(start.as_cycles(), &slot.spec.budget);
+                publish_budget_window(cpu, start.as_cycles(), view, &slot.spec.budget);
+                view
+            });
             // Publish this slot's id + AS as the currently-polling
             // task so syscall handlers + introspection can identify
             // the caller and resolve its mappings. Cleared after the
@@ -3837,10 +3965,23 @@ pub fn run_until_empty() {
             // `address_space_of(id)` it's already been popped from
             // the queue and thus invisible to that scan.
             current_task_slot().store(slot.id.raw(), Ordering::Release);
-            *active_user_as_slot().lock() = slot.addr_space.clone();
+            {
+                let mut active = active_user_as_slot().lock();
+                debug_assert!(
+                    active.is_none(),
+                    "top-level executor entered a poll with an active AS publication"
+                );
+                // Move, rather than clone, the slot's Arc into the active
+                // publication. The slot is exclusively owned by this executor
+                // frame until poll returns, and the Arc is moved back below.
+                // This retains the page tables for concurrent introspection
+                // without two refcount operations per dispatch.
+                *active = slot.addr_space.take();
+            }
             let poll_result = poll_with_domain(&mut slot, &mut ctx);
-            let borrowed = clear_budget_window(cpu)
-                || budget_dispatch.eligibility == BudgetEligibility::Borrowable;
+            let borrowed = budget_dispatch.is_some_and(|view| {
+                clear_budget_window(cpu) || view.eligibility == BudgetEligibility::Borrowable
+            });
             current_task_slot().store(0, Ordering::Release);
             // Keep the poll body's final AS alive while reconciling it with
             // the root installed by the outer handoff. An inline execve may
@@ -3851,11 +3992,11 @@ pub fn run_until_empty() {
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
             {
                 let observed = active_user_as_slot().lock().take();
-                address_space_handoff.finish_poll(observed, cpu);
+                slot.addr_space = address_space_handoff.finish_poll(observed, cpu);
             }
             #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
             {
-                *active_user_as_slot().lock() = None;
+                slot.addr_space = active_user_as_slot().lock().take();
             }
             let interrupt_elapsed =
                 accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
@@ -3866,9 +4007,12 @@ pub fn run_until_empty() {
             // EEVDF-lite: charge the cycles this dispatch ran to the task's
             // virtual runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`.
             slot.vruntime = slot.vruntime.wrapping_add(elapsed);
-            let period_outcome = slot
-                .account
-                .charge_period(elapsed, &slot.spec.budget, borrowed);
+            let period_outcome = if budget_dispatch.is_some() {
+                slot.account
+                    .charge_period(elapsed, &slot.spec.budget, borrowed)
+            } else {
+                crate::budget::ChargeOutcome::Continue
+            };
             let outcome = if burst_outcome == crate::budget::ChargeOutcome::Continue {
                 period_outcome
             } else {
@@ -4396,6 +4540,12 @@ pub fn run_until_empty() {
 /// path can't spin; a momentarily-contended queue conservatively reports
 /// "yes, preempt".
 pub fn has_other_runnable_work(current: u64) -> bool {
+    let cpu = narf_lib::percpu::current_cpu();
+    if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
+        && RUNNABLE_PEER[cpu].load(Ordering::Acquire)
+    {
+        return true;
+    }
     // A device/IRQ completion is waiting to wake some task.
     if narf_lib::deferred_wake::has_pending() {
         return true;
@@ -4407,22 +4557,17 @@ pub fn has_other_runnable_work(current: u64) -> bool {
         }
     }
     // A cross-core wake is staged for this CPU (Linux `rq->wake_list`).
-    let cpu = narf_lib::percpu::current_cpu();
     if wake_list_pending(cpu) {
         return true;
     }
-    // Another awake task is queued and ready to run.
-    let now = narf_time::now_cycles();
-    match READY[cpu].try_lock() {
-        Some(q) => q
-            .as_ref()
-            .map(|d| {
-                d.iter()
-                    .any(|s| s.id.raw() != current && slot_is_dispatchable(s, now))
-            })
-            .unwrap_or(false),
-        None => true,
+    // The authoritative dispatch scan published whether a peer remained after
+    // selecting `current`; every later false->true wake/enqueue raises the
+    // same hint. A mismatched dispatch identity is conservatively treated as
+    // runnable work while the executor is between selections.
+    if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != current {
+        return true;
     }
+    false
 }
 
 /// Is the exact task `task_id` queued and dispatchable on the calling CPU?
@@ -4706,7 +4851,10 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         match pos {
             Some(p) => {
                 let slot = q.remove(p);
-                if let (Some(scheduler), Some(slot)) = (scheduler, slot.as_ref()) {
+                if let (Some(scheduler), Some(slot)) = (
+                    scheduler.filter(|policy| policy::observes_queue_events(*policy)),
+                    slot.as_ref(),
+                ) {
                     scheduler.on_task_queue_event(
                         victim_id,
                         policy::TaskQueueEvent::Dequeued {

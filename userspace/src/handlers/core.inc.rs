@@ -7354,16 +7354,25 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // inherited state below has been installed.  A vfork/posix_spawn child may
     // execute its first `execveat(AT_EMPTY_PATH)` immediately, so publishing
     // it before `fd::fork` is an SMP-visible ENOENT race.
+    let mut child_spec = narf_scheduler::TaskSpec::user_task();
+    if share_thread {
+        // `CLONE_THREAD` shares the parent's mm and usually its hottest data.
+        // Keep Linux's clone wake-affinity shape: start the sibling on the
+        // creating CPU instead of consuming the global new-process round-robin
+        // preference. This is only a soft hint (`allowed` remains unchanged),
+        // so an idle CPU can still steal the thread when that is beneficial.
+        let parent_cpu = narf_scheduler::CpuId(narf_lib::percpu::current_cpu() as u32);
+        if child_spec.affinity.allowed.contains(parent_cpu) {
+            child_spec.affinity.preferred = Some(parent_cpu);
+        }
+    }
     let pending_child = match child_state {
         Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
-            narf_scheduler::TaskSpec::user_task(),
+            child_spec,
         ),
-        None => crate::user_task::prepare_user_process_initial(
-            proc,
-            narf_scheduler::TaskSpec::user_task(),
-        ),
+        None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
     proc_identity_fork(parent_pid, child_tid.raw());

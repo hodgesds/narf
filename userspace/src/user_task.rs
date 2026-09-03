@@ -2543,12 +2543,11 @@ impl core::future::Future for UserTaskFuture {
         // re-entered (the trap continuation is saved in the KernelTask ctx).
         if narf_scheduler::stackful::user_own_stack_enabled() {
             // Publish the FPU area so the scheduler's preempt/park can
-            // FXSAVE/FXRSTOR it across a kernel_switch, then restore it now.
+            // preserve it across a kernel_switch. Restore is deferred until
+            // this task's first FP/SIMD instruction; integer-only slices avoid
+            // both XSAVE and XRSTOR.
             narf_scheduler::stackful::set_current_user_fpu(&*this.fpu as *const FpuArea as *mut u8);
-            // SAFETY: live FpuArea (≥FPU_AREA_SIZE, 64-aligned); CR4.OSFXSR/OSXSAVE set.
-            unsafe {
-                narf_arch::x86_64::xsave::fpu_restore(&*this.fpu as *const FpuArea as *const u8);
-            }
+            narf_scheduler::stackful::arm_current_user_fpu();
             let top = narf_scheduler::stackful::current_stackful_stack_top();
             let _ = slice_start_ns; // CPU accounting on the own-stack path TODO
             match this.state {

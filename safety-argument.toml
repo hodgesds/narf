@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "ebedd0c0a9b5c6bf58a25e7ede31105d76e0eb74249832cfd8d10a37a0efba29"
+prompt_hash = "e49174a1ef054b05bd171157e7721b6efcd31f4240e1dd9c8702fdec67228020"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -762,8 +762,32 @@ argument = "XSAVEOPT is selected once from its architectural CPUID bit and publi
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "The sched_yield fast path elides a voluntary executor round only after the signal check and only when a nonblocking conservative probe sees no different dispatchable task, deferred IRQ wake, due timer, or staged cross-CPU wake. Queue contention returns true and preserves the handoff. The optimization cannot select a task, bypass scheduler policy, affinity, budget, capability, or domain restoration, and it does not change the syscall's successful return contract."
+argument = "The sched_yield fast path elides a voluntary executor round only when a nonblocking conservative probe sees no different dispatchable task, deferred IRQ wake, due timer, or staged cross-CPU wake. Queue contention returns true and preserves the handoff. Linux makes sched_yield non-interruptible, so the handler completes with zero and the existing common return-to-user boundary delivers a pending signal afterward. The optimization cannot select a task, bypass scheduler policy, affinity, budget, capability, or domain restoration."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "The x86 reschedule IPI is reduced to an allocation-free notification handler. Cross-CPU task ownership remains in the target's scheduler-owned wake inbox until that CPU drains it at an executor round boundary under the established queue and policy lock order. The existing NEED_RESCHED publication, inbox-length acquire/release pairing, idle-halt handshake, affinity checks, policy selection, domain restoration, and task lifetime rules remain authoritative; removing ready-queue growth and policy callbacks from hard-IRQ context grants no new scheduling, memory, capability, or domain authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Deferred x86 FP/SIMD restoration, active-address-space ownership transfer, affinity-generation caching, runnable-peer hints, and fused built-in policy selection remain inside the existing architecture, frame, and scheduler executor TCB seams. They add no trusted subsystem, DomainId, capability kind, page-table authority, user pointer, or externally selectable context-switch path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The x86 user #NM path runs only after common trap entry has entered the Frame domain, requires CPL3 plus the currently published own-stack task and its aligned task-owned image, clears CR0.TS before XRSTOR, and retries the same user instruction. Every live register image is XSAVEd before the task leaves the CPU or becomes migratable; an image not used in the slice remains authoritative in memory. Kernel-mode or unmatched #NM stays fatal, and all CR0 operations retain double compiler fences. Domain state, PKRS ordering, capabilities, address-space permissions, and task ownership are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The active address-space handoff moves, rather than clones, the same strong Arc owner between a detached TaskSlot and its CPU-local active slot. Hardware root changes still occur while that owner is live; an in-poll exec replacement is reconciled before the observed owner moves back, and executor-root restoration precedes maintenance, idle, or return. No page-table identity, permission, lifetime, domain tag, or capability check is weakened."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Current-task CPU accounting dereferences only the opaque Task pointer already published by the in-flight UserTaskFuture, whose Arc owns the pointee through the complete call. An expected nonzero TID must match before charging. Atomic counters replace a compatibility B-tree write on the hot path, while reads and test resets combine or clear both stores; the values grant no task lookup, memory, scheduling, capability, or domain authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Run-queue selection still performs one mandatory core scan that validates awake state and period-budget eligibility before detaching any slot. Fusing the exact built-in ClassScheduler ordering into that scan preserves class, priority, realtime-deadline, FIFO, and eligible-over-borrowable ordering. Only exact in-tree policy types whose queue-event hook is the default no-op skip TaskMeta materialization; every external or wrapper policy remains observable, and no policy can bypass affinity, budget, capability, address-space, or domain restoration."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L62"
+argument = "The runnable-peer and affinity-generation caches contain only scheduler-owned boolean/generation metadata already covered by the documented per-CPU scheduling-state exception. False-to-true wake publication is release-ordered, a complete eligibility scan refreshes the hint, and deferred/timer/inbox fallbacks preserve conservative yield behavior. They expose no task memory or capability and do not change dispatch eligibility."

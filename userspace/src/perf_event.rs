@@ -3074,7 +3074,6 @@ fn schedule_group(leader: &PerfEventFile, cpu: usize, registry: &[Weak<PerfEvent
 /// Scheduler PMU context hook. Runs outside scheduler queue locks and brackets
 /// the matching task continuation on the current logical CPU.
 pub(crate) fn on_task_switch(task: u64, running: bool) {
-    account_cpu_user_switch(running);
     // Gate on the live-event REFCOUNT, not the `enabled()` bool alone: the bool
     // can desync from the count (a stall-watchdog probe caught active_events=0
     // with enabled=true), and a stale-true bool ran this scan on EVERY syscall
@@ -3084,6 +3083,7 @@ pub(crate) fn on_task_switch(task: u64, running: bool) {
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
+    account_cpu_user_switch(running);
     let cpu = narf_lib::percpu::current_cpu();
     let mut registry = PERF_EVENT_REGISTRY.lock();
     registry.retain(|weak| weak.strong_count() != 0);
