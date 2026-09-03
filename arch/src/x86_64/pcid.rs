@@ -155,6 +155,14 @@ pub unsafe fn enable_pcide() {
     // SAFETY: Valid memory or trusted environment
     let leaf1 = unsafe { core::arch::x86_64::__cpuid(1) };
     if leaf1.ecx & (1u32 << 17) == 0 {
+        // Record it. Declining is correct -- writing CR4.PCIDE without CPUID
+        // support #GPs -- but it leaves this CPU unable to confine: with
+        // CR4.PCIDE clear, `enter_domain` returns an inert guard and whatever
+        // it was meant to sandbox runs with the kernel's own CR3. That is not
+        // hypothetical: under QEMU `-cpu max` + KVM the BSP sees this bit set
+        // while APs see it clear, so the machine boots reporting the PCID
+        // enforcer while every AP silently enforces nothing.
+        mark_pcide_missing();
         return;
     }
 
@@ -433,6 +441,28 @@ pub fn invpcid_supported() -> bool {
     // SAFETY: leaf 7 always defined.
     let (_, ebx, _, _) = unsafe { crate::x86_64::cpuid::cpuid(7, 0) };
     ebx & (1 << 10) != 0
+}
+
+/// Bitmask of CPUs where [`enable_pcide`] declined because the CPU does not
+/// advertise PCID. One bit per logical CPU (`narf_lib::percpu::MAX_CPUS` is
+/// 64, so a `u64` covers every slot).
+static PCIDE_MISSING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Flag the executing CPU as unable to enable PCIDE.
+fn mark_pcide_missing() {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    if cpu < 64 {
+        PCIDE_MISSING.fetch_or(1u64 << cpu, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// CPUs that could not enable CR4.PCIDE, as a bitmask.
+///
+/// Non-zero while the PCID backend is the active enforcer means those CPUs
+/// run domain-confined code unconfined. Callers report it; nothing here can
+/// fix it, since the CPU genuinely lacks the feature.
+pub fn cpus_without_pcide() -> u64 {
+    PCIDE_MISSING.load(core::sync::atomic::Ordering::Acquire)
 }
 
 /// `true` iff CR4.PCIDE is set on THIS CPU. Distinct from
