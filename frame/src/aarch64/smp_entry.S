@@ -46,7 +46,11 @@ _ap_start:
 
     /* MAIR / TCR / TTBR0 / TTBR1 — same setup as the BSP, using
      * the page tables BSP already populated. */
-    mov  x0, #0xFF04
+    /* Same MAIR as the BSP: Attr0 Normal, Attr1 Device, Attr2
+     * Normal-Tagged. MAIR is per-CPU, so an AP that skipped it would read
+     * different attributes from the identical descriptors. */
+    movz x0, #0x04FF
+    movk x0, #0xF0, lsl #16
     msr  mair_el1, x0
 
     mov  x0, #16
