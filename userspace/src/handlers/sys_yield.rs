@@ -17,6 +17,17 @@ pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
+                // Linux's fair `yield_task` leaves the sole runnable task in
+                // place: `schedule()` has no peer to select, so a full
+                // switch-out/switch-in would accomplish nothing. Preserve the
+                // same observable contract here. The signal check above still
+                // runs first, and the conservative probe reports `true` on
+                // queue contention or pending deferred/timer work, so we only
+                // elide a yield when no other work can use this CPU.
+                if !narf_scheduler::has_other_runnable_work(current_task_id()) {
+                    ctx.set_return(SyscallReturn::ok(0));
+                    return;
+                }
                 // sched_yield(2): hand the CPU to the executor ONCE so a ready
                 // sibling on this CPU runs, then resume and return 0. Routing
                 // through `own_stack_block` -> `own_stack_park` would break out

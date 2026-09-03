@@ -250,6 +250,28 @@ pub unsafe fn xsave(buf: *mut u8, mask: u64) {
     }
 }
 
+/// Save the selected state components in standard format using XSAVEOPT's
+/// modified-state optimization.
+///
+/// # Safety
+/// `caps().xsaveopt == true`. `buf` is a valid 64-byte-aligned standard
+/// XSAVE area for `mask`, and `mask` is a subset of XCR0.
+#[inline]
+unsafe fn xsaveopt(buf: *mut u8, mask: u64) {
+    let lo = mask as u32;
+    let hi = (mask >> 32) as u32;
+    // SAFETY: caller establishes the CPUID, buffer, and mask preconditions.
+    unsafe {
+        core::arch::asm!(
+            "xsaveopt [{p}]",
+            p = in(reg) buf,
+            in("eax") lo,
+            in("edx") hi,
+            options(nostack, preserves_flags),
+        );
+    }
+}
+
 /// Save the components selected by `mask` into `buf` using the compacted
 /// format (`XSAVEC`). The compacted format packs only the enabled components
 /// (no gaps for disabled ones) and stamps `XCOMP_BV` bit 63 in the header, so a
@@ -317,6 +339,12 @@ pub const FPU_AREA_SIZE: usize = 4096;
 /// on the BSP at boot; the value is identical on every (homogeneous) CPU.
 static FPU_XSAVE_MASK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
+/// Boot-selected standard-format save instruction. Published before
+/// `FPU_XSAVE_MASK`, whose release/acquire pair makes this visible to every
+/// later task switch.
+static FPU_USE_XSAVEOPT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Decide the per-task FPU save method. Call ONCE at boot AFTER
 /// [`enable_default`] (which sets `XCR0`) and with `CR4.OSXSAVE` set. Selects
 /// `XSAVE` (recording the enabled-component mask) when the CPU supports it and
@@ -330,6 +358,7 @@ pub unsafe fn init_task_fpu() {
     // SAFETY: caller asserts CR4.OSXSAVE=1.
     let mask = unsafe { read_xcr0() };
     if mask != 0 && area_size_for_mask(mask) <= FPU_AREA_SIZE {
+        FPU_USE_XSAVEOPT.store(caps().xsaveopt, core::sync::atomic::Ordering::Relaxed);
         FPU_XSAVE_MASK.store(mask, core::sync::atomic::Ordering::Release);
     }
 }
@@ -344,8 +373,15 @@ pub unsafe fn init_task_fpu() {
 pub unsafe fn fpu_save(buf: *mut u8) {
     let mask = FPU_XSAVE_MASK.load(core::sync::atomic::Ordering::Acquire);
     if mask != 0 {
-        // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0.
-        unsafe { xsave(buf, mask) };
+        // SAFETY: buf sized/aligned per caller; mask ⊆ enabled XCR0. The
+        // XSAVEOPT flag was derived from CPUID and published before `mask`.
+        unsafe {
+            if FPU_USE_XSAVEOPT.load(core::sync::atomic::Ordering::Relaxed) {
+                xsaveopt(buf, mask);
+            } else {
+                xsave(buf, mask);
+            }
+        }
     } else {
         // SAFETY: buf ≥ 512 bytes, 16-byte aligned (64 ⊇ 16); CR4.OSFXSR set.
         unsafe {

@@ -111,6 +111,22 @@ pub struct aarch64::UserFpState { /* 528 bytes, 16-byte aligned */ }
 pub unsafe fn aarch64::save_user_fp_state(state: *mut u8);
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn aarch64::restore_user_fp_state(state: *const u8);
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::sysreg::read_ttbr0_el1() -> u64;
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn aarch64::sysreg::write_ttbr0_el1(value: u64);
+
+/// FSGSBASE is enabled independently on every supporting CPU before EL0 runs.
+/// The accessors use RDFSBASE/WRFSBASE only when the current CPU's CR4 cache
+/// confirms the enable bit and otherwise use the architectural MSR fallback.
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::user_mode::fsgsbase_supported() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::user_mode::enable_fsgsbase();
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::user_mode::user_fs_base() -> u64;
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
 /// EL0 entry/resume variants that first abandon the current EL1 frames and
 /// reset SP_EL1 to the supplied per-task kernel-stack top.
@@ -289,6 +305,13 @@ pub mod xsave {
     /// Standard-format bytes required by exactly `mask`, derived from
     /// CPUID.(0Dh,n) component offsets rather than the all-supported size.
     pub fn area_size_for_mask(mask: u64) -> usize;
+
+    /// Select the fixed-size per-task save mask and standard-format save
+    /// instruction once at boot. XSAVEOPT is selected only when advertised;
+    /// otherwise task images use XSAVE, with FXSAVE as the no-XSAVE fallback.
+    pub unsafe fn init_task_fpu();
+    pub unsafe fn fpu_save(buf: *mut u8);
+    pub unsafe fn fpu_restore(buf: *const u8);
 }
 ```
 
@@ -319,6 +342,15 @@ pub mod xsave {
   The `DomainPrimitive` impls, `Mmu::invlpg`, `Mmu::tlb_flush`, and
   cache-maintenance helpers are the only supported paths to the
   underlying instructions; they all carry the double-fence discipline.
+- **FSGSBASE is a per-CPU enable.** The BSP and every AP set
+  `CR4.FSGSBASE` only after CPUID advertises it and before that CPU can run
+  untrusted EL0. Every later CR4 mutation goes through the architecture helper
+  and preserves the bit. FS-base reads/writes test the executing CPU's cached
+  CR4 value and retain the fenced MSR fallback for unsupported CPUs.
+- **XSAVEOPT never changes the task-image format or component mask.** Boot
+  selects it only from CPUID.(0Dh,1):EAX[0], publishes that selection before
+  the release-published XCR0 mask, and restores the resulting standard-format
+  image with the same XRSTOR path as XSAVE.
   Callers must not reach around the HAL to raw `asm!`.
 - **Required features fail boot, optional features degrade.** Boot
   panics if any of these are absent: PKS (x86_64) or MTE (aarch64),

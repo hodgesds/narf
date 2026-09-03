@@ -52,6 +52,9 @@ pub const CR4_PKE: u64 = 1 << 22;
 /// CR3 carries a 12-bit PCID in bits 0..=11 and bit 63 of a CR3 write
 /// can preserve the previous PCID's TLB entries instead of flushing.
 pub const CR4_PCIDE: u64 = 1 << 17;
+/// CR4 bit: FSGSBASE (bit 16). Enables the RDFSBASE/RDGSBASE and
+/// WRFSBASE/WRGSBASE instructions at every privilege level.
+pub const CR4_FSGSBASE: u64 = 1 << 16;
 /// CR4 bit: OSXSAVE (bit 18). Enables XSAVE and processor extended states.
 pub const CR4_OSXSAVE: u64 = 1 << 18;
 

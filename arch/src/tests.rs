@@ -1413,6 +1413,41 @@ fn smoke_cpu_validate_baseline() -> TestResult {
 kernel_test_in!("arch/cpu_validate", smoke_cpu_validate_baseline);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_arch_fsgsbase_enabled_and_round_trips() -> TestResult {
+    use crate::x86_64::{cr, msr, user_mode};
+
+    if !user_mode::fsgsbase_supported() {
+        return TestResult::Skip("FSGSBASE not advertised");
+    }
+    if cr::cached_cr4() & cr::CR4_FSGSBASE == 0 {
+        return TestResult::Fail("FSGSBASE advertised but CR4.FSGSBASE is off");
+    }
+
+    const PROBE: u64 = 0x0000_7f53_4753_b000;
+    // Preserve the surrounding task's FS base. NARF kernel code uses GS for
+    // per-CPU state, so changing FS between these fenced helpers is inert.
+    // SAFETY: kernel tests execute at CPL0 and PROBE is canonical.
+    let original = unsafe { user_mode::user_fs_base() };
+    // SAFETY: as above; restore occurs before evaluating the result.
+    unsafe { user_mode::set_user_fs_base(PROBE) };
+    // SAFETY: CR4.FSGSBASE was checked above.
+    let observed = unsafe { user_mode::user_fs_base() };
+    // Verify the architectural backing state too, so the test cannot pass by
+    // reading a software cache rather than the live FS base.
+    // SAFETY: IA32_FS_BASE is readable at CPL0.
+    let observed_msr = unsafe { msr::rdmsr(user_mode::IA32_FS_BASE) };
+    // SAFETY: restore the canonical value captured from this CPU.
+    unsafe { user_mode::set_user_fs_base(original) };
+
+    if observed != PROBE || observed_msr != PROBE {
+        return TestResult::Fail("WRFSBASE/RDFSBASE did not round-trip IA32_FS_BASE");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("arch/fsgsbase", smoke_arch_fsgsbase_enabled_and_round_trips);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_vmx_caps_decode() -> TestResult {
     use crate::x86_64::vmx;
     let c = vmx::caps();

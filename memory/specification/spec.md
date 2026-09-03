@@ -1079,14 +1079,17 @@ x86_64 is rejected at runtime.
 ### aarch64
 - Paging: 4-level, 4 KiB granule (default) or 16 KiB / 64 KiB granules
   on platforms that prefer them, 48-bit VA.
-- `AddressSpace::activate` installs the address space's TTBR0 low-half root;
-  scheduler polling saves and restores the incoming TTBR0 so kernel tasks never
-  inherit a user root. Each live process root receives a unique ASID from the
-  hardware-supported namespace after tags 1..=16, which remain reserved for
-  domain roots. A switch to a nonzero lifetime tag does not flush; final
-  `AddressSpace` teardown broadcasts `TLBI ASIDE1IS` before making that tag
-  reusable. Pool exhaustion falls back safely to ASID 0 with a local full
-  invalidation on every distinct-root switch.
+- `AddressSpace::activate` installs the address space's TTBR0 low-half root.
+  Scheduler dispatch retains that root across an exact same-MM successor,
+  switches directly for a different user MM, and restores the incoming TTBR0
+  before a kernel task, maintenance, idle, or return. It keeps an
+  `Arc<AddressSpace>` alive until after every hardware-root transition. Each
+  live process root receives a unique ASID from the hardware-supported
+  namespace after tags 1..=16, which remain reserved for domain roots. A switch
+  to a nonzero lifetime tag does not flush; final `AddressSpace` teardown
+  broadcasts `TLBI ASIDE1IS` before making that tag reusable. Pool exhaustion
+  falls back safely to ASID 0 with a local full invalidation on every
+  distinct-root switch.
 - Final-owner TTBR0 teardown clears all valid L0 table descriptors under the
   root mutation shard, then drops the shard before walking the now-inactive
   subtrees and returning translation-table frames in bounded allocator batches.

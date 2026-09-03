@@ -393,19 +393,46 @@ pub unsafe fn write_mair_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
 }
 
-/// Write `TTBR0_EL1` — Translation Table Base Register 0.
+/// Read the complete `TTBR0_EL1` value, including its ASID field.
+///
+/// # Safety
+/// Issues a privileged `MRS` on `TTBR0_EL1`; the caller must execute at EL1.
+#[inline]
+pub unsafe fn read_ttbr0_el1() -> u64 {
+    compiler_fence(Ordering::SeqCst);
+    let value: u64;
+    // SAFETY: caller establishes EL1 and `value` is the sole output.
+    unsafe {
+        asm!(
+            "mrs {value}, ttbr0_el1",
+            value = out(reg) value,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    value
+}
+
+/// Write the complete `TTBR0_EL1` value, including its ASID field.
 ///
 /// # Safety
 /// Issues a privileged `MSR` on `TTBR0_EL1`; the caller must ensure the
-/// value points at a valid translation-table base and that the write is
-/// permitted at the current exception level.
+/// value points at a live translation-table base owned for the encoded ASID,
+/// and that the write is permitted at the current exception level.
 #[inline]
 pub unsafe fn write_ttbr0_el1(value: u64) {
     compiler_fence(Ordering::SeqCst);
-    // SAFETY: Always legal at EL1.
+    // SAFETY: caller establishes EL1 and a live `(root, ASID)` pair. The DSB
+    // completes prior table writes before the root changes; the ISB makes the
+    // new translation context effective before a later instruction/access.
     unsafe {
-        asm!("msr ttbr0_el1, {v}", v = in(reg) value,
-             options(nostack, preserves_flags));
+        asm!(
+            "dsb ish",
+            "msr ttbr0_el1, {value}",
+            "isb",
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        );
     }
     compiler_fence(Ordering::SeqCst);
 }

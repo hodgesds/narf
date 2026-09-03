@@ -541,6 +541,11 @@ calling task's accumulated user and kernel accounting.
 `sched_setscheduler(2)` accepts Linux's `SCHED_RESET_ON_FORK` modifier on every
 otherwise-supported policy; the cooperative scheduler retains compatibility
 state without assigning Linux real-time scheduling authority.
+`sched_yield(2)` returns success after checking pending signals. An own-stack
+task transfers to the executor when another runnable task, deferred wake, due
+timer, or staged cross-CPU wake can use the CPU; when the caller is the sole
+runnable task it returns directly because an executor round could only select
+that same task. Queue contention conservatively preserves the transfer.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated

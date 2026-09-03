@@ -1232,6 +1232,215 @@ kernel_test_in!(
     smoke_scheduler_user_then_kernel_task_sees_kernel_ttbr0
 );
 
+/// Linux-style active-mm handoff: two adjacent threads sharing one address
+/// space must both observe that exact root, a following process must observe
+/// its different root, and a following kernel task must see the executor root.
+/// This exercises same-MM retain, direct different-MM switch, and user->kernel
+/// restore in one ordered queue round on both architectures.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_scheduler_address_space_handoff() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn, spawn_user, TaskSpec};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::AddressSpace;
+
+    static SHARED_FIRST: AtomicU64 = AtomicU64::new(0);
+    static SHARED_SECOND: AtomicU64 = AtomicU64::new(0);
+    static DIFFERENT: AtomicU64 = AtomicU64::new(0);
+    static KERNEL: AtomicU64 = AtomicU64::new(0);
+    SHARED_FIRST.store(0, Ordering::Relaxed);
+    SHARED_SECOND.store(0, Ordering::Relaxed);
+    DIFFERENT.store(0, Ordering::Relaxed);
+    KERNEL.store(0, Ordering::Relaxed);
+
+    #[cfg(target_arch = "x86_64")]
+    const ROOT_MASK: u64 = 0x000f_ffff_ffff_f000;
+    #[cfg(target_arch = "aarch64")]
+    const ROOT_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+    crate::__reset_queues_for_test();
+    // SAFETY: the distributed kernel-test runner executes at CPL0/EL1.
+    let executor_root = unsafe { crate::read_active_address_space_root() };
+    // SAFETY: paging is live in the kernel-test environment.
+    let shared = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc shared AS"));
+    // SAFETY: as above; this allocation produces a distinct live root.
+    let different = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc second AS"));
+    let shared_root = shared.root.as_u64();
+    let different_root = different.root.as_u64();
+    if shared_root == different_root {
+        return TestResult::Fail("distinct address spaces reused a live root");
+    }
+
+    spawn_user(
+        crate::alloc_task_id(),
+        async {
+            // SAFETY: user futures are polled by the executor at CPL0/EL1.
+            SHARED_FIRST.store(
+                unsafe { crate::read_active_address_space_root() },
+                Ordering::Release,
+            );
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&shared),
+    );
+    spawn_user(
+        crate::alloc_task_id(),
+        async {
+            // SAFETY: as above.
+            SHARED_SECOND.store(
+                unsafe { crate::read_active_address_space_root() },
+                Ordering::Release,
+            );
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&shared),
+    );
+    spawn_user(
+        crate::alloc_task_id(),
+        async {
+            // SAFETY: as above.
+            DIFFERENT.store(
+                unsafe { crate::read_active_address_space_root() },
+                Ordering::Release,
+            );
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&different),
+    );
+    spawn(async {
+        // SAFETY: kernel futures are likewise polled at CPL0/EL1.
+        KERNEL.store(
+            unsafe { crate::read_active_address_space_root() },
+            Ordering::Release,
+        );
+    });
+
+    crate::run_until_empty();
+
+    let first = SHARED_FIRST.load(Ordering::Acquire);
+    let second = SHARED_SECOND.load(Ordering::Acquire);
+    let other = DIFFERENT.load(Ordering::Acquire);
+    let kernel = KERNEL.load(Ordering::Acquire);
+    drop(shared);
+    drop(different);
+
+    if first & ROOT_MASK != shared_root & ROOT_MASK || second & ROOT_MASK != shared_root & ROOT_MASK
+    {
+        return TestResult::Fail("same-MM handoff did not retain the shared root");
+    }
+    if other & ROOT_MASK != different_root & ROOT_MASK {
+        return TestResult::Fail("different-MM handoff did not install the next root");
+    }
+    if kernel != executor_root {
+        return TestResult::Fail("kernel task did not regain the executor root");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!("scheduler", smoke_scheduler_address_space_handoff);
+
+/// An own-stack exec may activate a replacement address space without
+/// returning through the outer future's original `TaskSlot` first. The
+/// handoff must notice that the poll body changed ACTIVE_USER_AS, restore the
+/// executor root while both page-table owners are live, and then reactivate an
+/// adjacent task that still belongs to the old MM. Treating the stale outer
+/// Arc as proof that the old root remained installed leaks the replacement
+/// process's mappings into that successor.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestResult {
+    extern crate alloc;
+    use crate::{spawn, spawn_user, TaskSpec};
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+    use narf_memory::AddressSpace;
+
+    static REPLACEMENT: AtomicU64 = AtomicU64::new(0);
+    static OLD_MM_SUCCESSOR: AtomicU64 = AtomicU64::new(0);
+    static KERNEL: AtomicU64 = AtomicU64::new(0);
+    REPLACEMENT.store(0, Ordering::Relaxed);
+    OLD_MM_SUCCESSOR.store(0, Ordering::Relaxed);
+    KERNEL.store(0, Ordering::Relaxed);
+
+    #[cfg(target_arch = "x86_64")]
+    const ROOT_MASK: u64 = 0x000f_ffff_ffff_f000;
+    #[cfg(target_arch = "aarch64")]
+    const ROOT_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+    crate::__reset_queues_for_test();
+    // SAFETY: the distributed kernel-test runner executes at CPL0/EL1.
+    let executor_root = unsafe { crate::read_active_address_space_root() };
+    // SAFETY: paging is live in the kernel-test environment.
+    let old_mm = Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc old AS"));
+    // SAFETY: as above; this allocation produces a distinct live root.
+    let replacement =
+        Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
+    let old_root = old_mm.root.as_u64();
+    let replacement_root = replacement.root.as_u64();
+    let replacement_for_poll = Arc::clone(&replacement);
+
+    spawn_user(
+        crate::alloc_task_id(),
+        async move {
+            // Mirror current-task replace_address_space publication followed
+            // by execve's inline activation. The local + published Arcs keep
+            // the new root owned through the transition.
+            *crate::active_user_as_slot().lock() = Some(Arc::clone(&replacement_for_poll));
+            let _ = replacement_for_poll.activate();
+            // SAFETY: user futures are polled by the executor at CPL0/EL1.
+            REPLACEMENT.store(
+                unsafe { crate::read_active_address_space_root() },
+                Ordering::Release,
+            );
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&old_mm),
+    );
+    spawn_user(
+        crate::alloc_task_id(),
+        async {
+            // SAFETY: as above.
+            OLD_MM_SUCCESSOR.store(
+                unsafe { crate::read_active_address_space_root() },
+                Ordering::Release,
+            );
+        },
+        TaskSpec::unthrottled(),
+        Arc::clone(&old_mm),
+    );
+    spawn(async {
+        // SAFETY: kernel futures are likewise polled at CPL0/EL1.
+        KERNEL.store(
+            unsafe { crate::read_active_address_space_root() },
+            Ordering::Release,
+        );
+    });
+
+    crate::run_until_empty();
+
+    let replacement_seen = REPLACEMENT.load(Ordering::Acquire);
+    let successor_seen = OLD_MM_SUCCESSOR.load(Ordering::Acquire);
+    let kernel_seen = KERNEL.load(Ordering::Acquire);
+    drop(old_mm);
+    drop(replacement);
+
+    if replacement_seen & ROOT_MASK != replacement_root & ROOT_MASK {
+        return TestResult::Fail("in-poll replacement root was not activated");
+    }
+    if successor_seen & ROOT_MASK != old_root & ROOT_MASK {
+        return TestResult::Fail("old-MM successor inherited the replacement root");
+    }
+    if kernel_seen != executor_root {
+        return TestResult::Fail("kernel task did not regain root after in-poll replacement");
+    }
+    TestResult::Pass
+}
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_address_space_handoff_reconciles_in_poll_replace
+);
+
 // ── relocated from verification ──
 
 fn smoke_sleep_future_waits() -> TestResult {
