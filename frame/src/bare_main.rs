@@ -520,11 +520,16 @@ fn setup_pcid_domains() {
     // low frames.
     let private_pdpts = unsafe { narf_memory::domain::init_per_domain_pdpts() }.unwrap_or_default();
     narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
+    // Report the CR4.PCIDE the BSP actually has, not a literal. This used to
+    // print "CR4.PCIDE=1" unconditionally, which is exactly wrong on a host
+    // where `enable_pcide` declined: the banner announced an enforcer that
+    // cannot enforce. `pcide_enabled` reads the cached CR4 for this CPU.
     let _ = writeln!(
         console::Writer,
-        "  domain enforcer: pcid (CR4.PCIDE=1, {} PML4 clones, \
+        "  domain enforcer: pcid (CR4.PCIDE={}, {} PML4 clones, \
          {} private PDPTs at slots 256..=271; cross-domain \
          access to private VAs faults at PML4 level)",
+        u8::from(narf_arch::x86_64::pcid::pcide_enabled()),
         registered,
         private_pdpts
     );
@@ -2225,6 +2230,26 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         started,
                         narf_lib::smp::online_count()
                     );
+
+                    // Say so when the PCID enforcer is selected but some CPU
+                    // could not enable CR4.PCIDE. `enter_domain` correctly
+                    // declines there, which means domain-confined code — BPF
+                    // programs, driver domains — runs on the kernel's own CR3
+                    // with no confinement at all. Silence made that look
+                    // identical to a working enforcer; the boot banner already
+                    // printed "domain enforcer: pcid".
+                    if narf_arch::effective_backend() == narf_arch::DomainBackend::Pcid {
+                        let missing = narf_arch::x86_64::pcid::cpus_without_pcide();
+                        if missing != 0 {
+                            let _ = writeln!(
+                                console::Writer,
+                                "  domain enforcer: WARNING — {} CPU(s) lack CR4.PCIDE \
+                                 (mask {:#x}); domain confinement is NOT enforced on them",
+                                missing.count_ones(),
+                                missing
+                            );
+                        }
+                    }
 
                     // Every AP is past the trampoline by the time this
                     // returns — `start_aps` spins on online flags the APs
