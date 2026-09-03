@@ -2490,10 +2490,11 @@ kernel_test_in!(
 /// never inspects the calling process — so this is where the caller's
 /// capabilities are still in scope, and this is where it has to be tested.
 ///
-/// A pipe stands in for the target: the gate is decided from the command
-/// number before dispatch, so what the fd refers to is irrelevant, and the
-/// privileged arm proving a NON-EPERM answer is what shows this is a
-/// privilege gate rather than a blanket refusal.
+/// The target is a regular file in a memfs: the gate sits inside the ioctl
+/// dispatch, after a FIFO has already been answered with ENOTTY, so the fd
+/// has to be one that reaches it. The privileged arm proving a NON-EPERM
+/// answer is what shows this is a privilege gate rather than a blanket
+/// refusal.
 fn smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin() -> TestResult {
     const CAP_SYS_ADMIN_BIT: u64 = 1 << 21;
     // The seven commands Linux gates, by number.
@@ -2507,8 +2508,20 @@ fn smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin() -> TestResult {
         0x0000_942e, // QUOTA_RESCAN_WAIT
     ];
 
-    with_setup(|| {
-        let (read_fd, write_fd) = make_pipe()?;
+    with_memfs("/abi-btrfs-qgroup", "qgroup", &[("data", b"x")], || {
+        // A regular file, not a pipe. `sys_ioctl` short-circuits a FIFO whose
+        // command the backend does not implement straight to ENOTTY -- which
+        // is what Linux's `pipe_ioctl` does via `-ENOIOCTLCMD` -- and that
+        // return happens BEFORE the quota gate, so a pipe never reaches it.
+        // This test used a pipe on the reasoning that the gate keys off the
+        // command number alone, which stopped being true when the FIFO arm
+        // landed. What the fd refers to does matter: it has to be an fd whose
+        // ioctl dispatch reaches the gate at all.
+        let path = b"/abi-btrfs-qgroup/data\0";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the regular file"),
+        };
         let mut buf = [0u8; 64];
 
         // Unprivileged: every one of them is refused, and refused with EPERM
@@ -2516,27 +2529,23 @@ fn smoke_abi_ioerrno_btrfs_qgroup_ioctls_need_cap_sys_admin() -> TestResult {
         // which is what userspace would see if the gate were missing.
         crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
         for cmd in QUOTA_IOCTLS {
-            if call(
-                Syscall::Ioctl.raw(),
-                a2(read_fd as u64, cmd, buf.as_mut_ptr() as u64),
-            ) != Some(EPERM)
-            {
+            if call(Syscall::Ioctl.raw(), a2(fd, cmd, buf.as_mut_ptr() as u64)) != Some(EPERM) {
                 crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+                let _ = call(Syscall::Close.raw(), a0(fd));
                 return Err("an unprivileged btrfs quota ioctl was not refused with EPERM");
             }
         }
 
-        // Privileged: the gate opens. A pipe implements none of these, so the
+        // Privileged: the gate opens. memfs implements none of these, so the
         // answer is whatever an unrecognised ioctl gets — the point is only
         // that it is no longer EPERM.
         crate::handlers::__test_set_caps(FAKE_TASK, CAP_SYS_ADMIN_BIT, CAP_SYS_ADMIN_BIT);
         let privileged = call(
             Syscall::Ioctl.raw(),
-            a2(read_fd as u64, QUOTA_IOCTLS[3], buf.as_mut_ptr() as u64),
+            a2(fd, QUOTA_IOCTLS[3], buf.as_mut_ptr() as u64),
         );
         crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
-        let _ = call(Syscall::Close.raw(), a0(read_fd as u64));
-        let _ = call(Syscall::Close.raw(), a0(write_fd as u64));
+        let _ = call(Syscall::Close.raw(), a0(fd));
         if privileged == Some(EPERM) {
             return Err("CAP_SYS_ADMIN did not open the gate");
         }
