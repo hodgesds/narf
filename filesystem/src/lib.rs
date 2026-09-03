@@ -993,6 +993,20 @@ pub trait FileOps: Send + Sync {
         self.readiness().map(|r| r.arm(task_id, interest, waker))
     }
 
+    /// Arm a blocking-I/O waiter with provider-selected exclusive semantics.
+    /// The default preserves ordinary wake-all behavior; providers whose Linux
+    /// wait queue is exclusive (notably anonymous pipes) override this so one
+    /// consumable event wakes one blocked syscall while poll observers still
+    /// all wake through [`Self::arm_readiness`].
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.arm_readiness(task_id, interest, waker)
+    }
+
     /// Register a PERSISTENT readiness waiter — the Linux `eppoll_entry` model,
     /// used by epoll to arm a per-fd ready-list waker at `EPOLL_CTL_ADD` that
     /// stays live for the fd's whole membership in the set (never consumed on

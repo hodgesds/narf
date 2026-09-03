@@ -8628,7 +8628,7 @@ pub(crate) fn park_reexecute_on_fd(
         // EAGAIN whenever own-stack mode is disabled.
         return park_reexecute_on_io(ctx);
     };
-    match ops.arm_readiness(task, interest, &waker) {
+    match ops.arm_readiness_exclusive(task, interest, &waker) {
         Some(Poll::Ready(_)) => {
             ops.disarm_readiness(task);
             #[cfg(target_arch = "x86_64")]
@@ -8639,8 +8639,8 @@ pub(crate) fn park_reexecute_on_fd(
             true
         }
         Some(Poll::Pending) => {
-            // `Readiness::arm` checked the level and installed this task's
-            // waker under the same per-fd lock used by `Readiness::set`.
+            // The provider checked the level and installed this task's waker
+            // under the same per-fd lock used by `Readiness::set`.
             // There is no lost-wake window to poll with a 1 ms timer.
             let parked = park_reexecute_on_io_until(ctx, u64::MAX);
             ops.disarm_readiness(task);

@@ -536,11 +536,11 @@ impl PipeShared {
     /// the peer-close flags, publishing the transition. POLL_IN (queue
     /// non-empty), POLL_OUT (room below capacity), POLL_HUP (writer gone),
     /// POLL_ERR (reader gone) — exactly the union of `PipeRead::poll_readiness`
-    /// and `PipeWrite::poll_readiness`. `set` bumps its edge sequence and wakes
-    /// armed waiters only on a rising edge, all under one lock (drop-free), so a
-    /// concurrent `arm` can never miss this transition. Once poll/epoll has
-    /// registered persistently, `notify(event & add)` also fires same-level
-    /// events, matching Linux's `pipe->poll_usage` gate. `event` is the
+    /// and `PipeWrite::poll_readiness`. `set_event` bumps its edge sequence and
+    /// wakes armed waiters under one lock (drop-free), so a concurrent `arm`
+    /// cannot miss the transition. Once poll/epoll has registered persistently,
+    /// the event argument also fires same-level events, matching Linux's
+    /// `pipe->poll_usage` gate without a second exclusive wake. `event` is the
     /// direction the caller changed: POLL_IN on a write, POLL_OUT on a read.
     fn sync_readiness(&self, event: u32) {
         let (len, full) = {
@@ -552,6 +552,16 @@ impl PipeShared {
 
     #[inline]
     fn sync_readiness_state(&self, event: u32, len: usize, full: bool) {
+        self.sync_readiness_state_with_policy(event, len, full, false);
+    }
+
+    #[inline]
+    fn sync_readiness_state_all(&self, event: u32, len: usize, full: bool) {
+        self.sync_readiness_state_with_policy(event, len, full, true);
+    }
+
+    #[inline]
+    fn sync_readiness_state_with_policy(&self, event: u32, len: usize, full: bool, wake_all: bool) {
         let writer_closed = self.writer_closed.load(Ordering::Acquire);
         let reader_closed = self.reader_closed.load(Ordering::Acquire);
         let mut add = 0u32;
@@ -579,13 +589,18 @@ impl PipeShared {
         } else {
             clear |= narf_filesystem::POLL_ERR;
         }
-        self.readiness.set(add, clear);
-        // Fire the wait-queue for the caller's direction (plus any peer-close bit
-        // that just latched, so a close reliably wakes the peer), masked to what
-        // is actually ready.
-        if self.poll_usage.load(Ordering::Acquire) {
-            self.readiness
-                .notify((event | narf_filesystem::POLL_HUP | narf_filesystem::POLL_ERR) & add);
+        if wake_all {
+            self.readiness.set_wake_all(add, clear);
+        } else {
+            // Fire one wait-queue event for the caller's direction. Folding it
+            // into the level update avoids selecting two exclusive blockers
+            // when the same operation also creates a rising edge.
+            let notify = if self.poll_usage.load(Ordering::Acquire) {
+                (event | narf_filesystem::POLL_HUP | narf_filesystem::POLL_ERR) & add
+            } else {
+                0
+            };
+            self.readiness.set_event(add, clear, notify);
         }
     }
 }
@@ -1160,7 +1175,7 @@ impl Drop for PipeRead {
         // Latch POLL_ERR into the durable cell after publishing closure — wakes
         // a writer parked on POLL_OUT|POLL_ERR, even on a full pipe.
         self.shared
-            .sync_readiness_state(narf_filesystem::POLL_OUT, len, full);
+            .sync_readiness_state_all(narf_filesystem::POLL_OUT, len, full);
         narf_net::readiness::bump_generation();
     }
 }
@@ -1177,7 +1192,7 @@ impl Drop for PipeWrite {
         // Latch POLL_HUP into the durable cell after publishing closure — wakes
         // a reader parked on POLL_IN|POLL_HUP so it runs read()→0=EOF.
         self.shared
-            .sync_readiness_state(narf_filesystem::POLL_IN, len, full);
+            .sync_readiness_state_all(narf_filesystem::POLL_IN, len, full);
         narf_net::readiness::bump_generation();
     }
 }
@@ -1297,6 +1312,19 @@ impl FileOps for PipeRead {
         Some(&self.shared.readiness)
     }
 
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(
+            self.shared
+                .readiness
+                .arm_exclusive(task_id, interest, waker),
+        )
+    }
+
     fn arm_readiness_persistent(
         &self,
         id: u64,
@@ -1410,6 +1438,19 @@ impl FileOps for PipeWrite {
         // POLL_OUT|POLL_ERR (the poll/epoll layer folds ERR in), so a peer read
         // (room frees) or a reader close (POLL_ERR) fires exactly this waiter.
         Some(&self.shared.readiness)
+    }
+
+    fn arm_readiness_exclusive(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        Some(
+            self.shared
+                .readiness
+                .arm_exclusive(task_id, interest, waker),
+        )
     }
 
     fn arm_readiness_persistent(
