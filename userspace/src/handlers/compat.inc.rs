@@ -5904,6 +5904,30 @@ fn futex_wake_waiters(uaddr: u64, n: u32) -> usize {
 }
 
 pub(crate) fn futex_wake_waiters_key(key: FutexKey, n: u32) -> usize {
+    // FUTEX_WAKE(..., 1) is the overwhelmingly common mutex/condvar handoff
+    // (and stress-ng's futex hot path). Avoid allocating both a key vector and
+    // an output vector for that single waiter. The waker still fires only after
+    // the bucket lock is dropped, preserving the no-scheduler-reentry-under-
+    // lock rule used by the general path below.
+    if n == 1 {
+        let waiter = {
+            let mut values = futex_wait_bucket(key).values.lock();
+            let waiter = values.get_mut(&key).and_then(|set| {
+                let tid = set.keys().next().copied()?;
+                set.remove(&tid).map(|waker| (tid, waker))
+            });
+            if values.get(&key).is_some_and(|set| set.is_empty()) {
+                values.remove(&key);
+            }
+            waiter
+        };
+        if let Some((tid, waker)) = waiter {
+            wake_one_urgent(tid, waker);
+            return 1;
+        }
+        return 0;
+    }
+
     let drained: alloc::vec::Vec<(u64, core::task::Waker)> = {
         let mut values = futex_wait_bucket(key).values.lock();
         let Some(set) = values.get_mut(&key) else {
