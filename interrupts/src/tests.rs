@@ -1936,6 +1936,30 @@ fn smoke_tsc_deadline_rearms_after_expiry() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("interrupts/timer", smoke_tsc_deadline_rearms_after_expiry);
 
+#[cfg(target_arch = "x86_64")]
+fn smoke_next_arm_target_non_owner_omits_global_wheel() -> TestResult {
+    use crate::x86_64::apic::next_arm_target;
+
+    let now = 1_000_000;
+    let periodic = now + 1_000_000;
+    let global_wheel = now + 20_000;
+    // A non-owner passes no wheel deadline to the common selector. Its local
+    // APIC must retain only the periodic deadline.
+    if next_arm_target(now, periodic, None, 10_000) != periodic {
+        return TestResult::Fail("non-owner mirrored the global wheel deadline");
+    }
+    // The nominated owner still chooses the earlier global deadline.
+    if next_arm_target(now, periodic, Some(global_wheel), 10_000) != global_wheel {
+        return TestResult::Fail("wheel owner omitted the global wheel deadline");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "interrupts/timer",
+    smoke_next_arm_target_non_owner_omits_global_wheel
+);
+
 #[cfg(not(target_arch = "x86_64"))]
 fn smoke_next_arm_target_wheel_earlier_than_periodic() -> TestResult {
     TestResult::Skip("next_arm_target is x86_64-specific (LAPIC TSC-deadline)")

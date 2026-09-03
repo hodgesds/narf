@@ -1035,6 +1035,125 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         return TestResult::Fail("Pipe round-trip bytes mismatch");
     }
 
+    // Linux errno and capacity contract on the optimized 4-KiB path.
+    // F_SETFL(O_NONBLOCK) makes a full atomic PIPE_BUF write return EAGAIN.
+    let mut fctx = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64,
+            arg1: 4, // F_SETFL
+            arg2: crate::fd::O_NONBLOCK as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Fcntl.raw(), &mut fctx);
+    if fctx.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("F_SETFL(O_NONBLOCK) on pipe failed");
+    }
+    let page = [0xA5u8; 4096];
+    for _ in 0..16 {
+        let mut fill = FakeCtx {
+            args: SyscallArgs {
+                arg0: write_fd as u64,
+                arg1: page.as_ptr() as u64,
+                arg2: page.len() as u64,
+                ..Default::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Write.raw(), &mut fill);
+        if fill.ret != Some(SyscallReturn::ok(page.len() as u64)) {
+            return TestResult::Fail("4-KiB pipe fill did not reach Linux capacity");
+        }
+    }
+    let mut full = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64,
+            arg1: page.as_ptr() as u64,
+            arg2: page.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut full);
+    if full.ret != Some(SyscallReturn::ok((-11i64) as u64)) {
+        return TestResult::Fail("full nonblocking pipe write was not -EAGAIN");
+    }
+    // Linux tests pipe fullness before dereferencing the source. A bad pointer
+    // on a full O_NONBLOCK pipe is therefore still EAGAIN, not EFAULT.
+    let mut full_fault = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64,
+            arg1: 1,
+            arg2: page.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut full_fault);
+    if full_fault.ret != Some(SyscallReturn::ok((-11i64) as u64)) {
+        return TestResult::Fail("full pipe did not prioritize -EAGAIN over -EFAULT");
+    }
+
+    // A faulting source is EFAULT and must not commit bytes into newly freed
+    // ring space. Drain one page first so EAGAIN cannot mask the fault.
+    let mut page_out = [0u8; 4096];
+    let mut drain = FakeCtx {
+        args: SyscallArgs {
+            arg0: read_fd as u64,
+            arg1: page_out.as_mut_ptr() as u64,
+            arg2: page_out.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Read.raw(), &mut drain);
+    if drain.ret != Some(SyscallReturn::ok(page_out.len() as u64)) || page_out != page {
+        return TestResult::Fail("4-KiB optimized pipe read corrupted data");
+    }
+    let mut fault = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64,
+            arg1: 1,
+            arg2: page.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut fault);
+    if fault.ret != Some(SyscallReturn::ok((-14i64) as u64)) {
+        return TestResult::Fail("faulting pipe write source was not -EFAULT");
+    }
+
+    // Closing the last reader makes every subsequent write EPIPE. Linux also
+    // raises SIGPIPE; the shared syscall result path retains that side effect.
+    let mut close = FakeCtx {
+        args: SyscallArgs {
+            arg0: read_fd as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Close.raw(), &mut close);
+    if close.ret != Some(SyscallReturn::ok(0)) {
+        return TestResult::Fail("closing pipe reader failed");
+    }
+    let mut broken = FakeCtx {
+        args: SyscallArgs {
+            arg0: write_fd as u64,
+            // Linux checks `!pipe->readers` before copying, so even an
+            // inaccessible source must report EPIPE (and raise SIGPIPE).
+            arg1: 1,
+            arg2: page.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(Syscall::Write.raw(), &mut broken);
+    if broken.ret != Some(SyscallReturn::ok((-32i64) as u64)) {
+        return TestResult::Fail("closed pipe did not prioritize -EPIPE over -EFAULT");
+    }
+
     fd::__test_reset();
     __test_clear_global();
     TestResult::Pass

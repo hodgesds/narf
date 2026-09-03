@@ -38,11 +38,16 @@ impl ProbeCell {
 static PROBE: [ProbeCell; MAX_CPUS] = [const { ProbeCell::NEW }; MAX_CPUS];
 
 #[inline]
+fn probe_for(cpu: usize) -> &'static ProbeCell {
+    &PROBE[if cpu < MAX_CPUS { cpu } else { 0 }]
+}
+
+#[inline]
 fn this_probe() -> &'static ProbeCell {
     let cpu = crate::current_cpu_id().raw() as usize;
     // Stage 2: single-CPU always returns 0; the clamp guards Stage-3
     // where MAX_CPUS could be exceeded by a mis-configured AP.
-    &PROBE[if cpu < MAX_CPUS { cpu } else { 0 }]
+    probe_for(cpu)
 }
 
 /// What the probe caught.
@@ -61,7 +66,15 @@ pub struct Caught {
 ///
 /// Clears any stale caught state from a prior arming.
 pub fn arm(recovery_rip: u64) {
-    let cell = this_probe();
+    arm_for_cpu(crate::current_cpu_id().raw() as usize, recovery_rip);
+}
+
+/// Arm the probe cell for an already-pinned CPU.  Guarded user copies disable
+/// IRQs before resolving the CPU once, then reuse that stable index for their
+/// marker and probe state instead of executing RDTSCP for each access.
+#[inline]
+pub(super) fn arm_for_cpu(cpu: usize, recovery_rip: u64) {
+    let cell = probe_for(cpu);
     cell.caught.store(0, Ordering::Release);
     cell.error.store(0, Ordering::Release);
     cell.recovery.store(recovery_rip, Ordering::Release);
@@ -69,7 +82,13 @@ pub fn arm(recovery_rip: u64) {
 
 /// Disarm the probe and return what was caught.
 pub fn disarm() -> Caught {
-    let cell = this_probe();
+    disarm_for_cpu(crate::current_cpu_id().raw() as usize)
+}
+
+/// Disarm the probe cell for an already-pinned CPU.  See [`arm_for_cpu`].
+#[inline]
+pub(super) fn disarm_for_cpu(cpu: usize) -> Caught {
+    let cell = probe_for(cpu);
     cell.recovery.store(0, Ordering::Release);
     let raw = cell.caught.swap(0, Ordering::AcqRel);
     let err = cell.error.swap(0, Ordering::AcqRel);

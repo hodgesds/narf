@@ -522,8 +522,8 @@ pub fn drain_due_to_deferred(now_cycles: u64) {
     if cached_min().is_none_or(|deadline| deadline > now_cycles) {
         return;
     }
+    let mut w = WHEEL.lock();
     for i in 0..MAX_SLEEPERS {
-        let mut w = WHEEL.lock();
         let taken = match w.slots[i].as_ref() {
             Some(s) if s.deadline_cycles <= now_cycles => w.slots[i].take(),
             _ => None,
@@ -547,10 +547,7 @@ pub fn drain_due_to_deferred(now_cycles: u64) {
             break;
         }
     }
-    {
-        let w = WHEEL.lock();
-        publish_min_locked(&w);
-    }
+    publish_min_locked(&w);
 }
 
 /// Earliest pending deadline, or `None` if the wheel is

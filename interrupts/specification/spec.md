@@ -120,6 +120,13 @@ initialisation. Its input must come from firmware discovery.
   TSC-deadline clockevent exclusively. The HPET comparator/IOAPIC path remains
   armed as a fallback only when that reliable primary is unavailable; the two
   sources do not intentionally deliver the same deadline.
+- The timer wheel is global, but exactly one logical CPU owns its LAPIC
+  TSC-deadline clockevent at a time. Publishing a new earliest deadline
+  transfers ownership to the publishing CPU. A previous owner's already-armed
+  one-shot may fire once, but it must not mirror or re-arm the global minimum;
+  this keeps wheel delivery O(1) rather than O(online CPUs). On expiry, the
+  owner removes due slots into a fixed per-CPU deferred-wake queue before
+  re-arming; it must not repeatedly floor and re-arm an already-due minimum.
 - UIPI: `WRMSR IA32_UINTR_*` MSRs; UITT entries per driver; `SENDUIPI`
   instruction for driver-to-driver signalling.
 

@@ -833,6 +833,15 @@ fn smoke_abi_fdio_pipe_fionread() -> TestResult {
         if available != payload.len() as i32 {
             return Err("FIONREAD reported the wrong pipe byte count");
         }
+        // pipe_ioctl returns put_user() directly: an inaccessible output
+        // pointer is EFAULT, while an unknown pipe ioctl is ENOTTY after
+        // vfs_ioctl translates the driver's internal ENOIOCTLCMD.
+        if call(Syscall::Ioctl.raw(), a2(rd as u64, FIONREAD, 0x1000)) != Some(EFAULT) {
+            return Err("pipe FIONREAD bad result pointer was not -EFAULT");
+        }
+        if call(Syscall::Ioctl.raw(), a2(rd as u64, 0xDEAD_BEEF, 0)) != Some(-25) {
+            return Err("unsupported pipe ioctl was not -ENOTTY");
+        }
         Ok(())
     })
 }
@@ -897,11 +906,8 @@ fn smoke_abi_fdio_pipe2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_neg);
 
-/// pipe2(2) flag validation — `fs/pipe.c::do_pipe2`: any flag outside
+/// pipe2(2) flag validation — `fs/pipe.c::__do_pipe_flags`: any flag outside
 /// O_CLOEXEC | O_NONBLOCK | O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL.
-/// LINUX-GAP: O_NOTIFICATION_PIPE (watch queues) is unimplemented and is
-/// rejected here rather than ignored, so a caller sees "unsupported" instead
-/// of an ordinary pipe on which its watches never fire.
 fn smoke_abi_fdio_pipe2_bad_flags_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 8];
@@ -910,20 +916,147 @@ fn smoke_abi_fdio_pipe2_bad_flags_neg() -> TestResult {
         if call(Syscall::Pipe2.raw(), a1(buf.as_mut_ptr() as u64, O_APPEND)) != Some(EINVAL) {
             return Err("pipe2(O_APPEND) was not -EINVAL");
         }
-        // O_NOTIFICATION_PIPE (0x0080_0000) — a real pipe2 flag on Linux, but
-        // unimplemented here, so still -EINVAL (LINUX-GAP above).
-        const O_NOTIFICATION_PIPE: u64 = 0x0080_0000;
+        // Linux validates flags before touching fildes.
+        if call(Syscall::Pipe2.raw(), a1(0, crate::fd::O_APPEND as u64)) != Some(EINVAL) {
+            return Err("pipe2(NULL, O_APPEND) did not prioritize -EINVAL");
+        }
+        // The kernel ABI receives flags as an `int`, so unused high register
+        // bits are truncated instead of participating in validation.
+        let mut high_bits = [0u8; 8];
+        if call(
+            Syscall::Pipe2.raw(),
+            a1(high_bits.as_mut_ptr() as u64, 1u64 << 32),
+        ) != Some(0)
+        {
+            return Err("pipe2 did not truncate flags to Linux int width");
+        }
+        let high_rd = i32::from_ne_bytes(high_bits[..4].try_into().unwrap()) as u32;
+        let high_wr = i32::from_ne_bytes(high_bits[4..].try_into().unwrap()) as u32;
+        let task = crate::handlers::current_task_id();
+        let _ = crate::fd::with_table(task, |table| {
+            table.close(high_rd);
+            table.close(high_wr);
+        });
+        // O_NOTIFICATION_PIPE aliases O_EXCL (0200). With CONFIG_WATCH_QUEUE
+        // absent Linux recognizes the flag and reports ENOPKG.
+        const O_NOTIFICATION_PIPE: u64 = 0o200;
         if call(
             Syscall::Pipe2.raw(),
             a1(buf.as_mut_ptr() as u64, O_NOTIFICATION_PIPE),
-        ) != Some(EINVAL)
+        ) != Some(-65)
         {
-            return Err("pipe2(O_NOTIFICATION_PIPE) was not -EINVAL");
+            return Err("pipe2(O_NOTIFICATION_PIPE) was not -ENOPKG");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe2_bad_flags_neg);
+
+fn smoke_abi_fdio_pipe_efault_does_not_publish_fds() -> TestResult {
+    with_setup(|| {
+        let task = crate::handlers::current_task_id();
+        let before = crate::fd::with_table(task, |table| table.open_fd_numbers().len())
+            .ok_or("missing fd table")?;
+        // Canonical user address, but deliberately unmapped: allocation has
+        // happened before the guarded copy discovers EFAULT.
+        if call(Syscall::Pipe2.raw(), a1(0x1000, 0)) != Some(EFAULT) {
+            return Err("pipe2 to unmapped fildes was not -EFAULT");
+        }
+        let after = crate::fd::with_table(task, |table| table.open_fd_numbers().len())
+            .ok_or("missing fd table after pipe2 EFAULT")?;
+        if after != before {
+            return Err("pipe2 EFAULT published or leaked descriptors");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe_efault_does_not_publish_fds
+);
+
+fn smoke_abi_fdio_pipe_emfile_precedes_bad_fildes() -> TestResult {
+    with_setup(|| {
+        // do_pipe2 calls __do_pipe_flags (including both fd reservations)
+        // before copy_to_user. With no descriptor number available, EMFILE
+        // therefore wins over the otherwise-faulting fildes pointer.
+        let limit = [0u64, 4096];
+        if call(
+            Syscall::Setrlimit.raw(),
+            a1(7, limit.as_ptr() as u64), // RLIMIT_NOFILE
+        ) != Some(0)
+        {
+            return Err("could not lower RLIMIT_NOFILE for pipe EMFILE test");
+        }
+        if call(Syscall::Pipe.raw(), a0(0)) != Some(-24) {
+            return Err("pipe(NULL) at RLIMIT_NOFILE did not prioritize -EMFILE");
+        }
+        if call(Syscall::Pipe2.raw(), a1(0, 0)) != Some(-24) {
+            return Err("pipe2(NULL, 0) at RLIMIT_NOFILE did not prioritize -EMFILE");
+        }
+        // Flag validation is earlier still and remains EINVAL.
+        if call(Syscall::Pipe2.raw(), a1(0, crate::fd::O_APPEND as u64)) != Some(EINVAL) {
+            return Err("pipe2 bad flags did not prioritize -EINVAL over -EMFILE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_pipe_emfile_precedes_bad_fildes
+);
+
+fn smoke_abi_fdio_pipe_size_errno_and_rounding() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        const F_SETPIPE_SZ: u64 = 1031;
+        const F_GETPIPE_SZ: u64 = 1032;
+        let regular = open_fd(b"/abi/f\0")?;
+        if call(Syscall::Fcntl.raw(), a2(regular as u64, F_GETPIPE_SZ, 0)) != Some(EBADF)
+            || call(Syscall::Fcntl.raw(), a2(regular as u64, F_SETPIPE_SZ, 4096)) != Some(EBADF)
+        {
+            return Err("pipe-size fcntl on a non-pipe was not -EBADF");
+        }
+
+        let (rd, wr) = make_pipe()?;
+        // Linux rounds sub-page sizes up to one page.
+        if call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 1)) != Some(4096)
+            || call(Syscall::Fcntl.raw(), a2(rd as u64, F_GETPIPE_SZ, 0)) != Some(4096)
+        {
+            return Err("F_SETPIPE_SZ did not round to one page");
+        }
+        // Restore two pages, fill both, then reject a one-page shrink with
+        // EBUSY because two live pipe buffers cannot fit.
+        if call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 8192)) != Some(8192) {
+            return Err("F_SETPIPE_SZ could not grow to two pages");
+        }
+        let payload = [0x5au8; 8192];
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, payload.as_ptr() as u64, payload.len() as u64),
+        ) != Some(8192)
+        {
+            return Err("two-page pipe fill failed");
+        }
+        if call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 4096)) != Some(-16) {
+            return Err("occupied pipe shrink was not -EBUSY");
+        }
+        // round_pipe_size rejects values above 2 GiB before allocation.
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(wr as u64, F_SETPIPE_SZ, u32::MAX as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("oversized F_SETPIPE_SZ was not -EINVAL");
+        }
+        // NARF has no privileged root bypass; growth above Linux's default
+        // pipe-max-size therefore follows the unprivileged EPERM path.
+        if call(Syscall::Fcntl.raw(), a2(wr as u64, F_SETPIPE_SZ, 1_048_577)) != Some(EPERM) {
+            return Err("F_SETPIPE_SZ above pipe-max-size was not -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_size_errno_and_rounding);
 
 const O_DIRECT_FLAG: u64 = 0o40000;
 

@@ -18,7 +18,7 @@
 //! 0x83E   APIC_TIMER_DIVIDE       — divide configuration
 //! ```
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use narf_arch::x86_64::msr::{rdmsr, wrmsr};
 
@@ -899,12 +899,45 @@ pub fn on_timer_tick() {
     } else {
         u64::MAX
     };
-    let target = next_arm_target(
-        now,
-        periodic_anchor,
-        narf_time::timer_wheel::next_deadline_cycles_try(),
-        MIN_DELTA_CYCLES,
-    );
+    // The timer wheel is global, but a global deadline needs only ONE local
+    // APIC clockevent.  Mirroring it onto every CPU makes one 1 ms userspace
+    // timeout produce N timer IRQs, N TSC-deadline WRMSRs, and N EOIs under
+    // KVM.  The wheel arm callback nominates the CPU that registered the new
+    // minimum.  A former owner can still receive one already-programmed stale
+    // interrupt, but it no longer re-arms the global minimum.
+    let wheel_owner = TSC_WHEEL_OWNER.load(Ordering::Acquire);
+    let wheel_earliest = if wheel_owner == cpu {
+        // Retire an expired wheel slot before selecting the next arm.  Merely
+        // waking the executor and leaving the due minimum cached makes this
+        // one-shot re-arm at `now + MIN_DELTA_CYCLES` over and over until the
+        // executor happens to run, producing an interrupt/MSR-exit storm under
+        // KVM.  The drain only moves wakers into the fixed per-CPU deferred
+        // queue; wake/drop still happens outside IRQ context.
+        narf_time::timer_wheel::drain_due_to_deferred(now);
+        // Another CPU may have published an earlier deadline and taken
+        // ownership while this handler drained the old minimum.  In that case
+        // its LAPIC represents the new minimum and this stale owner must not
+        // mirror it.
+        let next = if TSC_WHEEL_OWNER.load(Ordering::Acquire) == cpu {
+            narf_time::timer_wheel::next_deadline_cycles_try()
+        } else {
+            None
+        };
+        if next.is_none() {
+            // Do not clear a concurrently transferred owner.  A transfer to
+            // this same logical CPU cannot race this IRQ handler because IF=0.
+            let _ = TSC_WHEEL_OWNER.compare_exchange(
+                cpu,
+                NO_TSC_WHEEL_OWNER,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        next
+    } else {
+        None
+    };
+    let target = next_arm_target(now, periodic_anchor, wheel_earliest, MIN_DELTA_CYCLES);
     TSC_ARMED[cpu].store(target, Ordering::Relaxed);
     // SAFETY: TSC-deadline MSR is unconditionally writable when the
     // LVT_TIMER is configured for deadline mode, which is the gate that
@@ -930,13 +963,10 @@ pub fn on_timer_tick() {
     // check the moment a Waker's last reference goes away in the
     // same tick that a task completes.
     //
-    // The wheel is advanced from non-IRQ context instead, by
-    // `narf_scheduler::run_until_empty`'s idle path which busy-
-    // polls `fire_due` between halts with IRQs enabled. That
-    // path is safe to free from. The only thing the timer ISR
-    // does now is bump TIMER_TICKS for diagnostics + return
-    // promptly so the executor's halt_until_irq wakes up and
-    // serves the wheel on the next round.
+    // Due wakers were transferred above to the per-CPU deferred queue. The
+    // scheduler drains that queue from non-IRQ context, where waking and the
+    // final Arc drop are allocation-safe. The executor's idle-path `fire_due`
+    // remains a fallback for clockevents that do not use this LAPIC path.
 }
 
 /// Per-CPU TSC-deadline timer state. The LAPIC TSC-deadline MSR is
@@ -992,6 +1022,13 @@ static TSC_DEADLINE_NEXT: [AtomicU64; MAXC] = [const { AtomicU64::new(0) }; MAXC
 /// deadline appears (mirrors Linux hrtimer_reprogram's `expires >=
 /// expires_next` guard) — now against THIS CPU's armed value, not a global.
 static TSC_ARMED: [AtomicU64; MAXC] = [const { AtomicU64::new(u64::MAX) }; MAXC];
+
+/// Logical CPU whose local APIC currently represents the global timer-wheel
+/// minimum.  The owner is replaced whenever the wheel publishes an earlier
+/// minimum from another CPU.  An old owner's already-programmed one-shot may
+/// still fire once, but [`on_timer_tick`] will then omit the wheel deadline.
+const NO_TSC_WHEEL_OWNER: usize = usize::MAX;
+static TSC_WHEEL_OWNER: AtomicUsize = AtomicUsize::new(NO_TSC_WHEEL_OWNER);
 /// Minimum delta (TSC cycles) to program — a deadline already in the past
 /// is armed `now + MIN_DELTA_CYCLES` so it fires ASAP without a re-fire
 /// storm. ~a few µs at multi-GHz; mirrors Linux clockevents min_delta_ns.
@@ -1050,7 +1087,7 @@ pub(crate) const fn should_rearm_tsc_deadline(
 /// is registered, so it fires precisely instead of waiting for the periodic
 /// tick. No-op in InitialCount mode. Brief IRQ-off RCW so on_timer_tick
 /// (which also writes TSC_ARMED + the MSR) can't interleave.
-pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
+fn arm_tsc_deadline(deadline_cycles: u64, claim_wheel: bool) {
     // IRQs are masked across the whole RCW below (see the disable/enable
     // pair), so `tsc_cpu()` is stable — we can't migrate mid-function — and
     // the per-CPU `TSC_ARMED`/MSR we read, compare, and write all belong to
@@ -1099,12 +1136,32 @@ pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
             wrmsr(IA32_TSC_DEADLINE, target);
         }
     }
+    // Publish ownership only after this CPU has a live deadline no later than
+    // the wheel target.  IRQs are still masked, so a pending local timer cannot
+    // run before the ownership store becomes visible.
+    if claim_wheel {
+        TSC_WHEEL_OWNER.store(cpu, Ordering::Release);
+    }
     if irqs_were_on {
         // SAFETY: pairs with the disable above; restores caller IRQ state.
         unsafe {
             narf_arch::current::enable_interrupts();
         }
     }
+}
+
+/// Reprogram this CPU's generic LAPIC deadline if `deadline_cycles` is
+/// materially earlier than its current one-shot.  This does not change which
+/// CPU owns the global timer-wheel clockevent; scheduler/budget deadlines use
+/// this path.
+pub fn arm_tsc_deadline_if_earlier(deadline_cycles: u64) {
+    arm_tsc_deadline(deadline_cycles, false);
+}
+
+/// Make this CPU the sole LAPIC clockevent owner for the global timer-wheel
+/// minimum and program the deadline if needed.
+pub(crate) fn arm_timer_wheel_deadline(deadline_cycles: u64) {
+    arm_tsc_deadline(deadline_cycles, true);
 }
 
 /// Arm LAPIC TSC-deadline mode firing IRQ `timer_vector` every

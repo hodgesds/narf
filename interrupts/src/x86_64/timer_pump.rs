@@ -140,7 +140,7 @@ fn wheel_arm(deadline_cycles: u64) {
     // Primary: LAPIC TSC-deadline one-shot (reliable under KVM, where the
     // HPET one-shot IRQ isn't promptly delivered). Unconditional — must run
     // even before the HPET pump's STATE.initialised is set.
-    crate::x86_64::apic::arm_tsc_deadline_if_earlier(deadline_cycles);
+    crate::x86_64::apic::arm_timer_wheel_deadline(deadline_cycles);
     // Secondary: HPET one-shot only when the selected primary is not reliable
     // TSC-deadline. The clockevent probe is the authority here: preserving an
     // always-on HPET duplicate after LAPIC passed merely delivers the same

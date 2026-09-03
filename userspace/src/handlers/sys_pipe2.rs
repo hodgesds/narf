@@ -4,27 +4,29 @@ use super::*;
 pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let out_ptr = args.arg0;
-    let flags = args.arg1;
-    if out_ptr == 0 {
-        // NULL fd-array pointer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-        return;
-    }
+    // The Linux syscall prototype takes `int flags`; syscall-register bits
+    // above the low 32 are discarded before `do_pipe2` validates the mask.
+    let flags = args.arg1 as u32 as u64;
     // `fs/pipe.c::do_pipe2`: any flag outside O_CLOEXEC | O_NONBLOCK |
-    // O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL.
+    // O_DIRECT | O_NOTIFICATION_PIPE is -EINVAL. Flag validation happens
+    // before Linux reaches copy_to_user, so bad flags win over a bad pointer.
     //
     // O_DIRECT is packet mode (`pipe_write`'s one-buffer-per-write regime);
     // the pipe honours it, so it is accepted here.
     //
-    // LINUX-GAP: O_NOTIFICATION_PIPE (watch queues) is unimplemented and stays
-    // -EINVAL rather than being silently ignored. Silently dropping it would
-    // hand back an ordinary pipe on which `keyctl`/`fanotify` watches never
-    // arrive, and the caller would read that as "no events" forever instead of
-    // "not supported".
+    // O_NOTIFICATION_PIPE (the O_EXCL bit in this syscall) is recognized but
+    // the watch-queue feature is not built. Linux returns ENOPKG in exactly
+    // that configuration; silently creating an ordinary pipe would strand a
+    // caller waiting for notifications that can never arrive.
     let nonblock_bit = crate::fd::O_NONBLOCK as u64;
     let direct_bit = crate::fd::O_DIRECT as u64;
-    if flags & !(O_CLOEXEC_BIT | nonblock_bit | direct_bit) != 0 {
+    const O_NOTIFICATION_PIPE: u64 = 0o200;
+    if flags & !(O_CLOEXEC_BIT | nonblock_bit | direct_bit | O_NOTIFICATION_PIPE) != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    if flags & O_NOTIFICATION_PIPE != 0 {
+        ctx.set_return(SyscallReturn::ok((-65i64) as u64)); // -ENOPKG
         return;
     }
     let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
@@ -82,7 +84,12 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
     // it and SMAP-brackets the write of the 8-byte `buf`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        // Faulting fd-array buffer → EFAULT.
+        // Match do_pipe2: a failed user copy releases both reserved numbers
+        // and both files; no descriptor becomes visible on an EFAULT return.
+        let _ = fd::with_table(task, |table| {
+            table.close(r);
+            table.close(w);
+        });
         ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }

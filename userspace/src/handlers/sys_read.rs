@@ -152,11 +152,30 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
     let mut offset = endpoint.description.offset();
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        if let Some(outcome) = transactional_stream_read(endpoint.ops.as_ref(), want, |bytes| {
-            // SAFETY: read(2) validated the original range; this guarded
-            // copy catches protection changes racing that validation.
-            unsafe { copy_to_user(user_ptr + total as u64, bytes) }
-        }) {
+        let transactional = if let Some(pipe) = endpoint
+            .ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        {
+            Some(
+                pipe.read_direct_to_user(user_ptr + total as u64, want)
+                    .map_err(|error| match error {
+                        crate::pipe::VmspliceDrainError::WouldBlock => {
+                            TransactionalReadError::WouldBlock
+                        }
+                        crate::pipe::VmspliceDrainError::User(errno) => {
+                            TransactionalReadError::User(errno)
+                        }
+                    }),
+            )
+        } else {
+            transactional_stream_read(endpoint.ops.as_ref(), want, |bytes| {
+                // SAFETY: read(2) validated the original range; this guarded
+                // copy catches protection changes racing that validation.
+                unsafe { copy_to_user(user_ptr + total as u64, bytes) }
+            })
+        };
+        if let Some(outcome) = transactional {
             match outcome {
                 Ok(0) => break,
                 Ok(read) if read <= want => {

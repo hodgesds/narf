@@ -1268,7 +1268,8 @@ pub trait FileOps: Send + Sync {
     }
 
     /// Pipe buffer capacity in bytes, for `fcntl(F_GETPIPE_SZ/F_SETPIPE_SZ)`.
-    /// `None` for a non-pipe fd (fcntl then reports EINVAL, matching Linux).
+    /// `None` for a non-pipe fd (`pipe_fcntl` then reports EBADF, matching
+    /// Linux even though the descriptor itself is valid).
     fn pipe_capacity(&self) -> Option<usize> {
         None
     }

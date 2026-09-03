@@ -8544,25 +8544,30 @@ pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
     unreachable!("own-stack is not supported on this architecture");
 }
 
-/// Park the current task on net-I/O readiness (with the ~1ms timer-wheel
-/// backstop) and RIP-rewind so the in-flight syscall RE-EXECUTES with its
-/// original arguments on resume. This is the shared park shape of a blocking
-/// `read(2)` on an empty pipe/socket and a blocking `write(2)` on a full one
-/// (see sys_read / sys_write for the origin story of each field): a peer's
-/// write/read bumps the readiness generation and wakes the task promptly,
-/// the deadline is only a backstop.
+/// Park the current task on net-I/O readiness (with the legacy 1 ms
+/// timer-wheel backstop) and RIP-rewind so the in-flight syscall RE-EXECUTES
+/// with its original arguments on resume.
 ///
 /// Returns `true` when the task parked — the caller must `return` WITHOUT
 /// setting a return value (the syscall has not completed; it will re-run).
 /// Returns `false` when there is no executor (kernel-test context) and the
 /// caller must fall back to a synchronous result.
 pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
+    let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
+    park_reexecute_on_io_until(ctx, deadline)
+}
+
+/// Common net-I/O park setup. A durable per-fd [`Readiness`] arm passes
+/// `u64::MAX`: its arm-vs-set lock closes the lost-wake window, so a periodic
+/// retry would only create timer interrupts and spurious syscall re-execution.
+/// Providers without such a cell retain [`park_reexecute_on_io`]'s bounded
+/// backstop.
+fn park_reexecute_on_io_until(ctx: &mut dyn TrapContext, deadline: u64) -> bool {
     use core::sync::atomic::Ordering;
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
         crate::user_task::yield_hook(),
     ) {
-        let dl = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
         // Rewind past the architecture's syscall instruction so re-entry
         // re-runs this syscall with its original args (`syscall`/`int 0x80`
         // are 2 bytes; AArch64 `svc` is one fixed-width 4-byte instruction).
@@ -8578,7 +8583,7 @@ pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
         // hands the task to the executor.
         unsafe {
             let uc = &*uctx;
-            uc.sleep_deadline_ns.store(dl, Ordering::Release);
+            uc.sleep_deadline_ns.store(deadline, Ordering::Release);
             // Clear a stale futex_uaddr so this park can't mis-route into
             // the futex branch; snapshot the readiness generation for the
             // check→park lost-wake guard.
@@ -8634,7 +8639,10 @@ pub(crate) fn park_reexecute_on_fd(
             true
         }
         Some(Poll::Pending) => {
-            let parked = park_reexecute_on_io(ctx);
+            // `Readiness::arm` checked the level and installed this task's
+            // waker under the same per-fd lock used by `Readiness::set`.
+            // There is no lost-wake window to poll with a 1 ms timer.
+            let parked = park_reexecute_on_io_until(ctx, u64::MAX);
             ops.disarm_readiness(task);
             parked
         }
