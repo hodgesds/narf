@@ -743,3 +743,27 @@ argument = "Mixed hardware-huge and base-page mprotect holds the established hug
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Fork retains private base-page backing before child VMA publication and transfers ownership in region order. If a later fallible child index reservation fails, partial-child teardown balances only the published prefix while an allocation-free shard rollback removes only the unpublished suffix and restores implicit sole-owner counts without freeing a parent-owned frame. The parent may conservatively remain COW-marked, matching Linux partial-fork cleanup, but retains every mapping and backing owner. Releasing the global shared-owner transaction after regular child publication and before private huge-page allocation or copying changes no alias lifetime, page-table permission, reverse-map state, TLB ordering, domain assignment, capability authority, or cross-address-space access."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The address-space handoff, per-task TLS/FPU save changes, and per-CPU feature enablement remain inside the existing scheduler executor, memory domain-manager, architecture, and frame TCB seams. The sched_yield caller uses an existing read-only scheduler probe. No trusted subsystem, DomainId, capability kind, policy callback, mapping authority, or externally callable context-switch primitive is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The active-mm handoff retains a strong Arc for every page-table root for the complete interval in which hardware may reference it. Exact Arc identity is the only authority for a same-MM register-write elision; different user roots switch directly, and kernel tasks plus every maintenance, idle, and return boundary restore the captured executor root. A poll-time exec replacement is detected through the current-task publication and forces restoration while both old and replacement roots are owned, preventing stale bookkeeping from selecting the wrong process mapping. On x86_64 PCID-0 residency is published before activation and cleared only after the plain CR3 restore invalidates it; on AArch64 the complete root/ASID value is restored with fenced DSB/MSR/ISB helpers and ASIDs retain their existing lifetime invalidation rule. Mapping permissions, domain tags, and capability checks are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "FSGSBASE is enabled independently on the BSP and every AP only when CPUID advertises it and before untrusted EL0 runs. TLS accessors consult the executing CPU's architecture-maintained CR4 cache, use double compiler fences, and retain the RDMSR/WRMSR fallback. Switch-out snapshots the live user FS base into the currently published task before that task can migrate or another task can resume, including userspace WRFSBASE updates; zero remains an explicitly valid task value. No kernel GS/per-CPU state, address-space permission, capability, or domain right is exposed or modified."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "XSAVEOPT is selected once from its architectural CPUID bit and published before the release-published XCR0 task mask. It writes the same standard-format, task-owned, fixed-size image restored by the existing XRSTOR path; unsupported CPUs retain XSAVE and no-XSAVE CPUs retain FXSAVE. The selected component mask, buffer ownership and alignment requirements, PKRU/domain switching order, and per-task isolation are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The sched_yield fast path elides a voluntary executor round only after the signal check and only when a nonblocking conservative probe sees no different dispatchable task, deferred IRQ wake, due timer, or staged cross-CPU wake. Queue contention returns true and preserves the handoff. The optimization cannot select a task, bypass scheduler policy, affinity, budget, capability, or domain restoration, and it does not change the syscall's successful return contract."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The x86 reschedule IPI is reduced to an allocation-free notification handler. Cross-CPU task ownership remains in the target's scheduler-owned wake inbox until that CPU drains it at an executor round boundary under the established queue and policy lock order. The existing NEED_RESCHED publication, inbox-length acquire/release pairing, idle-halt handshake, affinity checks, policy selection, domain restoration, and task lifetime rules remain authoritative; removing ready-queue growth and policy callbacks from hard-IRQ context grants no new scheduling, memory, capability, or domain authority."

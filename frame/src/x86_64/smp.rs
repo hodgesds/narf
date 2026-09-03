@@ -270,6 +270,9 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
             narf_arch::x86_64::smap::enable();
         }
         narf_arch::x86_64::sse::enable();
+        // Per-CPU parity with the BSP: a migrated task may execute WRFSBASE
+        // directly and the scheduler uses RDFSBASE/WRFSBASE for its TLS state.
+        narf_arch::x86_64::user_mode::enable_fsgsbase();
         // CR4.OSXSAVE (bit 18) MUST be set before `xsave::enable_default`
         // issues `xsetbv`, exactly as the BSP does in bare_main. CR4 is
         // per-logical-processor, so the BSP's write doesn't cover APs. The

@@ -391,7 +391,24 @@ fn current_user_fpu() -> *mut u8 {
 #[cfg(target_arch = "x86_64")]
 #[inline]
 fn user_fpu_save() {
-    let area = current_user_fpu();
+    let cpu = this_cpu();
+    let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if task.is_null() {
+        return;
+    }
+    // CR4.FSGSBASE lets userspace update its own thread pointer without an
+    // arch_prctl syscall. Snapshot the live value at the same switch-out
+    // boundary as FP state so a later resume or migration cannot overwrite a
+    // user WRFSBASE update or inherit another thread's TLS base.
+    // SAFETY: CURRENT names the live task and this function runs at CPL0.
+    let fs_base = unsafe { narf_arch::x86_64::user_mode::user_fs_base() };
+    // SAFETY: CURRENT names the in-flight task on this CPU.
+    unsafe {
+        (*task).user_fs_base.store(fs_base, Ordering::Relaxed);
+        (*task).user_tls_valid.store(true, Ordering::Release);
+    }
+    // SAFETY: CURRENT names the in-flight task on this CPU.
+    let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
     if !area.is_null() {
         // SAFETY: `area` is the in-flight task's FpuArea (≥FPU_AREA_SIZE,
         // 64-aligned; set by the userspace poll); CR4.OSFXSR/OSXSAVE is on.

@@ -10445,10 +10445,12 @@ impl AddressSpace {
             // valid; user code's low-half mappings come from the
             // regions we materialise into `self.root`.
             //
-            // Install this address space's low-half root. The scheduler saves
-            // the incoming TTBR0 around every user-task poll and restores it
-            // before polling another task; the kernel itself executes and
-            // accesses physical memory through the shared TTBR1 high half.
+            // Install this address space's low-half root. The scheduler keeps
+            // a strongly-owned active-mm handoff across adjacent user polls,
+            // skips an exact same-MM switch, and restores its incoming TTBR0
+            // before a kernel task or maintenance boundary; the kernel itself
+            // executes and accesses physical memory through TTBR1's shared
+            // high half.
             // A lifetime-scoped nonzero ASID keeps this address space's cached
             // translations across switches. Pool exhaustion falls back to
             // ASID 0 and the local full-invalidation path.

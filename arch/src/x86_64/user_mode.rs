@@ -18,14 +18,68 @@
 use core::arch::{asm, naked_asm};
 use core::sync::atomic::{compiler_fence, Ordering};
 
+/// Whether this CPU advertises the FSGSBASE instruction family.
+#[inline]
+pub fn fsgsbase_supported() -> bool {
+    // SAFETY: CPUID leaf 7 returns zero for unsupported feature bits.
+    let (_, ebx, _, _) = unsafe { crate::x86_64::cpuid::cpuid(7, 0) };
+    ebx & 1 != 0
+}
+
+/// Enable the FSGSBASE instructions on the current CPU when advertised.
+///
+/// # Safety
+/// Must run at CPL0 during per-CPU bring-up, before untrusted code can run on
+/// this CPU. All later CR4 writes must preserve the enabled bit.
+#[inline]
+pub unsafe fn enable_fsgsbase() {
+    if !fsgsbase_supported() {
+        return;
+    }
+    // SAFETY: this function's contract requires CPL0 during per-CPU bring-up.
+    let current = unsafe { crate::x86_64::cr::read_cr4() };
+    if current & crate::x86_64::cr::CR4_FSGSBASE == 0 {
+        // SAFETY: CPUID.7.0:EBX.FSGSBASE was checked above; setting only its
+        // architected CR4 enable bit is valid at CPL0.
+        unsafe {
+            crate::x86_64::cr::write_cr4(current | crate::x86_64::cr::CR4_FSGSBASE);
+        }
+    }
+}
+
+/// Read the live user FS base. Uses the non-privileged instruction when the
+/// current CPU enabled it and falls back to the architectural MSR otherwise.
+///
+/// # Safety
+/// Must execute at CPL0 so the fallback RDMSR is permitted.
+#[inline]
+pub unsafe fn user_fs_base() -> u64 {
+    if crate::x86_64::cr::cached_cr4() & crate::x86_64::cr::CR4_FSGSBASE != 0 {
+        let value: u64;
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: CR4.FSGSBASE is set on this CPU.
+        unsafe {
+            asm!(
+                "rdfsbase {value}",
+                value = out(reg) value,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        value
+    } else {
+        // SAFETY: caller established CPL0; IA32_FS_BASE is architectural in
+        // long mode.
+        unsafe { crate::x86_64::msr::rdmsr(IA32_FS_BASE) }
+    }
+}
+
 /// MSR index `IA32_FS_BASE` (Intel SDM Vol. 4 §2.6, "MSRs Common to
 /// the IA-32 Family"). On x86_64 Linux and the SysV-AMD64 TLS model,
 /// the FS segment base is the thread pointer — `mov rax, fs:[0]`
 /// fetches `*(fs_base + 0)` which the ABI defines as the TCB self-
-/// pointer. Writing this MSR is the canonical way to plant a per-
-/// thread pointer in CPL=0 / CPL=3 transitions; the `wrfsbase`
-/// instruction is gated on `CR4.FSGSBASE = 1` and so is not relied
-/// upon here.
+/// pointer. NARF uses `WRFSBASE` after per-CPU bring-up enables
+/// `CR4.FSGSBASE`, with the architectural MSR as the compatibility fallback.
 pub const IA32_FS_BASE: u32 = 0xC000_0100;
 
 /// Program `IA32_FS_BASE` so the next user-mode entry observes
@@ -48,6 +102,20 @@ pub const IA32_FS_BASE: u32 = 0xC000_0100;
 /// nothing here validates that.
 #[inline]
 pub unsafe fn set_user_fs_base(fs_base: u64) {
+    if crate::x86_64::cr::cached_cr4() & crate::x86_64::cr::CR4_FSGSBASE != 0 {
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: CR4.FSGSBASE is set on this CPU; the caller owns the
+        // canonical-address requirement documented by this function.
+        unsafe {
+            asm!(
+                "wrfsbase {value}",
+                value = in(reg) fs_base,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        compiler_fence(Ordering::SeqCst);
+        return;
+    }
     let low = fs_base as u32;
     let high = (fs_base >> 32) as u32;
     compiler_fence(Ordering::SeqCst);

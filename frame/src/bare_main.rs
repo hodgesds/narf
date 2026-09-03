@@ -735,6 +735,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // SAFETY: CPL=0; SSE2 is architectural.
         unsafe {
             narf_arch::x86_64::sse::enable();
+            // Linux enables FSGSBASE on every supporting CPU and uses
+            // WRFSBASE/RDFSBASE for task TLS switches. Besides avoiding an
+            // intercepted WRMSR on every pthread handoff, this completes the
+            // CR4 enable matrix required by arch/security-hardening.md §3.2.
+            narf_arch::x86_64::user_mode::enable_fsgsbase();
             let mut cr4 = narf_arch::x86_64::cr::read_cr4();
             cr4 |= narf_arch::x86_64::cr::CR4_OSXSAVE;
             narf_arch::x86_64::cr::write_cr4(cr4);
@@ -765,9 +770,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         let pti = kpti::detect();
         let _ = writeln!(
             console::Writer,
-            "  hardening: SMEP={} SMAP={} KPTI={:?} SPEC={:?}",
+            "  hardening: SMEP={} SMAP={} FSGSBASE={} KPTI={:?} SPEC={:?}",
             smep::is_enabled(),
             smap::is_enabled(),
+            narf_arch::x86_64::cr::cached_cr4() & narf_arch::x86_64::cr::CR4_FSGSBASE != 0,
             pti,
             speculation_state,
         );
@@ -970,14 +976,11 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // call shoot_va once they come up, and the handler must
             // be live before the first IPI lands.
             narf_interrupts::x86_64::ipi::install();
-            // Reschedule IPI: the handler drains this CPU's cross-core wake
-            // inbox in the IPI (Linux `sched_ttwu_pending`), so a woken task is
-            // folded into the run queue with IPI latency instead of waiting out
-            // the target's next full ready-queue round; the interrupt also
-            // un-halts an idle owner CPU. Paired with the scheduler's sender
-            // hook below (a cross-core waker kicks the target on the inbox
-            // empty->nonempty edge).
-            narf_interrupts::install_resched_ipi(narf_scheduler::resched_ipi_drain);
+            // Reschedule IPI: notification-only handler (being interrupted is
+            // the point) plus the scheduler's sender hook. The target drains
+            // its cross-core wake inbox at the next executor round boundary,
+            // outside hard-IRQ context where queue growth is permitted.
+            narf_interrupts::install_resched_ipi();
             narf_scheduler::set_resched_ipi_hook(|cpu| {
                 narf_interrupts::x86_64::apic::send_fixed_ipi(
                     1u64 << cpu,

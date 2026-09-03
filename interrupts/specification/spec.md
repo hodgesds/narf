@@ -51,6 +51,9 @@ pub fn uses_hpet_fallback() -> bool; // x86_64::timer_pump diagnostic
 pub fn install_tlb_shootdown_bridge();
 
 #[cfg(target_arch = "x86_64")]
+pub fn install_resched_ipi(); // notification-only; no queue work in hard IRQ
+
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn ipi::shoot_range_mask(
     va: u64,
     pages: u64,
@@ -209,6 +212,11 @@ The order — increment first, sync handler second, waker third
 — is the contract every consumer relies on. A waker observing
 the wake call is guaranteed that any subsequent `fire_count`
 read sees the increment (release-acquire ordering).
+
+The reschedule IPI is notification-only: receipt interrupts or un-halts the
+target, but its handler does not mutate scheduler queues or invoke policy
+callbacks. The scheduler drains any staged cross-CPU wake inbox at its next
+executor round boundary, where ready-queue growth may allocate safely.
 
 The `enter_irq` / `exit_irq` brackets give every handler-side
 caller (drivers, allocators, locks) a true `in_irq()` answer

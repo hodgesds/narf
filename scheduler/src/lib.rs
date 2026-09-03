@@ -1274,12 +1274,11 @@ fn resched_remote(target_cpu: u32) {
 /// Unconditional cross-core reschedule kick: send the IPI regardless of the
 /// target's published `CPU_HALTED`. Used for the wake-inbox empty->nonempty
 /// transition (Linux `__ttwu_queue_wakelist` -> `__smp_call_single_queue`
-/// always IPIs on the first entry): the target must drain the inbox in its IPI
-/// handler (`resched_ipi_drain`) promptly even while RUNNING, or a woken task
-/// waits out a whole ready-queue round. Gated by the caller on `was_empty` so it
-/// is one IPI per empty->nonempty edge, not one per wake (Linux `llist_add`'s
-/// "first entry" gate). A spurious IPI to a running target just drains an inbox
-/// that already looks empty — cheap. No-op for self / out-of-range.
+/// always IPIs on the first entry). The IPI only interrupts or un-halts the
+/// target; the executor drains the inbox outside hard-IRQ context at its next
+/// round boundary. Gated by the caller on `was_empty` so it is one IPI per
+/// empty->nonempty edge, not one per wake (`llist_add`'s "first entry" gate).
+/// No-op for self / out-of-range.
 #[inline]
 fn resched_remote_force(target_cpu: u32) {
     let me = narf_lib::percpu::current_cpu() as u32;
@@ -2178,22 +2177,6 @@ fn drain_wake_list(cpu: usize) {
     }
 }
 
-/// Reschedule-IPI handler body (Linux `sched_ttwu_pending`): fold THIS CPU's
-/// wake inbox into its run queue, right now, in the IPI. This is what makes the
-/// wake list low-latency — otherwise a woken task waits until the target's
-/// `run_until_empty` loops back to its top-of-round drain, which under a deep
-/// ready queue is many polls away (a wake-bound workload craters). Safe in IRQ
-/// context: `drain_wake_list` takes only IRQ-masking locks local to this CPU,
-/// and the CPU provably holds none of them when the IPI is delivered (holding
-/// any masks IRQs, so the IPI can't arrive) — the same invariant that lets
-/// Linux take `rq_lock_irqsave` inside `sched_ttwu_pending`.
-pub fn resched_ipi_drain() {
-    let cpu = narf_lib::percpu::current_cpu();
-    if cpu < narf_lib::percpu::MAX_CPUS {
-        drain_wake_list(cpu);
-    }
-}
-
 /// Push `slot` onto `cpu`'s ready queue. Panics if `init()` hasn't run.
 fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason) {
     // EEVDF-lite: place a NEWLY ADMITTED task at the target CPU's virtual-time
@@ -2237,16 +2220,12 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     );
     if cpu != me && cpu < narf_lib::percpu::MAX_CPUS && target_drains {
         let was_empty = wake_list_push(cpu, slot, reason);
-        // Kick the target to drain its inbox in the IPI handler
-        // (`resched_ipi_drain` = Linux `sched_ttwu_pending`). On the
-        // empty->nonempty edge, kick UNCONDITIONALLY (even a running target) so
-        // the staged wake is folded into READY promptly instead of waiting out a
-        // whole ready-queue round — this is what keeps a wake-bound workload from
-        // cratering. Batched to one IPI per edge (Linux `llist_add` first-entry
-        // gate): once the inbox is non-empty an IPI is already accounted for.
-        // Off the edge, fall back to the halted-only kick (`resched_remote`),
-        // which pairs with the idle-side Dekker handshake: every commit-to-halt
-        // publishes CPU_HALTED, fences, and re-scans `wake_list_pending`.
+        // Kick the target on the empty->nonempty edge. The IPI is deliberately
+        // notification-only: folding the inbox here would run ready-queue growth
+        // and policy callbacks in hard-IRQ context. The target drains at its next
+        // executor round boundary. Batched to one IPI per edge (`llist_add`'s
+        // first-entry gate); off the edge, fall back to the halted-only kick,
+        // which pairs with the idle-side Dekker handshake.
         if was_empty {
             resched_remote_force(cpu as u32);
         } else if awake {
@@ -3551,6 +3530,143 @@ fn report_parked_queue_idle() {
     narf_rcu::report_idle();
 }
 
+/// Scoped executor address-space handoff, mirroring Linux `active_mm`.
+///
+/// Consecutive user tasks sharing the exact same `Arc<AddressSpace>` retain
+/// their root without a register access. A different-MM user task switches
+/// directly to its root. A kernel task, maintenance boundary, or return to the
+/// caller restores the executor's incoming root. `active` keeps the installed
+/// page tables alive until after hardware has stopped referencing them, and
+/// `Drop` is the backstop for every normal early-return path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[derive(Debug, Default)]
+struct AddressSpaceHandoff {
+    incoming_root: Option<u64>,
+    active: Option<Arc<AddressSpace>>,
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl AddressSpaceHandoff {
+    fn prepare(&mut self, next: Option<&Arc<AddressSpace>>, cpu: usize) {
+        if self
+            .active
+            .as_ref()
+            .zip(next)
+            .is_some_and(|(current, next)| Arc::ptr_eq(current, next))
+        {
+            return;
+        }
+
+        let Some(next) = next else {
+            self.restore(cpu);
+            return;
+        };
+
+        if self.active.is_none() {
+            // Preserve the complete architecture root, including PCID/ASID,
+            // once for the exact restore at the end of this handoff scope.
+            // SAFETY: scheduler execution is CPL0/EL1.
+            self.incoming_root = Some(unsafe { read_active_address_space_root() });
+        }
+
+        if next.activate().is_ok() {
+            // Replace only after activate completes, keeping the previous page
+            // tables alive for the entire direct hardware-root transition.
+            let previous = self.active.replace(Arc::clone(next));
+            drop(previous);
+        } else if self.active.is_none() {
+            // A rejected first activation did not change hardware state.
+            self.incoming_root = None;
+        } else {
+            // A rejected target must not leave the prior user root live after
+            // the core has decided to dispatch a different address space.
+            self.restore(cpu);
+        }
+    }
+
+    fn restore(&mut self, cpu: usize) {
+        let Some(active) = self.active.take() else {
+            self.incoming_root = None;
+            return;
+        };
+        let Some(incoming) = self.incoming_root.take() else {
+            debug_assert!(false, "active handoff missing incoming root");
+            // Keep the active root alive: dropping it while hardware still
+            // references it would be worse than retaining it on this bug path.
+            core::mem::forget(active);
+            return;
+        };
+        // SAFETY: `incoming` was read from this CPU immediately before the
+        // first user root was installed. PCID/ASID configuration is unchanged
+        // during one executor round and `active` keeps the old root alive until
+        // this exact restore completes.
+        unsafe { restore_active_address_space_root(incoming, cpu) };
+        drop(active);
+    }
+
+    /// Reconcile the address space published by the poll body with the root
+    /// this handoff installed before the poll.
+    ///
+    /// `execve` may replace and activate the current task's address space from
+    /// inside a stackful continuation. In that case `observed` owns the new
+    /// live root while `self.active` still names the pre-exec root. Restore the
+    /// executor root before either owner is dropped so a same-MM successor can
+    /// never mistake the stale bookkeeping for the hardware state.
+    fn finish_poll(&mut self, observed: Option<Arc<AddressSpace>>, cpu: usize) {
+        let unchanged = match (self.active.as_ref(), observed.as_ref()) {
+            (Some(active), Some(observed)) => Arc::ptr_eq(active, observed),
+            (None, None) => true,
+            _ => false,
+        };
+        if !unchanged {
+            self.restore(cpu);
+        }
+        drop(observed);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn read_active_address_space_root() -> u64 {
+    // SAFETY: forwarded CPL0 contract.
+    unsafe { narf_arch::x86_64::cr::read_cr3() }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn restore_active_address_space_root(root: u64, cpu: usize) {
+    // SAFETY: `root` is the complete CR3 value captured on this CPU.
+    unsafe { narf_arch::x86_64::cr::write_cr3(root) };
+    // A plain restore flushes PCID 0. Clear residency only after it, so a
+    // concurrent shared-MM mutation cannot omit this CPU while stale user
+    // translations remain usable.
+    narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn read_active_address_space_root() -> u64 {
+    // SAFETY: forwarded EL1 contract.
+    unsafe { narf_arch::aarch64::sysreg::read_ttbr0_el1() }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn restore_active_address_space_root(root: u64, _cpu: usize) {
+    // SAFETY: `root` is the complete `(root, ASID)` TTBR0 value captured on
+    // this CPU, and the retained Arc keeps the outgoing root live until after
+    // this restore. Lifetime-scoped ASIDs need no switch-time invalidation.
+    unsafe { narf_arch::aarch64::sysreg::write_ttbr0_el1(root) };
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl Drop for AddressSpaceHandoff {
+    fn drop(&mut self) {
+        let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+        self.restore(cpu);
+    }
+}
+
 pub fn run_until_empty() {
     let cpu = narf_lib::percpu::current_cpu();
     let cpu = if cpu < narf_lib::percpu::MAX_CPUS {
@@ -3574,6 +3690,8 @@ pub fn run_until_empty() {
     // while a truly idle CPU still HLTs and preserves power. Persists
     // across rounds as an executor-local — no static, no layout churn.
     let mut halt_poll_cycles: u64 = 0;
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let mut address_space_handoff = AddressSpaceHandoff::default();
 
     loop {
         // Logical hot-unplug publishes Draining before inspecting/migrating
@@ -3695,74 +3813,12 @@ pub fn run_until_empty() {
             bump_vfloor(cpu, slot.vruntime);
             publish_current_sched(cpu, &slot);
 
-            // Save the kernel per-AS register before activating
-            // the user AS so we can swap back after `poll()`
-            // returns. Without this, the next kernel task to be
-            // polled runs with the stale user mapping register
-            // active — any low-half access (FB phys, identity-
-            // mapped MMIO, beacon paint) page-faults on x86_64.
-            //
-            // x86_64: the single CR3 holds both halves; leaving
-            // it on the user AS is the actual bug we hit on Zen2
-            // (init's user AS lacked the FB phys low-half map,
-            // every subsequent kernel task faulted silently).
-            //
-            // aarch64: split TTBR0/TTBR1. Kernel always resolves
-            // via TTBR1, so kernel tasks following a user task
-            // are fine even without this restore. But two user
-            // tasks back-to-back would inherit the previous one's
-            // TTBR0 until their own activate() runs — same
-            // save/restore shape prevents the user-vs-user leak
-            // pre-emptively.
-            #[cfg(target_arch = "x86_64")]
-            let saved_cr3: u64 = if slot.addr_space.is_some() {
-                let raw: u64;
-                // SAFETY: Reading CR3 is an unprivileged-of-side-effects
-                // ring-0 instruction with no memory operand; `nomem`/`nostack`
-                // accurately describe it and `raw` receives the value.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    core::arch::asm!(
-                        "mov {0}, cr3",
-                        out(reg) raw,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                }
-                raw
-            } else {
-                0
-            };
-            #[cfg(target_arch = "aarch64")]
-            let saved_ttbr0: u64 = if slot.addr_space.is_some() {
-                let raw: u64;
-                // SAFETY: `mrs ttbr0_el1` reads the EL1 translation-table
-                // base register; the scheduler runs at EL1 where this read
-                // is unconditionally permitted. It has no memory operand,
-                // so `nomem`/`nostack`/`preserves_flags` hold, and `raw`
-                // receives the register value.
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                // SAFETY: EL1 system-register asm; operands as documented above.
-                unsafe {
-                    core::arch::asm!(
-                        "mrs {0}, ttbr0_el1",
-                        out(reg) raw,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                }
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                raw
-            } else {
-                0
-            };
-
-            // If the task owns an address space, activate it before
-            // polling so user-mode accesses land in the right low-half
-            // mappings. Live on x86_64 (CR3 swap) and aarch64 (TTBR0
-            // swap). The error path remains so kernel-only tasks on
-            // unsupported arches keep running unchanged.
-            if let Some(ref a) = slot.addr_space {
-                let _ = a.activate();
-            }
+            // Linux-style `active_mm` handoff: same-MM peers keep the current
+            // root, different user MMs switch directly, and a kernel task
+            // restores the executor root before its poll. The guard retains
+            // every installed root through the hardware transition.
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            address_space_handoff.prepare(slot.addr_space.as_ref(), cpu);
 
             let waker = make_waker(slot.awake.clone());
             let mut ctx = Context::from_waker(&waker);
@@ -3786,52 +3842,20 @@ pub fn run_until_empty() {
             let borrowed = clear_budget_window(cpu)
                 || budget_dispatch.eligibility == BudgetEligibility::Borrowable;
             current_task_slot().store(0, Ordering::Release);
-            *active_user_as_slot().lock() = None;
-            // Restore kernel per-AS register — see save comment
-            // above. Without this, every kernel task polled after
-            // a user task runs with stale user-AS CR3 (x86_64)
-            // and faults on any low-half access; on aarch64 two
-            // back-to-back user tasks would inherit each other's
-            // TTBR0 until their own activate() runs.
-            #[cfg(target_arch = "x86_64")]
-            if saved_cr3 != 0 {
-                // SAFETY: `saved_cr3` was just read from CR3 in
-                // kernel context above; writing it back is
-                // identity-safe.
-                // SAFETY: Valid memory or trusted environment
-                unsafe {
-                    core::arch::asm!(
-                        "mov cr3, {0}",
-                        in(reg) saved_cr3,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                }
-                // The plain kernel-root CR3 restore flushes PCID 0 on this
-                // CPU. Clear residency only after that flush, so a concurrent
-                // shared-AS mutation can never omit a CPU retaining a stale
-                // user translation.
-                narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
+            // Keep the poll body's final AS alive while reconciling it with
+            // the root installed by the outer handoff. An inline execve may
+            // have activated a replacement root and updated ACTIVE_USER_AS;
+            // clearing that Arc before restoring hardware would free live
+            // page tables, while ignoring it could make an old-MM successor
+            // incorrectly skip its required activation.
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            {
+                let observed = active_user_as_slot().lock().take();
+                address_space_handoff.finish_poll(observed, cpu);
             }
-            #[cfg(target_arch = "aarch64")]
-            if saved_ttbr0 != 0 {
-                // SAFETY: `saved_ttbr0` was just read from
-                // TTBR0_EL1 in kernel context above. Process ASIDs are unique
-                // for the AddressSpace lifetime and are invalidated before
-                // reuse, so restoring the saved `(root, ASID)` context needs
-                // only the architected DSB + MSR + ISB sequence. Flushing here
-                // would discard the translations that ASIDs exist to retain.
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-                // SAFETY: EL1 TLBI/ASID asm; operands as documented above.
-                unsafe {
-                    core::arch::asm!(
-                        "dsb ish",
-                        "msr ttbr0_el1, {0}",
-                        "isb",
-                        in(reg) saved_ttbr0,
-                        options(nomem, nostack, preserves_flags),
-                    );
-                }
-                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                *active_user_as_slot().lock() = None;
             }
             let interrupt_elapsed =
                 accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
@@ -3913,6 +3937,12 @@ pub fn run_until_empty() {
                 }
             }
         }
+
+        // No active user mapping may cross into RCU maintenance, stealing,
+        // sleep pumps, device work, idle, or the caller. Same-MM retention is
+        // deliberately bounded to adjacent dispatches in one queue round.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        address_space_handoff.restore(cpu);
 
         // RCU maintenance: if this CPU holds deferred reclamations (e.g. a
         // retired `Box<KernelTask>` from a completed slot's drop), publish

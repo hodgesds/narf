@@ -47,6 +47,9 @@ pub fn spawn_user(
     address_space: Arc<AddressSpace>,
 ) -> TaskId;
 pub fn yield_now() -> impl Future<Output=()>;
+/// Conservative current-CPU probe: false only when no runnable peer,
+/// deferred wake, due timer, or staged cross-CPU wake can use a yield.
+pub fn has_other_runnable_work(current: u64) -> bool;
 pub fn donate_to(task: TaskId, cap: &Cap<Task, Invoke>)
     -> Result<(), DonateError>;
 pub fn set_task_mems_allowed(task: u64, mask: u64);
@@ -101,6 +104,21 @@ The optional userspace PMU hook brackets every stackful continuation in
 executor context after run-queue locks have been released. `running=true`
 precedes the switch into the task and `running=false` follows every switch
 back, including preemption and migration.
+The executor owns a scoped `active_mm`-style address-space handoff across
+adjacent dispatches. Consecutive user tasks sharing the same
+`Arc<AddressSpace>` retain the installed architecture root; different user
+address spaces switch directly; a kernel task restores the executor root
+before its poll. The installed root remains strongly owned until after the
+hardware transition. The executor also restores its incoming root before RCU
+maintenance, stealing, device/sleep pumps, idle, or return. Policy callbacks
+may therefore execute with the prior task's user low-half root active, as Linux
+scheduler callbacks do; they must use only kernel-owned addresses. On x86_64
+the kernel high half is present in every user root and SMAP blocks accidental
+supervisor access to user leaves; on aarch64 the kernel remains in TTBR1. If a
+poll body replaces and activates its address space (notably inline `execve`),
+the post-poll publication mismatch forces an executor-root restore while both
+old and replacement roots remain strongly owned; a stale outer Arc can never
+authorize a same-MM switch elision.
 On x86_64 and aarch64, every own-stack switch-out folds the elapsed on-CPU slice through
 the slice-account hook. A CPL0 timer preemption additionally calls `pause`
 before switching and calls `resume` only when `pause` reported an open syscall
@@ -139,6 +157,13 @@ They use nonblocking queue acquisition and report current queue ownership,
 awake state, affinity, and CPU idle/lock state. They deliberately maintain no
 per-poll, per-pop, per-requeue, or global per-wake counters on the normal
 scheduling path.
+
+Cross-CPU wakes stage owned task slots in the target CPU's wake inbox and send
+a reschedule IPI on the empty-to-nonempty edge. The IPI is notification-only;
+it must not grow a ready queue or invoke a policy callback in hard-IRQ context.
+The target drains the inbox under its own queue and policy locks at the next
+executor round boundary. The mirrored inbox length and `NEED_RESCHED` flag
+remain part of the idle-halt lost-wake handshake.
 
 #### 3.1.1 Pluggable scheduling policy
 
@@ -447,11 +472,16 @@ control callback.
 ## 4. Invariants & safety properties
 
 - A task always polls inside the domain it was spawned with.
-- A user task polls with its own address-space root active. On aarch64 the
-  executor saves the incoming TTBR0, installs the task's TTBR0 before polling,
-  and restores the saved `(root, ASID)` before any later kernel or user task is
-  polled. Lifetime-scoped ASIDs make both switches non-flushing; an ASID is not
-  reused until the memory subsystem completes a system-wide tag invalidation.
+- A user task polls with its own address-space root active. On both
+  architectures the executor captures the complete incoming root once, retains
+  an `Arc` to every root while hardware can reference it, skips the register
+  write for an exact same-MM successor, and switches directly to a different
+  user MM. A kernel task or end-of-round maintenance boundary restores the
+  incoming root before proceeding. On aarch64 lifetime-scoped ASIDs make user
+  switches non-flushing; an ASID is not reused until the memory subsystem
+  completes a system-wide tag invalidation. A poll-time address-space
+  replacement is reconciled before either root owner is dropped and forces a
+  restore rather than carrying stale same-MM identity into the next dispatch.
 - On x86_64 the executor publishes process-PCID-0 residency before a user root
   is loaded using the memory subsystem's sequentially consistent publication
   primitive, and clears it only after the plain kernel-root CR3 restore has
@@ -464,6 +494,9 @@ control callback.
   `Cap<Task, Invoke>` (Stage 3).
 - The executor never holds a lock across a poll boundary.
 - Work-stealing preserves per-task FIFO ordering of wakes.
+- `has_other_runnable_work` may return a false positive under queue contention
+  but never blocks to refine the answer. A false result means the caller can
+  elide a voluntary self-yield without withholding the CPU from known work.
 - A task is never scheduled on a CPU outside its `Affinity.allowed`
   set. Work-stealing and runtime requeue both respect this as a hard
   constraint; a mask change takes effect at the next cooperative poll

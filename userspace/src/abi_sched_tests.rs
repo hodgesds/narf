@@ -947,8 +947,9 @@ fn smoke_abi_sched_rseq_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_rseq_pos);
 
 // ── sched_yield() ───────────────────────────────────────────────────
-// Drives the sleep pumps and returns ok(0); no error path (no signal
-// pending for FAKE_TASK in the harness).
+// Returns ok(0) whether or not another runnable task exists; no error path (no
+// signal pending for FAKE_TASK in the harness). The sole-runnable fast path is
+// observable only as avoided scheduling work, never as a different return.
 
 fn smoke_abi_sched_yield_pos() -> TestResult {
     with_setup(|| match call(Syscall::Yield.raw(), a0(0)) {
@@ -956,7 +957,7 @@ fn smoke_abi_sched_yield_pos() -> TestResult {
         _ => Err("sched_yield should return 0"),
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_sched_yield_pos);
+kernel_test_in!("syscall_abi/sched_yield", smoke_abi_sched_yield_pos);
 
 // ─────────────────────────────────────────────────────────────────────
 // PRIO_PGRP / PRIO_USER and IOPRIO_WHO_PGRP / IOPRIO_WHO_USER
