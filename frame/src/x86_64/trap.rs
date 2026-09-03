@@ -1443,6 +1443,19 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
         return;
     }
 
+    // Deferred FP/SIMD restore. The scheduler saves every live image before a
+    // task can migrate, then sets CR0.TS instead of restoring eagerly. The
+    // first x87/MMX/SSE/AVX instruction in the next user slice arrives here;
+    // restore the current task's image and retry the faulting instruction.
+    // Kernel-mode #NM remains fatal: the kernel target is soft-float and an
+    // unexpected SIMD use must not be attributed to a user task.
+    if frame.vector == 7
+        && (frame.cs & 3) == 3
+        && narf_scheduler::stackful::handle_user_fpu_unavailable()
+    {
+        return;
+    }
+
     // COW write-fault recovery (user-mode only). When a fork()'d
     // process writes a shared, write-protected page for the first
     // time, #PF lands here with the present + write + user bits

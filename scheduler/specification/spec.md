@@ -68,6 +68,10 @@ pub fn set_user_slice_account_hook(hook: fn(elapsed_ns: u64));
 pub fn set_user_kernel_preempt_hooks(pause: fn() -> bool, resume: fn());
 pub unsafe fn set_current_user_context(context: *mut ());
 pub fn current_user_context() -> *mut ();
+#[cfg(target_arch = "x86_64")]
+pub fn stackful::arm_current_user_fpu();
+#[cfg(target_arch = "x86_64")]
+pub fn stackful::handle_user_fpu_unavailable() -> bool;
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
 /// Mark a dequeued synchronous waiter for an immediate local handoff.
@@ -108,7 +112,10 @@ The executor owns a scoped `active_mm`-style address-space handoff across
 adjacent dispatches. Consecutive user tasks sharing the same
 `Arc<AddressSpace>` retain the installed architecture root; different user
 address spaces switch directly; a kernel task restores the executor root
-before its poll. The installed root remains strongly owned until after the
+before its poll. The slot moves its strong `Arc` owner into the CPU-local
+active handoff before polling and moves the observed owner back afterward;
+the hot switch does not clone or drop a shared reference. The installed root
+remains strongly owned until after the
 hardware transition. The executor also restores its incoming root before RCU
 maintenance, stealing, device/sleep pumps, idle, or return. Policy callbacks
 may therefore execute with the prior task's user low-half root active, as Linux
@@ -129,6 +136,10 @@ Own-stack user tasks are timer-preemptible at the CPL3 scheduler tick. The
 preemption path retains the task's live trap frame, FPU state, address space,
 TLS base, and dedicated kernel-stack continuation across requeue, so a
 syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
+On x86_64, switch-out saves an FP/SIMD image only after the task has consumed
+the register file, then arms CR0.TS; the first user FP/SIMD instruction after
+resume raises `#NM`, restores that task's image, and retries. A task is always
+saved before it can migrate. AArch64 keeps the eager FPSIMD save/restore path.
 Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
 the userspace test-hook reset invokes it so distributed tests remain independent
 of link-order. Production builds neither compile nor call this reset.
@@ -171,7 +182,7 @@ Scheduling policy may be implemented in a separate `no_std` crate using only
 the public interface below:
 
 ```rust
-pub trait Scheduler: Send + Sync + 'static {
+pub trait Scheduler: Any + Send + Sync + 'static {
     fn name(&self) -> &'static str;
     fn pick_next(&self, cpu: CpuId, queue: &RunQueue<'_>)
         -> Option<TaskHandle>;
@@ -246,6 +257,13 @@ never observes selection before enqueue. It is a bounded hot-path callback and
 must not allocate, sleep, re-enter the scheduler, or acquire an IRQ-contended
 lock. Runnable/wake changes remain visible in authoritative `RunQueue`
 snapshots rather than invoking arbitrary policy code from a waker or IRQ.
+The four exact in-tree policy types that inherit the default no-op queue-event
+hook (`FifoScheduler`, `PriorityScheduler`, `ClassScheduler`, and
+`EevdfScheduler`) are treated as non-observers, so the core may omit their
+callback and its `TaskMeta` snapshot. Any external/wrapper policy remains
+observable by default. `ClassScheduler` selection may be fused into the core's
+mandatory eligibility scan, but produces the same class/priority/deadline/FIFO
+ordering and remains subordinate to core budget validation.
 
 Policy replacement is a first-class rolling operation ordered by an atomic
 generation ticket. `on_install` runs once before publication;
@@ -497,6 +515,15 @@ control callback.
 - `has_other_runnable_work` may return a false positive under queue contention
   but never blocks to refine the answer. A false result means the caller can
   elide a voluntary self-yield without withholding the CPU from known work.
+  The executor republishes its CPU-local runnable-peer hint after every full
+  eligibility scan, while a false-to-true enqueue/wake transition sets it
+  immediately; deferred wakes, due timers, and cross-CPU inbox state remain
+  conservative fallbacks.
+- On x86_64, a task's FP/SIMD memory image is authoritative whenever CR0.TS is
+  armed. The user `#NM` path clears TS, restores only the currently published
+  own-stack task image, and marks the register image live. Every path that can
+  switch or migrate that task saves a live image and re-arms TS first. A
+  kernel-mode `#NM` is never attributed to a user task.
 - A task is never scheduled on a CPU outside its `Affinity.allowed`
   set. Work-stealing and runtime requeue both respect this as a hard
   constraint; a mask change takes effect at the next cooperative poll

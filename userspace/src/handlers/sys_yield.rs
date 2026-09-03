@@ -2,10 +2,6 @@
 use super::*;
 
 pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
-    if maybe_deliver_signal_before_yield(ctx, Syscall::Yield.raw()) {
-        return;
-    }
-
     // Polling-future path mirroring sys_exit_task.
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -14,16 +10,16 @@ pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
         // SAFETY: same contract as sys_exit_task's hook path.
         unsafe {
             let uc = &*uctx;
-            ctx.save_user_state(uc.state.get() as *mut u8);
-            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 // Linux's fair `yield_task` leaves the sole runnable task in
                 // place: `schedule()` has no peer to select, so a full
                 // switch-out/switch-in would accomplish nothing. Preserve the
-                // same observable contract here. The signal check above still
-                // runs first, and the conservative probe reports `true` on
-                // queue contention or pending deferred/timer work, so we only
-                // elide a yield when no other work can use this CPU.
+                // same observable contract here. The conservative probe
+                // reports `true` on queue contention or pending deferred/timer
+                // work, so we only elide a yield when no other work can use
+                // this CPU. Pending signals are delivered by the common
+                // completed-syscall return hook after this handler returns;
+                // sched_yield itself is not interruptible and always returns 0.
                 if !narf_scheduler::has_other_runnable_work(current_task_id()) {
                     ctx.set_return(SyscallReturn::ok(0));
                     return;
@@ -43,6 +39,12 @@ pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }
+            // The legacy longjmp model resumes from this copied snapshot and
+            // consumes EXIT_REASON_YIELDED in its polling future. Own-stack
+            // yields resume the live syscall continuation above, so copying
+            // all 152 bytes there would be dead work on every context switch.
+            ctx.save_user_state(uc.state.get() as *mut u8);
+            *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             hook(uctx);
         }
         // unreachable

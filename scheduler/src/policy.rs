@@ -24,6 +24,7 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use core::any::{Any, TypeId};
 use core::fmt;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -385,7 +386,7 @@ impl<'a> RunQueue<'a> {
 /// `IrqSafeSpinLock` that an IRQ handler could be waiting on. The
 /// detached slot is owned by the executor for the duration of the
 /// poll and re-enqueued after.
-pub trait Scheduler: Send + Sync + 'static {
+pub trait Scheduler: Any + Send + Sync + 'static {
     /// Stable identifier — surfaced by `current_scheduler_name`.
     fn name(&self) -> &'static str;
 
@@ -441,6 +442,19 @@ pub trait Scheduler: Send + Sync + 'static {
     /// this callback is observational and must not block or re-enter the
     /// scheduler.
     fn on_cpu_state_change(&self, _cpu: CpuId, _change: CpuStateChange) {}
+}
+
+/// The in-tree stateless policies inherit the default no-op queue-event hook.
+/// Avoid materialising a full `TaskMeta` (including an RDTSC-backed budget
+/// snapshot) merely to make that no-op virtual call on every dequeue/requeue.
+/// External policies remain observable by default.
+#[inline]
+pub(crate) fn observes_queue_events(scheduler: &dyn Scheduler) -> bool {
+    let kind = scheduler.type_id();
+    kind != TypeId::of::<FifoScheduler>()
+        && kind != TypeId::of::<PriorityScheduler>()
+        && kind != TypeId::of::<ClassScheduler>()
+        && kind != TypeId::of::<crate::eevdf::EevdfScheduler>()
 }
 
 /// First-in-first-out scheduler — today's stage-3+ behaviour.
@@ -903,7 +917,13 @@ pub(crate) fn pick_next_slot(
     cpu: CpuId,
     q: &mut VecDeque<crate::TaskSlot>,
 ) -> Option<(TaskHandle, crate::TaskSlot)> {
-    let requested = {
+    // Fuse the built-in class policy into the mandatory validation scan below.
+    // External policies remain untrusted and still run their pick followed by
+    // the core pass that enforces work conservation and budget eligibility.
+    let builtin_class = scheduler.is_some_and(|s| s.type_id() == TypeId::of::<ClassScheduler>());
+    let requested = if builtin_class {
+        None
+    } else {
         let rq = RunQueue::projected(q);
         match scheduler {
             Some(s) => s.pick_next(cpu, &rq),
@@ -915,12 +935,19 @@ pub(crate) fn pick_next_slot(
     // a stale/foreign/wrong-tier handle or decline despite runnable candidates.
     // Keep the executor work-conserving without allowing policy to bypass a
     // strict throttle or run idle-borrow work ahead of regular eligibility.
-    let now = narf_time::now_cycles();
-    let dispatch_tier = |slot: &crate::TaskSlot| {
+    let mut now = None;
+    let mut dispatch_tier = |slot: &crate::TaskSlot| {
         if !slot.awake.flag.load(core::sync::atomic::Ordering::Acquire) {
             return 0u8;
         }
-        match slot.account.view(now, &slot.spec.budget).eligibility {
+        let eligibility = match slot.spec.budget.period {
+            None => BudgetEligibility::Eligible,
+            Some(_) => {
+                let timestamp = *now.get_or_insert_with(narf_time::now_cycles);
+                slot.account.view(timestamp, &slot.spec.budget).eligibility
+            }
+        };
+        match eligibility {
             BudgetEligibility::Eligible => 2,
             BudgetEligibility::Borrowable => 1,
             BudgetEligibility::Throttled => 0,
@@ -943,8 +970,17 @@ pub(crate) fn pick_next_slot(
     let mut best_pos: Option<usize> = None;
     let mut requested_hit: Option<(usize, u8)> = None;
     let mut wake_next_hit: Option<(usize, u8)> = None;
+    let mut dispatchable_count = 0usize;
+    let mut class_pick: Option<(usize, u8, SchedClass, Priority, Option<u64>)> = None;
+    // Clear before scanning. A wake that races after this store raises the
+    // hint and is never overwritten; a wake that completed before the store
+    // has already made its slot awake and is counted by the scan below.
+    crate::publish_runnable_peer(cpu.0 as usize, false);
     for (index, slot) in q.iter().enumerate() {
         let tier = dispatch_tier(slot);
+        if tier != 0 {
+            dispatchable_count += 1;
+        }
         // `best_tier` only ever rises, so the index at which it reaches its
         // final value is the earliest top-tier slot — identical to the old
         // `position(tier == best_tier)` scan.
@@ -958,6 +994,44 @@ pub(crate) fn pick_next_slot(
         if wake_next_id != 0 && wake_next_id == slot.id.raw() {
             wake_next_hit = Some((index, tier));
         }
+        if builtin_class && tier != 0 {
+            let candidate = (
+                index,
+                tier,
+                slot.spec.class,
+                slot.spec.priority,
+                slot.spec.budget.deadline_cycles,
+            );
+            let replace = match class_pick {
+                None => true,
+                Some((_, current_tier, current_class, current_priority, current_deadline)) => {
+                    if tier != current_tier {
+                        tier > current_tier
+                    } else if slot.spec.class.rank() != current_class.rank() {
+                        slot.spec.class.rank() > current_class.rank()
+                    } else if slot.spec.priority != current_priority {
+                        slot.spec.priority.raw() < current_priority.raw()
+                    } else if slot.spec.class == SchedClass::Realtime {
+                        match (slot.spec.budget.deadline_cycles, current_deadline) {
+                            (Some(candidate), Some(incumbent)) => candidate < incumbent,
+                            (Some(_), None) => true,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    }
+                }
+            };
+            if replace {
+                class_pick = Some(candidate);
+            }
+        }
+    }
+    if let Some((index, tier, ..)) = class_pick {
+        requested_hit = Some((index, tier));
+    }
+    if dispatchable_count > 1 {
+        crate::publish_runnable_peer(cpu.0 as usize, true);
     }
     if best_tier == 0 {
         // No dispatchable work. Detach one slot for core maintenance so cap
@@ -965,7 +1039,7 @@ pub(crate) fn pick_next_slot(
         // task is parked or period-throttled; the executor rechecks
         // eligibility before polling and requeues a still-live slot.
         let slot = q.pop_front()?;
-        if let Some(scheduler) = scheduler {
+        if let Some(scheduler) = scheduler.filter(|policy| observes_queue_events(*policy)) {
             scheduler.on_task_queue_event(
                 cpu,
                 TaskQueueEvent::Dequeued {
@@ -993,7 +1067,7 @@ pub(crate) fn pick_next_slot(
     };
     let slot = q.remove(pos)?;
     let handle = TaskHandle::from_id(slot.id);
-    if let Some(scheduler) = scheduler {
+    if let Some(scheduler) = scheduler.filter(|policy| observes_queue_events(*policy)) {
         scheduler.on_task_queue_event(
             cpu,
             TaskQueueEvent::Dequeued {

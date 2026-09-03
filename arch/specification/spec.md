@@ -297,6 +297,14 @@ pub fn amd_pstate_request(
 }
 
 #[cfg(target_arch = "x86_64")]
+pub mod cr {
+    pub const CR0_TS: u64;
+    pub unsafe fn read_cr0() -> u64;
+    pub unsafe fn set_task_switched();
+    pub unsafe fn clear_task_switched();
+}
+
+#[cfg(target_arch = "x86_64")]
 pub mod xsave {
     /// Selects x87/SSE/AVX/AVX-512/PKRU dependencies as complete groups;
     /// deliberately excludes opt-in AMX state.
@@ -352,6 +360,11 @@ pub mod xsave {
   the release-published XCR0 mask, and restores the resulting standard-format
   image with the same XRSTOR path as XSAVE.
   Callers must not reach around the HAL to raw `asm!`.
+- **CR0.TS transitions are fenced architecture operations.** `read_cr0`, the
+  read-modify-write that sets TS, and `clts` carry the same compiler-fence
+  discipline as other privileged state transitions. Callers may cache the
+  scheduler-owned TS state only while execution is pinned to that CPU and must
+  clear TS before XSAVE/XRSTOR or explicit kernel FP/SIMD use.
 - **Required features fail boot, optional features degrade.** Boot
   panics if any of these are absent: PKS (x86_64) or MTE (aarch64),
   invariant TSC / Generic Timer, x2APIC / GICv3. Optional features

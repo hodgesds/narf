@@ -3152,6 +3152,9 @@ pub fn account_user_cpu_ns(delta_ns: u64) {
     if delta_ns == 0 {
         return;
     }
+    if crate::task::account_current_cpu_ns(0, delta_ns, 0) {
+        return;
+    }
     let task = current_task_id();
     if task == 0 {
         return;
@@ -3171,6 +3174,9 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
     if delta_ns == 0 {
         return;
     }
+    if crate::task::account_current_cpu_ns(0, 0, delta_ns) {
+        return;
+    }
     let task = current_task_id();
     if task == 0 {
         return;
@@ -3188,8 +3194,9 @@ pub fn account_kernel_cpu_ns(delta_ns: u64) {
 /// cost, which IS ours.
 #[cfg(feature = "unix-latency-trace")]
 pub fn cpu_split_ns_try(task: u64) -> Option<(u64, u64)> {
-    let u = task_account_try_get(&TASK_CPU_NS, task)?;
-    let k = task_account_try_get(&TASK_KERN_NS, task)?;
+    let (task_u, task_k) = crate::task::cpu_times_try(task)?;
+    let u = task_u.saturating_add(task_account_try_get(&TASK_CPU_NS, task)?);
+    let k = task_k.saturating_add(task_account_try_get(&TASK_KERN_NS, task)?);
     Some((u, k))
 }
 
@@ -3211,10 +3218,22 @@ pub fn close_kernel_span(uc: &crate::user_task::UserTaskCtx, task: u64) {
     if delta == 0 {
         return;
     }
-    task_account_add(&TASK_KERN_NS, task, delta);
+    if !crate::task::account_current_cpu_ns(task, 0, delta) {
+        task_account_add(&TASK_KERN_NS, task, delta);
+    }
 }
 
 fn open_kernel_span_for(uc: &crate::user_task::UserTaskCtx, task: u64) {
+    // The normal own-stack path owns its accounting atomics in `Task`, so no
+    // per-CPU ledger row or interrupt-masked CPU selection is needed. A timer
+    // interrupt observes either zero or the complete release-published start.
+    if task != 0 && crate::task::current_task_is(task) {
+        uc.kern_span_start_ns.store(
+            narf_scheduler::narf_time::monotonic_ns(),
+            core::sync::atomic::Ordering::Release,
+        );
+        return;
+    }
     narf_lib::sync::without_interrupts(|| {
         // The pause hook can close this span from timer IRQ context. Create
         // the task's row here, on the normal syscall path, so that close only
@@ -3316,7 +3335,9 @@ pub fn current_kernel_span_elapsed_ns() -> u64 {
 
 /// This task's accumulated in-syscall (kernel) CPU time (ns).
 pub fn kern_time_ns_of(task: u64) -> u64 {
-    task_account_get(&TASK_KERN_NS, task)
+    crate::task::cpu_times(task)
+        .1
+        .saturating_add(task_account_get(&TASK_KERN_NS, task))
 }
 
 /// Test hook: clear the current task's accumulated in-syscall (kernel) CPU
@@ -3330,6 +3351,7 @@ pub fn kern_time_ns_of(task: u64) -> u64 {
 /// stand-in `UserTaskCtx` is not.
 #[doc(hidden)]
 pub fn __test_reset_kernel_time_for(task: u64) {
+    crate::task::reset_cpu_times(task, false, true);
     task_account_remove(&TASK_KERN_NS, task);
 }
 
@@ -3371,13 +3393,16 @@ pub fn __test_account_kernel_ns_on_cpu(task: u64, cpu: usize, delta_ns: u64) {
 /// child's final software-clock contribution.
 #[doc(hidden)]
 pub fn __test_reset_cpu_times_for(task: u64) {
+    crate::task::reset_cpu_times(task, true, true);
     task_account_remove(&TASK_CPU_NS, task);
     task_account_remove(&TASK_KERN_NS, task);
 }
 
 /// This task's own accumulated user CPU time (ns).
 pub fn cpu_time_ns_of(task: u64) -> u64 {
-    task_account_get(&TASK_CPU_NS, task)
+    crate::task::cpu_times(task)
+        .0
+        .saturating_add(task_account_get(&TASK_CPU_NS, task))
 }
 
 /// Accumulated CPU time (ns) of `task`'s reaped children.

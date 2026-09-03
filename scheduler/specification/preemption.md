@@ -45,16 +45,18 @@ On a scheduler-timer trap:
 3. The hook checks the time slice and the core-published periodic-budget
    boundaries.
 4. If a switch is required, it re-arms the task waker, records an involuntary
-   return for RCU, saves user FPU/SIMD state when applicable, clears the
+   return for RCU, saves live user FPU/SIMD state when applicable, clears the
    per-CPU current pointer, and calls
    `kernel_switch(&mut task.ctx, executor_ctx)` directly from the trap handler
    with interrupts disabled.
 5. The executor accounts the elapsed on-CPU interval and dispatches another
    eligible slot.
 6. A later `kernel_switch` resumes inside the suspended trap handler. The task
-   republishes itself, restores FPU/SIMD, address-space, and TLS state as
-   applicable, and returns through the untouched common-trap frame to the
-   interrupted instruction.
+   republishes itself, restores address-space and TLS state, and returns
+   through the untouched common-trap frame to the interrupted instruction.
+   AArch64 also restores FPSIMD eagerly. On x86_64, resume instead arms CR0.TS;
+   the first user FP/SIMD instruction raises `#NM`, restores the image, and
+   retries without advancing the user instruction pointer.
 
 The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 
@@ -136,8 +138,10 @@ rolling generation-ordered cutover.
 - A policy callback receives no mutable queue or execution state.
 - A preemption return is not an RCU quiescent state.
 - User FPU/SIMD, address-space, TLS, trap continuation, and task stack remain
-  paired across preemption and migration. AArch64 captures live `TPIDR_EL0` at
-  switch-out because EL0 may write it directly.
+  paired across preemption and migration. X86 saves every live FP/SIMD image
+  before migration and permits deferred restore only while the task-owned
+  memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
+  because EL0 may write it directly.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
 - Realtime class metadata is demoted on generic spawn paths. Only
