@@ -1,9 +1,9 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.1, scope only**. No enforcement is implemented. This
-> records what exists, what is missing, and the order the missing
-> pieces have to land in, because getting that order wrong hangs the
-> machine with no console.
+> Status: **v0.2**. Steps 1 and 2 are implemented; nothing is enforced
+> yet. This records what exists, what is missing, and the order the
+> missing pieces have to land in, because getting that order wrong hangs
+> the machine with no console.
 
 ## The problem
 
@@ -36,6 +36,8 @@ everything below. The real one is this document.
   * **A Tagged Normal memory attribute.** `MAIR_EL1` Attr2 = `0xF0` and
     `PtFlags::ATTR_TAGGED` selects it. Until recently `ATTR_TAGGED`
     pointed at plain Normal WB, so a "tagged" mapping was never tagged.
+  * **A tagged, tagged-up BPF arena.** Pages map `ATTR_TAGGED` and every
+    granule carries the arena's tag. Nothing checks it yet.
 
 ## What is missing
 
@@ -65,21 +67,65 @@ on the intended access instead of bricking the CPU.
 
 Each step is separately verifiable and leaves the tree working.
 
-  1. **Map one bounded region tagged.** The BPF arena is the candidate:
+  1. **Map one bounded region tagged.** *Done.* The BPF arena:
      `map_arena_page` is a single chokepoint, the kernel controls every
-     access, and the region is already isolated by design. Pass
-     `ATTR_TAGGED`. *Verify:* read the leaf back and assert AttrIndx=2;
-     nothing else changes because nothing tags or checks yet.
-  2. **Tag on populate.** `stg` each granule when an arena page is
-     populated, and return tagged pointers from the arena's accessors.
-     *Verify:* `ldg` round-trips the tag a populate wrote.
-  3. **Flip TCF inside the domain scope.** `enter_domain` sets Sync,
+     access, and the region is already isolated by design. Verified by
+     `smoke_bpf_arena_pages_are_mapped_tagged`, which reads the leaf back
+     and compares the whole AttrIndx field.
+  2. **Tag on populate.** *Done.* `stg` writes the arena's tag to every
+     granule after mapping, and `ArenaPage` carries a `tagged_kva`
+     alongside the plain `kva`. Verified by
+     `smoke_bpf_arena_pages_carry_a_tag`: `ldg` round-trips the tag, a
+     mid-page granule carries it too, the tag is non-zero, and two pages
+     carry the *same* tag.
+
+     One tag per arena, not per page — see "The addressing contract".
+     Tagging must follow mapping: the zeroing in `populate` goes through
+     the untagged direct-map alias, and a store via a non-tagged alias
+     may leave a location's tag UNKNOWN.
+  3. **Make the arena's addressing contract tag-aware.** *Not started,
+     and larger than it looks — see below.* This has to precede any TCF
+     flip.
+  4. **Flip TCF inside the domain scope.** `enter_domain` sets Sync,
      `exit_domain` restores. *Verify:* a deliberate tag mismatch inside
      the scope faults synchronously and is reported, and the existing
      arena smokes still pass.
-  4. **Report honestly.** Only once 1–3 hold does `Mte` deserve to be
-     the reported enforcer; until then aarch64 should report
-     `Unenforced` for the same reason x86 does.
+  5. **Report honestly.** Only once the above hold does `Mte` deserve to
+     be the reported enforcer. aarch64 reports `Unenforced` today, which
+     was done first because it is independent of all of this.
+
+## The addressing contract
+
+This was underestimated when the increments above were first written,
+and it is the reason step 3 exists.
+
+Emitted code addresses the arena as `slot_base + handle + off16`, and
+the JIT bounds-checks against
+`[slot_base - ARENA_MAX_UNDERSHOOT_BYTES, slot_base + ARENA_SLOT_STRIDE)`
+(`bpf/src/jit_glue.rs`). Every arena access therefore inherits one base
+pointer's tag. Two consequences:
+
+  * **Per-page tags cannot work.** A single `slot_base` tag cannot match
+    pages tagged differently, so the check would fire on a legitimate
+    access that merely crossed a page boundary. Hence one tag per arena.
+    The isolation this buys is arena-vs-not-arena, not intra-arena.
+  * **`slot_base` has to carry the tag, and that fights the bounds
+    arithmetic.** With TCF=Sync, an untagged `slot_base` means every
+    legitimate access arrives with tag 0 and faults. But the tag sits in
+    bits 59:56, so a tagged base makes `a < lo || a >= hi` compare
+    inflated values unless every bound carries the identical tag or the
+    comparison strips it first.
+
+So step 3 is "make the JIT's arena addressing contract tag-aware",
+touching `jit_glue`, the emitter, and the bounds checks — not a bit flip
+in `enter_domain`. Half-doing it produces exactly the failure this
+document opens with: a fault the handler cannot service, and no console.
+
+The open design question is where the tag is stripped. Candidates:
+carry it in `slot_base` and mask in the bounds comparison; keep
+`slot_base` plain and have the emitter OR the tag into the computed
+address; or give the arena a fixed tag known at emit time. Each moves
+the cost to a different place, and none is obviously right yet.
 
 ## Traps
 

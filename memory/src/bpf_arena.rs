@@ -432,8 +432,18 @@ struct Inner {
 /// point rather than two that could disagree about which page was backed.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ArenaPage {
-    /// Kernel VA of the page's first byte.
+    /// Kernel VA of the page's first byte, untagged. Every internal
+    /// bookkeeping path (unmap, free-bitmap arithmetic, page-table walks)
+    /// uses this, so it stays a plain address.
     pub kva: u64,
+    /// The same address carrying the page's MTE allocation tag in bits
+    /// 59:56, for code that will be tag-checked. Equal to `kva` on targets
+    /// without MTE, and while the page is untagged.
+    ///
+    /// Kept separate rather than tagging `kva` in place: TBI means a tagged
+    /// pointer still translates, but it is not numerically equal to `kva`,
+    /// and the arena compares and derives plain VAs in several places.
+    pub tagged_kva: u64,
     /// The frame backing it.
     pub phys: PhysAddr,
 }
@@ -449,6 +459,19 @@ pub struct Arena {
     slot_base: u64,
     /// Declared maximum, in pages.
     max_pages: u64,
+    /// MTE allocation tag applied to every granule of every page in this
+    /// arena, in bits 59:56 of a pointer.
+    ///
+    /// One tag for the whole arena, not one per page. Emitted code addresses
+    /// the arena as `slot_base + handle + off16`, so every access inherits a
+    /// single base pointer's tag: per-page tags could not match it, and the
+    /// check would fire on legitimate accesses that merely crossed a page.
+    /// The isolation this buys is arena-vs-not-arena — a pointer forged
+    /// outside carries a different tag — not intra-arena separation.
+    ///
+    /// Zero when MTE is unavailable, which is also the untagged-pointer tag,
+    /// so checks are vacuous rather than wrong.
+    tag: u8,
     inner: IrqSafeSpinLock<Inner>,
 }
 
@@ -492,6 +515,7 @@ impl Arena {
             kva: slot.base + off,
             slot_base: slot.base,
             max_pages,
+            tag: pick_arena_tag(),
             inner: IrqSafeSpinLock::new(Inner {
                 free: FreeRanges::new(max_pages),
                 frames: Vec::new(),
@@ -563,7 +587,18 @@ impl Arena {
                 // `expect` keeps a bookkeeping bug from panicking the kernel
                 // from a page-fault handler.
                 .ok_or(ArenaError::OutOfRange)?;
-            return Ok(ArenaPage { kva, phys });
+            // Already populated and already tagged with the arena's tag;
+            // derive the pointer rather than re-tagging.
+            let tagged_kva = if self.tag == 0 {
+                kva
+            } else {
+                kva | ((self.tag as u64 & 0xF) << 56)
+            };
+            return Ok(ArenaPage {
+                kva,
+                tagged_kva,
+                phys,
+            });
         }
         let frame = crate::frame::alloc_frame().map_err(|_| ArenaError::NoFrame)?;
         // Zero on populate: arena memory is program-visible and must not leak
@@ -582,7 +617,16 @@ impl Arena {
         let phys = frame.start_address();
         inner.free.take(page);
         inner.frames.push((page, frame));
-        Ok(ArenaPage { kva, phys })
+        // SAFETY: the page is mapped Tagged Normal and exclusively ours.
+        // Tagging happens after the zeroing above, which went through the
+        // untagged direct-map alias: a store via a non-tagged alias may leave
+        // a location's tag UNKNOWN, so the tag has to be written last.
+        let tagged_kva = unsafe { tag_arena_page(kva, self.tag) };
+        Ok(ArenaPage {
+            kva,
+            tagged_kva,
+            phys,
+        })
     }
 
     /// Populate `count` pages starting at `from`.
@@ -717,11 +761,72 @@ unsafe fn unmap_arena_page(va: u64) {
     }
 }
 
+/// Write `tag` into the allocation tag of every 16-byte granule of the page,
+/// returning the page's first byte carrying it.
+///
+/// # Safety
+/// `kva` must be a mapped, Tagged-Normal, page-aligned arena page owned by
+/// the caller.
+/// Pick the allocation tag for a new arena.
+///
+/// Non-zero on purpose: tag 0 is what an untagged pointer carries, so an
+/// arena tagged 0 would accept exactly the forged pointers the tag exists to
+/// reject. `IRG` can return 0, so the value is forced into 1..=15.
+///
+/// Returns 0 when MTE is unavailable, which disables tagging entirely rather
+/// than writing tags nothing will check.
+fn pick_arena_tag() -> u8 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if !narf_arch::aarch64::mte::supported() {
+            return 0;
+        }
+        // SAFETY: IRG is register-to-register; the operand is never
+        // dereferenced.
+        let t = unsafe { narf_arch::aarch64::mte::irg(core::ptr::null_mut()) } as u64;
+        let tag = ((t >> 56) & 0xF) as u8;
+        if tag == 0 {
+            1
+        } else {
+            tag
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        0
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn tag_arena_page(kva: u64, tag: u8) -> u64 {
+    if !narf_arch::aarch64::mte::supported() || tag == 0 {
+        return kva;
+    }
+    let tagged = kva | ((tag as u64 & 0xF) << 56);
+    let mut off = 0u64;
+    while off < 4096 {
+        // SAFETY: every granule is inside the page the caller owns, and the
+        // pointer carries the tag STG is to store.
+        unsafe { narf_arch::aarch64::mte::stg((tagged + off) as *mut u8) };
+        off += 16;
+    }
+    tagged
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn map_arena_page(va: u64, phys: PhysAddr) -> Result<(), ArenaError> {
     use crate::aarch64::paging::{map_4kb, PtFlags};
     let root = crate::bpf_text::kernel_root_for_mapping().ok_or(ArenaError::SlotsUnreserved)?;
-    let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN;
+    // Tagged Normal (MAIR Attr2). MTE tag checks apply only to Tagged memory,
+    // so this is what makes the arena checkable at all once `enter_domain`
+    // starts flipping SCTLR_EL1.TCF; see
+    // `arch/specification/mte-enforcement.md`. Inert until then: an untagged
+    // access to a Tagged page is unchecked while TCF is Ignore.
+    //
+    // `map_4kb` composes the leaf as `default | flags` and the default's
+    // ATTR_NORMAL is index 0, so this yields AttrIndx=2 exactly. Passing a
+    // second attribute here would OR two indices into a third.
+    let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN | PtFlags::ATTR_TAGGED;
     // SAFETY: same as the x86_64 arm.
     unsafe { map_4kb(root, VirtAddr::new(va), phys, flags).map_err(|_| ArenaError::MapFailed) }
 }
@@ -735,6 +840,12 @@ unsafe fn unmap_arena_page(va: u64) {
     unsafe {
         let _ = crate::aarch64::paging::unmap_4kb(root, VirtAddr::new(va));
     }
+}
+
+/// No MTE outside aarch64: the tagged pointer is the plain VA.
+#[cfg(not(target_arch = "aarch64"))]
+unsafe fn tag_arena_page(kva: u64, _tag: u8) -> u64 {
+    kva
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

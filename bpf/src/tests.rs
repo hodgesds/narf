@@ -823,6 +823,115 @@ fn smoke_bpf_yield_does_not_refill_fuel() -> TestResult {
 }
 kernel_test_in!("bpf", smoke_bpf_yield_does_not_refill_fuel);
 
+/// Arena pages must be mapped Tagged Normal (MAIR Attr2), which is what makes
+/// them checkable once the MTE backend starts flipping `SCTLR_EL1.TCF`.
+///
+/// Asserted by reading the leaf descriptor back, not by observing that other
+/// tests still pass: a wrong memory attribute is invisible at runtime under
+/// QEMU — Device memory still reads and writes, and cacheable MMIO still
+/// works — so only the descriptor itself is evidence. That is exactly how the
+/// MAIR index mismatch this depends on survived unnoticed.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_pages_are_mapped_tagged() -> TestResult {
+    use narf_memory::aarch64::paging::{leaf_flags_at, PtFlags};
+    use narf_memory::bpf_arena::Arena;
+    use narf_memory::VirtAddr;
+
+    let cap = kernel_arena_cap();
+    let arena = match Arena::new(cap, 4) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("Arena::new failed"),
+    };
+    let page = match arena.populate(0) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("arena populate failed"),
+    };
+    let Some(root) = narf_memory::bpf_text::kernel_root_for_mapping() else {
+        return TestResult::Skip("kernel root not reserved");
+    };
+    // SAFETY: `root` is the live kernel translation root; `page.kva` is the
+    // arena VA `populate` just mapped.
+    let flags = unsafe { leaf_flags_at(root, VirtAddr::new(page.kva)) };
+    // AttrIndx is bits [4:2]; compare the whole field, since a wrong value
+    // that merely shares a bit with Tagged would otherwise pass.
+    const ATTR_FIELD: u64 = 0b111 << 2;
+    match flags {
+        None => TestResult::Fail("populated arena page has no leaf descriptor"),
+        Some((f, _)) if f.bits() & ATTR_FIELD == PtFlags::ATTR_TAGGED.bits() => TestResult::Pass,
+        Some(_) => TestResult::Fail("arena page is not mapped Tagged Normal (AttrIndx != 2)"),
+    }
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_pages_are_mapped_tagged);
+
+/// A populated arena page carries a real MTE allocation tag: `stg` wrote one
+/// to every granule, and `ldg` reads the same value back.
+///
+/// This is the step that makes tag checking meaningful. Mapping a page Tagged
+/// only makes it *checkable*; until the granules carry a tag and callers hold
+/// a pointer bearing it, enabling `SCTLR_EL1.TCF` would fault on the arena's
+/// own accesses.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_pages_carry_a_tag() -> TestResult {
+    use narf_arch::aarch64::mte;
+    use narf_memory::bpf_arena::Arena;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let cap = kernel_arena_cap();
+    let arena = match Arena::new(cap, 4) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("Arena::new failed"),
+    };
+    let page = match arena.populate(0) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("arena populate failed"),
+    };
+
+    // The tagged pointer must differ from the plain VA only in the tag bits,
+    // and the tag must be non-zero: 0 is what an untagged pointer carries, so
+    // a zero-tagged arena would accept exactly the forged pointers the tag
+    // exists to reject, and this check would be vacuous.
+    const TAG_MASK: u64 = 0xF << 56;
+    if page.tagged_kva & TAG_MASK == 0 {
+        return TestResult::Fail("arena tag is 0, which no pointer can mismatch");
+    }
+    if page.tagged_kva & !TAG_MASK != page.kva & !TAG_MASK {
+        return TestResult::Fail("tagged pointer differs outside the tag field");
+    }
+
+    // SAFETY: the page was just populated, so it is mapped Tagged and owned.
+    let read_back = unsafe { mte::ldg(page.kva as *mut u8) } as u64;
+    if read_back & TAG_MASK != page.tagged_kva & TAG_MASK {
+        return TestResult::Fail("ldg did not read back the tag stg wrote");
+    }
+
+    // A granule in the middle of the page carries the same tag: `populate`
+    // tags the whole page, so a check that only looked at byte 0 would pass
+    // against a loop that stopped after one granule.
+    // SAFETY: inside the page just populated.
+    let mid = unsafe { mte::ldg((page.kva + 2048) as *mut u8) } as u64;
+    if mid & TAG_MASK != page.tagged_kva & TAG_MASK {
+        return TestResult::Fail("a mid-page granule was left untagged");
+    }
+
+    // A second page carries the SAME tag. Emitted code addresses the arena as
+    // `slot_base + handle + off16`, so every access inherits one base
+    // pointer's tag; per-page tags would fire the check on a legitimate
+    // access that merely crossed a page boundary.
+    let second = match arena.populate(1) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("second arena populate failed"),
+    };
+    if second.tagged_kva & TAG_MASK != page.tagged_kva & TAG_MASK {
+        return TestResult::Fail("arena pages carry different tags");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_pages_carry_a_tag);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_bpf_sleepable_confinement_is_per_poll() -> TestResult {
     use core::future::Future;
