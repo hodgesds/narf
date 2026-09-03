@@ -646,7 +646,22 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         // SAFETY: CPL=0, single-threaded boot, before any
         // cacheable mapping spans a region we're changing.
         // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { narf_arch::x86_64::pat::init_default() };
+        // Report a failure rather than discarding it. `WriteCombining` is
+        // selected by PTE.PWT, which indexes PA1; if PAT was never
+        // reprogrammed PA1 keeps its reset value WT, so every WC request --
+        // prefetchable BARs, the framebuffer console -- silently gets
+        // write-through instead. Nothing else notices, because write-through
+        // is correct, just slow.
+        // SAFETY: CPL=0, single-threaded boot, before any
+        // cacheable mapping spans a region we're changing.
+        // SAFETY: Valid memory or trusted environment
+        if unsafe { narf_arch::x86_64::pat::init_default() }.is_err() {
+            let _ = writeln!(
+                console::Writer,
+                "  pat: could not program IA32_PAT — write-combining is \
+                 unavailable; WC mappings will be write-through"
+            );
+        }
 
         // Baseline CPU validation. Reads CPUID + CR4 + EFER and
         // refuses to proceed only if a TRULY required bit is off
