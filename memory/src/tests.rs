@@ -404,7 +404,7 @@ kernel_test_in!("memory", smoke_pcid_cr3_roundtrip);
 // ── high-half kernel direct map ───────────────────────────────────
 //
 // `init_mmu` installs a direct map at PML4[384..510] (base
-// `KERNEL_DIRECT_MAP_BASE = 0xFFFF_C000_0000_0000`) so the kernel can
+// the direct map's runtime base, randomized at boot) so the kernel can
 // reach RAM above 512 GiB — which the low identity map can't cover,
 // since PML4[1..255] is user address space. Slot 384 clears both the
 // PCID per-domain range (PML4[256..271]) and the kernel image
@@ -484,7 +484,7 @@ fn smoke_direct_map_installed() -> TestResult {
     // blankets the whole slot; nothing dereferences these).
     for gib in [0u64, 1, 3, 7, 511] {
         let phys = gib << 30;
-        let va = crate::KERNEL_DIRECT_MAP_BASE | phys;
+        let va = crate::direct_map_base() | phys;
         // SAFETY: walking live kernel tables through the direct map.
         match unsafe { translate(pml4_phys, va) } {
             None => return TestResult::Fail("direct-map VA does not translate"),
@@ -528,10 +528,10 @@ fn smoke_direct_map_low_frame_uses_direct_map() -> TestResult {
     let result = (|| {
         // The offset applies to low frames too: ptr != phys, and the
         // pointer lands inside the direct-map window.
-        if km_ptr as u64 != (phys.raw() | crate::KERNEL_DIRECT_MAP_BASE) {
+        if km_ptr as u64 != (phys.raw() | crate::direct_map_base()) {
             return TestResult::Fail("low frame did not take the direct-map offset");
         }
-        if (km_ptr as u64) < crate::KERNEL_DIRECT_MAP_BASE {
+        if (km_ptr as u64) < crate::direct_map_base() {
             return TestResult::Fail("kernel_mut_ptr fell outside the direct-map window");
         }
         // from_kernel_ptr must still invert it.
@@ -563,8 +563,14 @@ kernel_test_in!("memory", smoke_direct_map_low_frame_uses_direct_map);
 /// offset, the result lands inside the direct-map window, and
 /// `from_kernel_ptr` inverts it. Uses a synthetic phys — the map is
 /// installed for [0, RAM), so this validates the transform, not a
-/// dereference (a >512 GiB dereference needs a >512 GiB boot, checked
-/// by hand).
+/// dereference.
+///
+/// The address must stay under 512 GiB. `kernel_ptr` is `phys | base`, so
+/// it is only invertible while the two occupy disjoint bits, and a
+/// randomized base owns bits 39 and up. This used to probe 600 GiB, which
+/// worked only because the base was pinned to PML4[384]: with a randomized
+/// slot the round trip fails whenever the slot is odd, since `phys`'s bit 39
+/// lands on one the base already set.
 #[cfg(target_arch = "x86_64")]
 fn smoke_direct_map_high_phys_offset() -> TestResult {
     use crate::PhysAddr;
@@ -576,25 +582,32 @@ fn smoke_direct_map_high_phys_offset() -> TestResult {
         return TestResult::Skip("direct map not built (RAM <= 512 GiB)");
     }
 
-    // First slot the identity map can't reach.
-    let high = PhysAddr::new(600u64 << 30); // 600 GiB
+    // Below 512 GiB, so `phys` and the base share no bits whichever slot
+    // the map landed at.
+    let high = PhysAddr::new(400u64 << 30); // 400 GiB
     let km = high.kernel_mut_ptr::<u8>() as u64;
 
     // Must be offset into the direct-map window, not identity.
     if km == high.raw() {
         return TestResult::Fail("high frame was NOT offset (still identity)");
     }
-    if km < crate::KERNEL_DIRECT_MAP_BASE {
+    if km < crate::direct_map_base() {
         return TestResult::Fail("high frame VA is below the direct-map base");
     }
-    // Offset must equal base + phys (the map is base | phys, disjoint).
-    if km != crate::KERNEL_DIRECT_MAP_BASE + high.raw() {
-        return TestResult::Fail("direct-map VA != base + phys");
+    // The accessor's contract is `base | phys`, which equals `base + phys`
+    // only while the base has zeros in every bit `phys` can set. That held
+    // when the base was pinned to PML4[384] (bits 0..46 clear); it does not
+    // in general now that the slot is randomized, and 600 GiB is outside the
+    // map on any machine that did not size it that large. So assert the
+    // contract itself rather than the arithmetic coincidence.
+    if km != (crate::direct_map_base() | high.raw()) {
+        return TestResult::Fail("direct-map VA != base | phys");
     }
-    // The VA must decode to the expected PML4 slot (384 + phys/512GiB).
-    let expect_slot = crate::KERNEL_DIRECT_MAP_PML4_BASE as u64 + (600 / 512);
-    if (km >> 39) & 0x1FF != expect_slot {
-        return TestResult::Fail("direct-map VA lands in the wrong PML4 slot");
+    // It must land inside the direct map's slot range, wherever that is.
+    let slot = (km >> 39) & 0x1FF;
+    let first = crate::KERNEL_DIRECT_MAP_PML4_BASE as u64;
+    if !(first..first + crate::KERNEL_DIRECT_MAP_PML4_SLOTS as u64).contains(&slot) {
+        return TestResult::Fail("direct-map VA lands outside the direct-map slot range");
     }
     // Round-trip back to phys.
     if PhysAddr::from_kernel_ptr(km as *const u8).raw() != high.raw() {

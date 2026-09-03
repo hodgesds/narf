@@ -84,8 +84,8 @@ pub use aarch64::{ioremap, mmu, paging};
 
 #[cfg(target_arch = "x86_64")]
 pub use addr::{
-    direct_map_activate, direct_map_live, KERNEL_DIRECT_MAP_BASE, KERNEL_DIRECT_MAP_PML4_BASE,
-    KERNEL_DIRECT_MAP_PML4_SLOTS,
+    direct_map_activate_at, direct_map_base, direct_map_live, KERNEL_DIRECT_MAP_BASE,
+    KERNEL_DIRECT_MAP_PML4_BASE, KERNEL_DIRECT_MAP_PML4_SLOTS,
 };
 pub use addr::{PhysAddr, VirtAddr};
 pub use domain_state::{restore_domain_state, save_domain_state, DomainSavedState};

@@ -1447,6 +1447,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             "  mmu: installed, PML4 @ {:?}, console remapped",
                             pml4
                         );
+                        // Show the direct map's base so a boot log says
+                        // whether the slot was actually randomized — a silent
+                        // fallback to the fixed base looks identical otherwise.
+                        let _ = writeln!(
+                            console::Writer,
+                            "  mmu: direct map at PML4[{}] ({:#018x})",
+                            narf_memory::direct_map_base() >> 39 & 0x1FF,
+                            narf_memory::direct_map_base()
+                        );
                         // Supervisor stores ignore the read-only bit unless
                         // CR0.WP is set (Intel SDM Vol 3 §4.6.1), and boot.S
                         // only ever set CR0.PG — measured CR0 at this point

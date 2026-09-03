@@ -259,6 +259,46 @@ pub unsafe fn drop_ap_trampoline_window() {
     }
 }
 
+/// Pick the PML4 slot the direct map is built at.
+///
+/// The base used to be the fixed `KERNEL_DIRECT_MAP_BASE` (slot 384), so a
+/// leaked physical address became a kernel VA with one OR against a constant
+/// an attacker already knows. Randomizing the slot puts that behind a value
+/// chosen at boot — the same reasoning behind Linux randomizing
+/// `page_offset_base` (`arch/x86/mm/kaslr.c`).
+///
+/// Entropy is bounded by the OR: `PhysAddr::kernel_ptr` computes
+/// `phys | base`, which equals `base + phys` only while the base has zeros in
+/// every bit a physical address can set. A `chunks`-slot map lets `phys` reach
+/// into the next `chunks - 1` slot indices, so the base must be aligned to the
+/// next power of two at or above `chunks`. With RAM under 512 GiB that is one
+/// slot and any of PML4[384..=510] will do — about 7 bits. Coarser than
+/// Linux's 1 GiB-granular randomization, which is the price of OR; switching
+/// to ADD would buy more, but the OR is deliberate (it keeps the accessor
+/// idempotent for a kernel VA a caller wrapped in a `PhysAddr`), so it stays.
+///
+/// Falls back to the fixed base when no entropy is available, rather than
+/// pretending to randomize with something predictable.
+fn pick_direct_map_slot(chunks: u64) -> usize {
+    const FIRST: usize = crate::addr::KERNEL_DIRECT_MAP_PML4_BASE;
+    const SLOTS: usize = crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS;
+    let align = (chunks as usize).next_power_of_two();
+    // Slots that both fit `chunks` and keep `FIRST + k*align` aligned.
+    let first_aligned = FIRST.div_ceil(align) * align;
+    if first_aligned + chunks as usize > FIRST + SLOTS {
+        return FIRST;
+    }
+    let choices = (FIRST + SLOTS - (first_aligned + chunks as usize)) / align + 1;
+    if choices <= 1 {
+        return FIRST;
+    }
+    // SAFETY: RDRAND is a plain instruction; the helper reports absence.
+    let Some(r) = (unsafe { narf_arch::x86_64::hwrng::try_rdrand_u32() }) else {
+        return FIRST;
+    };
+    first_aligned + (r as usize % choices) * align
+}
+
 fn identity_leaf_needs_exec(phys: u64, len: u64) -> bool {
     kernel_window_leaf_needs_exec(phys, len)
         || overlaps(
@@ -567,9 +607,17 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // comes after this is proven present and harmless.
     const CHUNK_BYTES: u64 = 512u64 << 30; // one PML4 slot = 512 GiB
     let build_direct_map = true;
+    // Base the map ends up at; 0 until it is built. Published to the
+    // accessors after the CR3 swap.
+    let mut dmap_base: u64 = 0;
     if build_direct_map {
         let want_chunks = max_ram_phys.div_ceil(CHUNK_BYTES).max(1);
         let dmap_chunks = want_chunks.min(crate::addr::KERNEL_DIRECT_MAP_PML4_SLOTS as u64);
+        let dmap_pml4_base = pick_direct_map_slot(dmap_chunks);
+        // Sign-extend: every slot here is >= 256, so bit 47 is set and a
+        // canonical VA needs bits 63..48 set too. Without this the base is
+        // non-canonical and the first access #GPs rather than faulting.
+        dmap_base = 0xFFFF_0000_0000_0000 | ((dmap_pml4_base as u64) << 39);
         for chunk in 0..dmap_chunks {
             // PDPT frames come from the buddy: the early phys ceiling is
             // still armed (the caller releases it only after we return),
@@ -594,7 +642,7 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
                     let slot = PhysAddr::new(pdpt.raw() + gib * 8);
                     write_identity::<PageTableEntry>(slot, entry);
                 }
-                let pml4_idx = crate::addr::KERNEL_DIRECT_MAP_PML4_BASE as u64 + chunk;
+                let pml4_idx = dmap_pml4_base as u64 + chunk;
                 let pml4_slot = PhysAddr::new(pml4_addr.raw() + pml4_idx * 8);
                 write_identity::<PageTableEntry>(pml4_slot, PageTableEntry::new(pdpt, flags_ptr));
             }
@@ -627,13 +675,13 @@ pub unsafe fn init_mmu(max_ram_phys: u64) -> Result<PhysAddr, MmuError> {
     // was built (RAM <= 512 GiB) the flag stays false and every frame is
     // reached at `phys == virt` through the low identity map.
     if build_direct_map {
-        crate::addr::direct_map_activate();
+        crate::addr::direct_map_activate_at(dmap_base);
         // `narf-arch` cannot call `kernel_ptr` (narf-memory depends on it, so
         // the reverse would be a cycle), and its ACPI table parser can no
         // longer rely on a low identity map — that is gone as of this
         // function, bar the AP trampoline. Hand it the same offset the kernel
         // accessors use, before any table is touched.
-        narf_lib::directmap::set_offset(crate::addr::KERNEL_DIRECT_MAP_BASE);
+        narf_lib::directmap::set_offset(dmap_base);
     }
 
     // Step 5: *caller* notifies the console with a post-switch
