@@ -33,12 +33,20 @@ pub use aarch64 as current;
 /// per crossing instead of the WRMSR-class cost of PKS). `Sfi` is
 /// reserved for a future software-fault-isolation backend; not currently
 /// implemented.
+///
+/// `Unenforced` is the honest answer when the hardware cannot enforce at
+/// all: no PKS, and CR4.PCIDE unavailable so `pcid::enter_domain` would
+/// return an inert guard. Naming that state is the point — selecting
+/// `Pcid` anyway reports an enforcer that enforces nothing, which is worse
+/// than reporting none, because it reads as protection in a boot log and
+/// in `effective_backend()`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum DomainBackend {
     Pks,
     Mte,
     Pcid,
     Sfi,
+    Unenforced,
 }
 
 /// The *static-shape* primitive picked at compile time from the target
@@ -82,6 +90,7 @@ mod effective {
             DomainBackend::Mte => 1,
             DomainBackend::Pcid => 2,
             DomainBackend::Sfi => 3,
+            DomainBackend::Unenforced => 4,
         }
     }
     fn decode(v: u8) -> Option<DomainBackend> {
@@ -90,6 +99,7 @@ mod effective {
             1 => DomainBackend::Mte,
             2 => DomainBackend::Pcid,
             3 => DomainBackend::Sfi,
+            4 => DomainBackend::Unenforced,
             _ => return None,
         })
     }

@@ -481,6 +481,29 @@ fn setup_pcid_domains() {
     // has PCID==0 (init_mmu wrote a clean CR3), as enable_pcide requires.
     unsafe {
         narf_arch::x86_64::pcid::enable_pcide();
+    }
+    // `enable_pcide` declines on a CPU whose CPUID does not advertise PCID,
+    // and without CR4.PCIDE `pcid::enter_domain` returns an inert guard: every
+    // crossing it is supposed to confine runs on the kernel's own CR3. Naming
+    // that state beats selecting an enforcer that enforces nothing, which
+    // reads as protection both in the boot log and in `effective_backend()`.
+    //
+    // Only the BSP has run yet, so this catches "no CPU can enforce". The
+    // mixed case (BSP can, some AP cannot) is not knowable here and is
+    // reported after AP bring-up instead.
+    if !narf_arch::x86_64::pcid::pcide_enabled() {
+        narf_arch::set_effective_backend(narf_arch::DomainBackend::Unenforced);
+        let _ = writeln!(
+            console::Writer,
+            "  domain enforcer: NONE — no PKS and CR4.PCIDE unavailable; \
+             driver domains are NOT isolated"
+        );
+        // Skip the 16 per-domain PML4 clones and their private PDPTs. Nothing
+        // will switch to them, so building them only spends frames.
+        return;
+    }
+    // SAFETY: PCIDE is on, so a PCID-tagged CR3 is meaningful.
+    unsafe {
         narf_arch::x86_64::pcid::init();
     }
     // Spread domain D's PML4 onto NUMA node (D % num_nodes) for locality.
@@ -3774,6 +3797,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             narf_arch::DomainBackend::Mte => "mte",
             narf_arch::DomainBackend::Pcid => "pcid",
             narf_arch::DomainBackend::Sfi => "sfi",
+            narf_arch::DomainBackend::Unenforced => "none",
         };
         let cpu_count = narf_lib::smp::cpu_count();
         let numa_nodes = if narf_memory::is_numa_aware() {
