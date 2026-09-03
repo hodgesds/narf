@@ -126,6 +126,15 @@ pub const VT_GETSTATE: u32 = 0x5603;
 pub const VT_ACTIVATE: u32 = 0x5606;
 /// `ioctl(fd, VT_WAITACTIVE, vtnum)` — block until VT `vtnum` is active.
 pub const VT_WAITACTIVE: u32 = 0x5607;
+/// `ioctl(fd, VT_SETMODE, &vt_mode)` — install the VT switching mode (logind
+/// sets `VT_PROCESS` on a session's VT so it is signalled on switch requests).
+pub const VT_SETMODE: u32 = 0x5602;
+/// `ioctl(fd, VT_RELDISP, arg)` — acknowledge/allow a VT switch. NARF never
+/// forces one, so this is a no-op that returns success.
+pub const VT_RELDISP: u32 = 0x5605;
+/// `ioctl(fd, KDSETMODE, KD_TEXT|KD_GRAPHICS)` — set text vs graphics console
+/// mode. A compositor sets `KD_GRAPHICS` on its VT to take over the display.
+pub const KDSETMODE: u32 = 0x4B3A;
 
 // ── Ring buffer ───────────────────────────────────────────────────────────────
 
@@ -643,6 +652,150 @@ unsafe fn write_user_u32(uptr: usize, v: u32) -> Result<(), FsError> {
         narf_arch::x86_64::smap::with_user_access(|| {
             core::ptr::write_unaligned(uptr as *mut u32, v);
         });
+    }
+    Ok(())
+}
+
+// ── VT ioctl structs: vt_stat (6 bytes) / vt_mode (8 bytes) ──────────
+// `struct vt_stat { unsigned short v_active, v_signal, v_state; }` and
+// `struct vt_mode { char mode, waitv; short relsig, acqsig, frsig; }`
+// (`include/uapi/linux/vt.h`). Copied byte-for-byte through the SMAP window so
+// the on-wire layout is exact regardless of pointer alignment.
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn write_user_vt_stat(
+    uptr: usize,
+    active: u16,
+    signal: u16,
+    state: u16,
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 6];
+    b[0..2].copy_from_slice(&active.to_le_bytes());
+    b[2..4].copy_from_slice(&signal.to_le_bytes());
+    b[4..6].copy_from_slice(&state.to_le_bytes());
+    // SAFETY: `uptr` is the validated user `struct vt_stat *`; with_user_access
+    // opens the SMAP window for the 6-byte copy.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), uptr as *mut u8, 6);
+        });
+    }
+    Ok(())
+}
+
+/// Read a `struct vt_mode` → `(mode, waitv, relsig, acqsig, frsig)`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn read_user_vt_mode(uptr: usize) -> Result<(u8, u8, i16, i16, i16), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 8];
+    // SAFETY: `uptr` is the validated user `struct vt_mode *`.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(uptr as *const u8, b.as_mut_ptr(), 8);
+        });
+    }
+    Ok((
+        b[0],
+        b[1],
+        i16::from_le_bytes([b[2], b[3]]),
+        i16::from_le_bytes([b[4], b[5]]),
+        i16::from_le_bytes([b[6], b[7]]),
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn write_user_vt_mode(
+    uptr: usize,
+    mode: u8,
+    waitv: u8,
+    relsig: i16,
+    acqsig: i16,
+    frsig: i16,
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 8];
+    b[0] = mode;
+    b[1] = waitv;
+    b[2..4].copy_from_slice(&relsig.to_le_bytes());
+    b[4..6].copy_from_slice(&acqsig.to_le_bytes());
+    b[6..8].copy_from_slice(&frsig.to_le_bytes());
+    // SAFETY: `uptr` is the validated user `struct vt_mode *`.
+    unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| {
+            core::ptr::copy_nonoverlapping(b.as_ptr(), uptr as *mut u8, 8);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn write_user_vt_stat(
+    uptr: usize,
+    active: u16,
+    signal: u16,
+    state: u16,
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 6];
+    b[0..2].copy_from_slice(&active.to_le_bytes());
+    b[2..4].copy_from_slice(&signal.to_le_bytes());
+    b[4..6].copy_from_slice(&state.to_le_bytes());
+    // SAFETY: caller guarantees `uptr` is a valid 6-byte user buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b.as_ptr(), uptr as *mut u8, 6);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn read_user_vt_mode(uptr: usize) -> Result<(u8, u8, i16, i16, i16), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 8];
+    // SAFETY: caller guarantees `uptr` is a valid 8-byte user buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(uptr as *const u8, b.as_mut_ptr(), 8);
+    }
+    Ok((
+        b[0],
+        b[1],
+        i16::from_le_bytes([b[2], b[3]]),
+        i16::from_le_bytes([b[4], b[5]]),
+        i16::from_le_bytes([b[6], b[7]]),
+    ))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn write_user_vt_mode(
+    uptr: usize,
+    mode: u8,
+    waitv: u8,
+    relsig: i16,
+    acqsig: i16,
+    frsig: i16,
+) -> Result<(), FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let mut b = [0u8; 8];
+    b[0] = mode;
+    b[1] = waitv;
+    b[2..4].copy_from_slice(&relsig.to_le_bytes());
+    b[4..6].copy_from_slice(&acqsig.to_le_bytes());
+    b[6..8].copy_from_slice(&frsig.to_le_bytes());
+    // SAFETY: caller guarantees `uptr` is a valid 8-byte user buffer.
+    unsafe {
+        core::ptr::copy_nonoverlapping(b.as_ptr(), uptr as *mut u8, 8);
     }
     Ok(())
 }

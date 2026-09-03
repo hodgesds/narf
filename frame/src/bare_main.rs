@@ -3624,6 +3624,15 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                 narf_init::InitResult::Ok
             });
 
+            // /sys/class/tty/tty0/active — logind reads this to learn the active
+            // VT on seat0 and thereby which session is active. Without it logind
+            // "cannot determine the active graphical session", refuses
+            // TakeDevice, and the compositor cannot open /dev/dri/card0.
+            narf_init::register(narf_init::Stage::Late, "sysfs-tty-class", || {
+                narf_filesystem::sysfs::populate_tty_class();
+                narf_init::InitResult::Ok
+            });
+
             // The early SysFs population happens before PCI probing, so it
             // cannot see virtio-blk's GPT children. Re-populate the block
             // class after all drivers have registered; systemd-udevd's

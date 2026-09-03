@@ -798,6 +798,27 @@ pub fn get_or_create_child(parent: &Arc<Kobject>, name: &str) -> Arc<Kobject> {
 /// `sd_device` from `DEVPATH` and rejects class paths as non-device objects.
 /// Also registers under `/sys/block/<name>/` (flat view).
 /// Linux ref: `blk_register_queue` (block/blk-sysfs.c:852).
+/// Register `/sys/class/tty/tty0/active` — the attribute systemd-logind reads to
+/// learn the active VT on seat0.
+///
+/// logind's `sd-device` `seat_read_active_vt()` opens
+/// `/sys/class/tty/tty0/active` and parses `ttyN`; the session whose `VTNr`
+/// equals N is the seat's active session, and only the active session is handed
+/// DRM device fds via `TakeDevice`. Without this attribute logind logs "System
+/// has /dev/tty0 but not /sys/class/tty/tty0/active which is broken, ignoring"
+/// and can never determine the active graphical session — so it refuses
+/// TakeDevice, the compositor's fallback direct-open of `/dev/dri/card0` is
+/// denied, and the screen stays black.
+///
+/// The value tracks [`crate::vt::active_vt`] so it agrees with the
+/// `VT_GETSTATE` ioctl. Linux ref: `drivers/tty/vt/vt.c` — the `active` sysfs
+/// attribute of the `tty0` console device.
+pub fn populate_tty_class() {
+    let class_tty = class_register("tty");
+    let tty0 = class_device_register(class_tty, "tty0");
+    kobject_add_attr(&tty0, "active", crate::vt::active_sysfs);
+}
+
 pub fn populate_block_class() {
     let root = get_root();
     let class_block = {

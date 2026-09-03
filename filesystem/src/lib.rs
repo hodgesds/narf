@@ -88,6 +88,7 @@ pub mod root_mount;
 pub mod root_selector;
 pub mod sysfs;
 pub mod uevent;
+pub mod vt;
 
 mod cgroupfs_tests;
 mod debugfs_tests;
