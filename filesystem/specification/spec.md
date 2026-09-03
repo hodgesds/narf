@@ -94,6 +94,8 @@ pub trait FileOps {
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
         -> Option<Poll<u32>>;
+    fn arm_readiness_exclusive(&self, task_id: u64, interest: u32, waker: &Waker)
+        -> Option<Poll<u32>>;
     fn disarm_readiness(&self, task_id: u64) -> bool;
     fn tty_fg_pgrp(&self) -> Option<u64>;
     fn tty_session(&self) -> Option<u64>;
@@ -132,6 +134,11 @@ lose a drain/refill transition between readiness scans.
 epoll instance accepts an event for delivery. It lets a source retire a
 per-open-file change edge without allowing a passive nested-epoll readiness
 query to consume an event owned by its inner monitor.
+`arm_readiness_exclusive` is used only by a blocking I/O syscall. Its default
+delegates to ordinary `arm_readiness`; providers backed by a Linux-style
+exclusive wait queue override it so one consumable event wakes one syscall.
+Poll and epoll continue to use non-exclusive `arm_readiness` and persistent
+registration, respectively, and therefore all observe the event.
 `open_instance` defaults to `None`. Clone devices return a fresh open-file
 object so lookup/stat and `O_PATH` remain side-effect free; the Linux open path
 calls it only after access checks. `/dev/pts/ptmx` returns a fresh PTY master

@@ -181,6 +181,36 @@ RFLAGS.IF / DAIF.I read to expose `is_sleepable()` and the
 Storage: `[AtomicU32; MAX_CPUS]` indexed by `current_cpu()`.
 Lock-free; only the owning CPU writes its cell.
 
+### 3.7 Durable readiness
+
+```rust
+pub struct Readiness;
+impl Readiness {
+    pub fn arm(&self, id: u64, interest: u32, waker: &Waker) -> Poll<u32>;
+    pub fn arm_exclusive(&self, id: u64, interest: u32, waker: &Waker)
+        -> Poll<u32>;
+    pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32;
+    pub fn set(&self, add: u32, clear: u32);
+    pub fn set_event(&self, add: u32, clear: u32, event: u32);
+    pub fn set_wake_all(&self, add: u32, clear: u32);
+    pub fn notify(&self, bits: u32);
+    pub fn disarm(&self, id: u64);
+}
+```
+
+`arm` and `arm_persistent` are non-exclusive observers; every matching event
+wakes all of them. `arm_exclusive` joins a FIFO in which each matching event
+wakes at most one waiter, after the non-exclusive observers. Selection removes
+only the waiter's integer FIFO entry in the event path; its allocation-bearing
+waker remains stored until task-context re-arm or disarm. This matches Linux
+wait-queue exclusivity without permitting a waker drop or allocation in IRQ
+context. All arm variants check the current level under the same lock used by
+`set`, preserving the lost-wake-free contract. `set_event` folds a same-level
+provider notification into the state publication so one operation cannot
+select two exclusive waiters. `set_wake_all` is the terminal-state form: it
+wakes and logically dequeues all exclusive waiters without dropping their
+wakers.
+
 ## 4. Invariants & safety properties
 
 - All `no_std`-clean. No hidden `alloc` dependency without a
