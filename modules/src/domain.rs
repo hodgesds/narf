@@ -124,17 +124,29 @@ pub struct DomainScope {
 /// and closing that direction instead would mean an MSR write on every
 /// crossing — worth measuring before it is anyone's default.
 ///
-/// A no-op when PKS is not the active enforcer (a pre-SPR Intel or AMD part
-/// running the PCID backend, or a kernel built for another architecture).
-/// Pages still carry their key; nothing consults it.
+/// Dispatches to whichever x86 backend is live. `Pks::enter_domain` is the
+/// `DomainPrimitive` impl, which switches `IA32_PKRS` under PKS and swaps to
+/// the domain's PCID-tagged CR3 under PCID -- this used to call
+/// `pks::enter_domain` directly and gate on `pks::is_active()` alone, so a
+/// module on an AMD or pre-SPR Intel part ran with the pages still carrying
+/// their protection key and nothing consulting it. `bpf::domain::enter` has
+/// dispatched for both backends all along; this is the same call.
+///
+/// Still a no-op when neither backend can enforce -- no PKS and no usable
+/// CR4.PCIDE, or another architecture. `enter_domain` itself declines in that
+/// case, and the boot log says so.
 pub fn enter(domain: DomainId) -> DomainScope {
     #[cfg(target_arch = "x86_64")]
     {
-        if narf_arch::x86_64::pks::is_active() {
-            // SAFETY: `is_active` establishes CR4.PKS; both ids are 0..=15
-            // (`DomainId` is constructed from that range).
+        if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {
+            // SAFETY: one backend is live; both ids are 0..=15 (`DomainId` is
+            // constructed from that range). Under PCID this swaps CR3 to the
+            // domain's PML4 clone; under PKS it narrows IA32_PKRS.
             let saved = unsafe {
-                narf_arch::x86_64::pks::enter_domain(DomainId::FRAME.raw(), domain.raw())
+                <narf_arch::x86_64::Pks as narf_arch::DomainPrimitive>::enter_domain(
+                    DomainId::FRAME.raw(),
+                    domain.raw(),
+                )
             };
             return DomainScope { saved };
         }
@@ -159,10 +171,14 @@ pub fn enter(domain: DomainId) -> DomainScope {
 pub fn exit(scope: DomainScope) {
     #[cfg(target_arch = "x86_64")]
     {
-        if narf_arch::x86_64::pks::is_active() {
-            // SAFETY: CR4.PKS is on and `scope.saved` came from the matching
-            // `enter_domain`.
-            unsafe { narf_arch::x86_64::pks::exit_domain(scope.saved) };
+        if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {
+            // SAFETY: `scope.saved` came from the matching `enter_domain`, and
+            // exit dispatches to the same backend that produced it. Unbalanced
+            // here would leave PKRS narrowed or CR3 on a domain clone, and the
+            // fault would land arbitrarily far away.
+            unsafe {
+                <narf_arch::x86_64::Pks as narf_arch::DomainPrimitive>::exit_domain(scope.saved)
+            };
         }
     }
     #[cfg(not(target_arch = "x86_64"))]
