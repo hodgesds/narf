@@ -1092,25 +1092,38 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             hz
         );
 
-        // Domain-enforcer selection. MTE is the fast path on aarch64;
-        // when it's absent we will eventually fall back to ASID-tagged
-        // per-domain page tables (the aarch64 analogue of the PCID
-        // path on x86_64). Today only the MTE branch is wired.
-        // ID_AA64PFR1_EL1.MTE is a 4-bit field: 0=none, 1=instructions
-        // only, 2=memory tagging supported, 3+=advanced. Anything >=2
-        // is sufficient for our purposes.
+        // Domain-enforcer selection.
+        //
+        // Neither arm can enforce today, so neither may claim to.
+        // `Mte::enter_domain` is a structural no-op: it saves SCTLR_EL1 and
+        // GCR_EL1 and never flips SCTLR_EL1.TCF from Ignore to Sync, so a tag
+        // mismatch never faults. Nothing in the tree writes TCF at all. And
+        // the no-MTE arm selected `Pcid`, which on aarch64 is not a backend —
+        // the ASID-tagged fallback it named is unimplemented, so it reported
+        // an intent as though it were a mechanism.
+        //
+        // Reporting `Unenforced` is the same correction the x86 side made
+        // when PCID was selected with CR4.PCIDE clear: naming an enforcer
+        // that enforces nothing reads as protection in a boot log and in
+        // every `effective_backend()` caller. The path to a real MTE backend
+        // is scoped in `arch/specification/mte-enforcement.md`.
+        //
+        // ID_AA64PFR1_EL1.MTE is a 4-bit field: 0=none, 1=instructions only,
+        // 2=memory tagging supported, 3+=advanced. The distinction is kept in
+        // the message because "hardware absent" and "hardware present but
+        // unused" are different problems to a reader.
+        narf_arch::set_effective_backend(narf_arch::DomainBackend::Unenforced);
         if feats.mte >= 2 {
-            narf_arch::set_effective_backend(narf_arch::DomainBackend::Mte);
-            let _ = writeln!(console::Writer, "  domain enforcer: mte");
-        } else {
-            // No MTE — for now stay on the Mte type alias (its
-            // unimplemented stubs are never invoked in this config)
-            // and report Pcid-class fallback intent.
-            narf_arch::set_effective_backend(narf_arch::DomainBackend::Pcid);
             let _ = writeln!(
                 console::Writer,
-                "  domain enforcer: pcid-class fallback \
-                 (no MTE — ASID-tagged per-domain page tables pending)"
+                "  domain enforcer: NONE — MTE present but tag checking is \
+                 not enabled; driver domains are NOT isolated"
+            );
+        } else {
+            let _ = writeln!(
+                console::Writer,
+                "  domain enforcer: NONE — no MTE and no fallback; \
+                 driver domains are NOT isolated"
             );
         }
 
