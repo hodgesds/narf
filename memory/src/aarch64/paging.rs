@@ -86,10 +86,25 @@ impl PtFlags {
     /// Access Flag: must be 1 to avoid Access Flag faults.
     pub const AF: Self = Self(1 << 10);
 
-    /// MAIR attribute index (bits 4:2).
-    pub const ATTR_NORMAL: Self = Self(0 << 2); // Index 0 in MAIR
-    pub const ATTR_TAGGED: Self = Self(1 << 2); // Index 1 in MAIR
-    pub const ATTR_DEVICE: Self = Self(2 << 2); // Index 2 in MAIR
+    /// MAIR attribute index (bits 4:2). These MUST match `MAIR_EL1` as
+    /// programmed in `frame/src/aarch64/boot.S` and `smp_entry.S`:
+    ///
+    ///   Attr0 = 0xFF Normal WB, Attr1 = 0x04 Device-nGnRE,
+    ///   Attr2 = 0xF0 Normal WB Tagged.
+    ///
+    /// They did not. `ATTR_NORMAL` named index 0 and `ATTR_DEVICE` index 2
+    /// while MAIR had Device at 0 and Normal at 1, so every page this module
+    /// mapped as "normal" was mapped Device-nGnRE: uncached, strongly
+    /// ordered, faulting on unaligned access. `ATTR_TAGGED` named index 1,
+    /// plain Normal WB, so a tagged mapping was never tagged.
+    ///
+    /// Normal is index 0 on purpose. `map_4kb` composes a leaf as
+    /// `default | caller_flags` and an index field cannot be OR-ed, so the
+    /// default must contribute zero to bits [4:2]; otherwise asking for
+    /// Device would yield `Normal | Device` and map MMIO cacheable.
+    pub const ATTR_NORMAL: Self = Self(0 << 2); // Attr0: Normal WB
+    pub const ATTR_DEVICE: Self = Self(1 << 2); // Attr1: Device-nGnRE
+    pub const ATTR_TAGGED: Self = Self(2 << 2); // Attr2: Normal WB Tagged
 
     /// Execute-never bits.
     pub const UXN: Self = Self(1 << 54);

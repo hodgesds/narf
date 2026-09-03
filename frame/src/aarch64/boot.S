@@ -81,16 +81,17 @@ _start:
      *
      * Block descriptor bits:
      *   [1:0] = 01  (valid block)
-     *   [4:2] = AttrIndx (0=Device, 1=Normal, per MAIR_EL1 below)
+     *   [4:2] = AttrIndx (0=Normal, 1=Device, 2=Normal-Tagged, per
+     *           MAIR_EL1 below)
      *   [10]  = AF  (access flag — else fault on first access)
      *
-     * 0x401 = bit 0 + bit 10              → valid, AttrIndx=0 (Device)
-     * 0x405 = bit 0 + bit 2 + bit 10      → valid, AttrIndx=1 (Normal)
+     * 0x401 = bit 0 + bit 10              → valid, AttrIndx=0 (Normal)
+     * 0x405 = bit 0 + bit 2 + bit 10      → valid, AttrIndx=1 (Device)
      * (earlier 0x404 had bit 0 CLEAR = INVALID, causing translation
      * fault on first post-MMU instruction fetch at PA 0x40080000.)
      */
     add  x0, x0, #4096      /* x0 = &lo_L1 */
-    mov  x1, #0x401         /* valid block, AttrIndx=0 (Device), PA 0x0 */
+    mov  x1, #0x405         /* valid block, AttrIndx=1 (Device), PA 0x0 */
     mov  x5, #0x60
     orr  x1, x1, x5, lsl #48    /* PXN (53) | UXN (54) — see below */
     str  x1, [x0, #0]
@@ -128,15 +129,15 @@ _start:
      * the moment a user task `activate()`s its empty TTBR0 the
      * next `writeln!(console::Writer, ...)` page-faults.
      *
-     * 0x401 = valid block, AttrIndx=0 (Device, per MAIR_EL1). */
-    mov  x1, #0x401
+     * 0x405 = valid block, AttrIndx=1 (Device, per MAIR_EL1). */
+    mov  x1, #0x405
     mov  x5, #0x60
     orr  x1, x1, x5, lsl #48    /* PXN (53) | UXN (54) */
     str  x1, [x0, #(0 * 8)]
 
     /* ── Demote both 1 GiB RAM blocks to 2 MiB, NX outside kernel text ──
      *
-     * These two blocks used to be plain `0x405`: valid, Normal, AF, and
+     * These two blocks used to be plain `0x401`: valid, Normal, AF, and
      * — because bits 53/54 were clear — **executable at EL1**. Between
      * them they alias every physical page the kernel can reach (the
      * TTBR1 window at PA 0x4000_0000 is what `PhysAddr::kernel_ptr`
@@ -185,16 +186,24 @@ _start:
 
     dsb sy
 
-    /* MAIR_EL1: Attr0 = Device nGnRE (0x04), Attr1 = Normal WB (0xFF).
+    /* MAIR_EL1: Attr0 = Normal WB (0xFF), Attr1 = Device nGnRE (0x04),
+     * Attr2 = Normal WB Tagged (0xF0).
      *
-     * The bytes are low-to-high: bits[7:0]=Attr0, bits[15:8]=Attr1.
-     * Encoding 0xFF04 gives Attr0=0x04=Device, Attr1=0xFF=Normal —
-     * matching the AttrIndx values in the block descriptors above.
-     * (Earlier 0x04FF had them swapped, causing the RAM region to be
-     * mapped as Device memory, which breaks instruction-fetch ordering
-     * on modern cores.)
-     */
-    mov  x0, #0xFF04
+     * Bytes low-to-high: [7:0]=Attr0, [15:8]=Attr1, [23:16]=Attr2, so
+     * 0xF004FF. Normal is index 0 deliberately: `map_4kb` composes a leaf as
+     * `default | caller_flags`, and an index field cannot be OR-ed. With
+     * Normal at 0 the default contributes nothing to bits [4:2], so a caller
+     * asking for Device (1) or Tagged (2) gets exactly that. Any other
+     * ordering silently ORs two indices together -- Device|Normal would have
+     * mapped MMIO cacheable.
+     *
+     * Attr2 is inert until a descriptor selects AttrIndx=2. MTE tag checks
+     * apply only to Tagged Normal memory, so without it no page can be
+     * checked whatever SCTLR_EL1.TCF says.
+     *
+     * movz/movk: 0xF004FF does not fit a `mov` immediate. */
+    movz x0, #0x04FF
+    movk x0, #0xF0, lsl #16
     msr  mair_el1, x0
 
     /* TCR_EL1: 48-bit VA, TG=4KB */
@@ -271,7 +280,7 @@ build_ram_l2:
     mov  x3, #0                 /* i */
     movz x4, #0x4000, lsl #16   /* pa = 0x4000_0000 */
 2:
-    mov  x5, #0x405             /* valid block | AttrIndx=1 (Normal) | AF */
+    mov  x5, #0x401             /* valid block | AttrIndx=0 (Normal) | AF */
     add  x6, x4, #0x200000      /* pa_end */
     /* Overlap iff  pa < exec_end  &&  exec_start < pa_end. */
     cmp  x4, x2
