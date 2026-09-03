@@ -3,11 +3,6 @@ use super::*;
 
 pub(crate) fn sys_pipe(ctx: &mut dyn TrapContext) {
     let out_ptr = ctx.args().arg0;
-    if out_ptr == 0 {
-        // NULL fd-array pointer → EFAULT.
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-        return;
-    }
     let (rd, wr) = crate::pipe::pipe_pair();
     let task = current_task_id();
     // Access-mode status flags mirror `fs/pipe.c::create_pipe_files`:
@@ -44,7 +39,13 @@ pub(crate) fn sys_pipe(ctx: &mut dyn TrapContext) {
     // it and SMAP-brackets the write of the 8-byte `buf`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        // Faulting fd-array buffer → EFAULT.
+        // Linux reserves both numbers before copy_to_user but publishes
+        // neither file until that copy succeeds. NARF installed the pair to
+        // obtain the numbers, so roll it back before reporting EFAULT.
+        let _ = fd::with_table(task, |table| {
+            table.close(r);
+            table.close(w);
+        });
         ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }

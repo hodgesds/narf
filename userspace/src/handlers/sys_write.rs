@@ -59,23 +59,38 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     } else {
         endpoint.description.offset()
     };
+    let pipe_write = endpoint
+        .ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>());
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
-        // SAFETY: the complete original range passed validate_rw_user_range;
-        // each bounded guarded copy still catches a racing unmap.
-        let payload = match unsafe { copy_from_user_vec(user_ptr + total as u64, want) } {
-            Ok(payload) => payload,
-            Err(errno) if total == 0 => {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
-                return;
+        let outcome = if let Some(pipe) = pipe_write {
+            match pipe.write_from_user(user_ptr + total as u64, want) {
+                Ok(outcome) => outcome,
+                Err(errno) if total == 0 => {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
+        } else {
+            // SAFETY: the complete original range passed validate_rw_user_range;
+            // each bounded guarded copy still catches a racing unmap.
+            let payload = match unsafe { copy_from_user_vec(user_ptr + total as u64, want) } {
+                Ok(payload) => payload,
+                Err(errno) if total == 0 => {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                Err(_) => break,
+            };
+            if endpoint.append() {
+                offset = endpoint.ops.stat().size;
+            }
+            poll_blocking(endpoint.ops.write(offset, &payload))
+                .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
         };
-        if endpoint.append() {
-            offset = endpoint.ops.stat().size;
-        }
-        let outcome = poll_blocking(endpoint.ops.write(offset, &payload))
-            .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
         match outcome {
             Ok(0) if endpoint.ops.write_should_block() && total == 0 => {
                 if endpoint.nonblocking() {
@@ -97,10 +112,10 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                 return;
             }
             Ok(0) => break,
-            Ok(written) if written <= payload.len() => {
+            Ok(written) if written <= want => {
                 total += written;
                 offset = offset.saturating_add(written as u64);
-                if written < payload.len() {
+                if written < want {
                     break;
                 }
             }

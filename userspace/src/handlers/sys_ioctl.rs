@@ -564,6 +564,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     match ops.ioctl(cmd, arg) {
         Ok(rc) => ctx.set_return(SyscallReturn::ok(rc)),
         Err(narf_filesystem::FsError::Unsupported) => {
+            if ops.stat().mode.file_type == narf_filesystem::FileType::Fifo {
+                // pipe_ioctl's -ENOIOCTLCMD is translated by vfs_ioctl to
+                // ENOTTY. Do this before the generic filesystem-ioctl relay:
+                // an arbitrary command's encoded direction must not make a
+                // pipe ioctl touch its otherwise-ignored argument pointer.
+                ctx.set_return(SyscallReturn::ok((-25i64) as u64));
+                return;
+            }
             // Linux restricted FUSE ioctls derive their transfer buffers
             // solely from the command's _IOC direction and size fields.
             const IOC_WRITE: u32 = 1;
@@ -707,6 +715,14 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        }
+        Err(narf_filesystem::FsError::InvalidData)
+            if cmd == 0x541B
+                && ops.stat().mode.file_type == narf_filesystem::FileType::Fifo =>
+        {
+            // pipe_ioctl(FIONREAD) returns put_user() directly, so an invalid
+            // result pointer is EFAULT rather than an invalid ioctl argument.
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         }
         Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
             ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));

@@ -68,9 +68,13 @@ static GUARDED_COPY: [GuardedCopyMarker; narf_lib::percpu::MAX_CPUS] =
     [const { GuardedCopyMarker::new() }; narf_lib::percpu::MAX_CPUS];
 
 #[inline]
-fn guarded_copy_marker() -> &'static GuardedCopyMarker {
-    let cpu = crate::current_cpu_id().raw() as usize;
+fn guarded_copy_marker_for(cpu: usize) -> &'static GuardedCopyMarker {
     &GUARDED_COPY[cpu.min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+#[inline]
+fn guarded_copy_marker() -> &'static GuardedCopyMarker {
+    guarded_copy_marker_for(crate::current_cpu_id().raw() as usize)
 }
 
 /// Whether this CPU is inside [`copy_user_guarded`]'s probe/SMAP window.
@@ -85,8 +89,8 @@ pub fn guarded_copy_armed() -> bool {
 }
 
 #[inline]
-fn set_guarded_copy_armed(armed: bool) {
-    let marker = guarded_copy_marker();
+fn set_guarded_copy_armed_for(cpu: usize, armed: bool) {
+    let marker = guarded_copy_marker_for(cpu);
     let old = marker.armed.load(Ordering::Relaxed);
     debug_assert_ne!(old, armed, "nested or unbalanced guarded user copy");
     // This record has one writer: its own CPU with IRQs masked. A release
@@ -277,6 +281,11 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         unsafe {
             asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
         }
+        // IRQ masking pins execution to this CPU until the probe and SMAP
+        // window are both closed. Resolve the per-CPU slot once: the former
+        // marker/probe helpers each executed RDTSCP independently (four reads
+        // per 4 KiB pipe syscall) despite all four indices being identical.
+        let cpu = crate::current_cpu_id().raw() as usize;
         let recovery: u64;
         // SAFETY: LEA of a local label. `98f` resolves forward into
         // the copy block below — GAS numeric labels span asm blocks
@@ -288,8 +297,8 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
                 options(nostack, preserves_flags),
             );
         }
-        set_guarded_copy_armed(true);
-        probe::arm(recovery);
+        set_guarded_copy_armed_for(cpu, true);
+        probe::arm_for_cpu(cpu, recovery);
         // SAFETY: open the user-access window; the matching `clac`
         // below runs on both the fall-through and the recovery path
         // (label 98 sits before it).
@@ -318,8 +327,8 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
         unsafe {
             clac();
         }
-        let caught = probe::disarm();
-        set_guarded_copy_armed(false);
+        let caught = probe::disarm_for_cpu(cpu);
+        set_guarded_copy_armed_for(cpu, false);
         // Restore IF exactly as found.
         if saved_rflags & (1 << 9) != 0 {
             // SAFETY: re-enabling interrupts we disabled above.

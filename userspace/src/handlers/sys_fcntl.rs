@@ -439,17 +439,44 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 }
                 SyscallReturn::ok(0)
             }
-            // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report the pipe buffer
-            // capacity. NARF's pipe is a fixed-size ring, so F_SETPIPE_SZ can't
-            // grow it — return the current capacity (Linux rounds the request
-            // to a page/power-of-two anyway). EINVAL for a non-pipe fd, matching
-            // Linux. stress-ng's pipe stressor queries F_GETPIPE_SZ to size its
-            // I/O buffer; without this it fell back to a 4 KiB write + a stale
-            // errno on the first full-pipe short write.
-            1032 | 1031 => match entry.ops.pipe_capacity() {
+            // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report or resize the
+            // pipe buffer. `pipe_fcntl()` returns EBADF, not EINVAL, when the
+            // descriptor is valid but not a pipe. stress-ng's pipe stressor
+            // queries F_GETPIPE_SZ to size its I/O buffer.
+            1032 => match entry.ops.pipe_capacity() {
                 Some(cap) => SyscallReturn::ok(cap as u64),
-                None => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
+                None => SyscallReturn::ok((-(EBADF as i64)) as u64),
             },
+            1031 => {
+                // fcntl truncates arg through `int argi`; pipe_fcntl receives
+                // that low 32-bit value as unsigned int.
+                let size_arg = arg as u32;
+                let resized = entry.ops.as_any().and_then(|any| {
+                    if let Some(pipe) = any.downcast_ref::<crate::pipe::PipeRead>() {
+                        Some(pipe.set_capacity(size_arg))
+                    } else {
+                        any.downcast_ref::<crate::pipe::PipeWrite>()
+                            .map(|pipe| pipe.set_capacity(size_arg))
+                    }
+                });
+                match resized {
+                    Some(Ok(cap)) => SyscallReturn::ok(cap as u64),
+                    Some(Err(errno)) => SyscallReturn::ok((-(errno as i64)) as u64),
+                    // FIFOs expose pipe_capacity too. Their fixed backing is a
+                    // compatibility implementation: validate Linux's global
+                    // size errors, then report the live capacity.
+                    None => match entry.ops.pipe_capacity() {
+                        None => SyscallReturn::ok((-(EBADF as i64)) as u64),
+                        Some(_) if size_arg > (1u32 << 31) => {
+                            SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)
+                        }
+                        Some(_) if (size_arg as usize).max(4096).next_power_of_two() > 1_048_576 => {
+                            SyscallReturn::ok((-1i64) as u64) // -EPERM
+                        }
+                        Some(cap) => SyscallReturn::ok(cap as u64),
+                    },
+                }
+            }
             _ => SyscallReturn::invalid_op(),
         })
     });
