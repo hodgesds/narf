@@ -21,7 +21,7 @@ pub(crate) fn sys_setrlimit(ctx: &mut dyn TrapContext) {
     let cur = u64::from_ne_bytes(buf[..8].try_into().unwrap());
     let max = u64::from_ne_bytes(buf[8..].try_into().unwrap());
     let task = current_task_id();
-    match update_rlimit_atomic(task, resource, Some(RLimitPair { cur, max })) {
+    match update_rlimit_atomic(task, None, resource, Some(RLimitPair { cur, max })) {
         Ok(_) => ctx.set_return(SyscallReturn::ok(0)),
         Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
     }

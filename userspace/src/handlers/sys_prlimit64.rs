@@ -39,7 +39,7 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
 
     // Snapshot/validate/publish under one process-row transaction. The prior
     // value is what Linux copies out even when a new value is installed.
-    let prior = match update_rlimit_atomic(task.tid, resource, new_value) {
+    let prior = match update_rlimit_atomic(task.tid, task.owner.as_ref(), resource, new_value) {
         Ok(prior) => prior,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));

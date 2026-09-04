@@ -803,3 +803,15 @@ argument = "The pinned x86 FS-base accessor requires an already-resolved id for 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The scheduler-owned sched_yield helper resolves the current own-stack task once, keeps Linux's zero-return and sole-runnable no-op behavior, re-arms the same executor waker before switching, and delegates every actual selection to the unchanged run queue, affinity, budget, capability, and domain-restoration paths. After an actual yield resumes, that task has just been selected for a fresh slice; when the switch is elided, the same conservative probe just observed no dispatchable peer, deferred wake, due timer, or staged cross-CPU wake. Suppressing only sched_yield's immediately following generic syscall-exit expiry probe therefore defers no work known at that scheduling point; later wakes retain the normal wake-preemption and tick paths, while pending-signal delivery still runs at the common return-to-user boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Moving the active inner-poll Waker from an abandoned Rust stack local into KernelTask-owned storage stays wholly inside the existing scheduler executor TCB. Direct exit publishes completion and switches to the executor before the owner is destroyed; normal return and KernelTask drop provide the other exactly-once retirement paths. No trusted subsystem, context-switch entry point, capability, domain identifier, mapping authority, or task-selection rule is added."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The task-owned Waker slot contains only the executor's existing scheduler wake capability for that same task. Initialization is release-published, destruction atomically claims the initialized value once, and direct-exit destruction occurs only after the task can no longer access its abandoned Context. Address-space ownership, saved domain state, PKRS/TCF restore ordering, run-queue policy, and all user-memory permissions are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Task-exit cleanup removes only descriptor-path compatibility metadata keyed by the exiting never-reused TaskId; shared file objects and descriptor-table ownership remain governed by their existing Arc lifetimes. Reap serializes rlimit-row removal and retained-target revalidation in one RLIMIT_TABLE-before-task-registry lock order, so prlimit64 either completes before reap or observes ESRCH afterward without a permanent tombstone. Neither cleanup path grants access, changes mappings, or permits state from a recycled ProcessId to authorize another task."

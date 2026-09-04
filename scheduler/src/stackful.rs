@@ -50,6 +50,7 @@ use alloc::boxed::Box;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
+use core::mem::MaybeUninit;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll, Waker};
@@ -833,6 +834,20 @@ pub struct KernelTask {
     /// can read without panicking on a poisoned lock, and the
     /// kernel-stack body can swap in a fresh waker per entry.
     current_waker: narf_lib::sync::IrqSafeSpinLock<Option<Waker>>,
+    /// Owning waker used by the currently active inner-future poll.
+    ///
+    /// This must live in the `KernelTask`, not in `task_body_rust`'s stack
+    /// frame. [`exit_current_stackful`] deliberately abandons that Rust
+    /// continuation, so destructors for stack locals never run. Keeping an
+    /// owning `Waker` local there leaked one scheduler `WakeCell` Arc for
+    /// every directly exited userspace task. Normal poll return and the
+    /// executor's direct-exit switch-back each clear this slot; `Drop` is the
+    /// defensive third path.
+    active_poll_waker: UnsafeCell<MaybeUninit<Waker>>,
+    /// Initialization state for `active_poll_waker`. Release publication
+    /// follows the write; the mutually exclusive destroy paths claim it with
+    /// an acquire-release swap before running `Waker::drop` exactly once.
+    active_poll_waker_live: AtomicBool,
     /// Per-task user FP/SIMD area pointer, published by the userspace
     /// `UserTaskFuture::poll` on first entry. Lives HERE (not in a per-CPU slot)
     /// because in the own-stack model a task resumes via `kernel_switch` (not a
@@ -964,6 +979,8 @@ impl KernelTask {
             user_preempt: AtomicBool::new(false),
             preempted: AtomicBool::new(false),
             current_waker: narf_lib::sync::IrqSafeSpinLock::new(None),
+            active_poll_waker: UnsafeCell::new(MaybeUninit::uninit()),
+            active_poll_waker_live: AtomicBool::new(false),
             user_fpu: AtomicPtr::new(core::ptr::null_mut()),
             #[cfg(target_arch = "x86_64")]
             user_fpu_live: AtomicBool::new(false),
@@ -1255,6 +1272,10 @@ impl KernelTask {
             PREEMPTED_RETURN.inner[cpu].store(was_preempted, Ordering::Release);
         }
         if self.completed.load(Ordering::Acquire) {
+            // A direct exit abandons `task_body_rust` while its Context still
+            // borrows this value. Destroy it only after the task has switched
+            // back here and can no longer access that abandoned continuation.
+            self.drop_active_poll_waker();
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -1317,6 +1338,7 @@ impl KernelTask {
             Ordering::Release,
         );
         if self.completed.load(Ordering::Acquire) {
+            self.drop_active_poll_waker();
             Poll::Ready(())
         } else {
             Poll::Pending
@@ -1363,6 +1385,33 @@ impl KernelTask {
 }
 
 impl KernelTask {
+    /// Move the waker for one active inner-future poll into task-owned storage.
+    ///
+    /// The returned pointer remains valid until that poll returns normally or
+    /// commits to [`exit_current_stackful`]. A task can have only one active
+    /// poll, including while its continuation is involuntarily preempted.
+    fn install_active_poll_waker(&self, waker: Waker) -> *const Waker {
+        assert!(
+            !self.active_poll_waker_live.load(Ordering::Acquire),
+            "stackful task entered a second inner poll while its first poll waker was live"
+        );
+        // SAFETY: one-CPU-at-a-time task execution makes this the sole writer,
+        // and the false live flag proves no initialized value needs dropping.
+        let slot = unsafe { &mut *self.active_poll_waker.get() };
+        let installed = slot.write(waker) as *mut Waker as *const Waker;
+        self.active_poll_waker_live.store(true, Ordering::Release);
+        installed
+    }
+
+    /// Destroy the active poll's owning waker, if any, exactly once.
+    fn drop_active_poll_waker(&self) {
+        if self.active_poll_waker_live.swap(false, Ordering::AcqRel) {
+            // SAFETY: the release-published live state follows initialization,
+            // and swap(false) gives this path sole ownership of the value.
+            unsafe { core::ptr::drop_in_place((*self.active_poll_waker.get()).as_mut_ptr()) };
+        }
+    }
+
     /// Clear every per-CPU `CURRENT_STACKFUL_TASK` slot that still names
     /// this task, so no CPU can newly load a pointer to it (and none can
     /// try to preempt a task that is done executing). `StackfulAdapter`'s
@@ -1389,6 +1438,7 @@ impl Drop for KernelTask {
     /// RCU, so by the time this runs the slots are already clear; re-clear
     /// here in case a `KernelTask` is ever freed by some other path.
     fn drop(&mut self) {
+        self.drop_active_poll_waker();
         self.clear_current_slots();
     }
 }
@@ -1472,14 +1522,22 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         let set_cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[set_cpu].store(task_ptr, Ordering::Release);
 
-        let waker_guard = task.current_waker.lock();
-        let waker = match waker_guard.as_ref() {
-            Some(w) => w.clone(),
-            None => KernelTask::no_op_waker(),
+        let waker = {
+            let waker_guard = task.current_waker.lock();
+            match waker_guard.as_ref() {
+                Some(w) => w.clone(),
+                None => KernelTask::no_op_waker(),
+            }
         };
-        drop(waker_guard);
-        let mut cx = Context::from_waker(&waker);
-        let result = task.future.as_mut().poll(&mut cx);
+        let waker = task.install_active_poll_waker(waker);
+        let result = {
+            // SAFETY: `install_active_poll_waker` initialized this stable,
+            // task-owned slot. This lexical scope ends the `Context` borrow
+            // before the normal-return destroy below.
+            let mut cx = Context::from_waker(unsafe { &*waker });
+            task.future.as_mut().poll(&mut cx)
+        };
+        task.drop_active_poll_waker();
         match result {
             Poll::Ready(()) => {
                 task.completed.store(true, Ordering::Release);
@@ -5722,6 +5780,14 @@ pub mod tests {
     /// keeps the executor's immediate `Box<KernelTask>` drop sound.
     #[cfg(target_arch = "x86_64")]
     fn smoke_exit_current_stackful_poisons_ctx_and_completes() -> TestResult {
+        use alloc::sync::Arc;
+        use alloc::task::Wake;
+
+        struct ExitWaker;
+        impl Wake for ExitWaker {
+            fn wake(self: Arc<Self>) {}
+        }
+
         struct ExitsViaPrimitive;
         impl Future for ExitsViaPrimitive {
             type Output = ();
@@ -5734,7 +5800,8 @@ pub mod tests {
         }
         let mut task = KernelTask::new(ExitsViaPrimitive);
         let mut exec_ctx = KernelContext::default();
-        let waker = KernelTask::no_op_waker();
+        let observer = Arc::new(ExitWaker);
+        let waker: Waker = observer.clone().into();
         // SAFETY: standard stackful poll; the future diverges into
         // exit_current_stackful, which switches back to `exec_ctx`.
         let r = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
@@ -5753,6 +5820,18 @@ pub mod tests {
             .is_null()
         {
             return TestResult::Fail("CURRENT slot not cleared by exit_current_stackful");
+        }
+        if task.active_poll_waker_live.load(Ordering::Acquire) {
+            return TestResult::Fail("direct exit left the active poll waker initialized");
+        }
+        // `current_waker` owns another clone until the task is destroyed. Once
+        // both the task and caller's Waker are gone, only the observer should
+        // remain. Before the active-slot fix, the abandoned continuation kept
+        // one additional Arc strong reference forever.
+        drop(task);
+        drop(waker);
+        if Arc::strong_count(&observer) != 1 {
+            return TestResult::Fail("direct exit leaked the inner-poll waker");
         }
         TestResult::Pass
     }
