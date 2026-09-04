@@ -634,7 +634,13 @@ fn active_user_as_slot() -> &'static narf_lib::sync::IrqSafeSpinLock<Option<Arc<
 /// boot or between rounds).
 #[inline]
 pub fn current_task_id() -> TaskId {
-    TaskId(current_task_slot().load(Ordering::Acquire))
+    current_task_id_on(narf_lib::percpu::current_cpu())
+}
+
+#[inline]
+pub(crate) fn current_task_id_on(cpu: usize) -> TaskId {
+    debug_assert!(cpu < CURRENT_TASK.len(), "CPU id out of task-slot range");
+    TaskId(CURRENT_TASK[if cpu < CURRENT_TASK.len() { cpu } else { 0 }].load(Ordering::Acquire))
 }
 
 fn publish_budget_window(cpu: usize, started: u64, view: BudgetView, budget: &ResourceBudget) {
@@ -4541,6 +4547,13 @@ pub fn run_until_empty() {
 /// "yes, preempt".
 pub fn has_other_runnable_work(current: u64) -> bool {
     let cpu = narf_lib::percpu::current_cpu();
+    has_other_runnable_work_on(cpu, current)
+}
+
+#[inline]
+pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
+    debug_assert!(cpu < CURRENT_SCHED.len(), "CPU id out of scheduler range");
+    let cpu = if cpu < CURRENT_SCHED.len() { cpu } else { 0 };
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
         && RUNNABLE_PEER[cpu].load(Ordering::Acquire)
     {

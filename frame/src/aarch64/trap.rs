@@ -169,9 +169,14 @@ pub extern "C" fn rust_aarch64_sync_dispatch(frame: &mut TrapFrame) {
         // Linux's exit-to-user reschedule check: timer preemption is gated to
         // EL0 for user tasks, so a syscall-dense thread must still yield once
         // its slice is spent. This helper is a no-op outside own-stack mode.
-        // SAFETY: the live SVC frame is returning to EL0 and handler dispatch
-        // has completed; own-stack park uses the same kernel_switch boundary.
-        unsafe { narf_scheduler::stackful::maybe_resched_syscall_exit() };
+        // sched_yield already either ceded to the executor or conservatively
+        // established that there was no work to cede to. Avoid immediately
+        // repeating its reschedule probe and clock read for the new/no-op slice.
+        if narf_userspace::syscall_number(num) != narf_userspace::Syscall::Yield.raw() {
+            // SAFETY: the live SVC frame is returning to EL0 and handler dispatch
+            // has completed; own-stack park uses the same kernel_switch boundary.
+            unsafe { narf_scheduler::stackful::maybe_resched_syscall_exit() };
+        }
         return;
     }
 

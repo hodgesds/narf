@@ -126,6 +126,9 @@ pub unsafe fn x86_64::user_mode::enable_fsgsbase();
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn x86_64::user_mode::user_fs_base() -> u64;
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::user_mode::user_fs_base_for_cpu(cpu: usize) -> u64;
+// `cpu` must identify the executing CPU; this form reuses a pinned caller's id.
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
 /// EL0 entry/resume variants that first abandon the current EL1 frames and
