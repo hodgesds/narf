@@ -1,6 +1,34 @@
 #[allow(unused_imports)]
 use super::*;
 
+// Start on the first AP in the common contiguous topology. The BSP remains in
+// the rotation, but a single fork does not immediately collide with its kernel
+// housekeeping / RX-forwarder work.
+static NEXT_FORK_CPU: AtomicU64 = AtomicU64::new(1);
+
+fn round_robin_cpu(mut candidates: u64, sequence: u64) -> Option<narf_scheduler::CpuId> {
+    let count = u64::from(candidates.count_ones());
+    if count == 0 {
+        return None;
+    }
+    let mut ordinal = sequence % count;
+    loop {
+        let cpu = candidates.trailing_zeros();
+        if ordinal == 0 {
+            return Some(narf_scheduler::CpuId(cpu));
+        }
+        candidates &= candidates - 1;
+        ordinal -= 1;
+    }
+}
+
+/// Spread forked process groups across every online CPU. Pthread siblings
+/// subsequently inherit this CPU, retaining their shared-memory locality.
+fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
+    let candidates = allowed.intersection(narf_scheduler::online_cpu_set()).bits();
+    round_robin_cpu(candidates, NEXT_FORK_CPU.fetch_add(1, Ordering::Relaxed))
+}
+
 pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     let parent_as = match current_address_space() {
         Some(a) => a,
@@ -196,18 +224,19 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // Register the child under its TaskId but defer scheduler publication
     // until all fork inheritance below is complete.  The child may otherwise
     // run on another CPU before `fd::fork` installs its table.
+    let mut child_spec = narf_scheduler::TaskSpec::user_task();
+    if let Some(cpu) = fork_cpu(child_spec.affinity.allowed) {
+        child_spec.affinity.preferred = Some(cpu);
+    }
     let pending_child = match child_state {
         Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
-            narf_scheduler::TaskSpec::user_task(),
+            child_spec,
         ),
         // Fallback if save_user_state didn't fire (test contexts
         // with synthetic TrapContexts whose stub returns false).
-        None => crate::user_task::prepare_user_process_initial(
-            proc,
-            narf_scheduler::TaskSpec::user_task(),
-        ),
+        None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
@@ -301,4 +330,30 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     )));
     #[cfg(not(feature = "container"))]
     ctx.set_return(SyscallReturn::ok(child_pid.raw()));
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_fork_cpu_rotation_covers_sparse_allowed_set() -> TestResult {
+        let candidates = (1u64 << 1) | (1u64 << 3) | (1u64 << 7);
+        let observed = [0, 1, 2, 3].map(|sequence| {
+            round_robin_cpu(candidates, sequence)
+                .map(|cpu| cpu.0)
+                .unwrap_or(u32::MAX)
+        });
+        if observed != [1, 3, 7, 1] {
+            return TestResult::Fail("fork CPU rotation skipped or duplicated an allowed CPU");
+        }
+        if round_robin_cpu(0, 0).is_some() {
+            return TestResult::Fail("empty fork CPU candidate set selected a CPU");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/process",
+        smoke_fork_cpu_rotation_covers_sparse_allowed_set
+    );
 }

@@ -598,7 +598,12 @@ for legacy/test contexts and are included in read/reset operations. A task
 never charges another task through this pointer: an expected TID must match.
 `CLONE_THREAD` children inherit the creator CPU as a soft initial preference
 while retaining the full allowed affinity mask, preserving shared-mm locality
-without preventing idle-CPU stealing.
+without preventing idle-CPU stealing. Forked process groups instead rotate
+across every online CPU in their allowed mask (starting with an application
+processor on the common contiguous topology); pthread siblings created by each
+child then retain group locality. This uses otherwise-idle BSP capacity under
+process-level oversubscription without bouncing a group's shared lock data
+between CPUs.
 On aarch64, switch-out reads live `TPIDR_EL0` because EL0 may update it without
 a syscall, fork/clone inherit that live value and FPSIMD image, and exec clears
 both in line with Linux arm64 `copy_thread`/`flush_thread` semantics.
