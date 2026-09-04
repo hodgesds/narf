@@ -177,6 +177,31 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// The *live* `IA32_PAT` has PA1 = WC.
+    ///
+    /// `smoke_pat_narf_layout_pa1_is_wc` checks the `NARF_PAT` constant,
+    /// which proves the constant is well-formed and nothing about the CPU.
+    /// If `init_default` failed -- or was never called -- PA1 keeps its reset
+    /// value WT, and every `MmioAttrs::WriteCombining` mapping silently
+    /// becomes write-through: correct, so nothing fails, just not what the
+    /// caller asked for. Only the MSR itself is evidence.
+    fn smoke_pat_live_msr_pa1_is_wc() -> TestResult {
+        if !supported() {
+            return TestResult::Skip("no PAT on this CPU");
+        }
+        let live = read();
+        if ((live >> 8) & 0xFF) as u8 != ty::WC {
+            return TestResult::Fail("live IA32_PAT PA1 is not WC (WC mappings degrade to WT)");
+        }
+        // PA0 must still be WB: every mapping that predates the reprogramming
+        // selects it, and changing it under them would alter their semantics.
+        if (live & 0xFF) as u8 != ty::WB {
+            return TestResult::Fail("live IA32_PAT PA0 is not WB");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("arch", smoke_pat_live_msr_pa1_is_wc);
+
     fn smoke_pat_narf_layout_pa1_is_wc() -> TestResult {
         if ((NARF_PAT >> 8) & 0xFF) as u8 != ty::WC {
             return TestResult::Fail("NARF_PAT PA1 is not WC");
