@@ -416,10 +416,18 @@ fn pinned_orig_rax(pid: u64) -> Option<u64> {
 /// `orig_rax` is the syscall number (state.rax at entry). At the exit
 /// stop we pin it in the tracee's reported registers so a tracer that
 /// reads orig_rax sees the syscall number rather than the return value.
+// Inline the inactive gate into syscall entry/exit without duplicating the
+// tracing machinery at both call sites.
+#[inline]
 pub fn ptrace_syscall_stop(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: u64) {
     if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
         return;
     }
+    ptrace_syscall_stop_active(ctx, at_entry, orig_rax);
+}
+
+#[inline(never)]
+fn ptrace_syscall_stop_active(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: u64) {
     let task = current_task_id();
     let pid = tid_to_pid(task);
     if get_task_tracer(pid).is_none() {

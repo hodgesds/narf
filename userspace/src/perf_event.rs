@@ -2720,6 +2720,9 @@ fn ensure_pmi_route() -> Result<(), ()> {
 /// Drain allocation-free PMI snapshots into userspace mmap rings from normal
 /// syscall context. The IRQ handler captures IP/task/time and rearms hardware;
 /// record encoding and readiness wakeups happen here where allocation is safe.
+// Keep the overwhelmingly common inactive gate in the syscall caller while
+// leaving the sizeable sampling path out of line.
+#[inline]
 pub(crate) fn drain_irq_samples() {
     // Fast path: with no perf event attached anywhere, no producer can stage a
     // sample, so the per-CPU pending rings are all empty. Skip before touching
@@ -2736,6 +2739,11 @@ pub(crate) fn drain_irq_samples() {
     if ACTIVE_PERF_EVENTS.load(Ordering::Relaxed) == 0 {
         return;
     }
+    drain_irq_samples_active();
+}
+
+#[inline(never)]
+fn drain_irq_samples_active() {
     let mut notify = false;
     {
         let registry = PERF_EVENT_REGISTRY.lock();
