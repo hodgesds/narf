@@ -190,6 +190,43 @@ pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
 /// # Safety
 /// `ptr` must point into writable memory backed by tag storage
 /// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
+/// Bit position of the MTE allocation tag within a pointer.
+pub const TAG_SHIFT: u32 = 56;
+
+/// Mask of the tag field, bits 59:56.
+pub const TAG_MASK: u64 = 0xF << TAG_SHIFT;
+
+/// Replace `ptr`'s allocation tag with `tag` (low 4 bits).
+///
+/// **Replace, not OR.** A TTBR1 address has bits 63:48 set, so its tag field
+/// already reads `0b1111`; OR-ing a tag into it is a no-op and leaves every
+/// kernel pointer carrying tag 15. That is not a hypothetical — it is what
+/// `bpf_arena` did before this existed, which made `stg` write 15 to every
+/// granule while `pick_arena_tag`'s choice was silently discarded, and left
+/// the arena's tag equal to the tag every untagged kernel pointer already
+/// carries.
+///
+/// Safe for kernel pointers: with `TCR_EL1.TBI1` set (see `boot.S`), bits
+/// 63:56 are excluded from translation and TTBR selection is decided by
+/// bit 55, which this leaves untouched.
+#[inline]
+#[must_use]
+pub const fn with_tag(ptr: u64, tag: u8) -> u64 {
+    (ptr & !TAG_MASK) | (((tag as u64) & 0xF) << TAG_SHIFT)
+}
+
+/// The allocation tag `ptr` carries, in `0..=15`.
+#[inline]
+#[must_use]
+pub const fn tag_of(ptr: u64) -> u8 {
+    ((ptr >> TAG_SHIFT) & 0xF) as u8
+}
+
+/// The tag an untagged kernel pointer carries. Bits 63:48 of a TTBR1 address
+/// are all ones, so its tag field reads 15 — the kernel-half equivalent of
+/// user space's untagged 0, and therefore a value no arena may be assigned.
+pub const UNTAGGED_KERNEL_TAG: u8 = 0xF;
+
 /// CPU must report `supported()`.
 #[inline]
 pub unsafe fn stg(ptr: *mut u8) {

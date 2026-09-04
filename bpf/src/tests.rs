@@ -894,8 +894,19 @@ fn smoke_bpf_arena_pages_carry_a_tag() -> TestResult {
     // a zero-tagged arena would accept exactly the forged pointers the tag
     // exists to reject, and this check would be vacuous.
     const TAG_MASK: u64 = 0xF << 56;
-    if page.tagged_kva & TAG_MASK == 0 {
-        return TestResult::Fail("arena tag is 0, which no pointer can mismatch");
+    // The tag must differ from what an UNTAGGED KERNEL pointer carries, which
+    // is 15 and not 0: bits 63:48 of a TTBR1 address are all ones. Checking
+    // only `!= 0` is vacuous here, and was — this smoke passed for months
+    // while `tagged_kva` was built by OR-ing into an all-ones field, so every
+    // arena's tag was 15 and `pick_arena_tag`'s choice was discarded.
+    if mte::tag_of(page.tagged_kva) == mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("arena tag is 15, which every kernel pointer already carries");
+    }
+    if mte::tag_of(page.tagged_kva) != arena.tag() {
+        return TestResult::Fail("the page's tagged alias does not carry the arena's tag");
+    }
+    if page.tagged_kva == page.kva {
+        return TestResult::Fail("the tagged alias is identical to the plain VA");
     }
     if page.tagged_kva & !TAG_MASK != page.kva & !TAG_MASK {
         return TestResult::Fail("tagged pointer differs outside the tag field");

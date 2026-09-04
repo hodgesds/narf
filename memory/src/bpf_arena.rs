@@ -544,6 +544,21 @@ impl Arena {
         self.kva - self.slot_base
     }
 
+    /// The arena's MTE allocation tag, in `0..=15`. Zero when MTE is
+    /// unavailable, which is also what an untagged pointer carries.
+    ///
+    /// Exposed so the JIT can hand emitted code a *tagged* slot base: every
+    /// arena access is `slot_base + handle + off16`, so tagging the base is
+    /// what makes the emitted access arrive with the tag the granules were
+    /// written with. Without it, flipping `SCTLR_EL1.TCF` to Sync would make
+    /// every legitimate access fault with tag 0 against granules tagged
+    /// non-zero.
+    #[inline]
+    #[must_use]
+    pub fn tag(&self) -> u8 {
+        self.tag
+    }
+
     /// Kernel VA of the enclosing slot's base.
     #[inline]
     pub fn slot_base(&self) -> u64 {
@@ -589,11 +604,7 @@ impl Arena {
                 .ok_or(ArenaError::OutOfRange)?;
             // Already populated and already tagged with the arena's tag;
             // derive the pointer rather than re-tagging.
-            let tagged_kva = if self.tag == 0 {
-                kva
-            } else {
-                kva | ((self.tag as u64 & 0xF) << 56)
-            };
+            let tagged_kva = tagged_alias(kva, self.tag);
             return Ok(ArenaPage {
                 kva,
                 tagged_kva,
@@ -785,7 +796,12 @@ fn pick_arena_tag() -> u8 {
         // dereferenced.
         let t = unsafe { narf_arch::aarch64::mte::irg(core::ptr::null_mut()) } as u64;
         let tag = ((t >> 56) & 0xF) as u8;
-        if tag == 0 {
+        // Reject 15 as well as 0. Bits 63:48 of a TTBR1 address are all ones,
+        // so an untagged *kernel* pointer reads back tag 15 — the kernel-half
+        // equivalent of user space's untagged 0. An arena tagged 15 would
+        // accept every untagged kernel pointer, which is exactly the forgery
+        // the tag exists to reject. Both ends of the range fold to 1..=14.
+        if tag == 0 || tag == narf_arch::aarch64::mte::UNTAGGED_KERNEL_TAG {
             1
         } else {
             tag
@@ -797,12 +813,32 @@ fn pick_arena_tag() -> u8 {
     }
 }
 
+/// The tagged alias of `kva` for an arena tagged `tag`, or `kva` unchanged
+/// when tagging is off.
+///
+/// One helper rather than the bit arithmetic open-coded at each site: it was
+/// open-coded twice, both sites OR-ed instead of replacing, and both were
+/// wrong in the same invisible way.
+#[cfg(target_arch = "aarch64")]
+fn tagged_alias(kva: u64, tag: u8) -> u64 {
+    if tag == 0 {
+        kva
+    } else {
+        narf_arch::aarch64::mte::with_tag(kva, tag)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn tagged_alias(kva: u64, _tag: u8) -> u64 {
+    kva
+}
+
 #[cfg(target_arch = "aarch64")]
 unsafe fn tag_arena_page(kva: u64, tag: u8) -> u64 {
     if !narf_arch::aarch64::mte::supported() || tag == 0 {
         return kva;
     }
-    let tagged = kva | ((tag as u64 & 0xF) << 56);
+    let tagged = narf_arch::aarch64::mte::with_tag(kva, tag);
     let mut off = 0u64;
     while off < 4096 {
         // SAFETY: every granule is inside the page the caller owns, and the
