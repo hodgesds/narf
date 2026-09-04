@@ -3675,8 +3675,14 @@ pub fn kernel_syscall_entry_plain_with_state(
         // SAFETY: a real user frame is returning to CPL=3 (user_state non-null);
         // the helper self-checks own-stack liveness and only switches out via the
         // same executor kernel_switch the own-stack park paths use.
-        unsafe {
-            narf_scheduler::stackful::maybe_resched_syscall_exit();
+        // sched_yield already either ceded to the executor or conservatively
+        // established that there was no work to cede to. Avoid immediately
+        // repeating its reschedule probe and clock read for the new/no-op slice.
+        if !matches!(n, Syscall::Yield) {
+            // SAFETY: the live user frame is returning from a completed syscall.
+            unsafe {
+                narf_scheduler::stackful::maybe_resched_syscall_exit();
+            }
         }
     }
     ctx.ret

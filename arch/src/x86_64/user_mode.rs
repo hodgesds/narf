@@ -54,7 +54,29 @@ pub unsafe fn enable_fsgsbase() {
 /// Must execute at CPL0 so the fallback RDMSR is permitted.
 #[inline]
 pub unsafe fn user_fs_base() -> u64 {
-    if crate::x86_64::cr::cached_cr4() & crate::x86_64::cr::CR4_FSGSBASE != 0 {
+    let cpu = crate::current_cpu_id().raw() as usize;
+    // SAFETY: the CPU id was read from the executing CPU immediately above.
+    unsafe { user_fs_base_for_cpu(cpu) }
+}
+
+/// Read the live user FS base using an already-resolved executing CPU id.
+///
+/// This is the pinned hot-path form of [`user_fs_base`]. It preserves the
+/// per-CPU CR4 feature gate without repeating current-CPU discovery.
+///
+/// # Safety
+///
+/// Must execute at CPL0, and `cpu` must identify the CPU currently executing
+/// this call. A stale or remote id could select `RDFSBASE` on a CPU whose
+/// CR4.FSGSBASE bit is not enabled.
+#[inline]
+pub unsafe fn user_fs_base_for_cpu(cpu: usize) -> u64 {
+    debug_assert_eq!(
+        cpu,
+        crate::current_cpu_id().raw() as usize,
+        "FS-base CPU id does not name the executing CPU"
+    );
+    if crate::x86_64::cr::cached_cr4_for_cpu(cpu) & crate::x86_64::cr::CR4_FSGSBASE != 0 {
         let value: u64;
         compiler_fence(Ordering::SeqCst);
         // SAFETY: CR4.FSGSBASE is set on this CPU.

@@ -791,3 +791,15 @@ argument = "Run-queue selection still performs one mandatory core scan that vali
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L62"
 argument = "The runnable-peer and affinity-generation caches contain only scheduler-owned boolean/generation metadata already covered by the documented per-CPU scheduling-state exception. False-to-true wake publication is release-ordered, a complete eligibility scan refreshes the hint, and deferred/timer/inbox fallbacks preserve conservative yield behavior. They expose no task memory or capability and do not change dispatch eligibility."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The sched_yield consolidation and FPU/TLS save refactor remain inside the existing frame, architecture, and scheduler-executor TCB seams. The fast path reuses the already-published executing CPU and live KernelTask identity, but the task-owned context, executor continuation, waker lifetime, run-queue policy, and post-resume CPU rediscovery remain authoritative. No new trusted subsystem, context-switch entry point, capability, domain identifier, mapping authority, or externally supplied pointer is introduced."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The pinned x86 FS-base accessor requires an already-resolved id for the executing CPU, debug-checks that contract, reads that CPU's architecture-maintained CR4 snapshot, and preserves the fenced RDFSBASE or RDMSR fallback. Voluntary switch-out still snapshots TLS and saves any live task-owned FP/SIMD image before clearing the current-task publication; switch-in still republishes the possibly migrated task before arming or restoring its image. Domain-state save/restore ordering, address-space ownership, task memory isolation, and capability checks are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The scheduler-owned sched_yield helper resolves the current own-stack task once, keeps Linux's zero-return and sole-runnable no-op behavior, re-arms the same executor waker before switching, and delegates every actual selection to the unchanged run queue, affinity, budget, capability, and domain-restoration paths. After an actual yield resumes, that task has just been selected for a fresh slice; when the switch is elided, the same conservative probe just observed no dispatchable peer, deferred wake, due timer, or staged cross-CPU wake. Suppressing only sched_yield's immediately following generic syscall-exit expiry probe therefore defers no work known at that scheduling point; later wakes retain the normal wake-preemption and tick paths, while pending-signal delivery still runs at the common return-to-user boundary."

@@ -1432,6 +1432,9 @@ fn smoke_arch_fsgsbase_enabled_and_round_trips() -> TestResult {
     unsafe { user_mode::set_user_fs_base(PROBE) };
     // SAFETY: CR4.FSGSBASE was checked above.
     let observed = unsafe { user_mode::user_fs_base() };
+    let cpu = crate::current_cpu_id().raw() as usize;
+    // SAFETY: `cpu` names the executing CPU and the test runs at CPL0.
+    let observed_pinned = unsafe { user_mode::user_fs_base_for_cpu(cpu) };
     // Verify the architectural backing state too, so the test cannot pass by
     // reading a software cache rather than the live FS base.
     // SAFETY: IA32_FS_BASE is readable at CPL0.
@@ -1439,7 +1442,7 @@ fn smoke_arch_fsgsbase_enabled_and_round_trips() -> TestResult {
     // SAFETY: restore the canonical value captured from this CPU.
     unsafe { user_mode::set_user_fs_base(original) };
 
-    if observed != PROBE || observed_msr != PROBE {
+    if observed != PROBE || observed_pinned != PROBE || observed_msr != PROBE {
         return TestResult::Fail("WRFSBASE/RDFSBASE did not round-trip IA32_FS_BASE");
     }
     TestResult::Pass

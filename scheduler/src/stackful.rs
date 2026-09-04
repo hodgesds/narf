@@ -375,17 +375,7 @@ pub fn arm_current_user_fpu() {
         return;
     }
     // SAFETY: CURRENT names the live task on this CPU.
-    let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
-    if area.is_null() {
-        return;
-    }
-    // SAFETY: CURRENT names the live task on this CPU.
-    let live = unsafe { (*task).user_fpu_live.load(Ordering::Acquire) };
-    debug_assert!(
-        !live,
-        "cannot arm deferred FPU restore while live state is unsaved"
-    );
-    arm_user_fpu_trap(cpu);
+    user_fpu_restore_task(cpu, unsafe { &*task });
 }
 
 /// Resolve a user-mode x86 `#NM` raised by the deferred-restore policy.
@@ -495,41 +485,19 @@ pub fn set_current_user_fs_base(fs_base: u64) {
     }
 }
 
-/// Read the CURRENT task's user-FPU area, or null if none.
-#[inline]
-fn current_user_fpu() -> *mut u8 {
-    let cpu = this_cpu();
-    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-    if p.is_null() {
-        return core::ptr::null_mut();
-    }
-    // SAFETY: in-flight task on this CPU.
-    unsafe { (*p).user_fpu.load(Ordering::Acquire) }
-}
-
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn user_fpu_save() {
-    let cpu = this_cpu();
-    let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-    if task.is_null() {
-        return;
-    }
+fn user_fpu_save_task(cpu: usize, task: &KernelTask) {
     // CR4.FSGSBASE lets userspace update its own thread pointer without an
     // arch_prctl syscall. Snapshot the live value at the same switch-out
     // boundary as FP state so a later resume or migration cannot overwrite a
     // user WRFSBASE update or inherit another thread's TLS base.
     // SAFETY: CURRENT names the live task and this function runs at CPL0.
-    let fs_base = unsafe { narf_arch::x86_64::user_mode::user_fs_base() };
-    // SAFETY: CURRENT names the in-flight task on this CPU.
-    unsafe {
-        (*task).user_fs_base.store(fs_base, Ordering::Relaxed);
-        (*task).user_tls_valid.store(true, Ordering::Release);
-    }
-    // SAFETY: CURRENT names the in-flight task on this CPU.
-    let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
-    // SAFETY: same live-current-task invariant as the area lookup above.
-    let live = unsafe { (*task).user_fpu_live.load(Ordering::Acquire) };
+    let fs_base = unsafe { narf_arch::x86_64::user_mode::user_fs_base_for_cpu(cpu) };
+    task.user_fs_base.store(fs_base, Ordering::Relaxed);
+    task.user_tls_valid.store(true, Ordering::Release);
+    let area = task.user_fpu.load(Ordering::Acquire);
+    let live = task.user_fpu_live.load(Ordering::Acquire);
     // A task that never consumed FP/SIMD after its last deferred resume has no
     // live register state to fold. Its memory image is already current.
     if !area.is_null() && live {
@@ -537,8 +505,8 @@ fn user_fpu_save() {
         // 64-aligned; set by the userspace poll); CR4.OSFXSR/OSXSAVE is on.
         unsafe {
             narf_arch::x86_64::xsave::fpu_save(area);
-            (*task).user_fpu_live.store(false, Ordering::Release);
         }
+        task.user_fpu_live.store(false, Ordering::Release);
     }
     if !area.is_null() {
         // If this task used FP/SIMD, XSAVE above ran with TS clear and this
@@ -550,31 +518,37 @@ fn user_fpu_save() {
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
+fn user_fpu_save_task(_cpu: usize, task: &KernelTask) {
+    let area = task.user_fpu.load(Ordering::Acquire);
+    if area.is_null() {
+        return;
+    }
+    let tls_base: u64;
+    // EL0 may write TPIDR_EL0 directly, without a syscall. Snapshot its
+    // live value at the same switch-out boundary as FP/SIMD state so a
+    // later migration cannot restore a stale creation-time value.
+    // SAFETY: TPIDR_EL0 is readable at EL1; `area` is the live, aligned
+    // UserFpState owned by this current task and FPEN is enabled.
+    unsafe {
+        core::arch::asm!(
+            "mrs {tls_base}, tpidr_el0",
+            tls_base = out(reg) tls_base,
+            options(nomem, nostack, preserves_flags),
+        );
+        task.user_fs_base.store(tls_base, Ordering::Relaxed);
+        task.user_tls_valid.store(true, Ordering::Release);
+        narf_arch::aarch64::save_user_fp_state(area);
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
 fn user_fpu_save() {
     let cpu = this_cpu();
     let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
     if !task.is_null() {
         // SAFETY: CURRENT names the in-flight task on this CPU.
-        let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
-        if area.is_null() {
-            return;
-        }
-        let tls_base: u64;
-        // EL0 may write TPIDR_EL0 directly, without a syscall. Snapshot its
-        // live value at the same switch-out boundary as FP/SIMD state so a
-        // later migration cannot restore a stale creation-time value.
-        // SAFETY: TPIDR_EL0 is readable at EL1; `area` is the live, aligned
-        // UserFpState owned by this current task and FPEN is enabled.
-        unsafe {
-            core::arch::asm!(
-                "mrs {tls_base}, tpidr_el0",
-                tls_base = out(reg) tls_base,
-                options(nomem, nostack, preserves_flags),
-            );
-            (*task).user_fs_base.store(tls_base, Ordering::Relaxed);
-            (*task).user_tls_valid.store(true, Ordering::Release);
-            narf_arch::aarch64::save_user_fp_state(area);
-        }
+        user_fpu_save_task(cpu, unsafe { &*task });
     }
 }
 
@@ -583,20 +557,36 @@ fn user_fpu_save() {}
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-fn user_fpu_restore() {
-    let area = current_user_fpu();
-    if !area.is_null() {
-        arm_current_user_fpu();
+fn user_fpu_restore_task(cpu: usize, task: &KernelTask) {
+    if task.user_fpu.load(Ordering::Acquire).is_null() {
+        return;
     }
+    let live = task.user_fpu_live.load(Ordering::Acquire);
+    debug_assert!(
+        !live,
+        "cannot arm deferred FPU restore while live state is unsaved"
+    );
+    arm_user_fpu_trap(cpu);
 }
 
 #[cfg(target_arch = "aarch64")]
 #[inline]
-fn user_fpu_restore() {
-    let area = current_user_fpu();
+fn user_fpu_restore_task(_cpu: usize, task: &KernelTask) {
+    let area = task.user_fpu.load(Ordering::Acquire);
     if !area.is_null() {
         // SAFETY: same live task-owned UserFpState invariant as save.
         unsafe { narf_arch::aarch64::restore_user_fp_state(area) };
+    }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[inline]
+fn user_fpu_restore() {
+    let cpu = this_cpu();
+    let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if !task.is_null() {
+        // SAFETY: CURRENT names the in-flight task on this CPU.
+        user_fpu_restore_task(cpu, unsafe { &*task });
     }
 }
 
@@ -2114,6 +2104,22 @@ pub fn current_slice_elapsed_ns() -> u64 {
 /// own kernel stack, with a stackful task current on this CPU.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub unsafe fn yield_current_stackful() {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return;
+    }
+    // SAFETY: CURRENT names the live in-flight task on this CPU.
+    unsafe { yield_current_stackful_from(cpu, p) };
+}
+
+/// Switch a previously-resolved current task to its executor.
+///
+/// # Safety
+/// `p` must be the live `CURRENT_STACKFUL_TASK` for `cpu`, and the caller must
+/// execute on that CPU in kernel mode on the task's own stack.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask) {
     #[cfg(target_arch = "x86_64")]
     debug_assert!(
         !narf_arch::x86_64::smap::guarded_copy_armed(),
@@ -2124,11 +2130,6 @@ pub unsafe fn yield_current_stackful() {
         !narf_arch::aarch64::uaccess::guarded_copy_armed(),
         "context switch attempted inside guarded aarch64 user copy"
     );
-    let cpu = this_cpu();
-    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-    if p.is_null() {
-        return;
-    }
     // SAFETY: in-flight task on this CPU.
     let exec_ctx = unsafe { (*p).exec_ctx.load(Ordering::Acquire) };
     if exec_ctx.is_null() {
@@ -2137,7 +2138,10 @@ pub unsafe fn yield_current_stackful() {
     // Slice ends here — fold it before the switch (the resume side
     // restamps tsc_started below).
     fold_current_slice(p);
-    user_fpu_save();
+    // Reuse the task/cpu identity validated above. No migration is possible
+    // until kernel_switch hands control to the executor.
+    // SAFETY: `p` is the live current task required by this function's contract.
+    user_fpu_save_task(cpu, unsafe { &*p });
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: p is a valid non-null pointer to the active user task.
     let ctx = unsafe { &raw mut (*p).ctx };
@@ -2156,7 +2160,10 @@ pub unsafe fn yield_current_stackful() {
         (*p).tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
     }
-    user_fpu_restore();
+    // The task may have migrated while switched out, so use the freshly-read
+    // resume CPU with the same still-live task.
+    // SAFETY: the in-flight poll owns `p` across this complete switch round trip.
+    user_fpu_restore_task(cpu, unsafe { &*p });
 }
 
 /// Cooperatively yield the current stackful task to the executor, re-arming
@@ -2192,8 +2199,47 @@ pub fn cooperative_yield() -> bool {
     }
     // SAFETY: proven safe from syscall / in-kernel context — own_stack_park and
     // maybe_resched_syscall_exit switch out through the same path.
-    unsafe { yield_current_stackful() };
+    unsafe { yield_current_stackful_from(cpu, p) };
     true
+}
+
+/// Handle Linux-compatible `sched_yield(2)` for the current own-stack task.
+///
+/// Returns `false` when there is no fully-published stackful task and the
+/// caller should use its legacy fallback. Otherwise returns `true`, eliding the
+/// context switch when the conservative runnable-work probe finds no peer.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn sched_yield_current() -> bool {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return false;
+    }
+    let current = crate::current_task_id_on(cpu).raw();
+    if current == crate::TaskId::NONE.raw() {
+        return false;
+    }
+    if !crate::has_other_runnable_work_on(cpu, current) {
+        return true;
+    }
+
+    // Re-arm the executor slot before ceding, matching cooperative_yield.
+    // SAFETY: `p` is the live in-flight task loaded from this CPU's slot.
+    unsafe {
+        {
+            let waker = (*p).current_waker.lock();
+            if let Some(waker) = waker.as_ref() {
+                waker.wake_by_ref();
+            }
+        }
+        yield_current_stackful_from(cpu, p);
+    }
+    true
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub fn sched_yield_current() -> bool {
+    false
 }
 
 /// Per-CPU "yield at the next syscall exit" request, set by syscall handlers
@@ -2938,17 +2984,13 @@ pub mod tests {
         TestResult::Pass
     }
 
-    /// `cooperative_yield()` is the primitive `sched_yield(2)` routes through
-    /// under the own-stack model (`sys_yield`). Its Linux contract
-    /// (`do_sched_yield`: reschedule; the CPU runs a ready peer) is that a
-    /// yielding task hands the CPU to a runnable sibling. Two own-stack tasks
-    /// that each record their id then `cooperative_yield()` must therefore
+    /// A cooperative-yield primitive must hand the CPU to a runnable sibling.
+    /// Two own-stack tasks that each record their id then yield must therefore
     /// INTERLEAVE — the first task's yield lets the second run before the first
-    /// runs again; a no-op yield (the pre-fix behaviour) would run one task to
-    /// completion first, giving `ORDER[0] == ORDER[1]`. Driven by the executor's
-    /// real poll rounds so cleanup is the executor's.
-    #[cfg(target_arch = "x86_64")]
-    fn smoke_stackful_cooperative_yield_interleaves_siblings() -> TestResult {
+    /// runs again. Driven by real executor rounds so task identity and the
+    /// runnable-peer hint match production.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn yield_interleaves_siblings(yield_fn: fn() -> bool) -> TestResult {
         use core::future::Future;
         use core::pin::Pin;
         use core::sync::atomic::AtomicUsize;
@@ -2967,6 +3009,7 @@ pub mod tests {
         struct Yielder {
             id: u32,
             remaining: usize,
+            yield_fn: fn() -> bool,
         }
         impl Future for Yielder {
             type Output = ();
@@ -2979,7 +3022,7 @@ pub mod tests {
                     self.remaining -= 1;
                     // Hands the CPU to the sibling; the executor re-polls us
                     // (resume here) after the sibling runs.
-                    let _ = super::cooperative_yield();
+                    let _ = (self.yield_fn)();
                 }
                 DONE.fetch_add(1, Ordering::AcqRel);
                 Poll::Ready(())
@@ -2989,10 +3032,12 @@ pub mod tests {
         crate::spawn_stackful(Yielder {
             id: 0,
             remaining: N,
+            yield_fn,
         });
         crate::spawn_stackful(Yielder {
             id: 1,
             remaining: N,
+            yield_fn,
         });
         // Drive BOTH tasks to actual completion so neither is left suspended
         // mid-yield in the run queue.
@@ -3013,9 +3058,19 @@ pub mod tests {
         }
         // The first task's yield must have run the sibling before it ran again.
         if first == second {
-            return TestResult::Fail("cooperative_yield did not hand off to the sibling");
+            return TestResult::Fail("yield did not hand off to the sibling");
         }
         TestResult::Pass
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn smoke_stackful_cooperative_yield_interleaves_siblings() -> TestResult {
+        yield_interleaves_siblings(super::cooperative_yield)
+    }
+
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn smoke_sched_yield_current_interleaves_siblings() -> TestResult {
+        yield_interleaves_siblings(super::sched_yield_current)
     }
 
     /// Stack-overflow tripwire detector: a fresh task's low-end
@@ -5746,10 +5801,15 @@ pub mod tests {
         "scheduler/stackful",
         smoke_stackful_multi_yield_then_complete
     );
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     kernel_test_in!(
         "scheduler/stackful",
         smoke_stackful_cooperative_yield_interleaves_siblings
+    );
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_sched_yield_current_interleaves_siblings
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(

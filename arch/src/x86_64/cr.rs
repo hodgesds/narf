@@ -39,6 +39,16 @@ static PER_CPU_CACHED_CR4: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) };
 #[inline]
 pub fn cached_cr4() -> u64 {
     let cpu = crate::current_cpu_id().raw() as usize;
+    cached_cr4_for_cpu(cpu)
+}
+
+/// Read the cached CR4 snapshot for an already-resolved CPU.
+///
+/// Kept crate-private so architecture helpers can share a caller's pinned CPU
+/// identity without executing another RDTSCP. Cross-crate callers use the
+/// unsafe operation-specific APIs that state the current-CPU requirement.
+#[inline]
+pub(crate) fn cached_cr4_for_cpu(cpu: usize) -> u64 {
     debug_assert!(cpu < MAX_CPUS, "CPU id out of CR4 cache range");
     PER_CPU_CACHED_CR4[if cpu < MAX_CPUS { cpu } else { 0 }].load(Ordering::Acquire)
 }

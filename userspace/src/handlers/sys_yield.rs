@@ -2,6 +2,21 @@
 use super::*;
 
 pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
+    // Own-stack syscalls execute inside the scheduler's currently-polling
+    // task, so its directly-published id is authoritative. Keep this path
+    // ahead of the legacy user-context/hook lookup: neither value is consumed
+    // when the live syscall continuation resumes on its own kernel stack.
+    if narf_scheduler::stackful::user_own_stack_enabled()
+        && narf_scheduler::stackful::sched_yield_current()
+    {
+        // The scheduler preserves Linux's no-op behavior for a sole runnable
+        // task and otherwise resumes this live continuation after a peer runs.
+        // Pending signals are delivered by the common completed-syscall hook;
+        // sched_yield itself is not interruptible and always returns 0.
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+
     // Polling-future path mirroring sys_exit_task.
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -10,35 +25,6 @@ pub(crate) fn sys_yield(ctx: &mut dyn TrapContext) {
         // SAFETY: same contract as sys_exit_task's hook path.
         unsafe {
             let uc = &*uctx;
-            if narf_scheduler::stackful::user_own_stack_enabled() {
-                // Linux's fair `yield_task` leaves the sole runnable task in
-                // place: `schedule()` has no peer to select, so a full
-                // switch-out/switch-in would accomplish nothing. Preserve the
-                // same observable contract here. The conservative probe
-                // reports `true` on queue contention or pending deferred/timer
-                // work, so we only elide a yield when no other work can use
-                // this CPU. Pending signals are delivered by the common
-                // completed-syscall return hook after this handler returns;
-                // sched_yield itself is not interruptible and always returns 0.
-                if !narf_scheduler::has_other_runnable_work(current_task_id()) {
-                    ctx.set_return(SyscallReturn::ok(0));
-                    return;
-                }
-                // sched_yield(2): hand the CPU to the executor ONCE so a ready
-                // sibling on this CPU runs, then resume and return 0. Routing
-                // through `own_stack_block` -> `own_stack_park` would break out
-                // WITHOUT ever yielding, because a bare yield sets no park
-                // condition (`park_should_block` returns false). `cooperative_yield`
-                // is the correct primitive: it re-arms this task's slot waker
-                // (so the executor keeps it Ready and re-polls it after the
-                // siblings run) and `kernel_switch`es to the executor, returning
-                // here once we are re-dispatched. If nothing else is runnable the
-                // re-armed awake bit makes the executor re-poll us immediately, so
-                // a lone yielder keeps running rather than stalling.
-                narf_scheduler::stackful::cooperative_yield();
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
             // The legacy longjmp model resumes from this copied snapshot and
             // consumes EXIT_REASON_YIELDED in its polling future. Own-stack
             // yields resume the live syscall continuation above, so copying

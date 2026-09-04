@@ -47,6 +47,8 @@ pub fn spawn_user(
     address_space: Arc<AddressSpace>,
 ) -> TaskId;
 pub fn yield_now() -> impl Future<Output=()>;
+/// Handle sched_yield for the current own-stack task; false selects fallback.
+pub fn stackful::sched_yield_current() -> bool;
 /// Conservative current-CPU probe: false only when no runnable peer,
 /// deferred wake, due timer, or staged cross-CPU wake can use a yield.
 pub fn has_other_runnable_work(current: u64) -> bool;
