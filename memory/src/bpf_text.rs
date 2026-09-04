@@ -307,6 +307,21 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
         BPF_ARENA_PML4_SLOT,
         "BPF_ARENA_BASE does not decode to BPF_ARENA_PML4_SLOT"
     );
+    // The poke slot must miss both BPF windows and both arena guard slots.
+    // The compile-time assertions in `text_poke` pin this too; this one fires
+    // on the boot path so a bad edit is loud even in a build that skips them.
+    for occupied in [
+        BPF_TEXT_PML4_SLOT,
+        BPF_TEXT_PML4_SLOT + 1,
+        BPF_ARENA_PML4_SLOT,
+        BPF_ARENA_PML4_SLOT + 1,
+    ] {
+        debug_assert_ne!(
+            crate::text_poke::POKE_PML4_SLOT,
+            occupied,
+            "the poke window collides with a BPF window or an arena guard slot"
+        );
+    }
 
     if slots_reserved() {
         return Ok(());
@@ -321,7 +336,15 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
         if root.raw() == 0 {
             return Err(TextError::NoFrame);
         }
-        for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+        // `text_poke`'s per-CPU scratch window is reserved here too. It is not
+        // a BPF window, but it has the same requirement — a top-level entry
+        // present in every address space before the first poke — and the
+        // ordering constraint on this function is what guarantees it.
+        for slot in [
+            BPF_TEXT_PML4_SLOT,
+            BPF_ARENA_PML4_SLOT,
+            crate::text_poke::POKE_PML4_SLOT,
+        ] {
             // SAFETY: `root` is the live kernel PML4, identity-reachable
             // (page tables live in low RAM), and we are single-threaded on the
             // BSP with interrupts masked, so the read-modify-write of one
@@ -338,7 +361,11 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
         if root.raw() == 0 {
             return Err(TextError::NoFrame);
         }
-        for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+        for slot in [
+            BPF_TEXT_PML4_SLOT,
+            BPF_ARENA_PML4_SLOT,
+            crate::text_poke::POKE_PML4_SLOT,
+        ] {
             // SAFETY: same as x86_64 — live kernel root, single-threaded BSP.
             unsafe { reserve_slot_aarch64(root, slot)? };
         }

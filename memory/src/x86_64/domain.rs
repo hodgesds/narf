@@ -302,12 +302,13 @@ pub struct ConfinedSlot {
 /// TCB, which loads and JITs) and `BPF` (the CR3 that is current while a
 /// program runs).
 ///
-/// Note that slot `BPF_TEXT_PML4_SLOT` is not BPF-only: `text_poke`'s
-/// per-CPU scratch windows sit at `BPF_TEXT_BASE + BPF_TEXT_USABLE`, inside
-/// the same 512-GiB slot. That is safe because text patching runs at
-/// load/seal time on a task CR3 and never inside a domain guard — but it is
-/// a coupling, not a design, and moving the poke window to its own slot
-/// would let this table say what it means.
+/// Each slot here has exactly one tenant, which is what makes the table
+/// reviewable: `text_poke`'s per-CPU scratch windows used to live inside
+/// `BPF_TEXT_PML4_SLOT` and were moved to `text_poke::POKE_PML4_SLOT` so
+/// that confining a slot named for BPF does not silently also confine the
+/// kernel's text-patching window. Anything added here later should get the
+/// same treatment: confine a slot only when its whole span belongs to the
+/// domains listed.
 pub const CONFINED_SLOTS: &[ConfinedSlot] = &[
     ConfinedSlot {
         slot: crate::bpf_text::BPF_TEXT_PML4_SLOT,

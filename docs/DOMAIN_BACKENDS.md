@@ -88,7 +88,7 @@ that do not own it, driven by the `CONFINED_SLOTS` table:
 
 | Slot | Contents | Owners |
 |---|---|---|
-| `BPF_TEXT_PML4_SLOT` (273) | JIT'd packs, `text_poke` windows, program stacks | `FRAME`, `BPF` |
+| `BPF_TEXT_PML4_SLOT` (273) | JIT'd packs, program stacks | `FRAME`, `BPF` |
 | `BPF_ARENA_PML4_SLOT` (275) | arenas | `FRAME`, `BPF` |
 
 `FRAME` keeps them because it is the TCB: the loader, JIT and verifier
@@ -127,16 +127,37 @@ full:
   * BPF firing from a tracepoint while a guard is held nests a crossing
     into the BPF clone, where the regions are mapped.
 
-One coupling is worth knowing about: **slot 273 is not BPF-only.**
-`text_poke`'s per-CPU scratch windows sit at `BPF_TEXT_BASE +
-BPF_TEXT_USABLE`, so the slot holds the pack region at +0, the poke
-windows at +1 GiB and the program stacks at +2 GiB. Confining 273
-therefore also removes the poke window from driver clones. That is safe
-because text patching happens at load/seal time on a task CR3 and never
-inside a guard, but it is an accident of layout rather than a decision,
-and it is a trap for whoever first patches text from module init. Moving
-the poke window to slot 274 — which is unclaimed — would let the table
-above say what it means.
+Slot 273 used to have a second tenant: `text_poke`'s per-CPU scratch
+windows sat at `BPF_TEXT_BASE + BPF_TEXT_USABLE`, inside the same 512-GiB
+slot. Confining 273 would therefore have quietly removed the kernel's
+text-patching window from driver clones as well. Nothing depended on it —
+patching runs at load/seal time on a task CR3, never inside a guard — so
+this was a latent trap rather than a live bug: the first person to patch
+text from module init would have taken a fault with nothing in the source
+connecting "BPF slot" to "poke window".
+
+The window now has its own slot, `text_poke::POKE_PML4_SLOT` (277),
+reserved by `reserve_kernel_slots` alongside the BPF windows because it
+has the same requirement — a top-level entry present in every address
+space before the first poke.
+
+It is 277 and not 274, the first index that looks free above the text
+window. Slots 274 and 276 are the arena's guard slots, claimed by
+*absence*: they are kept permanently unmapped so that a runaway immediate
+displacement out of the arena cannot reach a mapped page, and
+`smoke_bpf_text_extable_recovers_probe_fault` separately dereferences
+274's base as an address nothing maps. Neither claim is visible by
+grepping for slot constants — the first attempt at this move did take 274,
+and the suite caught it on both architectures.
+
+That is now pinned rather than remembered: `const` assertions tie
+`POKE_VA_BASE` to its slot index and require the slot to sit above the
+arena's upper guard, and `reserve_kernel_slots` re-checks it against both
+windows and both guards on the boot path.
+
+Every slot in the table above now has exactly one tenant, which is the
+property that makes it reviewable. Anything added later should hold to it:
+confine a slot only when its whole span belongs to the domains listed.
 
 ### What is verified and what is not
 
