@@ -1618,7 +1618,8 @@ fn ptrace_fixture() -> Result<(), &'static str> {
         Syscall::Ptrace.raw(),
         a3(PTRACE_ATTACH_REQ, TRACEE_PID, 0, 0),
     ) {
-        Some(0) => Ok(()),
+        Some(0) if crate::ptrace::__test_tracee_count() == 1 => Ok(()),
+        Some(0) => Err("ptrace fixture: active-tracee count did not advance"),
         _ => Err("ptrace fixture: PTRACE_ATTACH did not succeed"),
     }
 }
@@ -1627,6 +1628,28 @@ fn ptrace_fixture_teardown() {
     crate::ptrace::ptrace_init();
     crate::task::release_task(TRACEE_PID);
 }
+
+fn smoke_abi_proc2_ptrace_tracer_exit_retires_active_count() -> TestResult {
+    with_setup(|| {
+        let result = (|| {
+            ptrace_fixture()?;
+            crate::ptrace::release_process(FAKE_TASK);
+            if crate::ptrace::__test_tracee_count() != 0 {
+                return Err("tracer exit did not retire the active-tracee count");
+            }
+            if crate::ptrace::is_task_traced(TRACEE_PID) {
+                return Err("tracer exit left its tracee attached");
+            }
+            Ok(())
+        })();
+        ptrace_fixture_teardown();
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_tracer_exit_retires_active_count
+);
 
 // A request aimed at a process the caller does not trace is ESRCH for
 // EVERY request, because ptrace_check_attach runs before arch_ptrace.
@@ -1812,6 +1835,9 @@ fn smoke_abi_proc2_ptrace_detach_signal_width_and_eio() -> TestResult {
             ) != Some(0)
             {
                 return Err("PTRACE_DETACH must truncate its signal argument to 32 bits");
+            }
+            if crate::ptrace::__test_tracee_count() != 0 {
+                return Err("PTRACE_DETACH did not retire the active-tracee count");
             }
             // Detached: the relationship is gone, so a second DETACH is
             // ESRCH (check_attach), not EPERM.
@@ -2201,12 +2227,18 @@ fn smoke_abi_proc2_ptrace_traceme_second_call_is_eperm() -> TestResult {
             if call(Syscall::Ptrace.raw(), a0(PTRACE_TRACEME)) != Some(0) {
                 return Err("PTRACE_TRACEME with a parent must succeed");
             }
+            if crate::ptrace::__test_tracee_count() != 1 {
+                return Err("PTRACE_TRACEME did not advance the active-tracee count");
+            }
             // `kernel/ptrace.c::ptrace_traceme` opens with
             // `int ret = -EPERM;` and only `if (!current->ptrace)` clears
             // it — one tracer per process, and a second TRACEME is a
             // genuine permission failure rather than a sentinel.
             if call(Syscall::Ptrace.raw(), a0(PTRACE_TRACEME)) != Some(EPERM) {
                 return Err("a second PTRACE_TRACEME must be -EPERM");
+            }
+            if crate::ptrace::__test_tracee_count() != 1 {
+                return Err("failed PTRACE_TRACEME changed the active-tracee count");
             }
             Ok(())
         })();

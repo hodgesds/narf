@@ -30,7 +30,7 @@ use crate::handlers::{
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 use alloc::collections::BTreeMap;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 use narf_memory::{paging::translate, VirtAddr};
 use narf_scheduler::address_space_of;
@@ -194,6 +194,15 @@ pub struct PtraceRegistry {
 }
 
 pub static PTRACE_STATE: IrqSafeSpinLock<Option<PtraceRegistry>> = IrqSafeSpinLock::new(None);
+/// Exact number of entries in `PtraceRegistry::tracers`. The syscall entry/
+/// exit hooks consult this before task-id translation or taking the registry
+/// lock, making ptrace-disabled syscall dispatch a single atomic read.
+static PTRACE_TRACEES: AtomicUsize = AtomicUsize::new(0);
+
+#[doc(hidden)]
+pub(crate) fn __test_tracee_count() -> usize {
+    PTRACE_TRACEES.load(Ordering::Acquire)
+}
 
 fn pid_to_tid(pid: u64) -> u64 {
     crate::handlers::pid_to_task_raw(pid).unwrap_or(pid)
@@ -204,7 +213,9 @@ fn tid_to_pid(tid: u64) -> u64 {
 }
 
 pub fn ptrace_init() {
-    *PTRACE_STATE.lock() = Some(PtraceRegistry::default());
+    let mut state = PTRACE_STATE.lock();
+    *state = Some(PtraceRegistry::default());
+    PTRACE_TRACEES.store(0, Ordering::Release);
 }
 
 /// Retire every ptrace row owned by an exiting process.
@@ -219,6 +230,7 @@ pub(crate) fn release_process(pid: u64) {
         let Some(r) = g.as_mut() else {
             return;
         };
+        let tracees_before = r.tracers.len();
 
         r.tracers.remove(&pid);
         r.stopped.remove(&pid);
@@ -242,6 +254,10 @@ pub(crate) fn release_process(pid: u64) {
             r.options.remove(tracee);
             r.orig_rax.remove(tracee);
         }
+        let removed = tracees_before - r.tracers.len();
+        if removed != 0 {
+            PTRACE_TRACEES.fetch_sub(removed, Ordering::Release);
+        }
         tracees
     };
 
@@ -251,6 +267,9 @@ pub(crate) fn release_process(pid: u64) {
 }
 
 pub fn get_task_tracer(child_pid: u64) -> Option<u64> {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     let g = PTRACE_STATE.lock();
     g.as_ref()?.tracers.get(&child_pid).copied()
 }
@@ -398,6 +417,9 @@ fn pinned_orig_rax(pid: u64) -> Option<u64> {
 /// stop we pin it in the tracee's reported registers so a tracer that
 /// reads orig_rax sees the syscall number rather than the return value.
 pub fn ptrace_syscall_stop(ctx: &mut dyn TrapContext, at_entry: bool, orig_rax: u64) {
+    if PTRACE_TRACEES.load(Ordering::Acquire) == 0 {
+        return;
+    }
     let task = current_task_id();
     let pid = tid_to_pid(task);
     if get_task_tracer(pid).is_none() {
@@ -742,6 +764,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
                     return;
                 }
+                PTRACE_TRACEES.fetch_add(1, Ordering::Release);
                 r.tracers.insert(caller_pid, parent_pid);
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
@@ -786,6 +809,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
                         return;
                     }
+                    PTRACE_TRACEES.fetch_add(1, Ordering::Release);
                     r.tracers.insert(pid, caller_pid);
                 } else {
                     ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
@@ -825,7 +849,9 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
                     return;
                 }
-                r.tracers.remove(&pid);
+                if r.tracers.remove(&pid).is_some() {
+                    PTRACE_TRACEES.fetch_sub(1, Ordering::Release);
+                }
                 r.stopped.remove(&pid);
                 r.stop_signal.remove(&pid);
                 r.signal_bypass.remove(&pid);
