@@ -228,6 +228,17 @@ impl ProgArena {
         self.reserved_bytes
     }
 
+    /// This arena's MTE allocation tag, in `0..=15`; zero without MTE.
+    ///
+    /// Forwards to [`narf_memory::bpf_arena::Arena::tag`]. Used by
+    /// [`ArenaGroup::slot_base_tagged`] to build the base emitted code
+    /// receives.
+    #[inline]
+    #[must_use]
+    pub fn tag(&self) -> u8 {
+        self.arena.tag()
+    }
+
     /// Kernel VA of byte 0 — the kernel's own view, never handed to a program.
     #[inline]
     #[must_use]
@@ -390,10 +401,63 @@ impl ArenaGroup {
     }
 
     /// Kernel VA of the slot base — what a JIT would pin a register to.
+    ///
+    /// Untagged, and deliberately so: this is the value the kernel compares
+    /// and does arithmetic against. The value handed to *emitted* code is
+    /// [`Self::slot_base_tagged`].
     #[inline]
     #[must_use]
     pub fn slot_base(&self) -> u64 {
         self.slot.base()
+    }
+
+    /// The slot base as emitted code must receive it: the same VA, carrying
+    /// the arena's MTE tag in bits 59:56.
+    ///
+    /// Emitted code addresses the arena as `slot_base + handle + off16` and
+    /// performs no runtime bounds check (`crate::jit_glue`), so every access
+    /// inherits exactly this pointer's tag. Tagging here is therefore the
+    /// whole of the JIT-side addressing contract: nothing in the emitter
+    /// changes, because `handle` is zero-extended from a `W` register and
+    /// `off16` is at most ±32 KiB, so neither can disturb bits 59:56.
+    ///
+    /// Returns the plain base when the group does not hold exactly one arena.
+    /// One tag per arena is forced by the addressing shape — a single base
+    /// pointer cannot match granules tagged differently — so a multi-arena
+    /// group has no single correct tag to apply. That is not a live case:
+    /// `BpfProg::native_path_admits` refuses native entry unless the group
+    /// holds exactly one arena, and this returning an untagged base for a
+    /// group it should never see is the conservative direction. With
+    /// `TCF=Ignore` it is also what happens on every non-MTE machine, where
+    /// `tag()` is zero.
+    ///
+    /// Kernel-side accesses keep using the untagged alias. Tags are only
+    /// checked on Tagged Normal pages, and only the arena's pages are mapped
+    /// that way, so an untagged kernel pointer into the arena is checked
+    /// against tag 0 once TCF is Sync — which is why `ArenaPage` carries a
+    /// `tagged_kva` for the paths that need to match.
+    #[inline]
+    #[must_use]
+    pub fn slot_base_tagged(&self) -> u64 {
+        let base = self.slot.base();
+        if self.arenas.len() != 1 {
+            return base;
+        }
+        let tag = self.arenas[0].tag();
+        if tag == 0 {
+            return base;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Replace the tag field, never OR into it: `base` is a TTBR1
+            // address whose bits 63:48 are all ones, so its tag field already
+            // reads 15 and OR-ing changes nothing.
+            narf_arch::aarch64::mte::with_tag(base, tag)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            base
+        }
     }
 }
 

@@ -1209,7 +1209,13 @@ impl BpfProg {
             // merely currently absent.
             let slot_base = self.arenas.as_ref().map_or(0, |g| g.slot_base());
             if self.native_path_admits(image, slot_base) {
-                return self.run_atomic_native(ctx, ctx_len, slot_base);
+                // Emitted code gets the *tagged* base. The admission check
+                // above deliberately uses the untagged one: it is a `!= 0`
+                // test, and a tag would only obscure what is being asserted.
+                // See `ArenaGroup::slot_base_tagged` for why tagging the base
+                // is the entirety of the JIT-side addressing contract.
+                let entry_base = self.arenas.as_ref().map_or(0, |g| g.slot_base_tagged());
+                return self.run_atomic_native(ctx, ctx_len, entry_base);
             }
         }
         self.run_atomic_interpreted_inner(ctx, ctx_len, packet_region, typed)
@@ -1307,9 +1313,13 @@ impl BpfProg {
     /// burn fuel per block; "no arena" when it learned the slot-relative access
     /// shape and the exception table behind it.)
     ///
-    /// `slot_base` is the program's arena slot, or zero when it has none. The
-    /// caller establishes that an image containing arena accesses is never
-    /// entered with a zero — see [`BpfProg::run_atomic`].
+    /// `slot_base` is the program's arena slot, or zero when it has none, and
+    /// carries the arena's MTE tag in bits 59:56 on a machine with MTE — see
+    /// [`crate::arena::ArenaGroup::slot_base_tagged`]. The caller establishes
+    /// that an image containing arena accesses is never entered with a zero —
+    /// see [`BpfProg::run_atomic`]. The tag does not disturb that check: it
+    /// occupies bits no VA in the slot uses, and is applied only to a base
+    /// that was already non-zero.
     fn run_atomic_native(
         &self,
         ctx: [u64; MAX_CTX_WORDS],
