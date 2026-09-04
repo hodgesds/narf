@@ -894,8 +894,19 @@ fn smoke_bpf_arena_pages_carry_a_tag() -> TestResult {
     // a zero-tagged arena would accept exactly the forged pointers the tag
     // exists to reject, and this check would be vacuous.
     const TAG_MASK: u64 = 0xF << 56;
-    if page.tagged_kva & TAG_MASK == 0 {
-        return TestResult::Fail("arena tag is 0, which no pointer can mismatch");
+    // The tag must differ from what an UNTAGGED KERNEL pointer carries, which
+    // is 15 and not 0: bits 63:48 of a TTBR1 address are all ones. Checking
+    // only `!= 0` is vacuous here, and was — this smoke passed for months
+    // while `tagged_kva` was built by OR-ing into an all-ones field, so every
+    // arena's tag was 15 and `pick_arena_tag`'s choice was discarded.
+    if mte::tag_of(page.tagged_kva) == mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("arena tag is 15, which every kernel pointer already carries");
+    }
+    if mte::tag_of(page.tagged_kva) != arena.tag() {
+        return TestResult::Fail("the page's tagged alias does not carry the arena's tag");
+    }
+    if page.tagged_kva == page.kva {
+        return TestResult::Fail("the tagged alias is identical to the plain VA");
     }
     if page.tagged_kva & !TAG_MASK != page.kva & !TAG_MASK {
         return TestResult::Fail("tagged pointer differs outside the tag field");
@@ -931,6 +942,169 @@ fn smoke_bpf_arena_pages_carry_a_tag() -> TestResult {
 }
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("bpf", smoke_bpf_arena_pages_carry_a_tag);
+
+/// The slot base handed to *emitted* code carries the arena's tag, and the
+/// base the kernel does arithmetic with does not.
+///
+/// This is the whole of step 3's addressing contract. Emitted code computes
+/// `slot_base + handle + off16` with no runtime bounds check, so the tag on
+/// this one pointer is what every arena access inherits. Without it, flipping
+/// `SCTLR_EL1.TCF` to Sync makes every legitimate access arrive with tag 0
+/// against granules tagged non-zero — the arena's own code faulting on its own
+/// memory.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_slot_base_carries_the_arena_tag() -> TestResult {
+    use narf_arch::aarch64::mte;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let cap = kernel_arena_cap();
+    let mut g = match ArenaGroup::new(cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+    };
+    if g.add(cap, 1).is_err() {
+        return TestResult::Fail("ArenaGroup::add failed");
+    }
+
+    const TAG_MASK: u64 = 0xF << 56;
+    let plain = g.slot_base();
+    let tagged = g.slot_base_tagged();
+
+    // `plain` is a TTBR1 address, so its tag field reads 15 — the untagged
+    // kernel value. That is the thing `tagged` must differ from; comparing
+    // against 0 would pass no matter what, which is how the step-2 smoke
+    // stayed green over a tag that was never applied.
+    if mte::tag_of(plain) != mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("slot_base() does not read as an untagged kernel pointer");
+    }
+    if mte::tag_of(tagged) == mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("slot_base_tagged() still reads as untagged");
+    }
+    if tagged == plain {
+        return TestResult::Fail("slot_base_tagged() returned the plain base");
+    }
+    // Both sides must have the tag field masked off. Comparing a stripped
+    // `tagged` against a raw `plain` fails on the tag bits `plain` legitimately
+    // carries, which is the same all-ones-tag-field trap the code under test
+    // just had.
+    if tagged & !TAG_MASK != plain & !TAG_MASK {
+        return TestResult::Fail("the tagged base differs outside the tag field");
+    }
+    // The tag must be the *arena's*, not merely some non-zero value: emitted
+    // accesses are checked against the granules `populate` tagged, so any
+    // other value faults once TCF is Sync.
+    if mte::tag_of(tagged) != g.arenas()[0].tag() {
+        return TestResult::Fail("the base's tag is not this arena's tag");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_slot_base_carries_the_arena_tag);
+
+/// The tagged base addresses the same memory as the untagged one.
+///
+/// TBI1 is set in `boot.S`, so bits 63:56 are ignored for translation and a
+/// tagged kernel pointer walks to the same page. Asserting it here rather than
+/// trusting the TCR bit: if TBI were off, the tagged base would be a
+/// non-canonical address and every arena access would fault the moment step 3
+/// landed — long before the TCF flip this is meant to prepare for.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_tagged_base_reaches_the_same_bytes() -> TestResult {
+    use narf_arch::aarch64::mte;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let cap = kernel_arena_cap();
+    let mut g = match ArenaGroup::new(cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+    };
+    if g.add(cap, 1).is_err() {
+        return TestResult::Fail("ArenaGroup::add failed");
+    }
+    let kva = g.arenas()[0].kva();
+    let off = kva - g.slot_base();
+    let via_tag = g.slot_base_tagged().wrapping_add(off);
+
+    const MAGIC: u64 = 0x0FED_C0DE_5EED_1234;
+    // SAFETY: byte 0 of a populated, kernel-owned arena page, written through
+    // the kernel's own untagged alias.
+    unsafe { core::ptr::write_volatile(kva as *mut u64, MAGIC) };
+    // SAFETY: same location by construction — `via_tag` differs from `kva`
+    // only in bits 63:56, which TBI1 excludes from translation. TCF is Ignore
+    // at this point, so the tag mismatch against an untagged write is not
+    // checked; that is exactly what step 4 changes.
+    let seen = unsafe { core::ptr::read_volatile(via_tag as *const u64) };
+    if seen != MAGIC {
+        return TestResult::Fail("the tagged base did not reach the same bytes");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_tagged_base_reaches_the_same_bytes);
+
+/// A group holding more than one arena gets an untagged base.
+///
+/// One tag per arena is forced by the addressing shape, so a multi-arena group
+/// has no single correct tag. `native_path_admits` already refuses native
+/// entry for such a group; this pins the conservative fallback so the two
+/// cannot drift into a state where emitted code receives one arena's tag while
+/// indexing into another's pages.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_multi_arena_base_is_untagged() -> TestResult {
+    use narf_arch::aarch64::mte;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let cap = kernel_arena_cap();
+    let mut g = match ArenaGroup::new(cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+    };
+    if g.add(cap, 1).is_err() || g.add(cap, 1).is_err() {
+        return TestResult::Fail("ArenaGroup::add failed");
+    }
+    if g.arenas().len() != 2 {
+        return TestResult::Fail("expected a two-arena group");
+    }
+    if g.slot_base_tagged() != g.slot_base() {
+        return TestResult::Fail("a multi-arena group got a tagged base");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_multi_arena_base_is_untagged);
+
+/// On a machine without MTE — every x86_64 host, and an aarch64 CPU without
+/// the feature — the tagged base is the plain base.
+///
+/// `pick_arena_tag` returns 0 there, and tag 0 is what an untagged pointer
+/// carries, so tagging would be a no-op at best. Asserted rather than assumed
+/// because the emitted code is shared: an x86 program indexing off a base with
+/// stray high bits would fault with no MTE anywhere in the picture.
+fn smoke_bpf_arena_untagged_platforms_get_a_plain_base() -> TestResult {
+    #[cfg(target_arch = "aarch64")]
+    if narf_arch::aarch64::mte::supported() {
+        return TestResult::Skip("MTE present; covered by the tagged-base smoke");
+    }
+    let cap = kernel_arena_cap();
+    let mut g = match ArenaGroup::new(cap) {
+        Ok(g) => g,
+        Err(_) => return TestResult::Fail("ArenaGroup::new failed"),
+    };
+    if g.add(cap, 1).is_err() {
+        return TestResult::Fail("ArenaGroup::add failed");
+    }
+    if g.slot_base_tagged() != g.slot_base() {
+        return TestResult::Fail("a tag appeared on a machine without MTE");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("bpf", smoke_bpf_arena_untagged_platforms_get_a_plain_base);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_bpf_sleepable_confinement_is_per_poll() -> TestResult {

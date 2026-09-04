@@ -1,7 +1,7 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.2**. Steps 1 and 2 are implemented; nothing is enforced
-> yet. This records what exists, what is missing, and the order the
+> Status: **v0.3**. Steps 1, 2 and 3 are implemented; nothing is
+> enforced yet — step 4 is the flip. This records what exists, what is missing, and the order the
 > missing pieces have to land in, because getting that order wrong hangs
 > the machine with no console.
 
@@ -83,9 +83,22 @@ Each step is separately verifiable and leaves the tree working.
      Tagging must follow mapping: the zeroing in `populate` goes through
      the untagged direct-map alias, and a store via a non-tagged alias
      may leave a location's tag UNKNOWN.
-  3. **Make the arena's addressing contract tag-aware.** *Not started,
-     and larger than it looks — see below.* This has to precede any TCF
-     flip.
+  3. **Make the arena's addressing contract tag-aware.** *Done, and
+     smaller than "see below" predicted — the prediction was wrong for a
+     reason worth keeping; see "The addressing contract".* Emitted code
+     receives `ArenaGroup::slot_base_tagged()`: the same VA carrying the
+     arena's tag in bits 59:56. The emitter is untouched. Verified by
+     `smoke_bpf_arena_slot_base_carries_the_arena_tag` (the base carries
+     *this arena's* tag, and the untagged base does not),
+     `smoke_bpf_arena_tagged_base_reaches_the_same_bytes` (TBI1 really is
+     on, so the tagged base addresses the same memory),
+     `smoke_bpf_arena_multi_arena_base_is_untagged` and
+     `smoke_bpf_arena_untagged_platforms_get_a_plain_base`.
+
+     Doing this surfaced a bug in step 2: the tagged pointer was built by
+     OR-ing into a field that is already all ones on a TTBR1 address, so
+     every arena's tag was 15 — the value every untagged kernel pointer
+     carries. Fixed separately; see "What step 3 found".
   4. **Flip TCF inside the domain scope.** `enter_domain` sets Sync,
      `exit_domain` restores. *Verify:* a deliberate tag mismatch inside
      the scope faults synchronously and is reported, and the existing
@@ -116,16 +129,63 @@ pointer's tag. Two consequences:
     inflated values unless every bound carries the identical tag or the
     comparison strips it first.
 
-So step 3 is "make the JIT's arena addressing contract tag-aware",
-touching `jit_glue`, the emitter, and the bounds checks — not a bit flip
-in `enter_domain`. Half-doing it produces exactly the failure this
-document opens with: a fault the handler cannot service, and no console.
+Step 3 was scoped as "touching `jit_glue`, the emitter, and the bounds
+checks". It touched none of them — see below for why the estimate was
+wrong. Half-doing it would still produce the failure this document opens
+with: a fault the handler cannot service, and no console.
 
-The open design question is where the tag is stripped. Candidates:
-carry it in `slot_base` and mask in the bounds comparison; keep
-`slot_base` plain and have the emitter OR the tag into the computed
-address; or give the arena a fixed tag known at emit time. Each moves
-the cost to a different place, and none is obviously right yet.
+The open design question was where the tag is stripped. It dissolved:
+**there is no runtime bounds comparison to strip it from.** `arena.rs`
+says so directly — a JIT "lowers this to `slot_base + handle + off16`
+with no per-access check". The bound is structural, not compared: the
+handle is zero-extended from a `W` register to `[0, 2^32)`, `off16` is at
+most ±32 KiB, and the arena slot's unmapped guard slots absorb the rest.
+The `[lo, hi)` range in this document is a *static* argument about
+reachable addresses, not emitted instructions.
+
+So the contract is one pointer. `ArenaGroup::slot_base_tagged()` carries
+the arena's tag; `slot_base()` stays untagged for kernel arithmetic and
+for the non-zero admission check. The emitter needs no change, because
+neither a zero-extended 32-bit handle nor a ±32 KiB displacement can
+disturb bits 59:56.
+
+Three things had to hold, and were checked rather than assumed:
+
+  * **TBI1 is on.** `boot.S:219` loads `0x62 << 32` — bits 33, 37, 38, so
+    IPS=40-bit with TBI0 and TBI1 set. Without it a tagged base is
+    non-canonical and every arena access faults immediately, not at the
+    TCF flip. `smoke_bpf_arena_tagged_base_reaches_the_same_bytes` pins
+    it, because a cleared TBI1 would otherwise surface as a boot hang.
+  * **The fault epilogue reports `AHANDLE`**, which holds `handle + off`
+    and never the base, so the offending-handle diagnostic is not
+    inflated by the tag.
+  * **The exception table keys on the faulting instruction's PC**, not on
+    the data address, so a tagged pointer does not perturb lookup.
+
+## What step 3 found
+
+Step 2 tagged nothing. `tag_arena_page` built the tagged alias as
+`kva | (tag << 56)`, and a TTBR1 address has bits 63:48 set, so the tag
+field already read `0b1111` and the OR was a no-op. `stg` wrote 15 to
+every granule, `pick_arena_tag`'s choice was discarded, and
+`ArenaPage::tagged_kva` equalled `kva`.
+
+Tag 15 is what every untagged kernel pointer carries, so the arena's tag
+matched everything. `pick_arena_tag` had guarded against tag 0 — right
+idea, wrong number: 0 is the untagged value for *user* pointers.
+
+Nothing misbehaved, because nothing was enforcing. The hazard was step 4:
+flipping TCF on top of this yields a backend that reports `Mte`, faults on
+nothing, and passes its own smokes. That is the failure this document
+opens with, arrived at from the other direction.
+
+Two lessons worth carrying into steps 4 and 5. **The step-2 smoke passed
+throughout** — it asserted `tag != 0` and that `tagged_kva` matched `kva`
+outside the tag field, and "every tag is 15" satisfies both. An assertion
+about tags has to name the value an *untagged kernel pointer* carries, not
+zero. And **tag arithmetic belongs in one helper**: it was open-coded at
+two sites and both were wrong identically. `mte::with_tag`, `tag_of` and
+`UNTAGGED_KERNEL_TAG` now exist for that reason.
 
 ## Traps
 
