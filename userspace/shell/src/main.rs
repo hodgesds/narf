@@ -2061,13 +2061,19 @@ unsafe fn dispatch_line(fd: i32, line: &[u8]) -> bool {
         }
     } else if cmd == b"dmesg" {
         // Read the kernel log ring via /dev/kmsg. Open + read in a
-        // loop with a 4 KiB buffer; print to fd. The kmsg file
-        // returns 0 once we've read past the snapshot, which is
-        // the natural end-of-output. No flags — Linux's `-T`, `-w`
-        // (follow), `-l` (level filter) etc. land later.
+        // loop with a 4 KiB buffer; print to fd. A nonblocking read
+        // reports EAGAIN once it reaches the current end of the live log,
+        // which is the natural end of this one-shot output. Linux's `-T`,
+        // `-w` (follow), `-l` (level filter) etc. land later.
         let mut kpath = *b"/dev/kmsg\0";
         // SAFETY: Valid memory or trusted environment
-        let kfd = unsafe { libc::posix::open(kpath.as_mut_ptr() as *mut i8, 0, 0) };
+        let kfd = unsafe {
+            libc::posix::open(
+                kpath.as_mut_ptr() as *mut i8,
+                libc::fd::O_NONBLOCK as i32,
+                0,
+            )
+        };
         if kfd < 0 {
             // SAFETY: Valid memory or trusted environment
             unsafe { write_all(fd, b"dmesg: cannot open /dev/kmsg\n"); }

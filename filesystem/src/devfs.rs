@@ -366,9 +366,10 @@ impl FileOps for DevZero {
 ///
 /// Mirrors Linux's `/dev/kmsg` (the canonical surface `dmesg` reads
 /// from). Each read returns a slice of the live klog snapshot
-/// starting at `offset` (caller-tracked, oldest-byte-first). On
-/// large logs the caller calls multiple times until the read
-/// returns 0. Writes are accepted (a no-op) so a userspace tool
+/// starting at `offset` (caller-tracked, oldest-byte-first). At the
+/// current end of the live log, reads return `WouldBlock`; `sys_read`
+/// maps that to `EAGAIN` for `O_NONBLOCK` descriptions. Writes are
+/// accepted (a no-op) so a userspace tool
 /// can pipe to `> /dev/kmsg` without erroring; the actual kmsg
 /// "inject" facility from Linux isn't implemented (write-discard).
 ///
@@ -422,10 +423,19 @@ impl FileOps for DevKmsg {
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        if buf.is_empty() {
+            return Box::pin(async { Ok(0) });
+        }
         // Copy only the requested window straight from the ring (no full-log
         // Vec snapshot per read — see poll_readiness_at).
         let n = narf_console::klog::read_at(offset as usize, buf);
-        Box::pin(async move { Ok(n) })
+        Box::pin(async move {
+            if n == 0 {
+                Err(FsError::WouldBlock)
+            } else {
+                Ok(n)
+            }
+        })
     }
 
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
@@ -2619,6 +2629,27 @@ fn smoke_kmsg_read_at_matches_snapshot() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_kmsg_read_at_matches_snapshot);
+
+/// A non-empty read at the current end of `/dev/kmsg` is temporary
+/// emptiness, not EOF. `sys_read` turns this result into `EAGAIN` for an
+/// `O_NONBLOCK` open. stress-ng's OOM detector drains `/dev/kmsg` until that
+/// error; returning `Ok(0)` instead makes it retry forever after a worker is
+/// terminated by a signal.
+fn smoke_dev_kmsg_empty_read_would_block() -> TestResult {
+    let dev = DevKmsg;
+    let mut buf = [0u8; 16];
+    match poll_once_devfs(dev.read(u64::MAX, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("empty /dev/kmsg read should return WouldBlock"),
+    }
+
+    let mut empty = [];
+    match poll_once_devfs(dev.read(u64::MAX, &mut empty)) {
+        Some(Ok(0)) => TestResult::Pass,
+        _ => TestResult::Fail("zero-length /dev/kmsg read should return 0"),
+    }
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_empty_read_would_block);
 
 /// udev's device-symlink sequence must work: mkdir a subdirectory under /dev,
 /// then create a symlink INSIDE it.
