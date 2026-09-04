@@ -5,8 +5,8 @@
 //!
 //! Implementation strategy:
 //!
-//! - **x86_64 with RDPID** (Intel Ice Lake / AMD Zen 2+): single
-//!   one-byte read of the IA32_TSC_AUX MSR's low 32 bits.
+//! - **x86_64 with RDPID** (Intel Ice Lake / AMD Zen 2+): direct,
+//!   non-serializing read of the IA32_TSC_AUX MSR's low 32 bits.
 //! - **x86_64 with RDTSCP** (universal since Nehalem / Bulldozer):
 //!   reads TSC + IA32_TSC_AUX in one instruction; we discard the
 //!   TSC and keep the aux. The aux MSR is loaded by the boot path
@@ -16,11 +16,10 @@
 //!   initial APIC id. Slow (CPUID is serializing); only used as a
 //!   compile-time-disabled fallback.
 //!
-//! Today the kernel is single-CPU; `current_cpu()` always returns 0
-//! because IA32_TSC_AUX is zero on the BSP and we haven't enabled
-//! RDPID feature gating yet. The plumbing is in place so AP
-//! bring-up just needs to write each AP's id into its own
-//! IA32_TSC_AUX after entering long mode.
+//! AP bring-up writes each CPU's logical id into IA32_TSC_AUX before it
+//! can enter the scheduler. RDPID and RDTSCP therefore return the same
+//! identity cookie; RDPID is preferred because CPU identity does not need
+//! RDTSCP's ordering or timestamp result.
 
 use core::arch::asm;
 
@@ -30,30 +29,54 @@ use core::arch::asm;
 /// aarch64 server parts).
 pub const MAX_CPUS: usize = 64;
 
-/// Cached "does this CPU support RDTSCP?" flag. Set on first call.
-/// QEMU TCG's qemu64 model claims RDTSCP support in CPUID but
-/// raises #UD when the instruction executes — so we can't trust
-/// CPUID alone. We probe by reading CPUID.80000001h:EDX[27], and
-/// if absent, fall back to returning 0 (single-CPU answer that's
-/// correct for the BSP).
+/// Cached instruction used to read IA32_TSC_AUX. Set on first call.
 ///
-/// 0 = unknown (probe needed), 1 = no RDTSCP, 2 = has RDTSCP.
-static RDTSCP_STATE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+/// 0 = unknown (probe needed), 1 = no reader, 2 = RDTSCP, 3 = RDPID.
+static CPU_ID_READER: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
-#[inline(never)]
-fn probe_rdtscp() -> bool {
-    // CPUID.80000001h:EDX[27] = RDTSCP support bit.
-    // SAFETY: __cpuid is always legal at CPL=0.
-    let leaf = unsafe { core::arch::x86_64::__cpuid(0x8000_0001) };
-    leaf.edx & (1u32 << 27) != 0
+const READER_NONE: u8 = 1;
+const READER_RDTSCP: u8 = 2;
+const READER_RDPID: u8 = 3;
+
+#[inline]
+const fn select_cpu_id_reader(has_rdpid: bool, has_rdtscp: bool) -> u8 {
+    if has_rdpid {
+        READER_RDPID
+    } else if has_rdtscp {
+        READER_RDTSCP
+    } else {
+        READER_NONE
+    }
 }
 
-/// Return the executing CPU's logical index. Single-CPU today; once
-/// AP bring-up populates IA32_TSC_AUX per CPU, this picks up the
-/// right value automatically.
+#[inline(never)]
+fn probe_cpu_id_reader() -> u8 {
+    // CPUID.(EAX=07H,ECX=0):ECX[22] = RDPID.
+    // CPUID.80000001h:EDX[27] = RDTSCP.
+    // SAFETY: __cpuid is always legal at CPL=0.
+    let max_basic = unsafe { core::arch::x86_64::__cpuid(0) }.eax;
+    let has_rdpid = if max_basic >= 7 {
+        // SAFETY: max_basic proves structured-feature leaf 7 exists.
+        unsafe { core::arch::x86_64::__cpuid_count(7, 0) }.ecx & (1u32 << 22) != 0
+    } else {
+        false
+    };
+    // SAFETY: extended-leaf maximum query is always legal at CPL=0.
+    let max_extended = unsafe { core::arch::x86_64::__cpuid(0x8000_0000) }.eax;
+    let has_rdtscp = if max_extended >= 0x8000_0001 {
+        // SAFETY: max_extended proves extended feature leaf 80000001H exists.
+        unsafe { core::arch::x86_64::__cpuid(0x8000_0001) }.edx & (1u32 << 27) != 0
+    } else {
+        false
+    };
+    select_cpu_id_reader(has_rdpid, has_rdtscp)
+}
+
+/// Return the executing CPU's logical index from the IA32_TSC_AUX value
+/// populated by BSP/AP bring-up.
 ///
-/// Falls back to returning 0 (BSP) on CPU models that don't
-/// implement RDTSCP — e.g. QEMU TCG's `qemu64` default model.
+/// Prefers RDPID, falls back to RDTSCP, and returns 0 (the BSP) on CPU
+/// models that implement neither instruction.
 ///
 /// # Safety
 /// Reading TSC_AUX is always defined at CPL=0; the function is safe
@@ -61,37 +84,46 @@ fn probe_rdtscp() -> bool {
 #[inline]
 pub fn current_cpu() -> u32 {
     use core::sync::atomic::Ordering;
-    let state = RDTSCP_STATE.load(Ordering::Acquire);
-    let has_rdtscp = match state {
-        2 => true,
-        1 => false,
-        _ => {
-            let supported = probe_rdtscp();
-            RDTSCP_STATE.store(if supported { 2 } else { 1 }, Ordering::Release);
-            supported
+    let state = match CPU_ID_READER.load(Ordering::Acquire) {
+        0 => {
+            let reader = probe_cpu_id_reader();
+            CPU_ID_READER.store(reader, Ordering::Release);
+            reader
         }
+        reader => reader,
     };
-    if !has_rdtscp {
-        // BSP fallback. APs will set their TSC_AUX during
-        // startup; in pre-AP single-CPU boot, 0 is the right
-        // answer. When AP bring-up lands, we'll need a real
-        // CPUID-leaf-0Bh-based fallback for non-RDTSCP CPUs.
-        return 0;
+    if state == READER_RDPID {
+        let aux: u64;
+        // SAFETY: CPUID advertised RDPID. IA32_TSC_AUX is initialized by
+        // BSP/AP bring-up before scheduler-visible per-CPU access.
+        unsafe {
+            asm!(
+                "rdpid {aux}",
+                aux = out(reg) aux,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        return aux as u32;
     }
-    let mut aux: u32;
-    let mut _hi: u32;
-    let mut _lo: u32;
-    // SAFETY: probe above confirmed RDTSCP support.
-    unsafe {
-        asm!(
-            "rdtscp",
-            out("eax") _lo,
-            out("edx") _hi,
-            out("ecx") aux,
-            options(nomem, nostack, preserves_flags),
-        );
+    if state == READER_RDTSCP {
+        let aux: u32;
+        let _hi: u32;
+        let _lo: u32;
+        // SAFETY: CPUID advertised RDTSCP.
+        unsafe {
+            asm!(
+                "rdtscp",
+                out("eax") _lo,
+                out("edx") _hi,
+                out("ecx") aux,
+                options(nomem, nostack, preserves_flags),
+            );
+        }
+        return aux;
     }
-    aux
+    // BSP fallback for CPUs without either TSC_AUX reader. SMP bring-up on
+    // such hardware still needs a CPUID-leaf-0Bh logical-id fallback.
+    0
 }
 
 /// Set the calling CPU's id (low 32 bits of IA32_TSC_AUX).
@@ -109,5 +141,18 @@ pub unsafe fn set_current_cpu(id: u32) {
     // SAFETY: Valid memory or trusted environment
     unsafe {
         wrmsr(0xC000_0103, id as u64);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_id_reader_prefers_rdpid_then_rdtscp() {
+        assert_eq!(select_cpu_id_reader(true, true), READER_RDPID);
+        assert_eq!(select_cpu_id_reader(true, false), READER_RDPID);
+        assert_eq!(select_cpu_id_reader(false, true), READER_RDTSCP);
+        assert_eq!(select_cpu_id_reader(false, false), READER_NONE);
     }
 }
