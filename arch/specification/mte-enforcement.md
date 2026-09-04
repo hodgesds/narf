@@ -1,6 +1,6 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.5**. Steps 1–5 are implemented. MTE **is enforcing**, for
+> Status: **v0.6**. Steps 1–5 are implemented. MTE **is enforcing**, for
 > the BPF arena and nothing else, and the boot report says exactly that:
 > the backend stays `Unenforced` and the arena's tag checking is reported
 > on its own line. This records what exists, what is missing, and the order the
@@ -292,3 +292,75 @@ has been about from the start — the reported name matches what is enforced
 `effective_backend()` at all. That absence is why the mistake was made
 three times: PCID selected with `CR4.PCIDE` clear, PKS and PCID documented
 as equivalent, and this arm naming an enforcer twice over.
+
+## Step 6 — driver domains: attempted, reverted, and what it needs
+
+Extending enforcement from the BPF arena to driver domains was tried and
+backed out. The page-level half works; the addressing half does not, and
+the two cannot land separately. What follows is what was learned, so the
+next attempt starts from here rather than from scratch.
+
+### x86 is not the model to copy from, but it is real
+
+`module_text::protection_key` is wired: `leaf_flags(domain)` ORs
+`PtFlags::pk(D)` into every module leaf, and `alloc(pages, domain)` uses
+it. PKS module isolation is genuine on x86. aarch64's `leaf_flags`
+explicitly drops the domain — "the domain does not travel in the leaf
+here" — so this is aarch64 catching up, not a tree-wide gap.
+
+### What worked
+
+Module pages can carry the domain: map them `ATTR_TAGGED` and have `alloc`
+write the domain's tag to every granule after the trap-fill (the same
+ordering `bpf_arena` needs — the fill goes through the untagged VA, and a
+store via a non-tagged alias can leave a granule UNKNOWN). Two readback
+tests were written and **passed**: one reading the leaf's whole `AttrIndx`
+field and `ldg`-ing the tag back from byte 0 and a mid-page granule, one
+asserting distinct tags per domain.
+
+### The tag space is one short, and the obvious sacrifice is wrong
+
+MTE has 16 tags, NARF has 16 domains, and tag 15 is what every untagged
+kernel pointer reads as. So fifteen usable tags must cover sixteen domains
+and exactly one domain goes untagged.
+
+It must be `FRAME` (mapping `D` to `D - 1`). `FRAME` is the TCB, its
+memory is not `ATTR_TAGGED` anyway, and `enter_domain` deliberately leaves
+it reachable from everywhere, so "unprotected" describes what it already
+is. The identity mapping — leaving domain 15 untagged — looks equivalent
+and is not: `DomainId::SCRATCH` **is** 15. It is a real driver domain, it
+is the one the module tests use, and sacrificing it made the only test
+that verifies tagging *skip* rather than run. The mechanism looked
+delivered and did nothing where it was most likely to be exercised.
+
+### The blocker: the relocator has no addressing contract
+
+For a module's own accesses to match its tagged granules, its code must
+run at a tagged VA — then absolute relocations carry the tag and
+`ADRP`-computed addresses inherit it from the PC. Relocating against
+`ModuleImage::tagged_base()` does that, and breaks loading outright:
+`smoke_module_load_real_ko_round_trip` fails with "sys_init_module
+rejected a real rustc-built .ko".
+
+`relocator.rs` computes `words = (target - place) >> 2` for
+`R_AARCH64_CALL26` / `JUMP26`. `target` is a kernel symbol — untagged, so
+tag 15 — while `place` is inside the image at tag `D - 1`. The difference
+carries `(15 - (D - 1)) << 56`, every call overflows the ±128 MiB bound,
+each demands a PLT veneer, the PLT exhausts, and the load is refused.
+
+This is the question "The addressing contract" above asks, arriving for
+real. For the JIT it dissolved because nothing compares addresses. The
+relocator compares constantly, so the contract must be stated and applied:
+**displacements are computed on untagged addresses; stored absolute
+addresses carry the tag.** That is a change across `CALL26`/`JUMP26`,
+`ADRP`/`ADD` and `PREL32` handling, and it is the real content of step 6 —
+the page tagging is the easy part.
+
+### Why the halves cannot land separately
+
+Tagging module pages without the addressing contract is not a safe
+intermediate. `TCF` is per-CPU and checks are per-page, so while any BPF
+domain scope holds `TCF=Sync`, an interrupt into driver code that touches
+its own now-tagged data through an untagged pointer takes a fatal fault —
+there is no exception-table entry for module code. Page tagging and the
+relocator contract must land together, or neither.
