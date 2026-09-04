@@ -556,6 +556,30 @@ fn setup_pcid_domains() {
         registered,
         private_pdpts
     );
+    // Confine the shared upper-half slots the clone snapshot pulled in.
+    // `init_per_domain_pdpts` above confines 256..=271; this handles the slots
+    // that live outside the private range but still must not be visible to
+    // every domain. Today that is BPF's text/stack and arena windows, which
+    // `reserve_kernel_slots` deliberately installs BEFORE the clones exist so
+    // the snapshot captures them -- correct for task address spaces, too broad
+    // for the domain clones. Under PKS these regions are confined by their PTE
+    // keys; slot presence is the only granularity PCID has.
+    //
+    // See `narf_memory::domain::CONFINED_SLOTS` for the policy table and for
+    // why FRAME (loads and JITs) and BPF (the CR3 current during a program
+    // run) keep their entries.
+    // SAFETY: the clones were registered above, this is the BSP, and no CPU
+    // can switch to a clone before the enforcer is announced.
+    let confined = unsafe { narf_memory::domain::confine_shared_slots() };
+    let _ = writeln!(
+        console::Writer,
+        "  domain enforcer: pcid confined {} shared PML4 {} outside the \
+         private range (BPF text/stack slot {}, arena slot {}) to FRAME+BPF",
+        confined,
+        if confined == 1 { "entry" } else { "entries" },
+        narf_memory::bpf_text::BPF_TEXT_PML4_SLOT,
+        narf_memory::bpf_text::BPF_ARENA_PML4_SLOT
+    );
 }
 
 #[unsafe(no_mangle)]

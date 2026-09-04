@@ -76,9 +76,79 @@ directly: it ORs in `pk(BPF)` only `if pks::is_active()`, because a PTE
 key means nothing to the PCID backend, and there is no PCID equivalent
 to reach for.
 
-Closing it would mean either mapping those regions inside each domain's
-private slot, or accepting that PCID's isolation stops at the private
-range and saying so at the boundary. Not decided.
+The exposure is asymmetric. `bpf_text::seal_mapping` rewrites the pack's
+leaves to drop `WRITABLE` once a pack is published, independently of the
+domain backend, so a foreign domain can *read* JIT'd text but not modify
+it — W^X closes that vector, not the enforcer. The stack and the arena
+stay read/write.
+
+**This is now closed under PCID.** `domain::confine_shared_slots` runs
+after the clones are built and zeroes each confined slot in the clones
+that do not own it, driven by the `CONFINED_SLOTS` table:
+
+| Slot | Contents | Owners |
+|---|---|---|
+| `BPF_TEXT_PML4_SLOT` (273) | JIT'd packs, `text_poke` windows, program stacks | `FRAME`, `BPF` |
+| `BPF_ARENA_PML4_SLOT` (275) | arenas | `FRAME`, `BPF` |
+
+`FRAME` keeps them because it is the TCB: the loader, JIT and verifier
+write text before it is sealed, and removing the slots there would break
+loading rather than harden it. `BPF` keeps them because
+`bpf::domain::enter` switches CR3 to the BPF clone around every program
+run, so that is the CR3 that must have the regions mapped.
+
+The policy is a table and not an open-coded check because the same
+"which domains may see this region" question is answered independently
+by PKS (`PtFlags::pk`) and PCID (slot presence). Two mechanisms, one
+intent; keeping the PCID half declarative puts the drift in one place.
+
+**It deliberately does not touch task address spaces.** Those snapshot
+the same range, and `reserve_kernel_slots` is sequenced before the first
+`new_user_pml4` precisely so they capture the BPF entries — the boot-path
+comment warns that a task CR3 holding a zero BPF entry triple-faults on
+the first BPF access. Kernel-side BPF work (map updates from syscalls,
+JIT writes, perf ring reads) runs on a task CR3 and is unaffected. Only
+the sixteen domain clones are narrowed.
+
+### The access graph this rests on
+
+Confinement is safe only if nothing running inside a driver-domain guard
+legitimately needs those regions. That graph is small enough to state in
+full:
+
+  * Driver domains are entered at exactly two sites, both in
+    `modules/src/loader.rs`: around a module's `init()` and its `exit()`.
+  * The kernel ABI a module may call is the `kernel_abi!` table in
+    `modules/src/kabi.rs` — `narf_printk`, `narf_kmalloc`, `narf_kfree`,
+    `narf_monotonic_ns`. None reach slots 273 or 275, and `register_all`
+    is the only path that populates KSYMTAB.
+  * A module's own image is at `MODULE_VA_BASE` (slot 511), so narrowing
+    273/275 does not unmap the code that is running.
+  * BPF firing from a tracepoint while a guard is held nests a crossing
+    into the BPF clone, where the regions are mapped.
+
+One coupling is worth knowing about: **slot 273 is not BPF-only.**
+`text_poke`'s per-CPU scratch windows sit at `BPF_TEXT_BASE +
+BPF_TEXT_USABLE`, so the slot holds the pack region at +0, the poke
+windows at +1 GiB and the program stacks at +2 GiB. Confining 273
+therefore also removes the poke window from driver clones. That is safe
+because text patching happens at load/seal time on a task CR3 and never
+inside a guard, but it is an accident of layout rather than a decision,
+and it is a trap for whoever first patches text from module init. Moving
+the poke window to slot 274 — which is unclaimed — would let the table
+above say what it means.
+
+### What is verified and what is not
+
+The policy is covered by `smoke_pcid_confined_slot_policy`, which is
+ungated and runs everywhere. The structural assertion that it landed in
+the clones, `smoke_pcid_confined_slots_applied`, gates on
+`pcid::is_active()` and therefore **skips on every runner available
+today**: QEMU's TCG does not implement PCID even under `-cpu max,+pcid`,
+and the development host's KVM reports `CPUID(1).ECX[17] = 0`. The PCID
+enforcement path has never executed on hardware we have. Treat the
+confinement as reviewed and unexercised until a PCID-capable runner
+exists.
 
 The aarch64 ASID-PT fallback for non-MTE silicon is conceptually
 identical to PCID and is the planned analog. Today, aarch64 boot
