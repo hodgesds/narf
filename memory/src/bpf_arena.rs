@@ -559,6 +559,20 @@ impl Arena {
         self.tag
     }
 
+    /// Apply this arena's tag to `kva`, giving a pointer that passes a tag
+    /// check against the arena's granules once `SCTLR_EL1.TCF` is Sync.
+    ///
+    /// Returns `kva` unchanged when tagging is off. Every path that reaches
+    /// arena bytes from inside a BPF domain scope must go through this or
+    /// carry the tag some other way: the JIT does it once, via
+    /// `ArenaGroup::slot_base_tagged`; the interpreter does it per resolve,
+    /// because it computes a fresh pointer for every access.
+    #[inline]
+    #[must_use]
+    pub fn tagged(&self, kva: u64) -> u64 {
+        tagged_alias(kva, self.tag)
+    }
+
     /// Kernel VA of the enclosing slot's base.
     #[inline]
     pub fn slot_base(&self) -> u64 {

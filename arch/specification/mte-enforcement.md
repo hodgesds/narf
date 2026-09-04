@@ -1,7 +1,8 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.3**. Steps 1, 2 and 3 are implemented; nothing is
-> enforced yet — step 4 is the flip. This records what exists, what is missing, and the order the
+> Status: **v0.4**. Steps 1–4 are implemented and MTE **is now
+> enforcing**, for the BPF arena and nothing else. Step 5 (reporting)
+> is deliberately not done — see "Why step 5 is not just a rename". This records what exists, what is missing, and the order the
 > missing pieces have to land in, because getting that order wrong hangs
 > the machine with no console.
 
@@ -99,13 +100,37 @@ Each step is separately verifiable and leaves the tree working.
      OR-ing into a field that is already all ones on a TTBR1 address, so
      every arena's tag was 15 — the value every untagged kernel pointer
      carries. Fixed separately; see "What step 3 found".
-  4. **Flip TCF inside the domain scope.** `enter_domain` sets Sync,
-     `exit_domain` restores. *Verify:* a deliberate tag mismatch inside
-     the scope faults synchronously and is reported, and the existing
-     arena smokes still pass.
-  5. **Report honestly.** Only once the above hold does `Mte` deserve to
-     be the reported enforcer. aarch64 reports `Unenforced` today, which
-     was done first because it is independent of all of this.
+  4. **Flip TCF inside the domain scope.** *Done.* `Mte::enter_domain`
+     sets `SCTLR_EL1.TCF` to Sync, `exit_domain` restores the saved
+     value, both followed by an `ISB`. Verified by
+     `smoke_bpf_arena_untagged_access_faults_in_scope`: an untagged
+     pointer into a tagged arena page faults inside the scope with
+     DFSC `0b010001` (Synchronous Tag Check Fault), while the tagged
+     pointer works inside it, the untagged pointer works outside it, and
+     TCF is back to Ignore after the scope exits.
+
+     The hazard the old no-op described — flip, fault, re-fault in the
+     handler, loop with no console — rested on treating tag checking as a
+     CPU-wide property. It is a property of the *page*: only
+     `ATTR_TAGGED` pages are checked, and only the arena's are mapped that
+     way, so the kernel stack, text, heap and page tables are unchecked
+     whatever TCF says. The blast radius is exactly the arena.
+
+     Two things had to be fixed first, neither of them in `enter_domain`:
+
+       * **The interpreter addressed the arena untagged.**
+         `ProgArena::resolve` returned `arena.kva() + off` and the
+         interpreter dereferences it from inside the scope. This is worse
+         than the JIT case: the EL1 abort handler's exception-table lookup
+         is keyed on `ELR_EL1` with no DFSC gate, so a tag fault in JIT'd
+         text recovers into the arena-fault epilogue and is *reported*,
+         while an interpreter fault has no entry, falls past
+         `probe::consume`, and is fatal. `resolve` now tags.
+       * **`write_sctlr_el1` issues no `ISB`**, only compiler fences. A
+         system-register write is not context-synchronising, so without one
+         the first accesses after the flip run under the old mode.
+  5. **Report honestly.** *Not done, and not a rename — see below.*
+     aarch64 reports `Unenforced` today.
 
 ## The addressing contract
 
@@ -218,3 +243,36 @@ two sites and both were wrong identically. `mte::with_tag`, `tag_of` and
   * **What a mismatch should do.** Sync faults give a precise address;
     async is cheaper. Sync is the right default for a first
     implementation.
+
+## Why step 5 is not just a rename
+
+Steps 1–4 hold, so on the original plan `Mte` would now be the reported
+enforcer. Reporting it would still overclaim, for a reason this document
+did not anticipate.
+
+The TCF flip is wired into `bpf::domain::enter` and nowhere else. Driver
+domains are entered through `modules::domain::enter`, which gates on
+`pks::is_active() || pcid::is_active()` — both false on aarch64 — so a
+kernel module's `init()` and `exit()` run with no domain confinement at
+all. What is enforced today is arena-vs-not-arena for BPF, which is what
+`Arena::tag`'s own documentation says the tag buys. It is not
+driver-domain isolation.
+
+An operator reading `domain enforcer: mte` concludes driver domains are
+isolated on aarch64. That is the same defect this document opens with,
+and the same one the x86 side fixed by reporting `Unenforced` rather than
+naming an enforcer that enforces nothing — reintroduced on the third
+architecture, one step before the finish line.
+
+So step 5 is a choice, not a mechanical edit:
+
+  * **Keep `Unenforced` and report the scope separately** — say that MTE
+    tag checking is active for the BPF arena and that no driver-domain
+    enforcer is wired. Accurate, small, and consistent with the x86 side.
+  * **Make the claim true**: extend the flip to `modules::domain::enter`
+    and report `Mte`. Larger, and it needs its own access audit — module
+    code touching any tagged page inside its scope would begin to fault,
+    and unlike the BPF paths there is no single chokepoint to tag.
+
+Either way the reported name has to match what is enforced, which is the
+one rule this document has been about from the start.

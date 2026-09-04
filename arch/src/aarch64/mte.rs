@@ -111,25 +111,50 @@ impl crate::DomainPrimitive for Mte {
 
     #[inline]
     unsafe fn enter_domain(_kernel_domain: u8, _driver_domain: u8) -> Self::SavedState {
-        // Stage-2 scope: structural save only.
+        // SAFETY: pure MRS of SCTLR_EL1/GCR_EL1 — legal at EL1 with ATA=1.
+        let saved = unsafe { Self::save() };
+        if !supported() {
+            return saved;
+        }
+        // Flip TCF Ignore -> Sync. This is the enforcement.
         //
-        // A real MTE "enter scope" would flip SCTLR_EL1.TCF from
-        // Ignore to Sync so tag mismatches fault, but that requires
-        // the kernel's live tag storage and tagged pointers to already
-        // be consistent — otherwise every memory access after the
-        // flip tag-faults, recurses into the fault handler (which
-        // also tag-faults), and we loop. Tag storage bring-up is a
-        // Stage-3 task that pairs with the MTE-tag-aware allocator.
+        // The reason this was a no-op for so long is real, and the reason it
+        // is safe now is narrow: **tag checks apply only to Tagged Normal
+        // memory**. A global flip with inconsistent tags faults on the next
+        // access, re-faults inside the handler, and loops with nothing on the
+        // console. But the only pages mapped `ATTR_TAGGED` are the BPF
+        // arena's, so the kernel stack, text, heap and page tables stay
+        // unchecked whatever TCF says. The blast radius is exactly the arena.
         //
-        // SAFETY: pure MRS of SCTLR_EL1 — always legal at EL1.
-        unsafe { Self::save() }
+        // What had to be true first, and now is: the arena's granules carry a
+        // tag that is not the untagged-kernel value (fixed in
+        // `bpf_arena` — the tag used to be OR-ed into an all-ones field and
+        // was therefore always 15), and both paths that reach arena bytes
+        // inside this scope address them with that tag — the JIT via
+        // `ArenaGroup::slot_base_tagged`, the interpreter via
+        // `ProgArena::resolve`. An untagged access to an arena page inside
+        // this scope now faults, which is the point.
+        //
+        // SAFETY: `supported()` holds, so TCF is implemented; ISB inside.
+        unsafe { set_tcf(TCF_SYNC) };
+        saved
     }
 
     #[inline]
     unsafe fn exit_domain(saved: Self::SavedState) {
-        // SAFETY: restore previous SCTLR_EL1.
+        // Restores the whole saved `SCTLR_EL1`, which puts TCF back to
+        // whatever it was on entry — Ignore for an outermost scope, Sync for a
+        // nested one. Unconditional even when `supported()` is false: the
+        // value written is the one just read, so a CPU without MTE restores
+        // itself to its own state rather than taking a second branch.
+        //
+        // SAFETY: restore previous SCTLR_EL1/GCR_EL1.
         unsafe {
             Self::restore(saved);
+            // Same context-synchronisation requirement as the flip in
+            // `enter_domain`: without it, accesses after the scope could still
+            // be checked under the scope's mode.
+            core::arch::asm!("isb", options(nostack, preserves_flags));
         }
     }
 }
@@ -190,6 +215,49 @@ pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
 /// # Safety
 /// `ptr` must point into writable memory backed by tag storage
 /// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
+/// `SCTLR_EL1.TCF` — Tag Check Fault mode for EL1, bits [41:40].
+pub const TCF_SHIFT: u32 = 40;
+/// Mask of the `SCTLR_EL1.TCF` field.
+pub const TCF_MASK: u64 = 0b11 << TCF_SHIFT;
+/// `TCF` = Ignore: tag mismatches are not reported. The boot default.
+pub const TCF_IGNORE: u64 = 0b00;
+/// `TCF` = Synchronous: a mismatch raises a Data Abort at the faulting
+/// instruction, so `FAR_EL1` and `ELR_EL1` name the access precisely.
+pub const TCF_SYNC: u64 = 0b01;
+
+/// The `TCF` mode currently programmed in `SCTLR_EL1`.
+///
+/// # Safety
+/// Reads `SCTLR_EL1`; always legal at EL1.
+#[inline]
+#[must_use]
+pub unsafe fn tcf_mode() -> u64 {
+    // SAFETY: MRS SCTLR_EL1 is always legal at EL1.
+    (unsafe { sysreg::read_sctlr_el1() } >> TCF_SHIFT) & 0b11
+}
+
+/// Set `SCTLR_EL1.TCF`, returning the previous whole `SCTLR_EL1`.
+///
+/// Followed by an `ISB`: `write_sctlr_el1` issues only compiler fences, and
+/// a system-register write does not affect subsequent instructions until
+/// context-synchronised. Without it the first accesses after the flip run
+/// under the old mode — which for the enter direction means unchecked
+/// accesses that were meant to be checked.
+///
+/// # Safety
+/// Caller must have established MTE is present (`supported()`); on a CPU
+/// without it the field is RES0 and the write is silently ineffective.
+#[inline]
+unsafe fn set_tcf(mode: u64) -> u64 {
+    // SAFETY: MRS/MSR SCTLR_EL1 at EL1.
+    unsafe {
+        let prev = sysreg::read_sctlr_el1();
+        sysreg::write_sctlr_el1((prev & !TCF_MASK) | ((mode & 0b11) << TCF_SHIFT));
+        asm!("isb", options(nostack, preserves_flags));
+        prev
+    }
+}
+
 /// Bit position of the MTE allocation tag within a pointer.
 pub const TAG_SHIFT: u32 = 56;
 

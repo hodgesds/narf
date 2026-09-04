@@ -1046,6 +1046,111 @@ fn smoke_bpf_arena_tagged_base_reaches_the_same_bytes() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("bpf", smoke_bpf_arena_tagged_base_reaches_the_same_bytes);
 
+/// The enforcement itself: inside a BPF domain scope, an *untagged* pointer
+/// into a tagged arena page takes a synchronous tag check fault, and the same
+/// access outside the scope does not.
+///
+/// Both halves matter. Without the in-scope fault, `SCTLR_EL1.TCF` is not
+/// actually reaching the CPU — the state this backend was in for its whole
+/// life, reporting `Mte` while checking nothing. Without the out-of-scope
+/// success, the test would pass just as well if tag checks were on
+/// permanently, which is a different (and much more dangerous) system than the
+/// one being built: enforcement is supposed to be scoped.
+#[cfg(target_arch = "aarch64")]
+fn smoke_bpf_arena_untagged_access_faults_in_scope() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::aarch64::{mte, probe};
+    use narf_memory::bpf_arena::Arena;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let cap = kernel_arena_cap();
+    let arena = match Arena::new(cap, 1) {
+        Ok(a) => a,
+        Err(_) => return TestResult::Fail("Arena::new failed"),
+    };
+    let page = match arena.populate(0) {
+        Ok(p) => p,
+        Err(_) => return TestResult::Fail("arena populate failed"),
+    };
+    if mte::tag_of(page.tagged_kva) == mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("arena tag is the untagged-kernel value; nothing could mismatch");
+    }
+
+    // Control 1: the untagged pointer is fine while TCF is Ignore. If this
+    // faults, the page is simply unmapped and the rest proves nothing.
+    // SAFETY: byte 0 of a page just populated and mapped RW at EL1.
+    let before = unsafe { core::ptr::read_volatile(page.kva as *const u64) };
+
+    // Control 2: the *tagged* pointer works inside the scope. This is the
+    // path the interpreter and JIT take, so a fault here is a real regression
+    // rather than the enforcement working.
+    let inside_tagged = {
+        let _confined = crate::domain::enter();
+        // SAFETY: same page, addressed with the tag its granules carry.
+        unsafe { core::ptr::read_volatile(page.tagged_kva as *const u64) }
+    };
+    if inside_tagged != before {
+        return TestResult::Fail("the tagged alias read a different value inside the scope");
+    }
+
+    // The enforcement: untagged pointer, in scope, expected to fault.
+    let caught = {
+        let _confined = crate::domain::enter();
+        // SAFETY: TCF must be Sync here or the whole scope is inert.
+        if unsafe { mte::tcf_mode() } != mte::TCF_SYNC {
+            return TestResult::Fail("entering a domain scope did not set TCF=Sync");
+        }
+        let recovery: u64;
+        // SAFETY: ADR of a local label, resolved forward into the block below.
+        unsafe {
+            asm!("adr {r}, 99f", r = out(reg) recovery, options(nostack, preserves_flags));
+        }
+        probe::arm(recovery);
+        // SAFETY: the load is expected to raise a synchronous tag check fault;
+        // the armed probe redirects ELR_EL1 to `99:` instead of taking the
+        // fatal path. If MTE checking is not implemented the load simply
+        // succeeds and the probe reports nothing, which fails below.
+        unsafe {
+            asm!(
+                "ldr {t}, [{p}]",
+                "99:",
+                p = in(reg) page.kva,
+                t = out(reg) _,
+                options(nostack),
+            );
+        }
+        probe::disarm()
+    };
+
+    if !caught.fired {
+        return TestResult::Fail("untagged access inside the scope did not fault");
+    }
+    // DFSC 0b010001 is a Synchronous Tag Check Fault. Checked rather than
+    // accepting any abort: a translation or permission fault here would mean
+    // the page is wrong, not that tag checking works.
+    const DFSC_TAG_CHECK: u64 = 0b01_0001;
+    if caught.esr & 0x3F != DFSC_TAG_CHECK {
+        return TestResult::Fail("the fault was not a synchronous tag check fault");
+    }
+
+    // Control 3: the same untagged access outside the scope still succeeds,
+    // so the scope is what enforces rather than the flip having leaked.
+    // SAFETY: as the first read.
+    let after = unsafe { core::ptr::read_volatile(page.kva as *const u64) };
+    if after != before {
+        return TestResult::Fail("the untagged read outside the scope changed value");
+    }
+    // SAFETY: MRS SCTLR_EL1.
+    if unsafe { mte::tcf_mode() } != mte::TCF_IGNORE {
+        return TestResult::Fail("TCF was left Sync after the scope exited");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("bpf", smoke_bpf_arena_untagged_access_faults_in_scope);
+
 /// A group holding more than one arena gets an untagged base.
 ///
 /// One tag per arena is forced by the addressing shape, so a multi-arena group
