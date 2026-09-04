@@ -647,11 +647,28 @@ unsafe fn set_alias_writable(_phys: u64, _len: u64, _writable: bool) -> Result<(
 
 // ── The poke window ────────────────────────────────────────────────────
 //
-// One 4 KiB scratch VA per CPU, carved out of the BPF text slot above the
-// 1 GiB `bpf_text` hands out packs from. The slot's top-level entry is already
-// present in every address space (`reserve_kernel_slots`, §4.1), so mapping
-// here needs no new PML4/L0 entry and is visible under whatever root is
-// current.
+// One 4 KiB scratch VA per CPU, in a top-level slot of its own. Its entry is
+// installed by `reserve_kernel_slots` (§4.1) alongside the BPF windows, so
+// mapping here needs no new PML4/L0 entry and is visible under whatever root
+// is current.
+//
+// It used to be carved out of the BPF text slot, immediately above the 1 GiB
+// `bpf_text` hands packs out of. That worked, but it made the text-patching
+// scratch space an undocumented tenant of a slot named for BPF — and once
+// `domain::confine_shared_slots` began removing that slot from domain clones
+// that do not own it, "the BPF slot" silently meant "and every CPU's poke
+// window too". Nothing depended on the coupling (patching runs at load/seal
+// time on a task CR3, never inside a domain guard), so this is not a bug fix;
+// it is making the layout say what it means, so the confinement table can
+// name one tenant per slot.
+//
+// The slot is 277, above the arena's upper guard, and NOT 274 — the first
+// apparently-free index above the text window. 274 and 276 are the arena's
+// guard slots: they are claimed by *absence*, kept permanently unmapped so a
+// runaway immediate displacement out of the arena cannot reach a mapped page
+// (`bpf_arena.rs`), and `smoke_bpf_text_extable_recovers_probe_fault` also
+// dereferences 274's base as an address nothing ever maps. Neither claim is
+// visible by grepping for slot constants; both are enforced by the suite.
 //
 // Per-CPU rather than one global scratch VA on purpose. A single shared VA
 // would need a cross-CPU shootdown on every teardown, because a peer that used
@@ -663,8 +680,37 @@ unsafe fn set_alias_writable(_phys: u64, _len: u64, _writable: bool) -> Result<(
 // Each slot is two pages apart so an off-by-one page never lands in a peer's
 // window; the odd page is never mapped.
 
-/// Base of the poke window: immediately above the pack region.
-const POKE_VA_BASE: u64 = crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::BPF_TEXT_USABLE;
+/// PML4 (x86_64) / L0 (aarch64) slot holding the poke window. Sits above the
+/// BPF arena's upper guard slot; see the layout note above for why the
+/// indices adjacent to the BPF windows are not free.
+pub const POKE_PML4_SLOT: usize = 277;
+
+/// Base of the poke window.
+const POKE_VA_BASE: u64 = 0xFFFF_8A80_0000_0000;
+
+// The base and the slot index have to agree, or `reserve_kernel_slots` would
+// install a table under one slot while `poke_va` handed out addresses that
+// walk through another — a fault on the first poke, at a point in boot where
+// diagnosing it is unpleasant.
+const _: () = assert!(
+    ((POKE_VA_BASE >> 39) & 0x1FF) as usize == POKE_PML4_SLOT,
+    "POKE_VA_BASE does not decode to POKE_PML4_SLOT"
+);
+
+// The poke slot must clear the BPF windows AND the arena's guard slots on
+// either side of it. Mapping a guard would not fault anything at boot — it
+// silently removes the property that makes an arena displacement escape
+// structurally impossible, which is why this is a build-time assertion and
+// not a comment.
+const _: () = assert!(
+    POKE_PML4_SLOT > crate::bpf_text::BPF_ARENA_PML4_SLOT + 1,
+    "the poke window must sit above the BPF arena's upper guard slot"
+);
+const _: () = assert!(
+    POKE_PML4_SLOT != crate::bpf_text::BPF_TEXT_PML4_SLOT
+        && POKE_PML4_SLOT != crate::bpf_text::BPF_TEXT_PML4_SLOT + 1,
+    "the poke window must not take the BPF text slot or the guard above it"
+);
 
 /// Scratch VA owned by `cpu`.
 fn poke_va(cpu: usize) -> u64 {
@@ -1123,6 +1169,67 @@ fn smoke_text_poke_protect_round_trip() -> TestResult {
 #[cfg(target_arch = "aarch64")]
 kernel_test_in!("memory", smoke_text_poke_protect_round_trip);
 
+/// The poke window lands in its own top-level slot, clear of the BPF windows
+/// and — the part that actually bit — clear of the arena's guard slots.
+///
+/// A kernel test rather than a `#[cfg(test)]` unit test because this crate is
+/// built for bare-metal targets and `cargo xtask host-test` never compiles it:
+/// anything in the `mod tests` below is documentation, not coverage. The
+/// `const` assertions next to `POKE_VA_BASE` are the build-time half of this;
+/// this is the half that runs on the machine the addresses are used on.
+fn smoke_poke_window_slot_placement() -> TestResult {
+    use crate::bpf_text::{
+        BPF_ARENA_BASE, BPF_ARENA_PML4_SLOT, BPF_TEXT_BASE, BPF_TEXT_PML4_SLOT, SLOT_SPAN,
+    };
+
+    let last = poke_va(narf_lib::percpu::MAX_CPUS - 1);
+    if last < POKE_VA_BASE {
+        return TestResult::Fail("poke_va went below the window base");
+    }
+    if last >= POKE_VA_BASE + SLOT_SPAN {
+        return TestResult::Fail("the per-CPU windows overflow their slot");
+    }
+    if ((last >> 39) & 0x1FF) as usize != POKE_PML4_SLOT {
+        return TestResult::Fail("the far window decodes to the wrong slot");
+    }
+
+    // Guards are claimed by absence, so name them explicitly: the slots either
+    // side of the arena must stay unmapped for its displacement-escape
+    // property to hold.
+    for occupied in [
+        BPF_TEXT_PML4_SLOT,
+        BPF_TEXT_PML4_SLOT + 1,
+        BPF_ARENA_PML4_SLOT,
+        BPF_ARENA_PML4_SLOT + 1,
+    ] {
+        if POKE_PML4_SLOT == occupied {
+            return TestResult::Fail("the poke slot took a BPF window or an arena guard");
+        }
+    }
+
+    // And the same check against the window bases, in case a slot constant and
+    // its base ever disagree.
+    for base in [BPF_TEXT_BASE, BPF_ARENA_BASE] {
+        if last >= base && last < base + SLOT_SPAN {
+            return TestResult::Fail("a poke window landed inside a BPF window");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_poke_window_slot_placement);
+
+/// Per-CPU windows stay two pages apart, so an off-by-one page never lands in
+/// a peer's slot and a local INVLPG remains sufficient.
+fn smoke_poke_windows_do_not_collide() -> TestResult {
+    for cpu in 1..narf_lib::percpu::MAX_CPUS {
+        if poke_va(cpu) < poke_va(cpu - 1) + 2 * FOUR_KB {
+            return TestResult::Fail("two CPUs' poke windows are less than two pages apart");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_poke_windows_do_not_collide);
+
 /// aarch64 twin of the reachability half. There is no fault probe on this
 /// arch, so the teardown half is not checkable here; what is checkable is that
 /// the copy lands where it was asked to and nowhere else.
@@ -1173,15 +1280,6 @@ kernel_test_in!("memory", smoke_text_poke_window_reaches_the_frame);
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn poke_window_sits_above_the_pack_region() {
-        // A poke slot that overlapped the pack region would map a scratch
-        // frame on top of live JIT text. POKE_VA_BASE is defined at the exact
-        // end of that region; this test checks the far endpoint.
-        let last = poke_va(narf_lib::percpu::MAX_CPUS - 1);
-        assert!(last < crate::bpf_text::BPF_TEXT_BASE + crate::bpf_text::SLOT_SPAN);
-    }
 
     #[test]
     fn poke_slots_do_not_collide() {

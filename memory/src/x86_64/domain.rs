@@ -249,3 +249,144 @@ pub fn cross_domain_slot_present(inspector: u8, target_domain: u8) -> Option<boo
     let pml4 = unsafe { &*PhysAddr::new(pml4_phys).kernel_ptr::<PageTable>() };
     Some(pml4.entries[PRIVATE_PML4_BASE + target_domain as usize].is_present())
 }
+
+// ---------------------------------------------------------------------------
+// Confining shared upper-half slots
+// ---------------------------------------------------------------------------
+//
+// `init_per_domain_pdpts` above confines slots 256..=271: domain D's slot is
+// present only in D's own clone. Everything else in PML4[256..511] is copied
+// BY VALUE by `new_user_pml4_on` and is therefore present, and permitted, in
+// all sixteen clones. For most of that range that is exactly right — the frame
+// allocator, the IDT and the kernel heap have to be reachable from whatever
+// CR3 is current.
+//
+// It is not right for BPF. `bpf_text::reserve_kernel_slots` deliberately runs
+// BEFORE the clones are built (see the ordering comment at its call site in
+// `bare_main`) so that the BPF PML4 entries are captured by the snapshot,
+// which leaves JIT'd text, the per-program stacks and the arena reachable from
+// every domain. Under the PKS backend those same regions are confined by their
+// PTE keys; PCID has no per-page equivalent, so the confinement has to happen
+// at the only granularity PCID has — PML4 slot presence.
+//
+// The policy is a table rather than an open-coded check in the boot path
+// because the same "which domains may see this region" question is answered
+// independently by PKS (via `PtFlags::pk`) and by PCID (via slot presence).
+// Two mechanisms, one intent: keeping the PCID half declarative at least makes
+// the drift visible in one place instead of spread across a boot sequence.
+//
+// Why FRAME keeps them: FRAME is the TCB. The loader, the JIT and the verifier
+// run on a task CR3 or under domain 0 and write BPF text before it is sealed;
+// removing the slots from FRAME's clone would break loading, not harden it.
+// Why BPF keeps them: `bpf::domain::enter` switches CR3 to the BPF clone
+// around every program run (`bpf/src/prog.rs`), so that is the CR3 that must
+// have the regions mapped.
+//
+// This deliberately does NOT touch task address spaces. They snapshot the same
+// range, and the boot-path comment warns that a task CR3 holding a zero BPF
+// entry triple-faults on the first BPF access. Kernel-side BPF work — map
+// updates from syscalls, JIT writes, perf ring reads — runs on a task CR3 and
+// must keep working. Only the sixteen domain clones are narrowed.
+
+/// One confined shared slot: a PML4 slot that lives outside the private
+/// range but must still be restricted to a named set of domains.
+#[derive(Debug)]
+pub struct ConfinedSlot {
+    /// The upper-half PML4 slot index.
+    pub slot: usize,
+    /// Domains whose clone keeps the entry. Every other clone gets a zero.
+    pub owners: &'static [u8],
+}
+
+/// The confined shared slots. Both BPF windows are owned by `FRAME` (the
+/// TCB, which loads and JITs) and `BPF` (the CR3 that is current while a
+/// program runs).
+///
+/// Each slot here has exactly one tenant, which is what makes the table
+/// reviewable: `text_poke`'s per-CPU scratch windows used to live inside
+/// `BPF_TEXT_PML4_SLOT` and were moved to `text_poke::POKE_PML4_SLOT` so
+/// that confining a slot named for BPF does not silently also confine the
+/// kernel's text-patching window. Anything added here later should get the
+/// same treatment: confine a slot only when its whole span belongs to the
+/// domains listed.
+pub const CONFINED_SLOTS: &[ConfinedSlot] = &[
+    ConfinedSlot {
+        slot: crate::bpf_text::BPF_TEXT_PML4_SLOT,
+        owners: &[0, 14], // DomainId::FRAME, DomainId::BPF
+    },
+    ConfinedSlot {
+        slot: crate::bpf_text::BPF_ARENA_PML4_SLOT,
+        owners: &[0, 14],
+    },
+];
+
+/// Does `domain`'s clone keep the entry at `slot`?
+///
+/// True for every slot the table does not mention, which is the whole point:
+/// the default stays "shared", and confinement is opt-in per slot.
+pub const fn clone_keeps_slot(domain: u8, slot: usize) -> bool {
+    let mut i = 0;
+    while i < CONFINED_SLOTS.len() {
+        let c = &CONFINED_SLOTS[i];
+        if c.slot == slot {
+            let mut j = 0;
+            while j < c.owners.len() {
+                if c.owners[j] == domain {
+                    return true;
+                }
+                j += 1;
+            }
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Apply [`CONFINED_SLOTS`] to every registered domain clone, zeroing each
+/// entry the policy does not grant. Returns the number of entries cleared.
+///
+/// Idempotent: a slot already zero stays zero and is not counted twice.
+///
+/// # Safety
+/// `pcid::set_domain_pml4` must have registered the clones, and this must
+/// run on the BSP before any CPU can switch to a clone.
+pub unsafe fn confine_shared_slots() -> u32 {
+    let mut cleared = 0u32;
+    for domain in 0..NUM_DOMAINS {
+        let pml4_phys = pcid::get_domain_pml4(domain);
+        if pml4_phys == 0 {
+            continue;
+        }
+        // SAFETY: the PML4 page is reached through the direct map.
+        let pml4 = unsafe { &mut *PhysAddr::new(pml4_phys).kernel_mut_ptr::<PageTable>() };
+        for c in CONFINED_SLOTS {
+            if clone_keeps_slot(domain, c.slot) {
+                continue;
+            }
+            if pml4.entries[c.slot].is_present() {
+                pml4.entries[c.slot] = PageTableEntry::EMPTY;
+                cleared += 1;
+            }
+        }
+    }
+    cleared
+}
+
+/// Is the entry at `slot` present in `inspector`'s clone? `None` when
+/// `inspector` is out of range or has no registered PML4.
+///
+/// The sibling of [`cross_domain_slot_present`] for slots outside the
+/// private range; the kernel test uses it to assert the policy landed.
+pub fn shared_slot_present(inspector: u8, slot: usize) -> Option<bool> {
+    if inspector >= NUM_DOMAINS || slot >= 512 {
+        return None;
+    }
+    let pml4_phys = pcid::get_domain_pml4(inspector);
+    if pml4_phys == 0 {
+        return None;
+    }
+    // SAFETY: pml4_phys reached through the direct map; read-only.
+    let pml4 = unsafe { &*PhysAddr::new(pml4_phys).kernel_ptr::<PageTable>() };
+    Some(pml4.entries[slot].is_present())
+}

@@ -38,8 +38,138 @@ On AMD x86_64 today, the PCID backend is wired end-to-end:
 A cross-domain access to a private VA hits a not-present PML4E and
 `#PF`s at the very first level of the walk — hardware-enforced, no
 software check. Domain crossings cost ~50–100 cycles for the `MOV CR3`
-(vs the ~tens-of-cycles `WRMSR` cost on PKS); same correctness,
-different throughput class.
+(vs the ~tens-of-cycles `WRMSR` cost on PKS).
+
+## What the two backends do and do not cover
+
+They are not interchangeable, and this section exists because an earlier
+version of it said "same correctness, different throughput class". The
+throughput claim is right; the correctness one is not.
+
+**Neither backend confines a domain from ordinary kernel memory.** PKS
+`enter_domain(FRAME, D)` denies all sixteen keys and then re-allows two —
+but `FRAME` is domain 0, and key 0 is what every untagged page carries,
+so all untagged kernel memory stays readable and writable. PCID's clones
+share every mapping outside the private slots for the same practical
+effect. What both provide is *cross-domain* isolation: keeping domain A
+out of domain B's resources.
+
+**They cover different sets of resources, and that is the real
+difference.**
+
+  * **PKS protection is page-granular and follows the page.** Any leaf
+    can carry `PtFlags::pk(D)`, wherever it is mapped, and `IA32_PKRS`
+    denies it to every domain but the two allowed. `bpf_stack` does
+    exactly this: its pages are tagged `pk(BPF)`, so no other domain may
+    touch the BPF stack.
+  * **PCID protection is PML4-slot-granular and covers only slot
+    256+D.** The per-domain PML4s are byte-clones and `PML4[256..511]`
+    is copied *by value*, so anything mapped outside the private slot is
+    present and permitted in every domain's clone.
+
+That gap is not hypothetical. BPF's own regions sit outside the private
+range on purpose — `BPF_TEXT_PML4_SLOT` is 273, `BPF_ARENA_PML4_SLOT` is
+275, and the BPF stack is `BPF_TEXT_BASE + 2 GiB`, so also slot 273. All
+three are cross-domain protected under PKS, by their keys, and reachable
+from every domain under PCID. `bpf_stack::map_stack_page` shows the seam
+directly: it ORs in `pk(BPF)` only `if pks::is_active()`, because a PTE
+key means nothing to the PCID backend, and there is no PCID equivalent
+to reach for.
+
+The exposure is asymmetric. `bpf_text::seal_mapping` rewrites the pack's
+leaves to drop `WRITABLE` once a pack is published, independently of the
+domain backend, so a foreign domain can *read* JIT'd text but not modify
+it — W^X closes that vector, not the enforcer. The stack and the arena
+stay read/write.
+
+**This is now closed under PCID.** `domain::confine_shared_slots` runs
+after the clones are built and zeroes each confined slot in the clones
+that do not own it, driven by the `CONFINED_SLOTS` table:
+
+| Slot | Contents | Owners |
+|---|---|---|
+| `BPF_TEXT_PML4_SLOT` (273) | JIT'd packs, program stacks | `FRAME`, `BPF` |
+| `BPF_ARENA_PML4_SLOT` (275) | arenas | `FRAME`, `BPF` |
+
+`FRAME` keeps them because it is the TCB: the loader, JIT and verifier
+write text before it is sealed, and removing the slots there would break
+loading rather than harden it. `BPF` keeps them because
+`bpf::domain::enter` switches CR3 to the BPF clone around every program
+run, so that is the CR3 that must have the regions mapped.
+
+The policy is a table and not an open-coded check because the same
+"which domains may see this region" question is answered independently
+by PKS (`PtFlags::pk`) and PCID (slot presence). Two mechanisms, one
+intent; keeping the PCID half declarative puts the drift in one place.
+
+**It deliberately does not touch task address spaces.** Those snapshot
+the same range, and `reserve_kernel_slots` is sequenced before the first
+`new_user_pml4` precisely so they capture the BPF entries — the boot-path
+comment warns that a task CR3 holding a zero BPF entry triple-faults on
+the first BPF access. Kernel-side BPF work (map updates from syscalls,
+JIT writes, perf ring reads) runs on a task CR3 and is unaffected. Only
+the sixteen domain clones are narrowed.
+
+### The access graph this rests on
+
+Confinement is safe only if nothing running inside a driver-domain guard
+legitimately needs those regions. That graph is small enough to state in
+full:
+
+  * Driver domains are entered at exactly two sites, both in
+    `modules/src/loader.rs`: around a module's `init()` and its `exit()`.
+  * The kernel ABI a module may call is the `kernel_abi!` table in
+    `modules/src/kabi.rs` — `narf_printk`, `narf_kmalloc`, `narf_kfree`,
+    `narf_monotonic_ns`. None reach slots 273 or 275, and `register_all`
+    is the only path that populates KSYMTAB.
+  * A module's own image is at `MODULE_VA_BASE` (slot 511), so narrowing
+    273/275 does not unmap the code that is running.
+  * BPF firing from a tracepoint while a guard is held nests a crossing
+    into the BPF clone, where the regions are mapped.
+
+Slot 273 used to have a second tenant: `text_poke`'s per-CPU scratch
+windows sat at `BPF_TEXT_BASE + BPF_TEXT_USABLE`, inside the same 512-GiB
+slot. Confining 273 would therefore have quietly removed the kernel's
+text-patching window from driver clones as well. Nothing depended on it —
+patching runs at load/seal time on a task CR3, never inside a guard — so
+this was a latent trap rather than a live bug: the first person to patch
+text from module init would have taken a fault with nothing in the source
+connecting "BPF slot" to "poke window".
+
+The window now has its own slot, `text_poke::POKE_PML4_SLOT` (277),
+reserved by `reserve_kernel_slots` alongside the BPF windows because it
+has the same requirement — a top-level entry present in every address
+space before the first poke.
+
+It is 277 and not 274, the first index that looks free above the text
+window. Slots 274 and 276 are the arena's guard slots, claimed by
+*absence*: they are kept permanently unmapped so that a runaway immediate
+displacement out of the arena cannot reach a mapped page, and
+`smoke_bpf_text_extable_recovers_probe_fault` separately dereferences
+274's base as an address nothing maps. Neither claim is visible by
+grepping for slot constants — the first attempt at this move did take 274,
+and the suite caught it on both architectures.
+
+That is now pinned rather than remembered: `const` assertions tie
+`POKE_VA_BASE` to its slot index and require the slot to sit above the
+arena's upper guard, and `reserve_kernel_slots` re-checks it against both
+windows and both guards on the boot path.
+
+Every slot in the table above now has exactly one tenant, which is the
+property that makes it reviewable. Anything added later should hold to it:
+confine a slot only when its whole span belongs to the domains listed.
+
+### What is verified and what is not
+
+The policy is covered by `smoke_pcid_confined_slot_policy`, which is
+ungated and runs everywhere. The structural assertion that it landed in
+the clones, `smoke_pcid_confined_slots_applied`, gates on
+`pcid::is_active()` and therefore **skips on every runner available
+today**: QEMU's TCG does not implement PCID even under `-cpu max,+pcid`,
+and the development host's KVM reports `CPUID(1).ECX[17] = 0`. The PCID
+enforcement path has never executed on hardware we have. Treat the
+confinement as reviewed and unexercised until a PCID-capable runner
+exists.
 
 The aarch64 ASID-PT fallback for non-MTE silicon is conceptually
 identical to PCID and is the planned analog. Today, aarch64 boot

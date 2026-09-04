@@ -678,6 +678,78 @@ fn smoke_pcid_domain_private_slots_isolated() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_pcid_domain_private_slots_isolated);
 
+/// The confined-slot policy itself, independent of whether any clone was
+/// ever built. This one is deliberately NOT gated on `pcid::is_active()`:
+/// the structural assertions below can only run on PCID silicon, which no
+/// CI runner has today, so without an ungated test of the policy the whole
+/// mechanism would be unexercised everywhere.
+#[cfg(target_arch = "x86_64")]
+fn smoke_pcid_confined_slot_policy() -> TestResult {
+    use crate::bpf_text::{BPF_ARENA_PML4_SLOT, BPF_TEXT_PML4_SLOT};
+    use crate::domain::clone_keeps_slot;
+    use narf_lib::id::DomainId;
+
+    let frame = DomainId::FRAME.raw();
+    let bpf = DomainId::BPF.raw();
+
+    for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+        if !clone_keeps_slot(frame, slot) {
+            return TestResult::Fail("FRAME must keep the BPF slots: it loads and JITs");
+        }
+        if !clone_keeps_slot(bpf, slot) {
+            return TestResult::Fail("BPF must keep its own slots: its clone is CR3 during a run");
+        }
+        for d in 0u8..16 {
+            if d == frame || d == bpf {
+                continue;
+            }
+            if clone_keeps_slot(d, slot) {
+                return TestResult::Fail("a non-owner domain keeps a confined BPF slot");
+            }
+        }
+    }
+
+    // Unlisted slots default to shared for every domain -- the kernel heap,
+    // IDT and frame allocator have to stay reachable from any CR3.
+    for d in 0u8..16 {
+        if !clone_keeps_slot(d, crate::vmalloc::KERNEL_PML4_SLOT) {
+            return TestResult::Fail("an unlisted slot was confined");
+        }
+        if !clone_keeps_slot(d, 511) {
+            return TestResult::Fail("the kernel image slot was confined");
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_pcid_confined_slot_policy);
+
+/// The policy actually landed in the clones. Needs real PCID silicon.
+#[cfg(target_arch = "x86_64")]
+fn smoke_pcid_confined_slots_applied() -> TestResult {
+    use crate::bpf_text::{BPF_ARENA_PML4_SLOT, BPF_TEXT_PML4_SLOT};
+    use crate::domain::{clone_keeps_slot, shared_slot_present};
+    use narf_arch::x86_64::pcid;
+
+    if !pcid::is_active() {
+        return TestResult::Skip("PCID enforcer not active (PKS-class CPU)");
+    }
+
+    for slot in [BPF_TEXT_PML4_SLOT, BPF_ARENA_PML4_SLOT] {
+        for d in 0u8..16 {
+            match (shared_slot_present(d, slot), clone_keeps_slot(d, slot)) {
+                (Some(true), true) | (Some(false), false) => {}
+                (Some(true), false) => return TestResult::Fail("confined slot still present"),
+                (Some(false), true) => return TestResult::Fail("owner lost its BPF slot"),
+                (None, _) => return TestResult::Fail("PML4 not registered"),
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_pcid_confined_slots_applied);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_pcid_domain_private_va_layout() -> TestResult {
     use crate::domain;
