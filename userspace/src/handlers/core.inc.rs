@@ -7913,7 +7913,7 @@ pub fn signal_pending_bits(task: u64) -> u64 {
 
 /// AND-out the given signal bits from `task`'s pending set.
 pub(crate) fn clear_pending_signal_bits(task: u64, mask: u64) {
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| *slot &= !mask);
+    let _ = pending_signal_bits_update_existing(task, |slot| *slot &= !mask);
 }
 
 /// WIFSTOPPED-shaped wstatus carrying `sig` as WSTOPSIG.
@@ -7951,7 +7951,7 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
         }
     }
     // Linux notifies the parent with SIGCHLD on stop/continue too.
-    let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(17));
+    let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(17));
     crate::user_task::wake_wait_child(parent);
 }
 
@@ -8864,7 +8864,7 @@ fn release_task_tables(tid: u64) {
     // cannot outlive the task that was given it.
     narf_memory::wx::revoke_jit(tid);
     // Signal state.
-    signal_bits_remove(&SIGNAL_PENDING, tid);
+    pending_signal_bits_remove(tid);
     signal_bits_remove(&SIGNAL_READABLE_GEN, tid);
     signal_bits_remove(&SIGNAL_RAISE_GEN, tid);
     signal_bits_remove(&SIGNAL_MASK, tid);
@@ -9603,7 +9603,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // Linux: kernel/signal.c::do_notify_parent sets SIGCHLD pending.
     // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
     const SIGCHLD: u32 = 17;
-    let _ = signal_bits_update(&SIGNAL_PENDING, parent, |slot| *slot |= sig_bit(SIGCHLD));
+    let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(SIGCHLD));
     // Record which child, in the PARENT's namespace, so the parent's signalfd
     // (systemd PID 1's manager_dispatch_signal_fd) and SA_SIGINFO SIGCHLD
     // handler name the child rather than reading si_pid == 0. Linux

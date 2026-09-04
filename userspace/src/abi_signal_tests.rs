@@ -52,6 +52,45 @@ fn smoke_abi_signal_kill_null_signal() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_kill_null_signal);
 
+fn smoke_abi_signal_pending_task_count_tracks_transitions() -> TestResult {
+    with_setup(|| {
+        const OTHER_TASK: u64 = FAKE_TASK + 1;
+        if crate::handlers::__test_pending_signal_task_count() != 0 {
+            return Err("pending-task count was not reset");
+        }
+
+        crate::handlers::raise_signal_pending(FAKE_TASK, 10);
+        crate::handlers::raise_signal_pending(FAKE_TASK, 10); // coalesced
+        crate::handlers::raise_signal_pending(FAKE_TASK, 12);
+        if crate::handlers::__test_pending_signal_task_count() != 1 {
+            return Err("one task with multiple pending signals was counted more than once");
+        }
+
+        crate::handlers::raise_signal_pending(OTHER_TASK, 10);
+        if crate::handlers::__test_pending_signal_task_count() != 2 {
+            return Err("second pending task did not advance the count");
+        }
+
+        crate::handlers::clear_signal_pending(FAKE_TASK, 10);
+        if crate::handlers::__test_pending_signal_task_count() != 2 {
+            return Err("partially clearing a pending bitmap decremented the task count");
+        }
+        crate::handlers::clear_signal_pending(FAKE_TASK, 12);
+        if crate::handlers::__test_pending_signal_task_count() != 1 {
+            return Err("clearing the final bit did not decrement the task count");
+        }
+        crate::handlers::clear_signal_pending(OTHER_TASK, 10);
+        if crate::handlers::__test_pending_signal_task_count() != 0 {
+            return Err("pending-task count did not return to zero");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_pending_task_count_tracks_transitions
+);
+
 /// The per-task raise generation (SIGNAL_RAISE_GEN) advances on EVERY signal
 /// raise — including a second signal arriving while a first is still pending
 /// (NOT the empty->non-empty transition that SIGNAL_READABLE_GEN tracks). This
