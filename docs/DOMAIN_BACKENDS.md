@@ -38,8 +38,47 @@ On AMD x86_64 today, the PCID backend is wired end-to-end:
 A cross-domain access to a private VA hits a not-present PML4E and
 `#PF`s at the very first level of the walk — hardware-enforced, no
 software check. Domain crossings cost ~50–100 cycles for the `MOV CR3`
-(vs the ~tens-of-cycles `WRMSR` cost on PKS); same correctness,
-different throughput class.
+(vs the ~tens-of-cycles `WRMSR` cost on PKS).
+
+## What the two backends do and do not cover
+
+They are not interchangeable, and this section exists because an earlier
+version of it said "same correctness, different throughput class". The
+throughput claim is right; the correctness one is not.
+
+**Neither backend confines a domain from ordinary kernel memory.** PKS
+`enter_domain(FRAME, D)` denies all sixteen keys and then re-allows two —
+but `FRAME` is domain 0, and key 0 is what every untagged page carries,
+so all untagged kernel memory stays readable and writable. PCID's clones
+share every mapping outside the private slots for the same practical
+effect. What both provide is *cross-domain* isolation: keeping domain A
+out of domain B's resources.
+
+**They cover different sets of resources, and that is the real
+difference.**
+
+  * **PKS protection is page-granular and follows the page.** Any leaf
+    can carry `PtFlags::pk(D)`, wherever it is mapped, and `IA32_PKRS`
+    denies it to every domain but the two allowed. `bpf_stack` does
+    exactly this: its pages are tagged `pk(BPF)`, so no other domain may
+    touch the BPF stack.
+  * **PCID protection is PML4-slot-granular and covers only slot
+    256+D.** The per-domain PML4s are byte-clones and `PML4[256..511]`
+    is copied *by value*, so anything mapped outside the private slot is
+    present and permitted in every domain's clone.
+
+That gap is not hypothetical. BPF's own regions sit outside the private
+range on purpose — `BPF_TEXT_PML4_SLOT` is 273, `BPF_ARENA_PML4_SLOT` is
+275, and the BPF stack is `BPF_TEXT_BASE + 2 GiB`, so also slot 273. All
+three are cross-domain protected under PKS, by their keys, and reachable
+from every domain under PCID. `bpf_stack::map_stack_page` shows the seam
+directly: it ORs in `pk(BPF)` only `if pks::is_active()`, because a PTE
+key means nothing to the PCID backend, and there is no PCID equivalent
+to reach for.
+
+Closing it would mean either mapping those regions inside each domain's
+private slot, or accepting that PCID's isolation stops at the private
+range and saying so at the boundary. Not decided.
 
 The aarch64 ASID-PT fallback for non-MTE silicon is conceptually
 identical to PCID and is the planned analog. Today, aarch64 boot
