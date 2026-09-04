@@ -1133,19 +1133,29 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
         // Domain-enforcer selection.
         //
-        // Neither arm can enforce today, so neither may claim to.
-        // `Mte::enter_domain` is a structural no-op: it saves SCTLR_EL1 and
-        // GCR_EL1 and never flips SCTLR_EL1.TCF from Ignore to Sync, so a tag
-        // mismatch never faults. Nothing in the tree writes TCF at all. And
-        // the no-MTE arm selected `Pcid`, which on aarch64 is not a backend —
-        // the ASID-tagged fallback it named is unimplemented, so it reported
-        // an intent as though it were a mechanism.
+        // Still `Unenforced`, and deliberately so even though MTE now
+        // enforces something. `Mte::enter_domain` does flip SCTLR_EL1.TCF to
+        // Sync (step 4 of `arch/specification/mte-enforcement.md`), so an
+        // untagged pointer into a tagged BPF arena page faults synchronously.
+        // But that flip is wired into `bpf::domain::enter` and nowhere else.
+        // Driver domains are entered through `modules::domain::enter`, which
+        // gates on PKS or PCID — both false on aarch64 — so a module's
+        // `init()` and `exit()` run with no confinement at all.
         //
-        // Reporting `Unenforced` is the same correction the x86 side made
-        // when PCID was selected with CR4.PCIDE clear: naming an enforcer
-        // that enforces nothing reads as protection in a boot log and in
-        // every `effective_backend()` caller. The path to a real MTE backend
-        // is scoped in `arch/specification/mte-enforcement.md`.
+        // So what is enforced is arena-vs-not-arena for BPF, not driver-domain
+        // isolation, and `DomainBackend::Mte` would claim the latter. An
+        // operator reading `domain enforcer: mte` concludes their driver
+        // domains are isolated. That is the same defect the x86 side corrected
+        // when PCID was selected with CR4.PCIDE clear, and the earlier aarch64
+        // arm made twice over: naming an enforcer that enforces less than its
+        // name implies, which reads as protection in a boot log and in every
+        // `effective_backend()` caller.
+        //
+        // The banner reports the scope instead. "No driver-domain enforcer"
+        // and "MTE is checking the arena" are both true, and a reader needs
+        // both: the first is what they must not rely on, the second is what
+        // would otherwise look like dead configuration when they see
+        // `mte=on` in the feature line directly above.
         //
         // ID_AA64PFR1_EL1.MTE is a 4-bit field: 0=none, 1=instructions only,
         // 2=memory tagging supported, 3+=advanced. The distinction is kept in
@@ -1155,8 +1165,17 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
         if feats.mte >= 2 {
             let _ = writeln!(
                 console::Writer,
-                "  domain enforcer: NONE — MTE present but tag checking is \
-                 not enabled; driver domains are NOT isolated"
+                "  domain enforcer: NONE — driver domains are NOT isolated \
+                 (no enforcer is wired into module domain entry)"
+            );
+            // Separate line rather than a clause: this is a statement about a
+            // different scope, and folding it into the one above invites
+            // reading it as a qualifier on "NOT isolated".
+            let _ = writeln!(
+                console::Writer,
+                "  mte: tag checking ACTIVE for the BPF arena — \
+                 SCTLR_EL1.TCF=Sync inside bpf::domain scopes; an untagged \
+                 pointer into an arena page faults there"
             );
         } else {
             let _ = writeln!(

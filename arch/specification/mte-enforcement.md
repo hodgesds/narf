@@ -1,8 +1,9 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.4**. Steps 1–4 are implemented and MTE **is now
-> enforcing**, for the BPF arena and nothing else. Step 5 (reporting)
-> is deliberately not done — see "Why step 5 is not just a rename". This records what exists, what is missing, and the order the
+> Status: **v0.5**. Steps 1–5 are implemented. MTE **is enforcing**, for
+> the BPF arena and nothing else, and the boot report says exactly that:
+> the backend stays `Unenforced` and the arena's tag checking is reported
+> on its own line. This records what exists, what is missing, and the order the
 > missing pieces have to land in, because getting that order wrong hangs
 > the machine with no console.
 
@@ -129,8 +130,14 @@ Each step is separately verifiable and leaves the tree working.
        * **`write_sctlr_el1` issues no `ISB`**, only compiler fences. A
          system-register write is not context-synchronising, so without one
          the first accesses after the flip run under the old mode.
-  5. **Report honestly.** *Not done, and not a rename — see below.*
-     aarch64 reports `Unenforced` today.
+  5. **Report honestly.** *Done — as a scope line, not a rename; see
+     below.* The backend stays `DomainBackend::Unenforced`, because no
+     enforcer is wired into module domain entry, and boot prints a second
+     line stating that MTE tag checking is active for the BPF arena.
+     Verified by `smoke_aarch64_report_matches_enforcement`, which asserts
+     both halves: the report is `Unenforced`, and — on a CPU with MTE —
+     `enter_domain` really does set TCF=Sync and `exit_domain` restores
+     it.
 
 ## The addressing contract
 
@@ -264,15 +271,24 @@ and the same one the x86 side fixed by reporting `Unenforced` rather than
 naming an enforcer that enforces nothing — reintroduced on the third
 architecture, one step before the finish line.
 
-So step 5 is a choice, not a mechanical edit:
+**Resolved: keep `Unenforced`, report the scope.** Boot prints two lines
+— that driver domains are not isolated because no enforcer is wired into
+module domain entry, and that MTE tag checking is active for the BPF
+arena. They are separate lines rather than one sentence because they
+describe different scopes, and folding them together invites reading the
+second as a qualifier on the first. A reader needs both: the first is what
+they must not rely on, and without the second the `mte=on` in the feature
+line directly above looks like dead configuration.
 
-  * **Keep `Unenforced` and report the scope separately** — say that MTE
-    tag checking is active for the BPF arena and that no driver-domain
-    enforcer is wired. Accurate, small, and consistent with the x86 side.
-  * **Make the claim true**: extend the flip to `modules::domain::enter`
-    and report `Mte`. Larger, and it needs its own access audit — module
-    code touching any tagged page inside its scope would begin to fault,
-    and unlike the BPF paths there is no single chokepoint to tag.
+The alternative — extend the flip to `modules::domain::enter` and report
+`Mte` — remains open. It needs its own access audit: module code touching
+any tagged page inside its scope would begin to fault, and unlike BPF
+there is no single chokepoint to tag, which is the same "cooperation from
+the allocator" problem listed under Traps.
 
-Either way the reported name has to match what is enforced, which is the
-one rule this document has been about from the start.
+`smoke_aarch64_report_matches_enforcement` now pins the rule this document
+has been about from the start — the reported name matches what is enforced
+— and it is the first test in the tree to assert anything about
+`effective_backend()` at all. That absence is why the mistake was made
+three times: PCID selected with `CR4.PCIDE` clear, PKS and PCID documented
+as equivalent, and this arm naming an enforcer twice over.
