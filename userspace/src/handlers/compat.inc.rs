@@ -2931,6 +2931,10 @@ type SignalBitsTable = [SignalBitsBucket; SIGNAL_TABLE_BUCKETS];
 
 pub(crate) static SIGNAL_PENDING: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
+/// Number of tasks whose pending bitmap is non-zero. Syscall return uses this
+/// as an exact global inactive gate before resolving the current task and
+/// taking its signal-table shard lock.
+static SIGNAL_PENDING_TASKS: AtomicUsize = AtomicUsize::new(0);
 static SIGNAL_READABLE_GEN: SignalBitsTable =
     [const { SignalBitsBucket::new() }; SIGNAL_TABLE_BUCKETS];
 /// Per-task generation bumped on EVERY signal raise (unlike SIGNAL_READABLE_GEN,
@@ -3016,6 +3020,72 @@ fn signal_bits_update_existing<R>(
     let mut values = table[signal_bits_bucket(task)].values.lock();
     let slot = values.as_mut()?.get_mut(&task)?;
     Some(update(slot))
+}
+
+#[inline]
+fn note_pending_transition(before: u64, after: u64) {
+    if before == 0 && after != 0 {
+        // Publish while the shard remains locked. A reader which observes the
+        // non-zero count then either sees the bit or waits for this lock.
+        SIGNAL_PENDING_TASKS.fetch_add(1, Ordering::Release);
+    } else if before != 0 && after == 0 {
+        let previous = SIGNAL_PENDING_TASKS.fetch_sub(1, Ordering::Release);
+        debug_assert!(previous != 0, "pending-signal task count underflow");
+    }
+}
+
+fn pending_signal_bits_update<R>(
+    task: u64,
+    update: impl FnOnce(&mut u64) -> R,
+) -> Option<R> {
+    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+    let slot = values.as_mut()?.entry(task).or_insert(0);
+    let before = *slot;
+    let result = update(slot);
+    note_pending_transition(before, *slot);
+    Some(result)
+}
+
+fn pending_signal_bits_update_or_init<R>(task: u64, update: impl FnOnce(&mut u64) -> R) -> R {
+    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+    let slot = values
+        .get_or_insert_with(BTreeMap::new)
+        .entry(task)
+        .or_insert(0);
+    let before = *slot;
+    let result = update(slot);
+    note_pending_transition(before, *slot);
+    result
+}
+
+fn pending_signal_bits_update_existing<R>(
+    task: u64,
+    update: impl FnOnce(&mut u64) -> R,
+) -> Option<R> {
+    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+    let slot = values.as_mut()?.get_mut(&task)?;
+    let before = *slot;
+    let result = update(slot);
+    note_pending_transition(before, *slot);
+    Some(result)
+}
+
+fn pending_signal_bits_remove(task: u64) {
+    let mut values = SIGNAL_PENDING[signal_bits_bucket(task)].values.lock();
+    if values
+        .as_mut()
+        .and_then(|map| map.remove(&task))
+        .is_some_and(|bits| bits != 0)
+    {
+        note_pending_transition(1, 0);
+    }
+}
+
+fn pending_signal_bits_clear() {
+    for bucket in &SIGNAL_PENDING {
+        *bucket.values.lock() = Some(BTreeMap::new());
+    }
+    SIGNAL_PENDING_TASKS.store(0, Ordering::Release);
 }
 
 /// Test hook: expose only shard identity so signal smokes can guarantee they
@@ -3704,7 +3774,7 @@ pub(crate) fn sigqueue_store_and_raise_bit(
         queued + 1
     };
     // Set the pending bit while STILL holding the bucket lock (nested).
-    let was_empty = signal_bits_update_or_init(&SIGNAL_PENDING, task, |slot| {
+    let was_empty = pending_signal_bits_update_or_init(task, |slot| {
         let was_empty = *slot == 0;
         *slot |= sig_bit(signum);
         was_empty
@@ -3742,7 +3812,7 @@ pub(crate) fn sigwait_take_locked(task: u64, set: u64) -> Option<SigwaitTaken> {
     let more = g
         .as_ref()
         .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()));
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+    let _ = pending_signal_bits_update_existing(task, |slot| {
         if more {
             *slot |= sig_bit(signum);
         } else {
@@ -3816,7 +3886,7 @@ pub(crate) fn sigqueue_take_and_clear(task: u64, signum: u32) -> Option<Sigqueue
     let more = g
         .as_ref()
         .is_some_and(|m| m.get(&(task, signum)).is_some_and(|q| !q.is_empty()));
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+    let _ = pending_signal_bits_update_existing(task, |slot| {
         if more {
             *slot |= sig_bit(signum);
         } else {
@@ -4059,7 +4129,7 @@ pub(crate) fn restore_temporary_signal_mask(task: u64) {
 /// Initialise the per-task pending+mask+altstack registries.
 /// Pair with `sigaction_init` at boot.
 pub fn signal_init() {
-    signal_bits_clear(&SIGNAL_PENDING);
+    pending_signal_bits_clear();
     signal_bits_clear(&SIGNAL_READABLE_GEN);
     signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
@@ -4076,7 +4146,7 @@ pub fn signal_init() {
 /// Reset the registries — test hook. Drops every per-task entry.
 #[doc(hidden)]
 pub fn __test_signal_reset() {
-    signal_bits_clear(&SIGNAL_PENDING);
+    pending_signal_bits_clear();
     signal_bits_clear(&SIGNAL_READABLE_GEN);
     signal_bits_clear(&SIGNAL_RAISE_GEN);
     signal_bits_clear(&SIGNAL_MASK);
@@ -4088,6 +4158,13 @@ pub fn __test_signal_reset() {
 /// Diagnostic: peek the pending bitmap for `task`.
 pub fn signal_pending_of(task: u64) -> u64 {
     signal_bits_get(&SIGNAL_PENDING, task)
+}
+
+/// Test hook for the exact empty/non-empty task count that gates syscall-return
+/// signal delivery.
+#[doc(hidden)]
+pub fn __test_pending_signal_task_count() -> usize {
+    SIGNAL_PENDING_TASKS.load(Ordering::Acquire)
 }
 
 pub fn signal_readable_generation(task: u64) -> u64 {
@@ -4980,7 +5057,7 @@ pub fn raise_signal_pending(task: u64, signum: u32) {
     // Job-control stop/continue bookkeeping (SIGCONT resume + stop/cont
     // mutual cancellation) runs before the pending bit is set.
     signal_stopcont_interaction(task, signum);
-    let Some(was_empty) = signal_bits_update(&SIGNAL_PENDING, task, |slot| {
+    let Some(was_empty) = pending_signal_bits_update(task, |slot| {
         let was_empty = *slot == 0;
         *slot |= sig_bit(signum);
         was_empty
@@ -5106,7 +5183,7 @@ fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
 /// (e.g. arming an interval timer), where allocation is allowed. No-op
 /// if the entry already exists or the table is uninitialised.
 pub fn ensure_signal_pending_slot(task: u64) {
-    let _ = signal_bits_update(&SIGNAL_PENDING, task, |_| {});
+    let _ = pending_signal_bits_update(task, |_| {});
     // The IRQ raise advances readability on the first pending signal. Seed
     // that row here too so the IRQ path never allocates.
     let _ = signal_bits_update(&SIGNAL_READABLE_GEN, task, |_| {});
@@ -5130,7 +5207,7 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
     if signum == 0 || signum > 64 {
         return false;
     }
-    if let Some(was_empty) = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+    if let Some(was_empty) = pending_signal_bits_update_existing(task, |slot| {
         let was_empty = *slot == 0;
         *slot |= sig_bit(signum);
         was_empty
@@ -5141,7 +5218,7 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
             })
             .is_none()
         {
-            let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+            let _ = pending_signal_bits_update_existing(task, |slot| {
                 *slot &= !sig_bit(signum);
             });
             return false;
@@ -5266,7 +5343,7 @@ pub fn clear_signal_pending(task: u64, signum: u32) {
     if signum > 64 {
         return;
     }
-    let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+    let _ = pending_signal_bits_update_existing(task, |slot| {
         *slot &= !(sig_bit(signum));
     });
 }
@@ -6574,6 +6651,7 @@ fn build_delivery_params(
 ///   arch can lay out the frame on the altstack (SA_ONSTACK),
 ///   push the 3-arg siginfo_t+ucontext frame (SA_SIGINFO), and
 ///   rewind RIP for re-execution (SA_RESTART).
+#[inline]
 pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bool {
     // u64::MAX = no restriction: consider every deliverable signal. The
     // timer-IRQ preemptive path calls the restricted form with a narrower
@@ -6585,6 +6663,7 @@ pub fn default_signal_delivery(ctx: &mut dyn TrapContext, syscall_no: u32) -> bo
 /// `restrict` are eligible. Picks the lowest eligible deliverable signal
 /// (`pending & !mask & restrict`) and delivers it through the same handler
 /// / default-action path.
+#[inline]
 pub(crate) fn default_signal_delivery_restricted(
     ctx: &mut dyn TrapContext,
     syscall_no: u32,
@@ -6593,6 +6672,21 @@ pub(crate) fn default_signal_delivery_restricted(
     if !ctx.returning_to_user() {
         return false;
     }
+    // The common syscall-return case has no pending signals anywhere. Avoid
+    // resolving the current task and locking its sharded B-tree until a writer
+    // has published a non-empty pending bitmap.
+    if SIGNAL_PENDING_TASKS.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    default_signal_delivery_restricted_active(ctx, syscall_no, restrict)
+}
+
+#[inline(never)]
+fn default_signal_delivery_restricted_active(
+    ctx: &mut dyn TrapContext,
+    syscall_no: u32,
+    restrict: u64,
+) -> bool {
     let task = current_task_id();
 
     let pending = signal_bits_get(&SIGNAL_PENDING, task);
@@ -6655,7 +6749,7 @@ pub(crate) fn default_signal_delivery_restricted(
             // No user handler installed → POSIX default action.
             // Clear the pending bit before applying the action so a
             // retry trap doesn't re-fire the same signal.
-            let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+            let _ = pending_signal_bits_update_existing(task, |slot| {
                 *slot &= !(sig_bit(signum));
             });
             match default_signal_action(signum) {
@@ -6698,7 +6792,7 @@ pub(crate) fn default_signal_delivery_restricted(
     // stored as `None`, so it never reaches here (the None arm above applies
     // the default action); a SIG_IGN slot is the only `handler <= 1` case.
     if action.handler <= 1 {
-        let _ = signal_bits_update_existing(&SIGNAL_PENDING, task, |slot| {
+        let _ = pending_signal_bits_update_existing(task, |slot| {
             *slot &= !(sig_bit(signum));
         });
         // SIG_IGN consumes every queued RT instance with the bit.
