@@ -8811,10 +8811,17 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                     }
                     crate::pid_ns::clear_ns(tid);
                 }
-                crate::task::release_task(tid);
-                if let Some(state) = RLIMIT_TABLE.lock().as_mut() {
-                    state.rows.remove(&tid);
-                    state.reaped.insert(tid, ());
+                // Serialize rlimit-row removal with prlimit64's retained-task
+                // revalidation. Both paths take RLIMIT_TABLE before TASKS:
+                // prlimit either completes its transaction first, or observes
+                // that reap already removed the registry entry. No permanent
+                // TaskId tombstone is needed (TaskIds are never reused).
+                {
+                    let mut rlimits = RLIMIT_TABLE.lock();
+                    if let Some(state) = rlimits.as_mut() {
+                        state.rows.remove(&tid);
+                    }
+                    crate::task::release_task(tid);
                 }
                 // Reap-time pid↔tid unbinding. PIDs are recycled
                 // (lowest-free), so a surviving PID_TO_TASK row would
@@ -8938,6 +8945,7 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
         m.remove(&tid);
     }
+    crate::mqueue::release_task_fd_paths(tid);
 
     // Memory policy.
     if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
@@ -9234,6 +9242,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
             .is_some_and(|m| m.contains_key(&tid)),
         1 << 11,
     );
+    r |= has(crate::mqueue::task_has_fd_paths(tid), 1 << 12);
     r
 }
 
@@ -10562,16 +10571,12 @@ struct RlimitState {
     /// Rows are keyed by the monotonic thread-group leader TaskId. ProcessIds
     /// are recycled and therefore cannot safely own lifetime-bearing state.
     rows: BTreeMap<u64, [RLimitPair; RLIMIT_COUNT]>,
-    /// Reaped leader IDs are tombstoned so a prlimit holder that retained an
-    /// Arc<Task> across concurrent reap cannot recreate a dead process row.
-    reaped: BTreeMap<u64, ()>,
 }
 
 impl RlimitState {
     fn new() -> Self {
         Self {
             rows: BTreeMap::new(),
-            reaped: BTreeMap::new(),
         }
     }
 }
@@ -10588,6 +10593,12 @@ pub fn __test_rlimit_reset() {
     *RLIMIT_TABLE.lock() = Some(RlimitState::new());
 }
 
+/// Test-only count of every lifetime-bearing record in the rlimit store.
+#[doc(hidden)]
+pub fn __test_rlimit_storage_len() -> usize {
+    RLIMIT_TABLE.lock().as_ref().map_or(0, |state| state.rows.len())
+}
+
 /// Resolve any thread in a group to the leader's never-reused TaskId.
 fn process_state_key(task: u64) -> u64 {
     task_to_pid_raw(task)
@@ -10602,9 +10613,6 @@ fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     let key = process_state_key(task);
     let g = RLIMIT_TABLE.lock();
     let state = g.as_ref()?;
-    if state.reaped.contains_key(&key) {
-        return None;
-    }
     let row = state
         .rows
         .get(&key)
@@ -10623,6 +10631,17 @@ const RLIMIT_AS: usize = 9;
 struct MlockAuthority {
     limit_bytes: u64,
     bypass_limit: bool,
+}
+
+/// Resolve Linux prlimit's pid argument to a live task. A non-container build
+/// must still reject unregistered numeric IDs rather than manufacturing a
+/// default rlimit row for a phantom process.
+struct PrlimitTarget {
+    tid: u64,
+    /// Mirrors Linux's get_task_struct reference for cross-task operations.
+    /// The exact current task cannot disappear during its own syscall, and
+    /// some kernel-test shims intentionally have no registered Task object.
+    owner: Option<alloc::sync::Arc<crate::task::Task>>,
 }
 
 fn current_mlock_authority() -> MlockAuthority {
@@ -10668,6 +10687,7 @@ fn can_do_mlock(authority: MlockAuthority) -> bool {
 /// two CLONE_THREAD callers from raising a hard limit through stale snapshots.
 fn update_rlimit_atomic(
     task: u64,
+    owner: Option<&alloc::sync::Arc<crate::task::Task>>,
     resource: usize,
     new_value: Option<RLimitPair>,
 ) -> Result<RLimitPair, i64> {
@@ -10677,8 +10697,16 @@ fn update_rlimit_atomic(
     let key = process_state_key(task);
     let mut g = RLIMIT_TABLE.lock();
     let state = g.as_mut().ok_or(22i64)?;
-    if state.reaped.contains_key(&key) {
-        return Err(3); // ESRCH
+    if let Some(owner) = owner {
+        // Revalidate while holding RLIMIT_TABLE. Reap takes this lock before
+        // removing the task-registry entry, so it cannot slip between this
+        // check and the row transaction. This replaces the old unbounded set
+        // of every TaskId ever reaped without allowing a retained Arc<Task>
+        // from a raced prlimit64 to recreate the dead process's row.
+        let registered = crate::task::task_get(task).ok_or(3i64)?;
+        if !alloc::sync::Arc::ptr_eq(owner, &registered) {
+            return Err(3); // ESRCH
+        }
     }
     let row = state.rows.entry(key).or_insert_with(default_rlimits);
     let prior = row[resource];
@@ -10695,29 +10723,18 @@ fn update_rlimit_atomic(
     Ok(prior)
 }
 
-/// Resolve Linux prlimit's pid argument to a live task. A non-container build
-/// must still reject unregistered numeric IDs rather than manufacturing a
-/// default rlimit row for a phantom process.
-struct PrlimitTarget {
-    tid: u64,
-    /// Mirrors Linux's get_task_struct reference for cross-task operations.
-    /// The exact current task cannot disappear during its own syscall, and
-    /// some kernel-test shims intentionally have no registered Task object.
-    _owner: Option<alloc::sync::Arc<crate::task::Task>>,
-}
-
 fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
     if pid == 0 {
         return Some(PrlimitTarget {
             tid: caller,
-            _owner: crate::task::task_get(caller),
+            owner: crate::task::task_get(caller),
         });
     }
     let outer = accept_pid_from(caller, pid)?;
     let task = pid_to_task_raw(outer).or_else(|| task_to_pid_raw(outer).map(|_| outer))?;
     Some(PrlimitTarget {
         tid: task,
-        _owner: Some(crate::task::task_get(task)?),
+        owner: Some(crate::task::task_get(task)?),
     })
 }
 
@@ -10751,7 +10768,6 @@ fn rlimit_fork(parent: u64, child: u64) {
         .get(&parent_key)
         .copied()
         .unwrap_or_else(default_rlimits);
-    state.reaped.remove(&child_key);
     state.rows.insert(child_key, inherited);
 }
 

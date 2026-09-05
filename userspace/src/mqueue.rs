@@ -650,6 +650,27 @@ pub(crate) fn forget_fd_path(task: u64, fd: u32) {
     });
 }
 
+/// Drop every descriptor-path identity owned by an exiting task.
+///
+/// `CLONE_FILES` shares the descriptor table but the compatibility metadata
+/// remains task-keyed, so detaching the shared fd-table reference cannot
+/// retire these rows. Leaving them behind retains one cloned pathname (and
+/// its B-tree entry) per inherited descriptor for every exited thread.
+pub(crate) fn release_task_fd_paths(task: u64) {
+    let mut paths = FD_PATHS.lock();
+    if let Some(paths) = paths.as_mut() {
+        paths.retain(|&(owner, _), _| owner != task);
+    }
+}
+
+/// Test-only residue probe for the central task-exit sweep.
+pub(crate) fn task_has_fd_paths(task: u64) -> bool {
+    FD_PATHS
+        .lock()
+        .as_ref()
+        .is_some_and(|paths| paths.keys().any(|&(owner, _)| owner == task))
+}
+
 /// Duplicate (or replace) a descriptor's pathname identity.
 ///
 /// `dup2`/`dup3` may replace an existing destination, so an untracked source

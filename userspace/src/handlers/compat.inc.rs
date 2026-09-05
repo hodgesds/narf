@@ -4809,7 +4809,6 @@ pub fn rlimits_of(pid: u64) -> [(u64, u64); 16] {
     let row = {
         let g = RLIMIT_TABLE.lock();
         g.as_ref()
-            .filter(|state| !state.reaped.contains_key(&key))
             .and_then(|state| state.rows.get(&key).copied())
             .unwrap_or_else(default_rlimits)
     };

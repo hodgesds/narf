@@ -978,11 +978,12 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     crate::handlers::__test_parent_of_set(CHILD_PID, TID); // running child
     crate::handlers::__test_set_foreground_task(TID);
     crate::handlers::__test_set_robust_list(TID, 0xdead_0000, 24);
+    crate::mqueue::register_fd_path(TID, 9, "/task-exit-residue", None);
     crate::posix_timer::__test_arm_itimer_real(TID, u64::MAX, 1_000_000);
 
     let before = crate::handlers::__test_task_table_residue(TID);
-    // Bits 0,3,4,5,6,7,8,10,11 must be populated pre-exit (mask 0xDF9).
-    if before & 0xDF9 != 0xDF9 {
+    // Bits 0,3,4,5,6,7,8,10,11,12 must be populated pre-exit (mask 0x1DF9).
+    if before & 0x1DF9 != 0x1DF9 {
         crate::task::release_task(TID);
         return TestResult::Fail("test setup failed to populate the tables");
     }

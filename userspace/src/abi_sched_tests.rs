@@ -308,6 +308,36 @@ kernel_test_in!(
     smoke_abi_sched_prlimit64_error_order_and_missing_pid
 );
 
+fn smoke_abi_sched_reap_retires_rlimit_storage() -> TestResult {
+    with_setup(|| {
+        const TARGET_TID: u64 = 0xA7_100;
+        const TARGET_PID: u64 = 0xA7_200;
+        let owner = crate::task::Task::new_registered(TARGET_TID, TARGET_PID);
+        crate::handlers::register_pid_task_mapping(TARGET_PID, TARGET_TID);
+
+        let limits = [64u64, 200u64];
+        let set_result = call(
+            Syscall::Prlimit64.raw(),
+            a3(TARGET_PID, 7, limits.as_ptr() as u64, 0),
+        );
+        let populated = crate::handlers::__test_rlimit_storage_len();
+
+        crate::task::mark_zombie(TARGET_TID);
+        crate::handlers::release_reaped_task(TARGET_PID);
+        let retained = crate::handlers::__test_rlimit_storage_len();
+        drop(owner);
+
+        if set_result != Some(0) || populated != 1 {
+            return Err("prlimit64 did not populate exactly one target row");
+        }
+        if retained != 0 {
+            return Err("reap retained rlimit lifetime state for a dead TaskId");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_reap_retires_rlimit_storage);
+
 // ── sched_getaffinity(pid, cpusetsize, mask*) ───────────────────────
 // Reports the task's allowed mask intersected with online CPUs.
 
