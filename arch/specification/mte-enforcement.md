@@ -1,6 +1,6 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.6**. Steps 1–5 are implemented. MTE **is enforcing**, for
+> Status: **v0.7**. Steps 1–5 are implemented. MTE **is enforcing**, for
 > the BPF arena and nothing else, and the boot report says exactly that:
 > the backend stays `Unenforced` and the arena's tag checking is reported
 > on its own line. This records what exists, what is missing, and the order the
@@ -364,3 +364,73 @@ domain scope holds `TCF=Sync`, an interrupt into driver code that touches
 its own now-tagged data through an untagged pointer takes a fatal fault —
 there is no exception-table entry for module code. Page tagging and the
 relocator contract must land together, or neither.
+
+## Step 6 audit — every aarch64 relocation, and which ones the tag breaks
+
+Scoping pass over `modules/src/elf/reloc.rs::apply_aarch64` and the
+veneer pre-check in `modules/src/relocator.rs`. The question for each type
+is what it does with `val` (the symbol address, `sym_value + addend`) and
+`place` (`target_addr + loc`, always inside the module image). With the
+image relocated against a tagged base, `place` carries tag `D-1` while a
+kernel `val` carries the untagged 15.
+
+The rule the whole table reduces to: **a displacement must be computed on
+untagged operands; an absolute value must keep its tag.**
+
+| Relocation | Computation | Tag participates? | Action |
+|---|---|---|---|
+| `ABS64` | writes `val` | yes, and correctly | none — this is how a module's absolute pointers acquire the tag |
+| `ABS32` | `val`, errors if `> u32::MAX` | no | none — a 64-bit VA overflows tagged or not |
+| `PREL64` | `val - place` | **yes** | untag both |
+| `PREL32` | `val - place`, ±2 GiB | **yes** | untag both |
+| `CALL26` / `JUMP26` | `(val - place) >> 2`, ±128 MiB | **yes** | untag both |
+| `ADR_PREL_PG_HI21` | `(val&!0xFFF) - (place&!0xFFF) >> 12`, ±4 GiB | **yes** — masking 12 bits does not clear bit 56 | untag both |
+| `ADD_ABS_LO12_NC` | `val & 0xFFF` | no | none |
+| `LDST64_ABS_LO12_NC` | `val & 0xFFF` | no | none |
+| `MOVW_UABS_G0..G2(_NC)` | `val >> lsb`, checked forms error `> 0xFFFF` | no — tag sits in G3 | none |
+| `MOVW_UABS_G3` | `val >> 48` | yes, and correctly | none — this is how a MOVZ/MOVK-materialised pointer gets the tag |
+| `NONE` | — | no | none |
+
+So five arms change, out of eighteen. Plus one more site, and it is the
+one that actually failed: `relocator.rs:188` duplicates the `CALL26` /
+`JUMP26` range check to decide whether a PLT veneer is needed. Left
+tagged, every call appears to overflow ±128 MiB, every call demands a
+veneer, and the PLT exhausts — which is the "rejected a real rustc-built
+.ko" that ended the first attempt.
+
+### Why the absolute forms are right to leave alone
+
+`ABS64` and `MOVW_UABS_G3` are not oversights to fix later — they are the
+mechanism. An in-module symbol relocated absolutely yields a tagged
+pointer, which is exactly what makes the module's own data accesses match
+its granules. A kernel symbol yields an untagged one, which is also right:
+kernel pages are `ATTR_NORMAL` and unchecked.
+
+The same argument covers `ADRP` at *runtime*, which is worth stating
+because it looks like a problem and is not. The relocation encodes a page
+displacement computed untagged, but the CPU adds it to the live PC, which
+is tagged because the module executes at a tagged VA. An in-module target
+therefore resolves to a tag-`D-1` pointer (correct — matches the
+granules), and a kernel target resolves to a kernel address that happens
+to carry tag `D-1` (harmless — the page is not tagged, so nothing checks
+it). No runtime change is needed for `ADRP`; only the link-time
+displacement must be untagged.
+
+### Beyond the relocator
+
+`module_text::is_module_va` range-checks against `MODULE_VA_BASE` and
+would reject a tagged PC, so anything attributing an address to a module —
+backtraces, `/proc/modules`-adjacent diagnostics — needs to untag first.
+Diagnostic-only, but it fails silently: a module frame simply stops being
+recognised as one.
+
+### Proven versus inferred
+
+Only `CALL26` is demonstrated: it is what the failing load hit. The other
+four are read off the arithmetic, and `PREL32`/`PREL64` in particular may
+not appear in a real `.ko` at all — the existing comment in `reloc.rs`
+notes that `MOVW_UABS` quartets were added only because a rustc-built
+module used them where a synthesized test ELF did not. Before editing, log
+the relocation types the reference module actually emits; a type that
+never appears needs the fix for correctness but cannot be tested, and
+should be marked as such rather than counted as covered.
