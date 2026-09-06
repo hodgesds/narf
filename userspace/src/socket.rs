@@ -548,6 +548,7 @@ pub enum SocketOpResult {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SockError {
     BadFd,
+    NoMemory,
     InvalidArg,
     NotSupported,
     NotConnected,
@@ -566,6 +567,7 @@ impl SockError {
     pub fn errno(self) -> i32 {
         match self {
             Self::BadFd => 9,               // EBADF
+            Self::NoMemory => 12,           // ENOMEM
             Self::InvalidArg => 22,         // EINVAL
             Self::NotSupported => 95,       // ENOTSUP
             Self::NotConnected => 107,      // ENOTCONN
@@ -5185,7 +5187,7 @@ impl SocketFile {
             tx.write_packet(buf, crate::handlers::current_ucred())
         } else {
             tx.write(buf)
-        };
+        }?;
         drop(state);
         // Wake any peer parked in poll/epoll/recv on the other end of this
         // ring. AF_UNIX (and loopback INET) sockets carry no kernel TCB, so
@@ -5271,7 +5273,7 @@ impl SocketFile {
             tx.write_packet_with_fds(buf, fds, crate::handlers::current_ucred())
         } else {
             tx.write_stream_with_fds(buf, fds)
-        };
+        }?;
         drop(state);
         // Ring full (nothing fit) but there WAS data to send: the fd batch was
         // not enqueued (write_*_with_fds bails before queuing when no bytes
@@ -5422,9 +5424,10 @@ pub struct RingBuf {
 }
 
 struct RingInner {
-    buf: Vec<u8>,
-    head: usize,
-    len: usize,
+    /// Demand-grown stream storage. An idle connection owns no 64 KiB backing
+    /// allocation; capacity grows only as bytes are queued and is capped by
+    /// [`RING_CAP`].
+    buf: VecDeque<u8>,
     /// Record queue for connected SOCK_SEQPACKET/SOCK_DGRAM pairs.
     packets: VecDeque<PacketRecord>,
     packet_bytes: usize,
@@ -5454,8 +5457,7 @@ struct StreamControl {
 impl core::fmt::Debug for RingInner {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RingInner")
-            .field("head", &self.head)
-            .field("len", &self.len)
+            .field("len", &self.buf.len())
             .field("stream_controls", &self.stream_controls.len())
             .finish()
     }
@@ -5465,9 +5467,7 @@ impl RingBuf {
     fn new() -> Self {
         Self {
             inner: IrqSafeSpinLock::new(RingInner {
-                buf: alloc::vec![0u8; RING_CAP],
-                head: 0,
-                len: 0,
+                buf: VecDeque::new(),
                 packets: VecDeque::new(),
                 packet_bytes: 0,
                 delivered_packet_fds: None,
@@ -5528,8 +5528,8 @@ impl RingBuf {
         let (data, space) = {
             let g = self.inner.lock();
             (
-                g.len > 0 || !g.packets.is_empty(),
-                g.len < RING_CAP && g.packet_bytes < RING_CAP,
+                !g.buf.is_empty() || !g.packets.is_empty(),
+                g.buf.len() < RING_CAP && g.packet_bytes < RING_CAP,
             )
         };
         let readable = data || closed;
@@ -5572,15 +5572,14 @@ impl RingBuf {
         self.inner.lock().delivered_packet_cred.take()
     }
 
-    fn write(&self, src: &[u8]) -> usize {
+    fn write(&self, src: &[u8]) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
-        let avail = RING_CAP - g.len;
+        let avail = RING_CAP - g.buf.len();
         let n = core::cmp::min(src.len(), avail);
-        for (i, &byte) in src.iter().enumerate().take(n) {
-            let pos = (g.head + g.len + i) % RING_CAP;
-            g.buf[pos] = byte;
+        if n != 0 {
+            g.buf.try_reserve(n).map_err(|_| SockError::NoMemory)?;
+            g.buf.extend(src[..n].iter().copied());
         }
-        g.len += n;
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
         drop(g);
         // Fire the readable wait-queue on EVERY write that adds bytes, not only
@@ -5594,22 +5593,28 @@ impl RingBuf {
         if n != 0 {
             self.sync_readiness(narf_filesystem::POLL_IN);
         }
-        n
+        Ok(n)
     }
 
-    fn write_stream_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>) -> usize {
+    fn write_stream_with_fds(
+        &self,
+        src: &[u8],
+        fds: Vec<ScmRightsFile>,
+    ) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
-        let avail = RING_CAP - g.len;
+        let avail = RING_CAP - g.buf.len();
         let n = core::cmp::min(src.len(), avail);
         if n == 0 {
-            return 0;
+            return Ok(0);
+        }
+        g.buf.try_reserve(n).map_err(|_| SockError::NoMemory)?;
+        if !fds.is_empty() {
+            g.stream_controls
+                .try_reserve(1)
+                .map_err(|_| SockError::NoMemory)?;
         }
         let marker = g.stream_write_seq;
-        for (i, &byte) in src.iter().enumerate().take(n) {
-            let pos = (g.head + g.len + i) % RING_CAP;
-            g.buf[pos] = byte;
-        }
-        g.len += n;
+        g.buf.extend(src[..n].iter().copied());
         g.stream_write_seq = g.stream_write_seq.saturating_add(n as u64);
         if !fds.is_empty() {
             g.stream_controls.push_back(StreamControl {
@@ -5622,39 +5627,45 @@ impl RingBuf {
         // write so an EPOLLET reader re-fires on bytes appended before it
         // drained. n > 0 here (the n == 0 case returned early above).
         self.sync_readiness(narf_filesystem::POLL_IN);
-        n
+        Ok(n)
     }
 
-    fn write_packet(&self, src: &[u8], cred: Ucred) -> usize {
+    fn write_packet(&self, src: &[u8], cred: Ucred) -> Result<usize, SockError> {
         self.write_packet_with_fds(src, Vec::new(), cred)
     }
 
-    fn write_packet_with_fds(&self, src: &[u8], fds: Vec<ScmRightsFile>, cred: Ucred) -> usize {
+    fn write_packet_with_fds(
+        &self,
+        src: &[u8],
+        fds: Vec<ScmRightsFile>,
+        cred: Ucred,
+    ) -> Result<usize, SockError> {
         let mut g = self.inner.lock();
         if src.len() > RING_CAP.saturating_sub(g.packet_bytes) {
-            return 0;
+            return Ok(0);
         }
-        g.packets.push_back(PacketRecord {
-            data: src.to_vec(),
-            fds,
-            cred,
-        });
+        g.packets.try_reserve(1).map_err(|_| SockError::NoMemory)?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(src.len())
+            .map_err(|_| SockError::NoMemory)?;
+        data.extend_from_slice(src);
+        g.packets.push_back(PacketRecord { data, fds, cred });
         g.packet_bytes += src.len();
         drop(g);
         self.sync_readiness(narf_filesystem::POLL_IN);
-        src.len()
+        Ok(src.len())
     }
 
     fn read(&self, dst: &mut [u8]) -> usize {
         let mut g = self.inner.lock();
         g.delivered_packet_fds = None;
-        let n = core::cmp::min(dst.len(), g.len);
-        for (i, slot) in dst.iter_mut().enumerate().take(n) {
-            let pos = (g.head + i) % RING_CAP;
-            *slot = g.buf[pos];
-        }
-        g.head = (g.head + n) % RING_CAP;
-        g.len -= n;
+        let n = core::cmp::min(dst.len(), g.buf.len());
+        let (front, back) = g.buf.as_slices();
+        let first = n.min(front.len());
+        dst[..first].copy_from_slice(&front[..first]);
+        let second = n - first;
+        dst[first..n].copy_from_slice(&back[..second]);
+        drop(g.buf.drain(..n));
         let end = g.stream_read_seq.saturating_add(n as u64);
         let mut delivered = Vec::new();
         while g
@@ -5683,10 +5694,12 @@ impl RingBuf {
     fn peek(&self, dst: &mut [u8]) -> usize {
         let mut g = self.inner.lock();
         g.delivered_packet_fds = None;
-        let n = core::cmp::min(dst.len(), g.len);
-        for (i, slot) in dst.iter_mut().enumerate().take(n) {
-            *slot = g.buf[(g.head + i) % RING_CAP];
-        }
+        let n = core::cmp::min(dst.len(), g.buf.len());
+        let (front, back) = g.buf.as_slices();
+        let first = n.min(front.len());
+        dst[..first].copy_from_slice(&front[..first]);
+        let second = n - first;
+        dst[first..n].copy_from_slice(&back[..second]);
         let end = g.stream_read_seq.saturating_add(n as u64);
         let delivered: Vec<_> = g
             .stream_controls
@@ -5739,7 +5752,7 @@ impl RingBuf {
 
     fn has_data(&self) -> bool {
         let g = self.inner.lock();
-        g.len > 0 || !g.packets.is_empty()
+        !g.buf.is_empty() || !g.packets.is_empty()
     }
 
     /// Buffered byte count — backs `SIOCINQ`/`FIONREAD` on a stream socket.
@@ -5748,12 +5761,12 @@ impl RingBuf {
         g.packets
             .front()
             .map(|packet| packet.data.len())
-            .unwrap_or(g.len)
+            .unwrap_or(g.buf.len())
     }
 
     fn has_space(&self) -> bool {
         let g = self.inner.lock();
-        g.len < RING_CAP && g.packet_bytes < RING_CAP
+        g.buf.len() < RING_CAP && g.packet_bytes < RING_CAP
     }
 }
 
@@ -6809,6 +6822,26 @@ kernel_test_in!(
     smoke_netlink_pktinfo_tracks_received_multicast_group
 );
 
+fn smoke_unix_ring_storage_is_demand_grown() -> TestResult {
+    let ring = RingBuf::new();
+    if ring.inner.lock().buf.capacity() != 0 {
+        return TestResult::Fail("an idle socket ring allocated stream storage");
+    }
+    if ring.write(b"x") != Ok(1) {
+        return TestResult::Fail("demand-grown ring rejected its first byte");
+    }
+    let capacity = ring.inner.lock().buf.capacity();
+    if capacity == 0 || capacity >= RING_CAP {
+        return TestResult::Fail("first-byte write eagerly allocated the full ring");
+    }
+    let mut byte = [0u8; 1];
+    if ring.read(&mut byte) != 1 || byte != *b"x" {
+        return TestResult::Fail("demand-grown ring did not preserve its first byte");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace/socket", smoke_unix_ring_storage_is_demand_grown);
+
 fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
     let ring = RingBuf::new();
     let passed: Arc<dyn FileOps> = SocketFile::new(AF_UNIX, SOCK_STREAM);
@@ -6818,8 +6851,8 @@ fn smoke_unix_stream_rights_follow_byte_boundaries() -> TestResult {
         description: None,
     };
 
-    if ring.write(b"plain") != 5
-        || ring.write_stream_with_fds(b"fd", alloc::vec![passed_right]) != 2
+    if ring.write(b"plain") != Ok(5)
+        || ring.write_stream_with_fds(b"fd", alloc::vec![passed_right]) != Ok(2)
     {
         return TestResult::Fail("failed to seed stream control boundary");
     }
@@ -6864,9 +6897,9 @@ fn smoke_unix_stream_multiple_rights_batches_preserve_order() -> TestResult {
         description: None,
     };
 
-    if ring.write_stream_with_fds(b"a", alloc::vec![first_right]) != 1
-        || ring.write(b"-") != 1
-        || ring.write_stream_with_fds(b"b", alloc::vec![second_right]) != 1
+    if ring.write_stream_with_fds(b"a", alloc::vec![first_right]) != Ok(1)
+        || ring.write(b"-") != Ok(1)
+        || ring.write_stream_with_fds(b"b", alloc::vec![second_right]) != Ok(1)
     {
         return TestResult::Fail("failed to seed multiple stream control batches");
     }

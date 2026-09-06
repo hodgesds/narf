@@ -58,30 +58,18 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     a.set_local_groups(groups.clone());
     b.set_local_groups(groups);
     crate::socket::SocketFile::cross_peer_creds(&a, &b);
-    socket_arc_register(&a);
-    socket_arc_register(&b);
     let fd_flags = if cloexec { crate::fd::FD_CLOEXEC } else { 0 };
     let status_flags = crate::fd::O_RDWR | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
     let task = current_task_id();
-    let mk = |ops: alloc::sync::Arc<crate::socket::SocketFile>| {
-        fd::install(task, crate::fd::FdEntry {
-                ops,
-                offset: 0,
-                flags: fd_flags,
-                status_flags,
-            })
+    let mk = |ops: alloc::sync::Arc<crate::socket::SocketFile>| crate::fd::FdEntry {
+        ops,
+        offset: 0,
+        flags: fd_flags,
+        status_flags,
     };
-    let fd_a = match mk(a) {
-        Some(n) => n,
+    let (fd_a, fd_b) = match fd::install_pair(task, mk(a), mk(b)) {
+        Some(fds) => fds,
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
-            return;
-        }
-    };
-    let fd_b = match mk(b) {
-        Some(n) => n,
-        None => {
-            let _ = fd::with_table(task, |t| t.close(fd_a));
             ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
             return;
         }

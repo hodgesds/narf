@@ -318,6 +318,8 @@ across EOF selection and write, while their ordinary positions remain
 independent.
 
 The native send-family preserves Linux validation and errno ordering.
+Fallible socket queue growth reports `ENOMEM` without publishing a partial
+stream write, ancillary record, or datagram.
 `send(2)` validates a non-empty payload range before descriptor lookup;
 `sendmsg(2)` and `sendmmsg(2)` reject the kernel-only compat-control flag
 before distinguishing `EBADF` from `ENOTSOCK`, then import the complete native

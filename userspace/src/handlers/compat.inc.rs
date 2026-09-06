@@ -7404,20 +7404,29 @@ pub fn sigaction_lookup_full(task: u64, signum: usize) -> Option<SigAction> {
 // POSIX sockaddr_* unions in/out, the dispatcher owns per-family
 // state.
 
+fn socket_from_file_ops(
+    ops: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
+    if !ops
+        .as_any()
+        .is_some_and(|ops| ops.is::<crate::socket::SocketFile>())
+    {
+        return None;
+    }
+    let raw = alloc::sync::Arc::into_raw(ops);
+    // SAFETY: `as_any().is::<SocketFile>()` above proves the erased allocation
+    // contains a `SocketFile`. `Arc::into_raw` transfers exactly one strong
+    // reference; casting away the now-validated trait metadata recovers the
+    // original concrete data pointer, and `from_raw` takes ownership of that
+    // same reference count.
+    Some(unsafe { alloc::sync::Arc::from_raw(raw as *const crate::socket::SocketFile) })
+}
+
 fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
     let task = current_task_id();
-    fd::with_table(task, |t| t.get(fd).cloned())
+    fd::with_table(task, |t| t.get(fd).map(|entry| entry.ops.clone()))
         .flatten()
-        .and_then(|entry| {
-            // Downcast Arc<dyn FileOps> → Arc<SocketFile>. Manual
-            // because Arc downcast for trait objects isn't in core;
-            // we identify a SocketFile by raw-pointer comparison
-            // through a marker — but simpler: try downcast via
-            // unsafe transmute is risky. Use a manual pattern: keep
-            // a side table mapping fd → Arc<SocketFile>.
-            let raw = alloc::sync::Arc::as_ptr(&entry.ops) as *const ();
-            socket_arc_lookup(raw)
-        })
+        .and_then(socket_from_file_ops)
 }
 
 /// Resolve a socket descriptor without collapsing Linux's two descriptor
@@ -7426,11 +7435,12 @@ fn current_socket(fd: u32) -> Option<alloc::sync::Arc<crate::socket::SocketFile>
 /// syscalls must distinguish those as `EBADF` and `ENOTSOCK` respectively.
 fn current_socket_result(fd: u32) -> Result<alloc::sync::Arc<crate::socket::SocketFile>, i64> {
     let task = current_task_id();
-    let entry = fd::with_table(task, |table| table.get(fd).cloned())
+    let ops = fd::with_table(task, |table| {
+        table.get(fd).map(|entry| entry.ops.clone())
+    })
         .flatten()
         .ok_or(9i64)?; // EBADF
-    let raw = alloc::sync::Arc::as_ptr(&entry.ops) as *const ();
-    socket_arc_lookup(raw).ok_or(88) // ENOTSOCK
+    socket_from_file_ops(ops).ok_or(88) // ENOTSOCK
 }
 
 /// Install the kernel-held admin authority returned by a successful stack
@@ -7474,27 +7484,14 @@ pub fn delegate_netfilter_admin_to_socket(
     socket.delegate_netfilter_admin(admin)
 }
 
-// Side table to enable Arc<dyn FileOps> -> Arc<SocketFile> recovery.
-// `fd::FdEntry` stores Arc<dyn FileOps>; `dyn FileOps` is not
-// `Any`, so a downcast isn't possible. Stage-1: register the
-// concrete Arc when the socket is created; look it up by the same
-// raw pointer the FdEntry holds.
-// fd → SocketFile resolver. Holds a `Weak`, NOT a strong `Arc`: the SocketFile
-// is kept alive by its fd-table entries (and, for a listener, the LISTENERS
-// map), so the resolver entry must follow that liveness rather than pin it.
-// A strong ref here made `sys_close` remove the entry to avoid a leak — which
-// broke socketpair-across-fork (weston's helper launch): the parent's close
-// deleted the entry while the child still held an fd to the same SocketFile.
-// With a Weak, a surviving fd keeps the entry resolvable and the entry
-// self-invalidates only when the final fd drops (pruned lazily on lookup).
-// ── Pointer-keyed Arc side-tables (socket / epoll / timerfd / signalfd /
-// memfd), sharded ──────────────────────────────────────────────────
+// ── Pointer-keyed Arc side-tables (epoll / timerfd / signalfd / memfd),
+// sharded ───────────────────────────────────────────────────────────
 //
 // Each recovers a concrete `Arc<T>` from a `dyn FileOps` pointer. They sit on
-// hot syscall paths (`SOCKET_ARCS` on every socket send/recv; `EPOLL_ARCS` on
-// every epoll_wait/ctl), so a single global lock bounced one cache line between
-// every CPU. Shard 64-way by the pointer key (same transform as the signal /
-// futex tables) so unrelated fds no longer contend.
+// hot syscall paths (for example `EPOLL_ARCS` on every epoll_wait/ctl), so a
+// single global lock bounced one cache line between every CPU. Shard 64-way by
+// the pointer key (same transform as the signal / futex tables) so unrelated
+// fds no longer contend.
 const ARC_SHARDS: usize = 64;
 
 #[repr(align(64))]
@@ -7541,17 +7538,6 @@ fn arc_shard_get<T>(table: &ArcShardTable<T>, key: usize) -> Option<alloc::sync:
             None
         }
     }
-}
-
-static SOCKET_ARCS: ArcShardTable<crate::socket::SocketFile> =
-    [const { ArcShard::new() }; ARC_SHARDS];
-
-fn socket_arc_register(arc: &alloc::sync::Arc<crate::socket::SocketFile>) {
-    arc_shard_register(&SOCKET_ARCS, arc);
-}
-
-fn socket_arc_lookup(raw: *const ()) -> Option<alloc::sync::Arc<crate::socket::SocketFile>> {
-    arc_shard_get(&SOCKET_ARCS, raw as usize)
 }
 
 /// Import a MANDATORY user sockaddr for bind/connect, distinguishing Linux's
@@ -7656,7 +7642,6 @@ fn accept_common(ctx: &mut dyn TrapContext, flags: u32) {
                 } else {
                     0
                 };
-            socket_arc_register(&socket);
             let task = current_task_id();
             // Pairs with UNIXENQ (socket.rs Connect): stamps when the
             // listener's owner finally accept()ed, so connect→accept
