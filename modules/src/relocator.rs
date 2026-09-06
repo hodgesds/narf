@@ -19,6 +19,8 @@ use crate::elf::{
     apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
     SymbolTable, EM_AARCH64, EM_X86_64,
 };
+use core::fmt::Write as _;
+
 use crate::manifest::Manifest;
 use crate::plt::Plt;
 use crate::symbols::{resolve, ResolveError};
@@ -238,7 +240,21 @@ pub fn apply_one_rela_section(
                 });
             }
         };
-        result.map_err(RelocatorError::ApplyFailed)?;
+        if let Err(e) = result {
+            // Name the relocation. `ApplyFailed(Overflow)` on its own says a
+            // relocation did not fit and nothing about which one, which is
+            // most of the work when a real `.ko` stops loading. The type and
+            // the two operands are exactly what identifies it.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  reloc: type {} failed ({:?}) sym={:#x} place={:#x}",
+                r.ty(),
+                e,
+                sym_value,
+                target_addr.wrapping_add(loc as u64)
+            );
+            return Err(RelocatorError::ApplyFailed(e));
+        }
         applied += 1;
     }
     Ok(applied)

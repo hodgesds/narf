@@ -45,7 +45,22 @@ pub const VENEER_BYTES: usize = 12;
 /// produce a branch to the wrong address instead of a load failure.
 pub fn encode_veneer(dst: u64, pc: u64) -> Option<[u8; VENEER_BYTES]> {
     // ADRP x16, page(dst) — bits 30:29 hold immlo, bits 23:5 immhi.
-    let page_diff = ((dst & !0xFFF) as i64).wrapping_sub((pc & !0xFFF) as i64) >> 12;
+    //
+    // Untag both before subtracting. `pc` is a veneer address inside the
+    // module image, which on aarch64 carries the module's MTE domain tag,
+    // while `dst` is a kernel symbol carrying the untagged 15. Mixing them
+    // puts the page difference `(15 - tag) << 44` pages out, far past ADRP's
+    // ±4 GiB reach, so every veneer refuses to encode, `veneer_for` returns
+    // `None`, and the load fails as `PltExhausted` — an arena-full error for
+    // a PLT that is empty.
+    //
+    // Correct at run time as well as link time: the CPU adds this
+    // displacement to the live (tagged) PC, so `x16` ends up holding the
+    // right address with a stray tag in bits 59:56, and `BR` is an
+    // instruction fetch, where TBI ignores the top byte.
+    let dst_u = crate::elf::reloc::untag_kernel_pub(dst);
+    let pc_u = crate::elf::reloc::untag_kernel_pub(pc);
+    let page_diff = ((dst_u & !0xFFF) as i64).wrapping_sub((pc_u & !0xFFF) as i64) >> 12;
     if !(-(1 << 20)..(1 << 20)).contains(&page_diff) {
         return None;
     }

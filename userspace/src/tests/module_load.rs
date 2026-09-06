@@ -90,8 +90,42 @@ fn smoke_module_load_real_ko_round_trip() -> TestResult {
     let module = match narf_modules::syscalls::sys_init_module(&image) {
         Ok(m) => m,
         Err(e) => {
-            let _ = e;
-            return TestResult::Fail("sys_init_module rejected a real rustc-built .ko");
+            // Name the reason. This used to discard `e` and report only
+            // "rejected", which is the least useful thing a load failure can
+            // say: the interesting cases (a relocation overflow, a bad
+            // section, a missing symbol) are indistinguishable from a
+            // malformed file, and diagnosing one meant editing this test.
+            use narf_modules::loader::LoadError;
+            use narf_modules::syscalls::ModuleSyscallError as E;
+            return TestResult::Fail(match e {
+                E::Load(LoadError::Relocator(r)) => {
+                    use narf_modules::relocator::RelocatorError as R;
+                    match r {
+                        R::ApplyFailed(_) => "sys_init_module: a relocation could not be applied",
+                        R::PltExhausted(_) => {
+                            "sys_init_module: PLT exhausted (branch out of range)"
+                        }
+                        R::SymbolNotFound(_) => "sys_init_module: unresolved symbol",
+                        R::CapMissing(_) => "sys_init_module: export needs an undeclared cap",
+                        R::NoTargetSection => {
+                            "sys_init_module: rela targets a non-loadable section"
+                        }
+                        R::ArchMismatch { .. } => "sys_init_module: relocator arch mismatch",
+                    }
+                }
+                E::Load(LoadError::Image(_)) => "sys_init_module: the image could not be mapped",
+                E::Load(LoadError::BadSection(_)) => "sys_init_module: bad section",
+                E::Load(LoadError::Header(_)) => "sys_init_module: ELF header rejected",
+                E::Load(LoadError::Manifest(_)) => "sys_init_module: .modinfo rejected",
+                E::Load(LoadError::Domain(_)) => "sys_init_module: unknown target_domain",
+                E::Load(LoadError::SignatureRejected(_)) => "sys_init_module: signature rejected",
+                E::Load(LoadError::NoSymbols) => "sys_init_module: no symbols",
+                E::Load(LoadError::MissingInit) => "sys_init_module: no narf_module_init",
+                E::Load(LoadError::AlreadyLoaded(_)) => "sys_init_module: already loaded",
+                E::Load(LoadError::WrongArch { .. }) => "sys_init_module: wrong architecture",
+                E::InitFailed(_) => "sys_init_module: narf_module_init returned non-zero",
+                _ => "sys_init_module rejected a real rustc-built .ko",
+            });
         }
     };
 
