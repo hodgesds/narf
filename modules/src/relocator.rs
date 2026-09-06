@@ -190,7 +190,15 @@ pub fn apply_one_rela_section(
         {
             let target = (sym_value as i64).wrapping_add(r.r_addend) as u64;
             let place = target_addr.wrapping_add(loc as u64);
-            let words = (target as i64).wrapping_sub(place as i64) >> 2;
+            // Same untagging `apply_aarch64` does, and for the same reason:
+            // with a tagged module image, a raw subtraction here makes every
+            // call look like a +/-128 MiB overflow, so every call takes a
+            // veneer and the PLT exhausts. This check and the one it mirrors
+            // must agree, or a load fails for a reason the relocation itself
+            // would not have hit.
+            let words = (crate::elf::reloc::untag_kernel_pub(target) as i64)
+                .wrapping_sub(crate::elf::reloc::untag_kernel_pub(place) as i64)
+                >> 2;
             // Same ±128 MiB bound `apply_aarch64` enforces, checked here so
             // an overflow can be fixed instead of failing the load.
             if !(-(1 << 25)..(1 << 25)).contains(&words) {

@@ -158,6 +158,35 @@ pub fn apply_x86_64(
 }
 
 /// Apply one aarch64 relocation.
+/// Canonicalise a pointer's top byte so a tagged and an untagged address can
+/// be subtracted meaningfully.
+///
+/// Kernel VAs are TTBR1: bits 63:48 are all ones, and an MTE allocation tag
+/// occupies 59:56 of them, so forcing the top byte back to all-ones recovers
+/// the untagged address. Low-half addresses are left alone -- bit 55 clear
+/// means TTBR0, where the untagged form has a zero top byte instead.
+///
+/// aarch64 only by use, not by guard: `apply_x86_64` has the same
+/// subtractions and deliberately does not call this. x86 module VAs carry no
+/// tag, and this would be a no-op there anyway, but the two paths should not
+/// look like they share a contract they do not.
+#[inline]
+fn untag_kernel(a: u64) -> u64 {
+    if a & (1 << 55) != 0 {
+        a | 0xFF00_0000_0000_0000
+    } else {
+        a
+    }
+}
+
+/// [`untag_kernel`] for callers outside this module — the veneer pre-check in
+/// `relocator` must apply the identical rule to the identical operands.
+#[inline]
+#[must_use]
+pub fn untag_kernel_pub(a: u64) -> u64 {
+    untag_kernel(a)
+}
+
 pub fn apply_aarch64(
     dest: &mut [u8],
     loc: usize,
@@ -168,6 +197,20 @@ pub fn apply_aarch64(
 ) -> Result<(), RelocError> {
     let val = (sym_value as i64).wrapping_add(addend) as u64;
     let place = target_addr.wrapping_add(loc as u64);
+    // Displacement forms use these; absolute forms use `val` raw.
+    //
+    // A module image relocated for MTE sits at a VA carrying its domain's tag
+    // (bits 59:56), while a kernel symbol carries the untagged 15. Subtracting
+    // one from the other is off by `(15 - tag) << 56` -- not a small error:
+    // every CALL26 overflows its +/-128 MiB bound, every call demands a PLT
+    // veneer, the PLT exhausts, and the load is refused. That is what the
+    // first attempt at tagged module images actually hit.
+    //
+    // Absolute forms deliberately keep the tag: ABS64 and MOVW_UABS_G3 are how
+    // a module's own pointers acquire it, which is what makes its data
+    // accesses match the granules `module_text::alloc` wrote.
+    let val_u = untag_kernel(val);
+    let place_u = untag_kernel(place);
     match ty {
         R_AARCH64_NONE => Ok(()),
         R_AARCH64_ABS64 => write_u64(dest, loc, val),
@@ -178,11 +221,11 @@ pub fn apply_aarch64(
             write_u32(dest, loc, val as u32)
         }
         R_AARCH64_PREL64 => {
-            let diff = (val as i64).wrapping_sub(place as i64);
+            let diff = (val_u as i64).wrapping_sub(place_u as i64);
             write_u64(dest, loc, diff as u64)
         }
         R_AARCH64_PREL32 => {
-            let diff = (val as i64).wrapping_sub(place as i64);
+            let diff = (val_u as i64).wrapping_sub(place_u as i64);
             if diff < i32::MIN as i64 || diff > i32::MAX as i64 {
                 return Err(RelocError::Overflow);
             }
@@ -192,7 +235,7 @@ pub fn apply_aarch64(
             // PC-relative ±128 MiB branch with 26-bit immediate, low
             // 2 bits implicit-zero (4-byte aligned).
             // Linux ref: `arch/arm64/kernel/module.c:415`.
-            let diff = (val as i64).wrapping_sub(place as i64);
+            let diff = (val_u as i64).wrapping_sub(place_u as i64);
             if (diff & 0x3) != 0 {
                 return Err(RelocError::Overflow);
             }
@@ -208,8 +251,11 @@ pub fn apply_aarch64(
         R_AARCH64_ADR_PREL_PG_HI21 => {
             // ADRP-style: high 21 bits of the page diff.
             // Linux ref: `arch/arm64/kernel/module.c:376`.
-            let page_val = val & !0xFFF;
-            let page_place = place & !0xFFF;
+            // Untagged first, then page-masked: masking the low 12 bits
+            // does not clear bit 56, so `val & !0xFFF` would keep the tag --
+            // the easiest arm here to believe is already safe.
+            let page_val = val_u & !0xFFF;
+            let page_place = place_u & !0xFFF;
             let diff = (page_val as i64).wrapping_sub(page_place as i64) >> 12;
             if !(-(1 << 20)..(1 << 20)).contains(&diff) {
                 return Err(RelocError::Overflow);

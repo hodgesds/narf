@@ -445,6 +445,82 @@ fn smoke_elf_parse_valid_header() -> TestResult {
 }
 kernel_test_in!("modules/elf", smoke_elf_parse_valid_header);
 
+/// Tagging the place must not change any displacement a relocation computes.
+///
+/// This is the step-6 addressing contract stated as a property: relocating a
+/// module image at a VA carrying its MTE domain tag must produce byte-identical
+/// output to relocating it untagged, for every PC-relative form. If the tag
+/// leaks into a subtraction it does not shift the result slightly — it moves it
+/// by `(15 - tag) << 56`, so a `CALL26` overflows its ±128 MiB bound, takes a
+/// PLT veneer it does not need, and the PLT exhausts. That is precisely how the
+/// first attempt at tagged module images failed to load a real `.ko`.
+///
+/// Written as a direct call into `apply_aarch64` rather than through a module
+/// load because the reference `.ko` emits only `CALL26` and `JUMP26` of the
+/// five affected forms. `PREL32`, `PREL64` and `ADR_PREL_PG_HI21` are not in it
+/// at all, so a load-driven test would leave three of the five fixes unexercised
+/// while looking like coverage.
+#[cfg(target_arch = "aarch64")]
+fn smoke_reloc_displacements_ignore_the_place_tag() -> TestResult {
+    use crate::elf::reloc::{
+        apply_aarch64, R_AARCH64_ABS64, R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_CALL26,
+        R_AARCH64_JUMP26, R_AARCH64_PREL32, R_AARCH64_PREL64,
+    };
+
+    // A plausible module VA and a kernel symbol a short, encodable distance
+    // away — inside ±128 MiB so `CALL26` is representable without a veneer.
+    const PLAIN: u64 = 0xFFFF_FF7F_F800_0000;
+    const SYM: u64 = PLAIN + 0x10_0000;
+    // Domain 3's tag under the `D - 1` mapping, in bits 59:56.
+    const TAGGED: u64 = (PLAIN & !(0xF << 56)) | (2u64 << 56);
+
+    for ty in [
+        R_AARCH64_PREL64,
+        R_AARCH64_PREL32,
+        R_AARCH64_CALL26,
+        R_AARCH64_JUMP26,
+        R_AARCH64_ADR_PREL_PG_HI21,
+    ] {
+        let mut plain = [0u8; 16];
+        let mut tagged = [0u8; 16];
+        let a = apply_aarch64(&mut plain, 0, PLAIN, SYM, 0, ty);
+        let b = apply_aarch64(&mut tagged, 0, TAGGED, SYM, 0, ty);
+        // The untagged run must succeed, or both could fail identically and
+        // this would pass while proving nothing.
+        if a.is_err() {
+            return TestResult::Fail("the untagged relocation did not apply");
+        }
+        if b.is_err() {
+            return TestResult::Fail("the tagged relocation overflowed");
+        }
+        if plain != tagged {
+            return TestResult::Fail("a displacement changed when the place was tagged");
+        }
+    }
+
+    // Control: an ABSOLUTE form must NOT be tag-invariant. `ABS64` writing the
+    // symbol's address is how an in-module pointer acquires the domain tag, so
+    // a blanket untagging that also stripped it would break the mechanism
+    // while making every assertion above pass.
+    let mut plain = [0u8; 16];
+    let mut tagged = [0u8; 16];
+    let tagged_sym = (SYM & !(0xF << 56)) | (2u64 << 56);
+    if apply_aarch64(&mut plain, 0, PLAIN, SYM, 0, R_AARCH64_ABS64).is_err()
+        || apply_aarch64(&mut tagged, 0, TAGGED, tagged_sym, 0, R_AARCH64_ABS64).is_err()
+    {
+        return TestResult::Fail("ABS64 did not apply");
+    }
+    if plain == tagged {
+        return TestResult::Fail("ABS64 dropped the symbol's tag");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "modules/elf",
+    smoke_reloc_displacements_ignore_the_place_tag
+);
+
 fn smoke_elf_rejects_class32() -> TestResult {
     let mut bytes = ElfBuilder::new_x86_64()
         .modinfo(&modinfo_text("a", 0))
