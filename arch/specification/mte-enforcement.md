@@ -1,9 +1,8 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.7**. Steps 1–5 are implemented. MTE **is enforcing**, for
-> the BPF arena and nothing else, and the boot report says exactly that:
-> the backend stays `Unenforced` and the arena's tag checking is reported
-> on its own line. This records what exists, what is missing, and the order the
+> Status: **v1.0**. Steps 1–6 are implemented. MTE enforces for the BPF
+> arena **and for driver domains**, and the backend reports `Mte` because
+> that is now true end to end. This records what exists, what is missing, and the order the
 > missing pieces have to land in, because getting that order wrong hangs
 > the machine with no console.
 
@@ -434,3 +433,54 @@ module used them where a synthesized test ELF did not. Before editing, log
 the relocation types the reference module actually emits; a type that
 never appears needs the fix for correctness but cannot be tested, and
 should be marked as such rather than counted as covered.
+
+## Step 6 — done
+
+Module images map `ATTR_TAGGED` with one tag per domain, the loader
+relocates them at `ModuleImage::tagged_base()` so their own accesses carry
+that tag, and `modules::domain::enter` flips TCF. A pointer into an
+image derived from another domain faults;
+`smoke_module_domain_untagged_access_faults_in_scope` pins it with the
+same four-part shape the arena test uses.
+
+`effective_backend()` now reports `Mte`, and
+`smoke_aarch64_report_matches_enforcement` was inverted to match — it
+previously pinned `Unenforced` *because* the flip reached only
+`bpf::domain::enter`. That inversion is the intended shape: the report and
+the enforcement behind it move together, so a future regression in module
+confinement fails that test rather than quietly widening the claim.
+
+### What the audit missed
+
+The relocation audit above named five arms plus the relocator's veneer
+pre-check. It missed a third site in the same class: `plt.rs`'s
+`encode_veneer`, which computes an ADRP page displacement between a
+tagged veneer address and an untagged kernel target. Every veneer refused
+to encode and the load failed as `PltExhausted` — an arena-full error for
+an empty PLT.
+
+The audit went file by file through the two places the arithmetic was
+expected to live. The pattern, not the location, is what identifies these:
+any subtraction of two addresses where one can come from a module image
+and the other from the kernel. That is the search to run before adding a
+sixth tagged region.
+
+### The exemption, stated plainly
+
+FRAME (domain 0) is untagged. Fifteen usable tags cannot cover sixteen
+domains, because tag 15 is what every untagged kernel pointer already
+reads as. FRAME is the right one to give up — it is the TCB, its memory is
+not Tagged Normal, and `enter_domain` leaves it reachable from every
+domain by design — but it is an exemption, and boot prints it on its own
+line rather than leaving it to be discovered in the source.
+
+### What this still is not
+
+MTE gives arena-vs-not-arena and image-vs-image isolation: a pointer
+*derived* elsewhere carries a different tag and faults. It is not a
+capability boundary. A pointer handed across a domain boundary keeps its
+tag and keeps working, and a module's heap from `narf_kmalloc`, the
+globals behind the four exported ABI functions, and its kernel stack are
+plain Normal memory and unchecked. Extending past the image is the
+MTE-aware slab that `mte.rs` calls Stage-3 tag storage, and it is not
+started.

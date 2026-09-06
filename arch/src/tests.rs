@@ -47,16 +47,25 @@ fn smoke_aarch64_report_matches_enforcement() -> TestResult {
     use crate::aarch64::{mte, Mte};
     use crate::{effective_backend, DomainBackend, DomainPrimitive};
 
-    if effective_backend() != DomainBackend::Unenforced {
-        return TestResult::Fail(
-            "aarch64 names an enforcer while module domain entry is unconfined",
-        );
+    // The report tracks the hardware, because the enforcement does. With MTE
+    // the backend must name itself; without it there is no fallback on this
+    // architecture and `Unenforced` is the only honest answer.
+    //
+    // This assertion was the other way round until driver-domain enforcement
+    // landed: it pinned `Unenforced` because the TCF flip reached only
+    // `bpf::domain::enter`, leaving module domains unconfined. Flipping it is
+    // the last step of `mte-enforcement.md`, and it is deliberately the test
+    // that has to change rather than a comment — the report and what is
+    // actually enforced move together or not at all.
+    let want = if mte::supported() {
+        DomainBackend::Mte
+    } else {
+        DomainBackend::Unenforced
+    };
+    if effective_backend() != want {
+        return TestResult::Fail("the reported backend does not match what is enforced");
     }
 
-    // The other half of what boot prints: tag checking IS active. Asserted so
-    // the pair cannot drift into reporting "NONE" on a machine where the flip
-    // silently stopped happening, which would be honest about the enforcer and
-    // wrong about the arena.
     if !mte::supported() {
         return TestResult::Pass;
     }
