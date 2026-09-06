@@ -63,7 +63,6 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64));
         return;
     }
-    socket_arc_register(&sock);
     let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: sock.clone(),
             offset: 0,

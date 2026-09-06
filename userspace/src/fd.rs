@@ -139,6 +139,11 @@ pub struct FdTable {
     slots: Vec<Option<FdEntry>>,
     /// Parallel to `slots`. An occupied fd always has exactly one description.
     descriptions: Vec<Option<Description>>,
+    /// Exact lowest descriptor that is neither open nor reserved. Keeping the
+    /// same cursor as Linux's `files_struct::next_fd` makes the common
+    /// monotonically-growing allocation path O(1), while close/release lowers
+    /// it so POSIX lowest-free reuse remains exact.
+    next_fd: usize,
     /// In-flight fd-number reservations (fanotify delivery). Reserved slots
     /// are not visible through get()/procfs/fork and contain no published file,
     /// but concurrent opens skip them until commit or rollback.
@@ -176,6 +181,7 @@ impl FdTable {
         Self {
             slots: Vec::new(),
             descriptions: Vec::new(),
+            next_fd: 0,
             reserved: BTreeSet::new(),
             max_fds: Self::INITIAL_MAX_FDS,
             // Until a task's rlimits are consulted, impose no limit: the
@@ -273,13 +279,24 @@ impl FdTable {
     /// call. Without the bound the search ran forever upward and NARF could
     /// never report -EMFILE — so a descriptor leak grew without limit instead
     /// of failing at the point the program could still notice.
-    fn next_free_from(&self, mut candidate: usize) -> Option<usize> {
+    fn unavailable(&self, candidate: usize) -> bool {
+        self.slots.get(candidate).is_some_and(Option::is_some)
+            || self.reserved.contains(&(candidate as u32))
+    }
+
+    fn advance_next_fd(&mut self) {
+        while self.unavailable(self.next_fd) {
+            self.next_fd = self.next_fd.saturating_add(1);
+        }
+    }
+
+    fn next_free_from(&self, candidate: usize) -> Option<usize> {
+        let mut candidate = candidate.max(self.next_fd);
         loop {
             if candidate as u64 >= self.nofile_limit {
                 return None;
             }
-            let occupied = self.slots.get(candidate).is_some_and(Option::is_some);
-            if !occupied && !self.reserved.contains(&(candidate as u32)) {
+            if !self.unavailable(candidate) {
                 return Some(candidate);
             }
             candidate = candidate.saturating_add(1);
@@ -302,6 +319,10 @@ impl FdTable {
         self.slots[i] = Some(entry);
         self.descriptions[i] = Some(description);
         self.reserved.remove(&fd);
+        if i == self.next_fd {
+            self.next_fd = self.next_fd.saturating_add(1);
+            self.advance_next_fd();
+        }
     }
 
     /// Reserve lowest-free fd numbers without publishing FileOps. Used by
@@ -313,24 +334,22 @@ impl FdTable {
     /// table exactly as it was.
     pub(crate) fn reserve_fds(&mut self, count: usize) -> Option<Vec<u32>> {
         let mut out = Vec::with_capacity(count);
-        let mut candidate = 0u32;
         while out.len() < count {
-            if u64::from(candidate) >= self.nofile_limit {
+            let Some(candidate) = self.next_free_from(0) else {
                 for fd in &out {
                     self.reserved.remove(fd);
                 }
+                if let Some(fd) = out.iter().min() {
+                    self.next_fd = self.next_fd.min(*fd as usize);
+                }
                 return None;
-            }
-            let occupied = self
-                .slots
-                .get(candidate as usize)
-                .is_some_and(Option::is_some);
-            if !occupied && !self.reserved.contains(&candidate) {
-                self.reserved.insert(candidate);
-                self.grow_max_fds_for(candidate as usize);
-                out.push(candidate);
-            }
-            candidate = candidate.saturating_add(1);
+            };
+            let candidate = candidate as u32;
+            self.reserved.insert(candidate);
+            self.grow_max_fds_for(candidate as usize);
+            out.push(candidate);
+            self.next_fd = self.next_fd.saturating_add(1);
+            self.advance_next_fd();
         }
         Some(out)
     }
@@ -351,7 +370,9 @@ impl FdTable {
 
     pub(crate) fn release_reserved(&mut self, fds: &[u32]) {
         for fd in fds {
-            self.reserved.remove(fd);
+            if self.reserved.remove(fd) {
+                self.next_fd = self.next_fd.min(*fd as usize);
+            }
         }
     }
 
@@ -470,37 +491,40 @@ impl FdTable {
             self.slots.push(None);
             self.descriptions.push(None);
         }
-        self.slots[target] = Some(entry);
-        self.descriptions[target] = Some(description);
-        self.reserved.remove(&(target as u32));
+        self.set_with_description(target as u32, entry, description);
         Some(target as u32)
     }
 
     /// Remove the entry at `fd`. Returns `true` if it existed.
     pub fn close(&mut self, fd: u32) -> bool {
+        self.take(fd).is_some()
+    }
+
+    /// Remove and return the entry at `fd` while retaining its backing object
+    /// for close-time flush and object-specific cleanup outside the table
+    /// lock. Returns `None` when the descriptor was not open.
+    pub(crate) fn take(&mut self, fd: u32) -> Option<FdEntry> {
         let i = fd as usize;
         match self.slots.get_mut(i) {
             Some(slot @ Some(_)) => {
-                *slot = None;
+                let entry = slot.take();
                 self.descriptions[i] = None;
-                true
+                self.next_fd = self.next_fd.min(i);
+                entry
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    /// Whether another descriptor in this table refers to the same open file.
-    pub fn has_other_ops(
+    /// Whether a descriptor in this table refers to `ops`.
+    pub(crate) fn contains_ops(
         &self,
-        fd: u32,
         ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>,
     ) -> bool {
-        self.slots.iter().enumerate().any(|(index, slot)| {
-            index != fd as usize
-                && slot
-                    .as_ref()
-                    .map(|entry| alloc::sync::Arc::ptr_eq(&entry.ops, ops))
-                    .unwrap_or(false)
+        self.slots.iter().any(|slot| {
+            slot.as_ref()
+                .map(|entry| alloc::sync::Arc::ptr_eq(&entry.ops, ops))
+                .unwrap_or(false)
         })
     }
 
@@ -517,6 +541,7 @@ impl FdTable {
         if hi < lo {
             return;
         }
+        let mut lowest_closed = None;
         for (relative, slot) in self.slots[lo..=hi].iter_mut().enumerate() {
             if let Some(entry) = slot {
                 if cloexec {
@@ -524,8 +549,12 @@ impl FdTable {
                 } else {
                     *slot = None;
                     self.descriptions[lo + relative] = None;
+                    lowest_closed.get_or_insert(lo + relative);
                 }
             }
+        }
+        if let Some(fd) = lowest_closed {
+            self.next_fd = self.next_fd.min(fd);
         }
     }
 
@@ -535,14 +564,19 @@ impl FdTable {
     /// when this was the last holder).
     pub fn close_cloexec_slots(&mut self) -> usize {
         let mut n = 0;
+        let mut lowest_closed = None;
         for (i, slot) in self.slots.iter_mut().enumerate() {
             if let Some(entry) = slot {
                 if entry.flags & FD_CLOEXEC != 0 {
                     *slot = None;
                     self.descriptions[i] = None;
+                    lowest_closed.get_or_insert(i);
                     n += 1;
                 }
             }
+        }
+        if let Some(fd) = lowest_closed {
+            self.next_fd = self.next_fd.min(fd);
         }
         n
     }
@@ -1435,6 +1469,10 @@ pub fn fork(parent: u64, child: u64) -> usize {
     child_table.slots = parent_slots;
     child_table.descriptions = parent_descriptions;
     child_table.max_fds = parent_max_fds;
+    // Reservations describe unpublished parent-side transactions and are not
+    // inherited. Recompute instead of copying the parent's cursor, which may
+    // have advanced past slots that are immediately free in the child.
+    child_table.advance_next_fd();
     TABLES[table_shard(child)]
         .lock()
         .insert(child, Arc::new(IrqSafeSpinLock::new(child_table)));
@@ -1443,7 +1481,7 @@ pub fn fork(parent: u64, child: u64) -> usize {
 
 /// Whether any fd table OTHER than `closing_task`'s still holds `ops`.
 ///
-/// `FdTable::has_other_ops` only sees one process's descriptors, so after a
+/// `FdTable::contains_ops` only sees one process's descriptors, so after a
 /// fork every process believes it owns the last copy of an inherited file
 /// description. For a bound AF_UNIX socket that is the difference between
 /// "the last descriptor closed, release the path" and "a child dropped its
