@@ -521,6 +521,119 @@ kernel_test_in!(
     smoke_reloc_displacements_ignore_the_place_tag
 );
 
+/// The enforcement: inside a module's domain scope, a pointer into its image
+/// that does not carry the domain's tag faults; one that does, works.
+///
+/// This is what "driver domains are isolated on aarch64" has to mean, and the
+/// assertion the whole of step 6 exists to make true. Without the in-scope
+/// fault the tagging is bookkeeping — pages marked Tagged Normal, granules
+/// carrying a tag, and nothing ever checking either.
+///
+/// The out-of-scope half matters as much: it shows the enforcement is
+/// *scoped*. A test that only proved the fault would pass equally on a system
+/// where tag checking was simply always on, which is a different and far more
+/// dangerous machine than the one being built.
+#[cfg(target_arch = "aarch64")]
+fn smoke_module_domain_untagged_access_faults_in_scope() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::aarch64::{mte, probe};
+    use narf_lib::id::DomainId;
+    use narf_memory::module_text::{alloc, free};
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let img = match alloc(1, DomainId::SCRATCH) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
+    };
+    let plain = img.base;
+    let tagged = img.tagged_base();
+    if tagged == plain {
+        // SAFETY: nothing was executed from this image.
+        unsafe { free(img) };
+        return TestResult::Fail("SCRATCH's image is untagged, so nothing could fault");
+    }
+
+    // Control: the untagged pointer works with TCF at Ignore. If it faults
+    // here the page is simply not mapped and the rest proves nothing.
+    // SAFETY: byte 0 of a page `alloc` just mapped RW at EL1.
+    let before = unsafe { core::ptr::read_volatile(plain as *const u64) };
+
+    // Control: the TAGGED pointer works inside the scope. That is the path
+    // relocated module code takes, so a fault here is a regression rather
+    // than enforcement.
+    let inside_tagged = {
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        // SAFETY: same page, addressed with the tag its granules carry.
+        let v = unsafe { core::ptr::read_volatile(tagged as *const u64) };
+        crate::domain::exit(scope);
+        v
+    };
+
+    // The enforcement: untagged pointer, in scope, expected to fault.
+    let caught = {
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        let recovery: u64;
+        // SAFETY: ADR of a local label, resolved forward into the block below.
+        unsafe {
+            asm!("adr {r}, 99f", r = out(reg) recovery, options(nostack, preserves_flags));
+        }
+        probe::arm(recovery);
+        // SAFETY: the load is expected to raise a synchronous tag check fault;
+        // the armed probe redirects ELR_EL1 to `99:` instead of taking the
+        // fatal path. Module code has no exception-table entry, so without the
+        // probe this would be fatal rather than reported.
+        unsafe {
+            asm!(
+                "ldr {t}, [{p}]",
+                "99:",
+                p = in(reg) plain,
+                t = out(reg) _,
+                options(nostack),
+            );
+        }
+        let c = probe::disarm();
+        crate::domain::exit(scope);
+        c
+    };
+
+    // Control: still fine outside the scope, and TCF was restored.
+    // SAFETY: as the first read.
+    let after = unsafe { core::ptr::read_volatile(plain as *const u64) };
+    // SAFETY: MRS SCTLR_EL1.
+    let tcf_after = unsafe { mte::tcf_mode() };
+
+    // SAFETY: nothing was ever executed from this image.
+    unsafe { free(img) };
+
+    if inside_tagged != before {
+        return TestResult::Fail("the tagged pointer read a different value inside the scope");
+    }
+    if !caught.fired {
+        return TestResult::Fail("untagged access inside a module domain scope did not fault");
+    }
+    // DFSC 0b010001 is a Synchronous Tag Check Fault specifically. A
+    // translation or permission fault here would mean the mapping is wrong,
+    // not that tag checking works.
+    const DFSC_TAG_CHECK: u64 = 0b01_0001;
+    if caught.esr & 0x3F != DFSC_TAG_CHECK {
+        return TestResult::Fail("the fault was not a synchronous tag check fault");
+    }
+    if after != before {
+        return TestResult::Fail("the untagged read outside the scope changed value");
+    }
+    if tcf_after != mte::TCF_IGNORE {
+        return TestResult::Fail("TCF was left Sync after the scope exited");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "modules/domain",
+    smoke_module_domain_untagged_access_faults_in_scope
+);
+
 fn smoke_elf_rejects_class32() -> TestResult {
     let mut bytes = ElfBuilder::new_x86_64()
         .modinfo(&modinfo_text("a", 0))

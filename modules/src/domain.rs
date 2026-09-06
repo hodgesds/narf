@@ -109,6 +109,10 @@ pub fn resolve(name: &str) -> Result<DomainId, DomainError> {
 pub struct DomainScope {
     #[cfg(target_arch = "x86_64")]
     saved: narf_arch::x86_64::pks::SavedPkrs,
+    /// `None` when MTE is absent, so `exit` does not write `SCTLR_EL1` back on
+    /// a CPU where `enter` never touched it.
+    #[cfg(target_arch = "aarch64")]
+    saved: Option<narf_arch::aarch64::mte::SavedMteState>,
 }
 
 /// Enter `domain` — deny every PKS domain except the kernel's and this one.
@@ -156,7 +160,30 @@ pub fn enter(domain: DomainId) -> DomainScope {
             saved: narf_arch::x86_64::pks::SavedPkrs(0),
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        use narf_arch::aarch64::{mte, Mte};
+        use narf_arch::DomainPrimitive;
+        if mte::supported() {
+            // The image's pages are `ATTR_TAGGED` with the domain's tag in
+            // every granule (`memory::module_text`), and the loader relocated
+            // against `tagged_base()`, so the module's own accesses carry that
+            // tag. Flipping TCF to Sync therefore makes a pointer into this
+            // image derived from another domain fault -- the aarch64
+            // equivalent of narrowing IA32_PKRS.
+            //
+            // Safe for everything else it touches: checks apply only to
+            // `ATTR_TAGGED` pages, and the heap from `narf_kmalloc`, the
+            // globals behind the four exported ABI functions, and its kernel
+            // stack are all plain Normal.
+            //
+            // SAFETY: MTE is present; both ids are 0..=15.
+            let saved = unsafe { Mte::enter_domain(DomainId::FRAME.raw(), domain.raw()) };
+            return DomainScope { saved: Some(saved) };
+        }
+        DomainScope { saved: None }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = domain;
         DomainScope {}
@@ -181,7 +208,17 @@ pub fn exit(scope: DomainScope) {
             };
         }
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        if let Some(saved) = scope.saved {
+            // SAFETY: `saved` came from the matching `enter_domain`. Must run
+            // even when the module's entry point returned an error: leaving
+            // TCF at Sync would make every later untagged access to any tagged
+            // page fault, arbitrarily far from here.
+            unsafe { <narf_arch::aarch64::Mte as narf_arch::DomainPrimitive>::exit_domain(saved) };
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = scope;
     }
