@@ -1391,3 +1391,55 @@ kernel_test_in!(
     "modules/manifest",
     smoke_manifest_spans_multiple_modinfo_sections
 );
+
+/// `current_domain()` reports the domain whose scope is open, and restores
+/// the previous one on exit — including through nesting.
+///
+/// The hook behind it returned a hardcoded 0 until domain scopes started
+/// recording themselves, so every caller read `FRAME` regardless of what was
+/// running. That is not a harmless stub: `block::encrypted` asserts it runs
+/// as `KEYS`, and the assertion passed by comparing FRAME against FRAME.
+///
+/// Arch-neutral, and deliberately so. The tracking is not derived from
+/// `IA32_PKRS` or `SCTLR_EL1.TCF` — those say what is permitted, and on a CPU
+/// with no active backend they say nothing — so it must hold on x86 without
+/// PKS and on aarch64 without MTE just as it does with them.
+fn smoke_domain_scope_tracks_the_current_domain() -> TestResult {
+    use narf_lib::assert::current_domain;
+    use narf_lib::id::DomainId;
+
+    if current_domain() != DomainId::FRAME {
+        return TestResult::Fail("not in FRAME before any scope was entered");
+    }
+
+    let outer = crate::domain::enter(DomainId::SCRATCH);
+    if current_domain() != DomainId::SCRATCH {
+        crate::domain::exit(outer);
+        return TestResult::Fail("current_domain did not follow the scope");
+    }
+
+    // Nested: a BPF program can run from inside a module's init(), so the
+    // inner scope must restore the outer domain rather than reset to FRAME.
+    let inner = crate::domain::enter(DomainId::KEYS);
+    let nested_ok = current_domain() == DomainId::KEYS;
+    crate::domain::exit(inner);
+    let restored_to_outer = current_domain() == DomainId::SCRATCH;
+
+    crate::domain::exit(outer);
+    let restored_to_frame = current_domain() == DomainId::FRAME;
+
+    if !nested_ok {
+        return TestResult::Fail("a nested scope did not report its own domain");
+    }
+    if !restored_to_outer {
+        return TestResult::Fail("leaving a nested scope did not restore the outer domain");
+    }
+    if !restored_to_frame {
+        return TestResult::Fail("leaving the outer scope did not restore FRAME");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/domain",
+    smoke_domain_scope_tracks_the_current_domain
+);

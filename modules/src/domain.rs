@@ -107,6 +107,10 @@ pub fn resolve(name: &str) -> Result<DomainId, DomainError> {
 /// pages by domain yet.
 #[derive(Debug)]
 pub struct DomainScope {
+    /// The domain this CPU was in before `enter`. Restored by `exit` rather
+    /// than reset to FRAME, because scopes nest: a BPF program invoked from
+    /// inside a module's `init()` opens a second one.
+    prev_domain: u8,
     #[cfg(target_arch = "x86_64")]
     saved: narf_arch::x86_64::pks::SavedPkrs,
     /// `None` when MTE is absent, so `exit` does not write `SCTLR_EL1` back on
@@ -140,6 +144,11 @@ pub struct DomainScope {
 /// CR4.PCIDE, or another architecture. `enter_domain` itself declines in that
 /// case, and the boot log says so.
 pub fn enter(domain: DomainId) -> DomainScope {
+    // Record the scope before narrowing anything. `current_domain()` is what
+    // makes a per-domain decision possible further down -- a tagged heap
+    // allocation has to know whose it is -- and it must be true for the whole
+    // scope, including the part of `enter` that follows.
+    let prev_domain = narf_arch::enter_domain_scope(domain.raw());
     #[cfg(target_arch = "x86_64")]
     {
         if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {
@@ -152,11 +161,12 @@ pub fn enter(domain: DomainId) -> DomainScope {
                     domain.raw(),
                 )
             };
-            return DomainScope { saved };
+            return DomainScope { prev_domain, saved };
         }
         // Inactive: capture the current value so `exit` restores exactly
         // what was there rather than assuming all-allow.
         DomainScope {
+            prev_domain,
             saved: narf_arch::x86_64::pks::SavedPkrs(0),
         }
     }
@@ -179,14 +189,20 @@ pub fn enter(domain: DomainId) -> DomainScope {
             //
             // SAFETY: MTE is present; both ids are 0..=15.
             let saved = unsafe { Mte::enter_domain(DomainId::FRAME.raw(), domain.raw()) };
-            return DomainScope { saved: Some(saved) };
+            return DomainScope {
+                prev_domain,
+                saved: Some(saved),
+            };
         }
-        DomainScope { saved: None }
+        DomainScope {
+            prev_domain,
+            saved: None,
+        }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
         let _ = domain;
-        DomainScope {}
+        DomainScope { prev_domain }
     }
 }
 
@@ -196,6 +212,7 @@ pub fn enter(domain: DomainId) -> DomainScope {
 /// PKRS narrowed would deny the rest of the kernel access to every domain
 /// but two, and the fault would land arbitrarily far from here.
 pub fn exit(scope: DomainScope) {
+    narf_arch::exit_domain_scope(scope.prev_domain);
     #[cfg(target_arch = "x86_64")]
     {
         if narf_arch::x86_64::pks::is_active() || narf_arch::x86_64::pcid::is_active() {

@@ -40,6 +40,10 @@ use core::future::Future;
 #[derive(Debug)]
 #[must_use = "confinement ends the moment the guard is dropped"]
 pub struct Confined {
+    /// Domain this CPU was in before the guard, restored on drop. Scopes nest
+    /// -- a BPF program can run from inside a module's `init()` -- so this
+    /// restores rather than resetting to FRAME.
+    prev_domain: u8,
     /// The saved domain state to restore on exit, or `None` when no backend is
     /// live (then this guard is inert). On x86_64 the unified `Pks` enforcer's
     /// `SavedState` opaquely carries either a PKRS value (PKS) or a `CR3` value
@@ -64,6 +68,10 @@ pub struct Confined {
 /// reads under MTE, and a plain construction when no backend is live.
 #[inline]
 pub fn enter() -> Confined {
+    // Record the scope before narrowing. `current_domain()` must be true for
+    // the whole guard, and BPF is a domain like any other: code that asks
+    // which domain it is running in should get BPF here, not FRAME.
+    let prev_domain = narf_arch::enter_domain_scope(narf_lib::id::DomainId::BPF.raw());
     let preempt = narf_scheduler::preempt_disable();
     #[cfg(target_arch = "x86_64")]
     {
@@ -81,12 +89,14 @@ pub fn enter() -> Confined {
             // stays mapped). Balanced by `Pks::exit_domain` in `Drop`.
             let saved = unsafe { Pks::enter_domain(DomainId::FRAME.raw(), DomainId::BPF.raw()) };
             return Confined {
+                prev_domain,
                 saved: Some(saved),
                 _not_send: core::marker::PhantomData,
                 _preempt: preempt,
             };
         }
         Confined {
+            prev_domain,
             saved: None,
             _not_send: core::marker::PhantomData,
             _preempt: preempt,
@@ -104,12 +114,14 @@ pub fn enter() -> Confined {
             // task); balanced by `Mte::exit_domain` in `Drop`.
             let saved = unsafe { Mte::enter_domain(DomainId::FRAME.raw(), DomainId::BPF.raw()) };
             return Confined {
+                prev_domain,
                 saved: Some(saved),
                 _not_send: core::marker::PhantomData,
                 _preempt: preempt,
             };
         }
         Confined {
+            prev_domain,
             saved: None,
             _not_send: core::marker::PhantomData,
             _preempt: preempt,
@@ -144,6 +156,7 @@ pub async fn run_sleepable<F: Future>(future: F) -> F::Output {
 impl Drop for Confined {
     #[inline]
     fn drop(&mut self) {
+        narf_arch::exit_domain_scope(self.prev_domain);
         #[cfg(target_arch = "x86_64")]
         if let Some(saved) = self.saved {
             use narf_arch::DomainPrimitive;
