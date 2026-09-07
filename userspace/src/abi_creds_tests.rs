@@ -1658,6 +1658,7 @@ kernel_test_in!("syscall_abi", smoke_abi_caps_mount_efault_precedes_eperm);
 /// full capability set that also worked on the HOST would be an escalation
 /// available to any process, since creating a user namespace needs no
 /// privilege at all.
+#[cfg(feature = "container")]
 fn smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace() -> TestResult {
     with_setup(|| {
         const CLONE_NEWUTS: u64 = 0x0400_0000;
@@ -1695,6 +1696,7 @@ fn smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace() -> TestRe
         Ok(())
     })
 }
+#[cfg(feature = "container")]
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_caps_newuser_grants_authority_only_inside_the_namespace
@@ -1712,6 +1714,7 @@ kernel_test_in!(
 ///
 /// Asking the host question for both — what `capable()` does — gets one of
 /// them wrong whichever way the caller's credentials happen to fall.
+#[cfg(feature = "container")]
 fn smoke_abi_caps_mount_follows_the_mount_namespace_owner() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
@@ -1762,6 +1765,7 @@ fn smoke_abi_caps_mount_follows_the_mount_namespace_owner() -> TestResult {
         }
     })
 }
+#[cfg(feature = "container")]
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_caps_mount_follows_the_mount_namespace_owner
@@ -1884,6 +1888,7 @@ kernel_test_in!("syscall_abi", smoke_abi_caps_setns_einval_precedes_eperm);
 ///
 /// The wrong-type arm below shares the fixture and pins the other -EINVAL:
 /// `flags && ns->ns_type != flags`, also decided before any capability test.
+#[cfg(feature = "container")]
 fn smoke_abi_caps_setns_user_ns_reentry_is_einval() -> TestResult {
     with_setup(|| {
         const CLONE_NEWUSER: u64 = 0x1000_0000;
@@ -1913,6 +1918,7 @@ fn smoke_abi_caps_setns_user_ns_reentry_is_einval() -> TestResult {
         }
     })
 }
+#[cfg(feature = "container")]
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_caps_setns_user_ns_reentry_is_einval
