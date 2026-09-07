@@ -418,6 +418,12 @@ pub struct UserTaskCtx {
     /// a full watchdog interval with a ready fd and no scan means the
     /// syscall genuinely never re-executes.
     pub dbg_poll_strand_latch: AtomicU64,
+    /// LIFO metadata for nested userspace signal handlers. Signal delivery
+    /// and `rt_sigreturn` both execute on this task, so keeping the stack in
+    /// its stable context avoids a global lock + task-id B-tree lookup on
+    /// every handled signal. The vector retains capacity between handlers and
+    /// is reclaimed with the task.
+    pub(crate) sigreturn_stack: UnsafeCell<alloc::vec::Vec<crate::handlers::SigReturnRecord>>,
 }
 
 /// Recorded-fd window for [`UserTaskCtx::poll_wait_fds`]. Qt/glib main
@@ -494,6 +500,7 @@ impl UserTaskCtx {
             poll_wait_nfds: AtomicU32::new(0),
             dbg_poll_scans: AtomicU64::new(0),
             dbg_poll_strand_latch: AtomicU64::new(0),
+            sigreturn_stack: UnsafeCell::new(alloc::vec::Vec::new()),
         }
     }
 }

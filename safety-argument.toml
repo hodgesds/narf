@@ -815,3 +815,7 @@ argument = "The task-owned Waker slot contains only the executor's existing sche
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "Task-exit cleanup removes only descriptor-path compatibility metadata keyed by the exiting never-reused TaskId; shared file objects and descriptor-table ownership remain governed by their existing Arc lifetimes. Reap serializes rlimit-row removal and retained-target revalidation in one RLIMIT_TABLE-before-task-registry lock order, so prlimit64 either completes before reap or observes ESRCH afterward without a permanent tombstone. Neither cleanup path grants access, changes mappings, or permits state from a recycled ProcessId to authorize another task."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "x86 signal-frame writes remain inside the existing recoverable guarded-uaccess window: present writable pages copy directly; demand, stack-growth, and COW faults run before probe recovery; and an invalid, read-only, overflowed, or concurrently unmapped destination reaches the per-CPU fixup and fails delivery without exposing kernel memory or panicking the frame. Removing the redundant preflight changes neither user-range authority nor page-table permissions."
