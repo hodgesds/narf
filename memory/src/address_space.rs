@@ -5551,6 +5551,37 @@ impl AddressSpace {
         }
     }
 
+    /// Cross-CPU invalidation of `pages` pages at `base` that is NOT gated on
+    /// `vm_shared`. `flush_region_broadcast`'s gate assumes the caller is a
+    /// thread of this AS (so a single-threaded AS can only be resident on the
+    /// calling CPU); page migration runs from a foreign task (compaction,
+    /// `migrate_pages(2)`), where the owner may be resident on any CPU. The
+    /// caller has already completed the local invalidation.
+    fn flush_range_all_cpus(&self, base: VirtAddr, pages: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+            if pages == 0 {
+                return;
+            }
+            if pages > FULL_FLUSH_PAGE_CEILING {
+                // SAFETY: CPL=0; the page-table helper already completed the
+                // current CPU's local invalidation phase.
+                unsafe { crate::x86_64::paging::flush_user_tlb_local() };
+                crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+            } else {
+                crate::tlb_shootdown::shootdown_remote(
+                    crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
+                );
+            }
+        }
+        // aarch64: the unmap's TLBI already covers the shareability domain.
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (base, pages);
+        }
+    }
+
     /// Walk a region's per-page PTEs, unmap each, and return its
     /// frame to the allocator. Used by `unmap_region` and by
     /// `Drop for AddressSpace`.
@@ -5924,6 +5955,50 @@ impl AddressSpace {
 
     /// Return whether `vaddr` belongs to a registered base-page or hardware
     /// huge-page region.
+    /// Diagnostic: describe the VMA bookkeeping and per-page backing state at
+    /// `vaddr` (region bounds/perms, the `phys` slot, and any swap transition)
+    /// as one line. Read-only; intended for one-shot fault forensics.
+    pub fn debug_page_backing(&self, vaddr: VirtAddr) -> alloc::string::String {
+        use core::fmt::Write as _;
+        let v = vaddr.as_u64() & !0xFFFu64;
+        let mut out = alloc::string::String::new();
+        if let Some(region) = self
+            .huge_regions
+            .lock()
+            .iter()
+            .find(|r| v >= r.base.as_u64() && v < r.base.as_u64().saturating_add(r.len))
+        {
+            let _ = write!(
+                out,
+                "huge base={:#x} len={:#x} perms={:?}",
+                region.base.as_u64(),
+                region.len,
+                region.perms
+            );
+            return out;
+        }
+        let table = self.regions.lock();
+        match table.containing(v) {
+            Some(region) => {
+                let index = ((v - region.base.as_u64()) >> 12) as usize;
+                let slot = region.phys.get(index).map(|p| p.raw());
+                let _ = write!(
+                    out,
+                    "region base={:#x} len={:#x} perms={:?} slot={:x?}",
+                    region.base.as_u64(),
+                    region.len,
+                    region.perms,
+                    slot
+                );
+            }
+            None => {
+                let _ = write!(out, "region=<none>");
+            }
+        }
+        let _ = write!(out, " swap={:?}", table.swap_pages.get(&v));
+        out
+    }
+
     pub fn contains_address(&self, vaddr: VirtAddr) -> bool {
         let v = vaddr.as_u64();
         if self.huge_regions.lock().iter().any(|region| {
@@ -9440,80 +9515,16 @@ impl AddressSpace {
         let new_frame = crate::frame::alloc_user_frame_on_strict(target_node)
             .map_err(|_| AddressSpaceError::OutOfRange)?;
         let new_phys = new_frame.start_address();
-        // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                old_phys.kernel_ptr::<u8>(),
-                new_phys.kernel_mut_ptr::<u8>(),
-                crate::frame::PAGE_SIZE as usize,
-            );
-        }
-
-        // SAFETY: the live AS owns the page-table root; page_va and both
-        // physical frames were validated from its private region.
-        let map_result = unsafe {
-            #[cfg(target_arch = "x86_64")]
-            {
-                use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
-                let mut flags = PtFlags::USER;
-                if user_page_writable(region.perms, new_phys) {
-                    flags |= PtFlags::WRITABLE;
-                }
-                if !region.perms.contains(RegionPerms::EXEC) {
-                    flags |= PtFlags::NO_EXEC;
-                }
-                let _ = unmap_4kb_local(self.root, page_va);
-                map_4kb(self.root, page_va, new_phys, flags)
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
-                let mut flags = if user_page_writable(region.perms, new_phys) {
-                    PtFlags::AP_RW_EL0
-                } else {
-                    PtFlags::AP_RO_EL0
-                };
-                if !region.perms.contains(RegionPerms::EXEC) {
-                    flags = flags | PtFlags::UXN | PtFlags::PXN;
-                }
-                let _ = unmap_4kb(self.root, page_va);
-                map_4kb(self.root, page_va, new_phys, flags)
-            }
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-            {
-                Err(crate::x86_64::paging::MapError::InvalidAddress)
-            }
-        };
-        if map_result.is_err() {
-            // Best-effort rollback: preserve the original mapping if the
-            // replacement leaf could not be installed.
-            #[cfg(target_arch = "x86_64")]
-            {
-                use crate::x86_64::paging::{map_4kb, PtFlags};
-                let mut flags = PtFlags::USER;
-                if user_page_writable(region.perms, old_phys) {
-                    flags |= PtFlags::WRITABLE;
-                }
-                if !region.perms.contains(RegionPerms::EXEC) {
-                    flags |= PtFlags::NO_EXEC;
-                }
-                // SAFETY: same root/page/backing invariants as above.
-                let _ = unsafe { map_4kb(self.root, page_va, old_phys, flags) };
-            }
-            #[cfg(target_arch = "aarch64")]
-            {
-                use crate::aarch64::paging::{map_4kb, PtFlags};
-                let mut flags = if user_page_writable(region.perms, old_phys) {
-                    PtFlags::AP_RW_EL0
-                } else {
-                    PtFlags::AP_RO_EL0
-                };
-                if !region.perms.contains(RegionPerms::EXEC) {
-                    flags = flags | PtFlags::UXN | PtFlags::PXN;
-                }
-                // SAFETY: same root/page/backing invariants as above.
-                let _ = unsafe { map_4kb(self.root, page_va, old_phys, flags) };
-            }
+        let perms = region.perms;
+        // Invalidate-everywhere → copy → install, via the shared relocation
+        // core (see `relocate_leaf` for why the order is load-bearing).
+        // SAFETY: live root; `page_va` maps `old_phys` in this private region;
+        // `new_phys` is a fresh, exclusively-owned frame.
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        let relocated = unsafe { self.relocate_leaf(page_va, perms, old_phys, new_phys) };
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        let relocated: Result<(), ()> = Err(());
+        if relocated.is_err() {
             crate::frame::free_frame(new_frame);
             return Err(AddressSpaceError::NotImplemented);
         }
@@ -9521,17 +9532,17 @@ impl AddressSpace {
         drop(regions);
 
         // The page now maps a fresh frame on the target node: move its rmap
-        // entry so a later reverse-map walk finds the live frame.
+        // entry so a later reverse-map walk finds the live frame. Every CPU's
+        // translation of `page_va` was already invalidated before the copy.
         crate::rmap::remove(old_phys, self.root, page_va);
         crate::rmap::add(new_phys, self.root, page_va);
-
-        self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
         Ok(old_node)
     }
 
-    /// Copy `old_phys` → `new_phys` and atomically repoint the leaf at
-    /// `page_va` from old to new, rolling the leaf back to `old_phys` if the
+    /// Move the page at `page_va` from `old_phys` to `new_phys`: tear the
+    /// leaf down and invalidate it on every CPU, THEN copy the contents, then
+    /// install the new leaf — rolling the leaf back to `old_phys` if the
     /// replacement cannot be installed. Returns `Ok` when `new_phys` is mapped,
     /// `Err(())` (mapping restored to `old_phys`) otherwise.
     ///
@@ -9539,14 +9550,14 @@ impl AddressSpace {
     /// `Region.phys`, the reverse map, the cross-CPU TLB broadcast, or free
     /// either frame — the caller owns that bookkeeping under the region lock.
     /// `perms` is copied out of the region so no borrow is held across the call.
-    /// (`migrate_page_to_node` predates this and still inlines the equivalent
-    /// mechanics; folding it onto this helper is a follow-up.)
+    /// Shared by `relocate_page_inner` (compaction) and `migrate_page_to_node`
+    /// (NUMA migration / hint faults).
     ///
     /// # Safety
     /// `self.root` must be a live root; `page_va` must currently map `old_phys`
     /// in a private region, and `new_phys` must be a fresh, exclusively-owned
     /// frame; the direct map must be live.
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     unsafe fn relocate_leaf(
         &self,
         page_va: VirtAddr,
@@ -9554,7 +9565,40 @@ impl AddressSpace {
         old_phys: PhysAddr,
         new_phys: PhysAddr,
     ) -> Result<(), ()> {
-        // SAFETY: both frames are live, distinct 4 KiB direct-map ranges.
+        // ORDER MATTERS (Linux `migrate_pages` → `try_to_migrate` → copy →
+        // `remove_migration_ptes`): the leaf is torn down and invalidated on
+        // EVERY CPU that may cache it BEFORE the contents are copied, so no
+        // CPU can store into `old_phys` after the snapshot is taken. A user
+        // access that lands in the window takes a not-present fault, spins on
+        // the region lock the caller holds (servicing shootdown IPIs while it
+        // spins — see `IrqSafeSpinLock::lock`), and retries against the new
+        // leaf once it is published.
+        //
+        // The previous copy-then-swap shape (plus a LOCAL-only invalidation)
+        // lost every user store that raced the copy — a torn string write
+        // showed up as heap garbage — and, for a victim process resident on
+        // ANOTHER CPU (compaction runs from the reclaim thread), left that
+        // CPU translating to a frame already returned to the allocator: the
+        // SMP-only cross-process corruption behind the KDE greeter aborts.
+        //
+        // The broadcast is deliberately NOT gated on `vm_shared`: that gate
+        // assumes the caller is a thread of this AS, which the migrator is not.
+        // SAFETY: the live AS owns the root; `page_va` + both frames validated
+        // by the caller from the private region.
+        unsafe {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Local invalidation + residency-filtered cross-CPU shootdown.
+                let _ = crate::x86_64::paging::unmap_4kb(self.root, page_va);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // `unmap_4kb`'s TLBI is inner-shareable: hardware broadcast.
+                let _ = crate::aarch64::paging::unmap_4kb(self.root, page_va);
+            }
+        }
+        // SAFETY: both frames are live, distinct 4 KiB direct-map ranges, and
+        // no CPU can reach `old_phys` through `page_va` any more.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 old_phys.kernel_ptr::<u8>(),
@@ -9562,12 +9606,11 @@ impl AddressSpace {
                 crate::frame::PAGE_SIZE as usize,
             );
         }
-        // SAFETY: the live AS owns the root; `page_va` + both frames validated
-        // by the caller from the private region.
+        // SAFETY: as above; the leaf slot is empty and the root is live.
         let map_result = unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                use crate::x86_64::paging::{map_4kb, unmap_4kb_local, PtFlags};
+                use crate::x86_64::paging::{map_4kb, PtFlags};
                 let mut flags = PtFlags::USER;
                 if user_page_writable(perms, new_phys) {
                     flags |= PtFlags::WRITABLE;
@@ -9575,12 +9618,11 @@ impl AddressSpace {
                 if !perms.contains(RegionPerms::EXEC) {
                     flags |= PtFlags::NO_EXEC;
                 }
-                let _ = unmap_4kb_local(self.root, page_va);
                 map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
             }
             #[cfg(target_arch = "aarch64")]
             {
-                use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
+                use crate::aarch64::paging::{map_4kb, PtFlags};
                 let mut flags = if user_page_writable(perms, new_phys) {
                     PtFlags::AP_RW_EL0
                 } else {
@@ -9589,7 +9631,6 @@ impl AddressSpace {
                 if !perms.contains(RegionPerms::EXEC) {
                     flags = flags | PtFlags::UXN | PtFlags::PXN;
                 }
-                let _ = unmap_4kb(self.root, page_va);
                 map_4kb(self.root, page_va, new_phys, flags).map_err(|_| ())
             }
         };
@@ -9769,11 +9810,11 @@ impl AddressSpace {
         region.phys[page_idx] = new_phys;
         drop(regions);
 
-        // Move the reverse mapping to the live frame, flush peers before the
-        // source is freed, then release it.
+        // Move the reverse mapping to the live frame, then release the source:
+        // `relocate_leaf` already invalidated every CPU's translation of
+        // `page_va` before it copied, so nothing can reach `old_phys` now.
         crate::rmap::remove(old_phys, self.root, page_va);
         crate::rmap::add(new_phys, self.root, page_va);
-        self.flush_region_broadcast(page_va, 1);
         crate::frame::free_frame(crate::frame::PhysFrame::new(old_phys));
         Ok(new_phys)
     }
@@ -9956,20 +9997,24 @@ impl AddressSpace {
             Err(_) => return Some(Err(AddressSpaceError::OutOfRange)),
         };
         let bytes = new.size_bytes();
+        // Tear the leaf down and invalidate it on EVERY CPU before the copy,
+        // so no store can land in the old frame after the snapshot (same
+        // order as `relocate_leaf`; a copy-first shape loses racing writes).
+        if self.unmap_huge_leaf(leaf_va, size).is_err() {
+            crate::hugepage::free_hugepage(new);
+            return Some(Err(AddressSpaceError::Unmapped));
+        }
+        self.flush_range_all_cpus(leaf_va, bytes >> 12);
         // SAFETY: both huge frames are live, distinct, naturally aligned
-        // direct-map ranges of the same size, and the region lock prevents a
-        // concurrent unmap from returning the source frame to the pool.
+        // direct-map ranges of the same size; the region lock prevents a
+        // concurrent unmap from returning the source frame to the pool, and
+        // no CPU can reach it through `leaf_va` any more.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 PhysAddr::new(old.phys()).kernel_ptr::<u8>(),
                 PhysAddr::new(new.phys()).kernel_mut_ptr::<u8>(),
                 bytes as usize,
             );
-        }
-
-        if self.unmap_huge_leaf(leaf_va, size).is_err() {
-            crate::hugepage::free_hugepage(new);
-            return Some(Err(AddressSpaceError::Unmapped));
         }
         if let Err(error) = self.map_huge_leaf(leaf_va, new.phys(), size, perms) {
             // The old leaf's page-table ancestors remain allocated, so
@@ -9984,7 +10029,6 @@ impl AddressSpace {
         huge[region_idx].frames[frame_idx] = new;
         drop(huge);
 
-        self.flush_region_broadcast(leaf_va, bytes >> 12);
         crate::hugepage::free_hugepage(old);
         crate::frame::account_numa_allocation(target_node, target_node, bytes >> 12);
         Some(Ok(old_node))

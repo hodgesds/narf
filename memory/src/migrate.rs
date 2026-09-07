@@ -714,6 +714,136 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_relocates);
 
+    // A user store that lands right as the migration invalidates the page must
+    // survive the move: the leaf teardown + cross-CPU flush has to PRECEDE the
+    // copy (Linux `try_to_migrate` → copy → `remove_migration_ptes`). The test
+    // wraps the single-page shootdown hook: when the migration invalidates the
+    // page, the hook plays the last racing writer and stores a marker into the
+    // OLD frame. A copy taken after the flush carries the marker; a copy taken
+    // before it (the torn-write bug that corrupted the KDE greeter's heap under
+    // SMP) does not.
+    #[cfg(target_arch = "x86_64")]
+    static RACE_VA: u64 = 0x0000_0080_00A0_0000;
+    #[cfg(target_arch = "x86_64")]
+    static RACE_OLD_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    #[cfg(target_arch = "x86_64")]
+    static RACE_HOOK_CALLS: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    #[cfg(target_arch = "x86_64")]
+    static RACE_INNER_HOOK: core::sync::atomic::AtomicUsize =
+        core::sync::atomic::AtomicUsize::new(0);
+    #[cfg(target_arch = "x86_64")]
+    const RACE_MARKER: u32 = 0xA5A5_5A5A;
+
+    #[cfg(target_arch = "x86_64")]
+    fn racing_writer_hook(va: u64) {
+        use core::sync::atomic::Ordering;
+        if va == RACE_VA {
+            let old = RACE_OLD_PHYS.load(Ordering::Acquire);
+            if old != 0 {
+                // SAFETY: `old` is the test's live, identity-mapped source frame.
+                unsafe { *(PhysAddr::new(old).kernel_mut_ptr::<u32>().add(2)) = RACE_MARKER };
+                RACE_HOOK_CALLS.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        let inner = RACE_INNER_HOOK.load(Ordering::Acquire);
+        if inner != 0 {
+            // SAFETY: stored from `paging::shootdown_hook()` as `fn(u64) as usize`.
+            let f: crate::x86_64::paging::TlbShootdownHook = unsafe { core::mem::transmute(inner) };
+            f(va);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_migrate_frame_flushes_before_copy() -> TestResult {
+        use super::migrate_frame;
+        use crate::x86_64::paging::{clear_shootdown_hook, set_shootdown_hook, shootdown_hook};
+        use crate::{Region, RegionPerms, VirtAddr};
+        use core::sync::atomic::Ordering;
+
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        // SAFETY: paging + frame allocator live in the kernel suite.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => Arc::new(a),
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let p = match crate::alloc_frame() {
+            Ok(f) => f.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        // SAFETY: identity-mapped fresh frame, sole owner.
+        unsafe {
+            *(p.kernel_mut_ptr::<u32>()) = 0x5EED_2222;
+            *(p.kernel_mut_ptr::<u32>().add(2)) = 0;
+        }
+        let va = VirtAddr::new(RACE_VA);
+        if aspace
+            .map_region(Region {
+                base: va,
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: alloc::vec![p],
+            })
+            .is_err()
+        {
+            return TestResult::Fail("map_region failed");
+        }
+        // SAFETY: aspace owns a live root and the validated region.
+        if unsafe { aspace.materialize() }.is_err() {
+            return TestResult::Fail("materialize failed");
+        }
+        *TEST_AS.lock() = Some(aspace.clone());
+        register_address_space_resolver(&SINGLE_AS_RESOLVER);
+
+        let prev = shootdown_hook();
+        RACE_INNER_HOOK.store(prev.map_or(0, |h| h as usize), Ordering::Release);
+        RACE_HOOK_CALLS.store(0, Ordering::Release);
+        RACE_OLD_PHYS.store(p.raw(), Ordering::Release);
+        set_shootdown_hook(racing_writer_hook);
+
+        let result = (|| {
+            let new_p = match migrate_frame(p) {
+                Ok(x) => x,
+                Err(_) => return TestResult::Fail("migrate_frame failed for a live frame"),
+            };
+            if RACE_HOOK_CALLS.load(Ordering::Acquire) == 0 {
+                return TestResult::Fail(
+                    "migration must invalidate the page on every CPU (broadcast) before copying",
+                );
+            }
+            // SAFETY: new_p is the live frame; identity-mapped.
+            let (seed, marker) = unsafe {
+                (
+                    *(new_p.kernel_ptr::<u32>()),
+                    *(new_p.kernel_ptr::<u32>().add(2)),
+                )
+            };
+            if seed != 0x5EED_2222 {
+                return TestResult::Fail("migration did not preserve the page contents");
+            }
+            if marker != RACE_MARKER {
+                return TestResult::Fail(
+                    "a store racing the migration was lost: the copy ran before the flush",
+                );
+            }
+            TestResult::Pass
+        })();
+
+        RACE_OLD_PHYS.store(0, Ordering::Release);
+        match prev {
+            Some(h) => set_shootdown_hook(h),
+            None => clear_shootdown_hook(),
+        }
+        RACE_INNER_HOOK.store(0, Ordering::Release);
+        *TEST_AS.lock() = None;
+        __reset_resolver_for_test();
+        crate::rmap::__reset_for_test();
+        result
+    }
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("memory/migrate", smoke_migrate_frame_flushes_before_copy);
+
     // A resolver backed by several test-owned address spaces, so a fork-shared
     // frame's owners (parent + child) both resolve.
     #[cfg(target_arch = "x86_64")]
