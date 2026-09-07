@@ -171,7 +171,6 @@ kernel_abi! {
         // image already has. Falls through to the ordinary kernel heap
         // whenever the tagged path declines (no MTE, FRAME, oversized, or the
         // window full), which is a capacity answer and not an error.
-        #[cfg(target_arch = "aarch64")]
         {
             let domain = narf_lib::assert::current_domain();
             if let Some(p) = narf_memory::domain_heap::alloc(layout, domain) {
@@ -203,7 +202,6 @@ kernel_abi! {
         // Route by ADDRESS, not by current domain: a buffer may be freed
         // outside the scope that allocated it, or by a different domain, and
         // sending it to the wrong allocator corrupts one of them.
-        #[cfg(target_arch = "aarch64")]
         if narf_memory::domain_heap::owns(ptr) {
             // SAFETY: forwarded from the module's contract — matched pair.
             unsafe { narf_memory::domain_heap::free(ptr, layout) };
