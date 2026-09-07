@@ -35,17 +35,20 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    // Linux fdget()s input then output, so preserve which EBADF wins.
-    let Some(input) = copy_fd_endpoint(task, fd_in) else {
+    // Linux fdget()s input then output. The paired snapshot preserves that
+    // lookup order while pinning both descriptions in one table acquisition.
+    let Some((input, output)) = copy_fd_endpoints(task, fd_in, fd_out) else {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64));
         return;
     };
-    let Some(output) = copy_fd_endpoint(task, fd_out) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        return;
-    };
-    let in_is_pipe = input.is_pipe();
-    let out_is_pipe = output.is_pipe();
+    // Snapshot the endpoint kinds once. Besides avoiding repeated virtual
+    // stat calls below, the source kind is NARF's analogue of Linux's
+    // `file->f_op->splice_read` gate: the generic buffered implementation is
+    // valid for regular and block-backed files, not character devices.
+    let input_type = input.ops.stat().mode.file_type;
+    let output_type = output.ops.stat().mode.file_type;
+    let in_is_pipe = input_type == narf_filesystem::FileType::Fifo;
+    let out_is_pipe = output_type == narf_filesystem::FileType::Fifo;
 
     // __do_splice identifies pipe endpoints before touching userspace.
     if (in_is_pipe && off_in_ptr != 0) || (out_is_pipe && off_out_ptr != 0) {
@@ -87,6 +90,17 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    if !in_is_pipe
+        && !matches!(
+            input_type,
+            narf_filesystem::FileType::File | narf_filesystem::FileType::Block
+        )
+    {
+        // Character devices such as /dev/zero do not expose splice_read on
+        // Linux. stress-ng probes this once and falls back to write(2).
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        return;
+    }
     if explicit_in.is_some() && input.ops.is_stream()
         || explicit_out.is_some() && output.ops.is_stream()
     {
@@ -118,11 +132,30 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     // Two descriptors for the two ends of one pipe name the same
     // pipe_inode_info on Linux and must fail EINVAL rather than lock itself.
     if in_is_pipe && out_is_pipe {
-        let same_pipe = input
+        // Anonymous pipes can compare their shared queue directly. Keep the
+        // readiness-cell identity fallback for other FIFO providers, but do
+        // not activate readiness tracking merely for stress-ng's deliberate
+        // self-splice error probe.
+        let anonymous_pair = input
             .ops
-            .readiness()
-            .zip(output.ops.readiness())
-            .is_some_and(|(left, right)| core::ptr::eq(left, right));
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+            .zip(
+                output
+                    .ops
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>()),
+            );
+        let same_pipe = anonymous_pair.map_or_else(
+            || {
+                input
+                    .ops
+                    .readiness()
+                    .zip(output.ops.readiness())
+                    .is_some_and(|(left, right)| core::ptr::eq(left, right))
+            },
+            |(read, write)| read.shares_pipe_with(write),
+        );
         if same_pipe {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64));
             return;

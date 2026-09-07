@@ -3435,6 +3435,7 @@ enum CopyFdError {
 /// numeric descriptor concurrently. The captured description similarly pins
 /// f_pos and receives every commit directly, so close+numeric-fd reuse cannot
 /// redirect an update to an unrelated file.
+#[derive(Clone)]
 struct CopyFdEndpoint {
     ops: Arc<dyn narf_filesystem::FileOps>,
     description: crate::fd::Description,
@@ -3557,12 +3558,39 @@ fn import_rw_iovecs(iov_ptr: u64, iovcnt: usize) -> Result<alloc::vec::Vec<Impor
 
 fn copy_fd_endpoint(task: u64, fd_num: u32) -> Option<CopyFdEndpoint> {
     fd::with_table(task, |table| {
-        let entry = table.get(fd_num)?;
-        Some(CopyFdEndpoint {
-            ops: entry.ops.clone(),
-            description: table.description(fd_num)?,
-            status_flags: table.status_flags(fd_num)?,
-        })
+        copy_fd_endpoint_from_table(table, fd_num)
+    })
+    .flatten()
+}
+
+fn copy_fd_endpoint_from_table(
+    table: &crate::fd::FdTable,
+    fd_num: u32,
+) -> Option<CopyFdEndpoint> {
+    let entry = table.get(fd_num)?;
+    Some(CopyFdEndpoint {
+        ops: entry.ops.clone(),
+        description: table.description(fd_num)?,
+        status_flags: table.status_flags(fd_num)?,
+    })
+}
+
+/// Snapshot two descriptors under one fd-table acquisition. Linux resolves
+/// the input first and does not inspect the output after an input EBADF; the
+/// `?` ordering below keeps that precedence while avoiding a second shard-map
+/// lookup, Arc clone, IRQ-disable section, and table lock on two-fd syscalls.
+fn copy_fd_endpoints(
+    task: u64,
+    first_fd: u32,
+    second_fd: u32,
+) -> Option<(CopyFdEndpoint, CopyFdEndpoint)> {
+    fd::with_table(task, |table| {
+        let first = copy_fd_endpoint_from_table(table, first_fd)?;
+        if first_fd == second_fd {
+            return Some((first.clone(), first));
+        }
+        let second = copy_fd_endpoint_from_table(table, second_fd)?;
+        Some((first, second))
     })
     .flatten()
 }
@@ -3577,13 +3605,19 @@ fn copy_fd_to_fd(
     let use_off_ptr = explicit_in_off.is_some();
     let use_out_off_ptr = explicit_out_off.is_some();
     let same_description = Arc::ptr_eq(&input.description, &output.description);
+    // Pipes and other streams have no f_pos. Their syscall modules reject an
+    // explicit offset before reaching this core, and an implicit transfer must
+    // neither serialize nor mutate the otherwise-unused description cursor.
+    let track_input_position = !use_off_ptr && !input.ops.is_stream();
+    let track_output_position = !use_out_off_ptr && !output.ops.is_stream();
 
-    // Linux locks each `struct file::f_pos` across the complete positioned
-    // transfer. Acquire distinct descriptions by stable address order so two
-    // opposite-direction copies cannot ABBA deadlock; aliases lock once.
+    // Linux locks each seekable `struct file::f_pos` across the complete
+    // positioned transfer. Acquire distinct descriptions by stable address
+    // order so two opposite-direction copies cannot ABBA deadlock; aliases
+    // lock once.
     let mut input_position_guard = None;
     let mut output_position_guard = None;
-    if !use_off_ptr && !use_out_off_ptr && !same_description {
+    if track_input_position && track_output_position && !same_description {
         let input_key = Arc::as_ptr(&input.description) as usize;
         let output_key = Arc::as_ptr(&output.description) as usize;
         if input_key < output_key {
@@ -3600,19 +3634,19 @@ fn copy_fd_to_fd(
         if input_position_guard.is_none() || output_position_guard.is_none() {
             return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
         }
-    } else if (!use_off_ptr || !use_out_off_ptr) && same_description {
+    } else if (track_input_position || track_output_position) && same_description {
         input_position_guard = poll_blocking(input.description.position_lock.lock());
         if input_position_guard.is_none() {
             return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
         }
     } else {
-        if !use_off_ptr {
+        if track_input_position {
             input_position_guard = poll_blocking(input.description.position_lock.lock());
             if input_position_guard.is_none() {
                 return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
             }
         }
-        if !use_out_off_ptr {
+        if track_output_position {
             output_position_guard = poll_blocking(output.description.position_lock.lock());
             if output_position_guard.is_none() {
                 return Err(CopyFdError::Fs(narf_filesystem::FsError::Busy));
@@ -3621,9 +3655,21 @@ fn copy_fd_to_fd(
     }
 
     // Snapshot implicit positions only after their serialization lock is held.
-    // Explicit-offset sides neither read nor modify the shared cursor.
-    let mut in_off = explicit_in_off.unwrap_or_else(|| input.description.offset());
-    let mut out_off = explicit_out_off.unwrap_or_else(|| output.description.offset());
+    // Explicit-offset and stream sides neither read nor modify the cursor.
+    let mut in_off = explicit_in_off.unwrap_or_else(|| {
+        if track_input_position {
+            input.description.offset()
+        } else {
+            0
+        }
+    });
+    let mut out_off = explicit_out_off.unwrap_or_else(|| {
+        if track_output_position {
+            output.description.offset()
+        } else {
+            0
+        }
+    });
     let input_ops = &input.ops;
     let output_ops = &output.ops;
 
@@ -3646,11 +3692,16 @@ fn copy_fd_to_fd(
             {
                 pipe_in.splice_to_pipe(pipe_out, want)
             } else {
+                let mut sink_off = step_out_off;
                 pipe_in.splice_to_sink(want, |bytes| {
                     // The source queue is locked until the accepted prefix is
                     // committed. Never park while its IRQ-safe lock is held.
-                    poll_once(output_ops.write(step_out_off, bytes))
-                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock))
+                    let result = poll_once(output_ops.write(sink_off, bytes))
+                        .unwrap_or(Err(narf_filesystem::FsError::WouldBlock));
+                    if let Ok(written) = result {
+                        sink_off = sink_off.saturating_add(written as u64);
+                    }
+                    result
                 })
             }
         } else {
@@ -3690,20 +3741,20 @@ fn copy_fd_to_fd(
 
         // Commit to the pinned descriptions, never by numeric fd. A concurrent
         // close+reuse cannot redirect cursor updates to an unrelated file.
-        if !use_off_ptr || !use_out_off_ptr {
-            if same_description && !use_off_ptr && !use_out_off_ptr {
+        if track_input_position || track_output_position {
+            if same_description && track_input_position && track_output_position {
                 // Both local cursors started together and advanced by the same
                 // accepted prefix; one shared f_pos is advanced once.
                 input
                     .description
                     .set_offset(in_off.saturating_add(moved as u64));
             } else {
-                if !use_off_ptr {
+                if track_input_position {
                     input
                         .description
                         .set_offset(in_off.saturating_add(moved as u64));
                 }
-                if !use_out_off_ptr {
+                if track_output_position {
                     output
                         .description
                         .set_offset(out_off.saturating_add(moved as u64));

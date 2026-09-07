@@ -139,6 +139,34 @@ impl PipeBytes {
         self.commit_write(n);
     }
 
+    /// Append a logical span from another pipe ring directly into this one.
+    /// The source and destination may each wrap independently, so advance by
+    /// the shorter contiguous span instead of bouncing every page through an
+    /// intermediate stack buffer.
+    fn append_from(&mut self, source: &Self, source_offset: usize, n: usize) {
+        debug_assert!(source_offset.saturating_add(n) <= source.len);
+        debug_assert!(n <= self.capacity() - self.len);
+        let source_capacity = source.capacity();
+        let destination_capacity = self.capacity();
+        let mut copied = 0usize;
+        let mut destination = (self.head + self.len) % destination_capacity;
+        while copied < n {
+            let source_index = (source.head + source_offset + copied) % source_capacity;
+            let chunk = core::cmp::min(
+                n - copied,
+                core::cmp::min(
+                    source_capacity - source_index,
+                    destination_capacity - destination,
+                ),
+            );
+            self.storage[destination..destination + chunk]
+                .copy_from_slice(&source.storage[source_index..source_index + chunk]);
+            copied += chunk;
+            destination = (destination + chunk) % destination_capacity;
+        }
+        self.commit_write(n);
+    }
+
     fn copy_out(&self, offset: usize, dst: &mut [u8]) {
         debug_assert!(offset + dst.len() <= self.len);
         let len = dst.len();
@@ -393,14 +421,7 @@ impl PipeBufs {
             if n == 0 {
                 break;
             }
-            let mut scratch = [0u8; PIPE_BUF];
-            let mut done = 0;
-            while done < n {
-                let chunk = core::cmp::min(PIPE_BUF, n - done);
-                self.bytes.copy_out(offset + done, &mut scratch[..chunk]);
-                dst.bytes.push(&scratch[..chunk]);
-                done += chunk;
-            }
+            dst.bytes.append_from(&self.bytes, offset, n);
             dst.push_frame(n, frame.packet);
             copied += n;
             if n < frame.len {
@@ -421,6 +442,25 @@ impl PipeBufs {
     /// instead of tearing it. A trailing NON-packet frame may still move
     /// partially, because its boundary is invisible to any reader.
     fn move_prefix_to(&mut self, dst: &mut PipeBufs, max: usize) -> usize {
+        // The dominant splice shape is a complete transfer into an empty pipe
+        // of the same capacity. Exchange the two backing rings and frame lists
+        // in O(1): the source receives the destination's empty allocation and
+        // the destination takes the complete queued payload. This is the flat
+        // ring equivalent of Linux moving `pipe_buffer` page references rather
+        // than copying their contents. Equal capacities are required because
+        // F_SETPIPE_SZ belongs to the pipe, not to whichever payload it holds.
+        if !self.is_empty()
+            && dst.is_empty()
+            && max >= self.len()
+            && self.capacity() == dst.capacity()
+        {
+            debug_assert!(dst.frames.is_empty());
+            let moved = self.len();
+            core::mem::swap(&mut self.bytes, &mut dst.bytes);
+            core::mem::swap(&mut self.frames, &mut dst.frames);
+            return moved;
+        }
+
         let mut moved = 0;
         while moved < max {
             let Some(&PipeFrame { len, packet }) = self.frames.front() else {
@@ -441,14 +481,7 @@ impl PipeBufs {
             if n == 0 {
                 break;
             }
-            let mut scratch = [0u8; PIPE_BUF];
-            let mut done = 0;
-            while done < n {
-                let chunk = core::cmp::min(PIPE_BUF, n - done);
-                self.bytes.copy_out(done, &mut scratch[..chunk]);
-                dst.bytes.push(&scratch[..chunk]);
-                done += chunk;
-            }
+            dst.bytes.append_from(&self.bytes, 0, n);
             self.bytes.consume(n);
             dst.push_frame(n, packet);
             self.retire_frames(n);
@@ -480,6 +513,13 @@ struct PipeShared {
     /// (see [`PipeShared::sync_readiness`]) fires the wait-queue for the changed
     /// direction so an EPOLLET consumer re-fires even at the same level.
     readiness: narf_lib::readiness::Readiness,
+    /// Readiness publication is lazy. An untouched pipe has no possible
+    /// waiter, so taking the readiness spinlock on every empty/full edge only
+    /// maintains state nobody can observe. The first readiness accessor sets
+    /// this while holding `queue`, publishes an exact snapshot, and leaves it
+    /// set forever; subsequent queue mutations then maintain and wake the
+    /// durable cell normally.
+    readiness_active: AtomicBool,
     /// Linux `pipe_inode_info::poll_usage`: once a persistent poll/epoll
     /// registration exists, same-level I/O events must continue firing.
     poll_usage: AtomicBool,
@@ -532,6 +572,23 @@ impl PipeShared {
         Ok(requested)
     }
 
+    /// Start maintaining the durable readiness cell on first use. Taking the
+    /// queue lock before publishing `readiness_active` closes both races:
+    ///
+    /// * an earlier mutation that observed `false` is included in this queue
+    ///   snapshot;
+    /// * a later mutation cannot change the queue until `true` is visible and
+    ///   the snapshot has been published.
+    fn activate_readiness(&self) {
+        if self.readiness_active.load(Ordering::Acquire) {
+            return;
+        }
+        let q = self.queue.lock();
+        if !self.readiness_active.swap(true, Ordering::AcqRel) {
+            self.publish_readiness_state_with_policy(0, q.len(), q.is_full(), false);
+        }
+    }
+
     /// Recompute the durable readiness cell from the current queue occupancy and
     /// the peer-close flags, publishing the transition. POLL_IN (queue
     /// non-empty), POLL_OUT (room below capacity), POLL_HUP (writer gone),
@@ -562,6 +619,19 @@ impl PipeShared {
 
     #[inline]
     fn sync_readiness_state_with_policy(&self, event: u32, len: usize, full: bool, wake_all: bool) {
+        if !self.readiness_active.load(Ordering::Acquire) {
+            return;
+        }
+        self.publish_readiness_state_with_policy(event, len, full, wake_all);
+    }
+
+    fn publish_readiness_state_with_policy(
+        &self,
+        event: u32,
+        len: usize,
+        full: bool,
+        wake_all: bool,
+    ) {
         let writer_closed = self.writer_closed.load(Ordering::Acquire);
         let reader_closed = self.reader_closed.load(Ordering::Acquire);
         let mut add = 0u32;
@@ -659,6 +729,7 @@ pub fn pipe_pair_flags(packetized: bool) -> (Arc<PipeRead>, Arc<PipeWrite>) {
         reader_closed: AtomicBool::new(false),
         // Fresh pipe: empty (not readable), has room (writable), both ends open.
         readiness: narf_lib::readiness::Readiness::new(narf_filesystem::POLL_OUT),
+        readiness_active: AtomicBool::new(false),
         poll_usage: AtomicBool::new(false),
     });
     (
@@ -799,6 +870,10 @@ impl PipeRead {
         self.shared.set_capacity(arg)
     }
 
+    pub(crate) fn shares_pipe_with(&self, write: &PipeWrite) -> bool {
+        Arc::ptr_eq(&self.shared, &write.shared)
+    }
+
     /// Linux-shaped `read(2)` path: copy the stable queue prefix directly to
     /// user memory and advance the pipe one page-sized buffer at a time. A
     /// fault before progress is `EFAULT`; a fault after a committed buffer
@@ -881,11 +956,8 @@ impl PipeRead {
     pub(crate) fn splice_to_sink(
         &self,
         max: usize,
-        write: impl FnOnce(&[u8]) -> Result<usize, narf_filesystem::FsError>,
+        mut write: impl FnMut(&[u8]) -> Result<usize, narf_filesystem::FsError>,
     ) -> Result<usize, narf_filesystem::FsError> {
-        // Reserve before disabling IRQs in the queue lock. `max` is capped by
-        // the syscall copy core's 64-KiB chunk size.
-        let mut staging = Vec::with_capacity(core::cmp::min(max, self.shared.capacity()));
         let mut q = self.shared.queue.lock();
         let avail = q.len();
         if avail == 0 {
@@ -897,22 +969,40 @@ impl PipeRead {
         }
         // `splice_from_pipe` hands the actor ONE buffer at a time, so the
         // offered span stops at a packet boundary of its own accord.
+        let was_full = q.is_full();
         let (n, _) = q.read_span(core::cmp::min(max, avail));
-        staging.resize(n, 0);
-        q.bytes.copy_out(0, &mut staging);
-        let written = write(&staging)?;
-        if written > n {
+        // The queue stays locked until the sink has accepted its prefix, so
+        // its one or two ring slices are stable and can be offered directly.
+        // This removes the allocation and full payload memcpy from the common
+        // pipe -> /dev/null splice. A wrapped ring needs a second sink call;
+        // advance only after the first slice was accepted completely.
+        let (front, wrapped) = q.bytes.prefix_slices(n);
+        let first = write(front)?;
+        if first > front.len() {
             return Err(narf_filesystem::FsError::InvalidData);
+        }
+        let mut written = first;
+        if first == front.len() && !wrapped.is_empty() {
+            match write(wrapped) {
+                Ok(second) if second <= wrapped.len() => written += second,
+                Ok(_) | Err(_) if written != 0 => {}
+                Err(error) => return Err(error),
+                Ok(_) => return Err(narf_filesystem::FsError::InvalidData),
+            }
         }
         // No packet discard here: a short actor write advances the buffer
         // (`buf->offset += ret; buf->len -= ret;`) and leaves the remainder
         // queued. Only `pipe_read` retires a partially-copied packet.
         q.commit(written);
+        let new_len = q.len();
+        let new_full = q.is_full();
         drop(q);
 
-        if written != 0 {
-            self.shared.sync_readiness(narf_filesystem::POLL_OUT);
-            narf_net::readiness::bump_generation();
+        if written != 0
+            && (was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire))
+        {
+            self.shared
+                .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
         }
         Ok(written)
     }
@@ -935,36 +1025,60 @@ impl PipeRead {
 
         let src_addr = Arc::as_ptr(&self.shared) as usize;
         let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (moved, _, _) = if src_addr < dst_addr {
-            let mut src = self.shared.queue.lock();
-            let mut dstq = dst.shared.queue.lock();
-            if dst.shared.reader_closed.load(Ordering::Acquire) {
-                return Err(narf_filesystem::FsError::BrokenPipe);
-            }
-            move_pipe_prefix(
-                &mut src,
-                &mut dstq,
-                max,
-                self.shared.writer_closed.load(Ordering::Acquire),
-            )?
-        } else {
-            let mut dstq = dst.shared.queue.lock();
-            let mut src = self.shared.queue.lock();
-            if dst.shared.reader_closed.load(Ordering::Acquire) {
-                return Err(narf_filesystem::FsError::BrokenPipe);
-            }
-            move_pipe_prefix(
-                &mut src,
-                &mut dstq,
-                max,
-                self.shared.writer_closed.load(Ordering::Acquire),
-            )?
-        };
+        let (moved, src_was_full, dst_was_empty, src_len, src_full, dst_len, dst_full) =
+            if src_addr < dst_addr {
+                let mut src = self.shared.queue.lock();
+                let mut dstq = dst.shared.queue.lock();
+                if dst.shared.reader_closed.load(Ordering::Acquire) {
+                    return Err(narf_filesystem::FsError::BrokenPipe);
+                }
+                let (moved, src_was_full, dst_was_empty) = move_pipe_prefix(
+                    &mut src,
+                    &mut dstq,
+                    max,
+                    self.shared.writer_closed.load(Ordering::Acquire),
+                )?;
+                (
+                    moved,
+                    src_was_full,
+                    dst_was_empty,
+                    src.len(),
+                    src.is_full(),
+                    dstq.len(),
+                    dstq.is_full(),
+                )
+            } else {
+                let mut dstq = dst.shared.queue.lock();
+                let mut src = self.shared.queue.lock();
+                if dst.shared.reader_closed.load(Ordering::Acquire) {
+                    return Err(narf_filesystem::FsError::BrokenPipe);
+                }
+                let (moved, src_was_full, dst_was_empty) = move_pipe_prefix(
+                    &mut src,
+                    &mut dstq,
+                    max,
+                    self.shared.writer_closed.load(Ordering::Acquire),
+                )?;
+                (
+                    moved,
+                    src_was_full,
+                    dst_was_empty,
+                    src.len(),
+                    src.is_full(),
+                    dstq.len(),
+                    dstq.is_full(),
+                )
+            };
 
         if moved != 0 {
-            self.shared.sync_readiness(narf_filesystem::POLL_OUT);
-            dst.shared.sync_readiness(narf_filesystem::POLL_IN);
-            narf_net::readiness::bump_generation();
+            if src_was_full || src_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
+                self.shared
+                    .sync_readiness_state(narf_filesystem::POLL_OUT, src_len, src_full);
+            }
+            if dst_was_empty || dst_full || dst.shared.poll_usage.load(Ordering::Acquire) {
+                dst.shared
+                    .sync_readiness_state(narf_filesystem::POLL_IN, dst_len, dst_full);
+            }
         }
         Ok(moved)
     }
@@ -991,27 +1105,32 @@ impl PipeRead {
         let writer_closed = self.shared.writer_closed.load(Ordering::Acquire);
         let src_addr = Arc::as_ptr(&self.shared) as usize;
         let dst_addr = Arc::as_ptr(&dst.shared) as usize;
-        let (copied, _) = if src_addr < dst_addr {
+        let (copied, dst_was_empty, dst_len, dst_full) = if src_addr < dst_addr {
             let src = self.shared.queue.lock();
             let mut dstq = dst.shared.queue.lock();
             if dst.shared.reader_closed.load(Ordering::Acquire) {
                 return Err(narf_filesystem::FsError::BrokenPipe);
             }
-            copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
+            let (copied, dst_was_empty) = copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?;
+            (copied, dst_was_empty, dstq.len(), dstq.is_full())
         } else {
             let mut dstq = dst.shared.queue.lock();
             let src = self.shared.queue.lock();
             if dst.shared.reader_closed.load(Ordering::Acquire) {
                 return Err(narf_filesystem::FsError::BrokenPipe);
             }
-            copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?
+            let (copied, dst_was_empty) = copy_pipe_prefix(&src, &mut dstq, max, writer_closed)?;
+            (copied, dst_was_empty, dstq.len(), dstq.is_full())
         };
 
         if copied != 0 {
             // Only the destination changed: tee leaves the source queue intact,
             // so the source's readiness is unchanged and must not be
             // republished as an edge.
-            dst.shared.sync_readiness(narf_filesystem::POLL_IN);
+            if dst_was_empty || dst_full || dst.shared.poll_usage.load(Ordering::Acquire) {
+                dst.shared
+                    .sync_readiness_state(narf_filesystem::POLL_IN, dst_len, dst_full);
+            }
             narf_net::readiness::bump_generation();
         }
         Ok(copied)
@@ -1072,6 +1191,7 @@ impl PipeRead {
                     Err(VmspliceDrainError::WouldBlock)
                 };
             }
+            let was_full = q.is_full();
             let (n, packet_consumed) = q.read_span(max);
             let (front, wrapped) = q.bytes.prefix_slices(n);
             let first = front.len();
@@ -1079,8 +1199,13 @@ impl PipeRead {
             staging[first..n].copy_from_slice(&wrapped[..n - first]);
             copy(&staging[..n]).map_err(VmspliceDrainError::User)?;
             q.commit(if discard_packets { packet_consumed } else { n });
+            let new_len = q.len();
+            let new_full = q.is_full();
             drop(q);
-            self.shared.sync_readiness(narf_filesystem::POLL_OUT);
+            if was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
+                self.shared
+                    .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
+            }
             narf_net::readiness::bump_generation();
             return Ok(n);
         }
@@ -1098,15 +1223,21 @@ impl PipeRead {
                 Err(VmspliceDrainError::WouldBlock)
             };
         }
+        let was_full = q.is_full();
         let (n, packet_consumed) = q.read_span(max);
         staging.resize(n, 0);
         q.bytes.copy_out(0, &mut staging);
 
         copy(&staging).map_err(VmspliceDrainError::User)?;
         q.commit(if discard_packets { packet_consumed } else { n });
+        let new_len = q.len();
+        let new_full = q.is_full();
         drop(q);
 
-        self.shared.sync_readiness(narf_filesystem::POLL_OUT);
+        if was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire) {
+            self.shared
+                .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
+        }
         narf_net::readiness::bump_generation();
         Ok(n)
     }
@@ -1306,10 +1437,20 @@ impl FileOps for PipeRead {
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
         // The shared cell reaches both halves; a read fd's poller arms it with
         // POLL_IN|POLL_HUP (the poll/epoll layer folds HUP in), and a peer write
-        // or close fires exactly this waiter. Reachable directly through the Arc
-        // field, so the default `arm_readiness`/`disarm_readiness` suffice — no
-        // override, unlike the lock-guarded AF_UNIX ring.
+        // or close fires exactly this waiter. Its first observer reconciles the
+        // lazily-maintained cell before returning it.
+        self.shared.activate_readiness();
         Some(&self.shared.readiness)
+    }
+
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.shared.activate_readiness();
+        Some(self.shared.readiness.arm(task_id, interest, waker))
     }
 
     fn arm_readiness_exclusive(
@@ -1318,6 +1459,7 @@ impl FileOps for PipeRead {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        self.shared.activate_readiness();
         Some(
             self.shared
                 .readiness
@@ -1332,6 +1474,7 @@ impl FileOps for PipeRead {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         self.shared.poll_usage.store(true, Ordering::Release);
+        self.shared.activate_readiness();
         Some(self.shared.readiness.arm_persistent(id, interest, waker))
     }
 
@@ -1437,7 +1580,18 @@ impl FileOps for PipeWrite {
         // Same shared cell as the read half; a write fd's poller arms it with
         // POLL_OUT|POLL_ERR (the poll/epoll layer folds ERR in), so a peer read
         // (room frees) or a reader close (POLL_ERR) fires exactly this waiter.
+        self.shared.activate_readiness();
         Some(&self.shared.readiness)
+    }
+
+    fn arm_readiness(
+        &self,
+        task_id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.shared.activate_readiness();
+        Some(self.shared.readiness.arm(task_id, interest, waker))
     }
 
     fn arm_readiness_exclusive(
@@ -1446,6 +1600,7 @@ impl FileOps for PipeWrite {
         interest: u32,
         waker: &core::task::Waker,
     ) -> Option<core::task::Poll<u32>> {
+        self.shared.activate_readiness();
         Some(
             self.shared
                 .readiness
@@ -1460,6 +1615,7 @@ impl FileOps for PipeWrite {
         waker: &core::task::Waker,
     ) -> Option<u32> {
         self.shared.poll_usage.store(true, Ordering::Release);
+        self.shared.activate_readiness();
         Some(self.shared.readiness.arm_persistent(id, interest, waker))
     }
 

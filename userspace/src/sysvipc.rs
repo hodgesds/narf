@@ -683,8 +683,9 @@ enum WaitData {
     MsgSend {
         mtype: i64,
         /// Owned by the wait record while parked and temporarily taken by the
-        /// re-executing syscall.  A still-full queue restores the same buffer
-        /// without allocating or copying under the IRQ-safe state lock.
+        /// re-executing syscall. Queue notifications skip that in-flight
+        /// sender until it either commits or restores the same buffer, without
+        /// allocating or copying under the IRQ-safe state lock.
         payload: Option<Vec<u8>>,
         msgflg: u64,
     },
@@ -1297,12 +1298,16 @@ fn notify_msg_waiters(queue: &mut MsgQueue, kind: WaitKind) {
                     let WaitData::MsgSend { payload, .. } = &node.wait.data else {
                         panic!("SysV sender wait lost its payload state");
                     };
-                    let payload_len = payload
-                        .as_ref()
-                        .expect("linked SysV sender payload is being rechecked")
-                        .len();
-                    payload_len.saturating_add(queue.current_bytes) <= queue.max_bytes
-                        && queue.msgs.len().saturating_add(1) <= queue.max_bytes
+                    // A woken sender takes ownership of its retained payload
+                    // before dropping this queue lock and rechecking the
+                    // queue. It deliberately remains linked in that window so
+                    // IPC_RMID can still publish EIDRM. A concurrent receive
+                    // therefore may encounter `None`; that sender is already
+                    // runnable and must not be queued for a duplicate wake.
+                    payload.as_ref().is_some_and(|payload| {
+                        payload.len().saturating_add(queue.current_bytes) <= queue.max_bytes
+                            && queue.msgs.len().saturating_add(1) <= queue.max_bytes
+                    })
                 }
                 WaitKind::Sem => panic!("semaphore wait notified through message queue"),
             };
@@ -1584,6 +1589,34 @@ pub(crate) fn __test_reblock_staged_msg_send(id: u64) -> bool {
     };
     {
         let mut q = handle.queue.lock();
+        restore_msg_send_wait(
+            &handle.queue,
+            &mut q,
+            task,
+            ipc_ns,
+            id,
+            mtype,
+            payload,
+            msgflg,
+        );
+    }
+    true
+}
+
+#[doc(hidden)]
+pub(crate) fn __test_notify_while_msg_send_rechecks(id: u64) -> bool {
+    let task = crate::handlers::current_task_id();
+    let ipc_ns = current_ipc_namespace_id();
+    let MsgSendResume::Staged(mtype, payload, msgflg) = take_msg_send_resume(task, ipc_ns, id)
+    else {
+        return false;
+    };
+    let Some(handle) = msg_wait_handle(task) else {
+        return false;
+    };
+    {
+        let mut q = handle.queue.lock();
+        notify_msg_waiters(&mut q, WaitKind::MsgSend);
         restore_msg_send_wait(
             &handle.queue,
             &mut q,

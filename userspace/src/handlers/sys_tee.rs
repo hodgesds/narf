@@ -57,11 +57,29 @@ pub(crate) fn sys_tee(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
-    let same_pipe = input
+    // Compare anonymous-pipe queues without touching their lazily-maintained
+    // readiness cells. Other FIFO implementations retain the shared-cell
+    // identity fallback.
+    let anonymous_pair = input
         .ops
-        .readiness()
-        .zip(output.ops.readiness())
-        .is_some_and(|(left, right)| core::ptr::eq(left, right));
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
+        .zip(
+            output
+                .ops
+                .as_any()
+                .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>()),
+        );
+    let same_pipe = anonymous_pair.map_or_else(
+        || {
+            input
+                .ops
+                .readiness()
+                .zip(output.ops.readiness())
+                .is_some_and(|(left, right)| core::ptr::eq(left, right))
+        },
+        |(read, write)| read.shares_pipe_with(write),
+    );
     if same_pipe {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;

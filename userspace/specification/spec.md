@@ -337,7 +337,9 @@ and advances input and output positions only by bytes accepted by the sink.
 Exact filesystem, `EAGAIN`, broken-pipe/`SIGPIPE`, and user-copy errors are
 preserved; zero count still performs fd and mode validation. NARF stream
 inputs currently fail closed because their `FileOps` do not expose Linux's
-transactional `splice_read` source operation.
+transactional `splice_read` source operation. The generic non-pipe splice
+source is limited to regular and block-backed files; character devices such
+as `/dev/zero` likewise return `EINVAL` when they lack that operation.
 `copy_file_range(2)` likewise serializes and commits implicit positions through
 the pinned descriptions. Explicit `loff_t` imports and write-backs use guarded
 user copies, so an unmapped or concurrently protected offset word returns
