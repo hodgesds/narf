@@ -305,7 +305,13 @@ impl ProgArena {
         if end > self.len_bytes() {
             return None;
         }
-        Some(self.arena.kva() + off)
+        // Tagged, because the interpreter dereferences this from inside a BPF
+        // domain scope where `SCTLR_EL1.TCF` is Sync. An untagged pointer into
+        // a Tagged Normal page is checked against the untagged-kernel tag and
+        // faults — and unlike the JIT's arena accesses, an interpreter fault
+        // has no exception-table entry to recover through, so it would be
+        // fatal rather than reported.
+        Some(self.arena.tagged(self.arena.kva() + off))
     }
 }
 

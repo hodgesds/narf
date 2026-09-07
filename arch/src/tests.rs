@@ -22,6 +22,78 @@ fn smoke_arch_backend() -> TestResult {
 }
 kernel_test_in!("arch", smoke_arch_backend);
 
+/// The *reported* backend matches what is actually enforced.
+///
+/// `BACKEND` above is the architecture's nominal backend, a compile-time
+/// constant. This is the runtime report — what boot prints and what every
+/// `effective_backend()` caller sees — and the two are allowed to differ
+/// precisely because hardware or wiring may not deliver the nominal one.
+///
+/// aarch64 must report `Unenforced`. `Mte::enter_domain` really does flip
+/// `SCTLR_EL1.TCF` to Sync, so tag checking is live, but it is wired into
+/// `bpf::domain::enter` alone: driver domains are entered through
+/// `modules::domain::enter`, which gates on PKS or PCID, both false here. So
+/// what is enforced is arena-vs-not-arena for BPF, not driver-domain
+/// isolation, and `DomainBackend::Mte` would claim the latter.
+///
+/// This test exists because that mistake has now been made three times in
+/// this tree — PCID selected with `CR4.PCIDE` clear, PKS and PCID documented
+/// as equivalent, and the earlier aarch64 arm naming an enforcer twice over —
+/// and nothing asserted against it. Changing the report to `Mte` should fail
+/// here and send the reader to `arch/specification/mte-enforcement.md`, which
+/// records what would first have to become true.
+#[cfg(target_arch = "aarch64")]
+fn smoke_aarch64_report_matches_enforcement() -> TestResult {
+    use crate::aarch64::{mte, Mte};
+    use crate::{effective_backend, DomainBackend, DomainPrimitive};
+
+    // The report tracks the hardware, because the enforcement does. With MTE
+    // the backend must name itself; without it there is no fallback on this
+    // architecture and `Unenforced` is the only honest answer.
+    //
+    // This assertion was the other way round until driver-domain enforcement
+    // landed: it pinned `Unenforced` because the TCF flip reached only
+    // `bpf::domain::enter`, leaving module domains unconfined. Flipping it is
+    // the last step of `mte-enforcement.md`, and it is deliberately the test
+    // that has to change rather than a comment — the report and what is
+    // actually enforced move together or not at all.
+    let want = if mte::supported() {
+        DomainBackend::Mte
+    } else {
+        DomainBackend::Unenforced
+    };
+    if effective_backend() != want {
+        return TestResult::Fail("the reported backend does not match what is enforced");
+    }
+
+    if !mte::supported() {
+        return TestResult::Pass;
+    }
+    // SAFETY: MRS SCTLR_EL1.
+    if unsafe { mte::tcf_mode() } != mte::TCF_IGNORE {
+        return TestResult::Fail("TCF is not Ignore outside a domain scope");
+    }
+    // SAFETY: MTE is present; this scope touches no tagged page, so flipping
+    // TCF here cannot fault. Balanced by `exit_domain` immediately below.
+    let saved = unsafe { Mte::enter_domain(0, 14) };
+    // SAFETY: MRS SCTLR_EL1.
+    let inside = unsafe { mte::tcf_mode() };
+    // SAFETY: `saved` came from the matching `enter_domain`.
+    unsafe { Mte::exit_domain(saved) };
+    // SAFETY: MRS SCTLR_EL1.
+    let after = unsafe { mte::tcf_mode() };
+
+    if inside != mte::TCF_SYNC {
+        return TestResult::Fail("entering a domain scope did not set TCF=Sync");
+    }
+    if after != mte::TCF_IGNORE {
+        return TestResult::Fail("exiting a domain scope did not restore TCF");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!("arch", smoke_aarch64_report_matches_enforcement);
+
 fn smoke_speculation_state_is_per_cpu() -> TestResult {
     use crate::speculation::{state, State};
     use narf_lib::percpu::MAX_CPUS;

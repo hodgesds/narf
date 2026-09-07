@@ -251,15 +251,60 @@ pub extern "Rust" fn narf_arch_cpu_id() -> usize {
     current::cpu::current_cpu() as usize
 }
 
-/// Hook that `narf_lib::assert::current_domain` calls to avoid a dep
-/// cycle. Stage 3 returns 0 (`DomainId::FRAME`) — the Stage-2 bring-up
-/// runs every task in-Frame. Stage 4 replaces the body with a live
-/// PKRU / PKRS / TCF-derived read once per-task domain tracking lands.
-/// Returning an out-of-range value here would cause `DomainId::new`
-/// to panic at construction, so the body is intentionally conservative.
+/// Per-CPU record of the domain whose scope this CPU is executing inside.
+///
+/// Written by the `enter`/`exit` pair in `modules::domain` and
+/// `bpf::domain`, which are the only places a domain scope is opened. Not
+/// derived from `IA32_PKRS` / `SCTLR_EL1.TCF`: those say what is *permitted*,
+/// and on a CPU where no backend is active they say nothing at all, whereas
+/// the question here is which domain's code is running.
+///
+/// Per-CPU rather than per-task because a scope never spans a context switch
+/// -- both `enter` sites wrap a single synchronous call into domain code, and
+/// hold preemption across it.
+static CURRENT_DOMAIN: [core::sync::atomic::AtomicU8; narf_lib::percpu::MAX_CPUS] =
+    [const { core::sync::atomic::AtomicU8::new(0) }; narf_lib::percpu::MAX_CPUS];
+
+/// Record that this CPU has entered `domain`'s scope, returning the domain it
+/// was in so a nested scope can restore it.
+///
+/// Nesting is real: a BPF program invoked from inside a module's `init()`
+/// opens a second scope, so `exit` must restore rather than reset to FRAME.
+#[inline]
+pub fn enter_domain_scope(domain: u8) -> u8 {
+    let cpu = current::cpu::current_cpu() as usize;
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return 0;
+    }
+    CURRENT_DOMAIN[cpu].swap(domain, core::sync::atomic::Ordering::AcqRel)
+}
+
+/// Restore the domain a matching [`enter_domain_scope`] displaced.
+#[inline]
+pub fn exit_domain_scope(previous: u8) {
+    let cpu = current::cpu::current_cpu() as usize;
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        CURRENT_DOMAIN[cpu].store(previous, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Hook that `narf_lib::assert::current_domain` calls to avoid a dep cycle.
+///
+/// Returned 0 unconditionally until domain scopes started recording
+/// themselves, which made every `current_domain()` caller read `FRAME` no
+/// matter what was running -- including `block::encrypted`, whose whole
+/// point is asserting it runs as `KEYS`. Those assertions were passing
+/// because they compared FRAME against FRAME.
+///
+/// An out-of-range value would panic in `DomainId::new`, so the stored byte
+/// is masked to 0..=15 rather than trusted.
 #[unsafe(no_mangle)]
 pub extern "Rust" fn narf_arch_current_domain() -> u8 {
-    0
+    let cpu = current::cpu::current_cpu() as usize;
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return 0;
+    }
+    CURRENT_DOMAIN[cpu].load(core::sync::atomic::Ordering::Acquire) & 0xF
 }
 
 /// Halt until the next interrupt. On x86_64 falls back to `spin_loop`

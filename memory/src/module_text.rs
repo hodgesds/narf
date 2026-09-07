@@ -214,24 +214,89 @@ impl Prot {
     #[cfg(target_arch = "aarch64")]
     fn leaf_flags(self, domain: DomainId) -> crate::paging::PtFlags {
         use crate::paging::PtFlags;
-        // aarch64 carries no per-page domain key. Its `DomainPrimitive`
-        // backend is MTE, which tags by allocation rather than by page-table
-        // field, so the domain does not travel in the leaf here. The loader
-        // still records the module's DomainId; what is missing is the
-        // enforcement side, not the bookkeeping.
-        let _ = domain;
+        // aarch64 has no per-page domain key, so unlike x86 the domain cannot
+        // travel in the leaf as a field. It travels as the memory *type*:
+        // `ATTR_TAGGED` (MAIR Attr2, Normal WB Tagged) makes the page
+        // tag-checked, and `alloc` writes the domain's tag to every granule.
+        // A pointer not carrying that tag faults once TCF is Sync.
+        //
+        // `ATTR_TAGGED` REPLACES `ATTR_NORMAL`; it is not added to it.
+        // `map_4kb` composes the leaf as `default | flags` and AttrIndx is a
+        // 3-bit field, not a bitmask -- passing both would OR two indices into
+        // a third. See the trap noted in `mte-enforcement.md`.
+        let attr = if domain_tag(domain).is_some() {
+            PtFlags::ATTR_TAGGED
+        } else {
+            PtFlags::ATTR_NORMAL
+        };
         // UXN on every class: module text executes at EL1 only. Clearing PXN
         // is what makes it fetchable there.
         match self {
-            Prot::Rx => PtFlags::AP_RO_EL1 | PtFlags::ATTR_NORMAL | PtFlags::UXN,
-            Prot::Ro => PtFlags::AP_RO_EL1 | PtFlags::ATTR_NORMAL | PtFlags::UXN | PtFlags::PXN,
-            Prot::Rw => PtFlags::AP_RW_EL1 | PtFlags::ATTR_NORMAL | PtFlags::UXN | PtFlags::PXN,
+            Prot::Rx => PtFlags::AP_RO_EL1 | attr | PtFlags::UXN,
+            Prot::Ro => PtFlags::AP_RO_EL1 | attr | PtFlags::UXN | PtFlags::PXN,
+            Prot::Rw => PtFlags::AP_RW_EL1 | attr | PtFlags::UXN | PtFlags::PXN,
         }
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     fn leaf_flags(self, _domain: DomainId) -> crate::paging::PtFlags {
         crate::paging::PtFlags::PRESENT
+    }
+}
+
+/// Write `domain`'s tag to every 16-byte granule of the page at `kva`.
+///
+/// No-op when MTE is absent or the domain is untaggable, matching
+/// [`Prot::leaf_flags`], which leaves such a page `ATTR_NORMAL`. The two must
+/// agree: tagging granules of an untagged page is wasted work, and leaving a
+/// tagged page's granules unwritten leaves them UNKNOWN.
+///
+/// # Safety
+/// `kva` must name a mapped, writable, exclusively-owned page.
+#[cfg(target_arch = "aarch64")]
+unsafe fn tag_module_page(kva: u64, domain: DomainId) {
+    use narf_arch::aarch64::mte;
+    if !mte::supported() {
+        return;
+    }
+    let Some(tag) = domain_tag(domain) else {
+        return;
+    };
+    let tagged = mte::with_tag(kva, tag);
+    let mut off = 0u64;
+    while off < 4096 {
+        // SAFETY: every granule lies inside the caller's page, and the pointer
+        // carries the tag STG is to store.
+        unsafe { mte::stg((tagged + off) as *mut u8) };
+        off += 16;
+    }
+}
+
+/// The MTE allocation tag for `domain`, or `None` when it cannot be tagged.
+///
+/// MTE has 16 tags and NARF has 16 domains, but one value is spoken for: bits
+/// 63:48 of a TTBR1 address are all ones, so every untagged kernel pointer
+/// reads as tag 15 (`mte::UNTAGGED_KERNEL_TAG`). A domain tagged 15 would
+/// accept every untagged kernel pointer -- no isolation, silently. Fifteen
+/// usable tags must cover sixteen domains, so exactly one domain goes
+/// untagged.
+///
+/// That domain is `FRAME`, mapping `D` to `D - 1`. FRAME is the TCB, its
+/// memory is not `ATTR_TAGGED` anyway, and `enter_domain` deliberately leaves
+/// it reachable from everywhere -- so "unprotected" describes what it already
+/// is. The identity mapping, leaving domain 15 untagged, looks equivalent and
+/// is not: `DomainId::SCRATCH` IS 15, a real driver domain and the one the
+/// module tests use. Choosing it made the only test that verifies tagging skip
+/// rather than run.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn domain_tag(domain: DomainId) -> Option<u8> {
+    let d = domain.raw();
+    if d == DomainId::FRAME.raw() {
+        None
+    } else {
+        // 1..=15 -> 0..=14, so no domain lands on UNTAGGED_KERNEL_TAG.
+        Some(d - 1)
     }
 }
 
@@ -336,6 +401,32 @@ pub struct ModuleImage {
 }
 
 impl ModuleImage {
+    /// The image base as *module code* must see it: `base` carrying the
+    /// domain's MTE tag on aarch64, `base` unchanged elsewhere.
+    ///
+    /// The same split `ArenaGroup` makes. `base` stays untagged because it is
+    /// what this module's bookkeeping does arithmetic with -- page indices,
+    /// teardown extents, the VA bitmap. The loader relocates against and
+    /// enters at the tagged address, so every pointer the module derives --
+    /// absolute relocations, and ADRP-computed addresses, which inherit the
+    /// executing PC's high bits -- carries the tag and matches the granules
+    /// `alloc` wrote. A pointer into this image derived from anywhere else
+    /// carries a different tag and faults once TCF is Sync. That is the
+    /// aarch64 equivalent of the x86 leaf's protection key.
+    #[inline]
+    #[must_use]
+    pub fn tagged_base(&self) -> u64 {
+        #[cfg(target_arch = "aarch64")]
+        {
+            if narf_arch::aarch64::mte::supported() {
+                if let Some(tag) = domain_tag(self.domain) {
+                    return narf_arch::aarch64::mte::with_tag(self.base, tag);
+                }
+            }
+        }
+        self.base
+    }
+
     /// Byte span of the image.
     #[inline]
     pub fn len(&self) -> usize {
@@ -375,6 +466,14 @@ impl ModuleImage {
 /// that need to attribute a kernel address to a loaded module.
 #[inline]
 pub fn is_module_va(addr: u64) -> bool {
+    // Untag first. A module image is entered at a tagged VA on aarch64, so a
+    // PC sampled from module code carries the domain's tag and would fall
+    // outside this range. The failure is silent -- a module frame simply stops
+    // being recognised as one in a backtrace -- which is why it is handled
+    // here rather than at each caller.
+    #[cfg(target_arch = "aarch64")]
+    let addr =
+        narf_arch::aarch64::mte::with_tag(addr, narf_arch::aarch64::mte::UNTAGGED_KERNEL_TAG);
     (MODULE_VA_BASE..MODULE_VA_BASE + MODULE_VA_USABLE).contains(&addr)
 }
 
@@ -554,6 +653,15 @@ pub fn alloc(pages: usize, domain: DomainId) -> Result<ModuleImage, ModuleTextEr
         // SAFETY: the page was just mapped RW and its translation verified.
         unsafe {
             core::ptr::write_bytes(va.as_u64() as *mut u8, TRAP_FILL, 4096);
+        }
+
+        // Tag AFTER the trap-fill. Same ordering `bpf_arena` needs: the fill
+        // goes through this untagged VA, and a store via a non-tagged alias
+        // may leave a granule's tag UNKNOWN. Tagging last settles it.
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: mapped RW at EL1 and exclusively ours until publication.
+        unsafe {
+            tag_module_page(va.as_u64(), domain);
         }
         mapped += 1;
     }
@@ -856,6 +964,125 @@ fn smoke_module_text_alloc_seal_execute() -> TestResult {
     }
 }
 kernel_test_in!("memory/module_text", smoke_module_text_alloc_seal_execute);
+
+/// A module image's pages are Tagged Normal and their granules carry the
+/// module's domain tag.
+///
+/// aarch64 has no protection-key field, so the domain travels as the memory
+/// type plus the granule tags. Asserted by reading the leaf back and `ldg`-ing
+/// the tag rather than trusting `alloc`: a memory-attribute bug is invisible
+/// under QEMU — a wrongly-attributed page still reads and writes — so only a
+/// readback separates "tagged" from "we asked for tagged".
+#[cfg(target_arch = "aarch64")]
+fn smoke_module_text_pages_are_tagged_for_their_domain() -> TestResult {
+    use crate::aarch64::paging::{leaf_flags_at, PtFlags};
+    use crate::VirtAddr;
+    use narf_arch::aarch64::mte;
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let img = match alloc(1, DomainId::SCRATCH) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
+    };
+    let Some(want_tag) = domain_tag(DomainId::SCRATCH) else {
+        // SAFETY: nothing was executed from this image.
+        unsafe { free(img) };
+        // Not a skip. SCRATCH is a real driver domain and must be taggable;
+        // returning None here is exactly how the first `domain_tag` hid the
+        // fact that it protected nothing for the domain the tests use.
+        return TestResult::Fail("SCRATCH has no tag, so module tagging is inert for it");
+    };
+    let Ok(root) = kernel_root() else {
+        // SAFETY: nothing was executed from this image.
+        unsafe { free(img) };
+        return TestResult::Fail("kernel root unavailable");
+    };
+
+    // AttrIndx is bits [4:2]; compare the whole field, because a wrong value
+    // selects a different MAIR entry rather than setting a flag.
+    const ATTR_FIELD: u64 = 0b111 << 2;
+    // SAFETY: `root` is the live kernel root; `img.base` was just mapped.
+    let flags = unsafe { leaf_flags_at(root, VirtAddr::new(img.base)) };
+    let attr_ok =
+        matches!(flags, Some((f, _)) if f.bits() & ATTR_FIELD == PtFlags::ATTR_TAGGED.bits());
+
+    // SAFETY: mapped RW at EL1 and owned by this image.
+    let read_tag = mte::tag_of(unsafe { mte::ldg(img.base as *mut u8) } as u64);
+    // A mid-page granule too: a loop that stopped after the first would
+    // satisfy a byte-0-only check.
+    // SAFETY: inside the page just allocated.
+    let mid_tag = mte::tag_of(unsafe { mte::ldg((img.base + 2048) as *mut u8) } as u64);
+    let tagged_base = img.tagged_base();
+    let is_va = is_module_va(tagged_base);
+
+    // SAFETY: nothing was ever executed from this image.
+    unsafe { free(img) };
+
+    if !attr_ok {
+        return TestResult::Fail("module page is not mapped Tagged Normal (AttrIndx != 2)");
+    }
+    if read_tag != want_tag {
+        return TestResult::Fail("module page granule does not carry the domain's tag");
+    }
+    if mid_tag != want_tag {
+        return TestResult::Fail("a mid-page granule was left untagged");
+    }
+    if mte::tag_of(tagged_base) != want_tag {
+        return TestResult::Fail("tagged_base() does not carry the domain's tag");
+    }
+    if mte::tag_of(tagged_base) == mte::UNTAGGED_KERNEL_TAG {
+        return TestResult::Fail("the domain tag is the untagged-kernel value");
+    }
+    // A tagged PC must still attribute to its module, or backtraces silently
+    // stop recognising module frames.
+    if !is_va {
+        return TestResult::Fail("is_module_va rejected a tagged module address");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_pages_are_tagged_for_their_domain
+);
+
+/// Distinct domains get distinct tags, and none gets the untagged-kernel one.
+///
+/// The property the mechanism exists for, and cheap to lose: `domain_tag`
+/// returning a constant would leave every other assertion in this file passing.
+#[cfg(target_arch = "aarch64")]
+fn smoke_module_text_domains_get_distinct_tags() -> TestResult {
+    use narf_arch::aarch64::mte;
+
+    let mut seen = [false; 16];
+    for d in 0u8..16 {
+        match domain_tag(DomainId::new(d)) {
+            // FRAME is deliberately untaggable -- fifteen usable tags cannot
+            // cover sixteen domains, and the TCB is the one to give up. Pinned
+            // to FRAME specifically: an earlier version sacrificed domain 15,
+            // which is SCRATCH, a real driver domain.
+            None if d == DomainId::FRAME.raw() => {}
+            None => return TestResult::Fail("a domain other than FRAME is untaggable"),
+            Some(t) => {
+                if t == mte::UNTAGGED_KERNEL_TAG {
+                    return TestResult::Fail("a domain was given the untagged-kernel tag");
+                }
+                if seen[t as usize] {
+                    return TestResult::Fail("two domains share an MTE tag");
+                }
+                seen[t as usize] = true;
+            }
+        }
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "memory/module_text",
+    smoke_module_text_domains_get_distinct_tags
+);
 
 /// W^X, stated as a property rather than a comment: once a page is executable
 /// at its module VA, no kernel window may still offer a writable alias of the

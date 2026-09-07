@@ -1133,32 +1133,37 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
 
         // Domain-enforcer selection.
         //
-        // Neither arm can enforce today, so neither may claim to.
-        // `Mte::enter_domain` is a structural no-op: it saves SCTLR_EL1 and
-        // GCR_EL1 and never flips SCTLR_EL1.TCF from Ignore to Sync, so a tag
-        // mismatch never faults. Nothing in the tree writes TCF at all. And
-        // the no-MTE arm selected `Pcid`, which on aarch64 is not a backend —
-        // the ASID-tagged fallback it named is unimplemented, so it reported
-        // an intent as though it were a mechanism.
-        //
-        // Reporting `Unenforced` is the same correction the x86 side made
-        // when PCID was selected with CR4.PCIDE clear: naming an enforcer
-        // that enforces nothing reads as protection in a boot log and in
-        // every `effective_backend()` caller. The path to a real MTE backend
-        // is scoped in `arch/specification/mte-enforcement.md`.
-        //
-        // ID_AA64PFR1_EL1.MTE is a 4-bit field: 0=none, 1=instructions only,
-        // 2=memory tagging supported, 3+=advanced. The distinction is kept in
-        // the message because "hardware absent" and "hardware present but
-        // unused" are different problems to a reader.
-        narf_arch::set_effective_backend(narf_arch::DomainBackend::Unenforced);
+        // `Mte` at last, and only because the claim is now true end to end.
+        // For most of this backend's life it reported an enforcer that never
+        // flipped `SCTLR_EL1.TCF`; then it honestly reported `Unenforced`
+        // while MTE guarded the BPF arena but nothing guarded driver domains.
+        // Both halves now hold: module images are mapped `ATTR_TAGGED` with
+        // one tag per domain, the loader relocates them at a tagged VA so
+        // their own accesses match, and `modules::domain::enter` flips TCF, so
+        // a pointer into another domain's image faults. Pinned by
+        // `smoke_module_domain_untagged_access_faults_in_scope`.
         if feats.mte >= 2 {
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Mte);
             let _ = writeln!(
                 console::Writer,
-                "  domain enforcer: NONE — MTE present but tag checking is \
-                 not enabled; driver domains are NOT isolated"
+                "  domain enforcer: mte (SCTLR_EL1.TCF=Sync inside domain \
+                 scopes; module images Tagged Normal, one tag per domain)"
+            );
+            // Say what it does not cover, in the same breath. MTE has 16 tags
+            // and NARF has 16 domains, but tag 15 is what every untagged
+            // kernel pointer already reads as, so fifteen usable tags must
+            // cover sixteen domains and one goes untagged. FRAME is the one:
+            // it is the TCB, its memory is not Tagged Normal anyway, and
+            // `enter_domain` leaves it reachable from everywhere by design.
+            // An operator should not have to read the source to learn that
+            // one domain is exempt.
+            let _ = writeln!(
+                console::Writer,
+                "  mte: FRAME (domain 0) is untagged by design — 15 usable \
+                 tags cover 16 domains, and the TCB is the one given up"
             );
         } else {
+            narf_arch::set_effective_backend(narf_arch::DomainBackend::Unenforced);
             let _ = writeln!(
                 console::Writer,
                 "  domain enforcer: NONE — no MTE and no fallback; \

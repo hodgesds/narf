@@ -445,6 +445,195 @@ fn smoke_elf_parse_valid_header() -> TestResult {
 }
 kernel_test_in!("modules/elf", smoke_elf_parse_valid_header);
 
+/// Tagging the place must not change any displacement a relocation computes.
+///
+/// This is the step-6 addressing contract stated as a property: relocating a
+/// module image at a VA carrying its MTE domain tag must produce byte-identical
+/// output to relocating it untagged, for every PC-relative form. If the tag
+/// leaks into a subtraction it does not shift the result slightly — it moves it
+/// by `(15 - tag) << 56`, so a `CALL26` overflows its ±128 MiB bound, takes a
+/// PLT veneer it does not need, and the PLT exhausts. That is precisely how the
+/// first attempt at tagged module images failed to load a real `.ko`.
+///
+/// Written as a direct call into `apply_aarch64` rather than through a module
+/// load because the reference `.ko` emits only `CALL26` and `JUMP26` of the
+/// five affected forms. `PREL32`, `PREL64` and `ADR_PREL_PG_HI21` are not in it
+/// at all, so a load-driven test would leave three of the five fixes unexercised
+/// while looking like coverage.
+#[cfg(target_arch = "aarch64")]
+fn smoke_reloc_displacements_ignore_the_place_tag() -> TestResult {
+    use crate::elf::reloc::{
+        apply_aarch64, R_AARCH64_ABS64, R_AARCH64_ADR_PREL_PG_HI21, R_AARCH64_CALL26,
+        R_AARCH64_JUMP26, R_AARCH64_PREL32, R_AARCH64_PREL64,
+    };
+
+    // A plausible module VA and a kernel symbol a short, encodable distance
+    // away — inside ±128 MiB so `CALL26` is representable without a veneer.
+    const PLAIN: u64 = 0xFFFF_FF7F_F800_0000;
+    const SYM: u64 = PLAIN + 0x10_0000;
+    // Domain 3's tag under the `D - 1` mapping, in bits 59:56.
+    const TAGGED: u64 = (PLAIN & !(0xF << 56)) | (2u64 << 56);
+
+    for ty in [
+        R_AARCH64_PREL64,
+        R_AARCH64_PREL32,
+        R_AARCH64_CALL26,
+        R_AARCH64_JUMP26,
+        R_AARCH64_ADR_PREL_PG_HI21,
+    ] {
+        let mut plain = [0u8; 16];
+        let mut tagged = [0u8; 16];
+        let a = apply_aarch64(&mut plain, 0, PLAIN, SYM, 0, ty);
+        let b = apply_aarch64(&mut tagged, 0, TAGGED, SYM, 0, ty);
+        // The untagged run must succeed, or both could fail identically and
+        // this would pass while proving nothing.
+        if a.is_err() {
+            return TestResult::Fail("the untagged relocation did not apply");
+        }
+        if b.is_err() {
+            return TestResult::Fail("the tagged relocation overflowed");
+        }
+        if plain != tagged {
+            return TestResult::Fail("a displacement changed when the place was tagged");
+        }
+    }
+
+    // Control: an ABSOLUTE form must NOT be tag-invariant. `ABS64` writing the
+    // symbol's address is how an in-module pointer acquires the domain tag, so
+    // a blanket untagging that also stripped it would break the mechanism
+    // while making every assertion above pass.
+    let mut plain = [0u8; 16];
+    let mut tagged = [0u8; 16];
+    let tagged_sym = (SYM & !(0xF << 56)) | (2u64 << 56);
+    if apply_aarch64(&mut plain, 0, PLAIN, SYM, 0, R_AARCH64_ABS64).is_err()
+        || apply_aarch64(&mut tagged, 0, TAGGED, tagged_sym, 0, R_AARCH64_ABS64).is_err()
+    {
+        return TestResult::Fail("ABS64 did not apply");
+    }
+    if plain == tagged {
+        return TestResult::Fail("ABS64 dropped the symbol's tag");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "modules/elf",
+    smoke_reloc_displacements_ignore_the_place_tag
+);
+
+/// The enforcement: inside a module's domain scope, a pointer into its image
+/// that does not carry the domain's tag faults; one that does, works.
+///
+/// This is what "driver domains are isolated on aarch64" has to mean, and the
+/// assertion the whole of step 6 exists to make true. Without the in-scope
+/// fault the tagging is bookkeeping — pages marked Tagged Normal, granules
+/// carrying a tag, and nothing ever checking either.
+///
+/// The out-of-scope half matters as much: it shows the enforcement is
+/// *scoped*. A test that only proved the fault would pass equally on a system
+/// where tag checking was simply always on, which is a different and far more
+/// dangerous machine than the one being built.
+#[cfg(target_arch = "aarch64")]
+fn smoke_module_domain_untagged_access_faults_in_scope() -> TestResult {
+    use core::arch::asm;
+    use narf_arch::aarch64::{mte, probe};
+    use narf_lib::id::DomainId;
+    use narf_memory::module_text::{alloc, free};
+
+    if !mte::supported() {
+        return TestResult::Skip("no MTE on this CPU");
+    }
+    let img = match alloc(1, DomainId::SCRATCH) {
+        Ok(i) => i,
+        Err(_) => return TestResult::Fail("module_text::alloc(1) failed"),
+    };
+    let plain = img.base;
+    let tagged = img.tagged_base();
+    if tagged == plain {
+        // SAFETY: nothing was executed from this image.
+        unsafe { free(img) };
+        return TestResult::Fail("SCRATCH's image is untagged, so nothing could fault");
+    }
+
+    // Control: the untagged pointer works with TCF at Ignore. If it faults
+    // here the page is simply not mapped and the rest proves nothing.
+    // SAFETY: byte 0 of a page `alloc` just mapped RW at EL1.
+    let before = unsafe { core::ptr::read_volatile(plain as *const u64) };
+
+    // Control: the TAGGED pointer works inside the scope. That is the path
+    // relocated module code takes, so a fault here is a regression rather
+    // than enforcement.
+    let inside_tagged = {
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        // SAFETY: same page, addressed with the tag its granules carry.
+        let v = unsafe { core::ptr::read_volatile(tagged as *const u64) };
+        crate::domain::exit(scope);
+        v
+    };
+
+    // The enforcement: untagged pointer, in scope, expected to fault.
+    let caught = {
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        let recovery: u64;
+        // SAFETY: ADR of a local label, resolved forward into the block below.
+        unsafe {
+            asm!("adr {r}, 99f", r = out(reg) recovery, options(nostack, preserves_flags));
+        }
+        probe::arm(recovery);
+        // SAFETY: the load is expected to raise a synchronous tag check fault;
+        // the armed probe redirects ELR_EL1 to `99:` instead of taking the
+        // fatal path. Module code has no exception-table entry, so without the
+        // probe this would be fatal rather than reported.
+        unsafe {
+            asm!(
+                "ldr {t}, [{p}]",
+                "99:",
+                p = in(reg) plain,
+                t = out(reg) _,
+                options(nostack),
+            );
+        }
+        let c = probe::disarm();
+        crate::domain::exit(scope);
+        c
+    };
+
+    // Control: still fine outside the scope, and TCF was restored.
+    // SAFETY: as the first read.
+    let after = unsafe { core::ptr::read_volatile(plain as *const u64) };
+    // SAFETY: MRS SCTLR_EL1.
+    let tcf_after = unsafe { mte::tcf_mode() };
+
+    // SAFETY: nothing was ever executed from this image.
+    unsafe { free(img) };
+
+    if inside_tagged != before {
+        return TestResult::Fail("the tagged pointer read a different value inside the scope");
+    }
+    if !caught.fired {
+        return TestResult::Fail("untagged access inside a module domain scope did not fault");
+    }
+    // DFSC 0b010001 is a Synchronous Tag Check Fault specifically. A
+    // translation or permission fault here would mean the mapping is wrong,
+    // not that tag checking works.
+    const DFSC_TAG_CHECK: u64 = 0b01_0001;
+    if caught.esr & 0x3F != DFSC_TAG_CHECK {
+        return TestResult::Fail("the fault was not a synchronous tag check fault");
+    }
+    if after != before {
+        return TestResult::Fail("the untagged read outside the scope changed value");
+    }
+    if tcf_after != mte::TCF_IGNORE {
+        return TestResult::Fail("TCF was left Sync after the scope exited");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "aarch64")]
+kernel_test_in!(
+    "modules/domain",
+    smoke_module_domain_untagged_access_faults_in_scope
+);
+
 fn smoke_elf_rejects_class32() -> TestResult {
     let mut bytes = ElfBuilder::new_x86_64()
         .modinfo(&modinfo_text("a", 0))
@@ -1201,4 +1390,56 @@ fn smoke_manifest_spans_multiple_modinfo_sections() -> TestResult {
 kernel_test_in!(
     "modules/manifest",
     smoke_manifest_spans_multiple_modinfo_sections
+);
+
+/// `current_domain()` reports the domain whose scope is open, and restores
+/// the previous one on exit — including through nesting.
+///
+/// The hook behind it returned a hardcoded 0 until domain scopes started
+/// recording themselves, so every caller read `FRAME` regardless of what was
+/// running. That is not a harmless stub: `block::encrypted` asserts it runs
+/// as `KEYS`, and the assertion passed by comparing FRAME against FRAME.
+///
+/// Arch-neutral, and deliberately so. The tracking is not derived from
+/// `IA32_PKRS` or `SCTLR_EL1.TCF` — those say what is permitted, and on a CPU
+/// with no active backend they say nothing — so it must hold on x86 without
+/// PKS and on aarch64 without MTE just as it does with them.
+fn smoke_domain_scope_tracks_the_current_domain() -> TestResult {
+    use narf_lib::assert::current_domain;
+    use narf_lib::id::DomainId;
+
+    if current_domain() != DomainId::FRAME {
+        return TestResult::Fail("not in FRAME before any scope was entered");
+    }
+
+    let outer = crate::domain::enter(DomainId::SCRATCH);
+    if current_domain() != DomainId::SCRATCH {
+        crate::domain::exit(outer);
+        return TestResult::Fail("current_domain did not follow the scope");
+    }
+
+    // Nested: a BPF program can run from inside a module's init(), so the
+    // inner scope must restore the outer domain rather than reset to FRAME.
+    let inner = crate::domain::enter(DomainId::KEYS);
+    let nested_ok = current_domain() == DomainId::KEYS;
+    crate::domain::exit(inner);
+    let restored_to_outer = current_domain() == DomainId::SCRATCH;
+
+    crate::domain::exit(outer);
+    let restored_to_frame = current_domain() == DomainId::FRAME;
+
+    if !nested_ok {
+        return TestResult::Fail("a nested scope did not report its own domain");
+    }
+    if !restored_to_outer {
+        return TestResult::Fail("leaving a nested scope did not restore the outer domain");
+    }
+    if !restored_to_frame {
+        return TestResult::Fail("leaving the outer scope did not restore FRAME");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "modules/domain",
+    smoke_domain_scope_tracks_the_current_domain
 );

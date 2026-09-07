@@ -19,6 +19,8 @@ use crate::elf::{
     apply_aarch64, apply_x86_64, parse_rela, parse_section, section_name, Elf64Header, RelocError,
     SymbolTable, EM_AARCH64, EM_X86_64,
 };
+use core::fmt::Write as _;
+
 use crate::manifest::Manifest;
 use crate::plt::Plt;
 use crate::symbols::{resolve, ResolveError};
@@ -190,7 +192,15 @@ pub fn apply_one_rela_section(
         {
             let target = (sym_value as i64).wrapping_add(r.r_addend) as u64;
             let place = target_addr.wrapping_add(loc as u64);
-            let words = (target as i64).wrapping_sub(place as i64) >> 2;
+            // Same untagging `apply_aarch64` does, and for the same reason:
+            // with a tagged module image, a raw subtraction here makes every
+            // call look like a +/-128 MiB overflow, so every call takes a
+            // veneer and the PLT exhausts. This check and the one it mirrors
+            // must agree, or a load fails for a reason the relocation itself
+            // would not have hit.
+            let words = (crate::elf::reloc::untag_kernel_pub(target) as i64)
+                .wrapping_sub(crate::elf::reloc::untag_kernel_pub(place) as i64)
+                >> 2;
             // Same ±128 MiB bound `apply_aarch64` enforces, checked here so
             // an overflow can be fixed instead of failing the load.
             if !(-(1 << 25)..(1 << 25)).contains(&words) {
@@ -230,7 +240,21 @@ pub fn apply_one_rela_section(
                 });
             }
         };
-        result.map_err(RelocatorError::ApplyFailed)?;
+        if let Err(e) = result {
+            // Name the relocation. `ApplyFailed(Overflow)` on its own says a
+            // relocation did not fit and nothing about which one, which is
+            // most of the work when a real `.ko` stops loading. The type and
+            // the two operands are exactly what identifies it.
+            let _ = writeln!(
+                narf_console::Writer,
+                "  reloc: type {} failed ({:?}) sym={:#x} place={:#x}",
+                r.ty(),
+                e,
+                sym_value,
+                target_addr.wrapping_add(loc as u64)
+            );
+            return Err(RelocatorError::ApplyFailed(e));
+        }
         applied += 1;
     }
     Ok(applied)

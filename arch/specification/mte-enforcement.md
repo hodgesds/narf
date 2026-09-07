@@ -1,7 +1,8 @@
 # mte-enforcement — turning the aarch64 MTE domain backend on
 
-> Status: **v0.3**. Steps 1, 2 and 3 are implemented; nothing is
-> enforced yet — step 4 is the flip. This records what exists, what is missing, and the order the
+> Status: **v1.0**. Steps 1–6 are implemented. MTE enforces for the BPF
+> arena **and for driver domains**, and the backend reports `Mte` because
+> that is now true end to end. This records what exists, what is missing, and the order the
 > missing pieces have to land in, because getting that order wrong hangs
 > the machine with no console.
 
@@ -99,13 +100,43 @@ Each step is separately verifiable and leaves the tree working.
      OR-ing into a field that is already all ones on a TTBR1 address, so
      every arena's tag was 15 — the value every untagged kernel pointer
      carries. Fixed separately; see "What step 3 found".
-  4. **Flip TCF inside the domain scope.** `enter_domain` sets Sync,
-     `exit_domain` restores. *Verify:* a deliberate tag mismatch inside
-     the scope faults synchronously and is reported, and the existing
-     arena smokes still pass.
-  5. **Report honestly.** Only once the above hold does `Mte` deserve to
-     be the reported enforcer. aarch64 reports `Unenforced` today, which
-     was done first because it is independent of all of this.
+  4. **Flip TCF inside the domain scope.** *Done.* `Mte::enter_domain`
+     sets `SCTLR_EL1.TCF` to Sync, `exit_domain` restores the saved
+     value, both followed by an `ISB`. Verified by
+     `smoke_bpf_arena_untagged_access_faults_in_scope`: an untagged
+     pointer into a tagged arena page faults inside the scope with
+     DFSC `0b010001` (Synchronous Tag Check Fault), while the tagged
+     pointer works inside it, the untagged pointer works outside it, and
+     TCF is back to Ignore after the scope exits.
+
+     The hazard the old no-op described — flip, fault, re-fault in the
+     handler, loop with no console — rested on treating tag checking as a
+     CPU-wide property. It is a property of the *page*: only
+     `ATTR_TAGGED` pages are checked, and only the arena's are mapped that
+     way, so the kernel stack, text, heap and page tables are unchecked
+     whatever TCF says. The blast radius is exactly the arena.
+
+     Two things had to be fixed first, neither of them in `enter_domain`:
+
+       * **The interpreter addressed the arena untagged.**
+         `ProgArena::resolve` returned `arena.kva() + off` and the
+         interpreter dereferences it from inside the scope. This is worse
+         than the JIT case: the EL1 abort handler's exception-table lookup
+         is keyed on `ELR_EL1` with no DFSC gate, so a tag fault in JIT'd
+         text recovers into the arena-fault epilogue and is *reported*,
+         while an interpreter fault has no entry, falls past
+         `probe::consume`, and is fatal. `resolve` now tags.
+       * **`write_sctlr_el1` issues no `ISB`**, only compiler fences. A
+         system-register write is not context-synchronising, so without one
+         the first accesses after the flip run under the old mode.
+  5. **Report honestly.** *Done — as a scope line, not a rename; see
+     below.* The backend stays `DomainBackend::Unenforced`, because no
+     enforcer is wired into module domain entry, and boot prints a second
+     line stating that MTE tag checking is active for the BPF arena.
+     Verified by `smoke_aarch64_report_matches_enforcement`, which asserts
+     both halves: the report is `Unenforced`, and — on a CPU with MTE —
+     `enter_domain` really does set TCF=Sync and `exit_domain` restores
+     it.
 
 ## The addressing contract
 
@@ -218,3 +249,238 @@ two sites and both were wrong identically. `mte::with_tag`, `tag_of` and
   * **What a mismatch should do.** Sync faults give a precise address;
     async is cheaper. Sync is the right default for a first
     implementation.
+
+## Why step 5 is not just a rename
+
+Steps 1–4 hold, so on the original plan `Mte` would now be the reported
+enforcer. Reporting it would still overclaim, for a reason this document
+did not anticipate.
+
+The TCF flip is wired into `bpf::domain::enter` and nowhere else. Driver
+domains are entered through `modules::domain::enter`, which gates on
+`pks::is_active() || pcid::is_active()` — both false on aarch64 — so a
+kernel module's `init()` and `exit()` run with no domain confinement at
+all. What is enforced today is arena-vs-not-arena for BPF, which is what
+`Arena::tag`'s own documentation says the tag buys. It is not
+driver-domain isolation.
+
+An operator reading `domain enforcer: mte` concludes driver domains are
+isolated on aarch64. That is the same defect this document opens with,
+and the same one the x86 side fixed by reporting `Unenforced` rather than
+naming an enforcer that enforces nothing — reintroduced on the third
+architecture, one step before the finish line.
+
+**Resolved: keep `Unenforced`, report the scope.** Boot prints two lines
+— that driver domains are not isolated because no enforcer is wired into
+module domain entry, and that MTE tag checking is active for the BPF
+arena. They are separate lines rather than one sentence because they
+describe different scopes, and folding them together invites reading the
+second as a qualifier on the first. A reader needs both: the first is what
+they must not rely on, and without the second the `mte=on` in the feature
+line directly above looks like dead configuration.
+
+The alternative — extend the flip to `modules::domain::enter` and report
+`Mte` — remains open. It needs its own access audit: module code touching
+any tagged page inside its scope would begin to fault, and unlike BPF
+there is no single chokepoint to tag, which is the same "cooperation from
+the allocator" problem listed under Traps.
+
+`smoke_aarch64_report_matches_enforcement` now pins the rule this document
+has been about from the start — the reported name matches what is enforced
+— and it is the first test in the tree to assert anything about
+`effective_backend()` at all. That absence is why the mistake was made
+three times: PCID selected with `CR4.PCIDE` clear, PKS and PCID documented
+as equivalent, and this arm naming an enforcer twice over.
+
+## Step 6 — driver domains: attempted, reverted, and what it needs
+
+Extending enforcement from the BPF arena to driver domains was tried and
+backed out. The page-level half works; the addressing half does not, and
+the two cannot land separately. What follows is what was learned, so the
+next attempt starts from here rather than from scratch.
+
+### x86 is not the model to copy from, but it is real
+
+`module_text::protection_key` is wired: `leaf_flags(domain)` ORs
+`PtFlags::pk(D)` into every module leaf, and `alloc(pages, domain)` uses
+it. PKS module isolation is genuine on x86. aarch64's `leaf_flags`
+explicitly drops the domain — "the domain does not travel in the leaf
+here" — so this is aarch64 catching up, not a tree-wide gap.
+
+### What worked
+
+Module pages can carry the domain: map them `ATTR_TAGGED` and have `alloc`
+write the domain's tag to every granule after the trap-fill (the same
+ordering `bpf_arena` needs — the fill goes through the untagged VA, and a
+store via a non-tagged alias can leave a granule UNKNOWN). Two readback
+tests were written and **passed**: one reading the leaf's whole `AttrIndx`
+field and `ldg`-ing the tag back from byte 0 and a mid-page granule, one
+asserting distinct tags per domain.
+
+### The tag space is one short, and the obvious sacrifice is wrong
+
+MTE has 16 tags, NARF has 16 domains, and tag 15 is what every untagged
+kernel pointer reads as. So fifteen usable tags must cover sixteen domains
+and exactly one domain goes untagged.
+
+It must be `FRAME` (mapping `D` to `D - 1`). `FRAME` is the TCB, its
+memory is not `ATTR_TAGGED` anyway, and `enter_domain` deliberately leaves
+it reachable from everywhere, so "unprotected" describes what it already
+is. The identity mapping — leaving domain 15 untagged — looks equivalent
+and is not: `DomainId::SCRATCH` **is** 15. It is a real driver domain, it
+is the one the module tests use, and sacrificing it made the only test
+that verifies tagging *skip* rather than run. The mechanism looked
+delivered and did nothing where it was most likely to be exercised.
+
+### The blocker: the relocator has no addressing contract
+
+For a module's own accesses to match its tagged granules, its code must
+run at a tagged VA — then absolute relocations carry the tag and
+`ADRP`-computed addresses inherit it from the PC. Relocating against
+`ModuleImage::tagged_base()` does that, and breaks loading outright:
+`smoke_module_load_real_ko_round_trip` fails with "sys_init_module
+rejected a real rustc-built .ko".
+
+`relocator.rs` computes `words = (target - place) >> 2` for
+`R_AARCH64_CALL26` / `JUMP26`. `target` is a kernel symbol — untagged, so
+tag 15 — while `place` is inside the image at tag `D - 1`. The difference
+carries `(15 - (D - 1)) << 56`, every call overflows the ±128 MiB bound,
+each demands a PLT veneer, the PLT exhausts, and the load is refused.
+
+This is the question "The addressing contract" above asks, arriving for
+real. For the JIT it dissolved because nothing compares addresses. The
+relocator compares constantly, so the contract must be stated and applied:
+**displacements are computed on untagged addresses; stored absolute
+addresses carry the tag.** That is a change across `CALL26`/`JUMP26`,
+`ADRP`/`ADD` and `PREL32` handling, and it is the real content of step 6 —
+the page tagging is the easy part.
+
+### Why the halves cannot land separately
+
+Tagging module pages without the addressing contract is not a safe
+intermediate. `TCF` is per-CPU and checks are per-page, so while any BPF
+domain scope holds `TCF=Sync`, an interrupt into driver code that touches
+its own now-tagged data through an untagged pointer takes a fatal fault —
+there is no exception-table entry for module code. Page tagging and the
+relocator contract must land together, or neither.
+
+## Step 6 audit — every aarch64 relocation, and which ones the tag breaks
+
+Scoping pass over `modules/src/elf/reloc.rs::apply_aarch64` and the
+veneer pre-check in `modules/src/relocator.rs`. The question for each type
+is what it does with `val` (the symbol address, `sym_value + addend`) and
+`place` (`target_addr + loc`, always inside the module image). With the
+image relocated against a tagged base, `place` carries tag `D-1` while a
+kernel `val` carries the untagged 15.
+
+The rule the whole table reduces to: **a displacement must be computed on
+untagged operands; an absolute value must keep its tag.**
+
+| Relocation | Computation | Tag participates? | Action |
+|---|---|---|---|
+| `ABS64` | writes `val` | yes, and correctly | none — this is how a module's absolute pointers acquire the tag |
+| `ABS32` | `val`, errors if `> u32::MAX` | no | none — a 64-bit VA overflows tagged or not |
+| `PREL64` | `val - place` | **yes** | untag both |
+| `PREL32` | `val - place`, ±2 GiB | **yes** | untag both |
+| `CALL26` / `JUMP26` | `(val - place) >> 2`, ±128 MiB | **yes** | untag both |
+| `ADR_PREL_PG_HI21` | `(val&!0xFFF) - (place&!0xFFF) >> 12`, ±4 GiB | **yes** — masking 12 bits does not clear bit 56 | untag both |
+| `ADD_ABS_LO12_NC` | `val & 0xFFF` | no | none |
+| `LDST64_ABS_LO12_NC` | `val & 0xFFF` | no | none |
+| `MOVW_UABS_G0..G2(_NC)` | `val >> lsb`, checked forms error `> 0xFFFF` | no — tag sits in G3 | none |
+| `MOVW_UABS_G3` | `val >> 48` | yes, and correctly | none — this is how a MOVZ/MOVK-materialised pointer gets the tag |
+| `NONE` | — | no | none |
+
+So five arms change, out of eighteen. Plus one more site, and it is the
+one that actually failed: `relocator.rs:188` duplicates the `CALL26` /
+`JUMP26` range check to decide whether a PLT veneer is needed. Left
+tagged, every call appears to overflow ±128 MiB, every call demands a
+veneer, and the PLT exhausts — which is the "rejected a real rustc-built
+.ko" that ended the first attempt.
+
+### Why the absolute forms are right to leave alone
+
+`ABS64` and `MOVW_UABS_G3` are not oversights to fix later — they are the
+mechanism. An in-module symbol relocated absolutely yields a tagged
+pointer, which is exactly what makes the module's own data accesses match
+its granules. A kernel symbol yields an untagged one, which is also right:
+kernel pages are `ATTR_NORMAL` and unchecked.
+
+The same argument covers `ADRP` at *runtime*, which is worth stating
+because it looks like a problem and is not. The relocation encodes a page
+displacement computed untagged, but the CPU adds it to the live PC, which
+is tagged because the module executes at a tagged VA. An in-module target
+therefore resolves to a tag-`D-1` pointer (correct — matches the
+granules), and a kernel target resolves to a kernel address that happens
+to carry tag `D-1` (harmless — the page is not tagged, so nothing checks
+it). No runtime change is needed for `ADRP`; only the link-time
+displacement must be untagged.
+
+### Beyond the relocator
+
+`module_text::is_module_va` range-checks against `MODULE_VA_BASE` and
+would reject a tagged PC, so anything attributing an address to a module —
+backtraces, `/proc/modules`-adjacent diagnostics — needs to untag first.
+Diagnostic-only, but it fails silently: a module frame simply stops being
+recognised as one.
+
+### Proven versus inferred
+
+Only `CALL26` is demonstrated: it is what the failing load hit. The other
+four are read off the arithmetic, and `PREL32`/`PREL64` in particular may
+not appear in a real `.ko` at all — the existing comment in `reloc.rs`
+notes that `MOVW_UABS` quartets were added only because a rustc-built
+module used them where a synthesized test ELF did not. Before editing, log
+the relocation types the reference module actually emits; a type that
+never appears needs the fix for correctness but cannot be tested, and
+should be marked as such rather than counted as covered.
+
+## Step 6 — done
+
+Module images map `ATTR_TAGGED` with one tag per domain, the loader
+relocates them at `ModuleImage::tagged_base()` so their own accesses carry
+that tag, and `modules::domain::enter` flips TCF. A pointer into an
+image derived from another domain faults;
+`smoke_module_domain_untagged_access_faults_in_scope` pins it with the
+same four-part shape the arena test uses.
+
+`effective_backend()` now reports `Mte`, and
+`smoke_aarch64_report_matches_enforcement` was inverted to match — it
+previously pinned `Unenforced` *because* the flip reached only
+`bpf::domain::enter`. That inversion is the intended shape: the report and
+the enforcement behind it move together, so a future regression in module
+confinement fails that test rather than quietly widening the claim.
+
+### What the audit missed
+
+The relocation audit above named five arms plus the relocator's veneer
+pre-check. It missed a third site in the same class: `plt.rs`'s
+`encode_veneer`, which computes an ADRP page displacement between a
+tagged veneer address and an untagged kernel target. Every veneer refused
+to encode and the load failed as `PltExhausted` — an arena-full error for
+an empty PLT.
+
+The audit went file by file through the two places the arithmetic was
+expected to live. The pattern, not the location, is what identifies these:
+any subtraction of two addresses where one can come from a module image
+and the other from the kernel. That is the search to run before adding a
+sixth tagged region.
+
+### The exemption, stated plainly
+
+FRAME (domain 0) is untagged. Fifteen usable tags cannot cover sixteen
+domains, because tag 15 is what every untagged kernel pointer already
+reads as. FRAME is the right one to give up — it is the TCB, its memory is
+not Tagged Normal, and `enter_domain` leaves it reachable from every
+domain by design — but it is an exemption, and boot prints it on its own
+line rather than leaving it to be discovered in the source.
+
+### What this still is not
+
+MTE gives arena-vs-not-arena and image-vs-image isolation: a pointer
+*derived* elsewhere carries a different tag and faults. It is not a
+capability boundary. A pointer handed across a domain boundary keeps its
+tag and keeps working, and a module's heap from `narf_kmalloc`, the
+globals behind the four exported ABI functions, and its kernel stack are
+plain Normal memory and unchecked. Extending past the image is the
+MTE-aware slab that `mte.rs` calls Stage-3 tag storage, and it is not
+started.
