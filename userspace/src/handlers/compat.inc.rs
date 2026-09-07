@@ -4018,11 +4018,16 @@ const UNBLOCKABLE_MASK: u64 = (1 << 8) | (1 << 18);
 ///   - `saved_mask`: the pre-handler signal mask to restore on return (POSIX),
 ///     undoing the delivery's auto-block. `None` for a sync-fault handler (it
 ///     doesn't auto-block); the async path fills it after building the frame.
+///   - `interrupted_rsp`: stack pointer before the frame was installed. A
+///     later delivery at or above this address proves a downward-growing
+///     regular-stack frame was abandoned by `siglongjmp` instead of returned.
 #[derive(Clone, Copy)]
-struct SigReturnRecord {
+pub(crate) struct SigReturnRecord {
     use_rsp: bool,
     is_rt: bool,
     saved_mask: Option<u64>,
+    interrupted_rsp: u64,
+    on_altstack: bool,
 }
 
 /// Per-task STACK of sigreturn records — one push per delivered handler, one
@@ -4037,20 +4042,119 @@ static SIGRETURN_STACK: narf_lib::sync::IrqSafeSpinLock<
     Option<BTreeMap<u64, alloc::vec::Vec<SigReturnRecord>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Run `f` against the current task's private sigreturn stack. A user task is
+/// never executing on two CPUs concurrently, and delivery/return do not park,
+/// so the current trap owns this `UnsafeCell` for the duration of the call.
+/// Synthetic syscall tests have no published `UserTaskCtx` and use the legacy
+/// table below instead.
+fn with_current_sigreturn_stack<R>(
+    f: impl FnOnce(&mut alloc::vec::Vec<SigReturnRecord>) -> R,
+) -> Option<R> {
+    let ctx = crate::user_task::current_user_task()?;
+    // SAFETY: `current_user_task` returns the context owned by the task whose
+    // trap is executing. The scheduler cannot run that task concurrently, and
+    // this closure cannot await or switch context.
+    Some(unsafe { f(&mut *(*ctx).sigreturn_stack.get()) })
+}
+
 /// Push a fresh record for a signal delivery. `saved_mask` starts `None`; the
 /// async path fills it via `set_sigreturn_saved_mask` after the frame is built.
-fn push_sigreturn_record(task: u64, use_rsp: bool, is_rt: bool) {
-    let mut g = SIGRETURN_STACK.lock();
-    let map = g.get_or_insert_with(BTreeMap::new);
-    map.entry(task).or_default().push(SigReturnRecord {
+fn push_sigreturn_record(
+    task: u64,
+    use_rsp: bool,
+    is_rt: bool,
+    interrupted_rsp: u64,
+    on_altstack: bool,
+) {
+    let rec = SigReturnRecord {
         use_rsp,
         is_rt,
         saved_mask: None,
-    });
+        interrupted_rsp,
+        on_altstack,
+    };
+    if with_current_sigreturn_stack(|stack| {
+        prune_abandoned_sigreturn_records(stack, interrupted_rsp);
+        stack.push(rec);
+    })
+    .is_some()
+    {
+        return;
+    }
+    let mut g = SIGRETURN_STACK.lock();
+    let map = g.get_or_insert_with(BTreeMap::new);
+    let stack = map.entry(task).or_default();
+    prune_abandoned_sigreturn_records(stack, interrupted_rsp);
+    stack.push(rec);
 }
+
+/// Drop regular-stack signal frames bypassed by a non-local jump. Signal
+/// stacks grow downward, so a later fault at or above the interrupted RSP can
+/// no longer return through that frame. Alternate stacks are deliberately not
+/// inferred from address ordering: their placement is independent of the
+/// regular stack, and retaining a rare abandoned record is safer than pruning
+/// an active handler after a user-controlled stack pivot.
+fn prune_abandoned_sigreturn_records(
+    stack: &mut alloc::vec::Vec<SigReturnRecord>,
+    current_rsp: u64,
+) {
+    while stack
+        .last()
+        .is_some_and(|rec| !rec.on_altstack && current_rsp >= rec.interrupted_rsp)
+    {
+        stack.pop();
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+fn smoke_sigreturn_prunes_abandoned_regular_frames() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    let rec = |interrupted_rsp, on_altstack| SigReturnRecord {
+        use_rsp: true,
+        is_rt: true,
+        saved_mask: None,
+        interrupted_rsp,
+        on_altstack,
+    };
+    // A nested handler is below its outer handler. A non-local jump part-way
+    // out must discard only the bypassed inner frame.
+    let mut stack = alloc::vec![rec(0x8000, false), rec(0x7000, false)];
+    prune_abandoned_sigreturn_records(&mut stack, 0x7800);
+    if stack.len() != 1 || stack[0].interrupted_rsp != 0x8000 {
+        return TestResult::Fail("sigreturn prune did not discard only the bypassed inner frame");
+    }
+    // Returning to the outer interrupted depth abandons that frame too.
+    prune_abandoned_sigreturn_records(&mut stack, 0x8000);
+    if !stack.is_empty() {
+        return TestResult::Fail("sigreturn prune retained an abandoned outer frame");
+    }
+    // Alternate-stack placement is unrelated to the regular stack's address
+    // ordering, so it must never be guessed away by this optimization.
+    stack.push(rec(0x9000, true));
+    prune_abandoned_sigreturn_records(&mut stack, u64::MAX);
+    if stack.len() != 1 {
+        return TestResult::Fail("sigreturn prune discarded an alternate-stack frame");
+    }
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "userspace",
+    smoke_sigreturn_prunes_abandoned_regular_frames
+);
 
 /// Record the pre-handler mask on the CURRENT (top) delivery record.
 fn set_sigreturn_saved_mask(task: u64, mask: u64) {
+    if with_current_sigreturn_stack(|stack| {
+        if let Some(rec) = stack.last_mut() {
+            rec.saved_mask = Some(mask);
+        }
+    })
+    .is_some()
+    {
+        return;
+    }
     let mut g = SIGRETURN_STACK.lock();
     if let Some(rec) = g
         .as_mut()
@@ -4063,15 +4167,16 @@ fn set_sigreturn_saved_mask(task: u64, mask: u64) {
 
 /// Pop the current handler's record at `sys_sigreturn`. `None` (no record) →
 /// the caller falls back to modern defaults (is_rt, !use_rsp, no mask restore).
+/// Keep the empty per-task vector so the next signal delivery reuses its
+/// allocation; `UserTaskCtx` teardown reclaims it when the task exits. The
+/// synthetic-test fallback table likewise retains its empty entry until
+/// `release_task_tables` removes that task.
 fn pop_sigreturn_record(task: u64) -> Option<SigReturnRecord> {
-    let mut g = SIGRETURN_STACK.lock();
-    let map = g.as_mut()?;
-    let stack = map.get_mut(&task)?;
-    let rec = stack.pop();
-    if stack.is_empty() {
-        map.remove(&task);
+    if let Some(rec) = with_current_sigreturn_stack(|stack| stack.pop()) {
+        return rec;
     }
-    rec
+    let mut g = SIGRETURN_STACK.lock();
+    g.as_mut()?.get_mut(&task)?.pop()
 }
 
 // Pre-`rt_sigsuspend` signal mask, saved when sigsuspend installs its
@@ -6606,18 +6711,23 @@ fn build_delivery_params(
     // installed AND it's not SS_DISABLE. A misconfigured altstack
     // (size below MIN_SIGSTKSZ) was already rejected at install
     // time by `sys_sigaltstack`.
-    let altstack = sigaltstack_of(task);
-    let altstack_valid = (action.flags & SA_ONSTACK) != 0
-        && (altstack.flags & SS_DISABLE) == 0
-        && altstack.sp != 0
-        && altstack.size != 0;
+    let (altstack_sp, altstack_size) = if (action.flags & SA_ONSTACK) != 0 {
+        let altstack = sigaltstack_of(task);
+        if (altstack.flags & SS_DISABLE) == 0 && altstack.sp != 0 && altstack.size != 0 {
+            (altstack.sp, altstack.size)
+        } else {
+            (0, 0)
+        }
+    } else {
+        (0, 0)
+    };
     SigDeliveryParams {
         handler: action.handler,
         restorer: action.restorer,
         signum,
         flags: action.flags,
-        altstack_sp: if altstack_valid { altstack.sp } else { 0 },
-        altstack_size: if altstack_valid { altstack.size } else { 0 },
+        altstack_sp,
+        altstack_size,
         restartable_syscall: is_restartable_syscall(syscall_no),
         si_code,
         si_addr,
@@ -6808,6 +6918,7 @@ fn default_signal_delivery_restricted_active(
     let params = build_delivery_params(
         task, action, signum, syscall_no, si_code, 0, si_value, si_pid,
     );
+    let interrupted_rsp = ctx.user_rsp();
     if !ctx.deliver_signal(&params) {
         return false;
     }
@@ -6837,6 +6948,8 @@ fn default_signal_delivery_restricted_active(
         task,
         params.restorer != 0,
         (params.flags & 0x4) != 0 || params.restorer != 0,
+        interrupted_rsp,
+        params.altstack_sp != 0,
     );
     // Commit only after the rewrite succeeded — a failed delivery (handled
     // above) leaves the payload AND the pending bit intact so the next trap
@@ -7185,6 +7298,7 @@ pub fn default_sync_signal_delivery(
         0,
         0,
     );
+    let interrupted_rsp = ctx.user_rsp();
     let delivered = ctx.deliver_signal(&params);
     if delivered {
         // Push this (sync-fault) frame's sigreturn record. A stack push, not a
@@ -7195,6 +7309,8 @@ pub fn default_sync_signal_delivery(
             task,
             params.restorer != 0,
             (params.flags & 0x4) != 0 || params.restorer != 0,
+            interrupted_rsp,
+            params.altstack_sp != 0,
         );
         return true;
     }

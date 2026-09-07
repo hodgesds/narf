@@ -16,68 +16,13 @@ use core::fmt::Write;
 
 use narf_console::TrapWriter;
 
-/// Ensure every page in the user range `[lo, hi)` is present and writable in
-/// the active user address space, backing demand-paged / growable-stack pages
-/// on the way (the same recovery the `#PF` handler would do on a real touch).
-///
-/// Returns `false` if any page cannot be backed — i.e. the range runs off the
-/// end of a fixed mapping (a genuine stack overflow). This is the guard that
-/// keeps `deliver_signal`'s CPL=0 frame writes from faulting *un-recoverably*
-/// and panicking the whole kernel when a user task overflows its stack during
-/// signal delivery (e.g. a SIGSEGV handler that itself faults, walking the
-/// stack down one rt_sigframe at a time). On `false` the caller force-applies
-/// the signal's default action (terminate) — Linux's `force_sigsegv` model —
-/// so the offending task dies and the kernel survives.
-#[cfg(target_arch = "x86_64")]
-fn ensure_user_range_writable(lo: u64, hi: u64) -> bool {
-    use narf_memory::AddressSpaceError;
-    let Some(as_arc) = narf_userspace::active_user_as() else {
-        // No active user AS — a kernel-internal delivery (or a unit test
-        // driving a kernel-buffer "stack"). Nothing to back / can't check;
-        // don't block. Only a delivery to a *real* user task (AS present) but
-        // an unbacked target page is the overflow we must refuse.
-        return true;
-    };
-    let mut p = lo & !0xFFFu64;
-    while p < hi {
-        let v = narf_memory::VirtAddr::new(p);
-        // SAFETY: the active CR3 belongs to this AS (we're in its trap
-        // context); the identity map is live. `demand_alloc_page` backs a
-        // demand slot and reports `AlignmentMismatch` for an already-present
-        // page (both mean "writable now"); `try_grow_stack` promotes a guard
-        // page. Anything else means the page is unbacked and not growable.
-        let backed = matches!(
-            crate::bare::reclaim_wait::demand_page(&as_arc, v),
-            Ok(()) | Err(AddressSpaceError::AlignmentMismatch)
-        ) || {
-            let limits = narf_userspace::handlers::current_stack_growth_limits();
-            // SAFETY: same active-AS/identity-map contract as below.
-            unsafe { as_arc.try_grow_stack_limited(v, limits) }.is_ok()
-        };
-        if !backed {
-            return false;
-        }
-        // Presence is not writability. `AlignmentMismatch` above only proves
-        // the page is mapped — it may be read-only (an `mprotect(PROT_READ)`
-        // region, or a deliberately-bad `sigaltstack`). A CPL=0 frame write to
-        // such a page faults un-recoverably and panics the kernel. Confirm the
-        // page is (or can be made, via COW) writable; refuse otherwise so the
-        // caller applies the signal's default action instead.
-        // SAFETY: same identity-map / active-AS contract as the calls above.
-        if !unsafe { as_arc.user_page_writable_or_resolve(v) } {
-            return false;
-        }
-        p = p.wrapping_add(0x1000);
-    }
-    true
-}
-
 /// Copy a kernel object into the active user address space under the x86
-/// recoverable-uaccess probe. The preflight above is intentionally not relied
-/// on as a synchronization primitive: a CLONE_VM sibling may `mprotect` or
-/// `munmap` the target after that check. The guarded copy turns the resulting
-/// supervisor #PF into `false` so signal delivery can force the default action
-/// instead of panicking the kernel.
+/// recoverable-uaccess probe. A healable supervisor #PF first follows the
+/// ordinary demand-page, stack-growth, or COW path and resumes the copy. An
+/// unmapped/read-only/overflow target reaches the probe fixup and returns
+/// `false`, so signal delivery can force the default action instead of
+/// panicking the kernel. This single guarded access is also race-safe when a
+/// CLONE_VM sibling changes the mapping while the frame is being written.
 #[cfg(target_arch = "x86_64")]
 unsafe fn signal_copy_to_user<T>(dst: u64, src: &T) -> bool {
     // SAFETY: `src` is a live kernel object for exactly size_of::<T>() bytes.
@@ -2185,18 +2130,6 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         let raw_rsp = stack_top.wrapping_sub(frame_size);
         let new_rsp = (raw_rsp & !0xFu64) | 0x8;
 
-        // Back the frame's target pages first. The writes below run at CPL=0
-        // through the SMAP window, so a not-present page they touch faults in
-        // KERNEL mode; if that page is a genuine stack overflow (not growable),
-        // the `#PF` is unrecoverable and panics the whole kernel. Pre-faulting
-        // here turns "can't place the signal frame" into a clean `false`
-        // return → the caller applies the default action (terminate the task),
-        // matching Linux's `force_sigsegv`. Growable / demand pages get backed
-        // as a side effect, so legitimate deliveries proceed unchanged.
-        if !ensure_user_range_writable(new_rsp, new_rsp.wrapping_add(frame_size)) {
-            return false;
-        }
-
         let saved_rip = if (params.flags & SA_RESTART) != 0 && params.restartable_syscall {
             self.frame.rip.wrapping_sub(2)
         } else {
@@ -2777,15 +2710,15 @@ kernel_test_in!("frame/x86_64", smoke_x86_64_sa_restart_rewinds_saved_rip);
 /// `deliver_signal` must REFUSE (return false) so the caller force-applies
 /// the default action (terminate). Letting the CPL=0 frame write fault
 /// unrecoverably instead panics the whole kernel for one runaway task; this
-/// is the SMP `chroot_run` #PF that the pre-fault guard closes (Linux's
-/// `force_sigsegv` model).
+/// is the SMP `chroot_run` #PF that guarded uaccess converts into a refused
+/// delivery (Linux's `force_sigsegv` model).
 fn smoke_x86_64_deliver_signal_refuses_unbacked_user_stack() -> TestResult {
     use alloc::sync::Arc;
     use narf_memory::AddressSpace;
 
     // Present an EMPTY address space: every user vaddr is unbacked and not
-    // growable (no STACK_GUARD region), so the pre-fault can't back the
-    // frame. `AddressSpace::empty()` has root=0, but the unbacked path never
+    // growable (no STACK_GUARD region), so guarded uaccess must recover the
+    // fault. `AddressSpace::empty()` has root=0, but the unbacked path never
     // dereferences the root (no region matches → Unmapped before any walk).
     fn empty_as_lookup() -> Option<Arc<AddressSpace>> {
         Some(Arc::new(AddressSpace::empty()))
@@ -2836,10 +2769,10 @@ kernel_test_in!(
     smoke_x86_64_deliver_signal_refuses_unbacked_user_stack
 );
 
-/// The signal-frame write itself must be fault guarded. A writable preflight
-/// cannot pin a CLONE_VM mapping, so a sibling may unmap the page before the
-/// supervisor copy. Model the post-preflight state with an active but empty AS:
-/// the copy must return false through the recoverable #PF probe, not panic.
+/// The signal-frame write itself must be fault guarded because a CLONE_VM
+/// sibling may unmap the page before the supervisor copy. Model that state
+/// with an active but empty AS: the copy must return false through the
+/// recoverable #PF probe, not panic.
 fn smoke_x86_64_signal_copy_survives_racing_unmap() -> TestResult {
     use alloc::sync::Arc;
     use narf_memory::AddressSpace;

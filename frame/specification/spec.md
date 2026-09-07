@@ -76,6 +76,11 @@ shared type directly; it does not define or cast a mirror layout.
   pressure falls through to the architecture probe fixup and becomes `EFAULT`.
   This keeps the per-CPU probe slot, x86 SMAP AC window, and IRQ mask within one
   uninterrupted task/CPU interval.
+- x86 signal-frame writes use that guarded-uaccess path directly. A present
+  stack page needs no address-space preflight; demand paging, stack growth, and
+  COW are attempted by the synchronous fault handler, while an invalid or
+  concurrently unmapped target reaches the probe fixup and terminates only the
+  receiving task.
 - **x86_64 trap entry clears the live direction flag before executing any
   compiler-generated code.** CPL3 may be interrupted between `std` and `cld`;
   the CPU-pushed RFLAGS retains that user state for `iretq`, while the kernel
