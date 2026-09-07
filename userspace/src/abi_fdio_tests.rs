@@ -2760,6 +2760,18 @@ fn smoke_abi_fdio_splice_exact_validation() -> TestResult {
         if call(Syscall::Splice.raw(), mk(rd as u64, 0, wr as u64, 0, 1, 0)) != Some(EINVAL) {
             return Err("splice to the same pipe was not EINVAL");
         }
+
+        // Linux only accepts a non-pipe source with a splice_read operation.
+        // Character devices such as /dev/zero lack one, so stress-ng expects
+        // EINVAL and permanently falls back to a direct write(2) fill.
+        let zero = open_fd_flags(b"/dev/zero\0", 0)?;
+        if call(
+            Syscall::Splice.raw(),
+            mk(zero as u64, 0, wr as u64, 0, 1, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("splice from /dev/zero was not EINVAL");
+        }
         Ok(())
     })
 }
@@ -3000,6 +3012,79 @@ fn smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio_splice_partial_pipe_to_pipe_preserves_tail
+);
+
+/// A pipe payload may wrap around its fixed ring after a partial drain and a
+/// later write. The pipe-to-sink splice path offers both stable ring slices
+/// directly, so the second sink call must continue at the first call's output
+/// offset and consume the logical byte order exactly once.
+fn smoke_abi_fdio_splice_wrapped_pipe_to_file() -> TestResult {
+    with_memfs("/abi", "abi", &[("dst", b"")], || {
+        let (src_rd, src_wr) = make_pipe()?;
+        let dst = open_fd_flags(b"/abi/dst\0", crate::fd::O_WRONLY as u64)?;
+        let first = alloc::vec![0xA1u8; 60 * 1024];
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, first.as_ptr() as u64, first.len() as u64),
+        ) != Some(first.len() as i64)
+        {
+            return Err("failed to seed wrapped-splice pipe");
+        }
+        let mut discarded = alloc::vec![0u8; 56 * 1024];
+        if call(
+            Syscall::Read.raw(),
+            a2(
+                src_rd as u64,
+                discarded.as_mut_ptr() as u64,
+                discarded.len() as u64,
+            ),
+        ) != Some(discarded.len() as i64)
+        {
+            return Err("failed to advance wrapped-splice pipe head");
+        }
+        let second = alloc::vec![0xB2u8; 8 * 1024];
+        if call(
+            Syscall::Write.raw(),
+            a2(src_wr as u64, second.as_ptr() as u64, second.len() as u64),
+        ) != Some(second.len() as i64)
+        {
+            return Err("failed to wrap splice source ring");
+        }
+
+        let remaining = 12 * 1024;
+        if call(
+            Syscall::Splice.raw(),
+            SyscallArgs {
+                arg0: src_rd as u64,
+                arg2: dst as u64,
+                arg4: remaining as u64,
+                ..Default::default()
+            },
+        ) != Some(remaining as i64)
+        {
+            return Err("wrapped pipe splice returned the wrong count");
+        }
+        let verify = open_fd(b"/abi/dst\0")?;
+        let mut actual = alloc::vec![0u8; remaining];
+        if call(
+            Syscall::Read.raw(),
+            a2(
+                verify as u64,
+                actual.as_mut_ptr() as u64,
+                actual.len() as u64,
+            ),
+        ) != Some(remaining as i64)
+            || actual[..4 * 1024] != first[56 * 1024..]
+            || actual[4 * 1024..] != second
+        {
+            return Err("wrapped pipe splice reordered or lost a ring slice");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/splice",
+    smoke_abi_fdio_splice_wrapped_pipe_to_file
 );
 
 /// A non-pipe splice destination may use an explicit `off_out`. It advances

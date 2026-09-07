@@ -16,6 +16,7 @@ use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -47,7 +48,6 @@ pub struct FdEntry {
 #[derive(Debug)]
 struct OpenFileState {
     offset: u64,
-    status_flags: u32,
 }
 
 /// Shared `struct file` analogue. The async mutex serializes sequential I/O
@@ -55,6 +55,12 @@ struct OpenFileState {
 #[derive(Debug)]
 pub(crate) struct OpenFileDescription {
     state: IrqSafeSpinLock<OpenFileState>,
+    /// Linux's `file::f_flags` analogue. Reads dominate writes, and flag
+    /// snapshots need not serialize with the unrelated file-position cursor.
+    /// F_SETFL writers are already serialized by their fd tables; aliases in
+    /// different tables race with last-writer-wins semantics just as they do
+    /// on Linux.
+    status_flags: AtomicU32,
     pub(crate) position_lock: narf_lib::mutex::Mutex<()>,
     /// Index into the bounded inode/FileOps append-lock shard table.
     append_lock_index: usize,
@@ -87,6 +93,14 @@ impl OpenFileDescription {
 
     pub(crate) fn set_offset(&self, offset: u64) {
         self.state.lock().offset = offset;
+    }
+
+    fn status_flags(&self) -> u32 {
+        self.status_flags.load(Ordering::Acquire)
+    }
+
+    fn set_status_flags(&self, status_flags: u32) {
+        self.status_flags.store(status_flags, Ordering::Release);
     }
 
     pub(crate) fn append_lock(&self) -> &'static narf_lib::mutex::Mutex<()> {
@@ -380,8 +394,8 @@ impl FdTable {
         Arc::new(OpenFileDescription {
             state: IrqSafeSpinLock::new(OpenFileState {
                 offset: entry.offset,
-                status_flags: entry.status_flags,
             }),
+            status_flags: AtomicU32::new(entry.status_flags),
             position_lock: narf_lib::mutex::Mutex::new(()),
             append_lock_index: append_lock_index(&entry.ops),
         })
@@ -402,14 +416,13 @@ impl FdTable {
             .and_then(Option::as_ref)
             .ok_or(FdAllocError::BadFd)?
             .clone();
-        let state = description.state.lock();
+        let offset = description.state.lock().offset;
         let clone = FdEntry {
             ops: entry.ops.clone(),
-            offset: state.offset,
+            offset,
             flags,
-            status_flags: state.status_flags,
+            status_flags: description.status_flags(),
         };
-        drop(state);
 
         let min = min as usize;
         // Probe for a free slot BEFORE growing, so a request that cannot be
@@ -434,14 +447,13 @@ impl FdTable {
         let old = oldfd as usize;
         let entry = self.slots.get(old)?.as_ref()?;
         let description = self.descriptions.get(old)?.as_ref()?.clone();
-        let state = description.state.lock();
+        let offset = description.state.lock().offset;
         let clone = FdEntry {
             ops: entry.ops.clone(),
-            offset: state.offset,
+            offset,
             flags,
-            status_flags: state.status_flags,
+            status_flags: description.status_flags(),
         };
-        drop(state);
         self.set_with_description(newfd, clone, description);
         Some(())
     }
@@ -455,7 +467,7 @@ impl FdTable {
         let i = fd as usize;
         let entry = self.slots.get(i)?.as_ref()?;
         let description = self.descriptions.get(i)?.as_ref()?.clone();
-        let status_flags = description.state.lock().status_flags;
+        let status_flags = description.status_flags();
         Some((entry.ops.clone(), description, status_flags))
     }
 
@@ -616,21 +628,14 @@ impl FdTable {
 
     /// Snapshot the shared open-file-description status flags.
     pub fn status_flags(&self, fd: u32) -> Option<u32> {
-        Some(
-            self.descriptions
-                .get(fd as usize)?
-                .as_ref()?
-                .state
-                .lock()
-                .status_flags,
-        )
+        Some(self.descriptions.get(fd as usize)?.as_ref()?.status_flags())
     }
 
     /// Replace the shared open-file-description status flags.
     pub fn set_status_flags(&mut self, fd: u32, status_flags: u32) -> Option<()> {
         let i = fd as usize;
         let description = self.descriptions.get(i)?.as_ref()?;
-        description.state.lock().status_flags = status_flags;
+        description.set_status_flags(status_flags);
         if let Some(entry) = self.slots.get_mut(i)?.as_mut() {
             entry.status_flags = status_flags;
         }

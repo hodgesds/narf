@@ -2646,6 +2646,19 @@ fn smoke_abi_ipc_msg_sender_wakes_only_for_sufficient_capacity() -> TestResult {
             return Err("capacity waiter rejected its sender waker");
         }
 
+        // A woken sender temporarily owns its payload while it rechecks the
+        // queue, but remains linked so a concurrent IPC_RMID can publish
+        // EIDRM. A receive may scan the waiter during that window; it must
+        // neither panic on the absent retained payload nor duplicate the wake.
+        if !crate::sysvipc::__test_notify_while_msg_send_rechecks(id) {
+            set_task(FAKE_TASK);
+            return Err("sender recheck notification setup failed");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 0 {
+            set_task(FAKE_TASK);
+            return Err("sender recheck notification queued a duplicate wake");
+        }
+
         let mut out = [0u8; 10];
         let recv = SyscallArgs {
             arg0: id,
