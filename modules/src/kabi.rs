@@ -165,6 +165,19 @@ kernel_abi! {
         if layout.size() == 0 {
             return core::ptr::null_mut();
         }
+        // Module allocations come from the calling domain's tagged heap when
+        // one can serve them, so a buffer a module allocates is reachable only
+        // through a pointer carrying that domain's tag — the same property its
+        // image already has. Falls through to the ordinary kernel heap
+        // whenever the tagged path declines (no MTE, FRAME, oversized, or the
+        // window full), which is a capacity answer and not an error.
+        #[cfg(target_arch = "aarch64")]
+        {
+            let domain = narf_lib::assert::current_domain();
+            if let Some(p) = narf_memory::domain_heap::alloc(layout, domain) {
+                return p;
+            }
+        }
         // SAFETY: the layout is non-zero-sized and valid, as `alloc` requires.
         unsafe { alloc(layout) }
     }
@@ -185,6 +198,15 @@ kernel_abi! {
             return;
         };
         if layout.size() == 0 {
+            return;
+        }
+        // Route by ADDRESS, not by current domain: a buffer may be freed
+        // outside the scope that allocated it, or by a different domain, and
+        // sending it to the wrong allocator corrupts one of them.
+        #[cfg(target_arch = "aarch64")]
+        if narf_memory::domain_heap::owns(ptr) {
+            // SAFETY: forwarded from the module's contract — matched pair.
+            unsafe { narf_memory::domain_heap::free(ptr, layout) };
             return;
         }
         // SAFETY: forwarded from the module's contract — `ptr` came from

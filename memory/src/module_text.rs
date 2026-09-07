@@ -300,6 +300,16 @@ fn domain_tag(domain: DomainId) -> Option<u8> {
     }
 }
 
+/// [`domain_tag`] for callers outside this module — `domain_heap` must tag
+/// a domain's allocations with exactly the tag its image carries, or a module
+/// would fault on its own buffers.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[must_use]
+pub fn domain_tag_of(domain: DomainId) -> Option<u8> {
+    domain_tag(domain)
+}
+
 /// The protection-key field for `domain`, as it sits in a leaf PTE.
 ///
 /// x86_64 PTE bits 59..=62 hold a 4-bit key selecting which of the 16 PKS
