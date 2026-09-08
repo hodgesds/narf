@@ -12,6 +12,11 @@ fn smoke_hda_match_amd_phoenix_ids() -> TestResult {
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::{registered_pci_drivers, MatchKind};
     bus_reset();
+    // Restores the driver-match table (and re-probes) on every path out,
+    // including the early `Fail` returns below. `__reset_for_test` empties
+    // the table globally, and registering only this test's own subject
+    // leaves every other audio driver missing for whatever runs next.
+    let _restore = crate::tests::AudioProbeRestore;
     hda::register_pci_driver();
     let regs = registered_pci_drivers();
     let mut saw_phoenix = false;
@@ -57,6 +62,11 @@ fn smoke_hda_match_intel_pch_ids() -> TestResult {
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::{registered_pci_drivers, MatchKind};
     bus_reset();
+    // Restores the driver-match table (and re-probes) on every path out,
+    // including the early `Fail` returns below. `__reset_for_test` empties
+    // the table globally, and registering only this test's own subject
+    // leaves every other audio driver missing for whatever runs next.
+    let _restore = crate::tests::AudioProbeRestore;
     hda::register_pci_driver();
     let regs = registered_pci_drivers();
     // Every Intel HDA entry uses the same vendor id 0x8086. The
@@ -157,6 +167,11 @@ fn smoke_acp6_pci_match_registered() -> TestResult {
     use narf_bus::driver_match::__reset_for_test as bus_reset;
     use narf_bus::{registered_pci_drivers, MatchKind};
     bus_reset();
+    // Restores the driver-match table (and re-probes) on every path out,
+    // including the early `Fail` returns below. `__reset_for_test` empties
+    // the table globally, and registering only this test's own subject
+    // leaves every other audio driver missing for whatever runs next.
+    let _restore = crate::tests::AudioProbeRestore;
     acp6::register_pci_driver();
     let regs = registered_pci_drivers();
     // Multi-chip registration: agent landing for Renoir / Phoenix /
@@ -228,6 +243,11 @@ fn smoke_hda_writer_submit_round_trip() -> TestResult {
 
     hda::__reset_for_test();
     bus_reset();
+    // Restores the driver-match table (and re-probes) on every path out,
+    // including the early `Fail` returns below. `__reset_for_test` empties
+    // the table globally, and registering only this test's own subject
+    // leaves every other audio driver missing for whatever runs next.
+    let _restore = crate::tests::AudioProbeRestore;
     hda::register_pci_driver();
     let authority = bootstrap_registry_authority();
     if probe_all_pci(&authority).is_err() {
