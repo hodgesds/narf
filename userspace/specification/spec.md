@@ -212,6 +212,9 @@ The Linux-compatibility syscall surface includes stored `prctl(2)` process
 state required by service managers and brokers. Capability-shaped controls
 such as `PR_SET_KEEPCAPS` round-trip according to the Linux ABI but do not mint
 or retain NARF capabilities; authority remains capability-object based.
+`rseq(2)` returns `ENOSYS` until the kernel maintains the registered ABI area
+and performs critical-section aborts across preemption and CPU migration;
+returning success without those semantics is forbidden on preemptive SMP.
 `SO_PEERSEC` and `SO_PEERPIDFD` report `ENOPROTOOPT` while NARF has no Linux
 Security Module label provider or retained peer pidfd; the compatibility layer
 never fabricates security identity. Supplementary groups are stored per task,

@@ -505,6 +505,24 @@ pub fn set_shootdown_hook(hook: TlbShootdownHook) {
     SHOOTDOWN_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
+/// The currently installed single-page shootdown hook, if any. Lets a test
+/// wrap the production hook and restore it afterwards.
+pub fn shootdown_hook() -> Option<TlbShootdownHook> {
+    let h = SHOOTDOWN_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if h == 0 {
+        None
+    } else {
+        // SAFETY: stored as `TlbShootdownHook as usize` by `set_shootdown_hook`.
+        Some(unsafe { core::mem::transmute::<usize, TlbShootdownHook>(h) })
+    }
+}
+
+/// Remove the single-page shootdown hook (test teardown for a hook that was
+/// installed over `None`).
+pub fn clear_shootdown_hook() {
+    SHOOTDOWN_HOOK.store(0, core::sync::atomic::Ordering::Release);
+}
+
 /// Local INVLPG followed by a cross-CPU broadcast when the hook is
 /// installed. Use this from any path that *mutates* an existing
 /// mapping (remap or unmap) where stale TLB entries on peer CPUs

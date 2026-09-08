@@ -1131,3 +1131,113 @@ fn smoke_pty_hangup_matrix_matches_linux() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_pty_hangup_matrix_matches_linux);
+
+// ── VT layer (crate::vt) ────────────────────────────────────────────────────
+//
+// The logical VT state machine that backs the VT ioctls on /dev/tty0/ttyN and
+// the `/sys/class/tty/tty0/active` attribute. logind drives seat0 session
+// activation through these; see `crate::vt`. The ioctl→user-memory dispatch in
+// `DevConsole::ioctl` is a thin wrapper exercised by the desktop boot; here we
+// test the state machine directly (the struct is module-private).
+
+fn smoke_vt_activate_pos() -> TestResult {
+    crate::vt::__reset_for_test();
+    if crate::vt::active_vt() != 1 {
+        return TestResult::Fail("VT should boot active on VT 1");
+    }
+    if crate::vt::activate(3).is_err() {
+        return TestResult::Fail("VT_ACTIVATE(3) should succeed");
+    }
+    if crate::vt::active_vt() != 3 {
+        return TestResult::Fail("active VT should follow VT_ACTIVATE");
+    }
+    // /sys/class/tty/tty0/active must agree with VT_GETSTATE's view.
+    if crate::vt::active_sysfs() != "tty3\n" {
+        return TestResult::Fail("sysfs active attr must be 'tty3\\n'");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/vt", smoke_vt_activate_pos);
+
+fn smoke_vt_activate_neg() -> TestResult {
+    crate::vt::__reset_for_test();
+    // VT 0 and VT > MAX_VT are out of range → EINVAL (Err), active unchanged.
+    if crate::vt::activate(0).is_ok() {
+        return TestResult::Fail("VT_ACTIVATE(0) should be rejected");
+    }
+    if crate::vt::activate(crate::vt::MAX_VT + 1).is_ok() {
+        return TestResult::Fail("VT_ACTIVATE past MAX_VT should be rejected");
+    }
+    if crate::vt::active_vt() != 1 {
+        return TestResult::Fail("a rejected VT_ACTIVATE must not move the active VT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/vt", smoke_vt_activate_neg);
+
+fn smoke_vt_openqry_allocates_increasing() -> TestResult {
+    crate::vt::__reset_for_test();
+    // VT_OPENQRY hands out the lowest free VT and marks it allocated, so a
+    // display manager that queries repeatedly gets distinct VTs.
+    if crate::vt::openqry() != Some(1) {
+        return TestResult::Fail("first VT_OPENQRY should be VT 1");
+    }
+    if crate::vt::openqry() != Some(2) {
+        return TestResult::Fail("second VT_OPENQRY should be VT 2");
+    }
+    if crate::vt::openqry() != Some(3) {
+        return TestResult::Fail("third VT_OPENQRY should be VT 3");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/vt", smoke_vt_openqry_allocates_increasing);
+
+fn smoke_vt_owner_default_and_chown() -> TestResult {
+    crate::vt::__reset_for_test();
+    // Default owner is root:tty (0,5), as devtmpfs creates /dev/ttyN.
+    if crate::vt::owner(1) != (0, 5) {
+        return TestResult::Fail("default VT owner must be root:tty (0,5)");
+    }
+    // logind chowns a session's VT to the session user.
+    crate::vt::set_owner(1, 957, 985);
+    if crate::vt::owner(1) != (957, 985) {
+        return TestResult::Fail("chown of a VT should stick");
+    }
+    // A -1 (u32::MAX) component means "leave unchanged", matching chown(2).
+    crate::vt::set_owner(1, u32::MAX, 5);
+    if crate::vt::owner(1) != (957, 5) {
+        return TestResult::Fail("chown with uid=-1 must preserve the existing uid");
+    }
+    // Owners are per-VT: an untouched VT keeps the default.
+    if crate::vt::owner(2) != (0, 5) {
+        return TestResult::Fail("chowning one VT must not affect another");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/vt", smoke_vt_owner_default_and_chown);
+
+fn smoke_vt_mode_roundtrip() -> TestResult {
+    crate::vt::__reset_for_test();
+    // Default switch mode is VT_AUTO.
+    if crate::vt::get_mode(1).mode != crate::vt::VT_AUTO {
+        return TestResult::Fail("default VT mode must be VT_AUTO");
+    }
+    // logind installs VT_PROCESS with release/acquire signals; VT_GETMODE must
+    // round-trip it faithfully.
+    crate::vt::set_mode(
+        1,
+        crate::vt::VtMode {
+            mode: crate::vt::VT_PROCESS,
+            waitv: 0,
+            relsig: 10,
+            acqsig: 11,
+            frsig: 0,
+        },
+    );
+    let m = crate::vt::get_mode(1);
+    if m.mode != crate::vt::VT_PROCESS || m.relsig != 10 || m.acqsig != 11 {
+        return TestResult::Fail("VT_SETMODE→VT_GETMODE did not round-trip");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/vt", smoke_vt_mode_roundtrip);

@@ -1694,7 +1694,23 @@ pub(crate) fn copy_user_cstr_checked(
         unsafe { copy_from_user(&mut chunk, cursor) }.map_err(|_| EFAULT)?;
         if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul_pos]);
-            return alloc::string::String::from_utf8(out).map_err(|_| EFAULT);
+            // Linux (`fs/namei.c::getname_flags`) copies a path as an opaque
+            // byte string — it does NOT validate UTF-8. The bytes here were
+            // fully readable (every `copy_from_user` above returned Ok), so a
+            // non-UTF-8 path is NOT a bad address: returning EFAULT was wrong
+            // and diverged from Linux, which resolves the exact bytes and, for
+            // a name no file has, returns ENOENT. NARF's VFS is UTF-8-keyed and
+            // cannot store a non-UTF-8 name, so a lossy decode yields a name
+            // that matches no real entry → NotFound → ENOENT — the same
+            // observable result Linux gives for a non-representable path. This
+            // matters in practice: fontconfig scanning a directory builds
+            // `<dir>/<name>` paths and openat()s them with `ignore_missing`;
+            // a spurious EFAULT (instead of ENOENT) on a stray/garbage tail
+            // turned a survivable "skip this entry" into a fatal error.
+            return match alloc::string::String::from_utf8(out) {
+                Ok(path) => Ok(path),
+                Err(err) => Ok(alloc::string::String::from_utf8_lossy(err.as_bytes()).into_owned()),
+            };
         }
         out.extend_from_slice(&chunk);
         cursor = chunk_end;

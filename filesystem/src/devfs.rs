@@ -1187,9 +1187,27 @@ impl FileOps for DevConsole {
 
     fn owners(&self) -> (u32, u32) {
         match self.kind {
-            ConsoleNodeKind::Virtual(_) => (0, 5), // root:tty
+            // A VT node's owner is mutable: logind chowns a session's VT to the
+            // session user (and back to root on restore). Default root:tty.
+            ConsoleNodeKind::Virtual(index) => crate::vt::owner(index),
             _ => (0, 0),
         }
+    }
+
+    fn set_owners<'a>(&'a self, uid: u32, gid: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            match self.kind {
+                // `chown(/dev/ttyN, uid, gid)` — logind assigns a session's VT
+                // to its user so the compositor can drive it. Console/tty
+                // aliases stay root-owned (a chown there is a no-op success,
+                // matching devtmpfs semantics for the shared console).
+                ConsoleNodeKind::Virtual(index) => {
+                    crate::vt::set_owner(index, uid, gid);
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        })
     }
 
     /// Terminal ioctls so `/dev/console` looks like a real tty: a
@@ -1200,16 +1218,26 @@ impl FileOps for DevConsole {
     /// Other requests fall through to `-ENOTTY`.
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<u64, crate::FsError> {
         use crate::devfs_pty::{
-            read_user_i32, read_user_termios, read_user_termios2, read_user_winsize,
-            write_user_i32, write_user_termios, write_user_termios2, write_user_winsize,
-            WireWinsize, FIONREAD, KDGETMODE, KDGKBMODE, KDSIGACCEPT, KDSKBMODE, TCFLSH, TCGETS,
-            TCGETS2, TCSBRK, TCSETS, TCSETS2, TCSETSF, TCSETSF2, TCSETSW, TCSETSW2, TCXONC,
-            TIOCGPGRP, TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ,
-            VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY, VT_WAITACTIVE,
+            read_user_i32, read_user_termios, read_user_termios2, read_user_vt_mode,
+            read_user_winsize, write_user_i32, write_user_termios, write_user_termios2,
+            write_user_vt_mode, write_user_vt_stat, write_user_winsize, WireWinsize, FIONREAD,
+            KDGETMODE, KDGKBMODE, KDSETMODE, KDSIGACCEPT, KDSKBMODE, TCFLSH, TCGETS, TCGETS2,
+            TCSBRK, TCSETS, TCSETS2, TCSETSF, TCSETSF2, TCSETSW, TCSETSW2, TCXONC, TIOCGPGRP,
+            TIOCGSID, TIOCGWINSZ, TIOCNOTTY, TIOCSCTTY, TIOCSPGRP, TIOCSWINSZ, VT_ACTIVATE,
+            VT_GETMODE, VT_GETSTATE, VT_OPENQRY, VT_RELDISP, VT_SETMODE, VT_WAITACTIVE,
         };
         // Termios + winsize + foreground pgrp are owned by the unified
         // `console_tty` so a TCSETS / tcsetpgrp on /dev/console is visible
         // to fd 0 and vice versa.
+        //
+        // The VT a per-fd VT ioctl (VT_GETMODE / VT_SETMODE) applies to: this
+        // node's own VT for `/dev/ttyN` (N >= 1), else the currently active VT
+        // (the `/dev/tty0` master and the `/dev/tty` / `/dev/console` aliases
+        // all address "the current console").
+        let this_vt = match self.kind {
+            ConsoleNodeKind::Virtual(n) if n >= 1 => n,
+            _ => crate::vt::active_vt(),
+        };
         match cmd {
             TCGETS => {
                 let raw = crate::console_tty::termios();
@@ -1315,10 +1343,75 @@ impl FileOps for DevConsole {
                 // No VT keyboard/kbrequest state to change — accept + no-op.
                 Ok(0)
             }
-            VT_OPENQRY | VT_GETMODE | VT_GETSTATE | VT_ACTIVATE | VT_WAITACTIVE => {
-                // No VT layer; ENOTTY lets a VT-aware agetty degrade to a
-                // plain serial console instead of aborting.
-                Err(crate::FsError::Unsupported)
+            KDSETMODE => {
+                // KD_TEXT / KD_GRAPHICS. NARF has one framebuffer console and a
+                // Wayland compositor drives the GPU directly, so the mode is
+                // advisory — accept it so the compositor's "take over the VT"
+                // step succeeds. Linux ref: drivers/tty/vt/vt_ioctl.c.
+                let _ = arg;
+                Ok(0)
+            }
+            // ── VT layer (logical, single-console) ───────────────────
+            // seat0 is VT-owning in logind, so the DM/compositor drive session
+            // activation through these. See `crate::vt`. The VT a per-fd op
+            // applies to is this node's VT (`/dev/ttyN` → N), or the active VT
+            // for the `/dev/tty0` master and `/dev/tty`/`/dev/console` aliases.
+            VT_OPENQRY => {
+                // Lowest free VT the DM will run its session on (or -1 / none).
+                let n = crate::vt::openqry().map(|n| n as i32).unwrap_or(-1);
+                // SAFETY: `arg` is the validated user `int *`.
+                unsafe { write_user_i32(arg, n)? };
+                Ok(0)
+            }
+            VT_GETSTATE => {
+                let active = crate::vt::active_vt() as u16;
+                // v_state is a bitmask of in-use VTs; logind only reads
+                // v_active, so a minimal mask (active VT + VT1) is enough.
+                let state = (1u16 << active.min(15)) | 0x0002;
+                // SAFETY: `arg` is the validated user `struct vt_stat *`.
+                unsafe { write_user_vt_stat(arg, active, 0, state)? };
+                Ok(0)
+            }
+            VT_ACTIVATE => {
+                // `arg` is the VT number by value. Move the logical active VT so
+                // logind's active-session comparison (and the sysfs `active`
+                // read) resolve to the switched-to session.
+                crate::vt::activate(arg as u32)
+                    .map(|()| 0)
+                    .map_err(|()| crate::FsError::InvalidData)
+            }
+            VT_WAITACTIVE => {
+                // `arg` is the target VT. Activation is synchronous in NARF, so
+                // the target is already current — return success immediately.
+                let _ = arg;
+                Ok(0)
+            }
+            VT_GETMODE => {
+                let m = crate::vt::get_mode(this_vt);
+                // SAFETY: `arg` is the validated user `struct vt_mode *`.
+                unsafe { write_user_vt_mode(arg, m.mode, m.waitv, m.relsig, m.acqsig, m.frsig)? };
+                Ok(0)
+            }
+            VT_SETMODE => {
+                // SAFETY: `arg` is the validated user `struct vt_mode *`.
+                let (mode, waitv, relsig, acqsig, frsig) = unsafe { read_user_vt_mode(arg)? };
+                crate::vt::set_mode(
+                    this_vt,
+                    crate::vt::VtMode {
+                        mode,
+                        waitv,
+                        relsig,
+                        acqsig,
+                        frsig,
+                    },
+                );
+                Ok(0)
+            }
+            VT_RELDISP => {
+                // Acknowledge a switch request. NARF never forces a switch out
+                // from under the owner, so there is nothing to release.
+                let _ = arg;
+                Ok(0)
             }
             _ => Err(crate::FsError::Unsupported),
         }
@@ -1758,6 +1851,23 @@ impl DirOps for DevDir {
             "tty1" => Some(Arc::new(DevConsole {
                 kind: ConsoleNodeKind::Virtual(1),
             }) as Arc<dyn FileOps>),
+            // /dev/ttyN for N in 2..=MAX_VT — the VTs a display manager allocates
+            // via VT_OPENQRY and runs a session on. tty0/tty1 are handled above;
+            // NARF has one physical console, so every VT node maps to the same
+            // singleton tty and differs only in its VT number (for VT ioctls).
+            n if n.starts_with("tty")
+                && n.len() > 3
+                && n[3..].bytes().all(|c| c.is_ascii_digit())
+                && n[3..]
+                    .parse::<u32>()
+                    .map(|v| (2..=crate::vt::MAX_VT).contains(&v))
+                    .unwrap_or(false) =>
+            {
+                let v = n[3..].parse::<u32>().unwrap_or(0);
+                Some(Arc::new(DevConsole {
+                    kind: ConsoleNodeKind::Virtual(v),
+                }) as Arc<dyn FileOps>)
+            }
             "ptmx" => Some(symlink_file("ptmx", "pts/ptmx".into())),
             "fb0" if FB0_NODE.lock().is_some() => Some(Arc::new(DevFb0Proxy) as Arc<dyn FileOps>),
             // Userspace input-injection control device.
