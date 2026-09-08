@@ -319,6 +319,9 @@ impl RegionPerms {
     pub const LOCK_EXEMPT: RegionPerms;
     /// Provenance for growable user-stack fragments.
     pub const STACK_SEGMENT: RegionPerms;
+    /// Provenance for ordinary private anonymous non-fixed mappings eligible
+    /// for exact-adjacent metadata coalescing.
+    pub const ANON_MERGEABLE: RegionPerms;
     pub const COW: RegionPerms;
 }
 
@@ -364,8 +367,14 @@ impl AddressSpace {
         &self,
         plan: &ReclaimBatchPlan,
     ) -> SwapBatchReport;
-    /// Materialize every recorded base-page region; used for exec/fork build.
+    /// Materialize every recorded base-page region; used for exec build and
+    /// callers that explicitly require eager population.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
+    /// Duplicate region ownership for fork-style COW. Present parent leaves
+    /// whose frames become newly shared are write-protected before return.
+    /// Ordinary child leaves may remain absent and fault in from retained
+    /// Region backing; huge mappings are copied and installed eagerly.
+    pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError>;
     /// Back one anonymous/file-demand page. Anonymous reserve refusal returns
     /// `AddressSpaceError::ReclaimPressure` only after its page ticket and all
     /// address-space/allocator locks have been released; `Unmapped` and
@@ -464,6 +473,13 @@ impl AddressSpace {
     pub fn munlock_all(&self) -> Result<(), AddressSpaceError>;
     /// Publish an ordinary VMA with atomic future-lock/rlimit admission.
     pub fn map_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Publish an ordinary private anonymous non-fixed VMA and best-effort
+    /// coalesce exact-adjacent compatible anonymous VMAs. COW is retained but
+    /// ignored for compatibility because its authority is per backing page.
+    pub fn map_private_anonymous_region_limited(
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
@@ -833,10 +849,12 @@ x86_64 is rejected at runtime.
   greater than one. A write fault is recoverable only when both WRITE and COW
   are present; `mprotect(PROT_READ)` therefore cannot be mistaken for COW.
   Fork retains all resident private backing through one batched operation
-  while the parent region transaction is held. The batch groups frames by
-  refcount shard, locks each touched shard once, and increments once per input
-  occurrence; unbacked zero sentinels and externally owned SHARED mappings are
-  excluded. Child VMA publication transfers those retains in prefix order. If
+  while the parent region transaction is held. One counting-partitioned
+  allocation groups frames by refcount shard, each shard slice groups duplicate
+  physical addresses, and the batch locks each touched shard once and
+  increments once per input occurrence; unbacked zero sentinels and externally
+  owned SHARED mappings are excluded. Child VMA publication transfers those
+  retains in prefix order. If
   a later child index reservation fails, partial-child teardown releases the
   published prefix and an allocation-free rollback removes only the unpublished
   suffix, including restoration of the implicit sole-owner representation.
@@ -853,9 +871,19 @@ x86_64 is rejected at runtime.
   The buddy implementation pre-reserves its final-owner result before locking
   a COW shard, locks each touched shard once, and sends only final-owner /
   unregistered frames through scalar-equivalent cgroup uncharge and optional
-  scrub. It then groups without allocation into bounded NUMA-cache/buddy
-  transactions that retain the cache lock until displaced cached frames are
-  visible in the zone; alternative allocators use the scalar default.
+  scrub. Its allocation-free teardown window uses a fixed-size counting sort
+  to group frames by COW shard in O(pages + shards), rather than rescanning the
+  full window for every shard. It then groups without allocation into bounded
+  NUMA-cache/buddy transactions that retain the cache lock until displaced
+  cached frames are visible in the zone; alternative allocators use the
+  scalar default.
+- Ordinary private anonymous non-fixed mmap regions carry explicit provenance
+  and may coalesce only when exact-adjacent and otherwise permission-identical.
+  File, shared, fixed, heap, stack, guard, and special mappings never carry
+  that provenance. A region-wide COW marker is ignored only for compatibility
+  and ORed into the result; virtual addresses, PTEs, backing order, per-page
+  COW refcounts, and lock accounting are unchanged. If backing-vector growth
+  cannot be reserved, publication remains successful as a separate VMA.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
@@ -922,16 +950,27 @@ x86_64 is rejected at runtime.
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
-- Final-owner address-space teardown preallocates top-level detachment storage,
-  clears every private root descriptor under one short root-shard transaction,
-  and releases that shard before walking intermediate tables or entering the
-  frame allocator. The global shared-mapping transaction ends after all leaf
-  retirement and external backing release, before private intermediate-table
-  reclaim. The last-`Arc` contract proves that the detached root cannot be
-  active, repopulated, or gain a new shared alias. Intermediate and root frames
-  return in bounded 64-frame batches; x86_64 still requires a live ownership-
-  registry entry at every reclaimed level, so copied kernel tables remain
-  outside the detached set and can never enter a batch.
+- Final-owner address-space teardown relies on the scheduler active-mm's strong
+  `Arc` ownership: reaching `Drop` proves no CPU can still execute or repopulate
+  the root. x86_64's different-root/restore switch has already flushed the
+  process-wide PCID 0; aarch64 retires a nonzero lifetime ASID before any
+  backing becomes reusable, while ASID-0 switches flush locally. Teardown may
+  therefore detach the complete private tree without clearing every base-page
+  leaf first. The unlocked reclaim walk reports only actually-present 4 KiB
+  leaves; teardown resolves each reported VA through authoritative Region
+  backing and retires both authoritative and stale-descriptor rmap ownership
+  before that backing can be reused. `PROT_NONE` and NUMA-hint pages are the
+  stable states that intentionally retain an rmap owner without a present leaf,
+  and teardown removes those owners explicitly. Lazy absent fork leaves were
+  never registered and incur no rmap lookup. The reclaimer preallocates
+  top-level detachment storage, clears every private root descriptor under one
+  short root-shard transaction, and releases that shard before callbacks,
+  intermediate-table traversal, or frame-allocation work. The global
+  shared-mapping transaction covers tree detachment, rmap retirement, and
+  external backing release. Intermediate and root frames return in bounded
+  64-frame batches; x86_64 still requires a live ownership-registry entry at
+  every reclaimed level, so copied kernel tables remain outside the detached
+  set and can never enter a batch.
 - Reclaim progress is denominated only in physical 4 KiB base pages. Every
   shrinker scan receives a strict page budget and may report no more than that
   budget; object counts never advance watermark or allocation-retry progress.
@@ -1090,11 +1129,13 @@ x86_64 is rejected at runtime.
   broadcasts `TLBI ASIDE1IS` before making that tag reusable. Pool exhaustion
   falls back safely to ASID 0 with a local full invalidation on every
   distinct-root switch.
-- Final-owner TTBR0 teardown clears all valid L0 table descriptors under the
-  root mutation shard, then drops the shard before walking the now-inactive
-  subtrees and returning translation-table frames in bounded allocator batches.
-  The later ASID retirement still invalidates the lifetime tag before reuse;
-  no CPU can execute the retired root during the unlocked reclaim walk.
+- Final-owner teardown retires a nonzero lifetime ASID before releasing data
+  backing or translation tables. It then clears all valid L0 descriptors under
+  the root mutation shard, drops the shard, reports present L3 Page descriptors
+  for rmap retirement, and returns translation-table frames in bounded
+  allocator batches. No CPU can execute the retired root during the unlocked
+  reclaim walk, and every reported data frame remains live until its callback
+  returns.
 - Page-table mutation invalidates by VA for every ASID across the
   inner-shareable domain (`VAAE1IS` / `VAALE1IS`). This is required because
   the mutated root need not be the TTBR0 context active on the issuing CPU.

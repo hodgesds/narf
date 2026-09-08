@@ -865,6 +865,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 )
             })
         })
+        .map(|_| ())
     } else if flags & MAP_FIXED != 0 {
         as_ref.with_vma_transaction(|| {
             crate::mapped_file::publish_current_unowned_mapping(
@@ -900,6 +901,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 },
             )
         })
+        .map(|_| ())
+    } else if anonymous && flags & MAP_PRIVATE != 0 {
+        as_ref.map_private_anonymous_region_limited(
+            region,
+            explicit_lock,
+            mlock_authority.limit_bytes,
+            mlock_authority.bypass_limit,
+        )
     } else {
         let receipt = as_ref.map_region_limited_receipt(
             region,
@@ -913,6 +922,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             }
             finish_nonfixed_private_file_mapping(&as_ref, receipt)
         })
+        .map(|_| ())
     };
     if let Err(error) = map_result {
         // Drop releases only this attempt's pending cache holds. A concurrent

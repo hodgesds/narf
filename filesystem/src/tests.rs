@@ -5809,18 +5809,17 @@ fn smoke_devfs_console_fg_pgrp_roundtrip() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_devfs_console_fg_pgrp_roundtrip);
 
-// The VT / keyboard probes agetty fires must degrade gracefully: KDGKBMODE
-// and KDGETMODE succeed reporting the default text mode (0); the VT_*
-// switching ioctls return ENOTTY (Unsupported) so a VT-aware agetty falls
-// back to serial mode instead of aborting on a bare failure; TCFLSH/TCSBRK
-// succeed as no-ops. None of these may be a bare error the caller can't
-// interpret.
+// The VT / keyboard probes agetty and logind fire must behave like a usable
+// logical console: KD queries report text mode, VT queries expose the active
+// terminal and default switch mode, activation is synchronous, and terminal
+// flush/break operations succeed as no-ops.
 fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
     use crate::devfs_pty::{
         KDGETMODE, KDGKBMODE, TCFLSH, TCSBRK, VT_ACTIVATE, VT_GETMODE, VT_GETSTATE, VT_OPENQRY,
         VT_WAITACTIVE,
     };
     crate::console_tty::__test_reset_cooked();
+    crate::vt::__reset_for_test();
     let tty1 = match open_dev_tty1_for_test() {
         Some(t) => t,
         None => return TestResult::Fail("resolve /dev/tty1 failed"),
@@ -5835,25 +5834,31 @@ fn smoke_devfs_console_vt_kd_probes_degrade() -> TestResult {
             return TestResult::Fail("KD probe did not report default mode 0");
         }
     }
-    // VT switching ioctls are ENOTTY (Unsupported), not a bare -1.
-    let mut scratch: i32 = 0;
-    let sp = &mut scratch as *mut i32 as usize;
-    for &(cmd, name) in &[
-        (VT_OPENQRY, "VT_OPENQRY"),
-        (VT_GETMODE, "VT_GETMODE"),
-        (VT_GETSTATE, "VT_GETSTATE"),
-        (VT_ACTIVATE, "VT_ACTIVATE"),
-        (VT_WAITACTIVE, "VT_WAITACTIVE"),
-    ] {
-        match tty1.ioctl(cmd, sp) {
-            Err(crate::FsError::Unsupported) => {}
-            _ => return TestResult::Fail(name),
-        }
+    // VT_OPENQRY returns the first free logical VT through `int *`.
+    let mut open_vt: i32 = 0;
+    if tty1.ioctl(VT_OPENQRY, &mut open_vt as *mut i32 as usize) != Ok(0) || open_vt != 1 {
+        return TestResult::Fail("VT_OPENQRY");
+    }
+    // A fresh VT reports the zeroed VT_AUTO mode.
+    let mut mode = [0xFFu8; 8];
+    if tty1.ioctl(VT_GETMODE, mode.as_mut_ptr() as usize) != Ok(0) || mode != [0; 8] {
+        return TestResult::Fail("VT_GETMODE");
+    }
+    // Activation is synchronous; VT_GETSTATE must immediately report VT 2.
+    if tty1.ioctl(VT_ACTIVATE, 2) != Ok(0) || tty1.ioctl(VT_WAITACTIVE, 2) != Ok(0) {
+        return TestResult::Fail("VT_ACTIVATE/VT_WAITACTIVE");
+    }
+    let mut state = [0u8; 6];
+    if tty1.ioctl(VT_GETSTATE, state.as_mut_ptr() as usize) != Ok(0)
+        || u16::from_le_bytes([state[0], state[1]]) != 2
+    {
+        return TestResult::Fail("VT_GETSTATE");
     }
     // TCFLSH / TCSBRK succeed as no-ops.
     if tty1.ioctl(TCFLSH, 0) != Ok(0) || tty1.ioctl(TCSBRK, 0) != Ok(0) {
         return TestResult::Fail("TCFLSH/TCSBRK did not succeed as no-ops");
     }
+    crate::vt::__reset_for_test();
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_devfs_console_vt_kd_probes_degrade);

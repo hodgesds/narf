@@ -53,7 +53,7 @@ pub(crate) fn sys_shmem_map(ctx: &mut dyn TrapContext) {
                 // shmem registry's persistent backing frames (allocated once
                 // by `narf_shmem::create`, owned by the registry for the
                 // segment's life — `destroy` never frees them). Without the
-                // SHARED flag the AS teardown paths (`unmap_region_pages` /
+                // SHARED flag the AS teardown paths (live unmap /
                 // `unmap_free_page` / `Drop` / `madvise_dontneed`, which all
                 // special-case SHARED) treat these BORROWED frames as
                 // AS-owned and `free_frame` them on munmap/exit — returning a

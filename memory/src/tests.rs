@@ -102,6 +102,112 @@ kernel_test_in!(
     smoke_mapping_receipts_reject_another_address_space
 );
 
+/// Ordinary adjacent private-anonymous mmaps should share one VMA, including
+/// across a stale region-wide COW marker left by an earlier fork. The marker
+/// remains on the result so any pages still shared keep read-only leaves.
+fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_6000_0000;
+    let first_perms =
+        RegionPerms::READ | RegionPerms::WRITE | RegionPerms::COW | RegionPerms::ANON_MERGEABLE;
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 4096,
+            perms: first_perms,
+            phys: vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || aspace
+            .map_region(Region {
+                base: VirtAddr::new(base + 8192),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE,
+                phys: vec![PhysAddr::new(0)],
+            })
+            .is_err()
+    {
+        return TestResult::Fail("anonymous merge neighbors failed to map");
+    }
+    if aspace
+        .map_private_anonymous_region_limited(
+            Region {
+                base: VirtAddr::new(base + 4096),
+                len: 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: vec![PhysAddr::new(0)],
+            },
+            false,
+            u64::MAX,
+            false,
+        )
+        .is_err()
+    {
+        return TestResult::Fail("middle anonymous mapping failed");
+    }
+    let regions = aspace.regions_snapshot();
+    if regions.len() != 1 {
+        return TestResult::Fail("adjacent anonymous mappings stayed fragmented");
+    }
+    let merged = &regions[0];
+    if merged.base.as_u64() != base || merged.len != 3 * 4096 || merged.phys.len() != 3 {
+        return TestResult::Fail("anonymous merge changed the virtual/backing span");
+    }
+    if !merged.perms.contains(RegionPerms::ANON_MERGEABLE)
+        || !merged.perms.contains(RegionPerms::COW)
+    {
+        return TestResult::Fail("anonymous merge lost provenance or COW state");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_adjacent_anonymous_mmaps_coalesce);
+
+/// Identical permissions are insufficient for coalescing: a mapping without
+/// anonymous provenance may have file or bespoke ownership semantics.
+fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_7000_0000;
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: vec![PhysAddr::new(0)],
+        })
+        .is_err()
+        || aspace
+            .map_private_anonymous_region_limited(
+                Region {
+                    base: VirtAddr::new(base + 4096),
+                    len: 4096,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: vec![PhysAddr::new(0)],
+                },
+                false,
+                u64::MAX,
+                false,
+            )
+            .is_err()
+    {
+        return TestResult::Fail("provenance test mappings failed");
+    }
+    let regions = aspace.regions_snapshot();
+    if regions.len() != 2
+        || regions[0].perms.contains(RegionPerms::ANON_MERGEABLE)
+        || !regions[1].perms.contains(RegionPerms::ANON_MERGEABLE)
+    {
+        return TestResult::Fail("anonymous mapping merged across a provenance boundary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_anonymous_merge_respects_provenance);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_probe_catches_page_fault() -> TestResult {
     // Arm the recoverable-fault probe, write to an unmapped virtual
@@ -2782,6 +2888,7 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
         Ok(address_space) => address_space,
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
+    let mut backing_frames = alloc::vec::Vec::with_capacity(bases.len());
     for base in bases {
         let backing = match crate::alloc_frame() {
             Ok(frame) => frame.start_address(),
@@ -2799,10 +2906,32 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
             crate::free_frame(crate::PhysFrame::new(backing));
             return TestResult::Fail("sparse teardown fixture region was rejected");
         }
+        backing_frames.push(backing);
     }
     // SAFETY: the test owns the root and every registered backing frame.
     if unsafe { address_space.materialize() }.is_err() {
         return TestResult::Fail("sparse teardown fixture materialize failed");
+    }
+
+    // Exercise all final-rmap retirement states in one sparse hierarchy:
+    // one leaf remains present, one retains ownership behind a NUMA hint, and
+    // one retains ownership behind PROT_NONE. The latter two descriptors are
+    // absent but intentionally keep their rmap entries for later restoration.
+    // SAFETY: the test exclusively owns this live root and resident page.
+    if unsafe { address_space.protect_numa_hint_page(VirtAddr::new(bases[0])) } != Ok(true) {
+        return TestResult::Fail("sparse teardown fixture NUMA hint failed");
+    }
+    if address_space
+        .mprotect_range(VirtAddr::new(bases[1]), 4096, RegionPerms(0))
+        .is_err()
+    {
+        return TestResult::Fail("sparse teardown fixture PROT_NONE failed");
+    }
+    if backing_frames
+        .iter()
+        .any(|phys| crate::rmap::owner_count(*phys) != 1)
+    {
+        return TestResult::Fail("non-present sparse fixture lost rmap ownership before drop");
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -2863,6 +2992,12 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
     if after.1 != before.1 + 1 {
         return TestResult::Fail("final teardown did not batch table-frame return");
     }
+    if backing_frames
+        .iter()
+        .any(|phys| crate::rmap::owner_count(*phys) != 0)
+    {
+        return TestResult::Fail("final inactive-root teardown left a stale rmap owner");
+    }
     #[cfg(target_arch = "x86_64")]
     if registered_tables
         .iter()
@@ -2873,7 +3008,10 @@ fn smoke_memory_sparse_root_teardown_is_batched() -> TestResult {
     TestResult::Pass
 }
 #[cfg(feature = "kernel-test")]
-kernel_test_in!("memory", smoke_memory_sparse_root_teardown_is_batched);
+kernel_test_in!(
+    "memory/sparse-teardown",
+    smoke_memory_sparse_root_teardown_is_batched
+);
 
 // ── dual-arch tests (no AS::drop-realloc cycle) ───────────────────
 
@@ -3083,7 +3221,9 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x2000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000), PhysAddr::new(0x10_1000)],
+        // Metadata-only sentinels below LOW_RESERVED_BYTES cannot be mistaken
+        // for allocator-owned backing when this rootless address space drops.
+        phys: alloc::vec![PhysAddr::new(0x10_000), PhysAddr::new(0x11_000)],
     })
     .expect("first map");
     // Overlapping at the same base.
@@ -3091,7 +3231,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_0000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)],
     }) {
         Err(AddressSpaceError::Overlap) => {}
         _ => return TestResult::Fail("identical base overlap not rejected"),
@@ -3101,7 +3241,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase + 0x1000),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_0000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)],
     }) {
         Err(AddressSpaceError::Overlap) => {}
         _ => return TestResult::Fail("interior overlap not rejected"),
@@ -3111,7 +3251,7 @@ fn smoke_memory_overlapping_map_region_rejected() -> TestResult {
         base: VirtAddr::new(vbase + 0x2000),
         len: 0x1000,
         perms: RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_0000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000)],
     }) {
         Ok(()) => {}
         _ => return TestResult::Fail("adjacent region was rejected"),
@@ -3133,7 +3273,7 @@ fn smoke_memory_phys_len_mismatch_rejected() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x2000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)],
     }) {
         Err(AddressSpaceError::AlignmentMismatch) => {}
         _ => return TestResult::Fail("phys-len mismatch not rejected"),
@@ -3556,21 +3696,21 @@ fn smoke_memory_multiple_regions_in_one_as() -> TestResult {
         base: VirtAddr::new(0x1000),
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)],
     })
     .expect("map 1");
     a.map_region(Region {
         base: VirtAddr::new(0x3000),
         len: 0x2000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
-        phys: alloc::vec![PhysAddr::new(0x20_0000), PhysAddr::new(0x20_1000)],
+        phys: alloc::vec![PhysAddr::new(0x20_000), PhysAddr::new(0x21_000)],
     })
     .expect("map 2");
     a.map_region(Region {
         base: VirtAddr::new(0x10000),
         len: 0x1000,
         perms: RegionPerms::READ | RegionPerms::EXEC,
-        phys: alloc::vec![PhysAddr::new(0x30_0000)],
+        phys: alloc::vec![PhysAddr::new(0x30_000)],
     })
     .expect("map 3");
 
@@ -3609,12 +3749,12 @@ fn smoke_memory_map_region_owns_its_phys_vec() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)],
     })
     .expect("map");
     let snap = a.regions_snapshot();
     let recorded_phys = snap[0].phys[0].raw();
-    if recorded_phys != 0x10_0000 {
+    if recorded_phys != 0x10_000 {
         return TestResult::Fail("recorded phys != input");
     }
     TestResult::Pass
@@ -3878,7 +4018,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x4000),
         len: 0x1000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x10_0000)],
+        phys: alloc::vec![PhysAddr::new(0x10_000)],
     };
     if a.map_region(r1).is_err() {
         return TestResult::Fail("first map failed");
@@ -3889,7 +4029,7 @@ fn smoke_memory_address_space_region_table() -> TestResult {
         base: VirtAddr::new(0x5000),
         len: 0x2000,
         perms: rx,
-        phys: alloc::vec![PhysAddr::new(0x11_0000), PhysAddr::new(0x11_1000)],
+        phys: alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)],
     };
     if a.map_region(r2).is_err() {
         return TestResult::Fail("second non-overlap map failed");
@@ -4021,10 +4161,12 @@ fn smoke_memory_cow_refcount_batch_retains_each_owner() -> TestResult {
         phys[0],
         crate::PhysAddr::new(0),
     ];
-    cow::inc_ref_batch(&batch);
+    let newly_shared = cow::inc_ref_batch(&batch);
     let counts = cow::count_batch(&batch);
 
-    let mut verdict = if cow::count(phys[0]) != 3 {
+    let mut verdict = if newly_shared != [true, true, true, true, true, false] {
+        TestResult::Fail("batch transition bitmap lost aliases or input order")
+    } else if cow::count(phys[0]) != 3 {
         TestResult::Fail("duplicate batch entries did not retain distinct owners")
     } else if phys[1..].iter().any(|frame| cow::count(*frame) != 2) {
         TestResult::Fail("batch did not retain every unique frame")
@@ -4291,8 +4433,8 @@ fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     }
 
     // Cleanup: both `parent` and `child` own their region frames;
-    // their `Drop` impls walk the PTEs and return each frame via
-    // `unmap_region_pages → free_frame`. Explicitly freeing here
+    // their `Drop` impls retire the inactive roots and return authoritative
+    // region backing via `free_frame`. Explicitly freeing here
     // would double-free and corrupt the buddy free lists.
     let _ = c_split;
     let _ = p_post;
@@ -4492,9 +4634,9 @@ fn smoke_memory_cow_split_survives_reserve_watermark() -> TestResult {
                     TestResult::Pass
                 }
             };
-            // `parent`/`child` Drop unmap every region, which calls rmap::remove
-            // for each mapping before returning its frame to the buddy — so no
-            // freed frame carries a live rmap owner into the next test (the
+            // `parent`/`child` Drop retires every present or intentionally
+            // non-present rmap owner before returning backing to the buddy, so
+            // no freed frame carries a live owner into the next test (the
             // invariant Linux enforces in free_pages_prepare via the "nonzero
             // mapcount" bad_page check).
             drop(child);
@@ -4563,19 +4705,20 @@ fn smoke_memory_nested_fork_teardown_preserves_allocator_progress() -> TestResul
         Ok(address_space) => address_space,
         Err(_) => return TestResult::Fail("first nested clone_for_fork"),
     };
-    // SAFETY: child is a fresh inactive user root; parent rewrite applies COW
-    // permissions to its existing leaves.
-    if unsafe { child.materialize() }.is_err() || unsafe { parent.rematerialize() }.is_err() {
-        return TestResult::Fail("materialize first fork generation");
+    // SAFETY: child is a fresh inactive user root; clone_for_fork already
+    // restricted the parent's newly shared leaves.
+    if unsafe { child.materialize() }.is_err() {
+        return TestResult::Fail("materialize first child generation");
     }
     // SAFETY: same fork construction contract, now with an already-COW child.
     let grandchild = match unsafe { child.clone_for_fork() } {
         Ok(address_space) => address_space,
         Err(_) => return TestResult::Fail("second nested clone_for_fork"),
     };
-    // SAFETY: grandchild is fresh and child owns the leaves being rewritten.
-    if unsafe { grandchild.materialize() }.is_err() || unsafe { child.rematerialize() }.is_err() {
-        return TestResult::Fail("materialize second fork generation");
+    // SAFETY: grandchild is fresh and clone_for_fork already restricted the
+    // child's newly shared leaves.
+    if unsafe { grandchild.materialize() }.is_err() {
+        return TestResult::Fail("materialize second child generation");
     }
     if cow::count(phys[0]) != 3 || cow::count(phys[PAGES - 1]) != 3 {
         return TestResult::Fail("nested fork lost COW owner cardinality");
@@ -4831,7 +4974,7 @@ fn smoke_memory_remap_page_picks_up_perms_and_phys() -> TestResult {
     }
 
     // f1 was already returned to the allocator by `unmap_region` →
-    // `unmap_region_pages` → `free_frame`. f2 will be reclaimed by
+    // `free_frame`. f2 will be reclaimed by
     // `AddressSpace::drop` when `a` goes out of scope. Explicitly
     // freeing either here is a double-free that corrupts the buddy
     // free lists (the duplicate then surfaces several allocs later
@@ -9386,16 +9529,15 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
         Ok(c) => c,
         Err(_) => return TestResult::Fail("clone_for_fork"),
     };
+    if cow::count(p_frame) != 2 {
+        return TestResult::Fail("clone_for_fork did not establish two COW owners");
+    }
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { child.materialize() }.is_err() {
         return TestResult::Fail("child materialize");
     }
-    // Parent's PTEs need re-walking: clone_for_fork marked the resident frames
-    // COW-shared but the live PTEs are still RW.
-    // SAFETY: the operation upholds its documented invariant (see surrounding context).
-    if unsafe { parent.rematerialize() }.is_err() {
-        return TestResult::Fail("parent rematerialize");
-    }
+    // clone_for_fork itself must restrict the live parent leaf before it
+    // returns; syscall callers no longer perform a whole-AS rematerialize.
     #[cfg(target_arch = "x86_64")]
     let parent_read_only = {
         // SAFETY: the parent owns this live root and the region lock is not
@@ -9411,7 +9553,7 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
         )
     };
     if !parent_read_only {
-        return TestResult::Fail("parent rematerialize left the COW leaf writable");
+        return TestResult::Fail("clone_for_fork left the parent COW leaf writable");
     }
 
     // ── Replay the #PF handler's COW recovery on the child ──
@@ -9464,7 +9606,10 @@ fn smoke_memory_cow_fault_path_child_diverges() -> TestResult {
     TestResult::Pass
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-kernel_test_in!("memory", smoke_memory_cow_fault_path_child_diverges);
+kernel_test_in!(
+    "memory/cow-fault",
+    smoke_memory_cow_fault_path_child_diverges
+);
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
@@ -9520,11 +9665,6 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     if unsafe { child.materialize() }.is_err() {
         return TestResult::Fail("child materialize");
     }
-    // SAFETY: the operation upholds its documented invariant (see surrounding context).
-    if unsafe { parent.rematerialize() }.is_err() {
-        return TestResult::Fail("parent rematerialize");
-    }
-
     // Parent writes first → trap path runs on the parent.
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     if unsafe { parent.cow_split_on_write(VirtAddr::new(VADDR)) }.is_err() {
@@ -9569,7 +9709,10 @@ fn smoke_memory_cow_fault_path_parent_diverges() -> TestResult {
     TestResult::Pass
 }
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-kernel_test_in!("memory", smoke_memory_cow_fault_path_parent_diverges);
+kernel_test_in!(
+    "memory/cow-fault",
+    smoke_memory_cow_fault_path_parent_diverges
+);
 
 fn smoke_memory_cow_fault_path_outside_region_fails() -> TestResult {
     // Trap-handler fallthrough: cow_split_on_write on a vaddr that
@@ -10148,14 +10291,15 @@ fn smoke_memory_user_page_writable_gates_readonly() -> TestResult {
         base: ro,
         len: 0x1000,
         perms: RegionPerms::READ,
-        phys: alloc::vec![PhysAddr::new(0x3000_0000)],
+        // Metadata-only backing stays below the allocator's reserved floor.
+        phys: alloc::vec![PhysAddr::new(0x30_000)],
     })
     .is_err()
         || a.map_region(Region {
             base: rw,
             len: 0x1000,
             perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(0x3000_1000)],
+            phys: alloc::vec![PhysAddr::new(0x31_000)],
         })
         .is_err()
     {
@@ -10187,21 +10331,43 @@ kernel_test_in!("memory", smoke_memory_user_page_writable_gates_readonly);
 /// island, and rounds a one-byte request over its containing page.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_madvise_hole_is_atomic_and_len_rounds() -> TestResult {
-    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use crate::{AddressSpace, PhysFrame, Region, RegionPerms, VirtAddr};
 
     let a = AddressSpace::empty();
     let base = 0x0000_0080_0804_0000u64;
-    for (offset, phys) in [(0, 0x2000_0000), (0x2000, 0x2000_1000)] {
-        if a.map_region(Region {
-            base: VirtAddr::new(base + offset),
-            len: 0x1000,
-            perms: RegionPerms::READ | RegionPerms::WRITE,
-            phys: alloc::vec![PhysAddr::new(phys)],
-        })
-        .is_err()
-        {
-            return TestResult::Fail("map_region failed");
+    let first = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => return TestResult::Skip("frame allocator drained"),
+    };
+    let second = match crate::alloc_frame() {
+        Ok(frame) => frame.start_address(),
+        Err(_) => {
+            crate::free_frame(PhysFrame::new(first));
+            return TestResult::Skip("frame allocator drained");
         }
+    };
+    if a.map_region(Region {
+        base: VirtAddr::new(base),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![first],
+    })
+    .is_err()
+    {
+        crate::free_frame(PhysFrame::new(first));
+        crate::free_frame(PhysFrame::new(second));
+        return TestResult::Fail("first map_region failed");
+    }
+    if a.map_region(Region {
+        base: VirtAddr::new(base + 0x2000),
+        len: 0x1000,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![second],
+    })
+    .is_err()
+    {
+        crate::free_frame(PhysFrame::new(second));
+        return TestResult::Fail("second map_region failed");
     }
     if a.madvise_dontneed(VirtAddr::new(base), 0x3000) != Err(crate::AddressSpaceError::Unmapped) {
         return TestResult::Fail("madvise across a hole did not fail");
@@ -10241,9 +10407,10 @@ fn smoke_memory_residency_range_is_coherent() -> TestResult {
         len: 0x3000,
         perms: RegionPerms::READ | RegionPerms::WRITE,
         phys: alloc::vec![
-            PhysAddr::new(0x2100_0000),
+            // Non-zero residency sentinels, deliberately not allocator-owned.
+            PhysAddr::new(0x21_000),
             PhysAddr::new(0),
-            PhysAddr::new(0x2100_1000),
+            PhysAddr::new(0x22_000),
         ],
     })
     .is_err()
@@ -14413,8 +14580,10 @@ fn smoke_memory_fixed_relocate_preflight_preserves_target() -> TestResult {
     let address_space = AddressSpace::empty();
     let source = VirtAddr::new(0x0000_4080_2a00_0000);
     let target = VirtAddr::new(0x0000_4080_2b00_0000);
-    let source_phys = PhysAddr::new(0x0200_0000);
-    let target_phys = PhysAddr::new(0x0300_0000);
+    // Metadata-only sentinels below LOW_RESERVED_BYTES are never published to
+    // the buddy when the rootless fixture drops.
+    let source_phys = PhysAddr::new(0x20_000);
+    let target_phys = PhysAddr::new(0x30_000);
     if address_space
         .map_region(Region {
             base: source,

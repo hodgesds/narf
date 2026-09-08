@@ -1869,9 +1869,12 @@ fn smoke_userspace_loader_into_address_space() -> TestResult {
 
     // Pool: 2 pages for segment 1 + 1 page for segment 2 = 3 frames.
     let pool = alloc::vec![
-        PhysAddr::new(0x10_0000),
-        PhysAddr::new(0x10_1000),
-        PhysAddr::new(0x20_0000),
+        // These are metadata-only sentinels, not allocator-owned RAM. Keep
+        // them below the reserved 1 MiB floor so dropping the AddressSpace
+        // cannot publish them to the live buddy allocator.
+        PhysAddr::new(0x10_000),
+        PhysAddr::new(0x11_000),
+        PhysAddr::new(0x12_000),
     ];
     let a2 = AddressSpace::empty();
     let ep = match load_into(&img, pool.into_iter(), &a2) {
@@ -1889,10 +1892,10 @@ fn smoke_userspace_loader_into_address_space() -> TestResult {
     if r1.perms != (RegionPerms::READ | RegionPerms::EXEC) {
         return TestResult::Fail("first segment perms wrong");
     }
-    if r1.phys.first().copied() != Some(PhysAddr::new(0x10_0000)) {
+    if r1.phys.first().copied() != Some(PhysAddr::new(0x10_000)) {
         return TestResult::Fail("first segment did not pick first pool frame");
     }
-    if r1.phys.get(1).copied() != Some(PhysAddr::new(0x10_1000)) {
+    if r1.phys.get(1).copied() != Some(PhysAddr::new(0x11_000)) {
         return TestResult::Fail("first segment did not pick second pool frame for page 2");
     }
     if r1.len != 0x2000 {
@@ -1900,12 +1903,12 @@ fn smoke_userspace_loader_into_address_space() -> TestResult {
     }
     // Second region: RW, third pool frame (first two went to seg 1).
     let r2 = a2.lookup(VirtAddr::new(0x7000)).expect("mapped");
-    if r2.phys.first().copied() != Some(PhysAddr::new(0x20_0000)) {
+    if r2.phys.first().copied() != Some(PhysAddr::new(0x12_000)) {
         return TestResult::Fail("second segment picked wrong frame from pool");
     }
 
     // Insufficient pool → NoPhysFrames.
-    let tiny = alloc::vec![PhysAddr::new(0x30_0000)];
+    let tiny = alloc::vec![PhysAddr::new(0x13_000)];
     let a3 = AddressSpace::empty();
     match load_into(&img, tiny.into_iter(), &a3) {
         Err(LoadError::NoPhysFrames) => {}

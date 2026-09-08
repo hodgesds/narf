@@ -6,7 +6,7 @@
 //! that's what QEMU exposes; SMC fallback can land if needed.
 //!
 //! The AP entry path lives in `smp_entry.S`. Rust on the BSP side:
-//!   1. Reserves a per-CPU stack for each AP via `alloc_frame`.
+//!   1. Reserves a contiguous per-CPU stack for each AP via `alloc_pages_on`.
 //!   2. Stores the stack-top phys in `AP_STACKS[logical_id]`.
 //!   3. Calls `cpu_on(target_aff, _ap_start_phys, logical_id)`.
 //!   4. Spins until the AP marks itself online via
@@ -18,14 +18,20 @@ use core::sync::atomic::{compiler_fence, Ordering};
 use core::fmt::Write;
 use narf_console::Writer;
 
-use narf_memory::alloc_frame;
+use narf_memory::alloc_pages_on;
 
 /// PSCI 1.0 function ids.
 const PSCI_CPU_ON_64: u64 = 0xC400_0003;
 
-/// Per-AP stack size in bytes (4 KiB → one frame). Matches BSP's
-/// boot stack; kernel-test workloads fit in a single frame.
-const AP_STACK_PAGES: usize = 1;
+/// AP kernel stack order. APs run the full executor and take interrupts on this
+/// stack, so they need the same 64 KiB headroom as x86_64 APs. A single 4 KiB
+/// frame was observed to underflow by 0x3a0 bytes in `drain_and_wake`,
+/// overwriting the adjacent live AArch64 page table.
+///
+/// The allocation must be one contiguous block: the entry trampoline receives
+/// only a stack-top address and grows downward through the complete range.
+const AP_STACK_ORDER: u8 = 4;
+const AP_STACK_PAGES: u64 = 1 << AP_STACK_ORDER;
 
 // AP entry symbol (defined in `smp_entry.S`).
 extern "C" {
@@ -115,26 +121,16 @@ pub unsafe fn start_aps() -> u32 {
 
     let mut started = 0u32;
     for logical in 1..total {
-        // Allocate a stack for this AP.
-        let mut stack_top: u64 = 0;
-        for _ in 0..AP_STACK_PAGES {
-            match alloc_frame() {
-                Ok(f) => {
-                    let base = f.start_address().raw();
-                    // Stack grows down; top = base + 4 KiB.
-                    if stack_top == 0 {
-                        stack_top = base + 4096;
-                    }
-                }
-                Err(_) => {
-                    let _ = writeln!(Writer, "  smp: AP {}: stack alloc failed", logical);
-                    continue;
-                }
+        // Allocate one contiguous stack block. The AP starts with the MMU off,
+        // so AP_STACKS carries its physical top; smp_entry.S rebases the empty
+        // stack to the high direct map immediately after enabling the MMU.
+        let stack_top = match alloc_pages_on(0, AP_STACK_ORDER) {
+            Ok(f) => f.start_address().raw() + AP_STACK_PAGES * 4096,
+            Err(_) => {
+                let _ = writeln!(Writer, "  smp: AP {}: stack alloc failed", logical);
+                continue;
             }
-        }
-        if stack_top == 0 {
-            continue;
-        }
+        };
 
         // SAFETY: AP_STACKS is in .boot.data, the only writer is
         // the BSP during this start_aps call.

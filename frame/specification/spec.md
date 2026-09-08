@@ -140,6 +140,10 @@ shared type directly; it does not define or cast a mirror layout.
 - EL1 vector table aligned to 2 KiB; four groups of four vectors.
 - `TPIDR_EL1` holds the `CpuLocal` pointer.
 - SP_EL0 for user, SP_EL1 for kernel; SPSel=1 on entry.
+- Each AP receives one contiguous 64 KiB kernel stack before `CPU_ON`. The AP
+  entry trampoline uses its physical top with the MMU off, then rebases the
+  empty stack to the high direct map before entering Rust. AP executor and IRQ
+  work must never run on a single-page boot stack.
 - **Stack alignment:** SP must be 16-byte aligned at EL1 vector entry;
   the vector prologue enforces this before any push.
 - **MTE is suspended on vector entry.** The prologue clears

@@ -76,24 +76,9 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     //   `clone_for_fork`), so its `region.phys[i]` frame cannot be freed by
     //   compaction/migration (free happens only at refcount 0); it stays valid to
     //   fault in later even if the parent's copy is relocated.
-    // Re-materialise the parent's PTEs. `clone_for_fork` stripped
-    // WRITE from every region's metadata but the parent's live page
-    // tables still carry the old WRITE-set PTEs. Without this, the
-    // parent continues writing to the shared physical frames without
-    // triggering a COW fault, silently corrupting the child's copy.
-    // SMP note: this only invlpg's the local CPU, but every user-task
-    // resume reloads CR3 via `activate()` (flushing the non-global
-    // user TLB), so a migrated parent re-derives RO PTEs and faults
-    // into COW correctly on its next write.
-    // SAFETY: identity map live; root valid; may be called while
-    // the parent AS is the active CR3 — invlpg per page keeps the
-    // TLB coherent.
-    // SAFETY: Valid memory or trusted environment
-    if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-        // Parent COW re-materialization failed → ENOMEM.
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-        return;
-    }
+    // `clone_for_fork` has already write-protected the present parent leaves
+    // whose backing became newly shared. Repeated forks therefore do not
+    // re-walk pages that were already COW read-only.
     let child_as = alloc::sync::Arc::new(child_as);
 
     // Snapshot the parent's trap frame BEFORE we set the parent's

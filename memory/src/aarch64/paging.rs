@@ -565,17 +565,32 @@ pub(crate) fn pt_lock_for(root: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpi
     &PT_LOCKS[((root.raw() >> 12) as usize) & (PT_LOCK_SHARDS - 1)].0
 }
 
+/// Tear down every subtree of a user-mode TTBR0 root and return the root frame
+/// itself to the allocator after data-page backing has already been released.
+///
+/// This compatibility entry point ignores residual leaf descriptors. Final
+/// address-space teardown uses [`free_user_ttbr0_tree_with_4kb_leaves`] so it
+/// can retire reverse-map ownership before releasing backing.
+///
+/// # Safety
+/// Same root-ownership contract as
+/// [`free_user_ttbr0_tree_with_4kb_leaves`]. Every data-page owner must already
+/// be retired and no CPU may be using `root` as its active TTBR0.
+pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
+    // SAFETY: forwarded from the caller; no leaf state is consumed.
+    unsafe { free_user_ttbr0_tree_with_4kb_leaves(root, |_, _| {}) };
+}
+
 /// Tear down every subtree of a user-mode TTBR0 root and return
-/// the root frame itself to the allocator.
+/// the root frame itself to the allocator, visiting each present 4 KiB leaf
+/// before its containing page table is reclaimed.
 ///
 /// AArch64 user TTBR0 starts empty (the kernel lives in TTBR1 per
 /// `new_user_ttbr0`'s comment) so every present entry in the root
 /// is user-private — no kernel-half to skip. Walks all four levels
 /// (L0 → L1 → L2 → L3), freeing intermediate page-table frames on
-/// the way back up. Leaf L3 entries (data pages) are NOT freed
-/// here; the `AddressSpace::Drop` path arranges for
-/// `unmap_region_pages` to release every region's data frames first
-/// so this routine only reclaims the page-table pages themselves.
+/// the way back up. Leaf L3 entries are reported to `visit_leaf`, but their
+/// mapped data frames are never dereferenced or freed here.
 /// Valid L0 table descriptors are detached under the root shard; the inactive
 /// subtrees are walked and batch-returned after that shard is released.
 ///
@@ -586,9 +601,16 @@ pub(crate) fn pt_lock_for(root: PhysAddr) -> &'static narf_lib::sync::IrqSafeSpi
 ///
 /// # Safety
 /// - `root` must be identity-reachable (allocator contract).
-/// - All data-page leaves must already have been released.
+/// - Every 4 KiB data-page backing frame must remain live through its callback.
+///   The callback must retire any external ownership before the caller releases
+///   that backing. Block mappings are skipped and must already be retired.
 /// - No CPU may be using `root` as its active TTBR0.
-pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
+/// - Valid L0 table descriptors are detached before traversal, so
+///   `visit_leaf` runs without a page-table lock held.
+pub(crate) unsafe fn free_user_ttbr0_tree_with_4kb_leaves(
+    root: PhysAddr,
+    mut visit_leaf: impl FnMut(PhysAddr, VirtAddr),
+) {
     use crate::frame::{free_unique_frame_batch, PhysFrame};
     const FREE_BATCH_FRAMES: usize = 64;
 
@@ -628,7 +650,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
             if !entry_is_table(l0e) {
                 continue;
             }
-            detached_l1s.push(l0e.addr());
+            detached_l1s.push((l0_idx, l0e.addr()));
             l0.entries[l0_idx] = PageTableEntry::EMPTY;
         }
     }
@@ -642,7 +664,7 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
     // detached tables and entering allocator/COW locks therefore needs no root
     // shard and cannot block unrelated mutations that hash to the same shard.
     let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
-    for l1_pa in detached_l1s {
+    for (l0_idx, l1_pa) in detached_l1s {
         // SAFETY: same.
         let l1 = unsafe { &mut *l1_pa.kernel_mut_ptr::<PageTable>() };
         for l1_idx in 0..512usize {
@@ -658,10 +680,26 @@ pub unsafe fn free_user_ttbr0_tree(root: PhysAddr) {
                 if !entry_is_table(l2e) {
                     continue;
                 }
-                // L3 — leaf-level table; data frames already
-                // released by `unmap_region_pages`. Reclaim the
-                // table page itself.
-                queue_reclaimed(&mut reclaimed, l2e.addr());
+                let l3_pa = l2e.addr();
+                // L3 — visit valid Page descriptors while their backing stays
+                // live, then reclaim the leaf-level table itself.
+                // SAFETY: verified table descriptor in a detached, inactive
+                // user tree.
+                let l3 = unsafe { &*l3_pa.kernel_ptr::<PageTable>() };
+                for l3_idx in 0..512usize {
+                    let l3e = l3.entries[l3_idx];
+                    if !l3e.is_valid() || l3e.raw() & 0b11 != 0b11 {
+                        continue;
+                    }
+                    let va = VirtAddr::new(
+                        ((l0_idx as u64) << 39)
+                            | ((l1_idx as u64) << 30)
+                            | ((l2_idx as u64) << 21)
+                            | ((l3_idx as u64) << 12),
+                    );
+                    visit_leaf(l3e.addr(), va);
+                }
+                queue_reclaimed(&mut reclaimed, l3_pa);
             }
             queue_reclaimed(&mut reclaimed, l2_pa);
         }
@@ -1177,6 +1215,120 @@ pub unsafe fn rewrite_4kb_scatter_range(
         unsafe { publish_table_write() };
     }
     result
+}
+
+/// Clear EL0 write permission on present 4 KiB leaves in a contiguous range.
+///
+/// Missing levels and leaves stay absent, so a fork write-protect pass does
+/// not materialize inherited lazy backing. AP-only restriction is an in-place
+/// permission update (the output address and memory attributes do not change),
+/// followed by one inner-shareable TLBI for the range. The L3 walk caches each
+/// 2 MiB table.
+///
+/// Returns the number of leaves changed. Encountering a block mapping is a
+/// structural error because ordinary fork backing uses 4 KiB leaves.
+///
+/// # Safety
+/// `root` must remain a live, kernel-reachable translation root for the call.
+pub unsafe fn write_protect_4kb_range_existing(
+    root: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError> {
+    if !is_canonical(base) || base.as_u64() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base
+        .as_u64()
+        .checked_add(span)
+        .ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.as_u64() ^ last.as_u64()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _guard = pt_lock_for(root).lock();
+    // SAFETY: the root is kernel-reachable and mutation-locked.
+    let l0 = unsafe { &*root.kernel_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_l3: *mut PageTable = core::ptr::null_mut();
+    let mut changed = 0u64;
+    let mut result = Ok(());
+
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.as_u64() + page * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.l0 << 18) | (idx.l1 << 9) | idx.l2;
+        if key != cached_key {
+            cached_key = key;
+            cached_l3 = core::ptr::null_mut();
+            let l0e = l0.entries[idx.l0];
+            if !l0e.is_valid() {
+                continue;
+            }
+            if !entry_is_table(l0e) {
+                result = Err(MapError::EncounteredBlock);
+                break;
+            }
+            // SAFETY: verified table descriptor under the root lock.
+            let l1 = unsafe { &*l0e.addr().kernel_ptr::<PageTable>() };
+            let l1e = l1.entries[idx.l1];
+            if !l1e.is_valid() {
+                continue;
+            }
+            if !entry_is_table(l1e) {
+                result = Err(MapError::EncounteredBlock);
+                break;
+            }
+            // SAFETY: verified table descriptor under the root lock.
+            let l2 = unsafe { &*l1e.addr().kernel_ptr::<PageTable>() };
+            let l2e = l2.entries[idx.l2];
+            if !l2e.is_valid() {
+                continue;
+            }
+            if !entry_is_table(l2e) {
+                result = Err(MapError::EncounteredBlock);
+                break;
+            }
+            cached_l3 = l2e.addr().kernel_mut_ptr::<PageTable>();
+        }
+        if cached_l3.is_null() {
+            continue;
+        }
+        // SAFETY: cached_l3 came from this key's verified L2 descriptor and
+        // stays stable while the root mutation lock is held.
+        let l3 = unsafe { &mut *cached_l3 };
+        let leaf = l3.entries[idx.l3];
+        if !leaf.is_valid() {
+            continue;
+        }
+        if leaf.raw() & 0b11 != 0b11 {
+            result = Err(MapError::EncounteredBlock);
+            break;
+        }
+        const AP_MASK: u64 = 0b11 << 6;
+        if leaf.raw() & AP_MASK == PtFlags::AP_RW_EL0.bits() {
+            l3.entries[idx.l3] = PageTableEntry::from_raw(leaf.raw() | PtFlags::AP_RO_EL1.bits());
+            changed += 1;
+        }
+    }
+
+    if changed != 0 {
+        // SAFETY: publish every AP restriction before retiring cached writable
+        // translations on all PEs in the inner-shareable domain.
+        unsafe {
+            publish_table_write();
+            tlb_invalidate_4kb_range_all_asids_inner_shareable(base, pages);
+        }
+    }
+    result.map(|()| changed)
 }
 
 /// Tear down a 4 KiB mapping at `virt` under `root`. Returns the
