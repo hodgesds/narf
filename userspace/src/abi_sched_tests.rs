@@ -963,18 +963,19 @@ fn smoke_abi_sched_get_robust_list_bad_head_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_sched_get_robust_list_bad_head_neg);
 
 // ── rseq(rseq*, len, flags, sig) ────────────────────────────────────
-// Stub: accepts everything and returns ok(0); no reachable error path.
+// NARF does not implement restartable-sequence registration or migration
+// aborts. Report ENOSYS so libc uses its non-rseq fallback instead of trusting
+// an ABI area the kernel never maintains.
 
-fn smoke_abi_sched_rseq_pos() -> TestResult {
-    with_setup(|| {
-        // Registration is a no-op stub ⇒ always ok(0).
-        match call(Syscall::Rseq.raw(), a3(0xBEEF_0000, 32, 0, 0x53053053)) {
-            Some(0) => Ok(()),
-            _ => Err("rseq should return 0"),
-        }
-    })
+fn smoke_abi_sched_rseq_unimplemented() -> TestResult {
+    with_setup(
+        || match call(Syscall::Rseq.raw(), a3(0xBEEF_0000, 32, 0, 0x53053053)) {
+            Some(ENOSYS) => Ok(()),
+            _ => Err("unimplemented rseq must return -ENOSYS"),
+        },
+    )
 }
-kernel_test_in!("syscall_abi", smoke_abi_sched_rseq_pos);
+kernel_test_in!("syscall_abi", smoke_abi_sched_rseq_unimplemented);
 
 // ── sched_yield() ───────────────────────────────────────────────────
 // Returns ok(0) whether or not another runnable task exists; no error path (no
