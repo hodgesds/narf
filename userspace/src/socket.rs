@@ -4006,10 +4006,69 @@ impl SocketFile {
                         .lock()
                         .clone()
                         .unwrap_or_else(|| UnixPathKey::for_current_path(&p));
-                    LISTENERS
-                        .lock()
-                        .get_or_insert_with(BTreeMap::new)
-                        .insert(key, self.clone());
+                    // Socket-activation accept-queue handoff. A pathname AF_UNIX
+                    // socket is keyed by its resolved inode, so when a daemon
+                    // takes over a socket-activation listener by unlink()+bind()+
+                    // listen() (journald over PID1's /run/systemd/journal/stdout),
+                    // the NEW listener has a different key and does NOT find the
+                    // old one via `key` — leaving every connection that queued on
+                    // the old listener orphaned forever. In real systemd the
+                    // *listening fd, with its accept queue,* is passed to the
+                    // activated service, so those queued connections are accepted,
+                    // not lost. Emulate that: find any prior listener for the SAME
+                    // path and inherit its pending connections into this one.
+                    // Without it a service's stderr that connected before the
+                    // handoff blocks on write() forever — the observed KDE-greeter
+                    // black screen (kwin's stderr stuck on the orphaned listener,
+                    // kwin never becomes ready, systemd SIGTERMs it, greeter can't
+                    // connect to the dead compositor).
+                    let stale: alloc::vec::Vec<Arc<SocketFile>> = {
+                        let map = LISTENERS.lock();
+                        map.as_ref()
+                            .map(|m| {
+                                m.values()
+                                    .filter(|old| {
+                                        !Arc::ptr_eq(old, self)
+                                            && matches!(
+                                                &*old.state.lock(),
+                                                SocketState::UnixListener {
+                                                    addr: UnixAddr::Path(op),
+                                                    ..
+                                                } if *op == p
+                                            )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    // Drain each superseded listener's queue (its own state lock,
+                    // taken AFTER dropping the LISTENERS lock to keep the
+                    // LISTENERS→state order the connect path also uses).
+                    let mut inherited: alloc::collections::VecDeque<Arc<SocketFile>> =
+                        alloc::collections::VecDeque::new();
+                    for old in &stale {
+                        if let SocketState::UnixListener { pending, .. } = &mut *old.state.lock() {
+                            while let Some(conn) = pending.pop_front() {
+                                inherited.push_back(conn);
+                            }
+                        }
+                    }
+                    if !inherited.is_empty() {
+                        if let SocketState::UnixListener { pending, .. } = &mut *self.state.lock() {
+                            pending.append(&mut inherited);
+                        }
+                        // Wake anyone armed on THIS listener's accept cell.
+                        self.listener_readiness.set(narf_filesystem::POLL_IN, 0);
+                        self.listener_readiness.notify(narf_filesystem::POLL_IN);
+                    }
+                    {
+                        let mut guard = LISTENERS.lock();
+                        let map = guard.get_or_insert_with(BTreeMap::new);
+                        // Retire the superseded listener entries, then publish this one.
+                        map.retain(|_, v| !stale.iter().any(|o| Arc::ptr_eq(o, v)));
+                        map.insert(key, self.clone());
+                    }
                 }
                 SocketOpResult::Ok(0)
             }
