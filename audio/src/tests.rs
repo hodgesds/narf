@@ -20,16 +20,45 @@ fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
     hda::__reset_for_test();
     bus_reset();
 
-    if select_active_playback().is_some() {
-        return TestResult::Fail("picker returned a stream with no controller");
-    }
-
+    let picked = select_active_playback().is_some();
     // AudioWriter::open should fail with NoActiveStream.
     let cap = bootstrap_writer();
-    match AudioWriter::open(cap, AudioFormat::default_playback()) {
+    let opened = AudioWriter::open(cap, AudioFormat::default_playback());
+
+    // Put the world back before returning, on every path.
+    //
+    // These three resets are global and outlive this test. Without a restore
+    // the audio backend stays unprobed for the whole boot, and any later test
+    // needing one skips -- `smoke_audio_format_unsupported_rate_rejects` did
+    // exactly that, intermittently, depending on whether it happened to run
+    // before or after this one. It read as a flaky audio test; it was this
+    // test's teardown.
+    restore_audio_probe_state();
+
+    if picked {
+        return TestResult::Fail("picker returned a stream with no controller");
+    }
+    match opened {
         Err(AudioWriteError::NoActiveStream) => TestResult::Pass,
         _ => TestResult::Fail("AudioWriter::open should have failed with NoActiveStream"),
     }
+}
+
+/// Re-register the audio PCI drivers and re-probe, undoing the global resets
+/// a test performed.
+///
+/// Best-effort by design: on a machine with no audio device there is nothing
+/// to restore, and failing here would turn "this platform has no sound card"
+/// into a test failure. What it must not do is leave the buses unregistered
+/// after a test cleared them.
+fn restore_audio_probe_state() {
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+    use narf_drivers_virtio::snd_pci;
+
+    crate::hda::register_pci_driver();
+    snd_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
 }
 kernel_test_in!("audio", smoke_audio_picker_no_backend_when_unprobed);
 
