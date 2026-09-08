@@ -251,6 +251,39 @@ pub extern "Rust" fn narf_arch_cpu_id() -> usize {
     current::cpu::current_cpu() as usize
 }
 
+/// The domain byte this CPU is currently reporting, for a caller that must
+/// carry it across a context switch.
+///
+/// The *hardware* enforcement state — `IA32_PKRS`, `SCTLR_EL1`/`GCR_EL1` — is
+/// already saved and restored by `kernel_switch`, which keeps it in the
+/// `KernelContext` (`domain_state` on x86, `domain_sctlr`/`domain_gcr` on
+/// aarch64). This byte is not in that context, so it is the one piece of
+/// domain state a switch would otherwise leak: a task preempted inside a scope
+/// would leave `current_domain()` reporting that domain to whatever ran next.
+///
+/// Quieter than a hardware leak and worse for it. Nothing faults; instead
+/// `domain_heap::alloc` picks the wrong window for the next task's allocation,
+/// and `block::encrypted`'s constructor assertion reads a domain that is not
+/// its own.
+#[must_use]
+pub fn current_domain_byte() -> u8 {
+    let cpu = current::cpu::current_cpu() as usize;
+    if cpu >= narf_lib::percpu::MAX_CPUS {
+        return 0;
+    }
+    CURRENT_DOMAIN[cpu].load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Set the reported domain byte. Pairs with [`current_domain_byte`] across a
+/// context switch; scope entry and exit go through [`enter_domain_scope`] and
+/// [`exit_domain_scope`] instead.
+pub fn set_current_domain_byte(domain: u8) {
+    let cpu = current::cpu::current_cpu() as usize;
+    if cpu < narf_lib::percpu::MAX_CPUS {
+        CURRENT_DOMAIN[cpu].store(domain, core::sync::atomic::Ordering::Release);
+    }
+}
+
 /// Per-CPU record of the domain whose scope this CPU is executing inside.
 ///
 /// Written by the `enter`/`exit` pair in `modules::domain` and

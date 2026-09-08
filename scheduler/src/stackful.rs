@@ -789,6 +789,16 @@ pub struct KernelTask {
     /// Saved register state. Initialised by `KernelContext::fresh`
     /// to land the first kernel_switch on `trampoline_entry`.
     ctx: KernelContext,
+    /// The domain `current_domain()` should report while this task runs.
+    ///
+    /// The *hardware* enforcement state already rides in `ctx`: `kernel_switch`
+    /// saves and restores `domain_state` on x86 and `domain_sctlr`/`domain_gcr`
+    /// on aarch64. This byte does not, so without carrying it here a task
+    /// preempted inside a domain scope leaves `current_domain()` answering with
+    /// that domain for whatever runs next — which picks the wrong
+    /// `domain_heap` window and misfires `block::encrypted`'s assertion,
+    /// silently in both cases.
+    domain_byte: u8,
     /// Pointer to the executor's `KernelContext`. The executor
     /// stores its own ctx address here before switching in; the
     /// task reads it back to know where to switch when yielding.
@@ -966,6 +976,8 @@ impl KernelTask {
         let mut me = Box::new(KernelTask {
             future: Box::pin(future),
             stack,
+            // A fresh task has no scope open, so it reports FRAME.
+            domain_byte: narf_lib::id::DomainId::FRAME.raw(),
             // `KernelContext::default()` is a real register struct on x86_64
             // and a unit struct elsewhere; the allow covers the unit-struct
             // arches where clippy would otherwise flag the constructor.
@@ -1229,7 +1241,17 @@ impl KernelTask {
         let perf_task = crate::current_task_id().raw();
         user_perf_switch(perf_task, true);
         // SAFETY: Valid memory or trusted environment
+        // The reported domain follows the task, the way the hardware
+        // enforcement state already does inside `ctx`. Restored before the
+        // switch and re-captured after, so a task preempted inside a scope
+        // does not leave `current_domain()` answering with its domain for
+        // whoever runs next.
+        narf_arch::set_current_domain_byte(self.domain_byte);
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        // Both a voluntary yield and an involuntary preemption resume here,
+        // so one capture covers both: the CPU still holds the task's byte.
+        self.domain_byte = narf_arch::current_domain_byte();
+        narf_arch::set_current_domain_byte(narf_lib::id::DomainId::FRAME.raw());
         // ── We are resumed here when the task yields back ──
         // Stack-overflow tripwire: catch a task whose kernel stack
         // grew past its bottom during the slice that just ended,
@@ -1325,7 +1347,17 @@ impl KernelTask {
         let perf_task = crate::current_task_id().raw();
         user_perf_switch(perf_task, true);
         // SAFETY: both contexts and the task-owned stack remain live.
+        // The reported domain follows the task, the way the hardware
+        // enforcement state already does inside `ctx`. Restored before the
+        // switch and re-captured after, so a task preempted inside a scope
+        // does not leave `current_domain()` answering with its domain for
+        // whoever runs next.
+        narf_arch::set_current_domain_byte(self.domain_byte);
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        // Both a voluntary yield and an involuntary preemption resume here,
+        // so one capture covers both: the CPU still holds the task's byte.
+        self.domain_byte = narf_arch::current_domain_byte();
+        narf_arch::set_current_domain_byte(narf_lib::id::DomainId::FRAME.raw());
         self.check_stack_canary();
         user_perf_switch(perf_task, false);
         // SAFETY: same exclusive per-CPU slot as above.
@@ -5839,6 +5871,76 @@ pub mod tests {
     kernel_test_in!(
         "scheduler/stackful",
         smoke_preempt_disable_nests_and_unwinds
+    );
+
+    /// The reported domain follows a task across a yield, and does not follow
+    /// the CPU.
+    ///
+    /// The *hardware* enforcement state has always been carried:
+    /// `KernelContext` holds `domain_state` on x86 and
+    /// `domain_sctlr`/`domain_gcr` on aarch64, and `kernel_switch` saves and
+    /// restores it — `smoke_stackful_switch_preserves_domain_state` covers
+    /// that. The byte behind `current_domain()` was not in either context, so
+    /// it was the one piece of domain state a switch leaked.
+    ///
+    /// Silent when broken, which is why it is asserted rather than reasoned
+    /// about: nothing faults, but `domain_heap::alloc` picks the wrong window
+    /// for the next task's allocation and `block::encrypted`'s constructor
+    /// assertion reads a domain that is not its own and passes.
+    ///
+    /// Drives `narf_arch` directly rather than `modules::domain::enter`: this
+    /// is a property of the switch, and reaching for the module layer would
+    /// point the scheduler at a crate that depends on it.
+    fn smoke_domain_byte_follows_the_task_across_a_yield() -> TestResult {
+        use core::sync::atomic::{AtomicU8, Ordering};
+        use narf_lib::id::DomainId;
+
+        static AFTER_YIELD: AtomicU8 = AtomicU8::new(0xFF);
+        const SCOPED: u8 = 15;
+
+        struct YieldInScope {
+            polled: bool,
+        }
+
+        impl Future for YieldInScope {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                if !self.polled {
+                    self.polled = true;
+                    // Enter and yield without leaving — the situation an
+                    // involuntary preemption creates.
+                    narf_arch::enter_domain_scope(SCOPED);
+                    return Poll::Pending;
+                }
+                AFTER_YIELD.store(narf_arch::current_domain_byte(), Ordering::Release);
+                narf_arch::set_current_domain_byte(DomainId::FRAME.raw());
+                Poll::Ready(())
+            }
+        }
+
+        let before = narf_arch::current_domain_byte();
+        crate::block_on(YieldInScope { polled: false });
+        let after = narf_arch::current_domain_byte();
+        let observed = AFTER_YIELD.load(Ordering::Acquire);
+
+        if before != DomainId::FRAME.raw() {
+            return TestResult::Fail("test did not start in FRAME");
+        }
+        // Resuming with the domain it yielded holding is the half that makes
+        // the scope survive a yield at all.
+        if observed != SCOPED {
+            return TestResult::Fail("a task did not resume with the domain it yielded holding");
+        }
+        // And not leaking it back to the caller is the half that fixes the bug.
+        if after != DomainId::FRAME.raw() {
+            return TestResult::Fail("the scoped domain leaked out of the task");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_domain_byte_follows_the_task_across_a_yield
     );
     #[cfg(target_arch = "aarch64")]
     kernel_test_in!(
