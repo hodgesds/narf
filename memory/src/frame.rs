@@ -2117,29 +2117,76 @@ pub mod cow {
     ///
     /// Frames are grouped by refcount shard before any lock is taken, so a
     /// fork of an N-page address space acquires each touched shard once rather
-    /// than disabling IRQs around N independent lock acquisitions. Duplicate
-    /// addresses are intentional: each occurrence represents another owner
-    /// and therefore contributes one reference.
-    pub fn inc_ref_batch(frames: &[PhysAddr]) {
-        let mut by_shard: [Vec<u64>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
+    /// than disabling IRQs around N independent lock acquisitions. The return
+    /// bitmap preserves input order and marks every occurrence of a frame that
+    /// transitioned from sole-owned to shared during this batch. Fork uses it
+    /// to write-protect only newly shared parent leaves.
+    ///
+    /// Duplicate addresses are intentional: each occurrence represents
+    /// another owner and therefore contributes one reference. If a sole-owned
+    /// frame occurs more than once, every occurrence is marked so every parent
+    /// alias loses WRITE before the child can observe it.
+    pub fn inc_ref_batch(frames: &[PhysAddr]) -> Vec<bool> {
+        let mut newly_shared = alloc::vec![false; frames.len()];
+        let mut counts = [0usize; REFCOUNT_SHARDS];
         for phys in frames {
             let key = phys.raw();
             if key != 0 {
-                by_shard[ref_shard(key)].push(key);
+                counts[ref_shard(key)] += 1;
             }
         }
-
-        for (shard, keys) in by_shard.into_iter().enumerate() {
-            if keys.is_empty() {
+        let nonzero = counts.iter().sum();
+        let mut next = [0usize; REFCOUNT_SHARDS];
+        let mut offset = 0usize;
+        for (shard, count) in counts.iter().copied().enumerate() {
+            next[shard] = offset;
+            offset += count;
+        }
+        let mut entries = alloc::vec![(0u64, 0usize); nonzero];
+        for (index, phys) in frames.iter().enumerate() {
+            let key = phys.raw();
+            if key == 0 {
                 continue;
             }
+            let shard = ref_shard(key);
+            entries[next[shard]] = (key, index);
+            next[shard] += 1;
+        }
+
+        let mut start = 0usize;
+        for (shard, count) in counts.into_iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let shard_entries = &mut entries[start..start + count];
+            // Group aliases so one atomic add observes the pre-batch owner
+            // count. One counting-partitioned allocation covers every shard,
+            // avoiding up to 64 independently growing Vecs per fork.
+            shard_entries.sort_unstable_by_key(|(key, _)| *key);
             let mut guard = REFCOUNTS[shard].map.lock();
             let map = guard.get_or_insert_with(BTreeMap::new);
-            for key in keys {
+            let mut first = 0usize;
+            while first < shard_entries.len() {
+                let key = shard_entries[first].0;
+                let mut end = first + 1;
+                while end < shard_entries.len() && shard_entries[end].0 == key {
+                    end += 1;
+                }
                 let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
-                entry.fetch_add(1, Ordering::AcqRel);
+                let additional = u32::try_from(end - first)
+                    .expect("one COW retain batch cannot exceed u32 owners");
+                let previous = entry.fetch_add(additional, Ordering::AcqRel);
+                if previous <= 1 {
+                    for &(_, input_index) in &shard_entries[first..end] {
+                        newly_shared[input_index] = true;
+                    }
+                }
+                first = end;
             }
+            start += count;
         }
+        debug_assert_eq!(start, nonzero);
+        newly_shared
     }
 
     /// Undo speculative retains previously added by [`inc_ref_batch`].
@@ -2254,25 +2301,52 @@ pub mod cow {
     /// recursive allocation. That is a hard requirement for the teardown and
     /// OOM-reaper paths, which run precisely when memory is exhausted.
     ///
-    /// Each touched shard is locked at most once: the outer loop walks the
-    /// shard space and, for each shard, scans the input for the frames that
-    /// map to it. `on_release` runs while the shard lock is held, so it must
-    /// only record the address (e.g. into a stack buffer) — it must not take
-    /// the zone/cache locks, which would invert the established lock order.
+    /// The caller supplies at most one allocator teardown window. A fixed-size
+    /// counting sort groups that window by shard in O(frames + shards), then
+    /// each touched shard is locked exactly once. `on_release` runs while the
+    /// shard lock is held, so it must only record the address (e.g. into a
+    /// stack buffer) — it must not take the zone/cache locks, which would
+    /// invert the established lock order.
     /// Callers scrub/publish released frames after this returns.
-    pub fn dec_ref_batch_each(frames: &[PhysAddr], mut on_release: impl FnMut(PhysAddr)) {
-        for (shard, refcounts) in REFCOUNTS.iter().enumerate() {
-            let mut guard = None;
-            for &phys in frames {
-                let key = phys.raw();
-                if key == 0 || ref_shard(key) != shard {
-                    continue;
-                }
-                let g = guard.get_or_insert_with(|| refcounts.map.lock());
-                let Some(map) = g.as_mut() else {
+    pub(super) fn dec_ref_batch_each(frames: &[PhysAddr], mut on_release: impl FnMut(PhysAddr)) {
+        assert!(
+            frames.len() <= super::FREE_BATCH_WINDOW,
+            "COW decrement batch exceeds allocator teardown window"
+        );
+        let mut counts = [0usize; REFCOUNT_SHARDS];
+        for &phys in frames {
+            if phys.raw() != 0 {
+                counts[ref_shard(phys.raw())] += 1;
+            }
+        }
+        let mut next = [0usize; REFCOUNT_SHARDS];
+        let mut total = 0usize;
+        for (shard, count) in counts.iter().copied().enumerate() {
+            next[shard] = total;
+            total += count;
+        }
+        let mut ordered = [PhysAddr::new(0); super::FREE_BATCH_WINDOW];
+        for &phys in frames {
+            if phys.raw() == 0 {
+                continue;
+            }
+            let shard = ref_shard(phys.raw());
+            ordered[next[shard]] = phys;
+            next[shard] += 1;
+        }
+
+        let mut start = 0usize;
+        for (shard, count) in counts.into_iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            let mut guard = REFCOUNTS[shard].map.lock();
+            for &phys in &ordered[start..start + count] {
+                let Some(map) = guard.as_mut() else {
                     on_release(phys);
                     continue;
                 };
+                let key = phys.raw();
                 let Some(entry) = map.get(&key) else {
                     on_release(phys);
                     continue;
@@ -2282,7 +2356,9 @@ pub mod cow {
                     on_release(phys);
                 }
             }
+            start += count;
         }
+        debug_assert_eq!(start, total);
     }
 
     /// Read-only peek at a frame's refcount. Returns 0 if the

@@ -7150,7 +7150,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     let _share_files = (flags & CLONE_FILES) != 0;
     let share_sighand = (flags & CLONE_SIGHAND) != 0;
     let share_sysvsem = (flags & CLONE_SYSVSEM) != 0;
-
     // No-VM (fork-shaped) path: redirect to sys_fork's machinery.
     // The clone_args fields not consumed by fork are accepted-and-
     // ignored on this branch (Linux behaviour: clone3 without
@@ -7174,25 +7173,18 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
                 return;
             }
         };
-        // SAFETY: `dup` is the freshly-built child AddressSpace with a valid root
-        // and the regions cloned above; materialize installs only those PTEs.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { dup.materialize() }.is_err() {
-            // Child page-table materialization failed → ENOMEM.
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-            return;
-        }
-        // SAFETY: `parent_as` is the live caller AddressSpace; rematerialize rewrites
-        // its existing PTEs to match the WRITE-stripped (COW) region perms set by clone_for_fork.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { parent_as.as_ref().rematerialize() }.is_err() {
-            // Parent COW re-materialization failed → ENOMEM.
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-            return;
-        }
+        // Leave ordinary child leaves uninstalled, matching `sys_fork`'s lazy
+        // COW path. The first child access demand-faults the already-retained
+        // `Region::phys` frame as read-only and a later write splits it. This is
+        // especially important for clone callers with large resident mappings:
+        // constructing page tables for untouched child pages made clone cost
+        // proportional to the parent's resident set. Private huge mappings are
+        // still copied and installed eagerly by `clone_for_fork` because they
+        // have no base-page demand-fault path.
+        // `clone_for_fork` has already write-protected only the present parent
+        // leaves whose backing became newly shared.
         alloc::sync::Arc::new(dup)
     };
-
     // Stack: for `clone3(2)`, `ca.stack` points at the LOW end
     // of the user-provided stack region and `ca.stack_size` is
     // the byte length; the child's initial SP is the top

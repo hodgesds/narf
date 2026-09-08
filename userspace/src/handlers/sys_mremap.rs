@@ -813,7 +813,10 @@ mod tests {
             len: pages * 4096,
             perms: RegionPerms::READ | RegionPerms::WRITE,
             phys: (0..pages)
-                .map(|index| PhysAddr::new(0x0200_0000 + index * 4096))
+                // Metadata-only fixture: keep sentinels below the allocator's
+                // reserved 1 MiB floor so AddressSpace ownership teardown
+                // cannot donate them to the live buddy.
+                .map(|index| PhysAddr::new(0x10_000 + index * 4096))
                 .collect(),
         }
     }

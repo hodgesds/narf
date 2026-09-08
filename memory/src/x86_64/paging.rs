@@ -1380,6 +1380,110 @@ pub unsafe fn rewrite_4kb_scatter_range(
     result
 }
 
+/// Clear WRITE on the present 4 KiB leaves in a contiguous user range.
+///
+/// Missing upper levels and leaves remain absent: unlike
+/// [`rewrite_4kb_scatter_range`], this helper never allocates a page table or
+/// materializes lazy backing. The walk caches each 2 MiB leaf table and
+/// invalidates locally once after all descriptor stores. Address-space code
+/// broadcasts separately when the root can be active on peer CPUs.
+///
+/// Returns the number of leaves whose writable bit changed. A huge mapping in
+/// the requested span is a structural error; ordinary fork backing must be
+/// represented by 4 KiB leaves.
+///
+/// # Safety
+/// `pml4_phys` must be a live, identity-reachable root for the whole call.
+pub unsafe fn write_protect_4kb_range_existing(
+    pml4_phys: PhysAddr,
+    base: VirtAddr,
+    pages: u64,
+) -> Result<u64, MapError> {
+    if !is_canonical(base) || base.raw() & 0xFFF != 0 {
+        return Err(if is_canonical(base) {
+            MapError::UnalignedVirt
+        } else {
+            MapError::NonCanonical
+        });
+    }
+    let span = pages.checked_mul(4096).ok_or(MapError::NonCanonical)?;
+    let end = base.raw().checked_add(span).ok_or(MapError::NonCanonical)?;
+    if pages != 0 {
+        let last = VirtAddr::new(end - 1);
+        if !is_canonical(last) || ((base.raw() ^ last.raw()) & (1 << 47)) != 0 {
+            return Err(MapError::NonCanonical);
+        }
+    }
+
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: the root is identity-reachable and mutation-locked.
+    let pml4 = unsafe { &*pml4_phys.kernel_mut_ptr::<PageTable>() };
+    let mut cached_key = usize::MAX;
+    let mut cached_pt: *mut PageTable = core::ptr::null_mut();
+    let mut changed = 0u64;
+    let mut result = Ok(());
+
+    for page in 0..pages {
+        let virt = VirtAddr::new(base.raw() + page * 4096);
+        let idx = WalkIndices::from_virt(virt);
+        let key = (idx.pml4 << 18) | (idx.pdpt << 9) | idx.pd;
+        if key != cached_key {
+            cached_key = key;
+            cached_pt = core::ptr::null_mut();
+            let pml4e = pml4.entries[idx.pml4];
+            if !pml4e.is_present() {
+                continue;
+            }
+            // SAFETY: verified present table descriptor under the root lock.
+            let pdpt = unsafe { &*pml4e.addr().kernel_ptr::<PageTable>() };
+            let pdpte = pdpt.entries[idx.pdpt];
+            if !pdpte.is_present() {
+                continue;
+            }
+            if pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+                result = Err(MapError::EncounteredHugePage);
+                break;
+            }
+            // SAFETY: verified present, non-huge descriptor.
+            let pd = unsafe { &*pdpte.addr().kernel_ptr::<PageTable>() };
+            let pde = pd.entries[idx.pd];
+            if !pde.is_present() {
+                continue;
+            }
+            if pde.flags().contains(PtFlags::HUGE_PAGE) {
+                result = Err(MapError::EncounteredHugePage);
+                break;
+            }
+            cached_pt = pde.addr().kernel_mut_ptr::<PageTable>();
+        }
+        if cached_pt.is_null() {
+            continue;
+        }
+        // SAFETY: cached_pt came from this key's verified PDE and the root
+        // mutation lock prevents its replacement.
+        let pt = unsafe { &mut *cached_pt };
+        let leaf = pt.entries[idx.pt];
+        if leaf.is_present() && leaf.flags().contains(PtFlags::WRITABLE) {
+            pt.entries[idx.pt] = PageTableEntry::from_raw(leaf.raw() & !PtFlags::WRITABLE.bits());
+            changed += 1;
+        }
+    }
+
+    if changed != 0 {
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        if pages <= FULL_FLUSH_PAGE_CEILING {
+            for page in 0..pages {
+                // SAFETY: the validated range is canonical and page-aligned.
+                unsafe { invlpg(VirtAddr::new(base.raw() + page * 4096)) };
+            }
+        } else {
+            // SAFETY: user leaves are non-global.
+            unsafe { flush_user_tlb_local() };
+        }
+    }
+    result.map(|()| changed)
+}
+
 /// Tear down a 4 KiB mapping. Intermediate tables are left intact —
 /// Wave 2+'s refcounted-table work adds the "delete if empty" sweep.
 ///
@@ -1739,19 +1843,33 @@ unsafe fn unmap_4kb_locked(
     Ok(removed.addr())
 }
 
+/// Tear down every user-half subtree of `pml4_phys` and return the PML4 frame
+/// itself to the allocator after data-page backing has already been released.
+///
+/// This compatibility entry point ignores residual leaf descriptors. Final
+/// address-space teardown uses [`free_user_pml4_tree_with_4kb_leaves`] so it can
+/// retire reverse-map ownership before releasing backing.
+///
+/// # Safety
+/// Same root-ownership contract as
+/// [`free_user_pml4_tree_with_4kb_leaves`]. Every data-page owner must already
+/// be retired and no CPU may be using `pml4_phys` as its active CR3.
+pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
+    // SAFETY: forwarded from the caller; no leaf state is consumed.
+    unsafe { free_user_pml4_tree_with_4kb_leaves(pml4_phys, |_, _| {}) };
+}
+
 /// Tear down every user-half subtree of `pml4_phys` and return the
-/// PML4 frame itself to the allocator.
+/// PML4 frame itself to the allocator, visiting each present 4 KiB leaf before
+/// its containing page table is reclaimed.
 ///
 /// Walks PML4 entries 0..=255 (the user half — entries 256..=511
 /// belong to the shared kernel half installed by `new_user_pml4`'s
 /// full-copy of the kernel PML4 and MUST stay live for other
 /// processes). For each present user-half entry: descend into the
 /// PDPT, then PD, then PT, freeing each intermediate page-table
-/// frame on the way back up. Leaf PT entries are NOT followed —
-/// data-page frames must already have been released by
-/// `AddressSpace::unmap_region_pages` for every materialised
-/// region; this routine only reclaims the page-table pages
-/// themselves.
+/// frame on the way back up. Leaf PT entries are reported to `visit_leaf` but
+/// their mapped data frames are never dereferenced or freed here.
 ///
 /// Intel SDM Vol. 3 §4.5 paging-structure layout: each table is
 /// 4 KiB / 512 entries. Bit 0 = present, bit 7 = HUGE_PAGE on
@@ -1765,14 +1883,18 @@ unsafe fn unmap_4kb_locked(
 /// - The PML4 must have been allocated via `new_user_pml4` (so
 ///   PML4[1] was cleared) — calling this on the kernel PML4
 ///   would free the kernel's own page-table pages.
-/// - All data-page leaves must already have been released. The
-///   `AddressSpace::Drop` path arranges this by calling
-///   `unmap_region_pages` for every region before invoking us.
+/// - Every 4 KiB data-page backing frame must remain live through its callback.
+///   The callback must retire any external ownership before the caller releases
+///   that backing. Huge-page leaves are skipped and must already be retired.
 /// - Private top-level entries are detached under the root shard; the inactive
-///   subtrees are walked and batch-returned after that shard is released.
+///   subtrees are walked, visited, and batch-returned after that shard is
+///   released. `visit_leaf` therefore runs without a page-table lock held.
 /// - No CPU may be using `pml4_phys` as its active CR3 at the
 ///   time of the call.
-pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
+pub(crate) unsafe fn free_user_pml4_tree_with_4kb_leaves(
+    pml4_phys: PhysAddr,
+    mut visit_leaf: impl FnMut(PhysAddr, VirtAddr),
+) {
     use crate::frame::{free_unique_frame_batch, PhysFrame};
     const FREE_BATCH_FRAMES: usize = 64;
 
@@ -1867,7 +1989,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
             if !crate::frame::__pagetable_is_registered(pdpt_pa.raw()) {
                 continue;
             }
-            detached_pdpts.push(pdpt_pa);
+            detached_pdpts.push((slot, pdpt_pa));
             pml4.entries[slot] = PageTableEntry::EMPTY;
         }
     }
@@ -1882,7 +2004,7 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
     // bounded batches so a large sparse process neither monopolises the shard
     // nor builds an unbounded temporary vector during exit.
     let mut reclaimed = Vec::with_capacity(FREE_BATCH_FRAMES);
-    for pdpt_pa in detached_pdpts {
+    for (pml4_idx, pdpt_pa) in detached_pdpts {
         // SAFETY: identity-reachable; PDPT is a page-table frame.
         let pdpt = unsafe { &mut *pdpt_pa.kernel_mut_ptr::<PageTable>() };
         for pdpt_idx in 0..512usize {
@@ -1907,15 +2029,31 @@ pub unsafe fn free_user_pml4_tree(pml4_phys: PhysAddr) {
                 if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
                     continue;
                 }
-                // PT — leaf-level table; data frames already freed
-                // by AddressSpace::unmap_region_pages. Reclaim the table
-                // page itself (always AS-private under a registered PD,
-                // but guard for symmetry / defence in depth).
-                if !crate::frame::__pagetable_is_registered(pde.addr().raw()) {
+                let pt_pa = pde.addr();
+                // PT — visit present 4 KiB leaves while their backing remains
+                // live, then reclaim the table itself. It is always AS-private
+                // under a registered PD, but retain the registry guard for
+                // symmetry / defence in depth.
+                if !crate::frame::__pagetable_is_registered(pt_pa.raw()) {
                     continue;
                 }
-                crate::frame::__pagetable_unregister(pde.addr().raw());
-                queue_reclaimed(&mut reclaimed, pde.addr());
+                // SAFETY: verified registered PT in a detached, inactive tree.
+                let pt = unsafe { &*pt_pa.kernel_ptr::<PageTable>() };
+                for pt_idx in 0..512usize {
+                    let pte = pt.entries[pt_idx];
+                    if !pte.is_present() {
+                        continue;
+                    }
+                    let va = VirtAddr::new(
+                        ((pml4_idx as u64) << 39)
+                            | ((pdpt_idx as u64) << 30)
+                            | ((pd_idx as u64) << 21)
+                            | ((pt_idx as u64) << 12),
+                    );
+                    visit_leaf(pte.addr(), va);
+                }
+                crate::frame::__pagetable_unregister(pt_pa.raw());
+                queue_reclaimed(&mut reclaimed, pt_pa);
             }
             crate::frame::__pagetable_unregister(pd_pa.raw());
             queue_reclaimed(&mut reclaimed, pd_pa);
