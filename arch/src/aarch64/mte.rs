@@ -207,14 +207,6 @@ pub unsafe fn irg(ptr: *mut u8) -> *mut u8 {
     out
 }
 
-/// STG — Store Allocation Tag (ARM DDI0487 C6.2.STG).
-///
-/// Writes the logical tag carried in bits 59:56 of `ptr` to the
-/// 16-byte allocation-tag granule containing `ptr`.
-///
-/// # Safety
-/// `ptr` must point into writable memory backed by tag storage
-/// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
 /// `SCTLR_EL1.TCF` — Tag Check Fault mode for EL1, bits [41:40].
 pub const TCF_SHIFT: u32 = 40;
 /// Mask of the `SCTLR_EL1.TCF` field.
@@ -295,6 +287,14 @@ pub const fn tag_of(ptr: u64) -> u8 {
 /// user space's untagged 0, and therefore a value no arena may be assigned.
 pub const UNTAGGED_KERNEL_TAG: u8 = 0xF;
 
+/// STG — Store Allocation Tag (ARM DDI0487 C6.2.STG).
+///
+/// Writes the logical tag carried in bits 59:56 of `ptr` to the
+/// 16-byte allocation-tag granule containing `ptr`.
+///
+/// # Safety
+/// `ptr` must point into writable memory backed by tag storage
+/// (kernel mappings on QEMU `-machine virt,mte=on` qualify). The
 /// CPU must report `supported()`.
 #[inline]
 pub unsafe fn stg(ptr: *mut u8) {

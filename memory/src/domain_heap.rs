@@ -163,6 +163,8 @@ unsafe fn map_window(domain: u8, key: u8) -> bool {
     // Tagged Normal, RW at EL1, never executable. `ATTR_TAGGED` replaces
     // `ATTR_NORMAL` rather than joining it: AttrIndx is a 3-bit field.
     let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN | PtFlags::ATTR_TAGGED;
+    // SAFETY: `base` names an unmapped run inside the slot reserved at boot,
+    // and the caller holds the pool lock, so no other CPU is mapping here.
     if !unsafe { map_run(root, base, flags) } {
         return false;
     }
@@ -192,7 +194,8 @@ unsafe fn map_window(domain: u8, key: u8) -> bool {
         return false;
     };
     let flags = PtFlags::PRESENT | PtFlags::WRITABLE | PtFlags::NO_EXEC | PtFlags::pk(key);
-    // SAFETY: forwarded.
+    // SAFETY: same contract as the aarch64 arm -- an unmapped run inside the
+    // boot-reserved slot, with the pool lock held.
     unsafe { map_run(root, window_base(domain), flags) }
 }
 
@@ -334,21 +337,30 @@ pub fn alloc(layout: Layout, domain: DomainId) -> Option<*mut u8> {
             start += 1;
             continue;
         }
+        // Walked with an explicit index rather than `for i in start..`: the
+        // scan advances `start` past a blocked run, and mutating the bound of
+        // a `for` range does not shorten that loop -- it only reads as though
+        // it does.
         let mut ok = true;
-        for i in start..start + need {
+        let mut resume = start + 1;
+        let mut i = start;
+        while i < start + need {
             if bit(&pool.used, i) {
-                start = i + 1;
+                resume = i + 1;
                 ok = false;
                 break;
             }
+            i += 1;
         }
-        if ok {
-            for i in start..start + need {
-                set(&mut pool.used, i);
-            }
-            let va = window_base(d) + (start as u64) * BLOCK;
-            return Some(protected_ptr(va, key));
+        if !ok {
+            start = resume;
+            continue;
         }
+        for i in start..start + need {
+            set(&mut pool.used, i);
+        }
+        let va = window_base(d) + (start as u64) * BLOCK;
+        return Some(protected_ptr(va, key));
     }
     None
 }

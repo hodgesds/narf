@@ -1296,13 +1296,13 @@ impl KernelTask {
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
         let perf_task = crate::current_task_id().raw();
         user_perf_switch(perf_task, true);
-        // SAFETY: Valid memory or trusted environment
         // The reported domain follows the task, the way the hardware
         // enforcement state already does inside `ctx`. Restored before the
         // switch and re-captured after, so a task preempted inside a scope
         // does not leave `current_domain()` answering with its domain for
         // whoever runs next.
         narf_arch::set_current_domain_byte(self.domain_byte);
+        // SAFETY: Valid memory or trusted environment
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
@@ -1402,13 +1402,13 @@ impl KernelTask {
         guard_switch_into("poll_to_yield:self.ctx", &self.ctx);
         let perf_task = crate::current_task_id().raw();
         user_perf_switch(perf_task, true);
-        // SAFETY: both contexts and the task-owned stack remain live.
         // The reported domain follows the task, the way the hardware
         // enforcement state already does inside `ctx`. Restored before the
         // switch and re-captured after, so a task preempted inside a scope
         // does not leave `current_domain()` answering with its domain for
         // whoever runs next.
         narf_arch::set_current_domain_byte(self.domain_byte);
+        // SAFETY: both contexts and the task-owned stack remain live.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
