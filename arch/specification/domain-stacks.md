@@ -162,3 +162,53 @@ Per-domain stacks therefore remain unbuilt and, for the module case,
 unnecessary. Whether BPF stale frames are worth anything at all is the
 open question, and it is a threat-model question rather than a
 measurement one.
+
+## Scrub-on-exit: implemented, and reverted
+
+Built, and backed out. It works on aarch64 and faults on x86, and the
+reasons are worth recording because most of them are traps rather than
+bugs.
+
+`smoke_module_scope_scrubs_dead_stack_on_exit` passed on aarch64 — the
+planted pattern in dead stack was gone after a scope closed. The same code
+on x86 took a `#PF` with `rip = 0x0`: control transferred to null, meaning
+a live return address had been zeroed. A scrub that corrupts the stack is
+strictly worse than the leak it closes, so the implementation is out and
+only the supporting pieces are kept.
+
+### What to check before the next attempt
+
+**`&0u8 as *const u8` is not a stack address.** Rust const-promotes the
+literal to a `'static`, so it yields `.rodata` in the kernel image. Three
+rounds of this work computed a scrub extent from that address and drew
+conclusions from comparing it against real stack bounds — first "the
+aarch64 scheduler reports the wrong stack", then "async locals live on the
+heap", both wrong. The giveaway was the address being byte-identical
+across two rewrites that should have moved it. Read `RSP`/`SP` with `asm!`
+and nothing else.
+
+**A containment check is load-bearing, not defensive.** Requiring the live
+SP to lie inside the stack `current_stack_range()` reports is what turned
+the `.rodata` extent into a decline instead of an 8 KiB write into the
+kernel image. Any future version needs it from the first commit.
+
+**x86 is the harder target and the failure is not yet understood.** The
+fault shows the scrub reaching memory that was live. Candidates not ruled
+out: the red zone (data below `RSP` is live if the target does not build
+with `-mno-red-zone`), and the scrub running at a shallower `RSP` than the
+frames it is trying to erase, so that "below SP" at scrub time still
+contains a caller's frame. Establish which before writing any of it again.
+
+**The measurement still stands.** Module scopes run twice per module
+lifetime, so a scrub there is affordable; BPF scopes wrap every program
+run, where it is not. That conclusion did not depend on the
+implementation.
+
+### Kept from the attempt
+
+  * `scheduler::stackful::current_stack_range()` — the current task's stack
+    bounds, needed by anything writing into the dead part of a stack.
+  * `scheduler::stackful::run_on_stackful_task()` — drives a future to
+    completion on a real `KernelTask`. `block_on` polls inline on the
+    caller's stack, where there is no task stack at all; a test that needs
+    one and reaches for `block_on` silently tests nothing.

@@ -340,6 +340,62 @@ fn user_perf_switch(task: u64, running: bool) {
     }
 }
 
+/// Drive `fut` to completion on a dedicated stackful task.
+///
+/// The distinction that matters: `block_on` polls a future *inline on the
+/// caller's stack*, so no `kernel_switch` happens and
+/// [`current_stack_range`] answers `None`. Anything testing or relying on
+/// per-task stack state needs a real task, and building one means touching
+/// `KernelTask::new`, a `KernelContext` and a waker — arch-specific pieces
+/// that do not belong in every caller.
+///
+/// Polls until `Ready`, bounded: a future that parks forever would otherwise
+/// spin here, and this deliberately provides no wakeups.
+///
+/// # Panics
+/// Never. Returns early if the future has not completed within the bound.
+pub fn run_on_stackful_task<F>(fut: F) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    const MAX_POLLS: usize = 64;
+    let mut task = KernelTask::new(fut);
+    let mut exec_ctx = KernelContext::default();
+    let waker = KernelTask::no_op_waker();
+    for _ in 0..MAX_POLLS {
+        // SAFETY: the task and context are owned here and polled by no one
+        // else for the duration of this call.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } == Poll::Ready(()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The current stackful task's kernel stack as `(bottom, top)`, or `None`
+/// when this CPU is not running one (the executor's own stack, or before the
+/// first switch-in).
+///
+/// Exists so a caller that wants to write into the *dead* part of the stack —
+/// below the live `SP` — can clamp to the real bottom instead of guessing. The
+/// page under the bottom is not mapped, so an unclamped walk downwards faults
+/// rather than being merely wrong.
+#[must_use]
+pub fn current_stack_range() -> Option<(usize, usize)> {
+    let cpu = this_cpu();
+    let p = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: in-flight task on this CPU; `stack` is owned by the task and
+    // outlives the borrow, which does not escape.
+    unsafe {
+        let stack: &[u8] = &(*p).stack;
+        let base = stack.as_ptr() as usize;
+        Some((base, base + stack.len()))
+    }
+}
+
 /// Publish the CURRENT stackful task's user FP/SIMD save area. Called by the
 /// userspace `UserTaskFuture::poll` on first entry; stored per-task so a
 /// kernel_switch resume + a task exit never read a stale/freed area.
@@ -5908,7 +5964,7 @@ pub mod tests {
             fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
                 if !self.polled {
                     self.polled = true;
-                    // Enter and yield without leaving — the situation an
+                    // Enter and yield without leaving -- the situation an
                     // involuntary preemption creates.
                     narf_arch::enter_domain_scope(SCOPED);
                     return Poll::Pending;
@@ -5919,21 +5975,45 @@ pub mod tests {
             }
         }
 
+        // Driven through `KernelTask` + `poll_to_yield`, the way the
+        // neighbouring domain-state test is, because that is the only path
+        // that performs a real `kernel_switch`.
+        //
+        // An earlier version used `block_on`, which polls the future inline on
+        // the caller's stack. No switch happened, so the byte was preserved
+        // trivially and the test passed whether or not the fix was present --
+        // it asserted nothing about the thing it named.
         let before = narf_arch::current_domain_byte();
-        crate::block_on(YieldInScope { polled: false });
-        let after = narf_arch::current_domain_byte();
+        AFTER_YIELD.store(0xFF, Ordering::Release);
+        let mut task = KernelTask::new(YieldInScope { polled: false });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+
+        // SAFETY: single test-owned task/context, no concurrent poll.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Pending {
+            return TestResult::Fail("task did not yield");
+        }
+        // The executor must not have inherited the task's domain.
+        let executor_after_yield = narf_arch::current_domain_byte();
+
+        // SAFETY: same live task/context as the first round-trip.
+        if unsafe { task.poll_to_yield(&mut exec_ctx, &waker) } != Poll::Ready(()) {
+            return TestResult::Fail("task did not complete after resume");
+        }
         let observed = AFTER_YIELD.load(Ordering::Acquire);
 
         if before != DomainId::FRAME.raw() {
             return TestResult::Fail("test did not start in FRAME");
         }
-        // Resuming with the domain it yielded holding is the half that makes
-        // the scope survive a yield at all.
+        if executor_after_yield != DomainId::FRAME.raw() {
+            return TestResult::Fail("the executor inherited the task's domain across the yield");
+        }
+        // Resuming with the domain it yielded holding is what makes a scope
+        // survive a yield at all.
         if observed != SCOPED {
             return TestResult::Fail("a task did not resume with the domain it yielded holding");
         }
-        // And not leaking it back to the caller is the half that fixes the bug.
-        if after != DomainId::FRAME.raw() {
+        if narf_arch::current_domain_byte() != DomainId::FRAME.raw() {
             return TestResult::Fail("the scoped domain leaked out of the task");
         }
         TestResult::Pass
