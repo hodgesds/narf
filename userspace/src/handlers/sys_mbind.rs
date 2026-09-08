@@ -158,6 +158,10 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         }
     }
     {
+        // Publish possibility before the table mutation. Readers may take the
+        // slow path before this binding is visible, but cannot skip it after
+        // mbind completes. The flag is intentionally never cleared.
+        CUSTOM_MEMPOLICY_POSSIBLE.store(true, core::sync::atomic::Ordering::Release);
         let mut g = MBIND_TABLE.lock();
         let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
         let ranges = map.entry(task).or_default();

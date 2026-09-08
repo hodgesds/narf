@@ -95,7 +95,12 @@ architecture state required by an involuntary switch. The state remains
 executor-private and is intentionally absent from the policy interface.
 The per-task NUMA mask is the task-identity seam for cgroup-v2
 `cpuset.mems`; the page-fault policy resolver treats it as a hard
-allocation boundary and removes it when the task exits or detaches.
+allocation boundary and removes it when the task exits or detaches. Before the
+first restrictive mask is published, a monotonic acquire/release gate proves
+that every lookup returns the unconstrained mask without entering a task-map
+shard. The publisher raises that gate before table insertion, so a racing
+reader may conservatively take the slow path but cannot miss a completed
+restriction; the gate is never cleared.
 The memory-controller charge provider resolves the executor-private `TaskId`
 through `install_memory_pid_resolver` before charging: cgroup membership is
 keyed by the outer userspace ProcessId, never by a numerically coincident task

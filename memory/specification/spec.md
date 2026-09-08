@@ -319,8 +319,8 @@ impl RegionPerms {
     pub const LOCK_EXEMPT: RegionPerms;
     /// Provenance for growable user-stack fragments.
     pub const STACK_SEGMENT: RegionPerms;
-    /// Provenance for ordinary private anonymous non-fixed mappings eligible
-    /// for exact-adjacent metadata coalescing.
+    /// Provenance for ordinary private anonymous mappings eligible for
+    /// exact-adjacent metadata coalescing.
     pub const ANON_MERGEABLE: RegionPerms;
     pub const COW: RegionPerms;
 }
@@ -476,10 +476,24 @@ impl AddressSpace {
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
-    /// Publish an ordinary private anonymous non-fixed VMA and best-effort
+    /// Publish an ordinary private anonymous VMA and best-effort
     /// coalesce exact-adjacent compatible anonymous VMAs. COW is retained but
     /// ignored for compatibility because its authority is per backing page.
     pub fn map_private_anonymous_region_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Transaction-held MAP_FIXED_NOREPLACE private-anonymous counterpart.
+    /// Exact-address overlap is decided non-destructively while the caller
+    /// holds the VMA transaction; no mapping receipt escapes coalescing.
+    pub unsafe fn map_private_anonymous_region_locked_limited(
+        &self, region: Region, explicit_lock: bool,
+        limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError>;
+    /// Transaction-held destructive MAP_FIXED private-anonymous counterpart.
+    /// Admission precedes target retirement; no mapping receipt escapes
+    /// coalescing.
+    pub unsafe fn replace_private_anonymous_region_locked_limited(
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
@@ -803,7 +817,12 @@ x86_64 is rejected at runtime.
   cache-line isolated. Order-0 allocation/free is fronted by a bounded,
   cache-line-aligned per-CPU/per-node cache; refill and spill batch eight pages
   under one zone-lock acquisition, while cached pages remain included in
-  free-page and order-0 statistics. Batched final-owner return uses fixed
+  free-page and order-0 statistics. Each successful ownership handoff updates
+  one per-node atomic free-page total after removing a frame from the free pool
+  or after publishing it back; watermark and aggregate-free checks read those
+  counters without walking or locking all buddy zones. Cache refill, spill,
+  and drain merely move already-free frames and therefore do not change the
+  total. Batched final-owner return uses fixed
   64-frame stack chunks and holds the cache lock through buddy publication of
   any displaced entries, so freeing never allocates after owner count zero and
   cache drains cannot observe a frame in neither location. A base-page refill
@@ -877,13 +896,19 @@ x86_64 is rejected at runtime.
   NUMA-cache/buddy transactions that retain the cache lock until displaced
   cached frames are visible in the zone; alternative allocators use the
   scalar default.
-- Ordinary private anonymous non-fixed mmap regions carry explicit provenance
-  and may coalesce only when exact-adjacent and otherwise permission-identical.
-  File, shared, fixed, heap, stack, guard, and special mappings never carry
-  that provenance. A region-wide COW marker is ignored only for compatibility
-  and ORed into the result; virtual addresses, PTEs, backing order, per-page
-  COW refcounts, and lock accounting are unchanged. If backing-vector growth
-  cannot be reserved, publication remains successful as a separate VMA.
+- Ordinary private anonymous mmap regions, including MAP_FIXED replacements,
+  carry explicit provenance and may coalesce only when exact-adjacent and
+  otherwise permission-identical. File, shared, heap, stack, guard, and
+  special mappings never carry that provenance. A region-wide COW marker is
+  ignored only for compatibility and ORed into the result; virtual addresses,
+  PTEs, backing order, per-page COW refcounts, and lock accounting are
+  unchanged. Fixed replacement completes external-owner retirement in the
+  same transaction and exposes no receipt invalidated by coalescing. If
+  backing-vector growth cannot be reserved, publication remains successful as
+  a separate VMA. MAP_FIXED_NOREPLACE publishes at the exact address through
+  a non-destructive map operation while that same VMA transaction is held;
+  an unlocked fast rejection is advisory only, so a racing CLONE_VM insertion
+  returns overlap without punching its mapping or retiring external owners.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
@@ -907,8 +932,11 @@ x86_64 is rejected at runtime.
 - Base-page regions live in an arena-backed AVL tree keyed by virtual base.
   Tree links are stable arena indices, removed slots form a non-allocating
   intrusive free list, and `try_reserve_nodes(n)` makes the following `n`
-  distinct-key publications allocation-free. The key and `Region.base` remain
-  equal after every insertion, removal, split, stack growth, and relocation.
+  distinct-key publications allocation-free. Fallible reserve keeps ordinary
+  `Vec` amortized spare capacity, avoiding an arena copy at every new VMA
+  high-water mark while preserving the pre-mutation reservation guarantee.
+  The key and `Region.base` remain equal after every insertion, removal, split,
+  stack growth, and relocation.
   Because regions never overlap, admission, point lookup, random insertion,
   and empty MAP_FIXED punches are O(log VMA) and inspect only the
   predecessor/successor or intersecting tree range; ordered iteration remains
@@ -950,6 +978,27 @@ x86_64 is rejected at runtime.
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
+- Reverse maps use a 64-way sharded, open-addressed physical-frame index with
+  a mixed page-number hash and a maximum 75% occupied-plus-tombstone load.
+  Growth rehashes in amortized chunks; deletion beyond the reuse bound leaves
+  a tombstone, and missing-key lookup stops only at a never-occupied slot, so
+  colliding live owners cannot become false negatives. Each entry stores its
+  first `(root, virtual address)` owner inline; a second owner promotes the
+  entry to vector storage. Failure-atomic alias publication promotes and
+  fallibly reserves every promised vector slot before changing a PTE; ordinary
+  racing additions reserve beyond those slots, and rollback or final-owner
+  removal retains an empty entry while reservations remain outstanding. Each
+  shard may also retain at most 1024 empty physical keys as allocation-free
+  reuse shells; owner lookup, tracked-frame iteration, migration, swap, and
+  reuse auditing treat only non-empty owner states as mapped authority.
+- The x86 user not-present demand-fault installer publishes a fresh leaf
+  without `INVLPG`, matching Linux's not-present-to-present rule. No stale
+  present translation can exist because every older-leaf retirement still
+  invalidates before frame reuse. If a CPU retains a negative walk-cache
+  result, its one retry reaches the existing backed-page repair branch, which
+  verifies the leaf in memory and executes local `INVLPG`; general kernel,
+  remap, permission, teardown, and AArch64 paths retain their prior barriers
+  and invalidation behavior.
 - Final-owner address-space teardown relies on the scheduler active-mm's strong
   `Arc` ownership: reaching `Drop` proves no CPU can still execute or repopulate
   the root. x86_64's different-root/restore switch has already flushed the
@@ -962,7 +1011,13 @@ x86_64 is rejected at runtime.
   before that backing can be reused. `PROT_NONE` and NUMA-hint pages are the
   stable states that intentionally retain an rmap owner without a present leaf,
   and teardown removes those owners explicitly. Lazy absent fork leaves were
-  never registered and incur no rmap lookup. The reclaimer preallocates
+  never registered and incur no rmap lookup. Private regions acquire the
+  region-wide `COW` provenance bit before fork retains or publishes a second
+  backing owner; after translation and rmap retirement, teardown may therefore
+  return a non-`SHARED`, non-`COW` region's backing through the unique-owner
+  batch path without consulting the COW registry. `COW` regions retain the
+  refcounted final-owner path even when all of their pages have since split.
+  The reclaimer preallocates
   top-level detachment storage, clears every private root descriptor under one
   short root-shard transaction, and releases that shard before callbacks,
   intermediate-table traversal, or frame-allocation work. The global
