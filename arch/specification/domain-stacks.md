@@ -104,4 +104,61 @@ scrubbing the used extent of the stack on scope exit — no SP switch, no
 guard page, no overflow stack, and a cost proportional to how much stack
 the module actually touched.
 
-Recommended: measure scrub-on-exit before committing to per-domain stacks.
+## Scrub-on-exit: measured
+
+`smoke_measure_stack_scrub_cost` times `write_bytes` over the sizes a scrub
+would cover, median of 65 runs after a warm pass.
+
+| bytes | aarch64 ticks | x86_64 cycles |
+|---|---|---|
+| 512 | 184 | 216 |
+| 1024 | 276 | 798 |
+| 2048 | 469 | 930 |
+| 4096 | 850 | 1184 |
+| 8192 | 1751 | 2912 |
+| 16384 | 3141 | 5910 |
+| 32768 | 6164 | 12418 |
+
+aarch64's `CNTFRQ_EL0` reads 1 GHz, so those ticks are nanoseconds: a full
+32 KiB stack costs about **6 µs**. The x86 column is raw TSC with no
+frequency anchor.
+
+**Read these as shape, not as hardware.** Both runs are QEMU TCG, which
+emulates rather than executes, and a `memset` under TCG has no particular
+relationship to one on silicon. What survives the caveat is that cost is
+roughly linear in bytes with no cliff, which is the only property the
+decision below depends on.
+
+## The decision, split by site
+
+The question "is scrub-on-exit cheap enough" has two answers, because the
+two scope sites differ by orders of magnitude in how often they run.
+
+**Module scopes: yes, comfortably.** `modules::domain::enter` is called
+from exactly two places, both in `loader.rs` — around a module's `init()`
+and its `exit()`. That is twice per module *lifetime*. Even scrubbing an
+entire 32 KiB stack at both ends adds ~12 µs to a module load, against
+work that already includes ELF parsing, relocation, mapping and sealing.
+It does not need depth tracking either: scrubbing everything *below* the
+current `SP` is safe, since that memory is dead by definition, and it is
+exactly where the stale frames are.
+
+**BPF scopes: no.** `bpf::domain::enter` wraps every program run, four
+sites in `prog.rs`. A scrub of even 4 KiB is ~850 ns on the aarch64
+figures — the same order as a whole program invocation. That is not a
+tax on the hot path, it *is* the hot path.
+
+So the recommendation is asymmetric, which the original framing did not
+anticipate:
+
+  * Adopt scrub-on-exit for **module** domain scopes. Cheap, needs no SP
+    switch, no guard page, no overflow stack, and no change to exception
+    entry or unwinding.
+  * Do **not** scrub on BPF scope exit. If stale BPF frames matter, the
+    options are per-domain stacks or nothing — and per-domain stacks cost
+    a stack switch per program run, which is its own hot-path problem.
+
+Per-domain stacks therefore remain unbuilt and, for the module case,
+unnecessary. Whether BPF stale frames are worth anything at all is the
+open question, and it is a threat-model question rather than a
+measurement one.

@@ -1443,3 +1443,77 @@ kernel_test_in!(
     "modules/domain",
     smoke_domain_scope_tracks_the_current_domain
 );
+
+/// Measurement for `domain-stacks.md`: what scrubbing the kernel stack on
+/// domain-scope exit would cost.
+///
+/// Reports cycles for `write_bytes` over the sizes a scrub would plausibly
+/// cover, up to `DEFAULT_KERNEL_STACK_BYTES` (32 KiB) for the worst case of
+/// scrubbing a whole task stack. Median of 65 runs after a warm pass, because
+/// the first touch of a fresh buffer pays for faults and cache misses that a
+/// real scrub of a live stack would not.
+///
+/// Prints rather than asserts. The question it answers is a design one — is
+/// scrub-on-exit cheap enough to prefer over per-domain stacks — and a
+/// threshold baked in here would be a guess hardened into a test.
+fn smoke_measure_stack_scrub_cost() -> TestResult {
+    use alloc::vec;
+    use core::fmt::Write as _;
+
+    #[inline(always)]
+    fn cycles() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            narf_arch::x86_64::tsc::rdtsc()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            narf_arch::aarch64::timer::read_cntpct()
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            0
+        }
+    }
+
+    const RUNS: usize = 65;
+    let mut buf = vec![0u8; 32 * 1024];
+
+    let _ = writeln!(
+        narf_console::Writer,
+        "  scrub-cost: size_bytes median_cycles (median of {RUNS} runs)"
+    );
+
+    for size in [512usize, 1024, 2048, 4096, 8192, 16384, 32768] {
+        // Warm: first touch pays faults and misses a live stack would not.
+        // SAFETY: `buf` is at least `size` bytes.
+        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, size) };
+
+        let mut samples = [0u64; RUNS];
+        for s in samples.iter_mut() {
+            let t0 = cycles();
+            // SAFETY: as above; volatile-free on purpose — this is the same
+            // call a real scrub would make.
+            unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0xA5, size) };
+            let t1 = cycles();
+            *s = t1.wrapping_sub(t0);
+        }
+        samples.sort_unstable();
+        let median = samples[RUNS / 2];
+        // Keep the compiler from eliding the writes.
+        core::hint::black_box(&buf);
+        let _ = writeln!(narf_console::Writer, "  scrub-cost: {size} {median}");
+    }
+
+    // Anchor the cycle counter so the numbers above can be read as time. On
+    // aarch64 CNTPCT ticks at CNTFRQ_EL0; on x86 the TSC's rate is reported
+    // separately, and QEMU's TCG makes both approximate anyway.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: CNTFRQ_EL0 is always readable.
+        let hz = unsafe { narf_arch::aarch64::cpuid::generic_timer_hz() };
+        let _ = writeln!(narf_console::Writer, "  scrub-cost: counter_hz {hz}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/domain", smoke_measure_stack_scrub_cost);
