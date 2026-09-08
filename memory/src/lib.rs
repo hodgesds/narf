@@ -31,6 +31,7 @@ pub mod compress;
 pub mod compressed_ramdisk;
 pub mod context;
 pub mod diag;
+pub mod domain_heap;
 pub mod domain_state;
 pub mod frame;
 pub mod heap;

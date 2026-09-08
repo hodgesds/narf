@@ -1443,3 +1443,191 @@ kernel_test_in!(
     "modules/domain",
     smoke_domain_scope_tracks_the_current_domain
 );
+
+/// Measurement for `domain-stacks.md`: what scrubbing the kernel stack on
+/// domain-scope exit would cost.
+///
+/// Reports cycles for `write_bytes` over the sizes a scrub would plausibly
+/// cover, up to `DEFAULT_KERNEL_STACK_BYTES` (32 KiB) for the worst case of
+/// scrubbing a whole task stack. Median of 65 runs after a warm pass, because
+/// the first touch of a fresh buffer pays for faults and cache misses that a
+/// real scrub of a live stack would not.
+///
+/// Prints rather than asserts. The question it answers is a design one — is
+/// scrub-on-exit cheap enough to prefer over per-domain stacks — and a
+/// threshold baked in here would be a guess hardened into a test.
+fn smoke_measure_stack_scrub_cost() -> TestResult {
+    use alloc::vec;
+    use core::fmt::Write as _;
+
+    #[inline(always)]
+    fn cycles() -> u64 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            narf_arch::x86_64::tsc::rdtsc()
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            narf_arch::aarch64::timer::read_cntpct()
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            0
+        }
+    }
+
+    const RUNS: usize = 65;
+    let mut buf = vec![0u8; 32 * 1024];
+
+    let _ = writeln!(
+        narf_console::Writer,
+        "  scrub-cost: size_bytes median_cycles (median of {RUNS} runs)"
+    );
+
+    for size in [512usize, 1024, 2048, 4096, 8192, 16384, 32768] {
+        // Warm: first touch pays faults and misses a live stack would not.
+        // SAFETY: `buf` is at least `size` bytes.
+        unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0, size) };
+
+        let mut samples = [0u64; RUNS];
+        for s in samples.iter_mut() {
+            let t0 = cycles();
+            // SAFETY: as above; volatile-free on purpose — this is the same
+            // call a real scrub would make.
+            unsafe { core::ptr::write_bytes(buf.as_mut_ptr(), 0xA5, size) };
+            let t1 = cycles();
+            *s = t1.wrapping_sub(t0);
+        }
+        samples.sort_unstable();
+        let median = samples[RUNS / 2];
+        // Keep the compiler from eliding the writes.
+        core::hint::black_box(&buf);
+        let _ = writeln!(narf_console::Writer, "  scrub-cost: {size} {median}");
+    }
+
+    // Anchor the cycle counter so the numbers above can be read as time. On
+    // aarch64 CNTPCT ticks at CNTFRQ_EL0; on x86 the TSC's rate is reported
+    // separately, and QEMU's TCG makes both approximate anyway.
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: CNTFRQ_EL0 is always readable.
+        let hz = unsafe { narf_arch::aarch64::cpuid::generic_timer_hz() };
+        let _ = writeln!(narf_console::Writer, "  scrub-cost: counter_hz {hz}");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("modules/domain", smoke_measure_stack_scrub_cost);
+
+/// A module domain scope erases the dead stack beneath it on exit.
+///
+/// Plants a pattern *below* the live SP — memory a deeper call would have
+/// used — runs a scope, and requires every byte to be gone. That is the leak
+/// being closed: frames left by one domain and readable by whatever runs on
+/// the stack next.
+fn smoke_module_scope_scrubs_dead_stack_on_exit() -> TestResult {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use narf_lib::id::DomainId;
+
+    const PATTERN: u8 = 0x5A;
+    // Deep enough to sit inside the erased extent, shallow enough to stay
+    // clear of what the scope itself uses on the way down.
+    const PROBE_DEPTH: usize = 2048;
+    const PROBE_LEN: usize = 256;
+    /// 0 pass, 1 could not plant, 2 pattern survived, 3 no stackful stack,
+    /// 4 stack too shallow, 5 SP outside the reported stack.
+    static VERDICT: AtomicU8 = AtomicU8::new(0xFF);
+
+    /// Reads SP directly.
+    ///
+    /// `&0u8 as *const u8` looks like a stack address and is not: Rust
+    /// const-promotes the literal to a `'static`, yielding `.rodata` in the
+    /// kernel image. Two rounds of this test compared that against the task's
+    /// stack bounds and read the mismatch as the scheduler disagreeing with
+    /// itself. The giveaway was the address being byte-identical across
+    /// rewrites that should have moved it.
+    #[inline(never)]
+    fn probe_scrub() -> u8 {
+        let here: usize;
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: reading RSP into a register clobbers nothing.
+        unsafe {
+            core::arch::asm!("mov {}, rsp", out(reg) here, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: reading SP into a register clobbers nothing.
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) here, options(nomem, nostack, preserves_flags));
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            return 3;
+        }
+
+        let Some((bottom, top)) = narf_scheduler::stackful::current_stack_range() else {
+            return 3;
+        };
+        if here <= bottom || here > top {
+            return 5;
+        }
+        if here <= bottom + PROBE_DEPTH + PROBE_LEN {
+            return 4;
+        }
+        let probe = here - PROBE_DEPTH;
+
+        // Plant with interrupts masked, for the same reason the scrub masks
+        // them: a CPL0 interrupt pushes into this exact region.
+        let irqs = narf_arch::interrupts_enabled();
+        if irqs {
+            // SAFETY: re-enabled immediately after the plant.
+            unsafe { narf_arch::disable_interrupts() };
+        }
+        // SAFETY: inside this task's stack, strictly below the live SP.
+        unsafe { core::ptr::write_bytes(probe as *mut u8, PATTERN, PROBE_LEN) };
+        // SAFETY: same region, just written.
+        let planted = unsafe { core::ptr::read_volatile(probe as *const u8) };
+        if irqs {
+            // SAFETY: restoring the observed state.
+            unsafe { narf_arch::enable_interrupts() };
+        }
+        if planted != PATTERN {
+            return 1;
+        }
+
+        let scope = crate::domain::enter(DomainId::SCRATCH);
+        crate::domain::exit(scope);
+
+        let mut survived = 0usize;
+        for i in 0..PROBE_LEN {
+            // SAFETY: inside this task's stack, below the live SP.
+            if unsafe { core::ptr::read_volatile((probe + i) as *const u8) } == PATTERN {
+                survived += 1;
+            }
+        }
+        u8::from(survived != 0) * 2
+    }
+
+    // A real `KernelTask`: `block_on` polls inline on the caller's stack,
+    // where `current_stack_range()` is `None` and the scrub declines, so a
+    // test reaching for it would prove nothing.
+    VERDICT.store(0xFF, Ordering::Release);
+    let ran = narf_scheduler::stackful::run_on_stackful_task(async {
+        VERDICT.store(probe_scrub(), Ordering::Release);
+    });
+    if !ran {
+        return TestResult::Fail("the scrub task did not run to completion");
+    }
+
+    match VERDICT.load(Ordering::Acquire) {
+        0 => TestResult::Pass,
+        1 => TestResult::Fail("could not plant a pattern in the dead stack"),
+        2 => TestResult::Fail("the dead stack still held the planted pattern after exit"),
+        3 => TestResult::Fail("no stackful stack: current_stack_range() was None"),
+        4 => TestResult::Fail("too little dead stack below SP to probe"),
+        5 => TestResult::Fail("SP outside the reported task stack"),
+        _ => TestResult::Fail("the test body never ran"),
+    }
+}
+kernel_test_in!(
+    "modules/domain",
+    smoke_module_scope_scrubs_dead_stack_on_exit
+);

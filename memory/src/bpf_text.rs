@@ -344,6 +344,7 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
             BPF_TEXT_PML4_SLOT,
             BPF_ARENA_PML4_SLOT,
             crate::text_poke::POKE_PML4_SLOT,
+            crate::domain_heap::HEAP_L0_SLOT,
         ] {
             // SAFETY: `root` is the live kernel PML4, identity-reachable
             // (page tables live in low RAM), and we are single-threaded on the
@@ -365,6 +366,9 @@ pub fn reserve_kernel_slots() -> Result<(), TextError> {
             BPF_TEXT_PML4_SLOT,
             BPF_ARENA_PML4_SLOT,
             crate::text_poke::POKE_PML4_SLOT,
+            // The per-domain module heap. Same requirement as the others: a
+            // top-level entry present in every address space before first use.
+            crate::domain_heap::HEAP_L0_SLOT,
         ] {
             // SAFETY: same as x86_64 — live kernel root, single-threaded BSP.
             unsafe { reserve_slot_aarch64(root, slot)? };

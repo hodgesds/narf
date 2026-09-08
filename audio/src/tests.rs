@@ -20,15 +20,65 @@ fn smoke_audio_picker_no_backend_when_unprobed() -> TestResult {
     hda::__reset_for_test();
     bus_reset();
 
-    if select_active_playback().is_some() {
-        return TestResult::Fail("picker returned a stream with no controller");
-    }
+    // Put the world back on every path out.
+    //
+    // These three resets are global and outlive this test. Without a restore
+    // the audio backend stays unprobed for the whole boot, and any later test
+    // needing one skips -- `smoke_audio_format_unsupported_rate_rejects` did
+    // exactly that, intermittently, depending on whether it happened to run
+    // before or after this one. It read as a flaky audio test; it was this
+    // test's teardown.
+    let _restore = AudioProbeRestore;
 
+    let picked = select_active_playback().is_some();
     // AudioWriter::open should fail with NoActiveStream.
     let cap = bootstrap_writer();
-    match AudioWriter::open(cap, AudioFormat::default_playback()) {
+    let opened = AudioWriter::open(cap, AudioFormat::default_playback());
+
+    if picked {
+        return TestResult::Fail("picker returned a stream with no controller");
+    }
+    match opened {
         Err(AudioWriteError::NoActiveStream) => TestResult::Pass,
         _ => TestResult::Fail("AudioWriter::open should have failed with NoActiveStream"),
+    }
+}
+
+/// Re-register the audio PCI drivers and re-probe, undoing the global resets
+/// a test performed.
+///
+/// Best-effort by design: on a machine with no audio device there is nothing
+/// to restore, and failing here would turn "this platform has no sound card"
+/// into a test failure. What it must not do is leave the buses unregistered
+/// after a test cleared them.
+///
+/// Registers *every* audio driver, not just the one the calling test cared
+/// about. `driver_match::__reset_for_test` empties the whole table, so a test
+/// that clears it and re-registers only its own subject leaves the others
+/// missing for everything that runs afterwards.
+pub(crate) fn restore_audio_probe_state() {
+    use narf_bus::{bootstrap_registry_authority, probe_all_pci};
+    use narf_drivers_virtio::snd_pci;
+
+    crate::hda::register_pci_driver();
+    crate::acp6::register_pci_driver();
+    snd_pci::register_pci_driver();
+    let authority = bootstrap_registry_authority();
+    let _ = probe_all_pci(&authority);
+}
+
+/// Scope guard that restores audio probe state on the way out.
+///
+/// Declared immediately after a test's `__reset_for_test` calls, it covers
+/// every path out including early `return TestResult::Fail(..)` — which is
+/// what a manual call at the end of the happy path does not. These tests have
+/// several early returns each, and the state they clear is global and outlives
+/// the boot.
+pub(crate) struct AudioProbeRestore;
+
+impl Drop for AudioProbeRestore {
+    fn drop(&mut self) {
+        restore_audio_probe_state();
     }
 }
 kernel_test_in!("audio", smoke_audio_picker_no_backend_when_unprobed);
