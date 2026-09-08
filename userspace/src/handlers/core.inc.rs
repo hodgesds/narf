@@ -5337,6 +5337,12 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, u64, StoredPolicy)>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// Monotonic fault-path gate. False proves both policy tables have always been
+/// empty/default, letting ordinary anonymous faults avoid two IRQ-safe global
+/// lock acquisitions. Writers publish true before inserting policy state.
+static CUSTOM_MEMPOLICY_POSSIBLE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Linux keeps `il_prev`/`il_weight` in task state. NARF stores the equivalent
 /// monotonically increasing sequence position by task ID so CPU migration
 /// cannot restart or duplicate an interleave cycle.
@@ -5557,6 +5563,9 @@ fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
 /// Resolve the policy in force for `task` at user address `va`: a
 /// covering mbind range wins, else the task default, else DEFAULT.
 fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
+    if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
+        return StoredPolicy::DEFAULT;
+    }
     if let Some(ranges) = MBIND_TABLE.lock().as_ref().and_then(|m| m.get(&task)) {
         for &(start, len, pol) in ranges.iter() {
             if va >= start && va < start.saturating_add(len) {

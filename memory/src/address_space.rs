@@ -304,10 +304,11 @@ impl RegionPerms {
 
     /// Internal provenance marker for ordinary private anonymous `mmap`
     /// regions which may be coalesced with exact-adjacent compatible regions.
-    /// File, shared, fixed, heap, stack, and kernel-created mappings never set
-    /// this bit, so matching POSIX permissions alone cannot mix backing or
-    /// lifetime rules. The stale COW marker is ignored for merge compatibility
-    /// and preserved on the result: per-page refcounts remain authoritative.
+    /// File, shared, heap, stack, and kernel-created mappings never set this
+    /// bit; fixed mappings set it only for private anonymous backing. Matching
+    /// POSIX permissions alone therefore cannot mix backing or lifetime rules.
+    /// The stale COW marker is ignored for merge compatibility and preserved
+    /// on the result: per-page refcounts remain authoritative.
     pub const ANON_MERGEABLE: RegionPerms = RegionPerms(1 << 17);
 
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
@@ -959,6 +960,23 @@ impl RegionTable {
         for (_, entry) in self.by_base.range(lo, hi) {
             visit(&entry.region);
         }
+    }
+
+    /// Iterate only VMAs intersecting `[lo, hi)`, in virtual order.
+    ///
+    /// Range-scoped materialization uses this instead of walking
+    /// every VMA in the address space. The predecessor seek is necessary when
+    /// `lo` lands in the middle of a VMA; otherwise the ordered range begins at
+    /// the first VMA whose base is at or above `lo`.
+    fn overlapping(&self, lo: u64, hi: u64) -> impl Iterator<Item = &Region> {
+        let start = self
+            .by_base
+            .predecessor_or_equal(lo)
+            .filter(|(_, entry)| entry.region.base.as_u64().saturating_add(entry.region.len) > lo)
+            .map_or(lo, |(base, _)| base);
+        self.by_base
+            .range(start, hi)
+            .map(|(_, entry)| &entry.region)
     }
 
     /// Mutable counterpart of [`Self::for_each_overlapping`].
@@ -2217,8 +2235,22 @@ impl AddressSpace {
         Ok(receipt)
     }
 
-    /// Register an ordinary private anonymous non-fixed mapping and merge it
-    /// with exact-adjacent compatible anonymous VMAs when possible.
+    fn mark_private_anonymous_mergeable(region: &mut Region) -> Result<(), AddressSpaceError> {
+        let forbidden = RegionPerms::SHARED.0
+            | RegionPerms::FILE_DEMAND.0
+            | RegionPerms::BRK_HEAP.0
+            | RegionPerms::LOCK_EXEMPT.0
+            | RegionPerms::STACK_GUARD.0
+            | RegionPerms::STACK_SEGMENT.0;
+        if region.perms.0 & forbidden != 0 {
+            return Err(AddressSpaceError::NotImplemented);
+        }
+        region.perms = region.perms | RegionPerms::ANON_MERGEABLE;
+        Ok(())
+    }
+
+    /// Register an ordinary private anonymous mapping and merge it with
+    /// exact-adjacent compatible anonymous VMAs when possible.
     ///
     /// Coalescing is metadata-only: virtual addresses, PTEs, per-page backing,
     /// lock accounting, and COW refcounts do not change. A stale region-wide
@@ -2233,16 +2265,7 @@ impl AddressSpace {
         limit_bytes: u64,
         bypass_limit: bool,
     ) -> Result<(), AddressSpaceError> {
-        let forbidden = RegionPerms::SHARED.0
-            | RegionPerms::FILE_DEMAND.0
-            | RegionPerms::BRK_HEAP.0
-            | RegionPerms::LOCK_EXEMPT.0
-            | RegionPerms::STACK_GUARD.0
-            | RegionPerms::STACK_SEGMENT.0;
-        if region.perms.0 & forbidden != 0 {
-            return Err(AddressSpaceError::NotImplemented);
-        }
-        region.perms = region.perms | RegionPerms::ANON_MERGEABLE;
+        Self::mark_private_anonymous_mergeable(&mut region)?;
         let vma_guard = self.vma_transaction.lock();
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
         let (receipt, eager) =
@@ -2251,6 +2274,76 @@ impl AddressSpace {
             .lock()
             .coalesce_anonymous_around(receipt.base.as_u64());
         drop(vma_guard);
+        if eager {
+            self.populate_locked_range_best_effort(
+                receipt.base.as_u64(),
+                receipt.base.as_u64().saturating_add(receipt.len),
+            );
+        }
+        Ok(())
+    }
+
+    /// Transaction-held exact-address private-anonymous publication.
+    ///
+    /// Unlike the replacement form, this never punches an existing mapping:
+    /// overlap is reported atomically while the caller keeps the VMA
+    /// transaction held. This is the memory-side primitive required by
+    /// `MAP_FIXED_NOREPLACE`; an earlier unlocked probe alone cannot prevent a
+    /// CLONE_VM peer from claiming the address before publication.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`].
+    pub unsafe fn map_private_anonymous_region_locked_limited(
+        &self,
+        mut region: Region,
+        explicit_lock: bool,
+        limit_bytes: u64,
+        bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError> {
+        Self::mark_private_anonymous_mergeable(&mut region)?;
+        let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
+        let (receipt, eager) =
+            self.map_region_inner(region, requested, Some((limit_bytes, bypass_limit)))?;
+        self.regions
+            .lock()
+            .coalesce_anonymous_around(receipt.base.as_u64());
+        if eager {
+            self.populate_locked_range_best_effort(
+                receipt.base.as_u64(),
+                receipt.base.as_u64().saturating_add(receipt.len),
+            );
+        }
+        Ok(())
+    }
+
+    /// Replace a `MAP_FIXED` private-anonymous window and best-effort merge
+    /// the newly published VMA with exact-adjacent compatible anonymous VMAs.
+    /// Admission still precedes destructive target retirement.
+    ///
+    /// Unlike the receipt-returning generic replacement API, this method
+    /// completes coalescing before it returns; coalescing changes the VMA's
+    /// publication generation, so no stale receipt escapes to a deferred
+    /// materialization or rollback step. Lazy anonymous mappings need neither.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`]. It must also keep
+    /// every external mapping-owner transaction that can describe the target
+    /// locked until that owner has committed the corresponding fixed punch.
+    pub unsafe fn replace_private_anonymous_region_locked_limited(
+        &self,
+        mut region: Region,
+        explicit_lock: bool,
+        limit_bytes: u64,
+        bypass_limit: bool,
+    ) -> Result<(), AddressSpaceError> {
+        Self::mark_private_anonymous_mergeable(&mut region)?;
+        self.check_locked_mapping_limit(region.len, explicit_lock, limit_bytes, bypass_limit)?;
+        self.punch_fixed_locked_with_shared_reserving(region.base, region.len, false, 1)?;
+        let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
+        let (receipt, eager) = self.map_region_inner(region, requested, None)?;
+        self.regions
+            .lock()
+            .coalesce_anonymous_around(receipt.base.as_u64());
         if eager {
             self.populate_locked_range_best_effort(
                 receipt.base.as_u64(),
@@ -6065,7 +6158,16 @@ impl AddressSpace {
         // flush completed before this call, so the allocator may now drop all
         // owners while locking each touched COW shard once per window.
         let phys = &region.phys[..pages.min(region.phys.len())];
-        crate::frame::free_phys_batch(phys);
+        if region.perms.contains(RegionPerms::COW) {
+            crate::frame::free_phys_batch(phys);
+        } else {
+            // A private region acquires COW provenance before fork publishes a
+            // second frame owner. Without that bit every resident frame is
+            // unique after its leaf and reverse-map owner have been retired.
+            // SAFETY: SHARED returned above; the VMA provenance and teardown
+            // ordering establish the unique-frame contract.
+            unsafe { crate::frame::free_unique_phys_batch(phys) };
+        }
     }
 
     /// Retire a live range's complete reverse-map ownership, then release its
@@ -6795,7 +6897,7 @@ impl AddressSpace {
     /// - Frame allocator must be initialised.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-        use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
+        use crate::x86_64::paging::{map_4kb, map_4kb_demand, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
         // Swap faults are resolved before anonymous/file demand allocation.
         // Evicting/Loading means another CPU owns the transition; returning Ok
@@ -6944,7 +7046,7 @@ impl AddressSpace {
         };
 
         // The ticket, not the region lock, excludes a duplicate slow path for
-        // this page.  Other pages in the same CLONE_VM address space can now
+        // this page. Other pages in the same CLONE_VM address space can now
         // allocate/zero or enter their backing file in parallel.
         let phys = if file_backed {
             match file_fault_frame(v) {
@@ -6984,7 +7086,7 @@ impl AddressSpace {
             }
             // SAFETY: finish_demand_page holds the authoritative region lock;
             // `phys` has just become this page's backing and the root is live.
-            match unsafe { map_4kb(self.root, VirtAddr::new(v), phys, flags) } {
+            match unsafe { map_4kb_demand(self.root, VirtAddr::new(v), phys, flags) } {
                 Ok(()) => Ok(()),
                 Err(_) => Err(AddressSpaceError::NotImplemented),
             }
@@ -8130,12 +8232,7 @@ impl AddressSpace {
         };
         self.regions
             .lock()
-            .iter()
-            .filter(|r| {
-                let rb = r.base.as_u64();
-                let re = rb + r.len;
-                rb < hi && lo < re
-            })
+            .overlapping(lo, hi)
             .map(|r| r.perms)
             .collect()
     }
@@ -9041,7 +9138,8 @@ impl AddressSpace {
             return Err(AddressSpaceError::OutOfRange);
         }
         let regions = self.regions.lock();
-        for r in regions.iter() {
+        let scan = window.unwrap_or((0, Self::USER_HALF_END));
+        for r in regions.overlapping(scan.0, scan.1) {
             // PROT_NONE region: bookkeeping is recorded but no PTE
             // installed. User-mode access faults with P=0 (page
             // not present), which `frame::x86_64::trap` reports
@@ -9160,7 +9258,8 @@ impl AddressSpace {
             return Err(AddressSpaceError::OutOfRange);
         }
         let regions = self.regions.lock();
-        for r in regions.iter() {
+        let scan = window.unwrap_or((0, Self::USER_HALF_END));
+        for r in regions.overlapping(scan.0, scan.1) {
             // PROT_NONE region: no PTE installed. See x86_64
             // counterpart for rationale.
             if r.perms.prot_only().0 == 0 {

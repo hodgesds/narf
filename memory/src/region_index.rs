@@ -4,8 +4,11 @@
 //! insertion may allocate.  That is unsuitable for Linux-compatible fixed
 //! VMA transactions: all metadata allocation must finish before an existing
 //! target is retired.  This AVL tree stores nodes in a movable arena and uses
-//! indices rather than pointers, so one `Vec::try_reserve` prepares an exact
-//! number of later insertions without sacrificing logarithmic operations.
+//! indices rather than pointers, so one `Vec::try_reserve` prepares the needed
+//! later insertions without sacrificing logarithmic operations. Amortized
+//! spare capacity is retained because random VMA insertion otherwise
+//! reallocates and copies the entire arena for each newly reached high-water
+//! mark.
 
 use alloc::vec::Vec;
 use core::cmp::Ordering;
@@ -100,9 +103,7 @@ impl<V> RegionIndex<V> {
         }
 
         let new_slots = additional.saturating_sub(self.free_len);
-        self.slots
-            .try_reserve_exact(new_slots)
-            .map_err(|_| ReserveError)
+        self.slots.try_reserve(new_slots).map_err(|_| ReserveError)
     }
 
     #[cfg(any(test, feature = "kernel-test"))]

@@ -1012,6 +1012,41 @@ pub unsafe fn map_4kb(
     unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, true) }
 }
 
+/// Install a leaf while resolving a user-mode not-present page fault.
+///
+/// Unlike the general mapper, this does not execute `INVLPG` after the
+/// not-present-to-present write. There can be no stale present translation:
+/// every path that removed an older leaf invalidated it before frame reuse.
+/// If hardware retained a negative page-walk result, the retried user access
+/// faults once more and `AddressSpace::demand_alloc_page`'s backed-page repair
+/// branch observes the present leaf, invalidates this address, and retries.
+/// This matches Linux's x86 anonymous-fault rule that a previously non-present
+/// leaf needs no invalidation.
+///
+/// # Safety
+/// In addition to [`map_4kb`]'s contract, the caller must be resolving a
+/// user-mode not-present fault through that repair-capable demand path.
+pub(crate) unsafe fn map_4kb_demand(
+    pml4_phys: PhysAddr,
+    virt: VirtAddr,
+    phys: PhysAddr,
+    flags: PtFlags,
+) -> Result<(), MapError> {
+    if !is_canonical(virt) {
+        return Err(MapError::NonCanonical);
+    }
+    if virt.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedVirt);
+    }
+    if phys.raw() & 0xFFF != 0 {
+        return Err(MapError::UnalignedPhys);
+    }
+    let _pt_guard = pt_lock_for(pml4_phys).lock();
+    // SAFETY: validation and the root mutation guard are immediately above;
+    // the caller supplies the additional demand-fault/repair contract.
+    unsafe { map_4kb_locked(pml4_phys, virt, phys, flags, false) }
+}
+
 /// Install one validated leaf with the per-root page-table lock held.
 unsafe fn map_4kb_locked(
     pml4_phys: PhysAddr,

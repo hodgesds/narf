@@ -11,16 +11,15 @@
 //! Storage mirrors the COW refcount shards: a phys-frame-keyed map, sharded
 //! 64-way by frame number so unrelated frames on other CPUs don't contend.
 //! Most anonymous frames have exactly ONE owner (COW refcount 1) — only
-//! fork-shared frames have several — so the per-frame owner list is almost
-//! always length 1. `cow::count(phys)` already reports HOW MANY owners a frame
-//! has; this records WHO. (A future anon_vma-style representation could drop the
-//! per-frame `Vec`; noted as a follow-up.)
+//! fork-shared frames have several — so that owner is stored inline. A `Vec`
+//! is allocated only when a second alias appears or failure-atomic alias
+//! publication reserves capacity. `cow::count(phys)` already reports HOW MANY
+//! owners a frame has; this records WHO.
 //!
 //! This is standalone storage + API. The map / unmap / fork / COW-split paths
 //! are wired to it in separate changes, and the consumers (migration,
 //! per-cgroup LRU, swap) come after.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use narf_lib::sync::IrqSafeSpinLock;
@@ -41,25 +40,320 @@ pub struct Owner {
 // to one shard, but unrelated frames on other CPUs no longer contend on a
 // single lock.
 const RMAP_SHARDS: usize = 64;
+/// Retain a bounded high-water set of empty keys in each shard. Anonymous
+/// teardown commonly returns the same physical frames that the next mapping
+/// consumes; keeping their occupied hash slots avoids reinsertion work without
+/// letting reusable empty metadata grow with total machine RAM.
+const RETAINED_EMPTY_KEYS_PER_SHARD: usize = 1024;
 
 #[repr(align(64))]
 struct RmapShard {
-    map: IrqSafeSpinLock<Option<BTreeMap<u64, OwnerList>>>,
+    map: IrqSafeSpinLock<Option<RmapTable>>,
+}
+
+enum Owners {
+    Empty,
+    One(Owner),
+    Many(Vec<Owner>),
 }
 
 /// Per-frame owners plus capacity promised to an in-flight failure-atomic
-/// publisher. Ordinary map paths must leave `reserved` slots unused.
+/// publisher. The overwhelmingly common unique owner stays inline; ordinary
+/// map paths must leave `reserved` vector slots unused after promotion.
 struct OwnerList {
-    owners: Vec<Owner>,
+    owners: Owners,
     reserved: usize,
 }
 
 impl OwnerList {
-    const fn new() -> Self {
+    const fn new(owner: Owner) -> Self {
         Self {
-            owners: Vec::new(),
+            owners: Owners::One(owner),
             reserved: 0,
         }
+    }
+
+    fn len(&self) -> usize {
+        match &self.owners {
+            Owners::Empty => 0,
+            Owners::One(_) => 1,
+            Owners::Many(owners) => owners.len(),
+        }
+    }
+
+    fn contains(&self, owner: Owner) -> bool {
+        match &self.owners {
+            Owners::Empty => false,
+            Owners::One(existing) => *existing == owner,
+            Owners::Many(owners) => owners.contains(&owner),
+        }
+    }
+
+    fn add(&mut self, owner: Owner) {
+        if self.contains(owner) {
+            return;
+        }
+        match &mut self.owners {
+            Owners::Empty => self.owners = Owners::One(owner),
+            Owners::One(existing) => {
+                let first = *existing;
+                let mut owners = Vec::with_capacity(self.reserved.saturating_add(2));
+                // Capacity promised to a failure-atomic alias is not available
+                // to this ordinary add.
+                owners.push(first);
+                owners.push(owner);
+                self.owners = Owners::Many(owners);
+            }
+            Owners::Many(owners) => {
+                owners.reserve(self.reserved.saturating_add(1));
+                owners.push(owner);
+            }
+        }
+    }
+
+    fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
+        let promised = self.reserved.checked_add(additional).ok_or(())?;
+        match &mut self.owners {
+            Owners::Empty => return Err(()),
+            Owners::One(owner) => {
+                let first = *owner;
+                let mut owners = Vec::new();
+                owners
+                    .try_reserve_exact(promised.saturating_add(1))
+                    .map_err(|_| ())?;
+                owners.push(first);
+                self.owners = Owners::Many(owners);
+            }
+            Owners::Many(owners) => {
+                owners.try_reserve_exact(promised).map_err(|_| ())?;
+            }
+        }
+        self.reserved = promised;
+        Ok(())
+    }
+
+    fn add_reserved(&mut self, owner: Owner) {
+        assert!(
+            !self.contains(owner),
+            "reserved rmap owner already existed before commit"
+        );
+        let Owners::Many(owners) = &mut self.owners else {
+            panic!("reserved rmap owner list lost its prepared storage");
+        };
+        assert!(
+            self.reserved != 0 && owners.len() < owners.capacity(),
+            "reserved rmap owner capacity was consumed before commit"
+        );
+        self.reserved -= 1;
+        owners.push(owner);
+    }
+
+    fn remove(&mut self, owner: Owner) {
+        match &mut self.owners {
+            Owners::Empty => {}
+            Owners::One(existing) => {
+                if *existing == owner {
+                    self.owners = Owners::Empty;
+                }
+            }
+            Owners::Many(owners) => owners.retain(|existing| *existing != owner),
+        }
+    }
+
+    fn move_owner(&mut self, old: Owner, new: Owner) -> bool {
+        match &mut self.owners {
+            Owners::Empty => false,
+            Owners::One(existing) => {
+                if *existing != old {
+                    return false;
+                }
+                *existing = new;
+                true
+            }
+            Owners::Many(owners) => {
+                let Some(old_index) = owners.iter().position(|owner| *owner == old) else {
+                    return false;
+                };
+                if old != new && owners.contains(&new) {
+                    owners.swap_remove(old_index);
+                } else {
+                    owners[old_index] = new;
+                }
+                true
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Owner> {
+        match &self.owners {
+            Owners::Empty => Vec::new(),
+            Owners::One(owner) => Vec::from([*owner]),
+            Owners::Many(owners) => owners.clone(),
+        }
+    }
+}
+
+enum RmapSlot {
+    Vacant,
+    Tombstone,
+    Occupied { key: u64, owners: OwnerList },
+}
+
+/// Open-addressed physical-frame index. Reverse-map operations are on fault,
+/// unmap, COW, and migration hot paths; a B-tree made the common unique-owner
+/// lookup logarithmic and allocated one node per newly-seen frame. This table
+/// grows in amortized chunks and keeps lookup O(1) on average.
+struct RmapTable {
+    slots: Vec<RmapSlot>,
+    len: usize,
+    tombstones: usize,
+    retained_empty: usize,
+}
+
+impl RmapTable {
+    fn new() -> Self {
+        Self {
+            slots: Vec::new(),
+            len: 0,
+            tombstones: 0,
+            retained_empty: 0,
+        }
+    }
+
+    #[inline]
+    fn hash(key: u64) -> usize {
+        // SplitMix64 finalizer over the page number. The shard already used
+        // its low six bits, so mixing is important for sequential frames.
+        let mut value = key >> 12;
+        value ^= value >> 30;
+        value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value ^= value >> 27;
+        value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+        (value ^ (value >> 31)) as usize
+    }
+
+    fn find(&self, key: u64) -> Option<usize> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let mask = self.slots.len() - 1;
+        let mut index = Self::hash(key) & mask;
+        for _ in 0..self.slots.len() {
+            match &self.slots[index] {
+                RmapSlot::Vacant => return None,
+                RmapSlot::Occupied { key: existing, .. } if *existing == key => {
+                    return Some(index);
+                }
+                RmapSlot::Tombstone | RmapSlot::Occupied { .. } => {}
+            }
+            index = (index + 1) & mask;
+        }
+        None
+    }
+
+    fn insertion_slot(&self, key: u64) -> usize {
+        let mask = self.slots.len() - 1;
+        let mut index = Self::hash(key) & mask;
+        let mut first_tombstone = None;
+        for _ in 0..self.slots.len() {
+            match &self.slots[index] {
+                RmapSlot::Vacant => return first_tombstone.unwrap_or(index),
+                RmapSlot::Tombstone => {
+                    first_tombstone.get_or_insert(index);
+                }
+                RmapSlot::Occupied { key: existing, .. } => {
+                    assert_ne!(*existing, key, "duplicate rmap table insertion");
+                }
+            }
+            index = (index + 1) & mask;
+        }
+        first_tombstone.expect("rmap table has no insertion slot")
+    }
+
+    fn rehash(&mut self, capacity: usize) {
+        debug_assert!(capacity.is_power_of_two());
+        let mut slots = Vec::with_capacity(capacity);
+        slots.resize_with(capacity, || RmapSlot::Vacant);
+        let old = core::mem::replace(&mut self.slots, slots);
+        self.len = 0;
+        self.tombstones = 0;
+        for slot in old {
+            if let RmapSlot::Occupied { key, owners } = slot {
+                self.insert_rehashed(key, owners);
+            }
+        }
+    }
+
+    fn insert_rehashed(&mut self, key: u64, owners: OwnerList) {
+        let index = self.insertion_slot(key);
+        self.slots[index] = RmapSlot::Occupied { key, owners };
+        self.len += 1;
+    }
+
+    fn prepare_insert(&mut self) {
+        const INITIAL_CAPACITY: usize = 16;
+        if self.slots.is_empty() {
+            self.rehash(INITIAL_CAPACITY);
+            return;
+        }
+        // Keep at least 25% truly-vacant slots so a missing-key probe stays
+        // bounded. Rebuild in place when tombstones, rather than live keys,
+        // are what crossed the threshold.
+        let occupied_after_insert = self.len + self.tombstones + 1;
+        let load_ceiling = self.slots.len() - self.slots.len() / 4;
+        if occupied_after_insert >= load_ceiling {
+            let capacity = if self.len + 1 < self.slots.len() / 2 {
+                self.slots.len()
+            } else {
+                self.slots
+                    .len()
+                    .checked_mul(2)
+                    .expect("rmap table capacity overflow")
+            };
+            self.rehash(capacity);
+        }
+    }
+
+    fn get(&self, key: u64) -> Option<&OwnerList> {
+        let index = self.find(key)?;
+        match &self.slots[index] {
+            RmapSlot::Occupied { owners, .. } => Some(owners),
+            _ => unreachable!(),
+        }
+    }
+
+    fn get_mut(&mut self, key: u64) -> Option<&mut OwnerList> {
+        let index = self.find(key)?;
+        match &mut self.slots[index] {
+            RmapSlot::Occupied { owners, .. } => Some(owners),
+            _ => unreachable!(),
+        }
+    }
+
+    fn insert(&mut self, key: u64, owners: OwnerList) {
+        self.prepare_insert();
+        let index = self.insertion_slot(key);
+        if matches!(self.slots[index], RmapSlot::Tombstone) {
+            self.tombstones -= 1;
+        }
+        self.slots[index] = RmapSlot::Occupied { key, owners };
+        self.len += 1;
+    }
+
+    fn remove(&mut self, key: u64) {
+        let Some(index) = self.find(key) else {
+            return;
+        };
+        self.slots[index] = RmapSlot::Tombstone;
+        self.len -= 1;
+        self.tombstones += 1;
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, &OwnerList)> {
+        self.slots.iter().filter_map(|slot| match slot {
+            RmapSlot::Occupied { key, owners } => Some((*key, owners)),
+            RmapSlot::Vacant | RmapSlot::Tombstone => None,
+        })
     }
 }
 
@@ -80,9 +374,9 @@ fn shard(frame_key: u64) -> usize {
 }
 
 /// Record that `(root, va)` maps `phys`. Idempotent — a duplicate mapping for
-/// the same frame is not added twice. No-op for the null frame. Allocates
-/// (map/`Vec` growth), so it must run on a normal map path, never the
-/// allocation-failure path.
+/// the same frame is not added twice. No-op for the null frame. The first owner
+/// stays inline, but map insertion or later alias growth may allocate, so this
+/// must run on a normal map path, never the allocation-failure path.
 pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let key = phys.raw();
     if key == 0 {
@@ -90,13 +384,16 @@ pub fn add(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     }
     let owner = Owner { root, va };
     let mut g = RMAP[shard(key)].map.lock();
-    let map = g.get_or_insert_with(BTreeMap::new);
-    let list = map.entry(key).or_insert_with(OwnerList::new);
-    if !list.owners.contains(&owner) {
-        // Capacity promised to a failure-atomic alias is not available to an
-        // unrelated mapping racing on the same shared frame.
-        list.owners.reserve(list.reserved.saturating_add(1));
-        list.owners.push(owner);
+    let map = g.get_or_insert_with(RmapTable::new);
+    if let Some(list) = map.get_mut(key) {
+        let was_empty = list.len() == 0;
+        list.add(owner);
+        if was_empty {
+            debug_assert!(map.retained_empty != 0);
+            map.retained_empty -= 1;
+        }
+    } else {
+        map.insert(key, OwnerList::new(owner));
     }
 }
 
@@ -113,11 +410,8 @@ pub(crate) fn try_reserve_owner_slots(phys: PhysAddr, additional: usize) -> Resu
     }
     let key = phys.raw();
     let mut g = RMAP[shard(key)].map.lock();
-    let list = g.as_mut().and_then(|map| map.get_mut(&key)).ok_or(())?;
-    let promised = list.reserved.checked_add(additional).ok_or(())?;
-    list.owners.try_reserve_exact(promised).map_err(|_| ())?;
-    list.reserved = promised;
-    Ok(())
+    let list = g.as_mut().and_then(|map| map.get_mut(key)).ok_or(())?;
+    list.try_reserve(additional)
 }
 
 /// Allocation-free counterpart to [`try_reserve_owner_slots`].
@@ -133,18 +427,9 @@ pub(crate) fn add_reserved(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let mut g = RMAP[shard(key)].map.lock();
     let list = g
         .as_mut()
-        .and_then(|map| map.get_mut(&key))
+        .and_then(|map| map.get_mut(key))
         .expect("reserved rmap frame disappeared before commit");
-    assert!(
-        !list.owners.contains(&owner),
-        "reserved rmap owner already existed before commit"
-    );
-    assert!(
-        list.reserved != 0 && list.owners.len() < list.owners.capacity(),
-        "reserved rmap owner capacity was consumed before commit"
-    );
-    list.reserved -= 1;
-    list.owners.push(owner);
+    list.add_reserved(owner);
 }
 
 /// Release owner slots reserved by [`try_reserve_owner_slots`] when the
@@ -157,7 +442,7 @@ pub(crate) fn release_reserved_owner_slots(phys: PhysAddr, count: usize) {
     let mut g = RMAP[shard(key)].map.lock();
     let list = g
         .as_mut()
-        .and_then(|map| map.get_mut(&key))
+        .and_then(|map| map.get_mut(key))
         .expect("reserved rmap frame disappeared before rollback");
     assert!(
         list.reserved >= count,
@@ -166,8 +451,9 @@ pub(crate) fn release_reserved_owner_slots(phys: PhysAddr, count: usize) {
     list.reserved -= count;
 }
 
-/// Drop the `(root, va)` mapping of `phys`. Frees the frame's entry once its
-/// last owner is removed. No-op for the null frame or an unknown mapping.
+/// Drop the `(root, va)` mapping of `phys`. The last-owner key is either kept
+/// as a bounded reuse shell or changed to a probe-preserving tombstone. No-op
+/// for the null frame or an unknown mapping.
 pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let key = phys.raw();
     if key == 0 {
@@ -176,10 +462,18 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
     let owner = Owner { root, va };
     let mut g = RMAP[shard(key)].map.lock();
     if let Some(map) = g.as_mut() {
-        if let Some(list) = map.get_mut(&key) {
-            list.owners.retain(|o| *o != owner);
-            if list.owners.is_empty() && list.reserved == 0 {
-                map.remove(&key);
+        let became_empty = if let Some(list) = map.get_mut(key) {
+            let was_nonempty = list.len() != 0;
+            list.remove(owner);
+            was_nonempty && list.len() == 0 && list.reserved == 0
+        } else {
+            false
+        };
+        if became_empty {
+            if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
+                map.retained_empty += 1;
+            } else {
+                map.remove(key);
             }
         }
     }
@@ -196,8 +490,8 @@ pub fn contains_owner(phys: PhysAddr, root: PhysAddr, va: VirtAddr) -> bool {
         .map
         .lock()
         .as_ref()
-        .and_then(|map| map.get(&key))
-        .is_some_and(|list| list.owners.contains(&owner))
+        .and_then(|map| map.get(key))
+        .is_some_and(|list| list.contains(owner))
 }
 
 /// Change one recorded virtual coordinate without allocating.
@@ -214,18 +508,10 @@ pub fn move_owner(phys: PhysAddr, root: PhysAddr, old_va: VirtAddr, new_va: Virt
     let old = Owner { root, va: old_va };
     let new = Owner { root, va: new_va };
     let mut g = RMAP[shard(key)].map.lock();
-    let Some(list) = g.as_mut().and_then(|map| map.get_mut(&key)) else {
+    let Some(list) = g.as_mut().and_then(|map| map.get_mut(key)) else {
         return false;
     };
-    let Some(old_index) = list.owners.iter().position(|owner| *owner == old) else {
-        return false;
-    };
-    if list.owners.contains(&new) {
-        list.owners.swap_remove(old_index);
-    } else {
-        list.owners[old_index] = new;
-    }
-    true
+    list.move_owner(old, new)
 }
 
 /// Number of distinct mappings recorded for `phys` (`0` if untracked). Should
@@ -239,8 +525,8 @@ pub fn owner_count(phys: PhysAddr) -> usize {
         .map
         .lock()
         .as_ref()
-        .and_then(|m| m.get(&key))
-        .map_or(0, |list| list.owners.len())
+        .and_then(|m| m.get(key))
+        .map_or(0, OwnerList::len)
 }
 
 /// Visit every recorded owner of `phys`. Snapshots the owner list under the
@@ -256,8 +542,8 @@ pub fn for_each_owner(phys: PhysAddr, mut f: impl FnMut(Owner)) {
         .map
         .lock()
         .as_ref()
-        .and_then(|m| m.get(&key))
-        .map(|list| list.owners.clone())
+        .and_then(|m| m.get(key))
+        .map(OwnerList::snapshot)
         .unwrap_or_default();
     for o in owners {
         f(o);
@@ -274,7 +560,11 @@ pub fn for_each_tracked_frame(mut f: impl FnMut(PhysAddr)) {
             .map
             .lock()
             .as_ref()
-            .map(|m| m.keys().copied().collect())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(key, owners)| (owners.len() != 0).then_some(key))
+                    .collect()
+            })
             .unwrap_or_default();
         for key in frames {
             f(PhysAddr::new(key));
@@ -296,8 +586,9 @@ pub fn __reset_for_test() {
 // `narf.tests` section and actually run under `cargo xtask test`.
 mod tests {
     use super::{
-        __reset_for_test, add, add_reserved, for_each_owner, move_owner, owner_count, remove,
-        try_reserve_owner_slots, Owner,
+        __reset_for_test, add, add_reserved, for_each_owner, for_each_tracked_frame, move_owner,
+        owner_count, remove, shard, try_reserve_owner_slots, Owner, OwnerList, Owners, RmapTable,
+        RETAINED_EMPTY_KEYS_PER_SHARD, RMAP,
     };
     use crate::{PhysAddr, VirtAddr};
     use narf_kernel_test::{kernel_test_in, TestResult};
@@ -310,6 +601,16 @@ mod tests {
 
         // Two distinct owners of one frame (as a COW-shared page would have).
         add(phys, r0, v0);
+        let first_is_inline = RMAP[shard(phys.raw())]
+            .map
+            .lock()
+            .as_ref()
+            .and_then(|map| map.get(phys.raw()))
+            .is_some_and(|list| matches!(list.owners, Owners::One(owner) if owner == Owner { root: r0, va: v0 }));
+        if !first_is_inline {
+            __reset_for_test();
+            return TestResult::Fail("first rmap owner was not stored inline");
+        }
         add(phys, r1, v1);
         // Idempotent: re-adding the same mapping does not double-count.
         add(phys, r0, v0);
@@ -338,6 +639,11 @@ mod tests {
             if owner_count(phys) != 0 {
                 return TestResult::Fail("removing the last owner should free the entry");
             }
+            let mut still_tracked = false;
+            for_each_tracked_frame(|candidate| still_tracked |= candidate == phys);
+            if still_tracked {
+                return TestResult::Fail("retained empty rmap key was reported as an owner");
+            }
             // Null frame + unknown mapping are no-ops.
             add(PhysAddr::new(0), r0, v0);
             remove(phys, r0, v0);
@@ -350,6 +656,77 @@ mod tests {
         result
     }
     kernel_test_in!("memory/rmap", smoke_rmap_add_count_remove);
+
+    fn smoke_rmap_hash_index_grows_through_tombstones() -> TestResult {
+        let root = PhysAddr::new(0x1000);
+        let mut table = RmapTable::new();
+        for page in 1..=192u64 {
+            table.insert(
+                page << 12,
+                OwnerList::new(Owner {
+                    root,
+                    va: VirtAddr::new(page << 20),
+                }),
+            );
+        }
+        for page in (2..=192u64).step_by(2) {
+            table.remove(page << 12);
+        }
+        for page in 193..=320u64 {
+            table.insert(
+                page << 12,
+                OwnerList::new(Owner {
+                    root,
+                    va: VirtAddr::new(page << 20),
+                }),
+            );
+        }
+        let old_survived =
+            (1..=192u64).all(|page| table.get(page << 12).is_some() == (page & 1 != 0));
+        let new_visible = (193..=320u64).all(|page| table.get(page << 12).is_some());
+        if old_survived && new_visible && table.len == 224 {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("rmap hash growth lost a live key across tombstones")
+        }
+    }
+    kernel_test_in!(
+        "memory/rmap",
+        smoke_rmap_hash_index_grows_through_tombstones
+    );
+
+    fn smoke_rmap_retained_empty_keys_are_bounded() -> TestResult {
+        __reset_for_test();
+        let root = PhysAddr::new(0x1000);
+        let va = VirtAddr::new(0x4000_0000);
+        let count = RETAINED_EMPTY_KEYS_PER_SHARD + 2;
+        // Keep every key in shard 7 while forcing two last-owner removals past
+        // the retention ceiling. Those become tombstones, not probe-chain
+        // terminators.
+        for index in 0..count {
+            let pfn = 7 + index as u64 * super::RMAP_SHARDS as u64;
+            add(PhysAddr::new(pfn << 12), root, va);
+        }
+        for index in 0..count {
+            let pfn = 7 + index as u64 * super::RMAP_SHARDS as u64;
+            remove(PhysAddr::new(pfn << 12), root, va);
+        }
+        let shard = shard(7 << 12);
+        let bounded = RMAP[shard].map.lock().as_ref().is_some_and(|table| {
+            table.retained_empty == RETAINED_EMPTY_KEYS_PER_SHARD
+                && table.len == RETAINED_EMPTY_KEYS_PER_SHARD
+                && table.tombstones >= 2
+        });
+        let mut reported = false;
+        for_each_tracked_frame(|_| reported = true);
+        __reset_for_test();
+        if bounded && !reported {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("rmap empty-key retention exceeded its bound")
+        }
+    }
+    kernel_test_in!("memory/rmap", smoke_rmap_retained_empty_keys_are_bounded);
 
     fn smoke_rmap_move_owner_updates_coordinate() -> TestResult {
         __reset_for_test();

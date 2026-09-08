@@ -74,10 +74,16 @@ bridge; changing it requires the ABI versioning process in `abi/` §4.
 
 Linux-compatible anonymous private `mmap(2)` records lazy zero-backed VMAs;
 the mapping syscall does not walk unrelated regions or allocate resident data
-pages. Anonymous `MAP_SHARED` mappings eagerly allocate registry-owned frames,
+pages unless `MAP_POPULATE` requests a best-effort prefault. `MAP_NONBLOCK`
+suppresses that prefault without changing VMA publication. Anonymous
+`MAP_SHARED` mappings eagerly allocate registry-owned frames,
 retain them through the VMA and any fork aliases, and immediately remove their
 internal shmem name; the last alias unmap reclaims the backing without retaining
 one public registry entry per completed mapping until process exit.
+`MAP_FIXED_NOREPLACE` publishes its exact address non-destructively under the
+address-space VMA transaction. An occupied target returns `EEXIST`, including
+when a `CLONE_VM` peer claims the range after the syscall's initial fast probe;
+the syscall never punches that peer or retires file/SysV owner metadata.
 The native mmap entry validates a page-aligned byte offset before descriptor
 lookup, resolves non-anonymous descriptors before `do_mmap`-style validation,
 rejects an exact zero length with `EINVAL`, and distinguishes fixed-address
@@ -628,6 +634,11 @@ another node. `migrate_pages(2)` moves the caller's resident private pages
 between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement
 is intersected with the task's cgroup-v2 `cpuset.mems.effective` mask;
 `get_mempolicy(MPOL_F_MEMS_ALLOWED)` reports that effective constraint.
+Until either a task policy/range binding or restrictive cpuset mask has ever
+been published, monotonic gates prove the default fault placement without
+entering the corresponding IRQ-safe global maps. Each writer raises its gate
+before table publication and the gates are never lowered, so this optimization
+can add conservative slow-path lookups but can never hide live policy state.
 `get_mempolicy(2)` rejects unknown/conflicting flags, undersized nodemask
 buffers, and addresses supplied without `MPOL_F_ADDR`; address+node
 queries fault in valid lazy pages and report their actual SRAT node.

@@ -49,6 +49,10 @@ pub(crate) fn sys_set_mempolicy(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
     }
+    // Publish possibility before the table mutation. A racing fault may
+    // conservatively enter the locks early, but cannot miss this policy after
+    // the syscall returns.
+    CUSTOM_MEMPOLICY_POSSIBLE.store(true, core::sync::atomic::Ordering::Release);
     let mut g = MEMPOLICY_TABLE.lock();
     g.get_or_insert_with(alloc::collections::BTreeMap::new)
         .insert(

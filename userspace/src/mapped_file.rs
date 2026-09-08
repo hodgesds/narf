@@ -151,12 +151,40 @@ pub(crate) fn publish_current_unowned_mapping<T: Copy>(
     finish: impl FnOnce(T) -> Result<(), AddressSpaceError>,
 ) -> Result<T, AddressSpaceError> {
     let address_space_id = current_address_space_id().ok_or(AddressSpaceError::Unmapped)?;
-    let owner_bucket = mapping_owners(address_space_id);
+    // Anonymous address spaces normally have no file mappings. The caller's
+    // VMA transaction prevents a file-backed mapping from being published
+    // while we classify this operation, so an absent bucket is a stable fact
+    // for the duration of `publish`.
+    let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
+        let receipt = publish()?;
+        finish(receipt)?;
+        return Ok(receipt);
+    };
     let mut owners = owner_bucket.lock();
-    let receipt = publish()?;
-    if replace {
-        punch_locked(&mut owners, base, len);
+    if !replace {
+        // A non-replacing unowned mapping cannot retire a file owner. Do not
+        // hold an unrelated per-AS IRQ-safe lock across page-table work.
+        drop(owners);
+        let receipt = publish()?;
+        finish(receipt)?;
+        return Ok(receipt);
     }
+    let end = base.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
+    if !owners.iter().any(|mapping| {
+        mapping
+            .base
+            .checked_add(mapping.len)
+            .is_some_and(|mapping_end| mapping_end > base && mapping.base < end)
+    }) {
+        // The existing bucket belongs to disjoint mappings. The VMA
+        // transaction keeps that classification stable until publication.
+        drop(owners);
+        let receipt = publish()?;
+        finish(receipt)?;
+        return Ok(receipt);
+    }
+    let receipt = publish()?;
+    punch_locked(&mut owners, base, len);
     drop(owners);
     finish(receipt)?;
     Ok(receipt)

@@ -165,6 +165,81 @@ fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_adjacent_anonymous_mmaps_coalesce);
 
+/// Random fixed-page insertion must converge to the same compact anonymous
+/// VMA shape as ordinary mmap, without weakening fixed replacement semantics.
+fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_6800_0000;
+    for page in [0u64, 2, 1, 4, 3] {
+        let mapped = aspace.with_vma_transaction(|| {
+            // SAFETY: the VMA transaction is held; this synthetic address
+            // space has no external file or SysV mapping-owner registry.
+            unsafe {
+                aspace.replace_private_anonymous_region_locked_limited(
+                    Region {
+                        base: VirtAddr::new(base + page * 4096),
+                        len: 4096,
+                        perms: RegionPerms::READ | RegionPerms::WRITE,
+                        phys: vec![PhysAddr::new(0)],
+                    },
+                    false,
+                    u64::MAX,
+                    false,
+                )
+            }
+        });
+        if mapped.is_err() {
+            return TestResult::Fail("fixed anonymous page failed to map");
+        }
+    }
+    let regions = aspace.regions_snapshot();
+    if regions.len() != 1 {
+        return TestResult::Fail("fixed anonymous pages stayed fragmented");
+    }
+    let merged = &regions[0];
+    if merged.base.as_u64() != base
+        || merged.len != 5 * 4096
+        || merged.phys.len() != 5
+        || !merged.perms.contains(RegionPerms::ANON_MERGEABLE)
+    {
+        return TestResult::Fail("fixed anonymous merge changed mapping shape or provenance");
+    }
+
+    let noreplace = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held. This is the non-destructive
+        // fixed-address primitive, so an overlap must leave `merged` intact.
+        unsafe {
+            aspace.map_private_anonymous_region_locked_limited(
+                Region {
+                    base: VirtAddr::new(base + 2 * 4096),
+                    len: 4096,
+                    perms: RegionPerms::READ,
+                    phys: vec![PhysAddr::new(0)],
+                },
+                false,
+                u64::MAX,
+                false,
+            )
+        }
+    });
+    if noreplace != Err(crate::AddressSpaceError::Overlap) {
+        return TestResult::Fail("non-replacing fixed map accepted an occupied address");
+    }
+    let after = aspace.regions_snapshot();
+    if after.len() != 1
+        || after[0].base.as_u64() != base
+        || after[0].len != 5 * 4096
+        || !after[0].perms.contains(RegionPerms::WRITE)
+    {
+        return TestResult::Fail("failed non-replacing fixed map altered its target");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_memory_fixed_anonymous_mmaps_coalesce);
+
 /// Identical permissions are insufficient for coalescing: a mapping without
 /// anonymous provenance may have file or bespoke ownership semantics.
 fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {
