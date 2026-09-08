@@ -211,6 +211,134 @@ pub fn enter(domain: DomainId) -> DomainScope {
 /// Must run even when the module's entry point returned an error: leaving
 /// PKRS narrowed would deny the rest of the kernel access to every domain
 /// but two, and the fault would land arbitrarily far from here.
+/// Bytes of dead stack erased when a module domain scope closes.
+///
+/// Covers the module's own frames to this depth; a module that recursed
+/// deeper leaves residue below it. That is a coverage limit, not a
+/// correctness one — the alternative is a low-water mark, which needs either
+/// painting the stack (unreliable: CPL0 interrupts push into the same region)
+/// or compiler instrumentation.
+///
+/// 8 KiB rather than the whole 32 KiB stack because the erase runs with
+/// interrupts masked. `arch/specification/domain-stacks.md` measures ~1.75 us
+/// here against ~6 us for a full stack; a module load can afford either, and
+/// the interrupt-off window is what argues for the smaller.
+const SCRUB_BYTES: usize = 8 * 1024;
+
+/// Zero `len` bytes at `start` without making a call.
+///
+/// This is the whole reason the first attempt at scrub-on-exit was reverted.
+/// Calling `write_bytes` pushes a return address at `SP - 8` on x86, which is
+/// *inside* the region being erased, so memset zeroed its own return slot and
+/// `ret` jumped to null — `#PF` with `rip = 0`. aarch64 survived only because
+/// its return address goes in `LR`, a register, so the same code destroyed
+/// itself on one architecture and not the other.
+///
+/// Both arms are `options(nostack)` and push nothing, so the erased region
+/// cannot contain anything this function needs to return.
+///
+/// # Safety
+/// `[start, start + len)` must be mapped, writable, and dead.
+#[inline(always)]
+unsafe fn erase_no_call(start: usize, len: usize) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: `rep stosb` writes exactly `rcx` bytes from `rdi`. DF is clear
+    // by ABI on entry, so the store direction is ascending.
+    unsafe {
+        core::arch::asm!(
+            "rep stosb",
+            inout("rdi") start => _,
+            inout("rcx") len => _,
+            inout("eax") 0u32 => _,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: stores `n` doublewords ascending from `p`; `len` is rounded to
+    // a multiple of 8 by the caller and SP is 16-byte aligned, so every store
+    // is aligned and inside the range.
+    unsafe {
+        let words = len / 8;
+        core::arch::asm!(
+            "1:",
+            "cbz {n}, 2f",
+            "str xzr, [{p}], #8",
+            "sub {n}, {n}, #1",
+            "b 1b",
+            "2:",
+            p = inout(reg) start => _,
+            n = inout(reg) words => _,
+            options(nostack),
+        );
+    }
+}
+
+/// Erase the dead stack below `SP` after module code has returned.
+///
+/// Closes a module's frames outliving its scope: data left on the shared
+/// kernel stack by one domain and read later by another. That is the concrete
+/// gain per-domain stacks were considered for, and scrubbing buys it without
+/// an SP switch, a guard page, an overflow stack, or any change to exception
+/// entry — see `arch/specification/domain-stacks.md`.
+///
+/// Module scopes only. `bpf::domain::enter` wraps every program run, where an
+/// erase of this size is the same order as the invocation it follows.
+fn scrub_dead_stack() {
+    // Read SP directly. `&0u8 as *const u8` is NOT a stack address: Rust
+    // const-promotes the literal to a `'static`, so it yields `.rodata` in the
+    // kernel image. An earlier version computed its extent from that and was
+    // saved only by the containment check below.
+    let here: usize;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: reading RSP into a register clobbers nothing.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) here, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: reading SP into a register clobbers nothing.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) here, options(nomem, nostack, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        return;
+    }
+
+    let Some((bottom, top)) = narf_scheduler::stackful::current_stack_range() else {
+        // Not on a stackful task — the executor's own stack, or early boot.
+        // Bounds unknown, so erasing would be guessing where to stop.
+        return;
+    };
+    // The reported range must actually contain the live SP. Clamping to a
+    // bottom belonging to some other stack is not a clamp: it would authorise
+    // writing 8 KiB below an address the bound says nothing about.
+    if here <= bottom || here > top {
+        return;
+    }
+    // Rounded to a multiple of 8 for the aarch64 store loop.
+    let len = core::cmp::min(SCRUB_BYTES, here - bottom) & !7;
+    if len == 0 {
+        return;
+    }
+    let start = here - len;
+
+    // Interrupts off. A handler taken at CPL0 pushes below `SP` — into
+    // exactly the region being erased — so one landing mid-scrub would have
+    // its live frame zeroed underneath it.
+    let irqs = narf_arch::interrupts_enabled();
+    if irqs {
+        // SAFETY: re-enabled below on every path out.
+        unsafe { narf_arch::disable_interrupts() };
+    }
+    // SAFETY: `[start, here)` is inside the current task's stack and strictly
+    // below the live SP, and `erase_no_call` pushes nothing.
+    unsafe { erase_no_call(start, len) };
+    if irqs {
+        // SAFETY: restoring the state observed above.
+        unsafe { narf_arch::enable_interrupts() };
+    }
+}
+
 pub fn exit(scope: DomainScope) {
     narf_arch::exit_domain_scope(scope.prev_domain);
     #[cfg(target_arch = "x86_64")]
@@ -239,4 +367,7 @@ pub fn exit(scope: DomainScope) {
     {
         let _ = scope;
     }
+    // After the enforcer is restored, not before: erasing is ordinary kernel
+    // work and should run under the kernel's own rights, not the module's.
+    scrub_dead_stack();
 }

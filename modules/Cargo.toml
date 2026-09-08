@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 narf-lib          = { path = "../lib" }
 narf-arch         = { path = "../arch" }
+narf-scheduler    = { path = "../scheduler" }
 narf-memory       = { path = "../memory" }
 narf-console      = { path = "../console" }
 narf-init         = { path = "../init" }
