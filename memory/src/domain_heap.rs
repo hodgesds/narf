@@ -334,15 +334,9 @@ pub fn alloc(layout: Layout, domain: DomainId) -> Option<*mut u8> {
             start += 1;
             continue;
         }
-        let mut ok = true;
-        for i in start..start + need {
-            if bit(&pool.used, i) {
-                start = i + 1;
-                ok = false;
-                break;
-            }
-        }
-        if ok {
+        if let Some(i) = (start..start + need).find(|&i| bit(&pool.used, i)) {
+            start = i + 1;
+        } else {
             for i in start..start + need {
                 set(&mut pool.used, i);
             }

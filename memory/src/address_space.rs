@@ -1291,8 +1291,8 @@ pub enum BrkUpdateResult {
 }
 
 #[inline]
-fn anonymous_demand_alloc_error(reserve_pressure: bool) -> AddressSpaceError {
-    if reserve_pressure {
+fn anonymous_demand_alloc_error(error: crate::FrameAllocError) -> AddressSpaceError {
+    if error == crate::FrameAllocError::ReservePressure {
         AddressSpaceError::ReclaimPressure
     } else {
         AddressSpaceError::OutOfRange
@@ -7057,14 +7057,11 @@ impl AddressSpace {
                 }
             }
         } else {
-            let reserve_pressure = crate::reclaim::user_alloc_would_breach_reserve();
             let frame = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
                 Ok(frame) => frame,
-                Err(_) => {
+                Err(error) => {
                     self.cancel_demand_page(v, ticket);
-                    return Err(anonymous_demand_alloc_error(
-                        reserve_pressure || crate::reclaim::user_alloc_would_breach_reserve(),
-                    ));
+                    return Err(anonymous_demand_alloc_error(error));
                 }
             };
             let phys = frame.start_address();
@@ -7181,14 +7178,11 @@ impl AddressSpace {
                 }
             }
         } else {
-            let reserve_pressure = crate::reclaim::user_alloc_would_breach_reserve();
             let frame = match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
                 Ok(frame) => frame,
-                Err(_) => {
+                Err(error) => {
                     self.cancel_demand_page(v, ticket);
-                    return Err(anonymous_demand_alloc_error(
-                        reserve_pressure || crate::reclaim::user_alloc_would_breach_reserve(),
-                    ));
+                    return Err(anonymous_demand_alloc_error(error));
                 }
             };
             let phys = frame.start_address();
@@ -11417,10 +11411,16 @@ kernel_test_in!("memory", smoke_memory_demand_ticket_exhaustion_fails_closed);
 /// Reserve pressure is a retryable demand-fault condition, while an ordinary
 /// placement/range exhaustion remains the existing non-retryable surface.
 fn smoke_memory_demand_pressure_is_distinct_from_range_failure() -> TestResult {
-    if anonymous_demand_alloc_error(true) != AddressSpaceError::ReclaimPressure {
+    if anonymous_demand_alloc_error(crate::FrameAllocError::ReservePressure)
+        != AddressSpaceError::ReclaimPressure
+    {
         return TestResult::Fail("reserve pressure was not classified for reclaim wait");
     }
-    if anonymous_demand_alloc_error(false) != AddressSpaceError::OutOfRange {
+    if anonymous_demand_alloc_error(crate::FrameAllocError::Exhausted)
+        != AddressSpaceError::OutOfRange
+        || anonymous_demand_alloc_error(crate::FrameAllocError::Uninitialised)
+            != AddressSpaceError::OutOfRange
+    {
         return TestResult::Fail("ordinary allocation failure became reclaim pressure");
     }
     TestResult::Pass

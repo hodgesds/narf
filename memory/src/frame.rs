@@ -179,6 +179,9 @@ impl fmt::Debug for PhysFrame {
 pub enum FrameAllocError {
     /// No free frames remain in any usable region.
     Exhausted,
+    /// A user-backing allocation was refused to preserve the kernel's
+    /// protected minimum free-memory reserve.
+    ReservePressure,
     /// Allocator not initialised yet (`init_from_map` hasn't run).
     Uninitialised,
     /// The currently-installed `FrameAlloc` impl does not support
@@ -890,12 +893,12 @@ impl AllocContext {
     }
 }
 
-/// Central reserve gate. Returns `Exhausted` (and wakes the reclaimer) when a
-/// `User` allocation would breach the `min` watermark reserve; `Kernel` and
-/// `UserReserve` allocations always pass (the latter is a CoW break that must
-/// not fault a writable page — see [`AllocContext::UserReserve`]). Enforced
-/// once, here, so every allocation entry inherits the same policy — an ordinary
-/// user path cannot silently drain the reserve.
+/// Central reserve gate. Returns `ReservePressure` (and wakes the reclaimer)
+/// when a `User` allocation would breach the `min` watermark reserve; `Kernel`
+/// and `UserReserve` allocations always pass (the latter is a CoW break that
+/// must not fault a writable page — see [`AllocContext::UserReserve`]).
+/// Enforced once, here, so every allocation entry inherits the same policy —
+/// an ordinary user path cannot silently drain the reserve.
 #[inline]
 fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
     let node = current_cpu_node();
@@ -921,7 +924,7 @@ fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
         } else {
             crate::reclaim::request_reclaim(node, 1);
         }
-        return Err(FrameAllocError::Exhausted);
+        return Err(FrameAllocError::ReservePressure);
     }
     Ok(())
 }
@@ -2523,11 +2526,17 @@ pub fn stats() -> FrameStats {
 
 /// Buddy-backed implementation of `stats`.
 fn buddy_stats() -> FrameStats {
-    let free: usize = ALLOC
-        .node_free_frames
-        .iter()
-        .map(|free| free.load(Ordering::Relaxed))
-        .sum();
+    // The online mask is published after each node's counters and cleared
+    // only after its final range has left the allocator. Sparse iteration
+    // therefore preserves the aggregate while avoiding 16 cache-line reads
+    // on the overwhelmingly common one-node system.
+    let mut nodes = online_node_mask();
+    let mut free = 0usize;
+    while nodes != 0 {
+        let node = nodes.trailing_zeros() as usize;
+        free = free.saturating_add(ALLOC.node_free_frames[node].load(Ordering::Relaxed));
+        nodes &= nodes - 1;
+    }
     FrameStats {
         total: ALLOC.total_frames.load(Ordering::Relaxed),
         free,

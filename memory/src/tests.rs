@@ -5796,7 +5796,9 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not initialised in this flavour")
         }
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant for oversize order")
         }
         Ok(_) => TestResult::Fail("oversize order should fail, not succeed"),
@@ -6403,7 +6405,9 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
             TestResult::Skip("frame allocator not up in this flavour")
         }
         Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant from alloc_pages_on")
         }
     }
@@ -6422,7 +6426,9 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
             TestResult::Pass
         }
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant at MAX_ORDER boundary")
         }
     }

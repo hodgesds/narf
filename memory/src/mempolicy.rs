@@ -456,14 +456,22 @@ fn alloc_preferred_many(
     }
     candidates[..count].sort_unstable_by_key(|&node| (frame::node_distance(anchor, node), node));
     for &node in &candidates[..count] {
-        if let Ok(frame) = u_alloc_strict(node, node) {
-            return Ok(frame);
+        match u_alloc_strict(node, node) {
+            Ok(frame) => return Ok(frame),
+            Err(FrameAllocError::ReservePressure) => {
+                return Err(FrameAllocError::ReservePressure);
+            }
+            Err(_) => {}
         }
     }
     for node in 0..MAX_NUMA_NODES {
         if (allowed >> node) & 1 != 0 && (preferred >> node) & 1 == 0 {
-            if let Ok(frame) = u_alloc_strict(node, anchor) {
-                return Ok(frame);
+            match u_alloc_strict(node, anchor) {
+                Ok(frame) => return Ok(frame),
+                Err(FrameAllocError::ReservePressure) => {
+                    return Err(FrameAllocError::ReservePressure);
+                }
+                Err(_) => {}
             }
         }
     }
@@ -474,14 +482,22 @@ fn alloc_preferred_many(
 /// nodes. Every attempt is strict so a cgroup hard boundary cannot spill.
 fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, FrameAllocError> {
     if preferred < MAX_NUMA_NODES && (allowed >> preferred) & 1 != 0 {
-        if let Ok(frame) = u_alloc_strict(preferred, preferred) {
-            return Ok(frame);
+        match u_alloc_strict(preferred, preferred) {
+            Ok(frame) => return Ok(frame),
+            Err(FrameAllocError::ReservePressure) => {
+                return Err(FrameAllocError::ReservePressure);
+            }
+            Err(_) => {}
         }
     }
     for node in 0..MAX_NUMA_NODES {
         if node != preferred && (allowed >> node) & 1 != 0 {
-            if let Ok(frame) = u_alloc_strict(node, preferred) {
-                return Ok(frame);
+            match u_alloc_strict(node, preferred) {
+                Ok(frame) => return Ok(frame),
+                Err(FrameAllocError::ReservePressure) => {
+                    return Err(FrameAllocError::ReservePressure);
+                }
+                Err(_) => {}
             }
         }
     }
@@ -524,8 +540,12 @@ fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
     }
     let preferred = candidates[0];
     for &node in &candidates[..count] {
-        if let Ok(f) = u_alloc_strict(node, preferred) {
-            return Ok(f);
+        match u_alloc_strict(node, preferred) {
+            Ok(frame) => return Ok(frame),
+            Err(FrameAllocError::ReservePressure) => {
+                return Err(FrameAllocError::ReservePressure);
+            }
+            Err(_) => {}
         }
     }
     Err(FrameAllocError::Exhausted)

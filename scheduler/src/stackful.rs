@@ -1303,6 +1303,8 @@ impl KernelTask {
         // does not leave `current_domain()` answering with its domain for
         // whoever runs next.
         narf_arch::set_current_domain_byte(self.domain_byte);
+        // SAFETY: both contexts and the task-owned stack remain live across
+        // this switch; `exec_ctx` is this CPU's exclusive persistent slot.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
