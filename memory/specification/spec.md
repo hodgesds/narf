@@ -29,6 +29,15 @@ pub struct PhysFrame;     // owned 4 KiB physical frame (base page)
 pub struct VirtAddr(u64);
 pub struct DomainId(u8);  // 0..16
 
+pub enum FrameAllocError {
+    Exhausted,
+    /// User backing was refused before consuming the protected kernel reserve.
+    ReservePressure,
+    Uninitialised,
+    NotSupported,
+    AuthorityRevoked,
+}
+
 /// Reserved domain IDs. Authoritative assignment table is in
 /// `security-model/specification/spec.md` §4.1; the constants below
 /// are the code-side mirror. Any spec referencing one of these
@@ -483,6 +492,13 @@ impl AddressSpace {
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
+    /// Atomically select a reusable aligned mmap gap and publish an ordinary
+    /// private anonymous VMA; a free non-zero hint wins, otherwise the first
+    /// suitable gap at or above MMAP_CURSOR_BASE is selected.
+    pub fn map_private_anonymous_region_anywhere_limited(
+        &self, region: Region, hint: VirtAddr, align: u64,
+        explicit_lock: bool, limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<VirtAddr, AddressSpaceError>;
     /// Transaction-held MAP_FIXED_NOREPLACE private-anonymous counterpart.
     /// Exact-address overlap is decided non-destructively while the caller
     /// holds the VMA transaction; no mapping receipt escapes coalescing.
@@ -831,7 +847,9 @@ x86_64 is rejected at runtime.
   not serialize on a global frame lock. Coordinated draining bypasses new cache
   insertion before high-order retry; runtime-hotplug nodes bypass the cache so
   exact-range offline admission continues to observe every free frame in the
-  buddy.
+  buddy. Aggregate snapshots visit only nodes in the published online mask;
+  node counters are initialized before their bit is set and their bit is
+  cleared only after the final range has left the allocator.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range
@@ -909,6 +927,11 @@ x86_64 is rejected at runtime.
   a non-destructive map operation while that same VMA transaction is held;
   an unlocked fast rejection is advisory only, so a racing CLONE_VM insertion
   returns overlap without punching its mapping or retiring external owners.
+  Ordinary non-fixed private-anonymous placement follows Linux's unmapped-area
+  model: it accepts a suitably aligned free hint, otherwise finds the first
+  aligned hole in the mmap window. Selection and VMA publication share the
+  per-address-space transaction, so holes released by munmap are reusable and
+  no CLONE_VM peer can claim a selected interval before it is published.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
@@ -957,14 +980,17 @@ x86_64 is rejected at runtime.
   the fault path and returns to the frame allocator; a cancelled file alias is
   released through its backing-owner hook.
 - An anonymous demand fault refused by the protected user reserve reports
-  `ReclaimPressure` only after cancelling its exact page ticket and releasing
-  the region and allocator locks. The frame fault path may then register the
-  current stackful task in a fixed allocation-free waiter table, park, and
-  retry once after kswapd progress or completion. A generation handshake
-  orders waiter publication against completion, while absent stackful context,
-  full waiter capacity, and a second zero-progress failure all fail without
-  sleeping again. File refusal, missing VMAs, and ordinary placement/range
-  exhaustion never enter this wait path.
+  the typed `FrameAllocError::ReservePressure` directly from the allocator;
+  fallback policy walks preserve that result rather than collapsing it into
+  ordinary exhaustion. The fault reports `ReclaimPressure` only after
+  cancelling its exact page ticket and releasing the region and allocator
+  locks. The frame fault path may then register the current stackful task in a
+  fixed allocation-free waiter table, park, and retry once after kswapd
+  progress or completion. A generation handshake orders waiter publication
+  against completion, while absent stackful context, full waiter capacity, and
+  a second zero-progress failure all fail without sleeping again. File refusal,
+  missing VMAs, and ordinary placement/range exhaustion never enter this wait
+  path.
 - COW write faults use the same page-scoped exclusion principle. The ticket
   owner takes a temporary source-frame reference before releasing the region
   lock, allocates and copies outside that lock, and republishes only if the

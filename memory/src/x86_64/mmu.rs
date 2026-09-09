@@ -43,7 +43,9 @@ pub enum MmuError {
 impl From<FrameAllocError> for MmuError {
     fn from(e: FrameAllocError) -> Self {
         match e {
-            FrameAllocError::Exhausted => MmuError::FramesExhausted,
+            FrameAllocError::Exhausted | FrameAllocError::ReservePressure => {
+                MmuError::FramesExhausted
+            }
             FrameAllocError::Uninitialised => MmuError::AllocatorUninitialised,
             // `NotSupported` (e.g. bump-impl free) and `AuthorityRevoked`
             // (Cap::check_live failure on install) shouldn't reach the

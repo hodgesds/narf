@@ -290,8 +290,20 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
 
     // Base selection. Destructive MAP_FIXED replacement is deferred until the
     // requested mapping's semantic, backing, and lock-limit checks pass.
-    let base = if fixed {
+    let defer_private_anonymous_placement = !fixed
+        && anonymous
+        && map_type == MAP_PRIVATE
+        && huge_size.is_none()
+        && !(flags & MAP_POPULATE != 0
+            && flags & MAP_NONBLOCK == 0
+            && (prot & 0b111) != 0);
+    let mut base = if fixed {
         hint
+    } else if defer_private_anonymous_placement {
+        // The ordinary lazy private-anonymous path selects and publishes a
+        // reusable Linux-style VMA gap atomically after its fallible backing
+        // metadata has been prepared.
+        0
     } else {
         as_ref.reserve_mmap_va_aligned(len, page_size)
     };
@@ -299,7 +311,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // (the bump cursor would cross MMAP_WINDOW_TOP into the stack reserve).
     // Fail closed with -ENOMEM rather than mapping at a bogus base.
     // (MAP_FIXED takes the `hint` arm above, which is non-zero.)
-    if base == 0 {
+    if base == 0 && !defer_private_anonymous_placement {
         const ENOMEM: i64 = 12;
         ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
         return;
@@ -987,12 +999,25 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         })
         .map(|_| ())
     } else if anonymous && flags & MAP_PRIVATE != 0 {
-        as_ref.map_private_anonymous_region_limited(
-            region,
-            explicit_lock,
-            mlock_authority.limit_bytes,
-            mlock_authority.bypass_limit,
-        )
+        if defer_private_anonymous_placement {
+            as_ref
+                .map_private_anonymous_region_anywhere_limited(
+                    region,
+                    VirtAddr::new(hint),
+                    page_size,
+                    explicit_lock,
+                    mlock_authority.limit_bytes,
+                    mlock_authority.bypass_limit,
+                )
+                .map(|selected| base = selected.as_u64())
+        } else {
+            as_ref.map_private_anonymous_region_limited(
+                region,
+                explicit_lock,
+                mlock_authority.limit_bytes,
+                mlock_authority.bypass_limit,
+            )
+        }
     } else {
         let receipt = as_ref.map_region_limited_receipt(
             region,

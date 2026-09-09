@@ -3873,6 +3873,92 @@ fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_mmap_arena_fails_closed_at_ceiling);
 
+/// Linux get_unmapped_area searches the live VMA topology rather than burning
+/// virtual address space through a monotonic cursor. A private-anonymous hole
+/// released by munmap must therefore be selected again, and a usable non-fixed
+/// hint must win without becoming MAP_FIXED.
+fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    const LEN: u64 = 4 * 4096;
+    let aspace = AddressSpace::empty();
+    let lazy_region = || Region {
+        base: VirtAddr::new(0),
+        len: LEN,
+        perms: RegionPerms::READ | RegionPerms::WRITE,
+        phys: alloc::vec![PhysAddr::new(0); (LEN / 4096) as usize],
+    };
+    let first = match aspace.map_private_anonymous_region_anywhere_limited(
+        lazy_region(),
+        VirtAddr::new(0),
+        4096,
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("initial anonymous placement failed"),
+    };
+    if first.as_u64() != AddressSpace::MMAP_CURSOR_BASE {
+        return TestResult::Fail("initial anonymous placement missed the first mmap gap");
+    }
+    if aspace.unmap_region(first).is_err() {
+        return TestResult::Fail("could not release initial anonymous mapping");
+    }
+    let reused = match aspace.map_private_anonymous_region_anywhere_limited(
+        lazy_region(),
+        VirtAddr::new(0),
+        4096,
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("anonymous hole reuse failed"),
+    };
+    if reused != first {
+        return TestResult::Fail("released anonymous mmap hole was not reused");
+    }
+
+    let occupied_hint = VirtAddr::new(first.as_u64() + 4096);
+    let after_occupied = match aspace.map_private_anonymous_region_anywhere_limited(
+        lazy_region(),
+        occupied_hint,
+        4096,
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("occupied-hint fallback placement failed"),
+    };
+    if after_occupied.as_u64() != first.as_u64() + LEN {
+        return TestResult::Fail("occupied non-fixed hint did not fall back to the first gap");
+    }
+
+    let unaligned_hint = AddressSpace::MMAP_CURSOR_BASE + 0x20_0001;
+    let aligned_hint = VirtAddr::new((unaligned_hint + 4095) & !4095);
+    let hinted = match aspace.map_private_anonymous_region_anywhere_limited(
+        lazy_region(),
+        VirtAddr::new(unaligned_hint),
+        4096,
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("hinted anonymous placement failed"),
+    };
+    if hinted != aligned_hint {
+        return TestResult::Fail("free non-fixed mmap hint was not aligned and honoured");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints
+);
+
 /// Regression: an in-place `mremap` grow (`grow_region`) MUST advance the
 /// monotonic mmap bump cursor past the grown region, exactly as a fresh
 /// `map_region` does. Before the fix, `grow_region` extended the region's
@@ -5796,7 +5882,9 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not initialised in this flavour")
         }
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant for oversize order")
         }
         Ok(_) => TestResult::Fail("oversize order should fail, not succeed"),
@@ -6403,7 +6491,9 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
             TestResult::Skip("frame allocator not up in this flavour")
         }
         Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant from alloc_pages_on")
         }
     }
@@ -6422,7 +6512,9 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
             TestResult::Pass
         }
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
-        Err(FrameAllocError::NotSupported) | Err(FrameAllocError::AuthorityRevoked) => {
+        Err(FrameAllocError::ReservePressure)
+        | Err(FrameAllocError::NotSupported)
+        | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant at MAX_ORDER boundary")
         }
     }
