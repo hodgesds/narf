@@ -37,7 +37,7 @@ narf-io              = { path = "../../io" }
 narf-drivers-backlight = { path = "../backlight" }
 
 [features]
-# Tests cover linux-compat-only code (the DRM sysfs class bridge), so the
+# Tests cover the DRM sysfs class bridge, so the
 # kernel-test build must compile those paths.
 kernel-test = []
 
