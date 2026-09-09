@@ -1111,6 +1111,74 @@ fn smoke_abi_proc2_pid_fd_lists_and_symlinks() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_pid_fd_lists_and_symlinks);
 
+// /proc/self/fd/<n> — the "self" magic dir must resolve as an INTERMEDIATE
+// down into the fd subtree. This is the exact path glibc's fexecve /
+// posix_spawn readlink to turn an fd back into a filename; a regression makes
+// a downstream execve() see an empty/absent target (the greeter-teardown
+// symptom). Distinct from the explicit-<pid> fd test above: this exercises the
+// self→pid magic-dir hop.
+fn smoke_abi_proc2_self_fd_readlinks_backing() -> TestResult {
+    with_procfs(FAKE_TASK, "selffd", &["selffd"], 0, |base| {
+        let auth = bootstrap_mount_authority();
+        let fs = narf_filesystem::MemFs::with_seeds("sfdm", &[("f", b"hi")]);
+        let mh = registry()
+            .mount(&auth, "/sfdm", fs)
+            .map_err(|_| "backing memfs mount failed")?;
+        let result = (|| {
+            let srcfd = match call_open(b"/sfdm/f\0".as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => fd as u32,
+                _ => return Err("open of backing file failed"),
+            };
+            let link = alloc::format!("{}/self/fd/{}\0", base, srcfd);
+            let mut buf = [0u8; 128];
+            let n = match call_readlink(
+                link.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ) {
+                Some(v) if v > 0 => v as usize,
+                Some(0) => return Err("readlink /proc/self/fd/<n> returned EMPTY target"),
+                _ => return Err("readlink /proc/self/fd/<n> failed (self magic dir not resolved as intermediate?)"),
+            };
+            let target = core::str::from_utf8(&buf[..n]).map_err(|_| "fd link target not utf-8")?;
+            if target.ends_with("/sfdm/f") {
+                Ok(())
+            } else {
+                Err("/proc/self/fd/<n> did not resolve to the backing path via the self magic dir")
+            }
+        })();
+        let _ = registry().unmount(&mh, "/sfdm");
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_self_fd_readlinks_backing);
+
+// An fd with NO path-based open (memfd) must still readlink to a NON-EMPTY
+// target — Linux renders "/memfd:<name> (deleted)"; NARF renders
+// "anon_inode:[...]". An EMPTY target is precisely what would turn a fexecve
+// of such an fd into execve("") -> ENOENT, so this guards the never-empty
+// invariant for the whole /proc/<pid>/fd surface.
+fn smoke_abi_proc2_anon_fd_readlink_nonempty() -> TestResult {
+    with_procfs(FAKE_TASK, "anonfd", &["anonfd"], 0, |base| {
+        let fd = match call(Syscall::MemfdCreate.raw(), a1(b"t\0".as_ptr() as u64, 0)) {
+            Some(fd) if fd >= 0 => fd as u32,
+            _ => return Err("memfd_create failed"),
+        };
+        let link = alloc::format!("{}/{}/fd/{}\0", base, FAKE_TASK, fd);
+        let mut buf = [0u8; 128];
+        match call_readlink(
+            link.as_ptr() as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+        ) {
+            Some(v) if v > 0 => Ok(()),
+            Some(0) => Err("readlink of an anon (memfd) /proc/<pid>/fd/<n> returned EMPTY"),
+            _ => Err("readlink of an anon (memfd) /proc/<pid>/fd/<n> failed"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_anon_fd_readlink_nonempty);
+
 fn smoke_abi_proc2_fdinfo_uses_live_fd_metadata() -> TestResult {
     with_procfs(FAKE_TASK, "fdinfoproc", &["fdinfoproc"], 0, |base| {
         let auth = bootstrap_mount_authority();
