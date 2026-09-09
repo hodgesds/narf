@@ -17,6 +17,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::cell::Cell;
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -236,10 +237,10 @@ impl RegionPerms {
     /// Internal flag: this region is a stack guard page. Carries
     /// no POSIX prot bits — `materialize` skips installing a PTE
     /// so a user-mode access faults with P=0 — but the trap path
-    /// recognises the bit, allocates a fresh frame, promotes this
-    /// region to R+W, and installs a *new* one-page guard region
-    /// directly below. Implements POSIX-style automatic stack
-    /// extension on first write to the guard page.
+    /// recognises the bit, expands stack metadata down to the fault,
+    /// demand-backs that page, and installs a *new* one-page guard
+    /// region directly below. Implements POSIX-style automatic stack
+    /// extension on first access below the stack.
     /// Bit 9, separate from LOCKED (bit 8); the POSIX prot mask
     /// strips it the same way.
     pub const STACK_GUARD: RegionPerms = RegionPerms(1 << 9);
@@ -357,6 +358,8 @@ struct StackGrowthPlan {
     new_guard_base: u64,
     npages: u64,
     grown_perms: RegionPerms,
+    total_stack_bytes: u64,
+    total_mapped_bytes: u64,
 }
 
 impl StackGrowthLimits {
@@ -432,9 +435,9 @@ pub struct Region {
     pub base: VirtAddr,
     pub len: u64,
     pub perms: RegionPerms,
-    /// Per-page phys backing. Length must equal `len / 4096`; an
-    /// empty Vec is a structural error rejected by `map_region`.
-    /// `PhysAddr::new(0)` slots are unbacked (demand paging).
+    /// Per-page phys backing. Length normally equals `len / 4096`.
+    /// Demand-grown heap and stack regions may keep only a materialized
+    /// prefix; missing entries and `PhysAddr::new(0)` are both unbacked.
     pub phys: Vec<PhysAddr>,
 }
 
@@ -592,6 +595,15 @@ struct RegionTable {
     /// Kept under the same lock as `Region::phys` so the two authorities can
     /// never disagree at a visible transaction boundary.
     swap_pages: BTreeMap<u64, SwapPageState>,
+    /// Lazily-maintained `mm->total_vm` equivalent. Structural and mutable
+    /// region access invalidates it; read-mostly admission paths recompute at
+    /// most once between VMA mutations instead of walking a fragmented stack
+    /// twice for every fault.
+    mapped_bytes_cache: Cell<Option<u64>>,
+    /// Cumulative bytes in the exact-adjacent stack chain at `base`.
+    /// Automatic growth moves the chain base monotonically downward and can
+    /// update this in O(1); any other VMA mutation invalidates it.
+    stack_chain_cache: Cell<Option<(u64, u64)>>,
 }
 
 #[derive(Clone, Debug)]
@@ -626,7 +638,15 @@ impl RegionTable {
             demand_pages: DemandClaims::new(),
             cow_pages: BTreeMap::new(),
             swap_pages: BTreeMap::new(),
+            mapped_bytes_cache: Cell::new(Some(0)),
+            stack_chain_cache: Cell::new(None),
         }
+    }
+
+    #[inline]
+    fn invalidate_region_caches(&self) {
+        self.mapped_bytes_cache.set(None);
+        self.stack_chain_cache.set(None);
     }
 
     #[inline]
@@ -640,6 +660,7 @@ impl RegionTable {
     }
 
     fn for_each_mut(&mut self, mut visit: impl FnMut(&mut Region)) {
+        self.invalidate_region_caches();
         self.by_base.for_each_mut(|entry| visit(&mut entry.region));
     }
 
@@ -650,6 +671,7 @@ impl RegionTable {
 
     #[inline]
     fn get_mut(&mut self, base: u64) -> Option<&mut Region> {
+        self.invalidate_region_caches();
         self.by_base.get_mut(base).map(|entry| &mut entry.region)
     }
 
@@ -674,7 +696,10 @@ impl RegionTable {
             .filter(|region| address < region.base.as_u64().saturating_add(region.len))
     }
 
-    fn containing_mut(&mut self, address: u64) -> Option<&mut Region> {
+    /// Mutable lookup for changes to physical backing only. Callers must not
+    /// alter the region's base, length, or permissions: those fields feed the
+    /// VMA accounting caches and require a structural mutable accessor.
+    fn containing_backing_mut(&mut self, address: u64) -> Option<&mut Region> {
         let base = self.by_base.predecessor_or_equal(address)?.0;
         let region = &mut self.by_base.get_mut(base)?.region;
         (address < region.base.as_u64().saturating_add(region.len)).then_some(region)
@@ -780,6 +805,7 @@ impl RegionTable {
     }
 
     fn insert_reserved(&mut self, region: Region) -> Option<Region> {
+        self.invalidate_region_caches();
         let base = region.base.as_u64();
         let id = self.next_mapping_id;
         self.next_mapping_id = self
@@ -799,6 +825,7 @@ impl RegionTable {
 
     #[inline]
     fn remove(&mut self, base: u64) -> Option<Region> {
+        self.invalidate_region_caches();
         let region = self.by_base.remove(base)?.region;
         let end = region.base.as_u64().saturating_add(region.len);
         self.demand_pages.retain_outside(region.base.as_u64(), end);
@@ -981,6 +1008,7 @@ impl RegionTable {
 
     /// Mutable counterpart of [`Self::for_each_overlapping`].
     fn for_each_overlapping_mut(&mut self, lo: u64, hi: u64, mut visit: impl FnMut(&mut Region)) {
+        self.invalidate_region_caches();
         let start = self
             .by_base
             .predecessor(lo)
@@ -1072,8 +1100,14 @@ impl RegionTable {
     }
 
     fn mapped_bytes(&self) -> u64 {
-        self.iter()
-            .fold(0, |total, region| total.saturating_add(region.len))
+        if let Some(bytes) = self.mapped_bytes_cache.get() {
+            return bytes;
+        }
+        let bytes = self
+            .iter()
+            .fold(0u64, |total, region| total.saturating_add(region.len));
+        self.mapped_bytes_cache.set(Some(bytes));
+        bytes
     }
 
     /// Bytes represented by Linux-style VMAs for resource-limit accounting.
@@ -1103,6 +1137,11 @@ impl RegionTable {
 
     /// Bytes in the exact-adjacent stack chain beginning at `base`.
     fn contiguous_stack_bytes_from(&self, base: u64) -> u64 {
+        if let Some((cached_base, bytes)) = self.stack_chain_cache.get() {
+            if cached_base == base {
+                return bytes;
+            }
+        }
         let mut cursor = base;
         let mut total = 0u64;
         while let Some(region) = self.get(cursor) {
@@ -1112,6 +1151,7 @@ impl RegionTable {
             total = total.saturating_add(region.len);
             cursor = cursor.saturating_add(region.len);
         }
+        self.stack_chain_cache.set(Some((base, total)));
         total
     }
 }
@@ -2587,14 +2627,15 @@ impl AddressSpace {
         // which would silently leave pages unbacked or leak frames during
         // materialize.
         //
-        // EXCEPTION: a demand-paged BRK_HEAP region may carry a SHORTER phys list
-        // than its page count. brk grow extends only the region's length (O(1));
-        // each page materializes its phys slot on first fault (finish_demand_page
-        // resizes the prefix). The pages past the prefix are demand-zero, so no
-        // frame can leak (teardown iterates the materialized prefix) and none is
-        // under-mapped (the fault path installs them lazily).
+        // EXCEPTION: a demand-grown BRK_HEAP or STACK_SEGMENT region may carry
+        // a SHORTER phys list than its page count. Growth extends only VMA
+        // metadata; each page materializes its slot on first fault
+        // (finish_demand_page resizes the prefix). Pages past the prefix are
+        // demand-zero, so teardown has no absent frame to release.
         let region_pages = region.len >> 12;
-        let phys_covers = if region.perms.contains(RegionPerms::BRK_HEAP) {
+        let phys_covers = if region.perms.contains(RegionPerms::BRK_HEAP)
+            || region.perms.contains(RegionPerms::STACK_SEGMENT)
+        {
             region.phys.len() as u64 <= region_pages
         } else {
             region.phys.len() as u64 == region_pages
@@ -5642,10 +5683,10 @@ impl AddressSpace {
             punched_pages = punched_pages
                 .checked_add((last - first) as u64)
                 .ok_or(AddressSpaceError::OutOfRange)?;
-            // A demand-paged BRK_HEAP region carries a phys list SHORTER than its
-            // page count; pages past the materialized prefix are demand-zero with
-            // no frame. Clamp the range to the materialized prefix — the rest have
-            // nothing to release.
+            // A demand-paged heap or stack region may carry a phys list shorter
+            // than its page count; pages past the materialized prefix are
+            // demand-zero with no frame. Clamp the range to that prefix — the
+            // rest have nothing to release.
             let p_last = last.min(old.phys.len());
             let p_first = first.min(p_last);
             let resident = old.phys[p_first..p_last]
@@ -5698,8 +5739,8 @@ impl AddressSpace {
             let total = (old.len >> 12) as usize;
             let first = ((lo.max(rb) - rb) >> 12) as usize;
             let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
-            // Clamp to the materialized phys prefix — a demand-paged BRK_HEAP
-            // region's unmaterialized tail is demand-zero (no frame to release).
+            // Clamp to the materialized phys prefix — a demand-paged heap or
+            // stack region's unmaterialized tail has no frame to release.
             let p_last = last.min(old.phys.len());
             let p_first = first.min(p_last);
             if old.perms.contains(RegionPerms::SHARED) {
@@ -5711,9 +5752,9 @@ impl AddressSpace {
                 // its per-AS (root, va) reverse-map entry must still be dropped —
                 // otherwise a later registry free finds a stale owner.
                 // Clamp to the materialized phys prefix (like the release
-                // `extend`s below): a demand-paged BRK_HEAP region's unmaterialized
-                // tail has no frame and no rmap owner to retire, and slicing past
-                // its short phys list would panic.
+                // `extend`s below): a demand-paged heap or stack region's
+                // unmaterialized tail has no frame/rmap owner to retire, and
+                // slicing past its short phys list would panic.
                 for (off, phys) in old.phys[p_first..p_last].iter().enumerate() {
                     if phys.raw() != 0 {
                         let va = VirtAddr::new(rb + ((p_first + off) as u64) * 4096);
@@ -5733,9 +5774,9 @@ impl AddressSpace {
                 // leave a stale (root, va) owner on the reclaimed frame (Linux
                 // free_pages_prepare's "nonzero mapcount" invariant).
                 // Clamp to the materialized phys prefix (like the release
-                // `extend`s below): a demand-paged BRK_HEAP region's unmaterialized
-                // tail has no frame and no rmap owner to retire, and slicing past
-                // its short phys list would panic.
+                // `extend`s below): a demand-paged heap or stack region's
+                // unmaterialized tail has no frame/rmap owner to retire, and
+                // slicing past its short phys list would panic.
                 for (off, phys) in old.phys[p_first..p_last].iter().enumerate() {
                     if phys.raw() != 0 {
                         let va = VirtAddr::new(rb + ((p_first + off) as u64) * 4096);
@@ -5753,8 +5794,8 @@ impl AddressSpace {
             if rb < lo {
                 let n = ((lo - rb) >> 12) as usize;
                 // Kept head keeps its materialized prefix; the region stays
-                // demand-paged (its perms — BRK_HEAP for a heap split — permit a
-                // short phys list).
+                // demand-paged (BRK_HEAP/STACK_SEGMENT permits a short phys
+                // list).
                 kept_regions.push(Region {
                     base: VirtAddr::new(rb),
                     len: (n as u64) * 4096,
@@ -6632,10 +6673,9 @@ impl AddressSpace {
         }
         let index = ((v - rb) >> 12) as usize;
         // `containing(v)` proved the page lies in this region, so `index` is a
-        // valid page. A demand-paged BRK_HEAP region grows its length without
+        // valid page. A demand-paged heap or stack can grow its VMA without
         // materializing per-page phys slots, so an index past the materialized
-        // prefix is simply an unfaulted (demand-zero) page — identical to an
-        // in-range `phys[i] == 0`.
+        // prefix is an unfaulted demand-zero page, just like `phys[i] == 0`.
         let phys = region.phys.get(index).copied().unwrap_or(PhysAddr::new(0));
         let perms = region.perms;
         if phys.raw() != 0 {
@@ -6666,18 +6706,18 @@ impl AddressSpace {
         if regions.demand_pages.get(v) != Some(ticket) {
             return Ok(false);
         }
-        let Some(region) = regions.containing_mut(v) else {
+        let Some(region) = regions.containing_backing_mut(v) else {
             regions.demand_pages.remove(v);
             return Ok(false);
         };
         let rb = region.base.as_u64();
         let index = ((v - rb) >> 12) as usize;
         // Grow the materialized phys prefix to cover this page for a demand-paged
-        // region whose phys list is shorter than its length (BRK_HEAP): a grow
-        // only extended the region's length, so the first fault of each page
-        // installs its slot here. Intermediate pages fill with demand-zero
-        // sentinels, keeping every page independently faultable. Sequential brk
-        // touch makes this amortized O(1) per fault.
+        // region whose phys list is shorter than its length (heap or stack):
+        // growth extended only the VMA, so the first fault of each page installs
+        // its slot here. Intermediate pages fill with demand-zero sentinels,
+        // keeping every page independently faultable. Sequential touches are
+        // amortized O(1) per fault.
         if index >= region.phys.len() {
             region.phys.resize(index + 1, PhysAddr::new(0));
         }
@@ -6913,7 +6953,7 @@ impl AddressSpace {
                     );
                     {
                         let region = table
-                            .containing_mut(va)
+                            .containing_backing_mut(va)
                             .expect("swap victim region disappeared during transaction");
                         let index = ((va - region.base.as_u64()) >> 12) as usize;
                         assert_eq!(region.phys[index], *phys);
@@ -7092,7 +7132,7 @@ impl AddressSpace {
                     );
                     {
                         let region = table
-                            .containing_mut(va)
+                            .containing_backing_mut(va)
                             .expect("swap-in region disappeared during transaction");
                         let index = ((va - region.base.as_u64()) >> 12) as usize;
                         assert_eq!(region.phys[index], PhysAddr::new(0));
@@ -7368,18 +7408,15 @@ impl AddressSpace {
         Err(AddressSpaceError::NotImplemented)
     }
 
-    /// Stack auto-extension. Called from the user-mode #PF / data-
-    /// abort handler when the fault address lies in a region
-    /// flagged `STACK_GUARD`. Allocates a fresh zeroed frame,
-    /// promotes the guard region to R+W (installing the leaf PTE
-    /// with the region's perms), and installs a fresh one-page
-    /// guard region directly below — modelled on the implicit
-    /// stack-grow behaviour POSIX.1-2017 §2.2.2 leaves
-    /// implementation-defined.
+    /// Plan stack auto-extension for the user-mode #PF / data-abort path.
+    /// The fault may hit the explicit `STACK_GUARD` or skip downward by at
+    /// most `MAX_GROW`; a successful caller publishes lazy stack metadata
+    /// across that complete interval and moves the guard below the fault.
+    /// POSIX.1-2017 §2.2.2 leaves this automatic growth implementation-
+    /// defined, while the limit checks below mirror Linux `expand_downwards`.
     ///
-    /// Rejects (`Overlap`) if a new guard one page below the
-    /// current guard would collide with an existing region — the
-    /// caller surfaces this as a real SEGV.
+    /// Rejects (`Overlap`) if the expansion or its replacement guard would
+    /// collide with an existing region; the caller surfaces this as a SEGV.
     ///
     /// Returns `Unmapped` if `vaddr` is outside every region or
     /// the containing region is not flagged `STACK_GUARD` (real
@@ -7446,15 +7483,12 @@ impl AddressSpace {
             .ok_or(AddressSpaceError::OutOfRange)?;
 
         let existing_stack_bytes = regions.contiguous_stack_bytes_from(above_base);
-        if existing_stack_bytes.saturating_add(growth_bytes) > limits.stack_bytes {
+        let total_stack_bytes = existing_stack_bytes.saturating_add(growth_bytes);
+        if total_stack_bytes > limits.stack_bytes {
             return Err(AddressSpaceError::StackLimit);
         }
-        if regions
-            .mapped_bytes()
-            .saturating_add(huge_mapped_bytes)
-            .saturating_add(growth_bytes)
-            > limits.address_space_bytes
-        {
+        let total_mapped_bytes = regions.mapped_bytes().saturating_add(growth_bytes);
+        if total_mapped_bytes.saturating_add(huge_mapped_bytes) > limits.address_space_bytes {
             return Err(AddressSpaceError::StackLimit);
         }
         if grown_perms.contains(RegionPerms::LOCKED)
@@ -7470,34 +7504,39 @@ impl AddressSpace {
             new_guard_base,
             npages,
             grown_perms,
+            total_stack_bytes,
+            total_mapped_bytes,
         })
     }
 
-    fn free_stack_frames(frames: Vec<crate::PhysAddr>) {
-        for phys in frames {
-            crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
-        }
-    }
-
-    unsafe fn allocate_stack_frames(
-        npages: u64,
-    ) -> Result<Vec<crate::PhysAddr>, AddressSpaceError> {
-        let mut frames = Vec::with_capacity(npages as usize);
-        for _ in 0..npages {
-            let phys = match crate::frame::alloc_user_frame() {
-                Ok(frame) => frame.start_address(),
-                Err(_) => {
-                    Self::free_stack_frames(frames);
-                    return Err(AddressSpaceError::OutOfRange);
+    /// Verify that lazy stack metadata would not annex an orphaned hardware
+    /// leaf. Linux can rely on page-table reachability through its VMA tree;
+    /// NARF keeps this stronger explicit PTE/Region ownership check.
+    unsafe fn stack_growth_range_is_unmapped(&self, plan: StackGrowthPlan) -> bool {
+        for index in 0..=plan.npages {
+            let page = VirtAddr::new(plan.new_guard_base + index * 0x1000);
+            #[cfg(target_arch = "x86_64")]
+            {
+                // SAFETY: forwarded live-root contract; translation performs
+                // a read-only walk of this address space's user page tables.
+                if unsafe { crate::x86_64::paging::translate(self.root, page) }.is_some() {
+                    return false;
                 }
-            };
-            // SAFETY: the fresh user frame is exclusively owned here and the
-            // architecture's kernel alias remains valid while a user AS is
-            // active.
-            unsafe { core::ptr::write_bytes(phys.kernel_mut_ptr::<u8>(), 0, 4096) };
-            frames.push(phys);
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                // SAFETY: same contract for the live TTBR0 root.
+                if unsafe { crate::aarch64::paging::translate(self.root, page) }.is_some() {
+                    return false;
+                }
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            {
+                let _ = page;
+                return false;
+            }
         }
-        Ok(frames)
+        true
     }
 
     /// Grow a stack without Linux task-specific resource limits.
@@ -7511,8 +7550,12 @@ impl AddressSpace {
         unsafe { self.try_grow_stack_limited(vaddr, StackGrowthLimits::UNLIMITED) }
     }
 
-    #[cfg(target_arch = "x86_64")]
     /// Grow a stack after admitting the expansion against Linux task limits.
+    ///
+    /// Like Linux `expand_downwards`, this publishes lazy VMA coverage for the
+    /// complete gap but backs only the faulting page. An eagerly locked stack
+    /// is the exception: its complete newly-grown interval is populated on a
+    /// best-effort basis before the faulting page receives its final attempt.
     ///
     /// # Safety
     /// Same live-root, kernel-alias, and allocator requirements as
@@ -7522,11 +7565,10 @@ impl AddressSpace {
         vaddr: VirtAddr,
         limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError> {
-        use crate::x86_64::paging::{map_4kb, unmap_4kb, PtFlags};
         let v_page = vaddr.as_u64() & !0xFFFu64;
-        // Preflight under the VMA transaction, then allocate outside every
-        // address-space lock. Allocation may reclaim or otherwise take an
-        // unbounded path and must not pin an IRQ-safe guard.
+        // Preflight under the VMA transaction. The final transaction repeats
+        // every limit/topology check because a CLONE_VM peer may mutate the
+        // stack between these critical sections.
         let plan = {
             let _vma_guard = self.vma_transaction.lock();
             let huge = self.huge_regions.lock();
@@ -7536,123 +7578,6 @@ impl AddressSpace {
                 .fold(0u64, |total, region| total.saturating_add(region.len));
             Self::stack_growth_plan(&regions, huge_bytes, v_page, limits)?
         };
-        // SAFETY: forwarded frame-allocation and kernel-alias contract.
-        let new_phys = unsafe { Self::allocate_stack_frames(plan.npages) }?;
-        let mut guard_phys = Vec::new();
-        if guard_phys.try_reserve_exact(1).is_err() {
-            Self::free_stack_frames(new_phys);
-            return Err(AddressSpaceError::AllocationFailed);
-        }
-        guard_phys.push(crate::PhysAddr::new(0));
-
-        // A CLONE_VM peer may have changed the stack while allocation ran.
-        // Revalidate the complete plan before touching a PTE; a mismatch owns
-        // no published state and can release every speculative frame.
-        let _vma_guard = self.vma_transaction.lock();
-        let huge = self.huge_regions.lock();
-        let mut regions = self.regions.lock();
-        let huge_bytes = huge
-            .iter()
-            .fold(0u64, |total, region| total.saturating_add(region.len));
-        let current = Self::stack_growth_plan(&regions, huge_bytes, v_page, limits);
-        if current != Ok(plan) {
-            let error = current.err().unwrap_or(AddressSpaceError::Unmapped);
-            drop(regions);
-            drop(huge);
-            drop(_vma_guard);
-            Self::free_stack_frames(new_phys);
-            return Err(error);
-        }
-
-        // The grown stack and replacement guard are committed only after PTE
-        // installation, so prepare both index nodes before that first leaf.
-        if let Err(error) = regions.try_reserve_nodes(2) {
-            drop(regions);
-            drop(huge);
-            drop(_vma_guard);
-            Self::free_stack_frames(new_phys);
-            return Err(error);
-        }
-
-        let mut flags = PtFlags::USER | PtFlags::WRITABLE;
-        if !plan.grown_perms.contains(RegionPerms::EXEC) {
-            flags |= PtFlags::NO_EXEC;
-        }
-        for (index, phys) in new_phys.iter().copied().enumerate() {
-            let page = VirtAddr::new(plan.v_page + (index as u64) * 0x1000);
-            // SAFETY: the final plan is stable under the VMA transaction and
-            // each frame is fresh, aligned, and exclusively owned.
-            if unsafe { map_4kb(self.root, page, phys, flags) }.is_err() {
-                for rollback in 0..index as u64 {
-                    // SAFETY: only leaves installed by this transaction are
-                    // rolled back; pre-existing leaves are never accepted.
-                    let _ = unsafe {
-                        unmap_4kb(self.root, VirtAddr::new(plan.v_page + rollback * 0x1000))
-                    };
-                }
-                drop(regions);
-                drop(huge);
-                drop(_vma_guard);
-                Self::free_stack_frames(new_phys);
-                return Err(AddressSpaceError::NotImplemented);
-            }
-        }
-
-        regions
-            .remove(plan.guard_base)
-            .expect("stack guard disappeared under region lock");
-        assert!(regions
-            .insert_reserved(Region {
-                base: VirtAddr::new(plan.v_page),
-                len: plan.npages * 0x1000,
-                perms: plan.grown_perms,
-                phys: new_phys,
-            })
-            .is_none());
-        assert!(regions
-            .insert_reserved(Region {
-                base: VirtAddr::new(plan.new_guard_base),
-                len: 0x1000,
-                perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: guard_phys,
-            })
-            .is_none());
-        Ok(())
-    }
-
-    /// Grow a stack after admitting the expansion against Linux task limits.
-    ///
-    /// # Safety
-    /// - The low-memory identity map must be live (used to zero the fresh
-    ///   frame).
-    /// - `self.root` must be a valid `TTBR0_EL1` root for the AS currently
-    ///   active on this CPU.
-    /// - The frame allocator must be initialised.
-    #[cfg(target_arch = "aarch64")]
-    pub unsafe fn try_grow_stack_limited(
-        &self,
-        vaddr: VirtAddr,
-        limits: StackGrowthLimits,
-    ) -> Result<(), AddressSpaceError> {
-        use crate::aarch64::paging::{map_4kb, unmap_4kb, PtFlags};
-        let v_page = vaddr.as_u64() & !0xFFFu64;
-        let plan = {
-            let _vma_guard = self.vma_transaction.lock();
-            let huge = self.huge_regions.lock();
-            let regions = self.regions.lock();
-            let huge_bytes = huge
-                .iter()
-                .fold(0u64, |total, region| total.saturating_add(region.len));
-            Self::stack_growth_plan(&regions, huge_bytes, v_page, limits)?
-        };
-        // SAFETY: forwarded frame-allocation and kernel-alias contract.
-        let new_phys = unsafe { Self::allocate_stack_frames(plan.npages) }?;
-        let mut guard_phys = Vec::new();
-        if guard_phys.try_reserve_exact(1).is_err() {
-            Self::free_stack_frames(new_phys);
-            return Err(AddressSpaceError::AllocationFailed);
-        }
-        guard_phys.push(crate::PhysAddr::new(0));
 
         let _vma_guard = self.vma_transaction.lock();
         let huge = self.huge_regions.lock();
@@ -7662,74 +7587,61 @@ impl AddressSpace {
             .fold(0u64, |total, region| total.saturating_add(region.len));
         let current = Self::stack_growth_plan(&regions, huge_bytes, v_page, limits);
         if current != Ok(plan) {
-            let error = current.err().unwrap_or(AddressSpaceError::Unmapped);
-            drop(regions);
-            drop(huge);
-            drop(_vma_guard);
-            Self::free_stack_frames(new_phys);
-            return Err(error);
+            return Err(current.err().unwrap_or(AddressSpaceError::Unmapped));
         }
 
-        if let Err(error) = regions.try_reserve_nodes(2) {
-            drop(regions);
-            drop(huge);
-            drop(_vma_guard);
-            Self::free_stack_frames(new_phys);
-            return Err(error);
+        // The VMA topology says this interval is empty. Reject an unexpected
+        // present leaf without replacing or unmapping it.
+        // SAFETY: caller supplies the live root; the region lock excludes
+        // concurrent demand publication while the page tables are inspected.
+        if !unsafe { self.stack_growth_range_is_unmapped(plan) } {
+            return Err(AddressSpaceError::NotImplemented);
         }
 
-        let mut flags = PtFlags::AP_RW_EL0 | PtFlags::PXN;
-        if !plan.grown_perms.contains(RegionPerms::EXEC) {
-            flags = flags | PtFlags::UXN;
-        }
-        for (index, phys) in new_phys.iter().copied().enumerate() {
-            let page = VirtAddr::new(plan.v_page + (index as u64) * 0x1000);
-            // SAFETY: the final plan is stable and the frame is fresh.
-            if unsafe { map_4kb(self.root, page, phys, flags) }.is_err() {
-                for rollback in 0..index as u64 {
-                    // SAFETY: roll back only leaves installed above.
-                    let _ = unsafe {
-                        unmap_4kb(self.root, VirtAddr::new(plan.v_page + rollback * 0x1000))
-                    };
-                }
-                drop(regions);
-                drop(huge);
-                drop(_vma_guard);
-                Self::free_stack_frames(new_phys);
-                return Err(AddressSpaceError::NotImplemented);
-            }
-        }
-
-        regions
+        // Removal plus two insertions grows the VMA index by one. Reserve both
+        // publications before mutation so neither can fail after the old guard
+        // is removed, and reuse that guard's zero backing vector.
+        regions.try_reserve_nodes(2)?;
+        let mut guard = regions
             .remove(plan.guard_base)
             .expect("stack guard disappeared under region lock");
+        debug_assert!(guard.phys.iter().all(|phys| phys.raw() == 0));
+        guard.base = VirtAddr::new(plan.new_guard_base);
+        guard.len = 0x1000;
+        guard.perms = RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT;
+
         assert!(regions
             .insert_reserved(Region {
                 base: VirtAddr::new(plan.v_page),
                 len: plan.npages * 0x1000,
                 perms: plan.grown_perms,
-                phys: new_phys,
+                // Metadata-only expansion: `finish_demand_page` grows this
+                // materialized prefix when individual pages are touched.
+                phys: Vec::new(),
             })
             .is_none());
+        assert!(regions.insert_reserved(guard).is_none());
+        // Both insertions invalidated the conservative caches. The new stack
+        // chain is exactly the admitted old chain plus this interval; publish
+        // that identity while the VMA transaction still excludes mutation.
+        regions
+            .stack_chain_cache
+            .set(Some((plan.new_guard_base + 0x1000, plan.total_stack_bytes)));
+        regions
+            .mapped_bytes_cache
+            .set(Some(plan.total_mapped_bytes));
+        drop(regions);
+        drop(huge);
+        drop(_vma_guard);
 
-        assert!(regions
-            .insert_reserved(Region {
-                base: VirtAddr::new(plan.new_guard_base),
-                len: 0x1000,
-                perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
-                phys: guard_phys,
-            })
-            .is_none());
-        Ok(())
-    }
-
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    pub unsafe fn try_grow_stack_limited(
-        &self,
-        _vaddr: VirtAddr,
-        _limits: StackGrowthLimits,
-    ) -> Result<(), AddressSpaceError> {
-        Err(AddressSpaceError::NotImplemented)
+        if plan.grown_perms.contains(RegionPerms::LOCKED)
+            && !plan.grown_perms.contains(RegionPerms::LOCK_ONFAULT)
+        {
+            self.populate_locked_range_best_effort(plan.v_page, plan.v_page + plan.npages * 0x1000);
+        }
+        // SAFETY: the lazy stack VMA now owns this address and the caller
+        // supplied the live root/kernel alias/allocator contract.
+        unsafe { self.demand_alloc_page(VirtAddr::new(plan.v_page)) }
     }
 
     /// Return whether base-page regions cover every byte in `[lo, hi)`.
@@ -7870,10 +7782,10 @@ impl AddressSpace {
             let middle_phys: Vec<_> = (&mut phys).take(middle_pages).collect();
             let tail_phys: Vec<_> = phys.collect();
 
-            if !head_phys.is_empty() {
+            if head_pages != 0 {
                 rebuilt.push(Region {
                     base: region.base,
-                    len: head_phys.len() as u64 * 4096,
+                    len: head_pages as u64 * 4096,
                     perms: region.perms,
                     phys: head_phys,
                 });
@@ -7885,15 +7797,16 @@ impl AddressSpace {
             };
             let middle = Region {
                 base: VirtAddr::new(split_lo),
-                len: middle_phys.len() as u64 * 4096,
+                len: middle_pages as u64 * 4096,
                 perms: middle_perms,
                 phys: middle_phys,
             };
             rebuilt.push(middle);
-            if !tail_phys.is_empty() {
+            let tail_pages = ((re - split_hi) >> 12) as usize;
+            if tail_pages != 0 {
                 rebuilt.push(Region {
                     base: VirtAddr::new(split_hi),
-                    len: tail_phys.len() as u64 * 4096,
+                    len: tail_pages as u64 * 4096,
                     perms: region.perms,
                     phys: tail_phys,
                 });
@@ -8560,10 +8473,11 @@ impl AddressSpace {
                 new_list.push(mid_region);
 
                 // Tail fragment (preserves old perms).
-                if !tail_phys.is_empty() {
+                let tail_pages = ((re - split_hi) >> 12) as usize;
+                if tail_pages != 0 {
                     new_list.push(Region {
                         base: VirtAddr::new(split_hi),
-                        len: (tail_phys.len() as u64) << 12,
+                        len: (tail_pages as u64) << 12,
                         perms: r.perms,
                         phys: tail_phys,
                     });
@@ -9953,7 +9867,7 @@ impl AddressSpace {
             });
             if owns_ticket && current_matches {
                 let region = regions
-                    .containing_mut(v)
+                    .containing_backing_mut(v)
                     .expect("COW region disappeared under its lock");
                 let page_idx = ((v - region.base.as_u64()) >> 12) as usize;
                 region.phys[page_idx] = new_phys;
@@ -10014,7 +9928,7 @@ impl AddressSpace {
         let mut regions = self.regions.lock();
         let v = page_va.as_u64();
         let region = regions
-            .containing_mut(v)
+            .containing_backing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
         if region.perms.contains(RegionPerms::SHARED) {
             return Err(AddressSpaceError::SharedMapping);
@@ -10268,7 +10182,7 @@ impl AddressSpace {
         let v = page_va.as_u64();
         let mut regions = self.regions.lock();
         let region = regions
-            .containing_mut(v)
+            .containing_backing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
         if region.perms.contains(RegionPerms::SHARED) {
             return Err(AddressSpaceError::SharedMapping);
@@ -10300,7 +10214,7 @@ impl AddressSpace {
             return Err(AddressSpaceError::NotImplemented);
         }
         let region = regions
-            .containing_mut(v)
+            .containing_backing_mut(v)
             .ok_or(AddressSpaceError::Unmapped)?;
         let perms = region.perms;
         // Destination: the caller-provided frame (dual-scanner), else a fresh
@@ -10401,7 +10315,7 @@ impl AddressSpace {
             return Err(());
         }
         regions
-            .containing_mut(v)
+            .containing_backing_mut(v)
             .expect("region vanished under its own lock")
             .phys[page_idx] = dst;
         drop(regions);
@@ -11285,6 +11199,73 @@ fn translate_is_mapped(a: &AddressSpace, v: VirtAddr) -> bool {
         true
     }
 }
+
+/// VMA accounting caches are exact across inserts, topology/permission
+/// mutation, backing-only publication, and removal. This is the correctness
+/// boundary that lets repeated stack growth avoid rescanning an ever-longer
+/// fragment chain without trusting stale RLIMIT accounting.
+fn smoke_memory_region_accounting_caches_track_mutation() -> TestResult {
+    let mut table = RegionTable::new();
+    let base = 0x0000_0080_1000_0000u64;
+    let stack_perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT;
+    assert!(table
+        .insert(Region {
+            base: VirtAddr::new(base),
+            len: 0x1000,
+            perms: stack_perms,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("cache test RegionIndex reservation")
+        .is_none());
+    if table.mapped_bytes() != 0x1000 || table.contiguous_stack_bytes_from(base) != 0x1000 {
+        return TestResult::Fail("initial VMA accounting cache is wrong");
+    }
+
+    table
+        .containing_backing_mut(base)
+        .expect("cache test backing region")
+        .phys[0] = PhysAddr::new(0x4000);
+    if table.mapped_bytes_cache.get() != Some(0x1000)
+        || table.stack_chain_cache.get() != Some((base, 0x1000))
+    {
+        return TestResult::Fail("backing-only mutation invalidated topology accounting");
+    }
+
+    table.get_mut(base).expect("cache test stack region").len = 0x2000;
+    if table.mapped_bytes() != 0x2000 || table.contiguous_stack_bytes_from(base) != 0x2000 {
+        return TestResult::Fail("VMA length mutation retained stale accounting");
+    }
+    assert!(table
+        .insert(Region {
+            base: VirtAddr::new(base + 0x2000),
+            len: 0x1000,
+            perms: stack_perms,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("cache test successor reservation")
+        .is_none());
+    if table.mapped_bytes() != 0x3000 || table.contiguous_stack_bytes_from(base) != 0x3000 {
+        return TestResult::Fail("VMA insertion retained stale accounting");
+    }
+
+    table
+        .get_mut(base + 0x2000)
+        .expect("cache test successor")
+        .perms = RegionPerms::READ;
+    if table.contiguous_stack_bytes_from(base) != 0x2000 {
+        return TestResult::Fail("permission mutation retained a stale stack chain");
+    }
+    let _ = table.remove(base + 0x2000);
+    if table.mapped_bytes() == 0x2000 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("VMA removal retained stale mapped-byte accounting")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_region_accounting_caches_track_mutation
+);
 
 fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
     let mut table = RegionTable::new();

@@ -284,8 +284,9 @@ fn try_heal_user_data_abort(esr: u64, far: u64, may_wait_for_reclaim: bool) -> b
     let is_translation_fault = (dfsc & 0b11_1100) == DFSC_TRANSLATION_FAULT_TOP;
 
     // Stack auto-extension + demand paging on translation fault (no PTE
-    // installed). mmap's deferred-back path surfaces here; if the vaddr
-    // lands in a STACK_GUARD region the trap routes into try_grow_stack.
+    // installed). mmap's deferred-back path surfaces here; if the vaddr lands
+    // in or just below a STACK_GUARD region the trap routes into
+    // try_grow_stack.
     if is_translation_fault {
         if narf_userspace::handlers::handle_numa_hint_fault(far) {
             return true;
