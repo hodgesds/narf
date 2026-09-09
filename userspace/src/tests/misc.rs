@@ -1993,29 +1993,36 @@ kernel_test_in!(
 
 kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 
-/// Task #32 DELETED the ~10 ms lost-wake backstop: every readiness source now
-/// fires a durable targeted wake, so `park_fire_deadline_ns` is the IDENTITY —
-/// a finite park fires at its REAL deadline (no clamp), and an infinite park
-/// (`u64::MAX`) gets an inert never-firing timer, relying purely on its
-/// registered wakers. (Previously infinite + finite io-wait parks were clamped
-/// to a ~10 ms backstop — e.g. a QtDBus worker poll()ing the 25 s D-Bus method
-/// timeout; that clamp is gone now that the io-waiter wake is durable.)
+/// `park_fire_deadline_ns` policy after restoring the io-wait lost-wake backstop
+/// task #32 removed. An infinite `net_io_wait` park (`u64::MAX` + io-wait) must
+/// re-poll after `NET_IO_WAIT_BACKSTOP_NS` — its gen guard only refreshes (never
+/// compares) its snapshot and `IO_WAKERS` is unlatched, so a wake racing
+/// scan→register is otherwise LOST and the task strands forever (the CachyOS
+/// greeter wedge: PARK-CENSUS with every task parked on socket I/O, SMP=1
+/// included). Every OTHER case stays the identity: a non-io infinite park
+/// (pause/futex/signal — they re-check their own condition after registering) is
+/// inert (`u64::MAX`), and any finite park fires at its REAL deadline (the
+/// durable io-waiter wake normally revives an io-wait park earlier in practice).
 #[cfg(target_arch = "x86_64")]
-fn smoke_userspace_park_fire_deadline_is_identity() -> TestResult {
-    use crate::user_task::park_fire_deadline_ns;
+fn smoke_userspace_park_fire_deadline_net_io_backstop() -> TestResult {
+    use crate::user_task::{park_fire_deadline_ns, NET_IO_WAIT_BACKSTOP_NS};
     let now = 1_000_000_000; // arbitrary "now"
 
-    // Infinite park → u64::MAX (inert timer), NOT a 10 ms backstop, regardless
-    // of io-wait.
-    if park_fire_deadline_ns(u64::MAX, now, false) != u64::MAX {
-        return TestResult::Fail("infinite park must return u64::MAX (backstop deleted)");
+    // POSITIVE (the fix): infinite io-wait park → bounded backstop, NOT inert.
+    let want = now + NET_IO_WAIT_BACKSTOP_NS;
+    if park_fire_deadline_ns(u64::MAX, now, true) != want {
+        return TestResult::Fail("infinite io-wait park must arm the lost-wake backstop");
     }
-    if park_fire_deadline_ns(u64::MAX, now, true) != u64::MAX {
-        return TestResult::Fail("infinite io-wait park must return u64::MAX (backstop deleted)");
+
+    // NEGATIVE: infinite NON-io park (pause/futex/signal) stays inert (u64::MAX)
+    // — those paths re-check their own condition after registering, so a backstop
+    // would be needless idle wakeups.
+    if park_fire_deadline_ns(u64::MAX, now, false) != u64::MAX {
+        return TestResult::Fail("infinite non-io park must stay inert (u64::MAX)");
     }
 
     // Finite io-wait park with a FAR deadline (25 s) → its REAL deadline, NOT
-    // clamped (the durable io-waiter wake revives it earlier in practice).
+    // clamped to the backstop (the durable io-waiter wake revives it earlier).
     let far = now + 25_000_000_000;
     if park_fire_deadline_ns(far, now, true) != far {
         return TestResult::Fail("finite io-wait park must fire at its real deadline (no clamp)");
@@ -2026,15 +2033,18 @@ fn smoke_userspace_park_fire_deadline_is_identity() -> TestResult {
         return TestResult::Fail("finite sleep park must fire at its real deadline");
     }
 
-    // A near deadline is returned unchanged too.
-    let near = now + 2_000_000; // 2 ms
+    // A near deadline (< backstop) is returned unchanged for BOTH io and non-io.
+    let near = now + 2_000_000; // 2 ms < 10 ms backstop
     if park_fire_deadline_ns(near, now, true) != near {
-        return TestResult::Fail("near deadline must be returned unchanged");
+        return TestResult::Fail("near io-wait deadline must be returned unchanged");
+    }
+    if park_fire_deadline_ns(near, now, false) != near {
+        return TestResult::Fail("near sleep deadline must be returned unchanged");
     }
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_park_fire_deadline_is_identity);
+kernel_test_in!("userspace", smoke_userspace_park_fire_deadline_net_io_backstop);
 
 /// A global readiness notification that races an epoll/poll waiter's
 /// registration is not evidence that *this* interest set is ready.  The

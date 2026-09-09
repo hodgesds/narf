@@ -806,18 +806,39 @@ mod current_user_task_source_tests {
 // uses the slot-waker instead of `cx.waker()`. wait4 is NOT handled here (it
 // returns a reaped result, not a re-execute) — that handler parks natively.
 
-/// Absolute-ns time at which a finite park's wheel timer should fire.
+/// Bounded lost-wake backstop period for an infinite `net_io_wait` park (the
+/// ~10 ms fallback re-poll that task #32 removed, restored for the io-wait case
+/// only). See `park_fire_deadline_ns`.
+pub(crate) const NET_IO_WAIT_BACKSTOP_NS: u64 = 10_000_000;
+
+/// Absolute-ns time at which a park's wheel timer should fire.
 ///
-/// Task #32 DELETED the 10 ms lost-wake backstop: every readiness source now
-/// fires a durable targeted wake (per-fd `Readiness` cells / io-waiter / futex /
-/// signal), so a park no longer needs a periodic fallback re-poll. This is now
-/// the identity policy shared by the own-stack and async park sites:
-/// - a FINITE park fires at its real `deadline_ns` (sleep/nanosleep duration, or
-///   a poll/epoll timeout — the io-waiter normally wakes it earlier);
-/// - an INFINITE park (`u64::MAX`) gets `u64::MAX`, i.e. an inert timer that
-///   never fires, so it relies purely on its registered wakers.
-pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, _now_ns: u64, _net_io_wait: bool) -> u64 {
-    deadline_ns
+/// Task #32 removed the global 10 ms lost-wake backstop on the premise that every
+/// readiness source fires a durable targeted wake. That holds for finite parks
+/// and for the gen/word-guarded futex & signal parks, but NOT for an infinite
+/// `net_io_wait` park: `IO_WAKERS` is unlatched and this park's generation
+/// "guard" only REFRESHES — never COMPARES — its snapshot (see
+/// `refresh_io_wait_generation_after_registration`), so a `notify` /
+/// `wake_io_owner` landing in the scan→`register_io_waiter` window is dropped and
+/// the task strands forever on an inert `u64::MAX` timer. That is the CachyOS
+/// greeter wedge: PARK-CENSUS shows every task parked on socket I/O
+/// (`netio=true`, `deadline=u64::MAX`), SMP=1 included (so it is a same-CPU
+/// check-then-park race, not a cross-CPU IPI loss). The `UserTaskCtx` field docs
+/// still describe this backstop as live ("~10 ms lost-wake backstop (infinite
+/// parks and io-parks both arm it)"); this realigns the code with that contract
+/// for the io-wait case only:
+/// - a FINITE park fires at its real `deadline_ns` (the io-waiter normally wakes
+///   it earlier);
+/// - an INFINITE `net_io_wait` park re-polls after `NET_IO_WAIT_BACKSTOP_NS`, so
+///   a lost inbound-I/O wake costs one backstop period, not a permanent wedge;
+/// - any OTHER infinite park keeps `u64::MAX` (inert timer): futex/signal
+///   re-check their own condition after registering and cannot lose a wake.
+pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
+    if deadline_ns == u64::MAX && net_io_wait {
+        now_ns.saturating_add(NET_IO_WAIT_BACKSTOP_NS)
+    } else {
+        deadline_ns
+    }
 }
 
 /// Record the readiness generation observed after an I/O waiter has been
@@ -2188,12 +2209,49 @@ impl core::future::Future for UserTaskFuture {
                     // external wake, NOT the timer tick, could revive it, so a
                     // single lost readiness wake wedged it permanently; and
                     // (2) the self-wake tick-paced its re-poll, gating off-box
-                    // round-trips at ~16.7 ms. Task #32 DELETED the 10 ms
-                    // lost-wake backstop: an infinite io-wait park now arms NO
-                    // timer and relies purely on its durable wake — the io-waiter
-                    // / futex / signal wake (re-polled PROMPTLY by the scheduler's
-                    // EXTERNAL_WAKE fast-repoll) or the per-fd `Readiness` cell.
-                    // sleep_pumps still run in the executor's own idle path.
+                    // round-trips at ~16.7 ms. Task #32 removed the global 10 ms
+                    // backstop; a non-io infinite park (pause / futex / signal)
+                    // now arms NO timer and relies purely on its durable wake —
+                    // the futex / signal wake (re-polled PROMPTLY by the
+                    // scheduler's EXTERNAL_WAKE fast-repoll) — because those paths
+                    // re-check their own condition after registering and cannot
+                    // lose a wake. An infinite NET_IO_WAIT park, however, STILL
+                    // arms the bounded lost-wake backstop (see
+                    // `park_fire_deadline_ns`): `IO_WAKERS` is unlatched and the
+                    // io-wait gen guard only refreshes its snapshot, so a wake
+                    // racing scan→register would otherwise strand the task forever
+                    // (the CachyOS greeter wedge). sleep_pumps still run in the
+                    // executor's own idle path.
+                    let fire_ns = park_fire_deadline_ns(
+                        deadline,
+                        now,
+                        this.task.uctx.net_io_wait.load(Ordering::Acquire),
+                    );
+                    if fire_ns != u64::MAX {
+                        let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
+                        // `refresh_waker_at`, not `refresh_waker`: keep the slot's
+                        // fire time current across a re-poll (see the finite-park
+                        // note below) so the backstop actually fires.
+                        let refreshed = this.sleep_handle.is_some_and(|h| {
+                            narf_scheduler::narf_time::timer_wheel::refresh_waker_at(
+                                h,
+                                deadline_cycles,
+                                cx.waker().clone(),
+                            )
+                        });
+                        if !refreshed {
+                            this.sleep_handle = narf_scheduler::narf_time::timer_wheel::register(
+                                deadline_cycles,
+                                cx.waker().clone(),
+                            )
+                            .ok();
+                            if this.sleep_handle.is_none() {
+                                // Wheel full / no arm callback: self-wake so the
+                                // task still makes progress (degraded, not wedged).
+                                cx.waker().wake_by_ref();
+                            }
+                        }
+                    }
                     return core::task::Poll::Pending;
                 }
                 // Finite sleep (sys_sleep / nanosleep): PARK on the timer
