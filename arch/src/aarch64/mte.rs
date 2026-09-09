@@ -295,7 +295,12 @@ pub const fn tag_of(ptr: u64) -> u8 {
 /// user space's untagged 0, and therefore a value no arena may be assigned.
 pub const UNTAGGED_KERNEL_TAG: u8 = 0xF;
 
-/// CPU must report `supported()`.
+/// Store the allocation tag carried by `ptr` for its containing granule.
+///
+/// # Safety
+///
+/// The CPU must report [`supported`], and `ptr` must identify a valid
+/// tag-storage mapping whose containing 16-byte granule the caller owns.
 #[inline]
 pub unsafe fn stg(ptr: *mut u8) {
     // SAFETY: STG writes the granule's allocation-tag. The granule is
