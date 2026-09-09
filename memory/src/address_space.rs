@@ -2283,6 +2283,139 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Select and publish an ordinary private-anonymous VMA in one VMA
+    /// transaction, using the first aligned hole in the mmap window.
+    ///
+    /// This is the Linux `get_unmapped_area()` shape: a non-zero hint is used
+    /// when that complete interval is free, otherwise placement searches the
+    /// live VMA topology from the mmap base. Unlike the monotonic reservation
+    /// compatibility API, holes created by `munmap` are therefore reusable.
+    /// Selection and publication share the VMA transaction, so a CLONE_VM
+    /// peer cannot claim the selected hole between those two steps.
+    pub fn map_private_anonymous_region_anywhere_limited(
+        &self,
+        mut region: Region,
+        hint: VirtAddr,
+        align: u64,
+        explicit_lock: bool,
+        limit_bytes: u64,
+        bypass_limit: bool,
+    ) -> Result<VirtAddr, AddressSpaceError> {
+        Self::mark_private_anonymous_mergeable(&mut region)?;
+        if align < 4096 || !align.is_power_of_two() || region.len == 0 {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+
+        let vma_guard = self.vma_transaction.lock();
+        let selected = {
+            // Match the global address-space lock order used by publication
+            // and range mutation. The outer VMA transaction makes the
+            // allocation-free topology walk stable until map_region_inner
+            // publishes the selected interval.
+            let huge = self.huge_regions.lock();
+            let regions = self.regions.lock();
+            Self::find_unmapped_area_locked(&regions, &huge, hint.as_u64(), region.len, align)?
+        };
+        region.base = VirtAddr::new(selected);
+        let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
+        let (receipt, eager) =
+            self.map_region_inner(region, requested, Some((limit_bytes, bypass_limit)))?;
+        self.regions
+            .lock()
+            .coalesce_anonymous_around(receipt.base.as_u64());
+        drop(vma_guard);
+        if eager {
+            self.populate_locked_range_best_effort(
+                receipt.base.as_u64(),
+                receipt.base.as_u64().saturating_add(receipt.len),
+            );
+        }
+        Ok(VirtAddr::new(selected))
+    }
+
+    /// Linux-style bottom-up unmapped-area search over the authoritative base
+    /// and huge VMA sets. The caller holds the VMA transaction and both table
+    /// locks, so the returned gap cannot disappear before publication.
+    fn find_unmapped_area_locked(
+        regions: &RegionTable,
+        huge: &[HugeRegion],
+        hint: u64,
+        len: u64,
+        align: u64,
+    ) -> Result<u64, AddressSpaceError> {
+        let align_up = |value: u64| {
+            value
+                .checked_add(align - 1)
+                .map(|rounded| rounded & !(align - 1))
+        };
+        let next_obstacle = |candidate: u64, end: u64| {
+            let regular = regions
+                .containing(candidate)
+                .or_else(|| regions.successor(candidate))
+                .map(|region| {
+                    (
+                        region.base.as_u64().max(candidate),
+                        region.base.as_u64().saturating_add(region.len),
+                    )
+                })
+                .filter(|(start, _)| *start < end);
+            let huge_region = huge
+                .iter()
+                .filter(|region| region.base.as_u64().saturating_add(region.len) > candidate)
+                .min_by_key(|region| region.base.as_u64().max(candidate))
+                .map(|region| {
+                    (
+                        region.base.as_u64().max(candidate),
+                        region.base.as_u64().saturating_add(region.len),
+                    )
+                })
+                .filter(|(start, _)| *start < end);
+
+            match (regular, huge_region) {
+                (Some((regular_start, regular_end)), Some((huge_start, huge_end))) => {
+                    Some(if regular_start <= huge_start {
+                        regular_end
+                    } else {
+                        huge_end
+                    })
+                }
+                (Some((_, regular_end)), None) => Some(regular_end),
+                (None, Some((_, huge_end))) => Some(huge_end),
+                (None, None) => None,
+            }
+        };
+        let interval_is_free = |candidate: u64| {
+            candidate
+                .checked_add(len)
+                .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+                .is_some_and(|end| next_obstacle(candidate, end).is_none())
+        };
+
+        // Linux treats a non-fixed address as a hint: align and accept it only
+        // when the entire interval is legal and currently free, then fall back
+        // to the normal search rather than reporting overlap.
+        if hint >= Self::MMAP_CURSOR_BASE {
+            if let Some(candidate) = align_up(hint) {
+                if interval_is_free(candidate) {
+                    return Ok(candidate);
+                }
+            }
+        }
+
+        let mut candidate = Self::MMAP_CURSOR_BASE;
+        loop {
+            candidate = align_up(candidate).ok_or(AddressSpaceError::MappingLimit)?;
+            let end = candidate
+                .checked_add(len)
+                .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
+                .ok_or(AddressSpaceError::MappingLimit)?;
+            let Some(obstacle_end) = next_obstacle(candidate, end) else {
+                return Ok(candidate);
+            };
+            candidate = obstacle_end;
+        }
+    }
+
     /// Transaction-held exact-address private-anonymous publication.
     ///
     /// Unlike the replacement form, this never punches an existing mapping:

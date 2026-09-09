@@ -492,6 +492,13 @@ impl AddressSpace {
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
+    /// Atomically select a reusable aligned mmap gap and publish an ordinary
+    /// private anonymous VMA; a free non-zero hint wins, otherwise the first
+    /// suitable gap at or above MMAP_CURSOR_BASE is selected.
+    pub fn map_private_anonymous_region_anywhere_limited(
+        &self, region: Region, hint: VirtAddr, align: u64,
+        explicit_lock: bool, limit_bytes: u64, bypass_limit: bool,
+    ) -> Result<VirtAddr, AddressSpaceError>;
     /// Transaction-held MAP_FIXED_NOREPLACE private-anonymous counterpart.
     /// Exact-address overlap is decided non-destructively while the caller
     /// holds the VMA transaction; no mapping receipt escapes coalescing.
@@ -920,6 +927,11 @@ x86_64 is rejected at runtime.
   a non-destructive map operation while that same VMA transaction is held;
   an unlocked fast rejection is advisory only, so a racing CLONE_VM insertion
   returns overlap without punching its mapping or retiring external owners.
+  Ordinary non-fixed private-anonymous placement follows Linux's unmapped-area
+  model: it accepts a suitably aligned free hint, otherwise finds the first
+  aligned hole in the mmap window. Selection and VMA publication share the
+  per-address-space transaction, so holes released by munmap are reusable and
+  no CLONE_VM peer can claim a selected interval before it is published.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
