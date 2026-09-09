@@ -859,6 +859,72 @@ fn smoke_abi_proc_pidfd_open_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_neg);
 
+// `pidfd_open` validates `flags` against `PIDFD_NONBLOCK | PIDFD_THREAD`
+// (`kernel/pid.c`): any other bit is -EINVAL, and the check runs BEFORE the pid
+// lookup, so even a live pid with a junk flag fails. Regression guard for the
+// parity fix that stopped ignoring `flags` entirely.
+fn smoke_abi_proc_pidfd_open_bad_flags() -> TestResult {
+    with_setup(|| {
+        // bit 0 is neither PIDFD_NONBLOCK (0o4000) nor PIDFD_THREAD (0o200).
+        match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0x1)) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("pidfd_open with an unknown flag did not return -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_bad_flags);
+
+// `if (pid <= 0) return -EINVAL;` — a NEGATIVE pid is a malformed argument
+// (EINVAL), NOT a well-formed-but-absent pid (ESRCH). Guards the fix from
+// regressing to a `== 0`-only check that let a negative pid fall through.
+fn smoke_abi_proc_pidfd_open_neg_pid() -> TestResult {
+    with_setup(|| match call(Syscall::PidfdOpen.raw(), a1((-1i64) as u64, 0)) {
+        Some(v) if v == EINVAL => Ok(()),
+        Some(v) if v == ESRCH => {
+            Err("pidfd_open(-1) returned -ESRCH; Linux gives -EINVAL for pid<=0")
+        }
+        _ => Err("pidfd_open(-1) did not return -EINVAL"),
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_neg_pid);
+
+// PIDFD_NONBLOCK (== O_NONBLOCK) is a VALID flag: accepted (not -EINVAL) and
+// reflected in the open-file status flags, matching Linux `pidfd_create` which
+// ORs `flags` into the description. `fcntl(F_GETFL)` must read it back.
+fn smoke_abi_proc_pidfd_open_nonblock() -> TestResult {
+    with_setup(|| {
+        const PIDFD_NONBLOCK: u64 = 0o4000; // O_NONBLOCK
+        const F_GETFL: u64 = 3;
+        let fd = match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, PIDFD_NONBLOCK)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("pidfd_open(PIDFD_NONBLOCK) was rejected"),
+        };
+        match call(Syscall::Fcntl.raw(), a2(fd, F_GETFL, 0)) {
+            Some(v) if (v as u64) & PIDFD_NONBLOCK == PIDFD_NONBLOCK => Ok(()),
+            _ => Err("pidfd F_GETFL did not report O_NONBLOCK"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_nonblock);
+
+// Linux opens pidfds O_CLOEXEC (`pidfd_create` → O_RDWR | O_CLOEXEC), so
+// `fcntl(F_GETFD)` reports FD_CLOEXEC.
+fn smoke_abi_proc_pidfd_open_cloexec() -> TestResult {
+    with_setup(|| {
+        const F_GETFD: u64 = 1;
+        const FD_CLOEXEC: i64 = 1;
+        let fd = match call(Syscall::PidfdOpen.raw(), a1(FAKE_TASK, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("pidfd_open failed"),
+        };
+        match call(Syscall::Fcntl.raw(), a2(fd, F_GETFD, 0)) {
+            Some(v) if v & FD_CLOEXEC == FD_CLOEXEC => Ok(()),
+            _ => Err("pidfd F_GETFD did not report FD_CLOEXEC"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_cloexec);
+
 #[cfg(feature = "container")]
 fn smoke_abi_proc_pidfd_open_translates_inner_pid() -> TestResult {
     with_setup(|| {
