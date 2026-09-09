@@ -2802,6 +2802,132 @@ fn smoke_ext2_symlink_slow_round_trip() -> TestResult {
 }
 kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_slow_round_trip);
 
+// ── VFS-layer symlink hardening ────────────────────────────────────────
+// The fast/slow round-trip tests above call `read_symlink_target` directly on
+// the volume. These exercise the FileOps/VFS surface every real path walk and
+// `readlink(2)` actually use — resolve_async{,_nofollow} → FileOps::read /
+// symlink-follow — plus the exact 60/61-byte fast↔slow boundary. A regression
+// where the VFS layer returns an empty target here is what turns a downstream
+// consumer's fd→path resolution into an empty string.
+
+// NOFOLLOW resolve of a FAST (inline) ext symlink returns the symlink node,
+// and reading it through FileOps yields the inline target — the readlink(2) path.
+fn smoke_ext2_symlink_vfs_readlink_fast() -> TestResult {
+    use crate::volume::Ext2Volume;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"sym", b"data")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("fast symlink create failed");
+    }
+    let node = match poll_once(narf_filesystem::resolve_async_nofollow(volume.root(), "sym")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resolve_async_nofollow of ext symlink failed"),
+    };
+    if node.stat().mode.file_type != FileType::Symlink {
+        return TestResult::Fail("resolved ext node is not a symlink");
+    }
+    let mut buf = [0u8; 64];
+    let n = match poll_once(node.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("FileOps::read of ext symlink target failed"),
+    };
+    if &buf[..n] != b"data" {
+        return TestResult::Fail("VFS readlink of fast ext symlink returned wrong/empty target");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_vfs_readlink_fast);
+
+// FOLLOW resolve THROUGH a fast ext symlink reaches the target file, not the
+// symlink node — the path-walk case (open("/via-symlink/...")).
+fn smoke_ext2_symlink_vfs_follow_fast() -> TestResult {
+    use crate::volume::Ext2Volume;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::{FileType, FsInstance};
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    // `build_ext2_image` seeds a regular file "data" (content "x"); symlink to it.
+    if !matches!(
+        poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, b"lnk", b"data")),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("symlink create failed");
+    }
+    // FOLLOW resolve of "lnk" must land on the "data" FILE, not the symlink node.
+    let node = match poll_once(narf_filesystem::resolve_async(volume.root(), "lnk")) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resolve_async (follow) through ext symlink failed"),
+    };
+    if node.stat().mode.file_type == FileType::Symlink {
+        return TestResult::Fail("follow-resolve returned the symlink, not the target file");
+    }
+    // The followed node is the seeded "data" file — reading it yields "x",
+    // proving the symlink resolved to the correct target end-to-end.
+    let mut buf = [0u8; 8];
+    let n = match poll_once(node.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("read of followed symlink target failed"),
+    };
+    if &buf[..n] != b"x" {
+        return TestResult::Fail("follow-resolve reached the wrong file (content mismatch)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_vfs_follow_fast);
+
+// The 60/61-byte fast↔slow boundary, read back through the VFS: a 60-byte
+// target is inline (fast, blocks==0), 61 bytes spills to a data block (slow),
+// and both must read back byte-identical.
+fn smoke_ext2_symlink_boundary_60_61() -> TestResult {
+    use crate::volume::Ext2Volume;
+    use narf_block::ram::RamBlockDevice;
+    use narf_filesystem::FsInstance;
+    use narf_lib::id::DomainId;
+    let device = RamBlockDevice::from_image(512, build_ext2_image(b"x"));
+    let volume = match poll_once(Ext2Volume::mount(device, DomainId::DRIVER_0)) {
+        Some(Ok(v)) => v,
+        _ => return TestResult::Fail("mount failed"),
+    };
+    let t60 = [b'a'; 60];
+    let t61 = [b'b'; 61];
+    for (name, expect) in [(b"s60".as_slice(), t60.as_slice()), (b"s61".as_slice(), t61.as_slice())] {
+        if !matches!(
+            poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, name, expect)),
+            Some(Ok(_))
+        ) {
+            return TestResult::Fail("boundary symlink create failed");
+        }
+        let leaf = core::str::from_utf8(name).unwrap();
+        let node = match poll_once(narf_filesystem::resolve_async_nofollow(volume.root(), leaf)) {
+            Some(Ok(n)) => n,
+            _ => return TestResult::Fail("resolve of boundary symlink failed"),
+        };
+        let mut buf = [0u8; 128];
+        let n = match poll_once(node.read(0, &mut buf)) {
+            Some(Ok(n)) => n,
+            _ => return TestResult::Fail("read of boundary symlink target failed"),
+        };
+        if &buf[..n] != expect {
+            return TestResult::Fail("boundary symlink target mismatch (fast/slow off-by-one?)");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("drivers/fs/ext2", smoke_ext2_symlink_boundary_60_61);
+
 fn smoke_ext2_dir_full_block_invariant_holds() -> TestResult {
     // Verify the "last entry's rec_len extends to end-of-block"
     // invariant survives an insert into a full directory block at
