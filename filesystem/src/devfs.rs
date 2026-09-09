@@ -1210,6 +1210,19 @@ impl FileOps for DevConsole {
         })
     }
 
+    fn set_perms<'a>(&'a self, _perms: u16) -> FsFuture<'a, ()> {
+        // `fchmod(/dev/ttyN, ...)` — logind sets a session's VT to root:tty 0620
+        // on acquire and restores it on release (`session_restore_vt` ->
+        // `vt_restore`, which fchmods the VT fd). NARF has a single logical
+        // console whose permissions are advisory (the compositor drives the VT),
+        // and owner is tracked via `set_owners` while perms are not surfaced, so
+        // accept the mode as a no-op success. The FileOps default returns
+        // `Unsupported`, which `sys_fchmod` maps to -EOPNOTSUPP — that made
+        // logind log "Failed to restore VT, ignoring: Operation not supported"
+        // for the seat0 greeter session on teardown.
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Terminal ioctls so `/dev/console` looks like a real tty: a
     /// successful `TCGETS` (returning a cooked-mode termios) makes
     /// `isatty(0)` true, which is what flips a shell into interactive
@@ -2382,6 +2395,26 @@ fn smoke_dev_mknod_char_node() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/devfs", smoke_dev_mknod_char_node);
+
+/// logind's session VT restore fchmods the VT fd back to root:tty 0620
+/// (`session_restore_vt` -> `vt_restore`). DevConsole must ACCEPT the chmod
+/// (advisory — one logical console, compositor-driven) rather than fall to the
+/// FileOps default `set_perms` (-EOPNOTSUPP), which made logind log
+/// "Failed to restore VT, ignoring: Operation not supported" on the seat0
+/// greeter teardown. Owner changes (the earlier VT-chown fix) still round-trip.
+fn smoke_dev_console_vt_fchmod_accepted() -> TestResult {
+    let vt = DevConsole {
+        kind: ConsoleNodeKind::Virtual(1),
+    };
+    if !matches!(poll_once_devfs(vt.set_perms(0o620)), Some(Ok(()))) {
+        return TestResult::Fail("fchmod(/dev/tty1) must be accepted, not -EOPNOTSUPP");
+    }
+    if !matches!(poll_once_devfs(vt.set_owners(0, 5)), Some(Ok(()))) {
+        return TestResult::Fail("chown(/dev/tty1) must still succeed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_console_vt_fchmod_accepted);
 
 /// Linux devtmpfs keeps char/block identity, `st_rdev`, ownership, mode, and
 /// inode identity on dynamically-created device nodes. It also applies the
