@@ -1503,12 +1503,11 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 if r.is_ok() {
                     return;
                 }
-                // Demand-alloc surfaced Unmapped: vaddr might land
-                // in a STACK_GUARD region. try_grow_stack promotes
-                // the guard to a real stack page and installs a
-                // fresh guard below; on success the faulting
-                // instruction retries and lands on the freshly
-                // backed page. POSIX.1-2017 §2.2.2 — stack
+                // Demand-alloc surfaced Unmapped: vaddr might land in or just
+                // below a STACK_GUARD region. try_grow_stack expands lazy stack
+                // metadata through the fault, moves the guard below it, and
+                // demand-backs the exact faulting page; on success the
+                // instruction retries. POSIX.1-2017 §2.2.2 — stack
                 // auto-extension is implementation-defined.
                 //
                 // Also grow on a CPL=0 (supervisor) fault when cr2 is
@@ -1520,9 +1519,8 @@ pub extern "C" fn rust_trap_handler(frame: &mut TrapFrame) {
                 // kernel-mode write panics instead of growing the stack
                 // (hit by stress-ng under heavy SMP churn, where signals
                 // are delivered far more often near a stack boundary).
-                // try_grow_stack only ever promotes a real STACK_GUARD
-                // region, so a non-stack user vaddr still falls through
-                // to the SEGV/panic surface.
+                // try_grow_stack requires a nearby real STACK_GUARD region, so
+                // a non-stack user vaddr still reaches the SEGV/panic surface.
                 if from_user || cr2_in_user_half {
                     let limits = narf_userspace::handlers::current_stack_growth_limits();
                     // SAFETY: same identity-map argument.

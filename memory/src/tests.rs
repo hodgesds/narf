@@ -7825,6 +7825,232 @@ kernel_test_in!(
     smoke_memory_try_grow_stack_promotes_and_installs_new_guard
 );
 
+/// A fault may skip below the synthetic guard by as much as one stack frame.
+/// Linux expands VMA metadata across that gap but demand-backs only pages the
+/// program actually touches. NARF must likewise leave the skipped pages lazy.
+fn smoke_memory_stack_growth_skipped_gap_is_demand_paged() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: kernel-test paging/allocator setup satisfies new_for_user.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let guard = 0x0000_0080_0180_0000u64;
+    let fault = guard - 15 * 0x1000;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(guard),
+            len: 0x1000,
+            perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("map stack guard");
+
+    // SAFETY: this is the active-style live user root used by the fault path.
+    if unsafe { address_space.try_grow_stack(VirtAddr::new(fault + 8)) }.is_err() {
+        core::mem::forget(address_space);
+        return TestResult::Fail("skipped-gap stack growth failed");
+    }
+    let grown = address_space.lookup(VirtAddr::new(fault));
+    let metadata_is_lazy = grown.as_ref().is_some_and(|region| {
+        region.len == 16 * 0x1000
+            && region.perms.contains(RegionPerms::STACK_SEGMENT)
+            && region.phys.len() == 1
+            && region.phys[0].raw() != 0
+    });
+    // SAFETY: the root remains live until forgotten below.
+    let fault_present =
+        unsafe { translate_arch(address_space.root, VirtAddr::new(fault)) }.is_some();
+    // SAFETY: same; these skipped pages must have no leaf.
+    let skipped_absent = unsafe {
+        translate_arch(address_space.root, VirtAddr::new(fault + 0x1000)).is_none()
+            && translate_arch(address_space.root, VirtAddr::new(guard)).is_none()
+    };
+    let new_guard = address_space
+        .lookup(VirtAddr::new(fault - 0x1000))
+        .is_some_and(|region| region.perms.contains(RegionPerms::STACK_GUARD));
+    core::mem::forget(address_space);
+
+    if metadata_is_lazy && fault_present && skipped_absent && new_guard {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("stack gap was eagerly backed or metadata/guard was wrong")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_stack_growth_skipped_gap_is_demand_paged
+);
+
+/// VM_LOCKED stack growth follows Linux: eager locks populate the complete
+/// expansion, while VM_LOCKONFAULT retains the same lazy shape as an unlocked
+/// stack and pins each page when it is eventually faulted.
+fn smoke_memory_stack_growth_preserves_eager_and_onfault_lock_modes() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    for (offset, lock_bits, expect_all_present) in [
+        (0u64, RegionPerms::LOCKED, true),
+        (
+            0x20_0000u64,
+            RegionPerms::LOCKED | RegionPerms::LOCK_ONFAULT,
+            false,
+        ),
+    ] {
+        // SAFETY: kernel-test paging/allocator setup satisfies new_for_user.
+        let address_space = match unsafe { AddressSpace::new_for_user() } {
+            Ok(address_space) => address_space,
+            Err(_) => return TestResult::Skip("new_for_user failed"),
+        };
+        let guard = 0x0000_0080_01c0_0000u64 + offset;
+        let fault = guard - 3 * 0x1000;
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(guard),
+                len: 0x1000,
+                perms: RegionPerms::STACK_GUARD | RegionPerms::LOCK_EXEMPT,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .expect("map stack guard");
+        address_space
+            .map_region(Region {
+                base: VirtAddr::new(guard + 0x1000),
+                len: 0x1000,
+                perms: RegionPerms::READ
+                    | RegionPerms::WRITE
+                    | RegionPerms::STACK_SEGMENT
+                    | lock_bits,
+                phys: alloc::vec![PhysAddr::new(0)],
+            })
+            .expect("map locked stack");
+
+        // SAFETY: this is the live user-root operation used by the trap path.
+        if unsafe { address_space.try_grow_stack(VirtAddr::new(fault)) }.is_err() {
+            core::mem::forget(address_space);
+            return TestResult::Fail("locked skipped-gap growth failed");
+        }
+        let grown = address_space.lookup(VirtAddr::new(fault));
+        let bits_preserved = grown.as_ref().is_some_and(|region| {
+            region.perms.contains(RegionPerms::LOCKED)
+                && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+                    == lock_bits.contains(RegionPerms::LOCK_ONFAULT)
+        });
+        let all_present = (0..4).all(|page| {
+            // SAFETY: root remains live for this read-only translation walk.
+            unsafe {
+                translate_arch(address_space.root, VirtAddr::new(fault + page * 0x1000)).is_some()
+            }
+        });
+        let only_fault_present = {
+            // SAFETY: same live-root translation contract.
+            unsafe {
+                translate_arch(address_space.root, VirtAddr::new(fault)).is_some()
+                    && (1..4).all(|page| {
+                        translate_arch(address_space.root, VirtAddr::new(fault + page * 0x1000))
+                            .is_none()
+                    })
+            }
+        };
+        core::mem::forget(address_space);
+        if !bits_preserved
+            || (expect_all_present && !all_present)
+            || (!expect_all_present && !only_fault_present)
+        {
+            return TestResult::Fail("stack lock mode changed lazy/eager population semantics");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_stack_growth_preserves_eager_and_onfault_lock_modes
+);
+
+/// Splitting an only-partly-materialized stack VMA must use logical VMA page
+/// counts, not the shorter physical-backing prefix. Otherwise mlock/mprotect
+/// can silently discard the untouched lazy suffix after automatic growth.
+fn smoke_memory_lazy_stack_survives_lock_and_protection_splits() -> TestResult {
+    use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: kernel-test paging/allocator setup satisfies new_for_user.
+    let address_space = match unsafe { AddressSpace::new_for_user() } {
+        Ok(address_space) => address_space,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = 0x0000_0080_0200_0000u64;
+    address_space
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 16 * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::STACK_SEGMENT,
+            // This is the representation produced after one page faults in a
+            // Linux-style metadata-only stack expansion.
+            phys: alloc::vec![PhysAddr::new(0)],
+        })
+        .expect("map lazy stack fixture");
+
+    if address_space
+        .mlock_range_onfault(VirtAddr::new(base + 4 * 0x1000), 4 * 0x1000)
+        .is_err()
+    {
+        core::mem::forget(address_space);
+        return TestResult::Fail("MLOCK_ONFAULT split rejected lazy stack");
+    }
+    if address_space
+        .mprotect_range(
+            VirtAddr::new(base + 10 * 0x1000),
+            2 * 0x1000,
+            RegionPerms::READ,
+        )
+        .is_err()
+    {
+        core::mem::forget(address_space);
+        return TestResult::Fail("mprotect split rejected lazy stack");
+    }
+
+    let snapshot = address_space.regions_snapshot();
+    let full_coverage = (0..16).all(|page| {
+        snapshot.iter().any(|region| {
+            let page = base + page * 0x1000;
+            region.base.as_u64() <= page && page < region.base.as_u64() + region.len
+        })
+    });
+    let lock_bits = snapshot.iter().find(|region| {
+        region.base.as_u64() <= base + 4 * 0x1000
+            && base + 4 * 0x1000 < region.base.as_u64() + region.len
+    });
+    let protected = snapshot.iter().find(|region| {
+        region.base.as_u64() <= base + 10 * 0x1000
+            && base + 10 * 0x1000 < region.base.as_u64() + region.len
+    });
+    let modes_are_exact = lock_bits.is_some_and(|region| {
+        region.perms.contains(RegionPerms::LOCKED)
+            && region.perms.contains(RegionPerms::LOCK_ONFAULT)
+    }) && protected.is_some_and(|region| {
+        region.perms.prot_only() == RegionPerms::READ
+            && region.perms.contains(RegionPerms::STACK_SEGMENT)
+    });
+
+    // The untouched last page lies beyond every materialized phys entry. It
+    // must remain a valid demand-zero stack page after both kinds of split.
+    let last = VirtAddr::new(base + 15 * 0x1000);
+    // SAFETY: this is the same live user-root operation as a demand fault.
+    let tail_faulted = unsafe { address_space.demand_alloc_page(last) }.is_ok()
+        // SAFETY: read-only translation walk while the isolated root is live.
+        && unsafe { translate_arch(address_space.root, last) }.is_some();
+    core::mem::forget(address_space);
+
+    if full_coverage && modes_are_exact && tail_faulted {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("lazy stack suffix or split permissions were lost")
+    }
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_lazy_stack_survives_lock_and_protection_splits
+);
+
 /// try_grow_stack on a non-STACK_GUARD region returns Unmapped
 /// so the trap handler falls through to the SEGV path (a write
 /// to a real PROT_NONE region or a backed RO region is not a
@@ -8250,6 +8476,8 @@ fn smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it() -> Tes
         Err(_) => return TestResult::Skip("new_for_user failed"),
     };
     let guard = 0x0000_0080_0780_0000u64;
+    let fault = guard - 3 * 0x1000;
+    let rogue_page = guard - 0x1000;
     address_space
         .map_region(Region {
             base: VirtAddr::new(guard),
@@ -8270,7 +8498,7 @@ fn smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it() -> Tes
     if unsafe {
         map_4kb(
             address_space.root,
-            VirtAddr::new(guard),
+            VirtAddr::new(rogue_page),
             rogue_phys,
             PtFlags::USER | PtFlags::WRITABLE | PtFlags::NO_EXEC,
         )
@@ -8284,15 +8512,16 @@ fn smoke_memory_stack_growth_rejects_existing_leaf_without_unmapping_it() -> Tes
 
     // SAFETY: the AS is live; the intentional PTE/VMA mismatch exercises the
     // transaction's collision rollback.
-    let result = unsafe { address_space.try_grow_stack(VirtAddr::new(guard)) };
+    let result = unsafe { address_space.try_grow_stack(VirtAddr::new(fault)) };
     // SAFETY: root remains live and the leaf should still name rogue_phys.
-    let preserved =
-        unsafe { translate_arch(address_space.root, VirtAddr::new(guard)) } == Some(rogue_phys);
+    let preserved = unsafe {
+        translate_arch(address_space.root, VirtAddr::new(rogue_page)) == Some(rogue_phys)
+    };
     let still_guard = address_space.regions_snapshot().iter().any(|region| {
         region.base.as_u64() == guard && region.perms.contains(RegionPerms::STACK_GUARD)
     });
     // SAFETY: remove the leaf explicitly before returning its backing frame.
-    let _ = unsafe { unmap_4kb(address_space.root, VirtAddr::new(guard)) };
+    let _ = unsafe { unmap_4kb(address_space.root, VirtAddr::new(rogue_page)) };
     crate::frame::free_frame(rogue_frame);
     core::mem::forget(address_space);
 

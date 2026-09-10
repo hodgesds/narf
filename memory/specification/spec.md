@@ -609,8 +609,11 @@ impl AddressSpace {
         -> Result<(), FixedRelocationError>;
     pub unsafe fn alias_shared_region_fixed_locked_limited(/* ... */)
         -> Result<Option<(u64, u64)>, FixedRelocationError>;
-    /// Fault-time stack growth checks all task-specific memory limits and is
-    /// failure-atomic across speculative frame and PTE installation.
+    /// Fault-time stack growth checks all task-specific memory limits, then
+    /// publishes Linux-style lazy coverage for the gap and backs only the
+    /// faulting page. Eagerly VM_LOCKED growth best-effort populates the gap;
+    /// VM_LOCKONFAULT remains lazy. Pre-publication rejection changes nothing,
+    /// while post-publication backing failure retains the admitted VMA.
     pub unsafe fn try_grow_stack_limited(
         &self, fault: VirtAddr, limits: StackGrowthLimits,
     ) -> Result<(), AddressSpaceError>;
@@ -970,6 +973,24 @@ x86_64 is rejected at runtime.
   The periodic NUMA sampler seeks to the VMA containing or succeeding its
   page-aligned cursor and stops at the first eligible resident slot, rather
   than rescanning all preceding VMAs/pages under the IRQ-safe region lock.
+- Down-growing user stacks admit the complete page-aligned interval against
+  RLIMIT_STACK, RLIMIT_AS, and inherited RLIMIT_MEMLOCK before moving the
+  synthetic guard. As in Linux `expand_downwards`, ordinary and
+  VM_LOCKONFAULT expansion publishes lazy VMA coverage and demand-backs only
+  touched pages; eagerly VM_LOCKED expansion best-effort populates the new
+  interval. The VMA transaction revalidates CLONE_VM topology and limits, VMA
+  index capacity is reserved before guard removal, and every hardware leaf in
+  the gap and replacement guard must be absent before metadata may claim it.
+  The mapped-byte and contiguous-stack totals are cached under the region
+  lock: insertion, removal, or structural/permission mutation invalidates the
+  relevant value, backing-only publication cannot change it, and successful
+  monotonic growth advances both totals by the admitted interval. A cache miss
+  recomputes from the authoritative ordered VMA index before any limit decision.
+  VMA splits for locking or protection retain logical fragment lengths even
+  when their physical-backing prefixes are shorter. The faulting page is
+  zero-filled and gains rmap/PTE ownership only through the normal demand-page
+  ticket transaction. A backing failure after publication leaves the admitted
+  stack VMA in place, matching Linux fault semantics.
 - Anonymous and file-backed demand faults reserve a page-scoped ticket before
   leaving the address-space region lock. Frame allocation, page zeroing, and
   filesystem callbacks run without that IRQ-disabling lock, so faults on

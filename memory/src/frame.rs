@@ -2154,9 +2154,7 @@ pub fn __pagetable_is_registered(phys: u64) -> bool {
 /// pre-existing single-owner semantics. The map is populated
 /// only for frames that go through `inc_ref`.
 pub mod cow {
-    use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicU32, Ordering};
 
     use narf_lib::sync::IrqSafeSpinLock;
 
@@ -2171,7 +2169,254 @@ pub mod cow {
 
     #[repr(align(64))]
     struct RefShard {
-        map: IrqSafeSpinLock<Option<BTreeMap<u64, AtomicU32>>>,
+        map: IrqSafeSpinLock<Option<RefTable>>,
+    }
+
+    enum RefSlot {
+        Vacant,
+        Tombstone,
+        Occupied {
+            key: u64,
+            count: u32,
+            transition_epoch: u32,
+        },
+    }
+
+    /// Open-addressed physical-frame refcount index.
+    ///
+    /// COW retains already serialize on the frame's shard. A B-tree therefore
+    /// bought no concurrency while making every page retain/drop logarithmic.
+    /// Linux keeps the refcount directly beside each `struct page`; this sparse
+    /// table gives NARF the same average O(1) lookup without allocating metadata
+    /// proportional to the machine's highest physical address.
+    struct RefTable {
+        slots: Vec<RefSlot>,
+        len: usize,
+        tombstones: usize,
+        batch_epoch: u32,
+    }
+
+    impl RefTable {
+        fn new() -> Self {
+            Self {
+                slots: Vec::new(),
+                len: 0,
+                tombstones: 0,
+                batch_epoch: 0,
+            }
+        }
+
+        #[inline]
+        fn hash(key: u64) -> usize {
+            // SplitMix64 finalizer over the frame number. Low frame-number
+            // bits selected the shard, so mix before indexing the table.
+            let mut value = key >> super::PAGE_SHIFT;
+            value ^= value >> 30;
+            value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value ^= value >> 27;
+            value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+            (value ^ (value >> 31)) as usize
+        }
+
+        fn find(&self, key: u64) -> Option<usize> {
+            if self.slots.is_empty() {
+                return None;
+            }
+            let mask = self.slots.len() - 1;
+            let mut index = Self::hash(key) & mask;
+            for _ in 0..self.slots.len() {
+                match &self.slots[index] {
+                    RefSlot::Vacant => return None,
+                    RefSlot::Occupied { key: existing, .. } if *existing == key => {
+                        return Some(index);
+                    }
+                    RefSlot::Tombstone | RefSlot::Occupied { .. } => {}
+                }
+                index = (index + 1) & mask;
+            }
+            None
+        }
+
+        fn insertion_slot(&self, key: u64) -> usize {
+            let mask = self.slots.len() - 1;
+            let mut index = Self::hash(key) & mask;
+            let mut first_tombstone = None;
+            for _ in 0..self.slots.len() {
+                match &self.slots[index] {
+                    RefSlot::Vacant => return first_tombstone.unwrap_or(index),
+                    RefSlot::Tombstone => {
+                        first_tombstone.get_or_insert(index);
+                    }
+                    RefSlot::Occupied { key: existing, .. } => {
+                        assert_ne!(*existing, key, "duplicate COW refcount insertion");
+                    }
+                }
+                index = (index + 1) & mask;
+            }
+            first_tombstone.expect("COW refcount table has no insertion slot")
+        }
+
+        fn rehash(&mut self, capacity: usize) {
+            debug_assert!(capacity.is_power_of_two());
+            let mut slots = Vec::with_capacity(capacity);
+            slots.resize_with(capacity, || RefSlot::Vacant);
+            let old = core::mem::replace(&mut self.slots, slots);
+            self.len = 0;
+            self.tombstones = 0;
+            for slot in old {
+                if let RefSlot::Occupied {
+                    key,
+                    count,
+                    transition_epoch,
+                } = slot
+                {
+                    self.insert_rehashed(key, count, transition_epoch);
+                }
+            }
+        }
+
+        fn insert_rehashed(&mut self, key: u64, count: u32, transition_epoch: u32) {
+            let index = self.insertion_slot(key);
+            self.slots[index] = RefSlot::Occupied {
+                key,
+                count,
+                transition_epoch,
+            };
+            self.len += 1;
+        }
+
+        fn prepare_insert(&mut self) {
+            const INITIAL_CAPACITY: usize = 16;
+            if self.slots.is_empty() {
+                self.rehash(INITIAL_CAPACITY);
+                return;
+            }
+            // Keep one quarter of the table genuinely vacant so a missing-key
+            // probe terminates quickly. Rebuild in place if tombstones alone
+            // crossed the ceiling.
+            let occupied_after_insert = self.len + self.tombstones + 1;
+            let load_ceiling = self.slots.len() - self.slots.len() / 4;
+            if occupied_after_insert >= load_ceiling {
+                let capacity = if self.len + 1 < self.slots.len() / 2 {
+                    self.slots.len()
+                } else {
+                    self.slots
+                        .len()
+                        .checked_mul(2)
+                        .expect("COW refcount table capacity overflow")
+                };
+                self.rehash(capacity);
+            }
+        }
+
+        fn count(&self, key: u64) -> u32 {
+            let Some(index) = self.find(key) else {
+                return 0;
+            };
+            match &self.slots[index] {
+                RefSlot::Occupied { count, .. } => *count,
+                RefSlot::Vacant | RefSlot::Tombstone => unreachable!(),
+            }
+        }
+
+        /// Add one owner and return the count before the addition. A missing
+        /// row has one implicit original owner, matching the old map contract.
+        fn increment(&mut self, key: u64) -> u32 {
+            if let Some(index) = self.find(key) {
+                let RefSlot::Occupied { count, .. } = &mut self.slots[index] else {
+                    unreachable!();
+                };
+                let previous = *count;
+                *count = (*count).wrapping_add(1);
+                return previous;
+            }
+            self.prepare_insert();
+            let index = self.insertion_slot(key);
+            if matches!(self.slots[index], RefSlot::Tombstone) {
+                self.tombstones -= 1;
+            }
+            self.slots[index] = RefSlot::Occupied {
+                key,
+                count: 2,
+                transition_epoch: 0,
+            };
+            self.len += 1;
+            1
+        }
+
+        /// Begin one locked batch. The epoch lets duplicate aliases observe a
+        /// sole-to-shared transition made by an earlier occurrence without a
+        /// second allocation or a linear search through transitioned keys.
+        fn begin_batch(&mut self) -> u32 {
+            self.batch_epoch = self.batch_epoch.wrapping_add(1);
+            if self.batch_epoch == 0 {
+                for slot in &mut self.slots {
+                    if let RefSlot::Occupied {
+                        transition_epoch, ..
+                    } = slot
+                    {
+                        *transition_epoch = 0;
+                    }
+                }
+                self.batch_epoch = 1;
+            }
+            self.batch_epoch
+        }
+
+        /// Add one batch owner and return whether this key transitioned from
+        /// sole-owned in the current batch. Every duplicate occurrence sees
+        /// the same answer so every writable parent alias is write-protected.
+        fn increment_batch(&mut self, key: u64, epoch: u32) -> bool {
+            if let Some(index) = self.find(key) {
+                let RefSlot::Occupied {
+                    count,
+                    transition_epoch,
+                    ..
+                } = &mut self.slots[index]
+                else {
+                    unreachable!();
+                };
+                if *count <= 1 {
+                    *transition_epoch = epoch;
+                }
+                *count = (*count).wrapping_add(1);
+                return *transition_epoch == epoch;
+            }
+            self.prepare_insert();
+            let index = self.insertion_slot(key);
+            if matches!(self.slots[index], RefSlot::Tombstone) {
+                self.tombstones -= 1;
+            }
+            self.slots[index] = RefSlot::Occupied {
+                key,
+                count: 2,
+                transition_epoch: epoch,
+            };
+            self.len += 1;
+            true
+        }
+
+        /// Drop one explicit owner. `rollback` removes a `2 -> 1` row because
+        /// the speculative child never became an owner; ordinary teardown
+        /// retains count 1 until the original owner itself is freed.
+        fn decrement(&mut self, key: u64, rollback: bool) -> Option<(u32, u32)> {
+            let index = self.find(key)?;
+            let previous = match &self.slots[index] {
+                RefSlot::Occupied { count, .. } => *count,
+                RefSlot::Vacant | RefSlot::Tombstone => unreachable!(),
+            };
+            let next = previous.saturating_sub(1);
+            if previous <= 1 || (rollback && previous == 2) {
+                self.slots[index] = RefSlot::Tombstone;
+                self.len -= 1;
+                self.tombstones += 1;
+            } else if let RefSlot::Occupied { count, .. } = &mut self.slots[index] {
+                *count = next;
+            } else {
+                unreachable!();
+            }
+            Some((previous, next))
+        }
     }
 
     impl RefShard {
@@ -2198,12 +2443,11 @@ pub mod cow {
     pub fn inc_ref(phys: PhysAddr) -> u32 {
         let key = phys.raw();
         let mut g = REFCOUNTS[ref_shard(key)].map.lock();
-        let map = g.get_or_insert_with(BTreeMap::new);
-        let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
+        let map = g.get_or_insert_with(RefTable::new);
         // Bump from N to N+1; "first share" promotes the implicit
         // owner from `1` (representing the original sole owner) to
         // `2` (original + new sharer).
-        entry.fetch_add(1, Ordering::AcqRel) + 1
+        map.increment(key).wrapping_add(1)
     }
 
     /// Increment the COW reference for every non-zero frame in `frames`.
@@ -2251,30 +2495,23 @@ pub mod cow {
             if count == 0 {
                 continue;
             }
-            let shard_entries = &mut entries[start..start + count];
-            // Group aliases so one atomic add observes the pre-batch owner
-            // count. One counting-partitioned allocation covers every shard,
-            // avoiding up to 64 independently growing Vecs per fork.
-            shard_entries.sort_unstable_by_key(|(key, _)| *key);
+            let shard_entries = &entries[start..start + count];
             let mut guard = REFCOUNTS[shard].map.lock();
-            let map = guard.get_or_insert_with(BTreeMap::new);
-            let mut first = 0usize;
-            while first < shard_entries.len() {
-                let key = shard_entries[first].0;
-                let mut end = first + 1;
-                while end < shard_entries.len() && shard_entries[end].0 == key {
-                    end += 1;
+            let map = guard.get_or_insert_with(RefTable::new);
+            // Keep the counting-partition's input order. Sorting every shard
+            // made a repeated fork pay O(pages log pages) even though the
+            // common case contains no aliases and every refcount row already
+            // exists. Linux increments each struct-page refcount directly;
+            // doing the same ordered walk here leaves the operation linear.
+            //
+            // The table's batch epoch remembers a transition made by an
+            // earlier alias without allocating or searching a second vector.
+            // Every occurrence still gets its own reference and bitmap bit.
+            let epoch = map.begin_batch();
+            for &(key, input_index) in shard_entries {
+                if map.increment_batch(key, epoch) {
+                    newly_shared[input_index] = true;
                 }
-                let entry = map.entry(key).or_insert_with(|| AtomicU32::new(1));
-                let additional = u32::try_from(end - first)
-                    .expect("one COW retain batch cannot exceed u32 owners");
-                let previous = entry.fetch_add(additional, Ordering::AcqRel);
-                if previous <= 1 {
-                    for &(_, input_index) in &shard_entries[first..end] {
-                        newly_shared[input_index] = true;
-                    }
-                }
-                first = end;
             }
             start += count;
         }
@@ -2302,14 +2539,10 @@ pub mod cow {
                 let map = g
                     .as_mut()
                     .expect("speculative COW retain must have a refcount table");
-                let entry = map
-                    .get(&key)
+                let (previous, _) = map
+                    .decrement(key, true)
                     .expect("speculative COW retain must remain registered");
-                let previous = entry.fetch_sub(1, Ordering::AcqRel);
                 assert!(previous > 1, "cannot roll back the original COW owner");
-                if previous == 2 {
-                    map.remove(&key);
-                }
             }
         }
     }
@@ -2325,20 +2558,10 @@ pub mod cow {
             Some(m) => m,
             None => return 0,
         };
-        let entry = match map.get(&key) {
-            Some(e) => e,
-            None => return 0,
-        };
         // We want the post-decrement value. If the count is
         // already 1, drop the entry entirely so an unregistered
         // frame's next `free_frame` doesn't have to look it up.
-        let prev = entry.fetch_sub(1, Ordering::AcqRel);
-        if prev <= 1 {
-            map.remove(&key);
-            0
-        } else {
-            prev - 1
-        }
+        map.decrement(key, false).map_or(0, |(_, next)| next)
     }
 
     /// Drop one owner for every non-zero input and return exactly the frames
@@ -2373,13 +2596,11 @@ pub mod cow {
                     continue;
                 };
                 let key = phys.raw();
-                let Some(entry) = map.get(&key) else {
+                let Some((previous, _)) = map.decrement(key, false) else {
                     releasable.push(phys);
                     continue;
                 };
-                let previous = entry.fetch_sub(1, Ordering::AcqRel);
                 if previous <= 1 {
-                    map.remove(&key);
                     releasable.push(phys);
                 }
             }
@@ -2440,12 +2661,11 @@ pub mod cow {
                     continue;
                 };
                 let key = phys.raw();
-                let Some(entry) = map.get(&key) else {
+                let Some((previous, _)) = map.decrement(key, false) else {
                     on_release(phys);
                     continue;
                 };
-                if entry.fetch_sub(1, Ordering::AcqRel) <= 1 {
-                    map.remove(&key);
+                if previous <= 1 {
                     on_release(phys);
                 }
             }
@@ -2462,9 +2682,7 @@ pub mod cow {
             .map
             .lock()
             .as_ref()
-            .and_then(|m| m.get(&key))
-            .map(|c| c.load(Ordering::Acquire))
-            .unwrap_or(0)
+            .map_or(0, |map| map.count(key))
     }
 
     /// Snapshot COW counts in the same order as `frames`.
@@ -2493,10 +2711,7 @@ pub mod cow {
             };
             for index in indices {
                 let key = frames[index].raw();
-                counts[index] = map
-                    .get(&key)
-                    .map(|count| count.load(Ordering::Acquire))
-                    .unwrap_or(0);
+                counts[index] = map.count(key);
             }
         }
         counts
@@ -2510,6 +2725,57 @@ pub mod cow {
         for s in &REFCOUNTS {
             *s.map.lock() = None;
         }
+    }
+
+    // Always compiled so this exercises the same table implementation used by
+    // the in-kernel test image rather than a hosted-only substitute.
+    mod tests {
+        use super::RefTable;
+        use narf_kernel_test::{kernel_test_in, TestResult};
+
+        fn smoke_cow_refcount_hash_index_grows_through_tombstones() -> TestResult {
+            let mut table = RefTable::new();
+            for page in 1..=192u64 {
+                if table.increment(page << super::super::PAGE_SHIFT) != 1 {
+                    return TestResult::Fail("fresh COW hash entry was not implicit owner 1");
+                }
+            }
+            for page in (2..=192u64).step_by(2) {
+                let key = page << super::super::PAGE_SHIFT;
+                if table.decrement(key, false) != Some((2, 1))
+                    || table.decrement(key, false) != Some((1, 0))
+                {
+                    return TestResult::Fail("COW hash decrement lost owner cardinality");
+                }
+            }
+            for page in 193..=320u64 {
+                table.increment(page << super::super::PAGE_SHIFT);
+            }
+            let old_survived = (1..=192u64).all(|page| {
+                table.count(page << super::super::PAGE_SHIFT) == if page & 1 == 0 { 0 } else { 2 }
+            });
+            let new_visible =
+                (193..=320u64).all(|page| table.count(page << super::super::PAGE_SHIFT) == 2);
+            if !old_survived || !new_visible || table.len != 224 {
+                return TestResult::Fail("COW hash growth lost a live key across tombstones");
+            }
+
+            // Rollback of the only speculative share returns to the implicit
+            // owner representation and must preserve neighboring probe chains.
+            let rollback_key = 256u64 << super::super::PAGE_SHIFT;
+            if table.decrement(rollback_key, true) != Some((2, 1))
+                || table.count(rollback_key) != 0
+                || table.count(255u64 << super::super::PAGE_SHIFT) != 2
+                || table.count(257u64 << super::super::PAGE_SHIFT) != 2
+            {
+                return TestResult::Fail("COW rollback broke the hash probe chain");
+            }
+            TestResult::Pass
+        }
+        kernel_test_in!(
+            "memory/cow",
+            smoke_cow_refcount_hash_index_grows_through_tombstones
+        );
     }
 }
 

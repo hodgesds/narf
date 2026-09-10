@@ -163,6 +163,8 @@ unsafe fn map_window(domain: u8, key: u8) -> bool {
     // Tagged Normal, RW at EL1, never executable. `ATTR_TAGGED` replaces
     // `ATTR_NORMAL` rather than joining it: AttrIndx is a 3-bit field.
     let flags = PtFlags::AP_RW_EL1 | PtFlags::UXN | PtFlags::PXN | PtFlags::ATTR_TAGGED;
+    // SAFETY: `root` is the live kernel root and the caller established that
+    // this reserved domain window is currently unmapped.
     if !unsafe { map_run(root, base, flags) } {
         return false;
     }

@@ -453,8 +453,8 @@ pub unsafe fn load_user_process_with_root(
     // the stack base. Carries no POSIX prot bits so materialize()
     // skips installing a PTE — a stack-overflow access faults
     // with P=0 and the user-mode #PF handler routes it into
-    // `AddressSpace::try_grow_stack`, which promotes the guard
-    // to R+W and installs a new one-page guard directly below
+    // `AddressSpace::try_grow_stack`, which expands lazy stack
+    // metadata through the fault and moves the one-page guard below it
     // (POSIX.1-2017 §2.2.2 leaves stack auto-extension
     // implementation-defined). When the new guard would collide
     // with an existing region the grow fails and the user gets
