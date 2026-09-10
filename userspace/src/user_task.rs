@@ -938,7 +938,15 @@ fn park_should_block(
             }
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
             if uc.net_io_wait.load(Ordering::Acquire) {
-                crate::handlers::register_io_waiter(task_id, waker.clone());
+                if crate::handlers::register_io_waiter(task_id, waker.clone()) {
+                    // A targeted wake (wake_io_owner) landed in the scan→register
+                    // window and was latched; re-execute instead of parking so the
+                    // re-scan picks up the readiness. This is the precise close of
+                    // the lost-wake race (the io-wait backstop below is now only a
+                    // safety net for the untargeted broadcast path).
+                    uc.sleep_deadline_ns.store(0, Ordering::Release);
+                    return false;
+                }
                 refresh_io_wait_generation_after_registration(
                     uc,
                     narf_net::readiness::generation(),
@@ -2083,10 +2091,18 @@ impl core::future::Future for UserTaskFuture {
                 // (crate::handlers::wake_io_waiters via the net
                 // readiness hook) instead of waiting out the deadline.
                 if this.task.uctx.net_io_wait.load(Ordering::Acquire) {
-                    crate::handlers::register_io_waiter(
+                    if crate::handlers::register_io_waiter(
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
-                    );
+                    ) {
+                        // A targeted wake landed in the scan→register window and
+                        // was latched; re-execute instead of parking (precise
+                        // lost-wake close; the backstop is now only the broadcast
+                        // safety net).
+                        this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
+                        cx.waker().wake_by_ref();
+                        return core::task::Poll::Pending;
+                    }
                     // The global readiness generation is advisory, not a
                     // readiness predicate for this task's interest set. Keep
                     // the waiter parked after refreshing it; a true missed

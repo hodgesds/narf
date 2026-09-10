@@ -118,14 +118,30 @@ fn tcb_owner_shard(tcb_id: u32) -> usize {
     (tcb_id as usize) & (WAKE_SHARDS - 1)
 }
 
-#[allow(clippy::type_complexity)]
-static IO_WAKERS: [narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, core::task::Waker>>,
->; WAKE_SHARDS] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
+/// Per-shard io-waker state: the parked wakers keyed by task id, plus a
+/// pending-wake LATCH. A targeted wake (`wake_io_owner`) for a task with no
+/// registered waiter — one still between its readiness check and
+/// `register_io_waiter`, or simply not parked — records the task id in `pending`
+/// instead of dropping the wake. The next `register_io_waiter` consumes the
+/// latch and re-executes instead of parking, closing the scan→register lost-wake
+/// race precisely (no periodic backstop, no global-generation spurious re-exec).
+/// `wake_all_io_waiters` (the untargeted broadcast fallback) does NOT latch — it
+/// has no single target; that rarer race stays covered by the bounded io-wait
+/// backstop in `park_fire_deadline_ns`.
+struct WakerShard {
+    wakers: alloc::collections::BTreeMap<u64, core::task::Waker>,
+    pending: alloc::collections::BTreeSet<u64>,
+}
+
+static IO_WAKERS: [narf_lib::sync::IrqSafeSpinLock<Option<WakerShard>>; WAKE_SHARDS] =
+    [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; WAKE_SHARDS];
 
 pub fn io_waker_init() {
     for shard in IO_WAKERS.iter() {
-        *shard.lock() = Some(alloc::collections::BTreeMap::new());
+        *shard.lock() = Some(WakerShard {
+            wakers: alloc::collections::BTreeMap::new(),
+            pending: alloc::collections::BTreeSet::new(),
+        });
     }
 }
 
@@ -221,21 +237,31 @@ pub fn tcb_cell_disarm(tcb_id: u32, task_id: u64) {
     }
 }
 
-/// Register `task_id`'s waker as parked on net I/O readiness. Called
-/// from the user-task poll routine while a task blocks in epoll/poll.
-pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) {
+/// Register `task_id`'s waker as parked on net I/O readiness, and report whether
+/// a targeted wake was already latched for it: `true` means a `wake_io_owner`
+/// landed in the scan→register window, so the caller must NOT park — re-execute
+/// the syscall instead (it re-scans and finds the readiness). Called from the
+/// user-task poll routine while a task blocks in epoll/poll.
+pub fn register_io_waiter(task_id: u64, waker: core::task::Waker) -> bool {
     let mut g = IO_WAKERS[io_waker_shard(task_id)].lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(task_id, waker);
+    if let Some(s) = g.as_mut() {
+        if s.pending.remove(&task_id) {
+            // A targeted wake raced us and was latched — consume it, do not park.
+            return true;
+        }
+        s.wakers.insert(task_id, waker);
     }
+    false
 }
 
 /// Remove `task_id`'s I/O waker without firing it (the task woke for
-/// another reason / is returning from the syscall).
+/// another reason / is returning from the syscall). Also clears any latched
+/// pending wake so a stale latch can't spuriously skip the task's next park.
 pub fn drop_io_waiter(task_id: u64) {
     let mut g = IO_WAKERS[io_waker_shard(task_id)].lock();
-    if let Some(m) = g.as_mut() {
-        m.remove(&task_id);
+    if let Some(s) = g.as_mut() {
+        s.wakers.remove(&task_id);
+        s.pending.remove(&task_id);
     }
 }
 
@@ -316,7 +342,23 @@ pub fn wake_io_waiters(key: u64) {
 pub(crate) fn wake_io_owner(owner: u64) {
     let waker = {
         let mut g = IO_WAKERS[io_waker_shard(owner)].lock();
-        g.as_mut().and_then(|m| m.remove(&owner))
+        if let Some(s) = g.as_mut() {
+            match s.wakers.remove(&owner) {
+                w @ Some(_) => w,
+                None => {
+                    // Owner not parked yet (still between its readiness check and
+                    // `register_io_waiter`, or simply running): LATCH the wake so
+                    // its next register consumes it instead of dropping it — this
+                    // is what closes the scan→register lost-wake race. Idempotent
+                    // (a set); a stale latch on a running owner costs at most one
+                    // spurious re-exec (re-scan → nothing → re-park).
+                    s.pending.insert(owner);
+                    None
+                }
+            }
+        } else {
+            None
+        }
     };
     if let Some(w) = waker {
         // Narrow directed wake (boot flag `io_next`, default off): name this
@@ -346,8 +388,8 @@ fn wake_all_io_waiters() {
     let mut wakers: alloc::vec::Vec<(u64, core::task::Waker)> = alloc::vec::Vec::new();
     for shard in IO_WAKERS.iter() {
         let mut g = shard.lock();
-        if let Some(m) = g.as_mut() {
-            wakers.extend(core::mem::take(m));
+        if let Some(s) = g.as_mut() {
+            wakers.extend(core::mem::take(&mut s.wakers));
         }
     }
     for (task_id, w) in wakers {
@@ -9254,7 +9296,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
         IO_WAKERS[io_waker_shard(tid)]
             .lock()
             .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
+            .is_some_and(|s| s.wakers.contains_key(&tid)),
         1 << 4,
     );
     r |= has(futex_has_task_waiter(tid), 1 << 5);

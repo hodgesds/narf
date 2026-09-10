@@ -2046,6 +2046,65 @@ fn smoke_userspace_park_fire_deadline_net_io_backstop() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace", smoke_userspace_park_fire_deadline_net_io_backstop);
 
+/// The io-waiter LATCH closes the scan->register lost-wake race precisely: a
+/// targeted `wake_io_owner` for a task that has not yet registered its waiter
+/// records a pending latch instead of dropping the wake, and the task's next
+/// `register_io_waiter` consumes it and reports "already woken" (re-execute,
+/// don't park) rather than stranding forever. See core.inc.rs `WakerShard`.
+#[cfg(target_arch = "x86_64")]
+fn smoke_userspace_io_waiter_wake_latch() -> TestResult {
+    fn noop_waker() -> core::task::Waker {
+        fn c(_: *const ()) -> core::task::RawWaker {
+            r()
+        }
+        fn n(_: *const ()) {}
+        fn r() -> core::task::RawWaker {
+            core::task::RawWaker::new(
+                core::ptr::null(),
+                &core::task::RawWakerVTable::new(c, n, n, n),
+            )
+        }
+        // SAFETY: the vtable's fns are all no-ops over a null data pointer.
+        unsafe { core::task::Waker::from_raw(r()) }
+    }
+    const TID: u64 = 0x00CA_FE01;
+    // Clean slate (clears any waker + latch left by a prior run).
+    crate::handlers::drop_io_waiter(TID);
+
+    // NEGATIVE: no prior wake -> register PARKS (returns false) and installs a
+    // waiter.
+    if crate::handlers::register_io_waiter(TID, noop_waker()) {
+        return TestResult::Fail("register with no pending wake must return false (park)");
+    }
+    crate::handlers::drop_io_waiter(TID);
+
+    // POSITIVE (the fix): a targeted wake with no registered waiter LATCHES; the
+    // next register consumes it and returns true (re-execute, don't park) instead
+    // of the wake being dropped and the task stranding.
+    crate::handlers::wake_io_owner(TID);
+    if !crate::handlers::register_io_waiter(TID, noop_waker()) {
+        return TestResult::Fail("register after a latched wake_io_owner must return true");
+    }
+
+    // NEGATIVE: the latch is one-shot -- a second register (no new wake) parks.
+    if crate::handlers::register_io_waiter(TID, noop_waker()) {
+        return TestResult::Fail("latch must be one-shot: second register must park (false)");
+    }
+
+    // NEGATIVE: drop clears a standing latch -- wake then drop leaves nothing, so
+    // the next register parks (a stale latch must not spuriously skip a park).
+    crate::handlers::drop_io_waiter(TID);
+    crate::handlers::wake_io_owner(TID); // latch set
+    crate::handlers::drop_io_waiter(TID); // ...and cleared
+    if crate::handlers::register_io_waiter(TID, noop_waker()) {
+        return TestResult::Fail("drop must clear the latch (register should park)");
+    }
+    crate::handlers::drop_io_waiter(TID);
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_io_waiter_wake_latch);
+
 /// A global readiness notification that races an epoll/poll waiter's
 /// registration is not evidence that *this* interest set is ready.  The
 /// waiter must remain parked (with its generation refreshed) so unrelated
