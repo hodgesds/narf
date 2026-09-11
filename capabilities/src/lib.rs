@@ -507,7 +507,7 @@ pub enum CapKind {
     // for a core subsystem (frame allocator, heap, pager, scheduler
     // policy, donation policy, work-stealing strategy, block I/O
     // scheduler, TCP congestion control, idle governor, tracing
-    // sink). See `docs/PLUGGABILITY.md`.
+    // sink, OOM victim-selection policy). See `docs/PLUGGABILITY.md`.
     MemAlloc = 0x0200,
     HeapBackend = 0x0201,
     Pager = 0x0202,
@@ -518,6 +518,11 @@ pub enum CapKind {
     CongestionControl = 0x0207,
     IdleGovernor = 0x0208,
     EventSink = 0x0209,
+    /// Install the OOM victim-selection policy (`narf_memory::oom::OomKiller`).
+    /// Distinct from `MemAlloc`/`Pager`: choosing *which process dies* under
+    /// pressure is a kill authority, not an allocation one, and must be
+    /// grantable without handing over the frame allocator.
+    OomPolicy = 0x020A,
 
     // BPF (0x0300..). Split by operation rather than lumped into one
     // "CAP_BPF", because the authorities are genuinely different: loading
@@ -638,6 +643,7 @@ const KIND_NAMES: &[(&str, CapKind)] = &[
     ("CongestionControl", CapKind::CongestionControl),
     ("IdleGovernor", CapKind::IdleGovernor),
     ("EventSink", CapKind::EventSink),
+    ("OomPolicy", CapKind::OomPolicy),
     ("BpfProgLoad", CapKind::BpfProgLoad),
     ("BpfAttach", CapKind::BpfAttach),
     ("BpfMap", CapKind::BpfMap),
