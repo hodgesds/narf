@@ -64,6 +64,11 @@ pub fn resolve(
     flags: ResolveFlags,                   // FollowSymlinks | NoMount | CreateParents
     cap:   &Cap<Traverse, _>,
 ) -> impl Future<Output = Result<NodeRef, FsError>>;
+
+pub fn resolve_absolute_single_mount(
+    abs: &str,
+    f: impl FnOnce(&dyn FsInstance, &str, u64) -> R,
+) -> Option<R>; // filesystem-relative path + covering mount id
 ```
 
 - Resolution is **always scoped to `root`**. There is no path escape.
@@ -73,6 +78,12 @@ pub fn resolve(
   include the `MountPoint` traverse right.
 - Path strings are UTF-8; NARF does not emulate byte-pathname
   filesystems transparently (a compat FS in `drivers/fs/` may do so).
+- `resolve_absolute_single_mount` returns `None` when `abs` is a synthetic
+  ancestor of a deeper mount; otherwise its callback runs after the mount-table
+  lock is released and may walk the returned filesystem without rechecking the
+  mount table between components. Global descendant-free mounts use bounded
+  generation-tagged per-CPU lookup entries; mount, overmount, move, and unmount
+  invalidate those entries before publishing the change notification.
 
 ### 3.3 File operations (async)
 
@@ -83,13 +94,24 @@ pub fn write(f: &FileCap, offset: u64, buf: &[u8])             -> impl Future<Ou
 pub fn fsync(f: &FileCap)                                      -> impl Future<Output = ()>;
 pub fn stat (n: &Cap<NodeRef, Stat>)                           -> impl Future<Output = NodeStat>;
 pub fn truncate(f: &FileCap, len: u64)                         -> impl Future<Output = ()>;
+pub trait DirOps {
+    fn create_with_attrs(
+        &self,
+        name: &str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'_, Arc<dyn FileOps>>;
+}
 pub trait FileOps {
+    fn has_flush(&self) -> bool;
     fn poll_readiness(&self) -> u32;
     fn poll_readiness_at(&self, offset: u64) -> u32;
     fn poll_edge_token(&self) -> (u64, u64);
     fn acknowledge_poll_readiness(&self, readiness: u32);
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError>;
     fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>>;
+    fn mmap_cache_generation(&self) -> Option<u64>;
     fn open_instance(&self) -> Option<Arc<dyn FileOps>>;
     fn readiness(&self) -> Option<&narf_lib::readiness::Readiness>;
     fn arm_readiness(&self, task_id: u64, interest: u32, waker: &Waker)
@@ -117,6 +139,11 @@ pub enum FileType {
     Fifo,
 }
 ```
+
+`DirOps::create_with_attrs` publishes a new inode with the requested owner and
+mode as one create operation when the backend supports it. The default adapts
+legacy backends by creating first and applying both metadata updates; tmpfs /
+`MemFs` initialises the inode and its quota charge atomically before insertion.
 
 All operations submit through `abi/` rings when crossing the
 kernel↔user boundary; kernel-internal callers invoke directly.
@@ -406,6 +433,11 @@ punch/zero-range/preallocation, and regular-file `user.*`, `trusted.*`, and
 `security.*` xattrs. Inodes and allocated pages remain charged until the last
 directory entry/open reference drops.
 
+Successful in-memory subdirectory lookups use a bounded per-CPU weak cache
+keyed by parent inode, entry-generation, and name. Directory insertion,
+removal, and rename advance the generation while the authoritative entry map
+is locked; weak entries never extend inode or quota lifetime.
+
 Linux-compat mount namespaces hold a private snapshot of the mount table.
 Mount, bind-mount, and unmount operations after `CLONE_NEWNS` mutate that
 snapshot only. Private tables permit mount stacking; path resolution and
@@ -515,6 +547,19 @@ the last unmap. Multiplexed devices must return the specific backing owner;
 retaining only the open file is insufficient when an object handle can close
 while the file remains live.
 
+For a generic shared file mapping, `mmap_cache_generation` may identify the
+file as generic (mutually exclusive with `mmap_frames`/`mmap_fault`) and opt it
+into bounded retention of clean fallback pages after their final unmap. The
+generation changes after every byte or length mutation; an idle page is reused
+only while its recorded generation matches. The cache keeps only a weak file
+reference, never discards a dirty page, and files returning `None` retain the
+conservative final-unmap reclamation behavior.
+
+Ordinary unlocked generic shared mappings are demand-backed: VMA publication
+records absent page slots and first access resolves the canonical cache page.
+`MAP_LOCKED` and blocking `MAP_POPULATE` retain eager materialization; combining
+`MAP_POPULATE` with `MAP_NONBLOCK` suppresses the prefault as on Linux.
+
 `backing_identity` identifies the backing filesystem object rather than a
 mount attachment. Bind-mount adapters preserve their source value so a VFS
 consumer can recognise aliases of the same `(filesystem, inode)` pair.
@@ -605,10 +650,11 @@ Its `FsStat` result is translated to Linux `struct statfs`; FUSE mounts
 source those values from `FUSE_STATFS`, while other filesystems retain
 the conservative synthetic default.
 
-`FileOps::flush` runs on descriptor close and `FileOps::fsync` backs
-Linux `fsync(2)`/`fdatasync(2)`. FUSE files translate these to
-`FUSE_FLUSH` and `FUSE_FSYNC`; non-FUSE implementations default to
-success when they have no volatile backing state. Directory descriptors
+`FileOps::flush` runs on descriptor close when `FileOps::has_flush` reports
+an implementation hook, and `FileOps::fsync` backs Linux
+`fsync(2)`/`fdatasync(2)`. FUSE files translate these to `FUSE_FLUSH` and
+`FUSE_FSYNC`; non-FUSE implementations default to success and skip the
+no-op future when they have no volatile backing state. Directory descriptors
 forward the same operation through `DirOps`; FUSE opens a directory
 handle, issues `FUSE_FSYNCDIR` with the data-only flag when requested,
 and releases the handle.

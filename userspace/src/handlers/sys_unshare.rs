@@ -1,7 +1,6 @@
 #[allow(unused_imports)]
 use super::*;
 
-const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 
 #[inline]
@@ -59,11 +58,6 @@ const UNSHARE_VALID_FLAGS: u64 = CLONE_THREAD
 /// checking for EINVAL concluded the feature was present, then ran the
 /// workload unisolated. Feature probing is exactly what runc, bubblewrap and
 /// systemd's `RestrictNamespaces=` do at startup.
-///
-/// The one remaining failure inside the handler is the mount-namespace table
-/// refusing to initialise, which is an allocation failure — `copy_mnt_ns`'s
-/// -ENOMEM, not the `-1`/EPERM it used to report. A caller retries ENOMEM;
-/// EPERM tells it to give up and drop privileges it never lacked.
 ///
 /// `ksys_unshare` folds CLONE_NEWUSER into CLONE_THREAD|CLONE_FS before
 /// validating, and `check_unshare_flags` then requires a single-threaded
@@ -175,16 +169,8 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
         task_mount_ns_init();
         let task = current_task_id();
         let snap = snapshot_current_mount_namespace();
-        let mut g = TASK_MOUNT_NS.lock();
-        if let Some(m) = g.as_mut() {
-            m.insert(task, snap);
-            any = true;
-        } else {
-            // The per-task namespace table could not be created — the
-            // allocation failure `copy_mnt_ns` reports as -ENOMEM.
-            ctx.set_return(fail(ENOMEM));
-            return;
-        }
+        install_mount_namespace(task, snap);
+        any = true;
     }
 
     #[cfg(feature = "container")]

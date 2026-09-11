@@ -113,6 +113,6 @@ pub(crate) fn sys_chroot(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
-    task_map_set(&ROOT_DIR_TABLE, task, resolved);
+    set_root_dir(task, resolved);
     ctx.set_return(SyscallReturn::ok(0));
 }

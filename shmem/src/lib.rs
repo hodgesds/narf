@@ -1,11 +1,11 @@
 //! narf-shmem — userspace-mappable shared-memory handles.
 //!
-//! Each `Shmem` is a kernel-allocated, page-aligned, contiguous-VA
-//! region of N coherent frames, owned by a specific process pid.
-//! The handle is the public name; userspace maps the region into
-//! its VA via `SYS_SHMEM_MAP`. Kernel-side consumers (audio's tx
-//! ring, fb's blit source) read pixel/PCM data through the same
-//! frames via the identity map.
+//! Named `Shmem` objects are kernel-allocated, page-aligned regions of coherent
+//! frames owned by a process pid. The handle is the public name; userspace maps
+//! the region via `SYS_SHMEM_MAP`. Anonymous `MAP_SHARED` backing instead has
+//! no public handle and carries per-page references in a sharded registry.
+//! Kernel-side consumers (audio's tx ring, fb's blit source) read pixel/PCM
+//! data through named objects' same frames via the identity map.
 //!
 //! Surface mirrors `narf-fb`'s registry pattern: a static
 //! registry, a monotonic id allocator, and an exit-observer
@@ -99,14 +99,40 @@ struct Registry {
 static REGISTRY: IrqSafeSpinLock<Option<Registry>> = IrqSafeSpinLock::new(None);
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+// Anonymous MAP_SHARED objects have no public handle after mmap returns. Keep
+// their lifetime directly beside each backing-page identity rather than
+// routing every retain/drop through the named-object registry above. Linux's
+// shmem pages likewise carry per-page references; 64 cache-line-isolated
+// shards let unrelated processes map and unmap concurrently.
+const ANON_PAGE_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct AnonymousPageShard {
+    refs: IrqSafeSpinLock<Option<BTreeMap<u64, u32>>>,
+}
+
+impl AnonymousPageShard {
+    const fn new() -> Self {
+        Self {
+            refs: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static ANONYMOUS_PAGES: [AnonymousPageShard; ANON_PAGE_SHARDS] =
+    [const { AnonymousPageShard::new() }; ANON_PAGE_SHARDS];
+
+#[inline]
+fn anonymous_page_shard(phys: u64) -> usize {
+    (phys >> 12) as usize & (ANON_PAGE_SHARDS - 1)
+}
+
 fn with_registry<R>(f: impl FnOnce(&mut Registry) -> R) -> R {
     let mut registry = REGISTRY.lock();
     f(registry.get_or_insert_with(Registry::default))
 }
 
-/// Allocate a fresh shared-memory region of `len` bytes (rounded
-/// up to a page). Returns the new handle id (>0).
-pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
+fn allocate_zeroed_frames(len: u64) -> Result<(u64, Vec<u64>), ShmemError> {
     if len == 0 {
         return Err(ShmemError::BadLen);
     }
@@ -121,27 +147,28 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
     let mut frames = Vec::with_capacity(pages);
     for _ in 0..pages {
         let frame = match narf_memory::alloc_frame() {
-            Ok(f) => f,
+            Ok(frame) => frame,
             Err(_) => {
-                for phys in frames {
-                    narf_memory::free_frame(narf_memory::PhysFrame::new(PhysAddr::new(phys)));
-                }
+                free_phys_frames(frames);
                 return Err(ShmemError::OutOfMemory);
             }
         };
         let phys = frame.start_address().raw();
-        // Zero each frame so a fresh shmem doesn't surface stale
-        // kernel data.
-        // SAFETY: identity-mapped low-RAM frame; owned by us.
+        // SAFETY: this freshly allocated frame is exclusively owned here and
+        // is reachable through the kernel direct map.
         unsafe {
-            core::ptr::write_bytes(
-                narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
-                0,
-                PAGE as usize,
-            );
+            core::ptr::write_bytes(PhysAddr::new(phys).kernel_mut_ptr::<u8>(), 0, PAGE as usize);
         }
         frames.push(phys);
     }
+    Ok((len_pg, frames))
+}
+
+/// Allocate a fresh shared-memory region of `len` bytes (rounded
+/// up to a page). Returns the new handle id (>0).
+pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
+    let (len_pg, frames) = allocate_zeroed_frames(len)?;
+    let pages = frames.len();
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let entry = Box::new(Entry {
         handle,
@@ -167,6 +194,28 @@ pub fn create(pid: u64, len: u64) -> Result<u64, ShmemError> {
         );
     });
     Ok(handle)
+}
+
+/// Allocate an unnamed anonymous shared object and return its page snapshot.
+/// Each returned page carries one creator reference. The mmap path releases
+/// that reference after publishing (or abandoning) the VMA; mapping and fork
+/// references are retained through the ordinary shared-frame hooks.
+fn vt_create_anonymous(len: u64, out: &mut Vec<u64>) -> bool {
+    let (_, frames) = match allocate_zeroed_frames(len) {
+        Ok(result) => result,
+        Err(_) => return false,
+    };
+    for &phys in &frames {
+        let mut guard = ANONYMOUS_PAGES[anonymous_page_shard(phys)].refs.lock();
+        let refs = guard.get_or_insert_with(BTreeMap::new);
+        assert!(
+            refs.insert(phys, 1).is_none(),
+            "anonymous shmem frame already indexed"
+        );
+    }
+    out.clear();
+    out.extend_from_slice(&frames);
+    true
 }
 
 /// Phys addr at `byte_offset` into the region. Used by kernel-
@@ -380,7 +429,7 @@ pub fn count() -> usize {
 
 #[doc(hidden)]
 pub fn __reset_for_test() {
-    let frames = {
+    let mut frames: Vec<u64> = {
         let mut registry = REGISTRY.lock();
         core::mem::take(&mut *registry)
             .unwrap_or_default()
@@ -390,6 +439,11 @@ pub fn __reset_for_test() {
             .filter(|phys| *phys != 0)
             .collect()
     };
+    for shard in &ANONYMOUS_PAGES {
+        if let Some(refs) = core::mem::take(&mut *shard.refs.lock()) {
+            frames.extend(refs.into_keys());
+        }
+    }
     free_phys_frames(frames);
     NEXT_HANDLE.store(1, Ordering::Relaxed);
 }
@@ -403,6 +457,7 @@ pub fn syscall_vtable() -> &'static narf_userspace::handlers::ShmemSyscallVtable
     use narf_userspace::handlers::ShmemSyscallVtable;
     static V: ShmemSyscallVtable = ShmemSyscallVtable {
         create: vt_create,
+        create_anonymous: vt_create_anonymous,
         max_len: vt_max_len,
         len_of: vt_len_of,
         frames: vt_frames,
@@ -423,10 +478,19 @@ fn vt_max_len() -> u64 {
     MAX_PAGES_PER_HANDLE as u64 * PAGE
 }
 
-fn vt_retain_frame(phys: u64) {
+fn vt_retain_frame(phys: u64) -> bool {
+    {
+        let mut guard = ANONYMOUS_PAGES[anonymous_page_shard(phys)].refs.lock();
+        if let Some(count) = guard.as_mut().and_then(|refs| refs.get_mut(&phys)) {
+            *count = count
+                .checked_add(1)
+                .expect("anonymous shmem mapping reference overflow");
+            return true;
+        }
+    }
     with_registry(|registry| {
         let Some(&(handle, page)) = registry.frames.get(&phys) else {
-            return;
+            return false;
         };
         let entry = registry
             .entries
@@ -435,13 +499,35 @@ fn vt_retain_frame(phys: u64) {
         entry.refs[page] = entry.refs[page]
             .checked_add(1)
             .expect("shmem mapping reference overflow");
-    });
+        true
+    })
 }
 
-fn vt_release_frame(phys: u64) {
-    let reclaim = with_registry(|registry| {
+fn vt_release_frame(phys: u64) -> bool {
+    let anonymous_release = {
+        let mut guard = ANONYMOUS_PAGES[anonymous_page_shard(phys)].refs.lock();
+        guard.as_mut().and_then(|refs| {
+            let count = refs.get_mut(&phys)?;
+            assert!(*count > 0, "anonymous shmem mapping reference underflow");
+            *count -= 1;
+            if *count == 0 {
+                refs.remove(&phys);
+                Some(true)
+            } else {
+                Some(false)
+            }
+        })
+    };
+    if let Some(release) = anonymous_release {
+        if release {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(PhysAddr::new(phys)));
+        }
+        return true;
+    }
+
+    let (owned, reclaim) = with_registry(|registry| {
         let Some(&(handle, page)) = registry.frames.get(&phys) else {
-            return Vec::new();
+            return (false, Vec::new());
         };
         let entry = registry
             .entries
@@ -449,12 +535,21 @@ fn vt_release_frame(phys: u64) {
             .expect("shmem frame index named a missing entry");
         assert!(entry.refs[page] > 0, "shmem mapping reference underflow");
         entry.refs[page] -= 1;
-        reap_removed_entry(registry, handle)
+        (true, reap_removed_entry(registry, handle))
     });
     free_phys_frames(reclaim);
+    owned
 }
 
 fn vt_owns_frame(phys: u64) -> bool {
+    if ANONYMOUS_PAGES[anonymous_page_shard(phys)]
+        .refs
+        .lock()
+        .as_ref()
+        .is_some_and(|refs| refs.contains_key(&phys))
+    {
+        return true;
+    }
     REGISTRY
         .lock()
         .as_ref()
@@ -462,6 +557,14 @@ fn vt_owns_frame(phys: u64) -> bool {
 }
 
 fn vt_frame_locked(phys: u64) -> bool {
+    if ANONYMOUS_PAGES[anonymous_page_shard(phys)]
+        .refs
+        .lock()
+        .as_ref()
+        .is_some_and(|refs| refs.contains_key(&phys))
+    {
+        return false;
+    }
     REGISTRY
         .lock()
         .as_ref()
@@ -529,6 +632,54 @@ fn vt_unlock(handle: u64) -> bool {
 }
 
 fn vt_replace_frame(old_phys: u64, new_phys: u64) -> bool {
+    let old_shard = anonymous_page_shard(old_phys);
+    let new_shard = anonymous_page_shard(new_phys);
+    if old_shard == new_shard {
+        let mut guard = ANONYMOUS_PAGES[old_shard].refs.lock();
+        if let Some(refs) = guard.as_mut() {
+            if let Some(count) = refs.remove(&old_phys) {
+                assert!(
+                    refs.insert(new_phys, count).is_none(),
+                    "replacement anonymous shmem frame already indexed"
+                );
+                return true;
+            }
+        }
+    } else if old_shard < new_shard {
+        let mut old_guard = ANONYMOUS_PAGES[old_shard].refs.lock();
+        if old_guard
+            .as_ref()
+            .is_some_and(|refs| refs.contains_key(&old_phys))
+        {
+            let mut new_guard = ANONYMOUS_PAGES[new_shard].refs.lock();
+            let count = old_guard
+                .as_mut()
+                .and_then(|refs| refs.remove(&old_phys))
+                .expect("checked anonymous shmem frame disappeared");
+            assert!(
+                new_guard
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(new_phys, count)
+                    .is_none(),
+                "replacement anonymous shmem frame already indexed"
+            );
+            return true;
+        }
+    } else {
+        let mut new_guard = ANONYMOUS_PAGES[new_shard].refs.lock();
+        let mut old_guard = ANONYMOUS_PAGES[old_shard].refs.lock();
+        if let Some(count) = old_guard.as_mut().and_then(|refs| refs.remove(&old_phys)) {
+            assert!(
+                new_guard
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(new_phys, count)
+                    .is_none(),
+                "replacement anonymous shmem frame already indexed"
+            );
+            return true;
+        }
+    }
+
     with_registry(|registry| {
         let Some((handle, page)) = registry.frames.remove(&old_phys) else {
             return false;

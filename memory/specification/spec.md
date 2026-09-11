@@ -331,6 +331,9 @@ impl RegionPerms {
     /// Provenance for ordinary private anonymous mappings eligible for
     /// exact-adjacent metadata coalescing.
     pub const ANON_MERGEABLE: RegionPerms;
+    /// Provenance for System V shared-memory VMAs whose teardown requires
+    /// external attachment/nattch close accounting.
+    pub const SYSV_SHM: RegionPerms;
     pub const COW: RegionPerms;
 }
 
@@ -499,6 +502,12 @@ impl AddressSpace {
         &self, region: Region, hint: VirtAddr, align: u64,
         explicit_lock: bool, limit_bytes: u64, bypass_limit: bool,
     ) -> Result<VirtAddr, AddressSpaceError>;
+    /// Select the first aligned free mmap interval while a caller-held VMA
+    /// transaction keeps it stable through publication. Selection does not
+    /// consume the monotonic compatibility cursor on later failure.
+    pub unsafe fn mmap_unmapped_candidate_locked(
+        &self, len: u64, align: u64,
+    ) -> Result<VirtAddr, AddressSpaceError>;
     /// Transaction-held MAP_FIXED_NOREPLACE private-anonymous counterpart.
     /// Exact-address overlap is decided non-destructively while the caller
     /// holds the VMA transaction; no mapping receipt escapes coalescing.
@@ -524,6 +533,14 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError>;
     /// Run a VMA/external-owner transaction in VMA -> owner lock order.
     pub fn with_vma_transaction<R>(&self, op: impl FnOnce() -> R) -> R;
+    /// Serialize ordinary shared-alias publication and retirement for one
+    /// address-space incarnation against cross-address-space migration.
+    pub fn with_address_space_shared_mapping_transaction<R>(
+        address_space_id: u64, op: impl FnOnce() -> R,
+    ) -> R;
+    /// Exclude shared-alias mutations in every address space. Reserved for
+    /// operations, such as MOVE_ALL page migration, which update all aliases.
+    pub fn with_shared_mapping_transaction<R>(op: impl FnOnce() -> R) -> R;
     /// Allocation-free exact-VMA classification while that transaction is
     /// held; returns only Copy permissions, never proportional backing.
     pub unsafe fn exact_region_perms_locked(/* ... */)
@@ -532,6 +549,9 @@ impl AddressSpace {
     /// VMA for len==0) while the same transaction is held.
     pub unsafe fn region_perms_covering_locked(/* ... */)
         -> Option<RegionPerms>;
+    /// Allocation-free test for a permission/provenance marker on any VMA
+    /// overlapping a range while the same transaction is held.
+    pub unsafe fn range_intersects_perms_locked(/* ... */) -> bool;
     /// Read, but do not consume, the default mmap candidate while the VMA
     /// transaction is held. Successful publication advances the cursor.
     pub unsafe fn mmap_cursor_candidate_locked(/* ... */)
@@ -715,10 +735,12 @@ pub fn tlb_shootdown::{shootdown_count, local_only_count,
 
 Private-region teardown serializes only on the address space's region tables.
 Teardown that overlaps an externally owned `SHARED` alias additionally holds
-the global shared-mapping transaction through leaf removal, cross-CPU TLB
-invalidation, and the external owner's release hook. Classification and table
-mutation are one region-lock critical section, so a racing remap cannot switch
-a private region to `SHARED` between those steps.
+the shard selected by that address-space incarnation through leaf removal,
+cross-CPU TLB invalidation, and the external owner's release hook.
+Cross-address-space migration acquires every shard in ascending order before
+changing any alias or ownership row. Classification and table mutation are one
+region-lock critical section, so a racing remap cannot switch a private region
+to `SHARED` between those steps.
 
 impl AddressSpace {
     /// Replace one resident private base page, or the complete hardware leaf
@@ -931,24 +953,30 @@ x86_64 is rejected at runtime.
   an unlocked fast rejection is advisory only, so a racing CLONE_VM insertion
   returns overlap without punching its mapping or retiring external owners.
   Ordinary non-fixed private-anonymous placement follows Linux's unmapped-area
-  model: it accepts a suitably aligned free hint, otherwise finds the first
-  aligned hole in the mmap window. Selection and VMA publication share the
-  per-address-space transaction, so holes released by munmap are reusable and
-  no CLONE_VM peer can claim a selected interval before it is published.
+  model: it accepts a suitably aligned free caller hint and otherwise selects
+  the first aligned hole in the mmap window. Non-fixed movable private mremap
+  uses the same topology search rather than consuming the monotonic
+  compatibility cursor. Selection and VMA publication share the
+  per-address-space transaction, so holes released by munmap remain reusable,
+  later failure consumes no virtual interval, and no CLONE_VM peer can claim
+  the selected interval first.
 - Non-fixed base-page relocation installs the disjoint destination before
   removing the source, publishes backing ownership exactly once, invalidates
   source translations before freeing a truncated tail, and leaves it intact
   when destination installation fails. Ordinary SHARED relocation applies the
-  same ordering while holding the VMA then global shared-owner transactions:
+  same ordering while holding the VMA then per-address-space shared-owner shard:
   it moves (never clones) resident leaf/rmap authority, transfers kept external
   backing without a retain/release pair, and releases only truncated backing
-  after the source broadcast. Every proportional vector and required VMA-index
-  arena slot is fallibly prepared before PTE mutation. Provisional Region
-  nodes are then published allocation-free; rollback removes those nodes and
-  destination leaves while the original source remains authoritative. Private
-  moves require one exact Region; ordinary SHARED moves may
-  select an interval contained in one Region. Cross-Region/cross-VMA moves are
-  explicit unsupported outcomes. For any fixed shrinking move, Linux ordering
+  after the source broadcast. FILE_DEMAND alias and relocation copy only the
+  selected materialized prefix; untouched source, destination, and preserved
+  suffix ranges remain implicit and allocate no per-page metadata. Every
+  proportional vector and required VMA-index arena slot is fallibly prepared
+  before PTE mutation. Provisional Region nodes are then published
+  allocation-free; rollback removes those nodes and destination leaves while
+  the original source remains authoritative. Private moves require one exact
+  Region; ordinary SHARED moves may select an interval contained in one Region.
+  Cross-Region/cross-VMA moves are explicit unsupported outcomes. For any fixed
+  shrinking move, Linux ordering
   is intentionally destructive: target retirement precedes source-tail
   truncation, which precedes the move.
   A later failure reports both committed steps so external ownership can make
@@ -992,14 +1020,18 @@ x86_64 is rejected at runtime.
   ticket transaction. A backing failure after publication leaves the admitted
   stack VMA in place, matching Linux fault semantics.
 - Anonymous and file-backed demand faults reserve a page-scoped ticket before
-  leaving the address-space region lock. Frame allocation, page zeroing, and
-  filesystem callbacks run without that IRQ-disabling lock, so faults on
-  distinct pages of one shared address space may progress concurrently. The
-  winning ticket republishes backing and installs its leaf while holding the
-  region lock; structural VMA removal cancels every covered ticket before a
-  replacement can appear. A cancelled anonymous allocation remains owned by
-  the fault path and returns to the frame allocator; a cancelled file alias is
-  released through its backing-owner hook.
+  leaving the address-space region lock. Demand-grown heap/stack and
+  FILE_DEMAND backing vectors contain only the materialized prefix; an omitted
+  tail entry is equivalent to a zero sentinel. The claim fallibly grows that
+  prefix through the faulting page before filesystem code can retain external
+  backing, making the later publication allocation-free. Frame allocation,
+  page zeroing, and filesystem callbacks run without the IRQ-disabling region
+  lock, so faults on distinct pages of one shared address space may progress
+  concurrently. The winning ticket republishes backing and installs its leaf
+  while holding the region lock; structural VMA removal cancels every covered
+  ticket before a replacement can appear. A cancelled anonymous allocation
+  remains owned by the fault path and returns to the frame allocator; a
+  cancelled file alias is released through its backing-owner hook.
 - An anonymous demand fault refused by the protected user reserve reports
   the typed `FrameAllocError::ReservePressure` directly from the allocator;
   fallback policy walks preserve that result rather than collapsing it into
@@ -1067,9 +1099,9 @@ x86_64 is rejected at runtime.
   The reclaimer preallocates
   top-level detachment storage, clears every private root descriptor under one
   short root-shard transaction, and releases that shard before callbacks,
-  intermediate-table traversal, or frame-allocation work. The global
-  shared-mapping transaction covers tree detachment, rmap retirement, and
-  external backing release. Intermediate and root frames return in bounded
+  intermediate-table traversal, or frame-allocation work. Final-owner teardown
+  acquires all shared-mapping shards, covering tree detachment, rmap retirement,
+  and external backing release. Intermediate and root frames return in bounded
   64-frame batches; x86_64 still requires a live ownership-registry entry at
   every reclaimed level, so copied kernel tables remain outside the detached
   set and can never enter a batch.

@@ -810,28 +810,30 @@ pub fn install_at_least(task_id: u64, entry: FdEntry, min: u32) -> Option<u32> {
 /// in the syscall layer, above this module, so it is injected rather than
 /// reached for — the same shape as the task-id lookup.
 type NofileLimitFn = fn(u64) -> u64;
-static NOFILE_LIMIT_LOOKUP: IrqSafeSpinLock<Option<NofileLimitFn>> = IrqSafeSpinLock::new(None);
+static NOFILE_LIMIT_LOOKUP: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the RLIMIT_NOFILE lookup. Until this is called every table is
 /// unbounded, which is what the early-boot seeding path needs.
 pub fn install_nofile_limit_lookup(f: NofileLimitFn) {
-    *NOFILE_LIMIT_LOOKUP.lock() = Some(f);
+    NOFILE_LIMIT_LOOKUP.store(f as usize, Ordering::Release);
 }
 
 /// Drop the lookup again. Test-only: the kernel-test harness rebuilds global
 /// state between cases and must not inherit another case's limit.
 pub fn __test_clear_nofile_limit_lookup() {
-    *NOFILE_LIMIT_LOOKUP.lock() = None;
+    NOFILE_LIMIT_LOOKUP.store(0, Ordering::Release);
 }
 
 fn nofile_limit_for(task_id: u64) -> u64 {
-    // Copy the pointer out and drop the guard before calling: the callback
-    // takes the rlimit store's lock, and holding this one across it would
-    // create a lock order for no reason.
-    let lookup = *NOFILE_LIMIT_LOOKUP.lock();
-    match lookup {
-        Some(f) => f(task_id),
-        None => u64::MAX,
+    let raw = NOFILE_LIMIT_LOOKUP.load(Ordering::Acquire);
+    if raw == 0 {
+        u64::MAX
+    } else {
+        // SAFETY: the only non-zero value published above is a `NofileLimitFn`
+        // and function pointers remain valid for the kernel image's lifetime.
+        let lookup: NofileLimitFn = unsafe { core::mem::transmute(raw) };
+        lookup(task_id)
     }
 }
 

@@ -143,7 +143,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let mapping_transaction = shm_mapping_transaction(as_key);
     let _mapping_guard = mapping_transaction.lock();
 
-    let mut perms = RegionPerms::READ | RegionPerms::SHARED;
+    let mut perms = RegionPerms::READ | RegionPerms::SHARED | RegionPerms::SYSV_SHM;
     if flg & SHM_RDONLY == 0 {
         perms = perms | RegionPerms::WRITE;
     }
@@ -152,7 +152,7 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     }
     let authority = current_mlock_authority();
     let mapped = as_ref.with_vma_transaction(|| {
-        narf_memory::with_shared_mapping_transaction(|| {
+        narf_memory::with_address_space_shared_mapping_transaction(as_ref.identity(), || {
             let mut frames_raw = alloc::vec::Vec::new();
             if !(vtable.frames)(handle, &mut frames_raw) {
                 return Err(narf_memory::AddressSpaceError::Unmapped);

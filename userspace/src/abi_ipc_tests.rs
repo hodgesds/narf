@@ -3503,12 +3503,24 @@ fn smoke_abi_ipc_shmat_address_modes_and_remap() -> TestResult {
             if !exec_region.perms.contains(RegionPerms::READ)
                 || !exec_region.perms.contains(RegionPerms::EXEC)
                 || !exec_region.perms.contains(RegionPerms::SHARED)
+                || !exec_region.perms.contains(RegionPerms::SYSV_SHM)
                 || exec_region.perms.contains(RegionPerms::WRITE)
             {
                 return Err("SHM_RDONLY|SHM_EXEC produced wrong region permissions");
             }
             if call(Syscall::MProtect.raw(), a2(exec_base + 4096, 4096, 1)) != Some(0) {
                 return Err("mprotect could not split the tracked SysV attachment");
+            }
+            if as_ref
+                .regions_snapshot()
+                .into_iter()
+                .filter(|region| {
+                    region.base.as_u64() < exec_base + 8192
+                        && region.base.as_u64() + region.len > exec_base
+                })
+                .any(|region| !region.perms.contains(RegionPerms::SYSV_SHM))
+            {
+                return Err("mprotect split lost SysV VMA provenance");
             }
 
             let id2 = call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT | 0o600))

@@ -151,6 +151,13 @@ impl Mempolicy {
 /// Publish `policy` as the active mempolicy for the current CPU.
 pub fn set_active(policy: Mempolicy) {
     let slot = cpu_slot();
+    if policy == Mempolicy::DEFAULT {
+        // The packed sentinel is the publication point for the default
+        // policy. Side fields may retain an older custom policy because
+        // `active` ignores them whenever it observes this value.
+        ACTIVE[slot].store(u64::MAX, Ordering::Release);
+        return;
+    }
     ACTIVE_ALLOWED[slot].store(policy.allowed, Ordering::Release);
     ACTIVE_HOME[slot].store(policy.home_node, Ordering::Release);
     ACTIVE_INTERLEAVE_INDEX[slot].store(policy.interleave_index, Ordering::Release);
@@ -160,16 +167,21 @@ pub fn set_active(policy: Mempolicy) {
 /// Reset the current CPU's active policy to `MPOL_DEFAULT`.
 pub fn clear_active() {
     let slot = cpu_slot();
+    // `set_active` publishes side fields before the packed policy and
+    // `active` consults them only after acquiring a non-sentinel value.
+    // Retaining stale side fields is therefore safe and avoids three stores
+    // on every ordinary demand-fault return.
     ACTIVE[slot].store(u64::MAX, Ordering::Release);
-    ACTIVE_ALLOWED[slot].store(u64::MAX, Ordering::Release);
-    ACTIVE_HOME[slot].store(u32::MAX, Ordering::Release);
-    ACTIVE_INTERLEAVE_INDEX[slot].store(0, Ordering::Release);
 }
 
 /// The current CPU's active policy (DEFAULT when none installed).
 pub fn active() -> Mempolicy {
     let slot = cpu_slot();
-    let mut policy = Mempolicy::unpack(ACTIVE[slot].load(Ordering::Acquire));
+    let packed = ACTIVE[slot].load(Ordering::Acquire);
+    if packed == u64::MAX {
+        return Mempolicy::DEFAULT;
+    }
+    let mut policy = Mempolicy::unpack(packed);
     policy.allowed = ACTIVE_ALLOWED[slot].load(Ordering::Acquire);
     policy.home_node = ACTIVE_HOME[slot].load(Ordering::Acquire);
     policy.interleave_index = ACTIVE_INTERLEAVE_INDEX[slot].load(Ordering::Acquire);
@@ -554,5 +566,9 @@ fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
 /// Allocate honoring the **current CPU's active policy**. This is the
 /// entry point the demand-paging fault path uses.
 pub fn alloc_frame_policied(local: usize) -> Result<PhysFrame, FrameAllocError> {
-    alloc_frame_with(active(), local)
+    let policy = active();
+    if policy == Mempolicy::DEFAULT {
+        return u_alloc_on(local);
+    }
+    alloc_frame_with(policy, local)
 }

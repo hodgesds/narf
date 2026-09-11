@@ -47,6 +47,58 @@ fn prepare_anonymous_population(
     }
 }
 
+/// Populate the fallback backing for a file mapping one page at a time.
+///
+/// The returned physical addresses remain owned by the caller until they are
+/// either published into a VMA or the shared-file cache. Allocation failure
+/// releases every page already prepared by this attempt.
+pub(crate) fn load_file_mapping_pages(
+    ops: &Arc<dyn narf_filesystem::FileOps>,
+    offset: u64,
+    len_bytes: usize,
+    pages: usize,
+) -> Result<alloc::vec::Vec<narf_memory::PhysAddr>, ()> {
+    let mut frames = alloc::vec::Vec::new();
+    if frames.try_reserve_exact(pages).is_err() {
+        return Err(());
+    }
+    for i in 0..pages {
+        let frame = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => {
+                for frame in frames {
+                    narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+                }
+                return Err(());
+            }
+        };
+        let off = i * 4096;
+        let want = core::cmp::min(4096, len_bytes - off);
+        // SAFETY: freshly-allocated identity-mapped frame; zero the whole
+        // page first so any tail past `want` (and past EOF) reads as zero.
+        unsafe {
+            core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+        }
+        // SAFETY: `frame` is identity-mapped in the low 4 GiB and `want` is
+        // at most one page, so this slice stays within the allocation.
+        let dst = unsafe { core::slice::from_raw_parts_mut(frame.kernel_mut_ptr::<u8>(), want) };
+        let mut done = 0usize;
+        while done < want {
+            // Keep one future alive through completion. Dropping a pending
+            // driver read could let DMA target a recycled scratch buffer.
+            match poll_io_to_completion(
+                ops.read(offset + off as u64 + done as u64, &mut dst[done..]),
+            ) {
+                Some(Ok(0)) | None => break,
+                Some(Ok(n)) => done += n,
+                Some(Err(_)) => break,
+            }
+        }
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
@@ -277,16 +329,21 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
 
     let pages = (len >> 12) as usize;
     let perms = perms_of_prot(prot);
-    let task = current_task_id();
-    let lpid = task_to_pid_raw(task).unwrap_or(task);
-    let as_key = shm_as_key(&as_ref);
-    if destructive_fixed {
+    // Only a destructive fixed mapping can close a displaced SysV VMA.
+    // Ordinary mmap therefore has no reason to translate task->pid, derive
+    // the mm key, materialize an owner row, or allocate/lock a SysV mapping
+    // transaction. Linux likewise reaches SysV state only through the close
+    // callback of an actually displaced shm VMA.
+    let fixed_shm = destructive_fixed.then(|| {
+        let task = current_task_id();
+        let lpid = task_to_pid_raw(task).unwrap_or(task);
+        let as_key = shm_as_key(&as_ref);
         shm_register_as_owner(as_key, lpid);
-    }
-    let shm_transaction = destructive_fixed.then(|| shm_mapping_transaction(as_key));
-    let _shm_guard = shm_transaction
+        (as_key, lpid, shm_mapping_transaction(as_key))
+    });
+    let _shm_guard = fixed_shm
         .as_ref()
-        .map(|transaction| transaction.lock());
+        .map(|(_, _, transaction)| transaction.lock());
 
     // Base selection. Destructive MAP_FIXED replacement is deferred until the
     // requested mapping's semantic, backing, and lock-limit checks pass.
@@ -319,12 +376,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
 
     macro_rules! record_fixed_replacement_owner_committed {
         () => {
-            if destructive_fixed {
+            if let Some((as_key, lpid, _)) = fixed_shm.as_ref() {
                 // `mapped_file::publish_current_mapping` updated the file
                 // owner table under the VMA transaction. Only the independent
                 // SysV attachment index remains to mirror here.
                 {
-                    shm_record_fixed_punch(as_key, hint, hint + len, lpid);
+                    shm_record_fixed_punch(*as_key, hint, hint + len, *lpid);
                 }
             }
         };
@@ -388,6 +445,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         }
         let mapped = as_ref.with_vma_transaction(|| {
             crate::mapped_file::publish_current_unowned_mapping(
+                as_ref.identity(),
                 base,
                 len,
                 destructive_fixed,
@@ -429,6 +487,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    let mut fallback_file_ops = None;
     // Device-backed shared mapping — the keystone for graphics. A
     // `/dev/fb0` framebuffer (or a DRM dumb buffer) returns the
     // physical frames of its scanout buffer from `FileOps::mmap_frames`;
@@ -442,6 +501,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         let ops = fd::with_table(task, |t| t.get(fd as u32).map(|e| e.ops.clone())).flatten();
         if let Some(ops) = ops {
+            // A coherent cache generation is the generic-file contract. It
+            // cannot also expose device-owned mmap frames, so skip three
+            // virtual capability probes and carry this already-retained file
+            // reference directly into the fallback path below.
+            if ops.mmap_cache_generation().is_none() {
             // Acquire any per-object owner BEFORE resolving raw frames. A
             // concurrent handle close may remove the lookup-table entry after
             // this point, but it cannot recycle the backing while this Arc is
@@ -466,55 +530,61 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     phys,
                 };
                 let mapped = as_ref.with_vma_transaction(|| {
-                    narf_memory::with_shared_mapping_transaction(|| {
-                        crate::mapped_file::publish_current_mapping(
-                            crate::mapped_file::MappingOwnerRegistration {
-                                base,
-                                len,
-                                file_offset: offset,
-                                ops: Arc::clone(&ops),
-                                lifetime: mmap_lifetime.clone(),
-                                writeback_phys: None,
-                                replace: destructive_fixed,
-                            },
-                            || {
-                                // SAFETY: VMA -> shared transactions are held;
-                                // the file owner lock stays held until the VMA
-                                // has its external lifetime registered.
-                                unsafe {
-                                    if destructive_fixed {
-                                        as_ref.replace_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
-                                    } else {
-                                        as_ref.map_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
+                    narf_memory::with_address_space_shared_mapping_transaction(
+                        as_ref.identity(),
+                        || {
+                            crate::mapped_file::publish_current_mapping(
+                                as_ref.identity(),
+                                crate::mapped_file::MappingOwnerRegistration {
+                                    base,
+                                    len,
+                                    file_offset: offset,
+                                    ops: Arc::clone(&ops),
+                                    lifetime: mmap_lifetime.clone(),
+                                    writeback_phys: None,
+                                    replace: destructive_fixed,
+                                },
+                                || {
+                                    // SAFETY: VMA -> shared transactions are held;
+                                    // the file owner lock stays held until the VMA
+                                    // has its external lifetime registered.
+                                    unsafe {
+                                        if destructive_fixed {
+                                            as_ref.replace_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        } else {
+                                            as_ref.map_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        }
                                     }
-                                }
-                            },
-                            |receipt| {
-                                // SAFETY: same live root and VMA transaction;
-                                // rollback is receipt-scoped if PTE install
-                                // fails.
-                                match unsafe { as_ref.materialize_mapping_locked(receipt) } {
-                                    Ok(()) => Ok(()),
-                                    Err(error) => {
-                                        // SAFETY: VMA -> shared transactions
-                                        // remain held by the enclosing scopes.
-                                        let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
-                                        Err(error)
+                                },
+                                |receipt| {
+                                    // SAFETY: same live root and VMA transaction;
+                                    // rollback is receipt-scoped if PTE install
+                                    // fails.
+                                    match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                                        Ok(()) => Ok(()),
+                                        Err(error) => {
+                                            // SAFETY: VMA -> shared transactions
+                                            // remain held by the enclosing scopes.
+                                            let _ = unsafe {
+                                                as_ref.rollback_mapping_locked(receipt)
+                                            };
+                                            Err(error)
+                                        }
                                     }
-                                }
-                            },
-                        )
-                    })
+                                },
+                            )
+                        },
+                    )
                 });
                 if let Err(error) = mapped {
                     let errno = match error {
@@ -562,42 +632,46 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     phys: alloc::vec![narf_memory::PhysAddr::new(0); pages],
                 };
                 let mapped = as_ref.with_vma_transaction(|| {
-                    narf_memory::with_shared_mapping_transaction(|| {
-                        crate::mapped_file::publish_current_mapping(
-                            crate::mapped_file::MappingOwnerRegistration {
-                                base,
-                                len,
-                                file_offset: offset,
-                                ops: Arc::clone(&ops),
-                                lifetime: None,
-                                writeback_phys: None,
-                                replace: destructive_fixed,
-                            },
-                            || {
-                                // SAFETY: VMA -> shared transactions are held
-                                // while the owner lock prevents a racing fault
-                                // from observing an ownerless FILE_DEMAND VMA.
-                                unsafe {
-                                    if destructive_fixed {
-                                        as_ref.replace_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
-                                    } else {
-                                        as_ref.map_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
+                    narf_memory::with_address_space_shared_mapping_transaction(
+                        as_ref.identity(),
+                        || {
+                            crate::mapped_file::publish_current_mapping(
+                                as_ref.identity(),
+                                crate::mapped_file::MappingOwnerRegistration {
+                                    base,
+                                    len,
+                                    file_offset: offset,
+                                    ops: Arc::clone(&ops),
+                                    lifetime: None,
+                                    writeback_phys: None,
+                                    replace: destructive_fixed,
+                                },
+                                || {
+                                    // SAFETY: VMA -> shared transactions are held
+                                    // while the owner lock prevents a racing fault
+                                    // from observing an ownerless FILE_DEMAND VMA.
+                                    unsafe {
+                                        if destructive_fixed {
+                                            as_ref.replace_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        } else {
+                                            as_ref.map_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        }
                                     }
-                                }
-                            },
-                            |_receipt| Ok(()),
-                        )
-                    })
+                                },
+                                |_receipt| Ok(()),
+                            )
+                        },
+                    )
                 });
                 if let Err(error) = mapped {
                     let errno = match error {
@@ -623,100 +697,111 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(base));
                 return;
             }
+            }
+            fallback_file_ops = Some(ops);
         }
     }
 
     // Anonymous MAP_SHARED — Linux makes this a refcounted anonymous shared
     // object that survives fork: parent and child map the SAME frames and see
-    // each other's writes. NARF backs it with the narf-shmem frame registry
-    // (reached via the syscall vtable, exactly like System V shmat): the frames
-    // are zeroed, registry-owned (reaped by the shmem process-exit observer),
-    // and RegionPerms::SHARED makes `clone_for_fork` ALIAS them into the child
-    // rather than COW-splitting a private copy the parent never sees. Without
-    // this a child's writes — e.g. stress-ng's shared bogo-op counters, which
-    // live in a MAP_SHARED|MAP_ANONYMOUS page mmap'd before each worker fork —
-    // vanish from the parent's view (every counter reads back 0). Degrades to
-    // the private-anonymous path below if the registry is unavailable or the
-    // segment exceeds the per-handle cap (1 MiB); never a hard failure.
+    // each other's writes. NARF backs unnamed objects with narf-shmem's
+    // sharded per-page references rather than inserting a short-lived public
+    // handle into the named/System-V registry. RegionPerms::SHARED makes
+    // `clone_for_fork` alias and retain those pages rather than COW-splitting
+    // a private copy the parent never sees. Without this a child's writes —
+    // e.g. stress-ng's shared bogo-op counters — vanish from the parent's
+    // view. Degrades to the private-anonymous path if the registry is
+    // unavailable or the segment exceeds the per-object cap; never a hard
+    // failure.
     if flags & MAP_SHARED != 0 && anonymous {
         if let Some(v) = shmem_vtable() {
-            let handle = (v.create)(current_task_id(), len);
-            if handle != 0 {
-                let mapped = as_ref.with_vma_transaction(|| {
-                    narf_memory::with_shared_mapping_transaction(|| {
-                        let mut frames_raw = alloc::vec::Vec::new();
-                        if !(v.frames)(handle, &mut frames_raw) || frames_raw.len() != pages {
-                            return Err(narf_memory::AddressSpaceError::Unmapped);
-                        }
-                        let phys = frames_raw
-                            .into_iter()
-                            .map(narf_memory::PhysAddr::new)
-                            .collect();
-                        let region = Region {
-                            base: VirtAddr::new(base),
-                            len,
-                            perms: perms | RegionPerms::SHARED,
-                            phys,
-                        };
-                        crate::mapped_file::publish_current_unowned_mapping(
-                            base,
-                            len,
-                            destructive_fixed,
-                            || {
-                                // SAFETY: VMA -> shared-owner transactions
-                                // cover the backing snapshot and alias
-                                // publication.
-                                unsafe {
-                                    if destructive_fixed {
-                                        as_ref.replace_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
-                                    } else {
-                                        as_ref.map_shared_region_locked_limited_receipt(
-                                            region,
-                                            explicit_lock,
-                                            mlock_authority.limit_bytes,
-                                            mlock_authority.bypass_limit,
-                                        )
-                                    }
-                                }
-                            },
-                            |receipt| {
-                                // SAFETY: root plus VMA/shared transactions
-                                // remain live through completion.
-                                match unsafe { as_ref.materialize_mapping_locked(receipt) } {
-                                    Ok(()) => Ok(()),
-                                    Err(error) => {
-                                        // SAFETY: both structural
-                                        // transactions remain held.
-                                        let _ = unsafe { as_ref.rollback_mapping_locked(receipt) };
-                                        Err(error)
-                                    }
-                                }
-                            },
-                        )
-                    })
-                });
-                if let Ok(receipt) = mapped {
-                    record_fixed_replacement_owner_committed!();
-                    // This handle is an implementation detail, not a name
-                    // userspace can ever attach again. Remove it as soon as
-                    // the VMA has retained every frame.
-                    if !(v.destroy)(handle) {
-                        let _ = as_ref.rollback_mapping(receipt);
-                        // Segment teardown failed after mapping → ENOMEM.
-                        ctx.set_return(SyscallReturn::ok((-12i64) as u64));
-                        return;
+            let mut frames_raw = alloc::vec::Vec::new();
+            if (v.create_anonymous)(len, &mut frames_raw) {
+                if frames_raw.len() != pages {
+                    for &phys in &frames_raw {
+                        let _ = (v.release_frame)(phys);
                     }
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                    return;
+                }
+                let phys = frames_raw
+                    .iter()
+                    .copied()
+                    .map(narf_memory::PhysAddr::new)
+                    .collect();
+                let region = Region {
+                    base: VirtAddr::new(base),
+                    len,
+                    perms: perms | RegionPerms::SHARED,
+                    phys,
+                };
+                let mapped = as_ref.with_vma_transaction(|| {
+                    narf_memory::with_address_space_shared_mapping_transaction(
+                        as_ref.identity(),
+                        || {
+                            let result = crate::mapped_file::publish_current_unowned_mapping(
+                                as_ref.identity(),
+                                base,
+                                len,
+                                destructive_fixed,
+                                || {
+                                    // SAFETY: VMA -> shared-owner transactions
+                                    // cover the backing snapshot and alias
+                                    // publication.
+                                    unsafe {
+                                        if destructive_fixed {
+                                            as_ref.replace_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        } else {
+                                            as_ref.map_shared_region_locked_limited_receipt(
+                                                region,
+                                                explicit_lock,
+                                                mlock_authority.limit_bytes,
+                                                mlock_authority.bypass_limit,
+                                            )
+                                        }
+                                    }
+                                },
+                                |receipt| {
+                                    // SAFETY: root plus VMA/shared transactions
+                                    // remain live through completion.
+                                    match unsafe { as_ref.materialize_mapping_locked(receipt) } {
+                                        Ok(()) => Ok(()),
+                                        Err(error) => {
+                                            // SAFETY: both structural
+                                            // transactions remain held.
+                                            let _ = unsafe {
+                                                as_ref.rollback_mapping_locked(receipt)
+                                            };
+                                            Err(error)
+                                        }
+                                    }
+                                },
+                            );
+                            // Keep creator-drop serialized with global shared
+                            // page migration: the migrator may replace the
+                            // physical identity as soon as this transaction
+                            // ends, after which releasing the old snapshot
+                            // would miss its ownership row.
+                            for &phys in &frames_raw {
+                                let released = (v.release_frame)(phys);
+                                debug_assert!(released);
+                            }
+                            result
+                        },
+                    )
+                });
+                if mapped.is_ok() {
+                    record_fixed_replacement_owner_committed!();
                     crate::perf_event::on_mmap(current_task_id(), -1, base, len, 0, prot, flags);
                     ctx.set_return(SyscallReturn::ok(base));
                     return;
                 }
                 let map_error = mapped.expect_err("mapped success returned above");
-                (v.destroy)(handle);
                 if map_error == narf_memory::AddressSpaceError::LockLimit {
                     ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
                     return;
@@ -729,8 +814,8 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
                     return;
                 }
-                // Registry lookup/insertion failure for an ordinary anonymous
-                // shared mapping may still degrade to private anonymous.
+                // Publication failure for an ordinary anonymous shared
+                // mapping may still degrade to private anonymous.
             }
         }
         // Registry unavailable or create failed: degrade to private anonymous.
@@ -749,7 +834,19 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
     let shared_file_fallback = !anonymous && flags & MAP_SHARED != 0;
+    // Linux generic_file_mmap installs fault operations and obtains a
+    // page-cache folio only on first access. NARF likewise leaves a cache
+    // miss absent, but may install an already-resident canonical page here:
+    // unlike Linux, NARF does not yet have a multi-page filemap fault-around
+    // path, so needlessly faulting an existing page costs an extra trap and
+    // owner-table lookup without changing observable semantics.
+    let may_defer_shared_file = shared_file_fallback
+        && !explicit_lock
+        && (flags & MAP_POPULATE == 0 || flags & MAP_NONBLOCK != 0);
+    let mut lazy_shared_file = false;
     let mut shared_file_ops = None;
+    let mut shared_publication = None;
+    let mut shared_cache_generation = None;
     let populate_anonymous = anonymous
         && flags & MAP_POPULATE != 0
         && flags & MAP_NONBLOCK == 0
@@ -784,11 +881,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // frames are a scatter list, so no large contiguous allocation is
         // needed.
         let len_bytes = len as usize;
-        let ops = match fd::with_table(current_task_id(), |t| {
-            t.get(fd as u32).map(|e| e.ops.clone())
-        })
-        .flatten()
-        {
+        let ops = match fallback_file_ops.take().or_else(|| {
+            fd::with_table(current_task_id(), |t| {
+                t.get(fd as u32).map(|e| e.ops.clone())
+            })
+            .flatten()
+        }) {
             Some(o) => o,
             None => {
                 // File-backed mapping with an fd not in the fd table → EBADF.
@@ -797,71 +895,62 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             }
         };
         if shared_file_fallback {
+            shared_cache_generation = ops.mmap_cache_generation();
             shared_file_ops = Some(Arc::clone(&ops));
         }
-        // Fallible per-page frame list — see the anonymous branch: never panic
-        // the kernel on an oversized userspace mmap; return -ENOMEM. (The frame
-        // loop below is already fallible; only this capacity reservation could
-        // panic on a huge `pages`.)
-        let mut frames = alloc::vec::Vec::new();
-        if frames.try_reserve_exact(pages).is_err() {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
-            return;
-        }
-        for i in 0..pages {
-            let frame = match narf_memory::alloc_frame() {
-                Ok(f) => f.start_address(),
-                Err(_) => {
-                    // Frame allocator exhausted → ENOMEM.
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+        if may_defer_shared_file {
+            if let Some((frames, publication)) =
+                crate::mapped_file::reserve_cached_shared_file_pages(&ops, offset, pages)
+            {
+                shared_publication = Some(publication);
+                frames
+            } else {
+                lazy_shared_file = true;
+                narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+                // Linux installs only VMA metadata here. An empty sparse
+                // prefix represents every page as absent until FILE_DEMAND
+                // grows through the first touched slot.
+                alloc::vec::Vec::new()
+            }
+        } else if shared_file_fallback {
+            if let Some((frames, publication)) =
+                crate::mapped_file::reserve_cached_shared_file_pages(&ops, offset, pages)
+            {
+                shared_publication = Some(publication);
+                frames
+            } else {
+                match load_file_mapping_pages(&ops, offset, len_bytes, pages) {
+                    Ok(frames) => frames,
+                    Err(()) => {
+                        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                        return;
+                    }
+                }
+            }
+        } else {
+            match load_file_mapping_pages(&ops, offset, len_bytes, pages) {
+                Ok(frames) => frames,
+                Err(()) => {
+                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
                     return;
                 }
-            };
-            let off = i * 4096;
-            let want = core::cmp::min(4096, len_bytes - off);
-            // SAFETY: freshly-allocated identity-mapped frame; zero the whole
-            // page first so any tail past `want` (and past EOF) reads as zero.
-            unsafe {
-                core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
             }
-            // SAFETY: `frame` is identity-mapped in the low 4 GiB and `want`
-            // is <= 4096, so the slice stays within the page.
-            let dst = unsafe { core::slice::from_raw_parts_mut(frame.kernel_mut_ptr::<u8>(), want) };
-            let mut done = 0usize;
-            while done < want {
-                // Poll each read to COMPLETION, keeping the one future alive for
-                // the whole wait (`poll_io_to_completion`, huge backstop) — never
-                // drop it mid-request. The old code used `poll_blocking` (a small
-                // 4M budget) and treated its timeout (`None`) as EOF, silently
-                // zero-filling the page tail under a concurrent-execve storm (KDE
-                // launching dozens of procs): that truncated a mmap'd DSO — it
-                // lopped a libdbus `.rodata` string "/org/freedesktop/DBus" → "/",
-                // so every forked dbus client sent a malformed Hello, killing the
-                // session bus and stalling Plasma. Dropping a read future mid-DMA
-                // ALSO left an in-flight virtio-blk request writing into a scratch
-                // buffer that had been returned to the pool and reused → garbage.
-                // Holding the future to completion fixes both: the scratch buffer
-                // is released only after its DMA finishes.
-                match poll_io_to_completion(
-                    ops.read(offset + off as u64 + done as u64, &mut dst[done..]),
-                ) {
-                    Some(Ok(0)) | None => break, // real EOF (or wedged device) — rest stays zero
-                    Some(Ok(n)) => done += n,
-                    Some(Err(_)) => break, // read error — rest stays zero
-                }
-            }
-            frames.push(frame);
         }
-        frames
     };
     if populate_anonymous {
         prepare_anonymous_population(base, &mut phys_list, &mut population_frames);
     }
 
-    let mut shared_publication = None;
-    if let Some(ops) = shared_file_ops.as_ref() {
-        let (canonical, publication) =
-            crate::mapped_file::publish_shared_file_pages(ops, offset, phys_list);
+    if let Some(ops) = shared_file_ops
+        .as_ref()
+        .filter(|_| !lazy_shared_file && shared_publication.is_none())
+    {
+        let (canonical, publication) = crate::mapped_file::publish_shared_file_pages(
+            ops,
+            offset,
+            phys_list,
+            shared_cache_generation,
+        );
         phys_list = canonical;
         shared_publication = Some(publication);
     }
@@ -874,7 +963,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // VMAs alias one page and delegates lifetime to the cache through
         // memory's shared-frame hooks.
         perms: if shared_file_ops.is_some() {
-            perms | RegionPerms::SHARED
+            perms
+                | RegionPerms::SHARED
+                | if lazy_shared_file {
+                    RegionPerms::FILE_DEMAND
+                } else {
+                    RegionPerms(0)
+                }
         } else {
             perms
         },
@@ -882,8 +977,9 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     };
     let map_result = if let Some(ops) = shared_file_ops.as_ref() {
         as_ref.with_vma_transaction(|| {
-            narf_memory::with_shared_mapping_transaction(|| {
+            narf_memory::with_address_space_shared_mapping_transaction(as_ref.identity(), || {
                 crate::mapped_file::publish_current_mapping(
+                    as_ref.identity(),
                     crate::mapped_file::MappingOwnerRegistration {
                         base,
                         len,
@@ -915,6 +1011,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         }
                     },
                     |receipt| {
+                        if lazy_shared_file {
+                            // The complete sparse tail is intentionally absent.
+                            // First access publishes a cache-owned page through
+                            // the FILE_DEMAND hook.
+                            return Ok(());
+                        }
                         // SAFETY: the root and VMA transaction remain live.
                         match unsafe { as_ref.materialize_mapping_locked(receipt) } {
                             Ok(()) => Ok(()),
@@ -933,6 +1035,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     } else if fixed {
         as_ref.with_vma_transaction(|| {
             crate::mapped_file::publish_current_unowned_mapping(
+                as_ref.identity(),
                 base,
                 len,
                 destructive_fixed,
@@ -1679,9 +1782,21 @@ mod tests {
             Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
             _ => return TestResult::Fail("MAP_SHARED file mmap failed"),
         };
+        let initially_lazy = aspace
+            .lookup(narf_memory::VirtAddr::new(base))
+            .is_some_and(|region| {
+                region.perms.contains(RegionPerms::FILE_DEMAND)
+                    && region.phys.is_empty()
+            });
+        // SAFETY: the test owns this live user root and the address lies in
+        // the FILE_DEMAND mapping just published through sys_mmap.
+        let first_fault = unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(base)) };
+        if !initially_lazy || first_fault.is_err() {
+            return TestResult::Fail("generic MAP_SHARED mapping was not demand-backed");
+        }
         let region = match aspace.lookup(narf_memory::VirtAddr::new(base)) {
             Some(region) if region.phys.len() == 1 && region.phys[0].raw() != 0 => region,
-            _ => return TestResult::Fail("file mapping has no physical page"),
+            _ => return TestResult::Fail("file fault did not publish a physical page"),
         };
         // SAFETY: the syscall allocated this page exclusively for the test
         // mapping and all physical memory is kernel identity-mapped.
@@ -1713,9 +1828,13 @@ mod tests {
             Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
             _ => return TestResult::Fail("second MAP_SHARED file mmap failed"),
         };
+        // SAFETY: same test-owned root and FILE_DEMAND contract as above.
+        if unsafe { aspace.demand_alloc_page(narf_memory::VirtAddr::new(second_base)) }.is_err() {
+            return TestResult::Fail("second MAP_SHARED file fault failed");
+        }
         let second_region = match aspace.lookup(narf_memory::VirtAddr::new(second_base)) {
             Some(region) if region.phys.len() == 1 && region.phys[0].raw() != 0 => region,
-            _ => return TestResult::Fail("second file mapping has no physical page"),
+            _ => return TestResult::Fail("second file fault did not publish a physical page"),
         };
         if second_region.phys[0] != region.phys[0] {
             return TestResult::Fail("same-range MAP_SHARED mappings did not alias one file page");

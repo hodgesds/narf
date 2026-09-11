@@ -74,12 +74,17 @@ bridge; changing it requires the ABI versioning process in `abi/` §4.
 
 Linux-compatible anonymous private `mmap(2)` records lazy zero-backed VMAs;
 the mapping syscall does not walk unrelated regions or allocate resident data
-pages unless `MAP_POPULATE` requests a best-effort prefault. `MAP_NONBLOCK`
-suppresses that prefault without changing VMA publication. Anonymous
-`MAP_SHARED` mappings eagerly allocate registry-owned frames,
-retain them through the VMA and any fork aliases, and immediately remove their
-internal shmem name; the last alias unmap reclaims the backing without retaining
-one public registry entry per completed mapping until process exit.
+pages or one backing descriptor per untouched virtual page unless
+`MAP_POPULATE` requests a best-effort prefault. The VMA's materialized backing
+prefix grows through each faulted page, and its omitted tail retains normal
+demand-zero semantics. `MAP_NONBLOCK` suppresses prefaulting without changing
+VMA publication. No-hint private-anonymous placement uses the first suitable
+gap from the locked live topology; caller hints remain advisory. Anonymous
+`MAP_SHARED` mappings eagerly allocate zeroed frames whose unnamed ownership is
+tracked by cache-line-isolated, per-page reference shards. A creator reference
+keeps each page live until VMA publication or rollback completes; VMA and fork
+aliases take their own references, and the last alias unmap reclaims the page.
+Named and System V shared-memory objects retain the public-handle registry.
 `MAP_FIXED_NOREPLACE` publishes its exact address non-destructively under the
 address-space VMA transaction. An occupied target returns `EEXIST`, including
 when a `CLONE_VM` peer claims the range after the syscall's initial fast probe;
@@ -102,13 +107,19 @@ be materialized, removed, or registered by the losing syscall.
 
 `mremap(2)` supports no-op resize, real tail shrink, in-place lazy grow,
 `MREMAP_MAYMOVE`, disjoint `MREMAP_FIXED`, and `MREMAP_DONTUNMAP`. Private
-relocation transfers resident backing without copying it; DONTUNMAP leaves a
-lazy anonymous source range and transfers its lock contract to the
-destination. One-Region base-page shared mappings support ordinary shrink,
-in-place grow, MAYMOVE/FIXED relocation and equal-length DONTUNMAP, plus the
-historical `old_len == 0` duplication form. Ordinary relocation transfers kept
-backing and resident leaves, leaves a grown tail lazy, and releases a truncated
-tail only after source invalidation. DONTUNMAP and legacy duplication instead
+relocation may select an interval contained in one VMA, preserves unselected
+head/tail fragments with their exact backing offsets, and transfers selected
+resident backing without copying it; DONTUNMAP retains its exact-private-VMA
+restriction, leaves a lazy anonymous source range, and transfers its lock
+contract to the destination. A non-fixed private MAYMOVE destination uses the
+same first-gap search as mmap while the address-space transaction is held, so
+released holes are reused and a failed relocation consumes no cursor space.
+One-Region base-page shared mappings support
+ordinary shrink, in-place grow, MAYMOVE/FIXED relocation and equal-length
+DONTUNMAP, plus the historical `old_len == 0` duplication form. Ordinary
+relocation transfers kept backing and resident leaves, leaves a grown tail
+lazy, and releases a truncated tail only after source invalidation. DONTUNMAP
+and legacy duplication instead
 keep the backing owned by both VMAs; resident leaves move for DONTUNMAP and
 clone for duplication. File-demand slices and SysV attachment/nattch state are
 fallibly prepared and published atomically with every memory outcome,
@@ -120,10 +131,11 @@ so a CLONE_VM peer cannot replace the source between validation and mutation.
 Growth checks locked bytes first (`EAGAIN`), then page-rounded `RLIMIT_AS` and
 private-writable non-stack `RLIMIT_DATA` (`ENOMEM`), including Linux's
 soft-DATA-zero/hard-limit compatibility rule. Fixed replacement conditionally
-takes the global shared-backing transaction only when the target overlaps
+takes the address space's shared-backing shard only when the target overlaps
 borrowed backing; file/SysV owner rows are retired on success and on typed
 post-punch failure, and eager locked-tail population runs after all IRQ-safe
-transactions are released.
+transactions are released. Cross-address-space MOVE_ALL migration exclusively
+acquires every shard in ascending order.
 
 Linux-compatible `brk(2)` likewise changes only the address-space break and
 its single anonymous heap VMA. Growth appends lazy zero-backed page slots and
@@ -478,7 +490,11 @@ materialization maintain exact rollback and backing-lifetime accounting.
 Attachments retain their original detach address across VMA splits and partial
 replacement. A single mm-level transaction serializes SysV VMA creation,
 fixed-range punching, attachment publication/removal, and `shm_nattch` changes
-across `CLONE_VM` siblings. `munmap(2)`, `MAP_FIXED`, `SHM_REMAP`, and an
+across `CLONE_VM` siblings. SysV VMAs carry an internal provenance marker;
+ordinary `munmap(2)` inspects the affected range under the mm-level VMA
+transaction and bypasses SysV owner/attachment registries when none overlap,
+so a first concurrent attach cannot race an unaccounted unmap. `munmap(2)`,
+`MAP_FIXED`, `SHM_REMAP`, and an
 `MREMAP_FIXED` destination replacement update `shm_nattch`; a
 later `shmdt(2)` removes every surviving VMA fragment belonging to the selected
 logical attachment. Fork duplicates each inherited attachment and its count,
@@ -497,7 +513,10 @@ owner/creator rule and `RLIMIT_MEMLOCK` error classes, retain per-user charges
 until delayed backing destruction, expose `SHM_LOCKED`, and make registry
 frames ineligible for explicit NUMA migration. `ShmemSyscallVtable` exposes
 the backing limit, per-frame lock query, and whole-handle charged lock/unlock
-operations needed to keep those semantics coupled to backing lifetime.
+operations needed to keep those semantics coupled to backing lifetime. It also
+exposes unnamed-object creation with one creator reference per returned page;
+per-frame retain/release operations report ownership so anonymous shmem can be
+dispatched before the shared-file cache without scanning either registry.
 AF_UNIX listeners likewise advance a readable token whenever `connect(2)`
 queues an accept-ready endpoint. Accepting the final pending endpoint followed
 by a new connection before the next epoll scan remains a deliverable
@@ -947,6 +966,19 @@ snapshot, write each changed canonical page once even when it has overlapping
 aliases, and advance the snapshot only after the full page write succeeds.
 Clean pages perform no filesystem write; the comparison is byte-exact rather
 than hash-based so collision cannot suppress persistence.
+
+Unlocked generic `MAP_SHARED` publication is lazy like Linux
+`generic_file_mmap`: it publishes empty Region and writeback prefixes rather
+than allocating one absent slot per virtual page, then resolves a
+generation-valid canonical fallback page on first access. Missing tail entries
+have FILE_DEMAND absent-page semantics; both prefixes grow fallibly only
+through a touched page. The fault path drops the per-address-space owner lock
+before filesystem I/O, then revalidates the owner and records writeback backing
+before returning the retained page to the memory fault transaction.
+`MAP_LOCKED` and blocking `MAP_POPULATE` preserve eager backing; `MAP_NONBLOCK`
+suppresses prefaulting. Shared mremap slices and transfers only the materialized
+writeback prefix, so an untouched grown or relocated tail remains allocation
+free.
 
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the

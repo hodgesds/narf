@@ -1079,6 +1079,10 @@ fn open_impl(
     // `InputEventFile::nonblock_read_eagain`.)
     let open_status_flags =
         (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK | crate::fd::O_PATH);
+    // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
+    let access_mode = flags & 0o3;
+    let want_r = access_mode == 0 || access_mode == 2;
+    let want_w = access_mode == 1 || access_mode == 2;
     let task = current_task_id();
     // Linux open/openat reject an empty pathname with ENOENT. Do this before
     // cwd normalization: `resolve_cwd_path(task, "")` otherwise collapses to
@@ -1094,7 +1098,7 @@ fn open_impl(
     // keeps its already-relative-to-the-mount path). This is what makes
     // `ls` (which opens ".") and any relative open work from a shell.
     let path_owned = if mnt_len == 0 {
-        resolve_cwd_path(task, &path_owned_raw)
+        resolve_cwd_path_owned(task, path_owned_raw)
     } else {
         path_owned_raw
     };
@@ -1105,11 +1109,20 @@ fn open_impl(
     // those links through the current mount table before the final lookup.
     // O_NOFOLLOW still preserves a final link, while intermediate links must
     // always be traversed.
-    let proc_prefix = apply_chroot("/proc");
-    let proc_magic_path = path_owned == proc_prefix
-        || (path_owned.starts_with(proc_prefix.as_str())
-            && path_owned.as_bytes().get(proc_prefix.len()) == Some(&b'/'));
-    let path_owned = if mnt_len == 0 && !proc_magic_path {
+    let proc_magic_path = chroot_path_matches(task, &path_owned, "/proc", true);
+    let mut fast_create = if mnt_len == 0
+        && !proc_magic_path
+        && flags & O_CREAT != 0
+        && flags & 0o400000 == 0
+    {
+        resolve_create_fast(&path_owned)
+    } else {
+        None
+    };
+    let fast_create_mount_id = fast_create.as_ref().map(FastCreateResolution::mount_id);
+    let path_owned = if fast_create.is_some() {
+        path_owned
+    } else if mnt_len == 0 && !proc_magic_path {
         resolve_vfs_symlink_path(&path_owned, flags & 0o400000 == 0).unwrap_or(path_owned)
     } else {
         path_owned
@@ -1130,6 +1143,7 @@ fn open_impl(
     // still open the symlink itself, so leave that case to the nofollow path.
     #[cfg(feature = "container")]
     if mnt_len == 0 && flags & 0o400000 == 0 {
+        let proc_prefix = apply_chroot("/proc");
         if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
             let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
             let new_fd = fd::install(task, crate::fd::FdEntry {
@@ -1254,7 +1268,11 @@ fn open_impl(
     //   the registry finds the longest-matching mount.
     // - Explicit-mount: arg2/arg3 = (ptr, len). The path is relative.
     //   Useful when the caller already knows the mount.
-    let ops = if mnt_len == 0 {
+    let ops = if let Some(FastCreateResolution::Existing { node, .. }) = fast_create.as_ref() {
+        Some(Arc::clone(node))
+    } else if fast_create.is_some() {
+        None
+    } else if mnt_len == 0 {
         current_resolve_absolute(path, |fs, rel| {
             if rel.is_empty() {
                 // A file-rooted mount (mount --bind of a file) resolves to the
@@ -1296,7 +1314,7 @@ fn open_impl(
         .as_ref()
         .map(|o| o.stat().mode.file_type == narf_filesystem::FileType::Dir)
         .unwrap_or(false);
-    if (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
+    if fast_create.is_none() && (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
             let new_fd = fd::install(task, crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
@@ -1325,11 +1343,44 @@ fn open_impl(
     let ops = match ops {
         Some(o) => o,
         None if (flags & O_CREAT) != 0 && mnt_len == 0 => {
+            // Linux checks path-based LSM policy before publishing a new
+            // inode. The old order created the file and only then let
+            // Landlock reject the open, leaving a forbidden side effect.
+            if let Err(denied) =
+                crate::landlock::landlock_check_open(task, path, want_r, want_w)
+            {
+                ctx.set_return(denied);
+                return;
+            }
+            let accessor = current_accessor(task);
+            let permissions = (create_mode & !current_umask() & 0o777) as u16;
             // Async parent resolution so O_CREAT works in subdirectories of
             // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
-            match resolve_parent_dir_async(path)
-                .map(|(parent, leaf)| poll_blocking(parent.create(&leaf)))
-            {
+            let create_result = fast_create
+                .take()
+                .and_then(|resolution| match resolution {
+                    FastCreateResolution::Missing { parent, leaf, .. } => Some((parent, leaf)),
+                    FastCreateResolution::Existing { .. } => None,
+                })
+                .map(|(parent, leaf)| {
+                    poll_blocking(parent.create_with_attrs(
+                        &leaf,
+                        permissions,
+                        accessor.uid,
+                        accessor.gid,
+                    ))
+                })
+                .or_else(|| {
+                    resolve_parent_dir_async(path).map(|(parent, leaf)| {
+                        poll_blocking(parent.create_with_attrs(
+                            &leaf,
+                            permissions,
+                            accessor.uid,
+                            accessor.gid,
+                        ))
+                    })
+                });
+            match create_result {
                 Some(Some(Ok(o))) => {
                     {
                         created = true;
@@ -1388,13 +1439,6 @@ fn open_impl(
         }
     };
 
-    if created {
-        let accessor = current_accessor(task);
-        let _ = poll_blocking(ops.set_owners(accessor.uid, accessor.gid));
-        let permissions = (create_mode & !current_umask() & 0o777) as u16;
-        let _ = poll_blocking(ops.set_perms(permissions));
-    }
-
     // O_PATH: install a bare path-reference fd. Per Linux `do_dentry_open`,
     // an O_PATH open resolves the node but invokes NO file operation — no
     // FIFO peer-rendezvous, no /dev/ptmx clone, no device `open`, and no
@@ -1432,7 +1476,7 @@ fn open_impl(
     // for the system console. Preserve O_PATH's side-effect-free path inode
     // above; a real open selects the console or live PTY slave recorded by
     // TIOCSCTTY. A session with no controlling terminal gets Linux ENXIO.
-    let ops = if mnt_len == 0 && path == apply_chroot("/dev/tty") {
+    let ops = if mnt_len == 0 && chroot_path_matches(task, path, "/dev/tty", false) {
         let selected: Arc<dyn narf_filesystem::FileOps> = match task_ctty(task) {
             Some(CTTY_CONSOLE) => ops.clone(),
             Some(index) => match narf_filesystem::devfs_pty::pts_lookup(index) {
@@ -1462,75 +1506,84 @@ fn open_impl(
     // FSes report (uid=0, gid=0, perms=0o666) so non-root tasks see
     // the "other" triplet's rw bits and pass; the gate is structural
     // until ext2/minix start surfacing real owners.
-    let stat = ops.stat();
-    let (file_uid, file_gid) = ops.owners();
-    // O_RDONLY = 0, O_WRONLY = 1, O_RDWR = 2. Bits 0..1 of flags.
-    let access_mode = flags & 0o3;
-    let want_r = access_mode == 0 || access_mode == 2;
-    let want_w = access_mode == 1 || access_mode == 2;
-    // SECURITY: build the Accessor through the single translation funnel so
-    // a task inside a user-ns has its in-ns fsuid/fsgid mapped to
-    // HOST-absolute ids before posix_access_ok. File owners stay
-    // host-absolute. See current_accessor, which also supplies the DAC
-    // capability decision (it used to be inferred from uid == 0 inside
-    // posix_access_ok itself).
-    // `may_open` ends in `inode_permission(idmap, inode, MAY_OPEN|acc_mode)`,
-    // which reaches `generic_permission` -> `check_acl`, so open consults the
-    // inode's ACCESS ACL exactly as `access(2)` does. Without this fetch the
-    // check silently degrades to the mode bits and refuses a path that a
-    // `setfacl -m u:$uid:rw` grants — the ACL would be stored, honoured by
-    // access(2), and ignored by the open that follows it.
-    let acl = match poll_blocking(narf_filesystem::acl_of_file(
-        ops.as_ref(),
-        narf_filesystem::AclType::Access,
-    )) {
-        Some(Ok(acl)) => acl,
-        // A stored ACL that does not decode is NOT a fallback to the mode
-        // bits: `check_acl` returns the decode error and `generic_permission`
-        // passes anything that is not -EACCES straight out, so the errno
-        // reaches open(2) unchanged.
-        Some(Err(narf_filesystem::FsError::Unsupported)) => {
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
-            return;
-        }
-        Some(Err(_)) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-            return;
-        }
-        None => None,
+    let (stat, file_uid, file_gid) = if created {
+        // Linux's may_open() permission check applies to an existing inode.
+        // A newly created file is already open under the creation intent;
+        // checking its just-created mode could reject `open(O_CREAT, 000)`
+        // after the pathname had become visible.
+        (None, 0, 0)
+    } else {
+        let stat = ops.stat();
+        let (file_uid, file_gid) = ops.owners();
+        (Some(stat), file_uid, file_gid)
     };
-    if !narf_filesystem::posix_access_ok_with_acl(
-        narf_filesystem::FileOwner {
-            uid: file_uid,
-            gid: file_gid,
-            perms: stat.mode.perms,
-            is_dir: stat.mode.file_type == narf_filesystem::FileType::Dir,
-        },
-        &accessor_for_inode(task, file_uid, file_gid),
-        narf_filesystem::AccessRequest {
-            read: want_r,
-            write: want_w,
-            exec: false,
-        },
-        acl.as_ref(),
-    ) {
-        // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2) is
-        // explicit: EACCES is "the requested access to the file is not
-        // allowed, or search permission is denied for one of the directories
-        // in the path prefix"; EPERM means something else entirely. Reporting
-        // EPERM here made every permission denial read as "Operation not
-        // permitted" — e.g. journalctl's "opening journal file ...: Operation
-        // not permitted", which sends the reader looking for a capability or
-        // ownership bug instead of a plain mode/ACL denial.
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64));
-        return;
+    if let Some(stat) = stat {
+        let wanted = u16::from(want_r) * 0o4 + u16::from(want_w) * 0o2;
+        let owner = current_host_fsuid(task) == file_uid;
+        // Linux tests inode ownership before `check_acl`: ACL_USER_OBJ is
+        // already mirrored into the mode's owner triplet, and no named ACL
+        // entry may override it. The overwhelmingly common open-by-owner can
+        // therefore finish from lock-free inode metadata without allocating
+        // an xattr future or reading groups/capabilities.
+        let owner_mode_grants = owner && ((stat.mode.perms >> 6) & wanted) == wanted;
+        if !owner_mode_grants {
+            // `may_open` reaches `check_acl` only after the owner branch. A
+            // non-owner must still consult the ACCESS ACL; an owner denied by
+            // its mode skips it but may receive a capability override below.
+            let acl = if owner {
+                None
+            } else {
+                match poll_blocking(narf_filesystem::acl_of_file(
+                    ops.as_ref(),
+                    narf_filesystem::AclType::Access,
+                )) {
+                    Some(Ok(acl)) => acl,
+                    // A stored ACL that does not decode is NOT a fallback to
+                    // mode bits: check_acl returns the decode error unchanged.
+                    Some(Err(narf_filesystem::FsError::Unsupported)) => {
+                        ctx.set_return(SyscallReturn::ok((-95i64) as u64));
+                        return;
+                    }
+                    Some(Err(_)) => {
+                        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                        return;
+                    }
+                    None => None,
+                }
+            };
+            // SECURITY: build the Accessor through the single translation
+            // funnel so user-namespace ids and inode-scoped capability
+            // overrides retain their existing host-id semantics.
+            if !narf_filesystem::posix_access_ok_with_acl(
+                narf_filesystem::FileOwner {
+                    uid: file_uid,
+                    gid: file_gid,
+                    perms: stat.mode.perms,
+                    is_dir: stat.mode.file_type == narf_filesystem::FileType::Dir,
+                },
+                &accessor_for_inode(task, file_uid, file_gid),
+                narf_filesystem::AccessRequest {
+                    read: want_r,
+                    write: want_w,
+                    exec: false,
+                },
+                acl.as_ref(),
+            ) {
+                // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2)
+                // reserves EPERM for a different class of failure.
+                ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                return;
+            }
+        }
     }
 
     // Landlock: a self-restricted task's open must be permitted by its
     // active rulesets, else EACCES.
-    if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
-        ctx.set_return(denied);
-        return;
+    if !created {
+        if let Err(denied) = crate::landlock::landlock_check_open(task, path, want_r, want_w) {
+            ctx.set_return(denied);
+            return;
+        }
     }
 
     // Clone devices keep path lookup/stat side-effect free and allocate their
@@ -1562,7 +1615,7 @@ fn open_impl(
     // every lock first) and set the return itself.
     if let Some(shared) = ops.fifo_shared() {
         let node_ino = ops.ino();
-        let perms = stat.mode.perms;
+        let perms = ops.stat().mode.perms;
         let (fifo_uid, fifo_gid) = ops.owners();
         let nonblock = flags & (crate::fd::O_NONBLOCK as u64) != 0;
         open_fifo(
@@ -1592,14 +1645,17 @@ fn open_impl(
             return;
         }
     };
-    // inotify: record the fd's path (so a later write can fire IN_MODIFY)
-    // and emit IN_CREATE (new file) + IN_OPEN against any matching watch.
+    // Inotify: emit IN_CREATE (new file) + IN_OPEN against any matching
+    // watch, then move the normalized pathname into the fd identity table.
+    // All three publications finish before the syscall returns; moving avoids
+    // cloning the path only to free the original immediately afterwards.
     {
-        crate::mqueue::register_fd_path(task, new_fd, path, current_mount_id_at(path));
+        let fd_mount_id = fast_create_mount_id.or_else(|| current_mount_id_at(path));
         if created {
             crate::mqueue::notify_create(path, false);
         }
         crate::mqueue::notify_open(path);
+        crate::mqueue::register_fd_path_owned(task, new_fd, path_owned, fd_mount_id);
     }
     ctx.set_return(SyscallReturn::ok(new_fd as u64));
 }
@@ -6136,6 +6192,9 @@ mod fb_console_owner {
 #[derive(Copy, Clone)]
 pub struct ShmemSyscallVtable {
     pub create: fn(pid: u64, len: u64) -> u64,
+    /// Create an unnamed MAP_SHARED object. Returned frames each carry one
+    /// creator reference which the caller releases after VMA publication.
+    pub create_anonymous: fn(len: u64, out: &mut alloc::vec::Vec<u64>) -> bool,
     /// Largest supported handle, used for SysV SHMMAX/SHMALL reporting.
     pub max_len: fn() -> u64,
     pub len_of: fn(handle: u64) -> u64,
@@ -6153,8 +6212,12 @@ pub struct ShmemSyscallVtable {
     pub unlock: fn(handle: u64) -> bool,
     /// Atomically replace one registry backing entry after all aliases moved.
     pub replace_frame: fn(old_phys: u64, new_phys: u64) -> bool,
-    pub retain_frame: fn(phys: u64),
-    pub release_frame: fn(phys: u64),
+    /// Retain one mapping reference, returning false when this registry does
+    /// not own the frame.
+    pub retain_frame: fn(phys: u64) -> bool,
+    /// Release one mapping reference, returning false when this registry does
+    /// not own the frame.
+    pub release_frame: fn(phys: u64) -> bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -6190,21 +6253,21 @@ fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
 }
 
 pub fn retain_external_shared_frame(phys: u64) {
-    if crate::mapped_file::retain_shared_file_page(phys) {
-        return;
-    }
     if let Some(vtable) = shmem_vtable() {
-        (vtable.retain_frame)(phys);
+        if (vtable.retain_frame)(phys) {
+            return;
+        }
     }
+    let _ = crate::mapped_file::retain_shared_file_page(phys);
 }
 
 pub fn release_external_shared_frame(phys: u64) {
-    if crate::mapped_file::release_shared_file_page(phys) {
-        return;
-    }
     if let Some(vtable) = shmem_vtable() {
-        (vtable.release_frame)(phys);
+        if (vtable.release_frame)(phys) {
+            return;
+        }
     }
+    let _ = crate::mapped_file::release_shared_file_page(phys);
 }
 
 // ── FirmwareInstall — arg0=name_ptr, arg1=name_len,
@@ -6490,23 +6553,17 @@ pub(crate) fn zap_thread_group(tid: u64, pid: u64) {
             .store(true, core::sync::atomic::Ordering::Release);
     }
     // Find live CLONE_THREAD siblings sharing this visible pid.
-    let siblings: alloc::vec::Vec<u64> = {
-        let g = TASK_TO_PID.lock();
-        g.as_ref()
-            .map(|m| {
-                m.iter()
-                    .filter(|&(&t, &p)| p == pid && t != tid)
-                    .map(|(&t, _)| t)
-                    .filter(|&t| {
-                        crate::task::task_get(t).is_some_and(|t| {
-                            t.state.load(core::sync::atomic::Ordering::Acquire)
-                                == crate::task::TASK_RUNNING
-                        })
-                    })
-                    .collect()
+    let siblings: alloc::vec::Vec<u64> = task_pid_snapshot()
+        .into_iter()
+        .filter(|&(task, process)| process == pid && task != tid)
+        .map(|(task, _)| task)
+        .filter(|&task| {
+            crate::task::task_get(task).is_some_and(|task| {
+                task.state.load(core::sync::atomic::Ordering::Acquire)
+                    == crate::task::TASK_RUNNING
             })
-            .unwrap_or_default()
-    };
+        })
+        .collect();
     for s in siblings {
         raise_signal_pending(s, 9); // SIGKILL
         wake_signal(s);
@@ -8871,7 +8928,10 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                 {
                     let mut rlimits = RLIMIT_TABLE.lock();
                     if let Some(state) = rlimits.as_mut() {
-                        state.rows.remove(&tid);
+                        if state.rows.remove(&tid).is_some() {
+                            RLIMIT_CUSTOM_ROWS
+                                .fetch_sub(1, core::sync::atomic::Ordering::Release);
+                        }
                     }
                     crate::task::release_task(tid);
                 }
@@ -8883,13 +8943,16 @@ pub(crate) fn release_reaped_task(child_pid: u64) {
                 // pid someone else now owns. Removed only at reap:
                 // the zombie window still needs both directions
                 // (kill(pid) on a zombie, wstatus threading).
-                if let Some(m) = PID_TO_TASK.lock().as_mut() {
-                    if m.get(&child_pid) == Some(&tid) {
-                        m.remove(&child_pid);
+                {
+                    let _mutation = PID_TASK_MUTATION.lock();
+                    if let Some(m) = PID_TO_TASK[pid_task_shard(child_pid)].map.lock().as_mut() {
+                        if m.get(&child_pid) == Some(&tid) {
+                            m.remove(&child_pid);
+                        }
                     }
-                }
-                if let Some(m) = TASK_TO_PID.lock().as_mut() {
-                    m.remove(&tid);
+                    if let Some(m) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
+                        m.remove(&tid);
+                    }
                 }
             }
         }
@@ -8957,10 +9020,11 @@ fn release_task_tables(tid: u64) {
     }
 
     // Identity / credentials / per-task knobs.
-    if let Some(m) = UIDGID_TABLE.lock().as_mut() {
+    let credential_shard = credential_shard(tid);
+    if let Some(m) = CREDENTIAL_TABLES[credential_shard].uidgid.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = GROUPS_TABLE.lock().as_mut() {
+    if let Some(m) = CREDENTIAL_TABLES[credential_shard].groups.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = CAP_TABLE.lock().as_mut() {
@@ -8993,10 +9057,8 @@ fn release_task_tables(tid: u64) {
 
     // Filesystem view.
     task_map_remove(&CWD_TABLE, tid);
-    task_map_remove(&ROOT_DIR_TABLE, tid);
-    if let Some(m) = TASK_MOUNT_NS.lock().as_mut() {
-        m.remove(&tid);
-    }
+    remove_root_dir(tid);
+    remove_mount_namespace(tid);
     crate::mqueue::release_task_fd_paths(tid);
 
     // Memory policy.
@@ -9369,41 +9431,109 @@ fn has_living_child(parent: u64, want: i64, want_pgid: u64) -> bool {
 // the internal TaskId (e.g. scheduler lookups, fd-table accesses) must
 // translate through this table.
 
-/// ProcessId.raw() → TaskId.raw()
-static PID_TO_TASK: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const PID_TASK_SHARDS: usize = 32;
 
-/// TaskId.raw() → ProcessId.raw()
-static TASK_TO_PID: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+#[repr(align(64))]
+struct PidTaskMapShard {
+    map: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>>,
+}
+
+impl PidTaskMapShard {
+    const fn new() -> Self {
+        Self {
+            map: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+/// ProcessId.raw() → TaskId.raw(), sharded by ProcessId.
+static PID_TO_TASK: [PidTaskMapShard; PID_TASK_SHARDS] =
+    [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
+
+/// TaskId.raw() → ProcessId.raw(), sharded by TaskId.
+static TASK_TO_PID: [PidTaskMapShard; PID_TASK_SHARDS] =
+    [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
+/// Serializes the cold registration/removal paths with whole-registry
+/// snapshots. Point lookups intentionally bypass it and take one shard only.
+static PID_TASK_MUTATION: narf_lib::sync::IrqSafeSpinLock<()> =
+    narf_lib::sync::IrqSafeSpinLock::new(());
+
+#[inline]
+fn pid_task_shard(id: u64) -> usize {
+    (id as usize) & (PID_TASK_SHARDS - 1)
+}
+
+/// Snapshot all process mappings while holding every shard in ascending
+/// order. Group-wide signal and /proc walks need one coherent registry view;
+/// point lookups and mutations take only their key's shard.
+fn pid_task_snapshot() -> alloc::vec::Vec<(u64, u64)> {
+    let _mutation = PID_TASK_MUTATION.lock();
+    let mut snapshot = alloc::vec::Vec::new();
+    for shard in PID_TO_TASK.iter() {
+        if let Some(map) = shard.map.lock().as_ref() {
+            snapshot.extend(map.iter().map(|(&pid, &task)| (pid, task)));
+        }
+    }
+    snapshot.sort_unstable_by_key(|&(pid, _)| pid);
+    snapshot
+}
+
+/// Task-keyed counterpart to [`pid_task_snapshot`].
+fn task_pid_snapshot() -> alloc::vec::Vec<(u64, u64)> {
+    let _mutation = PID_TASK_MUTATION.lock();
+    let mut snapshot = alloc::vec::Vec::new();
+    for shard in TASK_TO_PID.iter() {
+        if let Some(map) = shard.map.lock().as_ref() {
+            snapshot.extend(map.iter().map(|(&task, &pid)| (task, pid)));
+        }
+    }
+    snapshot.sort_unstable_by_key(|&(task, _)| task);
+    snapshot
+}
 
 pub fn pid_task_map_init() {
-    *PID_TO_TASK.lock() = Some(BTreeMap::new());
-    *TASK_TO_PID.lock() = Some(BTreeMap::new());
+    for shard in PID_TO_TASK.iter() {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
+    for shard in TASK_TO_PID.iter() {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
 }
 
 pub fn pid_task_map_reset() {
-    *PID_TO_TASK.lock() = None;
-    *TASK_TO_PID.lock() = None;
+    for shard in PID_TO_TASK.iter() {
+        *shard.map.lock() = None;
+    }
+    for shard in TASK_TO_PID.iter() {
+        *shard.map.lock() = None;
+    }
 }
 
 /// Register a (ProcessId → TaskId) mapping. Called by `sys_fork` and
 /// boot spawn_one for every user task that gets a user-visible ProcessId.
 /// Records both directions simultaneously so all translations are O(1).
 pub fn register_pid_task_mapping(pid_raw: u64, task_raw: u64) {
-    register_task_to_pid(task_raw, pid_raw);
+    let _mutation = PID_TASK_MUTATION.lock();
+    TASK_TO_PID[pid_task_shard(task_raw)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task_raw, pid_raw);
     // Self-initialize: the map may be `None` if `wait_init` hasn't run
     // yet (early boot, or the kernel-test harness which boots straight
     // into the smoke runner). Without this a `fork` registration would
     // silently no-op and every later pid→task translation would miss.
-    PID_TO_TASK
+    PID_TO_TASK[pid_task_shard(pid_raw)]
+        .map
         .lock()
         .get_or_insert_with(BTreeMap::new)
         .insert(pid_raw, task_raw);
 }
 
 pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
-    TASK_TO_PID
+    let _mutation = PID_TASK_MUTATION.lock();
+    TASK_TO_PID[pid_task_shard(task_raw)]
+        .map
         .lock()
         .get_or_insert_with(BTreeMap::new)
         .insert(task_raw, pid_raw);
@@ -9421,7 +9551,8 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
         return;
     }
     crate::task::release_task(tid);
-    if let Some(m) = TASK_TO_PID.lock().as_mut() {
+    let _mutation = PID_TASK_MUTATION.lock();
+    if let Some(m) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
         m.remove(&tid);
     }
 }
@@ -9496,7 +9627,8 @@ pub fn __test_thread_group_live_reset() {
 /// `None` when the pid was never registered (kernel-internal tasks,
 /// boot tasks spawned before the table was inited, etc.).
 pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
-    PID_TO_TASK
+    PID_TO_TASK[pid_task_shard(pid_raw)]
+        .map
         .lock()
         .as_ref()
         .and_then(|m| m.get(&pid_raw).copied())
@@ -9506,7 +9638,8 @@ pub fn pid_to_task_raw(pid_raw: u64) -> Option<u64> {
 /// at fork/spawn time. Returns `None` when the task has no registered
 /// ProcessId (kernel-only tasks, test stubs).
 pub fn task_to_pid_raw(task_raw: u64) -> Option<u64> {
-    TASK_TO_PID
+    TASK_TO_PID[pid_task_shard(task_raw)]
+        .map
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task_raw).copied())
@@ -10117,13 +10250,13 @@ fn console_tiocgsid() -> u64 {
 // values are kernel-side state with no security implication
 // (capabilities still gate everything that matters).
 //
-// Storage shape mirrors the cwd table (BTreeMap<task_id, _>
-// behind an IrqSafeSpinLock); same init / test-reset hooks.
+// Storage is sharded by task ID so unrelated processes do not serialize
+// credential reads on the open/stat/access hot paths.
 // Default identity is (uid=0, gid=0) — matches what the prior
 // noop_ok stubs returned, so consumers that didn't touch
 // setuid/setgid see no change.
 
-#[derive(Copy, Clone, Default)]
+#[derive(Copy, Clone, Default, PartialEq, Eq)]
 struct UidGid {
     /// Real uid/gid.
     uid: u32,
@@ -10147,23 +10280,45 @@ struct UidGid {
     fsgid: u32,
 }
 
-static UIDGID_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
-static GROUPS_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::vec::Vec<u32>>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const CREDENTIAL_SHARDS: usize = 32;
+
+#[repr(align(64))]
+struct CredentialShard {
+    uidgid: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, UidGid>>>,
+    groups:
+        narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, alloc::vec::Vec<u32>>>>,
+}
+
+impl CredentialShard {
+    const fn new() -> Self {
+        Self {
+            uidgid: narf_lib::sync::IrqSafeSpinLock::new(None),
+            groups: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static CREDENTIAL_TABLES: [CredentialShard; CREDENTIAL_SHARDS] =
+    [const { CredentialShard::new() }; CREDENTIAL_SHARDS];
+
+#[inline]
+fn credential_shard(task: u64) -> usize {
+    (task as usize) & (CREDENTIAL_SHARDS - 1)
+}
 
 /// Initialise the per-task uid/gid registry. Call once at boot
 /// before any user task issues `setuid` / `getuid`.
 pub fn uidgid_init() {
-    *UIDGID_TABLE.lock() = Some(BTreeMap::new());
-    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
+    for shard in CREDENTIAL_TABLES.iter() {
+        *shard.uidgid.lock() = Some(BTreeMap::new());
+        *shard.groups.lock() = Some(BTreeMap::new());
+    }
 }
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_uidgid_reset() {
-    *UIDGID_TABLE.lock() = Some(BTreeMap::new());
-    *GROUPS_TABLE.lock() = Some(BTreeMap::new());
+    uidgid_init();
 }
 
 /// Set a task's (fsuid, fsgid) — test hook for the DAC security smoke.
@@ -10180,7 +10335,7 @@ pub fn __test_set_fsids(task: u64, fsuid: u32, fsgid: u32) {
 }
 
 fn read_uidgid(task: u64) -> UidGid {
-    let g = UIDGID_TABLE.lock();
+    let g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
     g.as_ref()
         .and_then(|m| m.get(&task).copied())
         .unwrap_or_default()
@@ -10332,6 +10487,11 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
     // (crw-rw---- root:video) despite narf being in `video`, and with it the
     // whole Plasma session.
     let groups = read_groups(task);
+    // One immutable credential snapshot answers both DAC capability bits.
+    // Besides avoiding duplicate registry/PID-translation walks on every
+    // open, this makes the pair coherent if another thread changes the
+    // process credential concurrently.
+    let effective_caps = read_caps(task).effective;
     #[cfg(feature = "container")]
     {
         let uns = crate::namespaces::current_user_ns(task);
@@ -10346,8 +10506,11 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
                     .iter()
                     .map(|g| uns.translate_gid_to_host(*g))
                     .collect(),
-                dac_override: task_capable(task, CAP_DAC_OVERRIDE),
-                dac_read_search: task_capable(task, CAP_DAC_READ_SEARCH),
+                // A task in a non-initial user namespace has no authority
+                // over host-owned inodes, irrespective of its in-namespace
+                // effective capability set.
+                dac_override: false,
+                dac_read_search: false,
             };
         }
     }
@@ -10361,8 +10524,28 @@ fn current_accessor(task: u64) -> narf_filesystem::Accessor {
         // that dropped CAP_DAC_OVERRIDE to sandbox itself was still
         // omnipotent under the old test, and a non-root task granted the
         // capability was still locked out.
-        dac_override: task_capable(task, CAP_DAC_OVERRIDE),
-        dac_read_search: task_capable(task, CAP_DAC_READ_SEARCH),
+        dac_override: effective_caps & (1u64 << CAP_DAC_OVERRIDE) != 0,
+        dac_read_search: effective_caps & (1u64 << CAP_DAC_READ_SEARCH) != 0,
+    }
+}
+
+/// Calling task's fsuid in the host inode-id space, without materialising the
+/// supplementary groups or capability snapshot needed only by a full DAC
+/// decision. This is the Linux owner-first `acl_permission_check` fast path.
+fn current_host_fsuid(task: u64) -> u32 {
+    let fsuid = read_uidgid(task).fsuid;
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        return if uns.is_initial() {
+            fsuid
+        } else {
+            uns.translate_uid_to_host(fsuid)
+        };
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        fsuid
     }
 }
 
@@ -10390,18 +10573,13 @@ pub fn __test_current_accessor(task: u64) -> narf_filesystem::Accessor {
 /// also defaults to root and we can skip the insert. This makes a
 /// dropped uid survive fork while leaving root parents as root.
 pub fn uidgid_fork(parent: u64, child: u64) {
-    let mut g = UIDGID_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        if let Some(v) = map.get(&parent).copied() {
-            map.insert(child, v);
-        }
+    let uidgid = read_uidgid(parent);
+    if uidgid != UidGid::default() {
+        let _ = write_uidgid(child, |entry| *entry = uidgid);
     }
-    drop(g);
-    let mut groups = GROUPS_TABLE.lock();
-    if let Some(map) = groups.as_mut() {
-        if let Some(v) = map.get(&parent).cloned() {
-            map.insert(child, v);
-        }
+    let groups = read_groups(parent);
+    if !groups.is_empty() {
+        let _ = write_groups(child, groups);
     }
 }
 
@@ -10487,7 +10665,8 @@ fn dir_search_permitted(path: &str, task: u64) -> bool {
 }
 
 pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {
-    GROUPS_TABLE
+    CREDENTIAL_TABLES[credential_shard(task)]
+        .groups
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).cloned())
@@ -10495,7 +10674,7 @@ pub(crate) fn read_groups(task: u64) -> alloc::vec::Vec<u32> {
 }
 
 pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
-    let mut table = GROUPS_TABLE.lock();
+    let mut table = CREDENTIAL_TABLES[credential_shard(task)].groups.lock();
     let Some(map) = table.as_mut() else {
         return false;
     };
@@ -10508,7 +10687,7 @@ pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
-    let mut g = UIDGID_TABLE.lock();
+    let mut g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
     let Some(m) = g.as_mut() else {
         return false;
     };
@@ -10635,20 +10814,27 @@ impl RlimitState {
 
 static RLIMIT_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<RlimitState>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static RLIMIT_CUSTOM_ROWS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 pub fn rlimit_init() {
     *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+    RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn __test_rlimit_reset() {
     *RLIMIT_TABLE.lock() = Some(RlimitState::new());
+    RLIMIT_CUSTOM_ROWS.store(0, core::sync::atomic::Ordering::Release);
 }
 
 /// Test-only count of every lifetime-bearing record in the rlimit store.
 #[doc(hidden)]
 pub fn __test_rlimit_storage_len() -> usize {
-    RLIMIT_TABLE.lock().as_ref().map_or(0, |state| state.rows.len())
+    RLIMIT_TABLE
+        .lock()
+        .as_ref()
+        .map_or(0, |state| state.rows.len())
 }
 
 /// Resolve any thread in a group to the leader's never-reused TaskId.
@@ -10661,6 +10847,12 @@ fn process_state_key(task: u64) -> u64 {
 fn read_rlimit(task: u64, resource: usize) -> Option<RLimitPair> {
     if resource >= RLIMIT_COUNT {
         return None;
+    }
+    // Rows are sparse: an absent process has exactly `default_rlimits()`.
+    // Most tasks never call setrlimit, so avoid task→pid→leader translation
+    // and the global table lock while no custom row exists anywhere.
+    if RLIMIT_CUSTOM_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return Some(default_rlimits()[resource]);
     }
     let key = process_state_key(task);
     let g = RLIMIT_TABLE.lock();
@@ -10760,8 +10952,11 @@ fn update_rlimit_atomic(
             return Err(3); // ESRCH
         }
     }
-    let row = state.rows.entry(key).or_insert_with(default_rlimits);
-    let prior = row[resource];
+    let prior = state
+        .rows
+        .get(&key)
+        .copied()
+        .unwrap_or_else(default_rlimits)[resource];
     if let Some(value) = new_value {
         if value.cur > value.max {
             return Err(22); // EINVAL
@@ -10770,7 +10965,12 @@ fn update_rlimit_atomic(
             // No authenticated CAP_SYS_RESOURCE authority exists yet.
             return Err(1); // EPERM
         }
+        let new_row = !state.rows.contains_key(&key);
+        let row = state.rows.entry(key).or_insert_with(default_rlimits);
         row[resource] = value;
+        if new_row {
+            RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
     }
     Ok(prior)
 }
@@ -10815,12 +11015,13 @@ fn rlimit_fork(parent: u64, child: u64) {
     }
     let mut g = RLIMIT_TABLE.lock();
     let state = g.get_or_insert_with(RlimitState::new);
-    let inherited = state
-        .rows
-        .get(&parent_key)
-        .copied()
-        .unwrap_or_else(default_rlimits);
-    state.rows.insert(child_key, inherited);
+    // Absence means the complete default table, so default-only parents need
+    // no child row. Preserve only an actually materialised custom snapshot.
+    if let Some(inherited) = state.rows.get(&parent_key).copied() {
+        if state.rows.insert(child_key, inherited).is_none() {
+            RLIMIT_CUSTOM_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 // ── prctl — per-task settings switchboard ──────────────────────────
