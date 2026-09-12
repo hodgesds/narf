@@ -40,6 +40,12 @@ pub(crate) fn sys_socket_sendmsg(ctx: &mut dyn TrapContext) {
             handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref())
         }
         SendMsgResult::Error(errno) => {
+            // Broken-pipe sendmsg raises SIGPIPE to the sender unless
+            // MSG_NOSIGNAL is set (Linux sk_stream_error net/core/stream.c:194,
+            // unix_stream_sendmsg net/unix/af_unix.c:2500). errno 32 == EPIPE.
+            if errno == 32 && flags & crate::socket::MSG_NOSIGNAL == 0 {
+                raise_signal_pending(current_task_id(), 13); // SIGPIPE
+            }
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
         }
     }

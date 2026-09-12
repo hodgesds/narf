@@ -334,6 +334,9 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const MSG_PEEK: u32 = 0x02;
 pub const MSG_TRUNC: u32 = 0x20;
+/// `MSG_NOSIGNAL` (include/linux/socket.h): suppress the `SIGPIPE` that a
+/// broken-pipe send would otherwise raise to the caller.
+pub const MSG_NOSIGNAL: u32 = 0x4000;
 
 // ── Address shape ───────────────────────────────────────────────
 

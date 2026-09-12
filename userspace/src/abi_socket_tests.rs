@@ -2366,6 +2366,12 @@ fn smoke_abi_socket_send_after_peer_close_epipe() -> TestResult {
         if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
             return Err("close(peer) failed");
         }
+        // flags=0 (no MSG_NOSIGNAL): -EPIPE AND a raised SIGPIPE, matching
+        // sk_stream_error / unix_stream_sendmsg. In-kernel tests never return to
+        // user, so the pending SIGPIPE is observed via its pending bit rather
+        // than terminating the harness. Clear any stale bit first, clear after.
+        let task = crate::handlers::current_task_id();
+        crate::handlers::clear_signal_pending(task, 13);
         let msg = *b"hello";
         let r = call(
             Syscall::SocketSend.raw(),
@@ -2373,7 +2379,13 @@ fn smoke_abi_socket_send_after_peer_close_epipe() -> TestResult {
         )
         .ok_or("status not Ok")?;
         if r != -32 {
+            crate::handlers::clear_signal_pending(task, 13);
             return Err("send() to a closed peer must return -EPIPE (-32)");
+        }
+        let sigpipe_raised = crate::handlers::signal_pending_bits(task) & crate::handlers::sig_bit(13) != 0;
+        crate::handlers::clear_signal_pending(task, 13);
+        if !sigpipe_raised {
+            return Err("send() to a closed peer (flags=0) must raise SIGPIPE");
         }
         Ok(())
     })
@@ -2381,6 +2393,49 @@ fn smoke_abi_socket_send_after_peer_close_epipe() -> TestResult {
 kernel_test_in!(
     "syscall_abi/socket",
     smoke_abi_socket_send_after_peer_close_epipe
+);
+
+/// send(MSG_NOSIGNAL) to a closed-peer stream socket still returns -EPIPE but
+/// must NOT raise SIGPIPE — the negative half of the SIGPIPE parity
+/// (net/core/stream.c:194 gates send_sig on `!(flags & MSG_NOSIGNAL)`).
+fn smoke_abi_socket_send_peer_close_nosignal_no_sigpipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::handlers::clear_signal_pending(task, 13);
+        const MSG_NOSIGNAL: u64 = 0x4000;
+        let msg = *b"hello";
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, msg.as_ptr() as u64, msg.len() as u64, MSG_NOSIGNAL),
+        )
+        .ok_or("status not Ok")?;
+        if r != -32 {
+            crate::handlers::clear_signal_pending(task, 13);
+            return Err("send(MSG_NOSIGNAL) to a closed peer must still return -EPIPE");
+        }
+        let sigpipe_raised = crate::handlers::signal_pending_bits(task) & crate::handlers::sig_bit(13) != 0;
+        crate::handlers::clear_signal_pending(task, 13);
+        if sigpipe_raised {
+            return Err("send(MSG_NOSIGNAL) must NOT raise SIGPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_peer_close_nosignal_no_sigpipe
 );
 
 // ─────────────────── AF_UNIX abstract namespace ───────────────────
