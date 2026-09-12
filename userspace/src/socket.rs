@@ -5436,19 +5436,26 @@ const RING_CAP: usize = 64 * 1024;
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
-        // `tx` is the ring THIS end writes into and the PEER reads from,
-        // so closing it is what surfaces EOF over there. `rx` belongs to
-        // this dying end and needs no marking.
-        let closed_tx = match &*self.state.lock() {
-            SocketState::UnixConnected { tx, .. }
-            | SocketState::InetConnected { tx, .. }
-            | SocketState::Inet6Connected { tx, .. } => {
+        // Closing this endpoint deads BOTH directions of the connection:
+        // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
+        //   peer's read (any buffered bytes still drain first, then EOF).
+        // - `rx` (the PEER writes, this end reads) → close surfaces EPIPE to the
+        //   peer's SEND: the reader is gone, so a subsequent peer send must fail
+        //   with -EPIPE (do_send: `tx.is_closed()` → SockError::Pipe), matching
+        //   unix_stream_sendmsg (net/unix/af_unix.c: a SOCK_DEAD peer sets
+        //   `err = -EPIPE`). Leaving rx open let a peer keep buffering into a
+        //   ring no one would ever read — a lost write reported as success.
+        let closed = match &*self.state.lock() {
+            SocketState::UnixConnected { tx, rx, .. }
+            | SocketState::InetConnected { tx, rx, .. }
+            | SocketState::Inet6Connected { tx, rx, .. } => {
                 tx.close();
+                rx.close();
                 true
             }
             _ => false,
         };
-        if closed_tx {
+        if closed {
             // Same reasoning as `do_send`: go through `readiness::notify`
             // rather than a bare wake so the generation is bumped and a
             // peer parked in an INFINITE-timeout epoll_wait/poll actually

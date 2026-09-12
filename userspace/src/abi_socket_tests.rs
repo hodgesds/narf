@@ -2234,10 +2234,12 @@ fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
         if r != -14 {
             return Err("sock_register_buf(NULL) must return -EFAULT (-14)");
         }
-        // A zero-length registration is -EINVAL.
-        let r = call(n, a1(0x1000, 0)).ok_or("status not Ok")?;
-        if r != -22 {
-            return Err("sock_register_buf(len=0) must return -EINVAL (-22)");
+        // A zero-length registration is also -EFAULT (io_validate_user_buf_range
+        // rejects `!ulen` with -EFAULT), NOT -EINVAL.
+        let backing = [0u8; 8];
+        let r = call(n, a1(backing.as_ptr() as u64, 0)).ok_or("status not Ok")?;
+        if r != -14 {
+            return Err("sock_register_buf(len=0) must return -EFAULT (-14)");
         }
         Ok(())
     })
@@ -2301,6 +2303,85 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_neg);
+
+/// A zero-copy send on a stream socket whose peer has CLOSED is -EPIPE, matching
+/// unix_stream_sendmsg (net/unix/af_unix.c: a dead peer sets `err = -EPIPE`).
+/// This exercises the send-failure branch (SockError::Pipe -> errno 32), which
+/// the bad-arg neg test above does not reach. NARF returns EPIPE here but does
+/// NOT raise SIGPIPE (a known parity gap vs Linux's `send_sig(SIGPIPE)` when
+/// MSG_NOSIGNAL is unset), so the syscall return is observable without the
+/// process being killed.
+fn smoke_abi_socket_sock_send_zc_pipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        let backing = *b"zerocopy";
+        let buf_id = call(Syscall::SockRegisterBuf.raw(), a1(backing.as_ptr() as u64, 8))
+            .ok_or("register status")?;
+        if buf_id < 0 {
+            return Err("buffer registration failed");
+        }
+        // Close the peer: this closes our TX ring (see socket.rs "peer close
+        // closes the peer's rings"), so the send discovers a broken pipe.
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        let r = call(Syscall::SockSendZc.raw(), a3(fd0, buf_id as u64, 0, 8)).ok_or("status not Ok")?;
+        if r != -32 {
+            return Err("sock_send_zc() to a closed peer must return -EPIPE (-32)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_pipe);
+
+/// send() on a stream socket whose PEER has closed is -EPIPE, matching
+/// unix_stream_sendmsg (net/unix/af_unix.c: a SOCK_DEAD peer → `err = -EPIPE`).
+/// Covers the SocketFile::drop fix: closing an endpoint must close BOTH its
+/// rings — its rx (the peer's tx) too — so a peer send fails with EPIPE instead
+/// of silently buffering into a ring no one will read. Exercises the regular
+/// send path (not just the zero-copy wrapper). NARF does not raise SIGPIPE here,
+/// so the syscall return is observed directly.
+fn smoke_abi_socket_send_after_peer_close_epipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+        // Close the peer: its drop closes our TX ring (its rx), so the reader is
+        // gone and the next send must EPIPE.
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        let msg = *b"hello";
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, msg.as_ptr() as u64, msg.len() as u64, 0),
+        )
+        .ok_or("status not Ok")?;
+        if r != -32 {
+            return Err("send() to a closed peer must return -EPIPE (-32)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_after_peer_close_epipe
+);
 
 // ─────────────────── AF_UNIX abstract namespace ───────────────────
 
