@@ -1664,6 +1664,100 @@ kernel_test_in!(
     smoke_abi_socket_connect_existing_nonsocket_econnrefused
 );
 
+// MSG_OOB is unsupported on AF_UNIX (no CONFIG_AF_UNIX_OOB) → a send with it is
+// -EOPNOTSUPP, both stream and datagram (Linux unix_stream/dgram_sendmsg).
+fn smoke_abi_socket_send_msg_oob_eopnotsupp() -> TestResult {
+    const EOPNOTSUPP: i64 = -95;
+    const MSG_OOB: u64 = 0x1;
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let p = b"x";
+        if call(Syscall::SocketSend.raw(), a3(fd0, p.as_ptr() as u64, 1, MSG_OOB)) != Some(EOPNOTSUPP)
+        {
+            return Err("stream send(MSG_OOB) must return -EOPNOTSUPP");
+        }
+        let d = open_unix(SOCK_DGRAM)?;
+        if call(Syscall::SocketSend.raw(), a3(d, p.as_ptr() as u64, 1, MSG_OOB)) != Some(EOPNOTSUPP) {
+            return Err("dgram send(MSG_OOB) must return -EOPNOTSUPP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_send_msg_oob_eopnotsupp);
+
+// A datagram larger than the send buffer is -EMSGSIZE (Linux unix_dgram_sendmsg
+// `len > sk_sndbuf - 32`), not the syscall-layer -EINVAL.
+fn smoke_abi_socket_dgram_send_oversized_emsgsize() -> TestResult {
+    with_setup(|| {
+        let d = open_unix(SOCK_DGRAM)?;
+        let big = alloc::vec![0u8; 213_000]; // > UNIX_DGRAM_SNDBUF(212992) - 32
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(d, big.as_ptr() as u64, big.len() as u64, 0),
+        ) != Some(EMSGSIZE_ERR)
+        {
+            return Err("oversized datagram must return -EMSGSIZE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_send_oversized_emsgsize
+);
+
+// A stream connect to a path where a DATAGRAM socket is bound is -EPROTOTYPE
+// (Linux unix_find_bsd `sk->sk_type != type`), not ECONNREFUSED/ENOENT.
+fn smoke_abi_socket_stream_connect_wrong_type_eprototype() -> TestResult {
+    const EPROTOTYPE: i64 = -91;
+    with_memfs("/m", "m", &[], || {
+        let d = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/m/dsock");
+        if call(Syscall::SocketBind.raw(), a2(d, addr.as_ptr() as u64, alen)).ok_or("bind status")?
+            != 0
+        {
+            return Err("dgram bind failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen)) != Some(EPROTOTYPE)
+        {
+            return Err("stream connect to a datagram-bound path must return -EPROTOTYPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_stream_connect_wrong_type_eprototype
+);
+
+// Linux `unix_dgram_connect` validates the target at connect time: a datagram
+// connect to a missing pathname is -ENOENT (not a deferred, always-Ok connect).
+fn smoke_abi_socket_dgram_connect_missing_enoent() -> TestResult {
+    with_setup(|| {
+        let d = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/abi-dgram-connect-missing.sock");
+        if call(Syscall::SocketConnect.raw(), a2(d, addr.as_ptr() as u64, alen)) != Some(ENOENT) {
+            return Err("dgram connect to a missing path must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_connect_missing_enoent
+);
+
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
 fn smoke_abi_socket_getsockopt_pos() -> TestResult {

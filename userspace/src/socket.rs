@@ -332,11 +332,20 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
 pub const O_NONBLOCK: u32 = 0o4000;
+/// `MSG_OOB` (include/linux/socket.h): out-of-band data. AF_UNIX supports it
+/// only under `CONFIG_AF_UNIX_OOB`, which NARF does not implement, so a send
+/// with MSG_OOB is `-EOPNOTSUPP` (Linux `unix_dgram_sendmsg`/`unix_stream_sendmsg`).
+pub const MSG_OOB: u32 = 0x01;
 pub const MSG_PEEK: u32 = 0x02;
 pub const MSG_TRUNC: u32 = 0x20;
 /// `MSG_NOSIGNAL` (include/linux/socket.h): suppress the `SIGPIPE` that a
 /// broken-pipe send would otherwise raise to the caller.
 pub const MSG_NOSIGNAL: u32 = 0x4000;
+/// AF_UNIX datagram send-buffer ceiling. Linux rejects a datagram with
+/// `len > sk_sndbuf - 32` → -EMSGSIZE (`unix_dgram_sendmsg`). NARF does not
+/// track a per-socket SO_SNDBUF, so this uses the Linux default sndbuf
+/// (net.core.wmem_default, 212992) to match the common case.
+const UNIX_DGRAM_SNDBUF: usize = 212992;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -567,6 +576,13 @@ pub enum SockError {
     /// the filesystem (Linux `unix_find_bsd` `kern_path` failure). Distinct from
     /// ConnectionRefused, which is "path present but no live listener".
     NoEntry,
+    /// EMSGSIZE — a datagram larger than the socket send buffer (Linux
+    /// `unix_dgram_sendmsg`: `len > sk_sndbuf - 32`).
+    MsgSize,
+    /// EPROTOTYPE — connect/sendto to a bound socket of the WRONG type (Linux
+    /// `unix_find_bsd`: `sk->sk_type != type`), e.g. a stream connect to a path
+    /// where only a datagram socket is bound.
+    ProtoType,
 }
 
 impl SockError {
@@ -587,6 +603,8 @@ impl SockError {
             Self::InProgress => 115,        // EINPROGRESS
             Self::Range => 34,              // ERANGE
             Self::NoEntry => 2,             // ENOENT
+            Self::MsgSize => 90,            // EMSGSIZE
+            Self::ProtoType => 91,          // EPROTOTYPE
         }
     }
 }
@@ -4121,15 +4139,20 @@ impl SocketFile {
                     Some(l) => l,
                     // Linux `unix_find_bsd` (net/unix/af_unix.c): a connect to a
                     // PATHNAME that does not exist is -ENOENT (kern_path failure);
-                    // a path that resolves but has no live listener is
-                    // -ECONNREFUSED. Abstract names have no filesystem node, so a
-                    // miss is always -ECONNREFUSED (`unix_find_abstract`).
+                    // a path bound by a socket of the WRONG type is -EPROTOTYPE
+                    // (`sk->sk_type != type` — a datagram socket occupies the path
+                    // this stream connect targeted); any other resolvable path with
+                    // no live stream listener is -ECONNREFUSED. Abstract names have
+                    // no filesystem node, so a miss is always -ECONNREFUSED.
                     None => {
                         return match &uaddr {
                             UnixAddr::Path(p)
                                 if !crate::handlers::unix_path_final_node_exists(p) =>
                             {
                                 SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            UnixAddr::Path(p) if unix_dgram_bound_at_path(p) => {
+                                SocketOpResult::Err(SockError::ProtoType)
                             }
                             _ => SocketOpResult::Err(SockError::ConnectionRefused),
                         };
@@ -4881,6 +4904,32 @@ impl SocketFile {
                     Some(a @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => a,
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                // Linux `unix_dgram_connect` resolves the target via
+                // `unix_find_other` and fails AT CONNECT (not deferred to the
+                // first send): missing pathname → -ENOENT, a stream socket at the
+                // path → -EPROTOTYPE, otherwise no bound datagram receiver →
+                // -ECONNREFUSED. Abstract names resolve only in ABSTRACT_DGRAM.
+                match &uaddr {
+                    UnixAddr::Path(p) if !unix_dgram_bound_at_path(p) => {
+                        if !crate::handlers::unix_path_final_node_exists(p) {
+                            return SocketOpResult::Err(SockError::NoEntry);
+                        } else if unix_stream_listener_at_path(p) {
+                            return SocketOpResult::Err(SockError::ProtoType);
+                        } else {
+                            return SocketOpResult::Err(SockError::ConnectionRefused);
+                        }
+                    }
+                    UnixAddr::Abstract(n) => {
+                        let bound = ABSTRACT_DGRAM
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|m| m.contains_key(&(self.net_ns_id(), n.clone())));
+                        if !bound {
+                            return SocketOpResult::Err(SockError::ConnectionRefused);
+                        }
+                    }
+                    _ => {}
+                }
                 let mut state = self.state.lock();
                 if let UnixAddr::Path(p) = &uaddr {
                     *self.connected_unix_path.lock() = Some(UnixPathKey::for_connect_path(p));
@@ -4902,11 +4951,16 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send {
-                buf,
-                flags: _,
-                addr,
-            } => {
+            SocketOp::Send { buf, flags, addr } => {
+                // Linux `unix_dgram_sendmsg`: MSG_OOB → -EOPNOTSUPP (checked
+                // first), then a datagram larger than the send buffer →
+                // -EMSGSIZE (`len > sk_sndbuf - 32`).
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(SockError::NotSupported);
+                }
+                if buf.len() > UNIX_DGRAM_SNDBUF - 32 {
+                    return SocketOpResult::Err(SockError::MsgSize);
+                }
                 let explicit_dest = addr.is_some();
                 let state = self.state.lock();
                 let (local_addr, dest_addr, connected_path) = match &*state {
@@ -4986,6 +5040,11 @@ impl SocketFile {
                                 if !crate::handlers::unix_path_final_node_exists(p) =>
                             {
                                 SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            // A STREAM listener occupies the path a datagram send
+                            // targeted → wrong type → -EPROTOTYPE (unix_find_bsd).
+                            UnixAddr::Path(p) if unix_stream_listener_at_path(p) => {
+                                SocketOpResult::Err(SockError::ProtoType)
                             }
                             _ => SocketOpResult::Err(SockError::ConnectionRefused),
                         };
@@ -5282,9 +5341,15 @@ impl SocketFile {
     fn do_send(
         &self,
         buf: &[u8],
-        _flags: u32,
+        flags: u32,
         _addr: Option<SockAddr>,
     ) -> Result<usize, SockError> {
+        // Linux `unix_stream_sendmsg`: without CONFIG_AF_UNIX_OOB (NARF's case) a
+        // send with MSG_OOB is -EOPNOTSUPP. Scoped to AF_UNIX — INET keeps TCP
+        // urgent-data support.
+        if self.domain == AF_UNIX && flags & MSG_OOB != 0 {
+            return Err(SockError::NotSupported);
+        }
         let state = self.state.lock();
         // InetWired sockets route through the kernel TCP-over-NIC stack.
         if let SocketState::InetWired { tcb_id, .. } = &*state {
@@ -6101,6 +6166,26 @@ static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::ne
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
+
+/// Whether a DATAGRAM socket is bound at pathname `p` (connect-key resolution).
+/// Used to report -EPROTOTYPE when a STREAM connect misses the stream listener
+/// registry but a datagram of the wrong type occupies the path (Linux
+/// `unix_find_bsd`: `sk->sk_type != type`).
+fn unix_dgram_bound_at_path(p: &str) -> bool {
+    UNIX_DGRAM_BOUND
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&UnixPathKey::for_connect_path(p)))
+}
+
+/// Whether a STREAM listener is bound at pathname `p` (connect-key resolution).
+/// The datagram-send mirror of [`unix_dgram_bound_at_path`].
+fn unix_stream_listener_at_path(p: &str) -> bool {
+    LISTENERS
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&UnixPathKey::for_connect_path(p)))
+}
 
 // ── Abstract-namespace registries (sun_path[0] == '\0') ─────────
 //
