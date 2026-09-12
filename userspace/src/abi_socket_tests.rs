@@ -2228,10 +2228,16 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_pos);
 fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
     with_setup(|| {
         let n = Syscall::SockRegisterBuf.raw();
-        // ptr == 0 → register_user_buffer returns None → -1.
+        // A NULL buffer base is -EFAULT (io_uring io_buffer_validate access_ok),
+        // NOT the old bare -1 that libc read as EPERM.
         let r = call(n, a1(0, 64)).ok_or("status not Ok")?;
-        if r != -1 {
-            return Err("sock_register_buf(NULL) did not return -1");
+        if r != -14 {
+            return Err("sock_register_buf(NULL) must return -EFAULT (-14)");
+        }
+        // A zero-length registration is -EINVAL.
+        let r = call(n, a1(0x1000, 0)).ok_or("status not Ok")?;
+        if r != -22 {
+            return Err("sock_register_buf(len=0) must return -EINVAL (-22)");
         }
         Ok(())
     })
@@ -2274,10 +2280,22 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
         let n = Syscall::SockSendZc.raw();
-        // buf_id 9999 was never registered → registered_buffer_slice None → -1.
+        // An unregistered buf_id → registered_buffer_slice None → -EFAULT (a bad
+        // send buffer, sendmsg(2)), NOT the old bare -1 (EPERM).
         let r = call(n, a3(fd, 9999, 0, 8)).ok_or("status not Ok")?;
-        if r != -1 {
-            return Err("sock_send_zc() with an unregistered buf_id did not return -1");
+        if r != -14 {
+            return Err("sock_send_zc(bad buf_id) must return -EFAULT (-14)");
+        }
+        // A bad fd (after registering a valid buffer) → -EBADF, not EPERM.
+        let backing = [0u8; 8];
+        let bid = call(Syscall::SockRegisterBuf.raw(), a1(backing.as_ptr() as u64, 8))
+            .ok_or("status not Ok")?;
+        if bid < 0 {
+            return Err("could not register a buffer for the bad-fd case");
+        }
+        let r = call(n, a3(0xFFFF_FFFF, bid as u64, 0, 8)).ok_or("status not Ok")?;
+        if r != -9 {
+            return Err("sock_send_zc(bad fd) must return -EBADF (-9)");
         }
         Ok(())
     })

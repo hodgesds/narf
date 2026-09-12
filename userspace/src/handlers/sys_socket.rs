@@ -60,7 +60,12 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
             .delegate_netlink_admin(narf_net::initial_loopback_admin())
             .is_err()
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+        // Deliberate denial: PID 1's initial-ns route socket could not be
+        // granted the kernel-held loopback admin authority. -1 folds to EPERM,
+        // the errno Linux uses when a NETLINK_ROUTE admin operation is refused
+        // for lack of CAP_NET_ADMIN — the right verdict for a denied privileged
+        // capability. Verified correct as EPERM (kept explicit).
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     let new_fd = match fd::install(task, crate::fd::FdEntry {
