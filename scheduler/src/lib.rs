@@ -351,32 +351,11 @@ pub fn disable_work_stealing() {
     STEAL_ENABLED.store(false, Ordering::Release);
 }
 
-/// Master switch for wake-time placement (`wake_place_hint` — the push-side
-/// analogue of Linux `select_task_rq`). OFF by default and independent of
-/// `STEAL_ENABLED`: pulling idle CPUs toward work (stealing) is always safe,
-/// but *pushing* a freshly-woken task onto an idle sibling is a policy that
-/// helps producer-consumer IPC (a woken consumer runs on an idle core instead
-/// of queuing behind a busy home) yet can HURT heavily-contended
-/// synchronization — scattering many waiters of one lock across CPUs multiplies
-/// contention + cache-line bouncing (measured: SysV `sem` under oversubscription
-/// stalls/regresses). So it is opt-in, gated behind a boot cmdline flag. A
-/// future debugfs `sched/features` surface can expose this same atomic.
-static WAKE_PLACEMENT_ENABLED: AtomicBool = AtomicBool::new(false);
-
-/// Enable wake-time placement. Opt-in (see [`WAKE_PLACEMENT_ENABLED`]).
-pub fn enable_wake_placement() {
-    WAKE_PLACEMENT_ENABLED.store(true, Ordering::Release);
-}
-
-/// Disable wake-time placement.
-pub fn disable_wake_placement() {
-    WAKE_PLACEMENT_ENABLED.store(false, Ordering::Release);
-}
-
-/// Whether wake-time placement is currently enabled.
-pub fn wake_placement_enabled() -> bool {
-    WAKE_PLACEMENT_ENABLED.load(Ordering::Acquire)
-}
+// Wake-time placement (`wake_place_hint` — NARF's `select_task_rq`) is
+// unconditional: the scheduler policy owns the decision via
+// `Scheduler::select_task_rq` (default `None` = keep prev_cpu), so a policy
+// without a placement model never places, and no separate global switch is
+// needed.
 
 /// Wake-next ("next buddy") dispatch. When a task is woken, record it as its
 /// home CPU's preferred next pick, so [`pick_next_slot`] runs it AHEAD of the
@@ -3306,26 +3285,28 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
     wake_place_hint(home);
 }
 
-/// Wake-time placement hint — the push-side counterpart of work-stealing and
-/// the analogue of Linux's `select_task_rq`. After a woken task's `home` CPU
-/// has been kicked, if `home` is BUSY, ask the installed balance strategy for
-/// an idle sibling and kick it too, so that sibling PULLS the freshly-woken
+/// Wake-time placement hint — NARF's analogue of Linux's `select_task_rq`.
+/// After a woken task's `home` (prev_cpu) has been kicked, if `home` is BUSY,
+/// ask the scheduler policy ([`Scheduler::select_task_rq`]) which idle sibling
+/// should run the wakee and kick it too, so that sibling PULLS the freshly-woken
 /// task via `try_steal_one` instead of the task waiting behind `home`'s current
 /// slice. `home` is always kicked first (above), so a stale/wrong hint can only
 /// waste one IPI — never strand the wake.
 ///
 /// No-op when `home` is idle (it wakes and runs the task itself — the common
 /// latency-critical ping-pong case, kept scan-free), when stealing is disabled
-/// (a kicked sibling could not pull), or when no strategy is installed.
+/// (a kicked sibling could not pull), or when the policy declines placement.
 ///
 /// Runs in the raw-waker path, which can be IRQ context: it must not allocate
-/// or block. `steal::snapshot()` is an `Arc` clone under an `IrqSafeSpinLock`,
-/// the strategy's `select_wake_cpu` is a bounded alloc-free CPU scan, and
-/// `resched_remote` only IPIs a target that has published `CPU_HALTED`.
+/// or block. `try_with_scheduler` is a `try_lock` on the per-CPU policy slot,
+/// `select_task_rq` is a bounded alloc-free CPU scan, and `resched_remote` only
+/// IPIs a target that has published `CPU_HALTED`.
 fn wake_place_hint(home: u32) {
-    // Opt-in (see WAKE_PLACEMENT_ENABLED) and only meaningful with stealing on
-    // (the kicked sibling pulls the task via try_steal_one).
-    if !WAKE_PLACEMENT_ENABLED.load(Ordering::Acquire) || !STEAL_ENABLED.load(Ordering::Acquire) {
+    // Only meaningful with stealing on (the kicked sibling pulls the task via
+    // try_steal_one). The placement decision itself is the policy's
+    // `select_task_rq`, which a policy without a placement model leaves as
+    // `None` (keep prev_cpu) — so there is no separate placement switch.
+    if !STEAL_ENABLED.load(Ordering::Acquire) {
         return;
     }
     // Home idle → `resched_remote(home)` above already woke it and it will run
@@ -3334,16 +3315,20 @@ fn wake_place_hint(home: u32) {
     if CPU_HALTED[home as usize].load(Ordering::SeqCst) {
         return;
     }
-    let Some(strategy) = crate::steal::snapshot() else {
-        return;
-    };
     let is_online = |c: crate::affinity::CpuId| narf_lib::smp::is_online(c.0);
     let is_idle = |c: crate::affinity::CpuId| {
         (c.0 as usize) < CPU_HALTED.len() && CPU_HALTED[c.0 as usize].load(Ordering::SeqCst)
     };
-    if let Some(target) =
-        strategy.select_wake_cpu(crate::affinity::CpuId(home), &is_online, &is_idle)
-    {
+    // The scheduler policy owns wake-time CPU placement (Linux `select_task_rq`).
+    // `home` is the wakee's cache-warm prev_cpu (busy here); the waker is the CPU
+    // running this raw wake.
+    let home_id = crate::affinity::CpuId(home);
+    let waker = crate::affinity::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let target = policy::try_with_scheduler(home_id, |scheduler| {
+        scheduler.and_then(|s| s.select_task_rq(home_id, waker, &is_online, &is_idle))
+    })
+    .flatten();
+    if let Some(target) = target {
         if target.0 != home {
             resched_remote(target.0);
         }

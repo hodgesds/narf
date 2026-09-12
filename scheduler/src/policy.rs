@@ -413,6 +413,26 @@ pub trait Scheduler: Any + Send + Sync + 'static {
         false
     }
 
+    /// Wake-time CPU placement — NARF's analogue of Linux `select_task_rq`.
+    /// Consulted on the wake path when the wakee's `prev_cpu` (its cache-warm
+    /// home CPU) is BUSY. Returns `Some(cpu)` to run the wakee on an idle
+    /// sibling now, or `None` to keep it on `prev_cpu`. `waker_cpu` is the CPU
+    /// issuing the wake. `is_online` / `is_idle` are per-CPU predicates supplied
+    /// by the core.
+    ///
+    /// Allocation-free and a bounded CPU scan: the raw-waker path that calls
+    /// this can be IRQ context.
+    fn select_task_rq(
+        &self,
+        prev_cpu: CpuId,
+        waker_cpu: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        let _ = (prev_cpu, waker_cpu, is_online, is_idle);
+        None
+    }
+
     /// Called once before this policy is published to any CPU. Constructors
     /// should perform fallible setup before `install_scheduler`; lifecycle
     /// callbacks themselves are infallible and may allocate but must not
