@@ -4287,6 +4287,14 @@ impl SocketFile {
                 Err(e) => SocketOpResult::Err(e),
             },
             SocketOp::Shutdown { how } => {
+                // Linux `unix_shutdown` (net/unix/af_unix.c) rejects an
+                // out-of-range mode BEFORE anything else: `if (mode < SHUT_RD ||
+                // mode > SHUT_RDWR) return -EINVAL`. `how` arrives as u32, so a
+                // negative int (mode < SHUT_RD) presents as a large value caught
+                // by `how > SHUT_RDWR`.
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
                 let state = self.state.lock();
                 match &*state {
                     SocketState::UnixConnected { tx, rx, .. } => {
@@ -4302,7 +4310,17 @@ impl SocketFile {
                         narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
-                    _ => SocketOpResult::Err(SockError::NotConnected),
+                    // Linux `unix_shutdown` ALWAYS returns 0, even on an
+                    // unconnected AF_UNIX socket. INET/INET6 keep ENOTCONN (TCP
+                    // `inet_shutdown` on an unconnected socket → -ENOTCONN).
+                    _ => {
+                        drop(state);
+                        if self.domain == AF_UNIX {
+                            SocketOpResult::Ok(0)
+                        } else {
+                            SocketOpResult::Err(SockError::NotConnected)
+                        }
+                    }
                 }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
@@ -4882,7 +4900,11 @@ impl SocketFile {
                         } else if let Some(p) = peer {
                             p.clone()
                         } else {
-                            return SocketOpResult::Err(SockError::InvalidArg);
+                            // No destination address and no connected peer. Linux
+                            // `unix_dgram_sendmsg` (net/unix/af_unix.c): namelen==0
+                            // → `other = unix_peer_get(sk)`; `if (!other) err =
+                            // -ENOTCONN`. (A malformed dest addr above is EINVAL.)
+                            return SocketOpResult::Err(SockError::NotConnected);
                         };
                         (la.clone(), dest, self.connected_unix_path.lock().clone())
                     }
@@ -4896,7 +4918,10 @@ impl SocketFile {
                                 Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
                                 _ => return SocketOpResult::Err(SockError::InvalidArg),
                             },
-                            None => return SocketOpResult::Err(SockError::InvalidArg),
+                            // Unbound (never connected) datagram socket with no
+                            // destination. Linux `unix_dgram_sendmsg`: no peer →
+                            // -ENOTCONN (net/unix/af_unix.c), not -EINVAL.
+                            None => return SocketOpResult::Err(SockError::NotConnected),
                         };
                         (None, dest, None)
                     }
@@ -5296,7 +5321,17 @@ impl SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => rx,
-            _ => return Err(SockError::NotConnected),
+            // Linux `unix_stream_read_generic` (net/unix/af_unix.c): a recv on a
+            // never-connected AF_UNIX stream socket (`sk_state != TCP_ESTABLISHED`)
+            // returns -EINVAL, NOT -ENOTCONN. INET/INET6 keep ENOTCONN (TCP
+            // recvmsg on TCP_CLOSE → -ENOTCONN), so scope EINVAL to AF_UNIX.
+            _ => {
+                return Err(if self.domain == AF_UNIX {
+                    SockError::InvalidArg
+                } else {
+                    SockError::NotConnected
+                });
+            }
         };
         // Claim this ring for the current reader (even on a WouldBlock read, so
         // a reader that parks BEFORE data arrives is still recorded), so the

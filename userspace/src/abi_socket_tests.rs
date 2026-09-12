@@ -1518,6 +1518,87 @@ fn smoke_abi_socket_shutdown_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_neg);
 
+// ── AF_UNIX Linux-errno-parity fixes (audit vs net/unix/af_unix.c) ──
+
+// unix_shutdown ALWAYS returns 0, even on a never-connected AF_UNIX socket
+// (net/unix/af_unix.c: the only early return is the -EINVAL `how` check; the
+// tail is an unconditional `return 0`). NARF used to return -ENOTCONN here.
+fn smoke_abi_socket_shutdown_unconnected_ok() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let r = call(Syscall::SocketShutdown.raw(), a1(fd, SHUT_RDWR)).ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("shutdown() on an unconnected AF_UNIX socket must return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_unconnected_ok);
+
+// unix_shutdown rejects an out-of-range `how` with -EINVAL before anything
+// else: `if (mode < SHUT_RD || mode > SHUT_RDWR) return -EINVAL`. how=3 is
+// past SHUT_RDWR(2).
+fn smoke_abi_socket_shutdown_bad_how_einval() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        if call(Syscall::SocketShutdown.raw(), a1(fd0, 3)) != Some(EINVAL) {
+            return Err("shutdown() with how=3 (> SHUT_RDWR) must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_bad_how_einval);
+
+// unix_stream_read_generic returns -EINVAL (NOT -ENOTCONN) for a recv on a
+// never-connected AF_UNIX stream socket (`sk_state != TCP_ESTABLISHED`).
+fn smoke_abi_socket_recv_unconnected_einval() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("recv() on an unconnected AF_UNIX stream socket must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_recv_unconnected_einval);
+
+// unix_dgram_sendmsg returns -ENOTCONN (NOT -EINVAL) for a send with no
+// destination on an unconnected datagram socket (`other = unix_peer_get(sk)`
+// is NULL → -ENOTCONN).
+fn smoke_abi_socket_dgram_send_no_dest_enotconn() -> TestResult {
+    with_setup(|| {
+        let fd = match call(Syscall::SocketOpen.raw(), a2(AF_UNIX, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_UNIX, SOCK_DGRAM) failed"),
+        };
+        let payload = b"x";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) != Some(ENOTCONN)
+        {
+            return Err("send() with no dest on an unconnected dgram socket must return -ENOTCONN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_dgram_send_no_dest_enotconn);
+
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
 fn smoke_abi_socket_getsockopt_pos() -> TestResult {
