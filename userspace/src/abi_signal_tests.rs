@@ -238,15 +238,24 @@ fn smoke_abi_signal_rt_sigaction_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_rt_sigaction_neg);
 
 // ── Sigaction ───────────────────────────────────────────────────────
-// sys_sigaction(sig, handler, oldout, flags): sig>=NSIG → invalid_op();
-// else stores handler + returns ok(0). NARF-native flattened shape.
+// sys_sigaction(sig, handler, oldout, flags): sig==0 || sig>=NSIG → -EINVAL;
+// SIGKILL(9)/SIGSTOP(19) → -EINVAL (uncatchable); else stores handler +
+// returns ok(0). NARF-native flattened shape mirroring Linux `do_sigaction`.
 
 fn smoke_abi_signal_sigaction_pos() -> TestResult {
     with_setup(|| {
         // handler=0 (clear), oldout=0, valid signum → ok(0).
-        let r = call(Syscall::Sigaction.raw(), a3(10, 0, 0, 0));
-        if r != Some(0) {
-            return Err("smoke_abi_signal_sigaction_pos: unexpected syscall return");
+        if call(Syscall::Sigaction.raw(), a3(10, 0, 0, 0)) != Some(0) {
+            return Err("sigaction(SIGUSR1, 0, ..) should return 0");
+        }
+        // Installing a real handler vaddr for a CATCHABLE signal still succeeds —
+        // the sig_kernel_only guard must not over-reject ordinary signals.
+        if call(Syscall::Sigaction.raw(), a3(10, 0x1000, 0, 0)) != Some(0) {
+            return Err("sigaction(SIGUSR1, handler, ..) should return 0");
+        }
+        // Highest valid signal (SIGRTMAX == 64) is accepted; 65 is out of range.
+        if call(Syscall::Sigaction.raw(), a3(64, 0, 0, 0)) != Some(0) {
+            return Err("sigaction(64=SIGRTMAX, ..) should return 0");
         }
         Ok(())
     })
@@ -255,13 +264,31 @@ kernel_test_in!("syscall_abi", smoke_abi_signal_sigaction_pos);
 
 fn smoke_abi_signal_sigaction_neg() -> TestResult {
     with_setup(|| {
-        // signum >= NSIG(64) → invalid_op() (None). Signal 40 became a
-        // VALID rt signal when the mask/pending bitmaps widened to u64;
-        // 70 is the out-of-range probe now.
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports NARF InvalidOp.
-        let r = call(Syscall::Sigaction.raw(), a3(70, 0, 0, 0));
-        if r.is_some() {
-            return Err("sigaction(70,..) should be a non-Ok (InvalidOp) status");
+        // signum >= NSIG(64) → -EINVAL. Signal 40 became a VALID rt signal when
+        // the mask/pending bitmaps widened to u64; 70 is the out-of-range probe
+        // now. Linux `do_sigaction`: `!valid_signal(sig)` → -EINVAL. The
+        // flattened form used to fold this to a NARF InvalidOp status (the old
+        // LINUX-GAP); it now returns the exact errno.
+        if call(Syscall::Sigaction.raw(), a3(70, 0, 0, 0)) != Some(EINVAL) {
+            return Err("sigaction(70,..) should return -EINVAL");
+        }
+        // Linux `do_sigaction`: `sig < 1` → -EINVAL (the null signal).
+        if call(Syscall::Sigaction.raw(), a3(0, 0, 0, 0)) != Some(EINVAL) {
+            return Err("sigaction(0,..) should return -EINVAL");
+        }
+        // Linux `do_sigaction`: `act && sig_kernel_only(sig)` → -EINVAL.
+        // SIGKILL(9)/SIGSTOP(19) can never have their action changed; a handler
+        // vaddr in arg1 must be refused so the signal stays uncatchable.
+        if call(Syscall::Sigaction.raw(), a3(9, 0x1000, 0, 0)) != Some(EINVAL) {
+            return Err("sigaction(SIGKILL, handler, ..) should return -EINVAL");
+        }
+        if call(Syscall::Sigaction.raw(), a3(19, 0x1000, 0, 0)) != Some(EINVAL) {
+            return Err("sigaction(SIGSTOP, handler, ..) should return -EINVAL");
+        }
+        // Even clearing (handler=0) SIGKILL/SIGSTOP is refused: the flattened
+        // form always installs an action, so `act` is always present.
+        if call(Syscall::Sigaction.raw(), a3(9, 0, 0, 0)) != Some(EINVAL) {
+            return Err("sigaction(SIGKILL, 0, ..) should return -EINVAL");
         }
         Ok(())
     })
