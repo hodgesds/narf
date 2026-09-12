@@ -1149,6 +1149,31 @@ fn smoke_abi_signal_sigkill_unblockable() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigkill_unblockable);
 
+/// SIGKILL (signal 9) is pending at bit 8 — the N-1 `sig_bit` convention, the
+/// same one `UNBLOCKABLE_MASK` uses (`1 << 8`). The job-control-stop
+/// breakthrough in `park_should_block` (user_task.rs, 3 sites) used a bare
+/// `1 << 9`, which is bit 9 = SIGUSR1(10): a SIGKILL'd STOPPED task therefore
+/// never woke to die until SIGCONT. Pin the bit so the off-by-one cannot return.
+fn smoke_abi_signal_sigkill_pending_at_sig_bit_9() -> TestResult {
+    const SIGKILL: u32 = 9;
+    crate::handlers::clear_signal_pending(FAKE_TASK, SIGKILL);
+    crate::handlers::raise_signal_pending(FAKE_TASK, SIGKILL);
+    let pending = crate::handlers::signal_pending_bits(FAKE_TASK);
+    // Correct: SIGKILL is detected at sig_bit(9) (== 1<<8).
+    let at_sig_bit = pending & crate::handlers::sig_bit(SIGKILL) != 0;
+    // The old buggy check `1 << 9` is SIGUSR1's bit, which SIGKILL must NOT set.
+    let at_stale_bit9 = pending & (1u64 << 9) != 0;
+    crate::handlers::clear_signal_pending(FAKE_TASK, SIGKILL);
+    if !at_sig_bit {
+        return TestResult::Fail("SIGKILL must be pending at sig_bit(9) (bit 8)");
+    }
+    if at_stale_bit9 {
+        return TestResult::Fail("SIGKILL must NOT set bit 9 (SIGUSR1) — the old breakthrough bug");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_signal_sigkill_pending_at_sig_bit_9);
+
 // ── Real-time signals (33..=63) ──────────────────────────────────────
 // The mask/pending bitmaps were u32 (NSIG=32), so RT signals could
 // neither be sent nor blocked — musl reserves SIGCANCEL(33) for

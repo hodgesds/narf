@@ -871,9 +871,12 @@ fn park_should_block(
     uc.dbg_park_checks.fetch_add(1, Ordering::Relaxed);
 
     // Job-control stop (SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU): stay parked until
-    // SIGCONT clears the stopped flag (SIGKILL=bit 9 still breaks through).
+    // SIGCONT clears the stopped flag; a pending SIGKILL still breaks through.
+    // SIGKILL is signal 9 → pending bit 8 (`sig_bit(9)`, the N-1 convention, see
+    // UNBLOCKABLE_MASK). The bare `1 << 9` this used to be is bit 9 = SIGUSR1,
+    // so a SIGKILL'd stopped task never woke to die until SIGCONT.
     if crate::handlers::is_task_stopped(task_id)
-        && (crate::handlers::signal_pending_bits(task_id) & (1 << 9)) == 0
+        && (crate::handlers::signal_pending_bits(task_id) & crate::handlers::sig_bit(9)) == 0
     {
         crate::handlers::register_signal_waker(task_id, waker.clone());
         return true;
@@ -2002,7 +2005,7 @@ impl core::future::Future for UserTaskFuture {
         {
             let tp = crate::handlers::current_task_id();
             if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & (1 << 9)) == 0
+                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
             {
                 crate::handlers::register_signal_waker(tp, cx.waker().clone());
                 return core::task::Poll::Pending;
@@ -2964,7 +2967,7 @@ impl core::future::Future for UserTaskFuture {
         {
             let tp = crate::handlers::current_task_id();
             if crate::handlers::is_task_stopped(tp)
-                && (crate::handlers::signal_pending_bits(tp) & (1 << 9)) == 0
+                && (crate::handlers::signal_pending_bits(tp) & crate::handlers::sig_bit(9)) == 0
             {
                 crate::handlers::register_signal_waker(tp, cx.waker().clone());
                 return core::task::Poll::Pending;
