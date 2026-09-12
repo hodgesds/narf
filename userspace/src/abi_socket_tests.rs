@@ -1599,6 +1599,71 @@ fn smoke_abi_socket_dgram_send_no_dest_enotconn() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_dgram_send_no_dest_enotconn);
 
+// connect() to a PATHNAME that does not exist is -ENOENT, not -ECONNREFUSED
+// (Linux `unix_find_bsd` `kern_path` failure). Clients (libdbus/libwayland/Xlib)
+// treat ENOENT as "server not up yet, retry" but ECONNREFUSED as fatal.
+fn smoke_abi_socket_connect_missing_path_enoent() -> TestResult {
+    with_setup(|| {
+        let cli = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-enoent-never-bound.sock");
+        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen)) != Some(ENOENT) {
+            return Err("connect() to a missing pathname must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_connect_missing_path_enoent);
+
+// sendto() to a PATHNAME datagram address that does not exist is -ENOENT
+// (Linux `unix_dgram_sendmsg`→`unix_find_other` `kern_path` failure).
+fn smoke_abi_socket_dgram_sendto_missing_path_enoent() -> TestResult {
+    with_setup(|| {
+        let tx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/abi-enoent-dgram-missing.sock");
+        let payload = b"x";
+        let send_args = SyscallArgs {
+            arg0: tx,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            arg3: 0,
+            arg4: addr.as_ptr() as u64,
+            arg5: alen,
+        };
+        if call(Syscall::SocketSend.raw(), send_args) != Some(ENOENT) {
+            return Err("sendto() to a missing pathname must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_sendto_missing_path_enoent
+);
+
+// connect() to a path that EXISTS but is not a live listener is -ECONNREFUSED,
+// NOT -ENOENT (Linux `unix_find_bsd`: node present, not a bound socket →
+// -ECONNREFUSED). A plain file stands in for the "present but not connectable"
+// node — this proves the ENOENT/ECONNREFUSED split keys on node existence.
+fn smoke_abi_socket_connect_existing_nonsocket_econnrefused() -> TestResult {
+    with_memfs("/m", "m", &[], || {
+        let plain = b"/m/plainfile\0";
+        if call_creat(plain.as_ptr() as u64, 0o644).ok_or("creat status")? < 0 {
+            return Err("creat of the stand-in file failed");
+        }
+        let cli = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/m/plainfile");
+        // -111 == ECONNREFUSED: the node exists, so it is NOT the ENOENT path.
+        if call(Syscall::SocketConnect.raw(), a2(cli, addr.as_ptr() as u64, alen)) != Some(-111) {
+            return Err("connect() to an existing non-socket path must return -ECONNREFUSED");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_existing_nonsocket_econnrefused
+);
+
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
 fn smoke_abi_socket_getsockopt_pos() -> TestResult {

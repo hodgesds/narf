@@ -563,6 +563,10 @@ pub enum SockError {
     Pipe,
     InProgress,
     Range,
+    /// ENOENT — an AF_UNIX pathname connect/sendto whose path does not exist in
+    /// the filesystem (Linux `unix_find_bsd` `kern_path` failure). Distinct from
+    /// ConnectionRefused, which is "path present but no live listener".
+    NoEntry,
 }
 
 impl SockError {
@@ -582,6 +586,7 @@ impl SockError {
             Self::Pipe => 32,               // EPIPE
             Self::InProgress => 115,        // EINPROGRESS
             Self::Range => 34,              // ERANGE
+            Self::NoEntry => 2,             // ENOENT
         }
     }
 }
@@ -4114,7 +4119,21 @@ impl SocketFile {
                 };
                 let listener = match listener {
                     Some(l) => l,
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    // Linux `unix_find_bsd` (net/unix/af_unix.c): a connect to a
+                    // PATHNAME that does not exist is -ENOENT (kern_path failure);
+                    // a path that resolves but has no live listener is
+                    // -ECONNREFUSED. Abstract names have no filesystem node, so a
+                    // miss is always -ECONNREFUSED (`unix_find_abstract`).
+                    None => {
+                        return match &uaddr {
+                            UnixAddr::Path(p)
+                                if !crate::handlers::unix_path_final_node_exists(p) =>
+                            {
+                                SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            _ => SocketOpResult::Err(SockError::ConnectionRefused),
+                        };
+                    }
                 };
                 // Reject an already-connected (or otherwise non-connectable) fd
                 // BEFORE minting/queuing any server endpoint. The old order
@@ -4956,9 +4975,21 @@ impl SocketFile {
                 };
                 let dest_sock = match dest_sock {
                     Some(s) => s,
-                    // No bound receiver. Linux returns ECONNREFUSED for a
-                    // datagram sent to a missing named socket.
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    // Linux `unix_dgram_sendmsg`→`unix_find_other`: a datagram to
+                    // a PATHNAME that does not exist is -ENOENT (kern_path
+                    // failure); a resolvable path with no bound receiver is
+                    // -ECONNREFUSED. Abstract names have no filesystem node → a
+                    // miss is always -ECONNREFUSED.
+                    None => {
+                        return match &dest_addr {
+                            UnixAddr::Path(p)
+                                if !crate::handlers::unix_path_final_node_exists(p) =>
+                            {
+                                SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            _ => SocketOpResult::Err(SockError::ConnectionRefused),
+                        };
+                    }
                 };
                 let pkt = DgramPacket {
                     peer_unix: local_addr,

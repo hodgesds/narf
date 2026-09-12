@@ -3028,6 +3028,52 @@ fn unix_socket_path_key_depth(
     })
 }
 
+/// Whether an AF_UNIX pathname's FINAL node currently exists in the VFS,
+/// following a final symlink the way `connect(2)`/`sendto(2)` do (Linux
+/// `unix_find_bsd` uses `kern_path(..., LOOKUP_FOLLOW, ...)`). Used to tell
+/// ENOENT ("path absent") from ECONNREFUSED ("node present but no live
+/// listener") on a FAILED AF_UNIX connect/sendto: Linux returns -ENOENT when
+/// `kern_path` fails and -ECONNREFUSED when the node exists but is not a live
+/// socket. Unlike [`unix_socket_path_key`], this deliberately does NOT fall
+/// back to the parent directory — an absent leaf must read as absent.
+pub(crate) fn unix_path_final_node_exists(path: &str) -> bool {
+    unix_path_final_node_exists_depth(path, 0)
+}
+fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
+    if path.is_empty() || path.starts_with('\0') {
+        return false;
+    }
+    let abs = resolve_cwd_path(current_task_id(), path);
+    let path_ref = abs.trim_end_matches('/');
+    // Follow a final symlink (LOOKUP_FOLLOW) exactly as the key computation
+    // does, so a symlinked socket alias resolves to its target's existence.
+    if depth < 40 {
+        if let Some(target) = resolve_final_symlink_target(path_ref) {
+            let target_abs = if target.starts_with('/') {
+                target
+            } else {
+                let parent = path_ref.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
+                alloc::format!("{parent}/{target}")
+            };
+            return unix_path_final_node_exists_depth(&target_abs, depth + 1);
+        }
+    }
+    // Resolve ONLY the final node (mirrors the primary block of
+    // `unix_socket_path_key_depth`); a present node of any type → exists.
+    current_resolve_absolute(path_ref, |fs, rel| {
+        let file = if rel.is_empty() {
+            fs.root_file()
+        } else {
+            narf_filesystem::resolve(fs.root(), rel).ok().or_else(|| {
+                poll_blocking(narf_filesystem::resolve_async_nofollow(fs.root(), rel))
+                    .and_then(|result| result.ok())
+            })
+        };
+        file.map(|file| file.ino() != 0).unwrap_or(false)
+    })
+    .unwrap_or(false)
+}
+
 /// Move `old_abs` to `new_abs` when the two live in DIFFERENT parent
 /// directories. Returns the raw syscall value: `0` on success, or a
 /// negative errno.
