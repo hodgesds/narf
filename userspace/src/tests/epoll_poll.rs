@@ -4417,3 +4417,158 @@ fn smoke_poll_holds_files_across_sibling_close() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_poll_holds_files_across_sibling_close);
+
+/// Nested epoll: a child epoll fd is itself pollable, so a PARENT epoll (or
+/// `poll(2)`) that watches it arms a persistent per-fd waker on the child's OWN
+/// readiness cell. When a fd inside the child becomes ready, the child must
+/// chain a TARGETED wake up to that waker (Linux `ep_poll_safewake`) — not leave
+/// the parent to re-discover it on a full re-scan driven by the lost-wake
+/// backstop. Regression for the CachyOS dbus-broker accept strand: the broker
+/// waits on an epoll that nests another epoll that nests the bus listener, so a
+/// new connection reached it only via the global `notify(0)` herd or the
+/// ~900 ms (NO_HZ-idle-stalled) backstop. Before the fix a nested epoll was
+/// non-cell-backed and `readiness()` returned `None`, so no parent waker could
+/// be armed at all.
+fn smoke_epoll_nested_child_ready_wakes_parent_cell() -> TestResult {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU32, Ordering};
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+
+    fn counting_waker(counter: Arc<AtomicU32>) -> Waker {
+        unsafe fn clone_raw(d: *const ()) -> RawWaker {
+            // SAFETY: `d` came from Arc::into_raw below; balanced by re-into_raw.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            let cloned = arc.clone();
+            let _ = Arc::into_raw(arc);
+            RawWaker::new(Arc::into_raw(cloned) as *const (), &VTAB)
+        }
+        unsafe fn wake_raw(d: *const ()) {
+            // SAFETY: consumes the strong reference owned by this waker.
+            let arc = unsafe { Arc::<AtomicU32>::from_raw(d as *const AtomicU32) };
+            arc.fetch_add(1, Ordering::AcqRel);
+        }
+        unsafe fn wake_ref_raw(d: *const ()) {
+            // SAFETY: the waker retains its strong reference across this call.
+            unsafe { (*(d as *const AtomicU32)).fetch_add(1, Ordering::AcqRel) };
+        }
+        unsafe fn drop_raw(d: *const ()) {
+            // SAFETY: releases the strong reference owned by this waker.
+            unsafe { drop(Arc::<AtomicU32>::from_raw(d as *const AtomicU32)) };
+        }
+        static VTAB: RawWakerVTable =
+            RawWakerVTable::new(clone_raw, wake_raw, wake_ref_raw, drop_raw);
+        // SAFETY: vtable matches the Arc<AtomicU32> representation.
+        unsafe { Waker::from_raw(RawWaker::new(Arc::into_raw(counter) as *const (), &VTAB)) }
+    }
+
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task = setup_poll_test();
+
+    // A pipe: the read end is cell-backed, so writing the write end fires its
+    // readiness cell — the child event that must chain up to the parent.
+    let mut fds: [i32; 2] = [-1, -1];
+    let r = call(
+        Syscall::Pipe,
+        SyscallArgs {
+            arg0: fds.as_mut_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if r.status != SyscallReturn::OK || r.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("pipe() failed");
+    }
+    let (read_fd, write_fd) = (fds[0] as u32, fds[1] as u32);
+
+    // Child epoll watching the pipe read end (EPOLLIN).
+    let epc = call(Syscall::EpollCreate, SyscallArgs::default()).value as u32;
+    let mut ev = [0u8; 12];
+    ev[..4].copy_from_slice(&crate::epoll::EPOLLIN.to_ne_bytes());
+    let added = call(
+        Syscall::EpollCtl,
+        SyscallArgs {
+            arg0: epc as u64,
+            arg1: crate::epoll::EPOLL_CTL_ADD as u64,
+            arg2: read_fd as u64,
+            arg3: ev.as_ptr() as u64,
+            ..SyscallArgs::default()
+        },
+    );
+    if added.value != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("CTL_ADD pipe into child epoll failed");
+    }
+
+    // The child epoll fd must itself expose a readiness cell (the fix). A parent
+    // epoll arms its eppoll_entry here; without a cell there is nowhere to arm.
+    let epc_ops = crate::fd::with_table(task, |t| t.get(epc).map(|e| e.ops.clone())).flatten();
+    let Some(epc_ops) = epc_ops else {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("child epfd not in fd table");
+    };
+    if epc_ops.readiness().is_none() {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail(
+            "nested epoll exposes no readiness cell — a parent cannot get a targeted wake",
+        );
+    }
+
+    // Simulate the parent's eppoll_entry via the FileOps arm path (what
+    // EpollInstance::arm_item_persistent calls) so the nested-parent latch is
+    // set. Pipe is empty, so it registers and reports not-ready (0).
+    let woken = Arc::new(AtomicU32::new(0));
+    let waker = counting_waker(woken.clone());
+    const PARENT_SUB: u64 = 1u64 << 63;
+    match epc_ops.arm_readiness_persistent(PARENT_SUB, narf_filesystem::POLL_IN, &waker) {
+        Some(0) => {}
+        Some(_) => {
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("child epoll reported ready before any data");
+        }
+        None => {
+            crate::syscall::__test_clear_global();
+            return TestResult::Fail("nested epoll did not accept a persistent parent waiter");
+        }
+    }
+    if woken.load(Ordering::Acquire) != 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("parent waker fired before any child event");
+    }
+
+    // A child event: write one byte to the pipe. read_fd's cell fires → child
+    // epoll's per-fd waker → push_ready → child's OWN cell notify → parent waker.
+    let payload = b"x";
+    let w = call(
+        Syscall::Write,
+        SyscallArgs {
+            arg0: write_fd as u64,
+            arg1: payload.as_ptr() as u64,
+            arg2: 1,
+            ..SyscallArgs::default()
+        },
+    );
+    if (w.value as i64) != 1 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("pipe write failed");
+    }
+
+    if woken.load(Ordering::Acquire) == 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail(
+            "child became ready but the parent's cell waker was NOT woken (nested lost wake)",
+        );
+    }
+    // And the child epoll fd now polls readable — what the woken parent re-scan
+    // will confirm (the poll_readiness / wake agreement nested loops rely on).
+    if epc_ops.poll_readiness() & narf_filesystem::POLL_IN == 0 {
+        crate::syscall::__test_clear_global();
+        return TestResult::Fail("child epoll fd does not poll readable after child became ready");
+    }
+    epc_ops.disarm_readiness(PARENT_SUB);
+    crate::syscall::__test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace",
+    smoke_epoll_nested_child_ready_wakes_parent_cell
+);
