@@ -1125,7 +1125,7 @@ fn smoke_abi_proc2_self_fd_readlinks_backing() -> TestResult {
             .mount(&auth, "/sfdm", fs)
             .map_err(|_| "backing memfs mount failed")?;
         let result = (|| {
-            let srcfd = match call_open(b"/sfdm/f\0".as_ptr() as u64, 0) {
+            let srcfd = match call_open(c"/sfdm/f".as_ptr() as u64, 0) {
                 Some(fd) if fd >= 0 => fd as u32,
                 _ => return Err("open of backing file failed"),
             };
@@ -1160,7 +1160,7 @@ kernel_test_in!("syscall_abi", smoke_abi_proc2_self_fd_readlinks_backing);
 // invariant for the whole /proc/<pid>/fd surface.
 fn smoke_abi_proc2_anon_fd_readlink_nonempty() -> TestResult {
     with_procfs(FAKE_TASK, "anonfd", &["anonfd"], 0, |base| {
-        let fd = match call(Syscall::MemfdCreate.raw(), a1(b"t\0".as_ptr() as u64, 0)) {
+        let fd = match call(Syscall::MemfdCreate.raw(), a1(c"t".as_ptr() as u64, 0)) {
             Some(fd) if fd >= 0 => fd as u32,
             _ => return Err("memfd_create failed"),
         };

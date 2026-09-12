@@ -878,13 +878,15 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_bad_flags);
 // (EINVAL), NOT a well-formed-but-absent pid (ESRCH). Guards the fix from
 // regressing to a `== 0`-only check that let a negative pid fall through.
 fn smoke_abi_proc_pidfd_open_neg_pid() -> TestResult {
-    with_setup(|| match call(Syscall::PidfdOpen.raw(), a1((-1i64) as u64, 0)) {
-        Some(v) if v == EINVAL => Ok(()),
-        Some(v) if v == ESRCH => {
-            Err("pidfd_open(-1) returned -ESRCH; Linux gives -EINVAL for pid<=0")
-        }
-        _ => Err("pidfd_open(-1) did not return -EINVAL"),
-    })
+    with_setup(
+        || match call(Syscall::PidfdOpen.raw(), a1((-1i64) as u64, 0)) {
+            Some(v) if v == EINVAL => Ok(()),
+            Some(v) if v == ESRCH => {
+                Err("pidfd_open(-1) returned -ESRCH; Linux gives -EINVAL for pid<=0")
+            }
+            _ => Err("pidfd_open(-1) did not return -EINVAL"),
+        },
+    )
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_open_neg_pid);
 

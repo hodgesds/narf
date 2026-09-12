@@ -2828,7 +2828,10 @@ fn smoke_ext2_symlink_vfs_readlink_fast() -> TestResult {
     ) {
         return TestResult::Fail("fast symlink create failed");
     }
-    let node = match poll_once(narf_filesystem::resolve_async_nofollow(volume.root(), "sym")) {
+    let node = match poll_once(narf_filesystem::resolve_async_nofollow(
+        volume.root(),
+        "sym",
+    )) {
         Some(Ok(n)) => n,
         _ => return TestResult::Fail("resolve_async_nofollow of ext symlink failed"),
     };
@@ -2903,7 +2906,10 @@ fn smoke_ext2_symlink_boundary_60_61() -> TestResult {
     };
     let t60 = [b'a'; 60];
     let t61 = [b'b'; 61];
-    for (name, expect) in [(b"s60".as_slice(), t60.as_slice()), (b"s61".as_slice(), t61.as_slice())] {
+    for (name, expect) in [
+        (b"s60".as_slice(), t60.as_slice()),
+        (b"s61".as_slice(), t61.as_slice()),
+    ] {
         if !matches!(
             poll_once(volume.dir_create_symlink(crate::EXT2_ROOT_INO, name, expect)),
             Some(Ok(_))

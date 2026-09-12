@@ -2044,7 +2044,10 @@ fn smoke_userspace_park_fire_deadline_net_io_backstop() -> TestResult {
     TestResult::Pass
 }
 #[cfg(target_arch = "x86_64")]
-kernel_test_in!("userspace", smoke_userspace_park_fire_deadline_net_io_backstop);
+kernel_test_in!(
+    "userspace",
+    smoke_userspace_park_fire_deadline_net_io_backstop
+);
 
 /// The io-waiter LATCH closes the scan->register lost-wake race precisely: a
 /// targeted `wake_io_owner` for a task that has not yet registered its waiter

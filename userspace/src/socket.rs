@@ -5338,12 +5338,7 @@ impl SocketFile {
         }
     }
 
-    fn do_send(
-        &self,
-        buf: &[u8],
-        flags: u32,
-        _addr: Option<SockAddr>,
-    ) -> Result<usize, SockError> {
+    fn do_send(&self, buf: &[u8], flags: u32, _addr: Option<SockAddr>) -> Result<usize, SockError> {
         // Linux `unix_stream_sendmsg`: without CONFIG_AF_UNIX_OOB (NARF's case) a
         // send with MSG_OOB is -EOPNOTSUPP. Scoped to AF_UNIX — INET keeps TCP
         // urgent-data support.

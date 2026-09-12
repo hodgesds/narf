@@ -155,7 +155,6 @@ impl StealStrategy for NumaAwareSteal {
 
         out
     }
-
 }
 
 /// Random steal — uniform permutation of `online` using a tiny LCG
@@ -208,7 +207,6 @@ impl StealStrategy for RandomSteal {
         }
         out
     }
-
 }
 
 /// `Arc<dyn StealStrategy>` slot. Arc (not Box) so the steal-fast-path
