@@ -969,22 +969,54 @@ impl RegionTable {
             return;
         }
 
+        // `Region::phys` is a materialized prefix: entries past `phys.len()`
+        // and explicit `PhysAddr::new(0)` slots both mean demand-zero.
+        // Appending a source's prefix directly after a destination whose own
+        // prefix is short would shift the source's resident frames to lower
+        // virtual pages, so a sparse destination is first zero-padded out to
+        // its page count when the source carries resident entries; the pad
+        // slots describe exactly the demand-zero tail the destination already
+        // had. A source with an empty prefix appends nothing, so the merged
+        // tail simply stays demand-zero with no padding. Capacity for every
+        // pad and append below is reserved before any region is removed, so
+        // the merge either completes or leaves the tables untouched. The
+        // successor terms use the destination's post-predecessor-merge page
+        // count, mirroring the second absorption below.
+        let page_count = |len: u64| (len >> 12) as usize;
+        let current_pages = page_count(current.len);
+        let current_phys_len = current.phys.len();
+        let successor_phys_len = successor_base
+            .and_then(|successor_base| self.get(successor_base))
+            .map_or(0, |successor| successor.phys.len());
+
         let destination_base = predecessor_base.unwrap_or(base);
-        let additional_pages = if predecessor_base.is_some() {
-            current.phys.len()
-        } else {
-            0
+        let destination = self
+            .get(destination_base)
+            .expect("anonymous merge destination disappeared");
+        let mut destination_pages = page_count(destination.len);
+        let mut destination_phys_len = destination.phys.len();
+        let mut additional_entries = 0usize;
+        if predecessor_base.is_some() {
+            if current_phys_len > 0 {
+                additional_entries = destination_pages
+                    .saturating_sub(destination_phys_len)
+                    .saturating_add(current_phys_len);
+                destination_phys_len = destination_pages.saturating_add(current_phys_len);
+            }
+            destination_pages = destination_pages.saturating_add(current_pages);
         }
-        .saturating_add(
-            successor_base
-                .and_then(|successor_base| self.get(successor_base))
-                .map_or(0, |successor| successor.phys.len()),
-        );
+        if successor_phys_len > 0 {
+            additional_entries = additional_entries.saturating_add(
+                destination_pages
+                    .saturating_sub(destination_phys_len)
+                    .saturating_add(successor_phys_len),
+            );
+        }
         if self
             .get_mut(destination_base)
             .expect("anonymous merge destination disappeared")
             .phys
-            .try_reserve(additional_pages)
+            .try_reserve(additional_entries)
             .is_err()
         {
             return;
@@ -1001,23 +1033,30 @@ impl RegionTable {
         let destination = self
             .get_mut(destination_base)
             .expect("anonymous merge destination disappeared after source removal");
-        if let Some(source) = current.as_mut() {
+        let absorb = |destination: &mut Region, source: &mut Region| {
             debug_assert_eq!(
                 destination.base.as_u64().saturating_add(destination.len),
                 source.base.as_u64()
             );
+            if !source.phys.is_empty() {
+                // Zero-pad a short destination prefix to its page count so
+                // the appended source entries keep their virtual offsets.
+                // The reservation above covers this growth, so neither the
+                // resize nor the append can allocate here.
+                let destination_pages = page_count(destination.len);
+                if destination.phys.len() < destination_pages {
+                    destination.phys.resize(destination_pages, PhysAddr::new(0));
+                }
+                destination.phys.append(&mut source.phys);
+            }
             destination.len = destination.len.saturating_add(source.len);
             destination.perms.0 |= source.perms.0 & RegionPerms::COW.0;
-            destination.phys.append(&mut source.phys);
+        };
+        if let Some(source) = current.as_mut() {
+            absorb(destination, source);
         }
         if let Some(source) = successor.as_mut() {
-            debug_assert_eq!(
-                destination.base.as_u64().saturating_add(destination.len),
-                source.base.as_u64()
-            );
-            destination.len = destination.len.saturating_add(source.len);
-            destination.perms.0 |= source.perms.0 & RegionPerms::COW.0;
-            destination.phys.append(&mut source.phys);
+            absorb(destination, source);
         }
         self.invalidate_mapping(destination_base);
     }
@@ -11530,6 +11569,252 @@ fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_memory_numa_candidate_seeks_from_cursor);
+
+/// Merge-eligible private-anonymous region for the coalescing smokes below.
+/// `phys` may be any materialized prefix of `pages`: shorter than `pages`
+/// (sparse), empty (fully lazy), or exactly `pages` (fully materialized).
+fn merge_test_region(base: u64, pages: u64, phys: Vec<PhysAddr>) -> Region {
+    Region {
+        base: VirtAddr::new(base),
+        len: pages * 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE,
+        phys,
+    }
+}
+
+/// Every resident frame paired with the virtual page that reaches it, in
+/// ascending virtual order. Missing-tail and explicit-zero prefix slots are
+/// demand-zero, not frames, so they carry no placement to preserve.
+fn resident_frame_placement(table: &RegionTable) -> Vec<(u64, u64)> {
+    let mut placement = Vec::new();
+    for region in table.iter() {
+        for (index, phys) in region.phys.iter().enumerate() {
+            if phys.raw() != 0 {
+                placement.push((phys.raw(), region.base.as_u64() + index as u64 * 4096));
+            }
+        }
+    }
+    placement
+}
+
+/// Insert `regions`, coalesce around `merge_base`, and require every resident
+/// frame to still be reachable at its pre-merge virtual page. Placement
+/// preservation is the coalescing invariant: `phys` is a positional prefix,
+/// so a merge that concatenates prefixes without padding a short destination
+/// would silently retarget the source's frames.
+fn coalesce_preserving_placement(
+    regions: Vec<Region>,
+    merge_base: u64,
+) -> Result<RegionTable, &'static str> {
+    let mut table = RegionTable::new();
+    for region in regions {
+        if table
+            .insert(region)
+            .expect("merge test RegionIndex reservation")
+            .is_some()
+        {
+            return Err("merge test regions share a base");
+        }
+    }
+    let before = resident_frame_placement(&table);
+    table.coalesce_anonymous_around(merge_base);
+    if resident_frame_placement(&table) != before {
+        return Err("coalescing moved a resident frame to a different virtual page");
+    }
+    Ok(table)
+}
+
+/// `(region count, len, raw phys prefix)` of the region at `base`.
+fn merged_shape(table: &RegionTable, base: u64) -> Option<(usize, u64, Vec<u64>)> {
+    let count = table.iter().count();
+    table.get(base).map(|region| {
+        (
+            count,
+            region.len,
+            region.phys.iter().map(|p| p.raw()).collect(),
+        )
+    })
+}
+
+/// A fully materialized destination absorbs a sparse source by plain append:
+/// every source frame's offset from the destination end equals its offset in
+/// the source, and the merged prefix stays shorter than the merged region.
+fn smoke_memory_anon_merge_full_destination_absorbs_sparse_source() -> TestResult {
+    let base = 0x0000_0081_0000_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(
+                base,
+                2,
+                alloc::vec![PhysAddr::new(0x41_000), PhysAddr::new(0x42_000)],
+            ),
+            merge_test_region(base + 0x2000, 3, alloc::vec![PhysAddr::new(0x43_000)]),
+        ],
+        base + 0x2000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x41_000, 0x42_000, 0x43_000]))
+    {
+        return TestResult::Fail("full destination did not append the sparse source prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_full_destination_absorbs_sparse_source
+);
+
+/// A fully lazy source (empty prefix) merges into a sparse destination
+/// without padding: the destination prefix is untouched and every page the
+/// source contributed stays demand-zero behind it.
+fn smoke_memory_anon_merge_lazy_source_leaves_sparse_destination() -> TestResult {
+    let base = 0x0000_0081_0100_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x44_000)]),
+            merge_test_region(base + 0x3000, 2, Vec::new()),
+        ],
+        base + 0x3000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x44_000])) {
+        return TestResult::Fail("lazy source merge disturbed the sparse destination prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_lazy_source_leaves_sparse_destination
+);
+
+/// A source with resident frames merges into a sparse destination by
+/// zero-padding the destination prefix out to its page count first; the
+/// source frames then land at their original virtual pages past the pad.
+fn smoke_memory_anon_merge_pads_sparse_destination_for_resident_source() -> TestResult {
+    let base = 0x0000_0081_0200_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x45_000)]),
+            merge_test_region(
+                base + 0x3000,
+                2,
+                alloc::vec![PhysAddr::new(0x46_000), PhysAddr::new(0x47_000)],
+            ),
+        ],
+        base + 0x3000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base)
+        != Some((1, 5 * 4096, alloc::vec![0x45_000, 0, 0, 0x46_000, 0x47_000]))
+    {
+        return TestResult::Fail("sparse destination was not zero-padded before the append");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_sparse_destination_for_resident_source
+);
+
+/// The successor direction pads too: a sparse current region absorbing a
+/// materialized successor gains explicit zero slots for its own demand-zero
+/// tail so the successor's frames keep their virtual pages.
+fn smoke_memory_anon_merge_pads_sparse_current_for_resident_successor() -> TestResult {
+    let base = 0x0000_0081_0300_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 2, alloc::vec![PhysAddr::new(0x48_000)]),
+            merge_test_region(
+                base + 0x2000,
+                2,
+                alloc::vec![PhysAddr::new(0x49_000), PhysAddr::new(0x4A_000)],
+            ),
+        ],
+        base,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base)
+        != Some((1, 4 * 4096, alloc::vec![0x48_000, 0, 0x49_000, 0x4A_000]))
+    {
+        return TestResult::Fail("sparse current region was not zero-padded for its successor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_sparse_current_for_resident_successor
+);
+
+/// Three-way merge where the predecessor absorption grows the destination:
+/// the successor's padding target is the post-growth page count (predecessor
+/// pages + current pages), not the predecessor's original size.
+fn smoke_memory_anon_merge_pads_grown_destination_before_successor() -> TestResult {
+    let base = 0x0000_0081_0400_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 1, alloc::vec![PhysAddr::new(0x4B_000)]),
+            merge_test_region(base + 0x1000, 2, Vec::new()),
+            merge_test_region(base + 0x3000, 1, alloc::vec![PhysAddr::new(0x4C_000)]),
+        ],
+        base + 0x1000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 4 * 4096, alloc::vec![0x4B_000, 0, 0, 0x4C_000])) {
+        return TestResult::Fail("successor padding ignored the predecessor-merge growth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_grown_destination_before_successor
+);
+
+/// Coalescing is best-effort: when the padding reservation cannot be
+/// satisfied (here a sparse destination whose zero-pad would need terabytes),
+/// the merge declines before removing anything and both VMAs survive with
+/// their original shapes and frame placement.
+fn smoke_memory_anon_merge_reserve_failure_leaves_regions_intact() -> TestResult {
+    let base = 0x0000_0081_0500_0000u64;
+    let huge_pages = 1u64 << 40;
+    let source_base = base + (huge_pages << 12);
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, huge_pages, alloc::vec![PhysAddr::new(0x4D_000)]),
+            merge_test_region(source_base, 1, alloc::vec![PhysAddr::new(0x4E_000)]),
+        ],
+        source_base,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if table.iter().count() != 2 {
+        return TestResult::Fail("a failed padding reservation still merged the VMAs");
+    }
+    let destination_intact = table
+        .get(base)
+        .is_some_and(|region| region.len == huge_pages << 12 && region.phys.len() == 1);
+    let source_intact = table
+        .get(source_base)
+        .is_some_and(|region| region.len == 4096 && region.phys.len() == 1);
+    if !destination_intact || !source_intact {
+        return TestResult::Fail("a declined merge changed a region's shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_reserve_failure_leaves_regions_intact
+);
 
 /// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
 /// outstanding ticket before its slow path can publish into the new mapping.
