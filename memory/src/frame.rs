@@ -2713,9 +2713,64 @@ pub mod cow {
         newly_shared
     }
 
-    /// Undo speculative retains previously added by [`inc_ref_batch`].
+    /// One fork's incremental COW retain pass.
     ///
-    /// Fork uses this only for the suffix of private frames whose child VMAs
+    /// [`inc_ref_batch`]'s slice shape forces the caller to materialize
+    /// every resident private frame in a side vector before any retain
+    /// happens; this cursor gives the same batch semantics one frame at a
+    /// time so fork can retain while it walks its regions. The flat-table
+    /// epoch is reserved lazily on the first retain, and duplicate aliases
+    /// of a frame whose sole→shared transition happened in this pass all
+    /// report newly-shared, exactly like [`inc_ref_batch`]'s bitmap. Keys
+    /// outside the flat table (memory hotplug, pre-init callers) take
+    /// their shard lock per call and track this pass's transitions in a
+    /// linear spill list — both are cold by construction, so the common
+    /// fork never leaves the lock-free flat path.
+    pub(crate) struct ForkRetain {
+        flat_epoch: u32,
+        spill_transitioned: Vec<u64>,
+    }
+
+    pub(crate) fn begin_fork_retain() -> ForkRetain {
+        ForkRetain {
+            flat_epoch: 0,
+            spill_transitioned: Vec::new(),
+        }
+    }
+
+    impl ForkRetain {
+        /// Add one COW owner for the resident frame `phys` and report
+        /// whether the frame is newly shared — its sole→shared transition
+        /// happened during this pass (every duplicate alias of such a frame
+        /// also reports true, so each writable parent alias gets
+        /// write-protected). Failed forks undo these retains with
+        /// [`rollback_inc_ref_batch`] over the frames retained so far.
+        pub(crate) fn retain(&mut self, phys: PhysAddr) -> bool {
+            let key = phys.raw();
+            debug_assert_ne!(key, 0, "COW retain requires a resident frame");
+            if let Some(slot) = flat_slot(key) {
+                if self.flat_epoch == 0 {
+                    self.flat_epoch = flat_next_epoch();
+                }
+                return flat_increment(slot, self.flat_epoch).1;
+            }
+            let previous = {
+                let mut guard = REFCOUNTS[ref_shard(key)].map.lock();
+                guard.get_or_insert_with(RefTable::new).increment(key)
+            };
+            if previous <= 1 {
+                self.spill_transitioned.push(key);
+                true
+            } else {
+                self.spill_transitioned.contains(&key)
+            }
+        }
+    }
+
+    /// Undo speculative retains previously added by [`inc_ref_batch`] or
+    /// [`ForkRetain::retain`].
+    ///
+    /// Fork uses this only for private frames whose child VMAs
     /// were never published.  The original owner is therefore still live: a
     /// count that falls from two to one is removed from the table, restoring
     /// the implicit sole-owner representation, and no frame is released.

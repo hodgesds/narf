@@ -4580,6 +4580,94 @@ kernel_test_in!(
     smoke_memory_failed_fork_rolls_back_unpublished_cow_refs
 );
 
+/// The first fork write-protects exactly the resident writable private
+/// pages it newly shares; a repeated fork of the unchanged parent selects
+/// none of them again — settled read-only leaves are skipped without a
+/// page-table re-walk, and lazy (phys == 0) slots are never selected.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_repeated_fork_skips_settled_cow_pages() -> TestResult {
+    use crate::address_space::__test_fork_write_protected_pages;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging is live in the kernel-test harness and this test owns
+    // the fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("repeated-fork parent root unavailable"),
+    };
+    let first = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("repeated-fork first frame unavailable"),
+    };
+    let second = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            frame::free_frame(first);
+            return TestResult::Skip("repeated-fork second frame unavailable");
+        }
+    };
+    let first_phys = first.start_address();
+    let second_phys = second.start_address();
+    // Two resident writable pages split by a lazy slot, so each fork sees
+    // two distinct protect runs rather than one.
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(0x0000_0080_3b00_0000),
+            len: 3 * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![first_phys, crate::PhysAddr::new(0), second_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(first);
+        frame::free_frame(second);
+        return TestResult::Fail("repeated-fork VMA setup failed");
+    }
+
+    let before = __test_fork_write_protected_pages();
+    // SAFETY: the inactive parent is exclusively owned and paging is live.
+    let first_child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("repeated-fork first fork failed"),
+    };
+    let after_first = __test_fork_write_protected_pages();
+    if after_first - before != 2 {
+        return TestResult::Fail("first fork must select exactly the resident writable pages");
+    }
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let second_child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("repeated-fork second fork failed"),
+    };
+    if __test_fork_write_protected_pages() != after_first {
+        return TestResult::Fail("repeated fork re-protected already-shared pages");
+    }
+    if cow::count(first_phys) != 3 || cow::count(second_phys) != 3 {
+        return TestResult::Fail("repeated fork lost a COW owner");
+    }
+
+    drop(second_child);
+    drop(first_child);
+    if cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("child teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(first_phys) == 0 && cow::count(second_phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left repeated-fork COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_repeated_fork_skips_settled_cow_pages);
+
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same

@@ -105,6 +105,16 @@ pub(crate) fn __test_fail_fork_child_region_reserve_after(calls: usize) {
     assert!(calls != 0);
     FAIL_FORK_CHILD_REGION_RESERVE_AFTER.store(calls, core::sync::atomic::Ordering::Release);
 }
+/// Cumulative count of parent pages selected for fork write-protection
+/// (newly shared and writable). Repeated forks of an unchanged parent must
+/// not select settled pages again; tests assert on deltas of this counter.
+#[cfg(feature = "kernel-test")]
+static FORK_WRITE_PROTECTED_PAGES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_fork_write_protected_pages() -> u64 {
+    FORK_WRITE_PROTECTED_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
 #[cfg(feature = "kernel-test")]
 pub(crate) fn __test_unmap_path_counts() -> (usize, usize) {
     use core::sync::atomic::Ordering;
@@ -9202,71 +9212,60 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe fn rewrite_perms_pages(&self, _regions: &[Region], _cow_readonly: bool) {}
 
-    /// Write-protect only private leaves whose backing became shared in the
-    /// current fork retain batch. The bitmap is aligned with non-zero physical
-    /// entries in private regions, in ordered region/page order.
+    /// One fused fork pass over every resident private page: retain the
+    /// child's COW owner and write-protect the parent leaf when this fork's
+    /// retain is the frame's sole→shared transition. Pages already shared
+    /// were made read-only by the fork that first shared them and are
+    /// skipped entirely, so repeated forks never re-touch settled leaves
+    /// (Linux `copy_page_range`'s wrprotect shape); absent lazy leaves need
+    /// no descriptor update. Runs of adjacent newly-shared writable pages
+    /// are protected with one descriptor walk per run, and a broadcast fork
+    /// that restricts more than a small ceiling of pages coalesces remote
+    /// invalidation into one full flush.
     ///
-    /// This is the fork equivalent of Linux's transition-based PTE write
-    /// protection: pages already shared were made read-only by the fork that
-    /// first shared them, while absent lazy leaves need no descriptor update.
-    /// Keeping the parent region lock held around this call makes the refcount
-    /// transition and its page-table restriction one VMA transaction.
+    /// Every retained frame is appended to `cow_frames` in region/page
+    /// order before the pass can fail, so on error the caller rolls back
+    /// exactly that prefix. Keeping the parent region lock held around this
+    /// call makes the refcount transition and its page-table restriction
+    /// one VMA transaction.
     ///
     /// # Safety
-    /// The caller must keep every region and backing frame stable, and `root`
-    /// must be a live identity-reachable page-table root.
+    /// The caller must hold the VMA transaction and the `parent` region
+    /// lock, keep every backing frame stable, and `self.root` must be zero
+    /// (metadata-only address space) or a live identity-reachable
+    /// page-table root.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    unsafe fn write_protect_newly_shared_pages(
+    unsafe fn fork_retain_and_write_protect(
         &self,
-        regions: &[Region],
-        newly_shared: &[bool],
+        parent: &RegionTable,
+        cow_frames: &mut Vec<PhysAddr>,
     ) -> Result<(), AddressSpaceError> {
-        let mut bitmap_index = 0usize;
-        let mut selected_pages = 0u64;
-        for region in regions {
-            if region.perms.contains(RegionPerms::SHARED) {
-                continue;
-            }
-            for phys in &region.phys {
-                if phys.raw() == 0 {
-                    continue;
-                }
-                let selected = *newly_shared
-                    .get(bitmap_index)
-                    .expect("fork COW transition bitmap must cover private backing");
-                bitmap_index += 1;
-                if selected && region.perms.contains(RegionPerms::WRITE) {
-                    selected_pages += 1;
-                }
-            }
-        }
-        assert_eq!(
-            bitmap_index,
-            newly_shared.len(),
-            "fork COW transition bitmap must match private backing"
-        );
-        if self.root.as_u64() == 0 || selected_pages == 0 {
-            return Ok(());
-        }
+        let mut retain = crate::frame::cow::begin_fork_retain();
+        let root_live = self.root.as_u64() != 0;
 
         #[cfg(target_arch = "x86_64")]
         const FULL_FLUSH_PAGE_CEILING: u64 = 512;
         #[cfg(target_arch = "x86_64")]
         let broadcast = self.is_vm_shared();
         #[cfg(target_arch = "x86_64")]
-        let use_full_remote_flush = broadcast && selected_pages > FULL_FLUSH_PAGE_CEILING;
-        #[cfg(target_arch = "x86_64")]
         let mut changed_pages = 0u64;
         #[cfg(target_arch = "x86_64")]
         let mut protect_run = |base: VirtAddr, pages: u64| {
+            #[cfg(feature = "kernel-test")]
+            FORK_WRITE_PROTECTED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+            if !root_live {
+                return Ok(());
+            }
             // SAFETY: the run is inside stable, ordinary Region backing and
-            // the caller supplied a live root.
+            // `self.root` is live.
             let changed = unsafe {
                 crate::x86_64::paging::write_protect_4kb_range_existing(self.root, base, pages)
             }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
             changed_pages += changed;
-            if broadcast && !use_full_remote_flush && changed != 0 {
+            // Per-run remote invalidation up to the ceiling; past it, the
+            // single full flush after the walk covers every restricted leaf.
+            if broadcast && changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
                 crate::tlb_shootdown::shootdown_remote(
                     crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
                 );
@@ -9275,6 +9274,11 @@ impl AddressSpace {
         };
         #[cfg(target_arch = "aarch64")]
         let protect_run = |base: VirtAddr, pages: u64| {
+            #[cfg(feature = "kernel-test")]
+            FORK_WRITE_PROTECTED_PAGES.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+            if !root_live {
+                return Ok(());
+            }
             // SAFETY: same stable ordinary-region contract. The architecture
             // helper publishes the AP changes and performs inner-shareable
             // invalidation before returning.
@@ -9285,8 +9289,7 @@ impl AddressSpace {
             .map_err(|_| AddressSpaceError::OutOfRange)
         };
 
-        bitmap_index = 0;
-        for region in regions {
+        for region in parent.iter() {
             if region.perms.contains(RegionPerms::SHARED) {
                 continue;
             }
@@ -9296,9 +9299,8 @@ impl AddressSpace {
                 let selected = if phys.raw() == 0 {
                     false
                 } else {
-                    let selected = newly_shared[bitmap_index];
-                    bitmap_index += 1;
-                    selected && writable
+                    cow_frames.push(*phys);
+                    retain.retain(*phys) && writable
                 };
                 if selected {
                     run_start.get_or_insert(page_index);
@@ -9314,10 +9316,9 @@ impl AddressSpace {
                 protect_run(base, pages)?;
             }
         }
-        debug_assert_eq!(bitmap_index, newly_shared.len());
 
         #[cfg(target_arch = "x86_64")]
-        if use_full_remote_flush && changed_pages != 0 {
+        if broadcast && changed_pages > FULL_FLUSH_PAGE_CEILING {
             crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
         }
         Ok(())
@@ -9906,16 +9907,6 @@ impl AddressSpace {
                 // frame-0 reuse — corruption surfacing far away.
                 r.perms = r.perms | RegionPerms::COW;
             });
-            // Group all resident private backing by refcount shard and take
-            // each touched lock once. Keep this inside the region transaction:
-            // moving it below the lock would let munmap free a source before
-            // its child's ownership was retained.
-            let cow_frames: Vec<PhysAddr> = g
-                .iter()
-                .filter(|region| !region.perms.contains(RegionPerms::SHARED))
-                .flat_map(|region| region.phys.iter().copied())
-                .filter(|phys| phys.raw() != 0)
-                .collect();
             let parent_regions = g.snapshot();
             if !fork_child_reserve_failure_injected {
                 child
@@ -9923,17 +9914,19 @@ impl AddressSpace {
                     .lock()
                     .try_reserve_nodes(parent_regions.len())?;
             }
-            let newly_shared = crate::frame::cow::inc_ref_batch(&cow_frames);
-            // Restrict the parent before the child can be returned to the
-            // scheduler. Frames already shared have read-only leaves from the
-            // earlier transition; missing lazy leaves stay missing.
+            // One fused walk retains every resident private frame for the
+            // child and restricts the parent leaves this fork newly shares,
+            // before the child can be returned to the scheduler. Keep it
+            // inside the region transaction: retaining below the lock would
+            // let munmap free a source before the child's ownership was
+            // retained. `cow_frames` receives exactly the retained frames in
+            // region/page order for the rollback paths below.
+            let mut cow_frames: Vec<PhysAddr> = Vec::new();
+            // SAFETY: the VMA transaction and region lock keep metadata
+            // and backing stable, and `self.root` is live by the function
+            // contract.
             if let Err(error) =
-                // SAFETY: the VMA transaction and region lock keep metadata
-                // and backing stable, and `self.root` is live by the function
-                // contract.
-                unsafe {
-                    self.write_protect_newly_shared_pages(&parent_regions, &newly_shared)
-                }
+                unsafe { self.fork_retain_and_write_protect(&g, &mut cow_frames) }
             {
                 crate::frame::cow::rollback_inc_ref_batch(&cow_frames);
                 return Err(error);
