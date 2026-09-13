@@ -4944,6 +4944,149 @@ kernel_test_in!(
     smoke_abi_socket_dgram_scm_rights_fd_passing
 );
 
+/// A CONNECTED AF_UNIX `SOCK_DGRAM` socketpair must carry SCM_RIGHTS on a
+/// `sendmsg` that supplies NO destination address — it delivers over the
+/// pair's crossed rings, not the address registry.
+///
+/// This is the exact shape of systemd's `netns_storage_socket`: for a
+/// `PrivateNetwork=` service the executor `unshare(CLONE_NEWNET)`s, opens
+/// `/proc/self/ns/net`, and `sendmsg`s that fd (SCM_RIGHTS, no `msg_name`)
+/// over a `SOCK_DGRAM` socketpair to stash the netns for reuse. The datagram
+/// SCM_RIGHTS send used to route through the address-registry dispatcher,
+/// which has no destination for a connected pair and returned -ENOTCONN — so
+/// the executor exited EXIT_NETWORK and every locale1/PrivateNetwork service
+/// (and, transitively, the KDE greeter's `kwin_wayland --locale1`) failed to
+/// start. A connected pair must instead take the connected packet sender.
+fn smoke_abi_socket_dgram_socketpair_scm_rights_no_addr() -> TestResult {
+    with_setup(|| {
+        // The transport: a connected SOCK_DGRAM socketpair (sv[0]=tx, sv[1]=rx).
+        let mut sp = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_DGRAM, 0, sp.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("socketpair(AF_UNIX, SOCK_DGRAM) setup failed");
+        }
+        let tx = i32::from_ne_bytes([sp[0], sp[1], sp[2], sp[3]]) as u64;
+        let rx = i32::from_ne_bytes([sp[4], sp[5], sp[6], sp[7]]) as u64;
+
+        // A real, independent descriptor to pass as SCM_RIGHTS data.
+        let mut pass = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, pass.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("passed-fd socketpair setup failed");
+        }
+        let passed_fd = i32::from_ne_bytes([pass[0], pass[1], pass[2], pass[3]]);
+
+        // sendmsg with an SCM_RIGHTS cmsg and NO destination address
+        // (msg_name = NULL, msg_namelen = 0) — the connected-pair case.
+        let payload = b"NETNS";
+        let mut iov = [0u8; 16];
+        iov[0..8].copy_from_slice(&(payload.as_ptr() as u64).to_ne_bytes());
+        iov[8..16].copy_from_slice(&(payload.len() as u64).to_ne_bytes());
+        let mut ctrl = [0u8; 24];
+        ctrl[0..8].copy_from_slice(&(20u64).to_ne_bytes()); // cmsghdr + one fd
+        ctrl[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        ctrl[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        ctrl[16..20].copy_from_slice(&passed_fd.to_ne_bytes());
+        let mut smsg = [0u8; 56];
+        // msg_name (0) + msg_namelen (0) left zero: a connected send.
+        smsg[16..24].copy_from_slice(&(iov.as_ptr() as u64).to_ne_bytes());
+        smsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        smsg[32..40].copy_from_slice(&(ctrl.as_ptr() as u64).to_ne_bytes());
+        smsg[40..48].copy_from_slice(&(ctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketSendMsg.raw(),
+            a2(tx, smsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+        {
+            return Err("connected-socketpair dgram sendmsg(SCM_RIGHTS, no addr) failed");
+        }
+
+        // recvmsg the datagram + its rights on the other half.
+        let mut dst = [0u8; 32];
+        let mut riov = [0u8; 16];
+        riov[0..8].copy_from_slice(&(dst.as_mut_ptr() as u64).to_ne_bytes());
+        riov[8..16].copy_from_slice(&(dst.len() as u64).to_ne_bytes());
+        let mut rctrl = [0u8; 64];
+        let mut rmsg = [0u8; 56];
+        rmsg[16..24].copy_from_slice(&(riov.as_ptr() as u64).to_ne_bytes());
+        rmsg[24..32].copy_from_slice(&1u64.to_ne_bytes());
+        rmsg[32..40].copy_from_slice(&(rctrl.as_mut_ptr() as u64).to_ne_bytes());
+        rmsg[40..48].copy_from_slice(&(rctrl.len() as u64).to_ne_bytes());
+        if call(
+            Syscall::SocketRecvMsg.raw(),
+            a2(rx, rmsg.as_ptr() as u64, 0),
+        ) != Some(payload.len() as i64)
+            || &dst[..payload.len()] != payload
+        {
+            return Err("connected-socketpair dgram recvmsg lost the datagram");
+        }
+        let level = i32::from_ne_bytes(rctrl[8..12].try_into().unwrap());
+        let ctype = i32::from_ne_bytes(rctrl[12..16].try_into().unwrap());
+        if level != SOL_SOCKET as i32 || ctype != SCM_RIGHTS {
+            return Err("connected-socketpair dgram recvmsg lost the SCM_RIGHTS record");
+        }
+        let received_fd = i32::from_ne_bytes(rctrl[16..20].try_into().unwrap());
+        if received_fd < 0 || received_fd as u64 == rx || received_fd as u64 == tx {
+            return Err("connected-socketpair dgram recvmsg did not install a distinct fd");
+        }
+        if call(Syscall::Close.raw(), a0(received_fd as u64)) != Some(0) {
+            return Err("passed fd was not usable by the receiver");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_socketpair_scm_rights_no_addr
+);
+
+/// Companion to the SCM_RIGHTS case: a plain (no ancillary) datagram on a
+/// connected `SOCK_DGRAM` socketpair with no destination address must also
+/// deliver over the crossed rings rather than answering -ENOTCONN. Pins that
+/// the connected-datagram send path is reached for the ordinary case too, not
+/// only when a control message forces the fd-passing branch.
+fn smoke_abi_socket_dgram_socketpair_plain_no_addr() -> TestResult {
+    with_setup(|| {
+        let mut sp = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_DGRAM, 0, sp.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("socketpair(AF_UNIX, SOCK_DGRAM) setup failed");
+        }
+        let tx = i32::from_ne_bytes([sp[0], sp[1], sp[2], sp[3]]) as u64;
+        let rx = i32::from_ne_bytes([sp[4], sp[5], sp[6], sp[7]]) as u64;
+        let msg = b"READY=1";
+        // send(2) with no address on the connected pair.
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(tx, msg.as_ptr() as u64, msg.len() as u64, 0),
+        ) != Some(msg.len() as i64)
+        {
+            return Err("connected-socketpair dgram send(no addr) failed");
+        }
+        let mut dst = [0u8; 16];
+        match call(
+            Syscall::SocketRecv.raw(),
+            a3(rx, dst.as_mut_ptr() as u64, dst.len() as u64, 0),
+        ) {
+            Some(n) if n == msg.len() as i64 && &dst[..msg.len()] == msg => Ok(()),
+            _ => Err("connected-socketpair dgram recv did not get the datagram"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_socketpair_plain_no_addr
+);
+
 /// Closing a duplicated listener fd must not unbind the listener while the
 /// original fd remains open (dbus-broker receives its listener this way).
 fn smoke_abi_socket_dup_listener_close_keeps_binding() -> TestResult {

@@ -158,12 +158,23 @@ pub(super) fn sendmsg_on_socket(
     crate::socket::dbg_dbus_peek("TX", &total);
 
     if !passed_fds.is_empty() {
-        let result =
-            if sock.domain == crate::socket::AF_UNIX && sock.kind == crate::socket::SOCK_DGRAM {
-                sock.unix_dgram_sendmsg(&total, flags, dest, passed_fds)
-            } else {
-                sock.unix_sendmsg(&total, passed_fds)
-            };
+        // A *connected* AF_UNIX datagram socketpair delivers over its crossed
+        // rings, not the address registry — so its SCM_RIGHTS send goes through
+        // `unix_sendmsg` (which frames a datagram record + fds for SOCK_DGRAM),
+        // exactly as `dispatch_op` reroutes the no-fd connected-datagram case.
+        // Only a bound/named datagram (destination via addr or connect) uses
+        // `unix_dgram_sendmsg`. Without this split, systemd's `netns_storage_socket`
+        // (a SOCK_DGRAM socketpair) hit `unix_dgram_sendmsg`'s address dispatcher,
+        // which has no destination for a connected pair and returned -ENOTCONN —
+        // failing every `PrivateNetwork=` service with EXIT_NETWORK.
+        let result = if sock.domain == crate::socket::AF_UNIX
+            && sock.kind == crate::socket::SOCK_DGRAM
+            && !sock.is_unix_connected()
+        {
+            sock.unix_dgram_sendmsg(&total, flags, dest, passed_fds)
+        } else {
+            sock.unix_sendmsg(&total, passed_fds)
+        };
         return match result {
             Ok(n) => SendMsgResult::Sent {
                 written: n,
