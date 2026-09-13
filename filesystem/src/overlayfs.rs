@@ -964,6 +964,10 @@ impl FileOps for OverlayFile {
         Box::pin(async move { self.active().flush().await })
     }
 
+    fn has_flush(&self) -> bool {
+        true
+    }
+
     fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move { self.active().fsync(data_only).await })
     }

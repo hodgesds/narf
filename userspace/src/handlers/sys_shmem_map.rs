@@ -33,7 +33,7 @@ pub(crate) fn sys_shmem_map(ctx: &mut dyn TrapContext) {
     let base = MMAP_CURSOR.fetch_add(len, Ordering::Relaxed);
     let authority = current_mlock_authority();
     let mapped = as_ref.with_vma_transaction(|| {
-        narf_memory::with_shared_mapping_transaction(|| {
+        narf_memory::with_address_space_shared_mapping_transaction(as_ref.identity(), || {
             let mut frames_raw: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
             if !(v.frames)(handle, &mut frames_raw) {
                 return Err(narf_memory::AddressSpaceError::Unmapped);

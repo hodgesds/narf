@@ -1719,6 +1719,95 @@ fn smoke_vfs_longest_prefix_mount_match() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_longest_prefix_mount_match);
 
+/// Warm the single-mount per-CPU cache, then exercise every global mutation
+/// that can change its answer. Nested mounts must also suppress the cached
+/// shortcut when a path is their synthetic ancestor.
+fn smoke_single_mount_cache_tracks_mutations() -> TestResult {
+    const BASE: &str = "/fme-single-cache";
+    const CHILD: &str = "/fme-single-cache/child";
+    const MOVED: &str = "/fme-single-cache-moved";
+
+    let auth = bootstrap_mount_authority();
+    let bottom = match registry().mount(&auth, BASE, MemFs::new("single-cache-bottom")) {
+        Ok(handle) => handle,
+        Err(_) => return TestResult::Fail("bottom cache-test mount failed"),
+    };
+    let warm = registry().resolve_absolute_single_mount("/fme-single-cache/file", |fs, rel, _| {
+        fs.name() == "single-cache-bottom" && rel == "file"
+    }) == Some(true);
+
+    let top = match registry().mount(&auth, BASE, MemFs::new("single-cache-top")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&bottom, BASE);
+            return TestResult::Fail("top cache-test mount failed");
+        }
+    };
+    let overmount_visible =
+        registry().resolve_absolute_single_mount("/fme-single-cache/file", |fs, _, _| {
+            fs.name() == "single-cache-top"
+        }) == Some(true);
+
+    let child = match registry().mount(&auth, CHILD, MemFs::new("single-cache-child")) {
+        Ok(handle) => handle,
+        Err(_) => {
+            let _ = registry().unmount(&top, BASE);
+            let _ = registry().unmount(&bottom, BASE);
+            return TestResult::Fail("nested cache-test mount failed");
+        }
+    };
+    let ancestor_rejected = registry()
+        .resolve_absolute_single_mount(BASE, |_, _, _| ())
+        .is_none();
+    let sibling_visible =
+        registry().resolve_absolute_single_mount("/fme-single-cache/sibling/file", |fs, rel, _| {
+            fs.name() == "single-cache-top" && rel == "sibling/file"
+        }) == Some(true);
+    let child_visible =
+        registry().resolve_absolute_single_mount("/fme-single-cache/child/file", |fs, rel, _| {
+            fs.name() == "single-cache-child" && rel == "file"
+        }) == Some(true);
+
+    let child_unmounted = registry().unmount(&child, CHILD).is_ok();
+    let parent_restored = registry().resolve_absolute_single_mount(BASE, |fs, rel, _| {
+        fs.name() == "single-cache-top" && rel.is_empty()
+    }) == Some(true);
+    let moved = registry().move_mount(&auth, BASE, MOVED).is_ok();
+    let bottom_restored =
+        registry().resolve_absolute_single_mount("/fme-single-cache/file", |fs, _, _| {
+            fs.name() == "single-cache-bottom"
+        }) == Some(true);
+    let moved_visible =
+        registry().resolve_absolute_single_mount("/fme-single-cache-moved/file", |fs, _, _| {
+            fs.name() == "single-cache-top"
+        }) == Some(true);
+
+    let top_unmounted = registry().unmount(&top, MOVED).is_ok();
+    let bottom_unmounted = registry().unmount(&bottom, BASE).is_ok();
+
+    if warm
+        && overmount_visible
+        && ancestor_rejected
+        && sibling_visible
+        && child_visible
+        && child_unmounted
+        && parent_restored
+        && moved
+        && bottom_restored
+        && moved_visible
+        && top_unmounted
+        && bottom_unmounted
+    {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("single-mount cache failed mutation or nested-mount semantics")
+    }
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_single_mount_cache_tracks_mutations
+);
+
 // ── Smoke 13: mount_id_at correctness ────────────────────────────────
 //
 // `mount_id_at` returns the id of the longest-prefix mount covering a

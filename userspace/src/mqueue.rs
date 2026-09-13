@@ -615,6 +615,10 @@ fn sync_inotify_readiness(id: u64) {
 
 static INOTIFY: IrqSafeSpinLock<Option<BTreeMap<u64, InotifyState>>> = IrqSafeSpinLock::new(None);
 static INOTIFY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+/// Set once an inotify instance exists. Like Linux's fsnotify static-key
+/// bypass, this keeps ordinary filesystem mutations off the notification
+/// machinery until a consumer has actually requested it.
+static INOTIFY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
     let mut g = INOTIFY.lock();
@@ -624,29 +628,68 @@ fn with_inotify<R>(f: impl FnOnce(&mut BTreeMap<u64, InotifyState>) -> R) -> R {
 // ── fd → path side table ────────────────────────────────────────────
 // The fd table stores only an `Arc<dyn FileOps>`, so sys_write (which has
 // just an fd) can't recover the file's path to fire IN_MODIFY. We record
-// (task, fd) → absolute path at open and consult it on write; close drops
-// the entry. The path is part of descriptor identity, so every duplication
-// path preserves it as well; *at syscalls also rely on it for directory fds.
+// task → fd-indexed absolute paths at open and consult it on write; close
+// clears the reusable slot. The path is part of descriptor identity, so every
+// duplication path preserves it as well; *at syscalls also rely on it for
+// directory fds. An fd-indexed vector mirrors FdTable: a hot open/close loop
+// reuses slot 3 instead of allocating and freeing a B-tree node every time.
 type FdPathIdentity = (String, Option<u64>);
-static FD_PATHS: IrqSafeSpinLock<Option<BTreeMap<(u64, u32), FdPathIdentity>>> =
-    IrqSafeSpinLock::new(None);
+type FdPathSlots = Vec<Option<FdPathIdentity>>;
+type FdPathTasks = BTreeMap<u64, FdPathSlots>;
+const FD_PATH_SHARDS: usize = 32;
 
-fn with_fd_paths<R>(f: impl FnOnce(&mut BTreeMap<(u64, u32), FdPathIdentity>) -> R) -> R {
-    let mut g = FD_PATHS.lock();
+#[repr(align(64))]
+struct FdPathShard {
+    paths: IrqSafeSpinLock<Option<FdPathTasks>>,
+}
+
+impl FdPathShard {
+    const fn new() -> Self {
+        Self {
+            paths: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static FD_PATHS: [FdPathShard; FD_PATH_SHARDS] = [const { FdPathShard::new() }; FD_PATH_SHARDS];
+
+#[inline]
+fn fd_path_shard(task: u64) -> usize {
+    (task as usize) & (FD_PATH_SHARDS - 1)
+}
+
+fn with_fd_paths<R>(task: u64, f: impl FnOnce(&mut FdPathTasks) -> R) -> R {
+    let mut g = FD_PATHS[fd_path_shard(task)].paths.lock();
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
 /// Record the absolute path an fd was opened on (for later IN_MODIFY).
 pub(crate) fn register_fd_path(task: u64, fd: u32, path: &str, mount_id: Option<u64>) {
-    with_fd_paths(|m| {
-        m.insert((task, fd), (String::from(path), mount_id));
+    register_fd_path_owned(task, fd, String::from(path), mount_id);
+}
+
+/// Owned counterpart for open paths that no longer need their normalized
+/// pathname after registration.
+pub(crate) fn register_fd_path_owned(task: u64, fd: u32, path: String, mount_id: Option<u64>) {
+    with_fd_paths(task, |m| {
+        let slots = m.entry(task).or_default();
+        let index = fd as usize;
+        if slots.len() <= index {
+            slots.resize_with(index + 1, || None);
+        }
+        slots[index] = Some((path, mount_id));
     });
 }
 
 /// Drop an fd → path mapping on close.
 pub(crate) fn forget_fd_path(task: u64, fd: u32) {
-    with_fd_paths(|m| {
-        m.remove(&(task, fd));
+    with_fd_paths(task, |m| {
+        if let Some(slot) = m
+            .get_mut(&task)
+            .and_then(|slots| slots.get_mut(fd as usize))
+        {
+            *slot = None;
+        }
     });
 }
 
@@ -657,18 +700,20 @@ pub(crate) fn forget_fd_path(task: u64, fd: u32) {
 /// retire these rows. Leaving them behind retains one cloned pathname (and
 /// its B-tree entry) per inherited descriptor for every exited thread.
 pub(crate) fn release_task_fd_paths(task: u64) {
-    let mut paths = FD_PATHS.lock();
+    let mut paths = FD_PATHS[fd_path_shard(task)].paths.lock();
     if let Some(paths) = paths.as_mut() {
-        paths.retain(|&(owner, _), _| owner != task);
+        paths.remove(&task);
     }
 }
 
 /// Test-only residue probe for the central task-exit sweep.
 pub(crate) fn task_has_fd_paths(task: u64) -> bool {
-    FD_PATHS
+    FD_PATHS[fd_path_shard(task)]
+        .paths
         .lock()
         .as_ref()
-        .is_some_and(|paths| paths.keys().any(|&(owner, _)| owner == task))
+        .and_then(|paths| paths.get(&task))
+        .is_some_and(|slots| slots.iter().any(Option::is_some))
 }
 
 /// Duplicate (or replace) a descriptor's pathname identity.
@@ -676,11 +721,23 @@ pub(crate) fn task_has_fd_paths(task: u64) -> bool {
 /// `dup2`/`dup3` may replace an existing destination, so an untracked source
 /// must explicitly clear any former identity at the destination.
 pub(crate) fn duplicate_fd_path(task: u64, source_fd: u32, destination_fd: u32) {
-    with_fd_paths(|m| {
-        if let Some(identity) = m.get(&(task, source_fd)).cloned() {
-            m.insert((task, destination_fd), identity);
-        } else {
-            m.remove(&(task, destination_fd));
+    with_fd_paths(task, |m| {
+        let identity = m
+            .get(&task)
+            .and_then(|slots| slots.get(source_fd as usize))
+            .and_then(Clone::clone);
+        if let Some(identity) = identity {
+            let slots = m.entry(task).or_default();
+            let index = destination_fd as usize;
+            if slots.len() <= index {
+                slots.resize_with(index + 1, || None);
+            }
+            slots[index] = Some(identity);
+        } else if let Some(slot) = m
+            .get_mut(&task)
+            .and_then(|slots| slots.get_mut(destination_fd as usize))
+        {
+            *slot = None;
         }
     });
 }
@@ -688,12 +745,22 @@ pub(crate) fn duplicate_fd_path(task: u64, source_fd: u32, destination_fd: u32) 
 /// Look up the absolute path an fd was opened on, if recorded. Used by
 /// `landlock_add_rule` to turn a `parent_fd` back into a path.
 pub(crate) fn fd_path(task: u64, fd: u32) -> Option<String> {
-    with_fd_paths(|m| m.get(&(task, fd)).map(|(path, _)| path.clone()))
+    with_fd_paths(task, |m| {
+        m.get(&task)
+            .and_then(|slots| slots.get(fd as usize))
+            .and_then(|slot| slot.as_ref())
+            .map(|(path, _)| path.clone())
+    })
 }
 
 /// Mount that was visible when `fd` was opened.
 pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
-    with_fd_paths(|m| m.get(&(task, fd)).and_then(|(_, id)| *id))
+    with_fd_paths(task, |m| {
+        m.get(&task)
+            .and_then(|slots| slots.get(fd as usize))
+            .and_then(|slot| slot.as_ref())
+            .and_then(|(_, id)| *id)
+    })
 }
 
 /// Copy fd-path identities along with the descriptor table during fork/clone.
@@ -702,16 +769,12 @@ pub(crate) fn fd_mount_id(task: u64, fd: u32) -> Option<u64> {
 /// calling task.  Without this, a forked systemd mount helper inherited a
 /// valid O_PATH parent fd but `mkdirat(parent_fd, ...)` saw EBADF.
 pub(crate) fn fork_fd_paths(parent: u64, child: u64) {
-    let inherited: Vec<(u32, FdPathIdentity)> = with_fd_paths(|m| {
-        m.iter()
-            .filter(|&(&(task, _), _)| task == parent)
-            .map(|(&(_, fd), identity)| (fd, identity.clone()))
-            .collect()
-    });
-    with_fd_paths(|m| {
-        m.retain(|&(task, _), _| task != child);
-        for (fd, identity) in inherited {
-            m.insert((child, fd), identity);
+    let inherited = with_fd_paths(parent, |m| m.get(&parent).cloned());
+    with_fd_paths(child, |m| {
+        if let Some(slots) = inherited {
+            m.insert(child, slots);
+        } else {
+            m.remove(&child);
         }
     });
 }
@@ -751,6 +814,9 @@ fn serialize_event(wd: i32, mask: u32, cookie: u32, name: &str) -> Vec<u8> {
 /// (MODIFY/CLOSE_WRITE/OPEN/MOVED/CREATE/DELETE) are numerically identical
 /// between the two ABIs, so one `mask` drives both.
 fn fs_notify(abs_path: &str, mask: u32, is_dir: bool) {
+    if !fs_notify_active() {
+        return;
+    }
     inotify_dispatch(abs_path, mask, is_dir);
     fanotify_dispatch(abs_path, mask as u64);
     // Filesystem event fds participate in poll/epoll. Publishing after both
@@ -840,6 +906,9 @@ pub(crate) fn notify_attrib(abs_path: &str, is_dir: bool) {
 /// IN_ATTRIB for the file behind `fd` (fchmod/fchown/futimens), looked up
 /// via the fd → path table.
 pub(crate) fn notify_attrib_fd(task: u64, fd: u32) {
+    if !fs_notify_active() {
+        return;
+    }
     let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_ATTRIB, false);
@@ -854,16 +923,26 @@ pub fn notify_modify_path(abs_path: &str) {
 
 /// IN_MODIFY for the file behind `fd`, looked up via the fd → path table.
 pub(crate) fn notify_modify_fd(task: u64, fd: u32) {
+    if !fs_notify_active() {
+        return;
+    }
     let path = fd_path(task, fd);
     if let Some(p) = path {
         fs_notify(&p, IN_MODIFY, false);
     }
 }
 
-/// IN_CLOSE_WRITE for the file behind `fd`.
-pub(crate) fn notify_close_fd(task: u64, fd: u32) {
-    if let Some(handle_id) = queue_id_of(task, fd) {
+/// Release an mqueue notification and emit IN_CLOSE_WRITE for `fd`.
+///
+/// `sys_close` removes the descriptor before running close hooks, matching
+/// Linux's close ordering.  Carry the mqueue handle from the retained file
+/// object instead of looking the now-closed descriptor up again.
+pub(crate) fn notify_close_fd(task: u64, fd: u32, queue_id: Option<u64>) {
+    if let Some(handle_id) = queue_id {
         mqueuefs::close_notification(handle_id, task);
+    }
+    if !fs_notify_active() {
+        return;
     }
     let path = fd_path(task, fd);
     if let Some(p) = path {
@@ -1092,6 +1171,10 @@ pub fn sys_inotify_init_no_flags(ctx: &mut dyn TrapContext) {
 
 fn inotify_init_common(ctx: &mut dyn TrapContext, flags: u64) {
     let id = INOTIFY_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    // Publish the slow-path gate before the instance can become visible via
+    // its fd. A concurrent mutation may see an empty registry in this small
+    // window, but no userspace observer can yet own the unpublished fd.
+    INOTIFY_ACTIVE.store(true, Ordering::Release);
     with_inotify(|m| {
         m.insert(
             id,
@@ -1230,6 +1313,11 @@ static FANOTIFY_NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Set once any fanotify group exists; lets the fs_notify dispatch and
 /// sys_read skip fanotify work entirely on the common path.
 static FANOTIFY_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[inline]
+fn fs_notify_active() -> bool {
+    INOTIFY_ACTIVE.load(Ordering::Acquire) || FANOTIFY_ACTIVE.load(Ordering::Acquire)
+}
 
 fn with_fanotify<R>(f: impl FnOnce(&mut BTreeMap<u64, FanGroup>) -> R) -> R {
     let mut g = FANOTIFY.lock();

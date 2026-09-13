@@ -75,31 +75,24 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             // it signals only processes visible there. Without the ns filter a
             // containerized kill(-1) broadcasts to the entire host.
             let self_tid = current_task_id();
-            let targets: alloc::vec::Vec<(u64, u64)> = {
-                let g = PID_TO_TASK.lock();
-                g.as_ref()
-                    .map(|m| {
-                        m.iter()
-                            .filter(|&(&p, &t)| {
-                                if t == self_tid {
-                                    return false;
-                                }
-                                #[cfg(feature = "container")]
-                                {
-                                    // Visible in the caller's ns and not init.
-                                    crate::pid_ns::ns_visible_inner(self_tid, p)
-                                        .is_some_and(|inner| inner > 1)
-                                }
-                                #[cfg(not(feature = "container"))]
-                                {
-                                    p != 1
-                                }
-                            })
-                            .map(|(&p, &t)| (p, t))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
+            let targets: alloc::vec::Vec<(u64, u64)> = pid_task_snapshot()
+                .into_iter()
+                .filter(|&(process, task)| {
+                    if task == self_tid {
+                        return false;
+                    }
+                    #[cfg(feature = "container")]
+                    {
+                        // Visible in the caller's ns and not init.
+                        crate::pid_ns::ns_visible_inner(self_tid, process)
+                            .is_some_and(|inner| inner > 1)
+                    }
+                    #[cfg(not(feature = "container"))]
+                    {
+                        process != 1
+                    }
+                })
+                .collect();
             let mut any = false;
             for (p, _t) in targets {
                 if signum == 0 {

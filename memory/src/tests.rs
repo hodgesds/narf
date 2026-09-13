@@ -11786,6 +11786,35 @@ fn smoke_mempolicy_allowed_mask_is_hard_boundary() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_mempolicy_allowed_mask_is_hard_boundary);
 
+fn smoke_mempolicy_active_default_sentinel_round_trip() -> TestResult {
+    let custom = crate::Mempolicy {
+        mode: crate::MPOL_PREFERRED,
+        nodemask: 0b10,
+        allowed: 0b11,
+        home_node: 1,
+        interleave_index: 7,
+    };
+    crate::mempolicy_set(custom);
+    if crate::mempolicy_active() != custom {
+        crate::mempolicy_clear();
+        return TestResult::Fail("active mempolicy lost custom side fields");
+    }
+    crate::mempolicy_clear();
+    if crate::mempolicy_active() != crate::Mempolicy::DEFAULT {
+        return TestResult::Fail("cleared mempolicy retained custom side fields");
+    }
+
+    crate::mempolicy_set(custom);
+    crate::mempolicy_set(crate::Mempolicy::DEFAULT);
+    if crate::mempolicy_active() != crate::Mempolicy::DEFAULT {
+        crate::mempolicy_clear();
+        return TestResult::Fail("default publication did not restore sentinel policy");
+    }
+    crate::mempolicy_clear();
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_mempolicy_active_default_sentinel_round_trip);
+
 #[cfg(target_arch = "x86_64")]
 fn smoke_shared_frame_replacement_updates_all_aliases() -> TestResult {
     use crate::x86_64::paging;
@@ -13965,6 +13994,80 @@ fn smoke_memory_shared_mremap_lock_exempt_eligibility() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_memory_shared_mremap_lock_exempt_eligibility);
+
+/// Untouched FILE_DEMAND VMAs keep no per-page backing allocation. Shared
+/// alias and relocation must preserve that sparse tail, including an
+/// unmaterialized suffix after moving a contained interval.
+fn smoke_memory_file_demand_sparse_shared_remap() -> TestResult {
+    use crate::{AddressSpace, MremapLimits, Region, RegionPerms, SharedMremapMode, VirtAddr};
+
+    let address_space = AddressSpace::empty();
+    let source = VirtAddr::new(0x0000_4080_2680_0000);
+    let alias = VirtAddr::new(0x0000_4080_2690_0000);
+    let destination = VirtAddr::new(0x0000_4080_26a0_0000);
+    let perms = RegionPerms::READ
+        | RegionPerms::WRITE
+        | RegionPerms::SHARED
+        | RegionPerms::FILE_DEMAND
+        | RegionPerms::LOCK_EXEMPT;
+    if address_space
+        .map_region(Region {
+            base: source,
+            len: 0x4000,
+            perms,
+            phys: alloc::vec::Vec::new(),
+        })
+        .is_err()
+    {
+        return TestResult::Fail("sparse FILE_DEMAND setup failed");
+    }
+
+    // SAFETY: AddressSpace::empty has no hardware root; the wrapper supplies
+    // the VMA and per-address-space shared transactions.
+    let aliased = unsafe {
+        address_space.alias_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x2000),
+            0x1000,
+            alias,
+            SharedMremapMode::Duplicate,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    if aliased.is_err()
+        || address_space
+            .lookup(alias)
+            .is_none_or(|region| region.len != 0x1000 || !region.phys.is_empty())
+    {
+        return TestResult::Fail("shared alias materialized an untouched file VMA");
+    }
+
+    // SAFETY: same metadata-only transaction contract. The selected middle
+    // leaves both an unmaterialized head and suffix at the source.
+    let moved = unsafe {
+        address_space.relocate_shared_region_limited(
+            VirtAddr::new(source.as_u64() + 0x1000),
+            0x2000,
+            destination,
+            0x3000,
+            MremapLimits::UNLIMITED,
+        )
+    };
+    let head = address_space
+        .lookup(source)
+        .is_some_and(|region| region.len == 0x1000 && region.phys.is_empty());
+    let suffix = address_space
+        .lookup(VirtAddr::new(source.as_u64() + 0x3000))
+        .is_some_and(|region| region.len == 0x1000 && region.phys.is_empty());
+    let destination_sparse = address_space
+        .lookup(destination)
+        .is_some_and(|region| region.len == 0x3000 && region.phys.is_empty());
+    if moved.is_ok() && head && suffix && destination_sparse {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("shared relocation lost sparse file topology")
+    }
+}
+kernel_test_in!("memory", smoke_memory_file_demand_sparse_shared_remap);
 
 /// Duplicate preflight preserves a fixed target, while DONTUNMAP deliberately
 /// performs full AS admission after target retirement and reports that state.

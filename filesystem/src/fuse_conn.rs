@@ -1458,6 +1458,10 @@ impl FileOps for FuseFile {
         })
     }
 
+    fn has_flush(&self) -> bool {
+        true
+    }
+
     fn fsync<'a>(&'a self, data_only: bool) -> FsFuture<'a, ()> {
         Box::pin(async move {
             let fh = self.ensure_open().await?;

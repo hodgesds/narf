@@ -32,10 +32,9 @@ use super::*;
 /// primitive keeps the two overlapping-unmap paths identical, and it already
 /// reports Ok for a range that contains no VMA at all — Linux's "return 0".
 ///
-/// Returns the rounded length on success, or the POSIX-positive errno.
-fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u64, i64> {
+/// Returns the page-aligned range on success, or the POSIX-positive errno.
+fn validate_munmap_range(base: u64, requested_len: u64) -> Result<(VirtAddr, u64), i64> {
     const EINVAL: i64 = 22;
-    const ENOMEM: i64 = 12;
     if base & 0xFFF != 0 || requested_len == 0 {
         return Err(EINVAL);
     }
@@ -48,12 +47,34 @@ fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u
     if end > AddressSpace::USER_HALF_END {
         return Err(EINVAL);
     }
+    Ok((VirtAddr::new(base), len))
+}
+
+/// Transaction-held teardown for the Linux syscall path. File mapping owners
+/// are prepared before the destructive address-space update and retired before
+/// the VMA transaction is released, matching Linux's VMA close ordering.
+fn munmap_current_locked(
+    as_ref: &AddressSpace,
+    base: VirtAddr,
+    len: u64,
+) -> Result<(), i64> {
+    const ENOMEM: i64 = 12;
+    crate::mapped_file::publish_current_punch(as_ref.identity(), base.as_u64(), len, || {
+        // SAFETY: every caller holds `as_ref.with_vma_transaction()`.
+        unsafe { as_ref.punch_fixed_locked_for_syscall(base, len) }
+    })
+    .map_err(|_| ENOMEM)
+}
+
+/// Returns the rounded length on success, or the POSIX-positive errno.
+#[cfg(target_arch = "x86_64")]
+fn munmap_core(as_ref: &AddressSpace, base: u64, requested_len: u64) -> Result<u64, i64> {
+    const ENOMEM: i64 = 12;
+    let (base, len) = validate_munmap_range(base, requested_len)?;
     // Everything past here is the teardown transaction, not the arguments:
     // an allocation failure while splitting, or a backing shape NARF cannot
     // split yet, is a resource failure and must not masquerade as EINVAL.
-    as_ref
-        .punch_fixed(VirtAddr::new(base), len)
-        .map_err(|_| ENOMEM)?;
+    as_ref.punch_fixed(base, len).map_err(|_| ENOMEM)?;
     Ok(len)
 }
 
@@ -81,26 +102,53 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    let (base, len) = match validate_munmap_range(args.arg0, args.arg1) {
+        Ok(range) => range,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+
+    // Linux reaches SysV accounting only through `shm_vm_ops.close`. Inspect
+    // the affected VMA range while holding the same per-mm transaction used by
+    // the punch. If no SysV VMA overlaps, a first shmat cannot publish one
+    // until this unmap releases the transaction, so the global SysV owner and
+    // attachment registries are unnecessary.
+    let fast_result = as_ref.with_vma_transaction(|| {
+        // SAFETY: the enclosing closure holds the VMA transaction through the
+        // classification and, on the fast path, the structural punch.
+        if unsafe {
+            as_ref.range_intersects_perms_locked(base, len, RegionPerms::SYSV_SHM)
+        } {
+            None
+        } else {
+            Some(munmap_current_locked(&as_ref, base, len))
+        }
+    });
+    if let Some(result) = fast_result {
+        ctx.set_return(match result {
+            Ok(()) => SyscallReturn::ok(0),
+            Err(errno) => SyscallReturn::ok((-errno) as u64),
+        });
+        return;
+    }
+
     let task = current_task_id();
     let lpid = task_to_pid_raw(task).unwrap_or(task);
     let as_key = shm_as_key(&as_ref);
     shm_register_as_owner(as_key, lpid);
     let shm_transaction = shm_mapping_transaction(as_key);
     let _shm_guard = shm_transaction.lock();
-    match munmap_core(&as_ref, args.arg0, args.arg1) {
-        Ok(len) => {
-            // Ordered after the unmap, and that order is load-bearing: this
-            // call may drop the mapping's last `Arc<dyn FileOps>`, which for
-            // a demand-paged file (a BPF arena) can free its backing frames.
-            // Releasing it before the address-space punch would expose those
-            // freed frames through live PTEs.  The range form mirrors the VMA
-            // split so surviving prefix/suffix owners retain their reference.
-            crate::mapped_file::punch_current(args.arg0, len);
-            {
-                shm_record_fixed_punch(as_key, args.arg0, args.arg0 + len, lpid);
-            }
-            ctx.set_return(SyscallReturn::ok(0));
-        }
+    let result: Result<(), i64> = as_ref.with_vma_transaction(|| {
+        munmap_current_locked(&as_ref, base, len)?;
+        // Keep SysV close accounting in the same VMA transaction as the
+        // teardown, equivalent to Linux invoking a SysV VMA's close hook.
+        shm_record_fixed_punch(as_key, base.as_u64(), base.as_u64() + len, lpid);
+        Ok(())
+    });
+    match result {
+        Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // EINVAL for a malformed range, ENOMEM when the teardown itself
         // could not be completed.
         Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),

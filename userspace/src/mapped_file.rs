@@ -16,7 +16,7 @@
 //! `memory/src/bpf_arena.rs`'s `Arena::drop` names the test that pins it.
 
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use narf_filesystem::{FileOps, MmapLifetime};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -25,7 +25,28 @@ use narf_memory::{AddressSpaceError, MappingReceipt, PhysAddr};
 #[derive(Clone)]
 struct FileWriteback {
     offset: u64,
+    /// Materialized prefix of this VMA. Missing tail entries are unfaulted,
+    /// exactly like the corresponding FILE_DEMAND Region backing.
     phys: Vec<PhysAddr>,
+}
+
+fn clone_writeback_window(
+    source: &[PhysAddr],
+    first: usize,
+    pages: usize,
+) -> Result<Vec<PhysAddr>, AddressSpaceError> {
+    let requested_end = first
+        .checked_add(pages)
+        .ok_or(AddressSpaceError::AllocationFailed)?;
+    let materialized_end = requested_end.min(source.len());
+    let slice = source
+        .get(first.min(materialized_end)..materialized_end)
+        .ok_or(AddressSpaceError::Unmapped)?;
+    let mut phys = Vec::new();
+    phys.try_reserve_exact(slice.len())
+        .map_err(|_| AddressSpaceError::AllocationFailed)?;
+    phys.extend_from_slice(slice);
+    Ok(phys)
 }
 
 struct MappingOwner {
@@ -49,23 +70,46 @@ struct MappingOwner {
 
 type MappingOwners = Arc<IrqSafeSpinLock<Vec<MappingOwner>>>;
 
-/// The global index is held only long enough to resolve one address-space
-/// bucket. Publication and faults serialize on that address space's lock, so
-/// a slow MAP_FIXED teardown cannot block unrelated processes system-wide.
-static MAPPING_OWNER_BUCKETS: IrqSafeSpinLock<BTreeMap<u64, MappingOwners>> =
-    IrqSafeSpinLock::new(BTreeMap::new());
+/// The top-level index is sharded by address-space incarnation. Publication
+/// and faults then serialize only on that address space's payload lock; an
+/// unrelated process normally neither shares the index lock nor its cache
+/// line. Fork snapshots and drops one source bucket before resolving the
+/// destination, so no operation holds two shards at once.
+const MAPPING_OWNER_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct MappingOwnerShard {
+    buckets: IrqSafeSpinLock<BTreeMap<u64, MappingOwners>>,
+}
+
+impl MappingOwnerShard {
+    const fn new() -> Self {
+        Self {
+            buckets: IrqSafeSpinLock::new(BTreeMap::new()),
+        }
+    }
+}
+
+static MAPPING_OWNER_BUCKETS: [MappingOwnerShard; MAPPING_OWNER_SHARDS] =
+    [const { MappingOwnerShard::new() }; MAPPING_OWNER_SHARDS];
+
+#[inline]
+fn mapping_owner_shard(address_space_id: u64) -> &'static MappingOwnerShard {
+    &MAPPING_OWNER_BUCKETS[address_space_id as usize & (MAPPING_OWNER_SHARDS - 1)]
+}
 
 fn mapping_owners(address_space_id: u64) -> MappingOwners {
     if let Some(existing) = existing_mapping_owners(address_space_id) {
         return existing;
     }
     let candidate = Arc::new(IrqSafeSpinLock::new(Vec::new()));
-    let mut buckets = MAPPING_OWNER_BUCKETS.lock();
+    let mut buckets = mapping_owner_shard(address_space_id).buckets.lock();
     Arc::clone(buckets.entry(address_space_id).or_insert_with(|| candidate))
 }
 
 fn existing_mapping_owners(address_space_id: u64) -> Option<MappingOwners> {
-    MAPPING_OWNER_BUCKETS
+    mapping_owner_shard(address_space_id)
+        .buckets
         .lock()
         .get(&address_space_id)
         .map(Arc::clone)
@@ -75,7 +119,10 @@ pub(crate) fn drop_address_space(address_space_id: u64) {
     // Drop the bucket (and therefore FileOps/MmapLifetime references) after
     // releasing the global index: destructors may allocate or take arbitrary
     // filesystem locks.
-    let retired = MAPPING_OWNER_BUCKETS.lock().remove(&address_space_id);
+    let retired = mapping_owner_shard(address_space_id)
+        .buckets
+        .lock()
+        .remove(&address_space_id);
     drop(retired);
 }
 
@@ -98,6 +145,7 @@ pub(crate) struct MappingOwnerRegistration {
 }
 
 pub(crate) fn publish_current_mapping(
+    address_space_id: u64,
     registration: MappingOwnerRegistration,
     publish: impl FnOnce() -> Result<MappingReceipt, AddressSpaceError>,
     finish: impl FnOnce(MappingReceipt) -> Result<(), AddressSpaceError>,
@@ -111,7 +159,6 @@ pub(crate) fn publish_current_mapping(
         writeback_phys,
         replace,
     } = registration;
-    let address_space_id = current_address_space_id().ok_or(AddressSpaceError::Unmapped)?;
     let owner_bucket = mapping_owners(address_space_id);
     let mut owners = owner_bucket.lock();
     let receipt = publish()?;
@@ -144,13 +191,13 @@ pub(crate) fn publish_current_mapping(
 /// Publish a VMA which has no new file owner while atomically retiring any
 /// file owners covered by a successful `MAP_FIXED` replacement.
 pub(crate) fn publish_current_unowned_mapping<T: Copy>(
+    address_space_id: u64,
     base: u64,
     len: u64,
     replace: bool,
     publish: impl FnOnce() -> Result<T, AddressSpaceError>,
     finish: impl FnOnce(T) -> Result<(), AddressSpaceError>,
 ) -> Result<T, AddressSpaceError> {
-    let address_space_id = current_address_space_id().ok_or(AddressSpaceError::Unmapped)?;
     // Anonymous address spaces normally have no file mappings. The caller's
     // VMA transaction prevents a file-backed mapping from being published
     // while we classify this operation, so an absent bucket is a stable fact
@@ -520,13 +567,11 @@ fn publish_owner_alias<T>(
 /// Publish a transaction-held unmap and retire overlapping file-owner rows
 /// before the caller releases the VMA transaction.
 pub(crate) fn publish_current_punch(
+    address_space_id: u64,
     base: u64,
     len: u64,
     publish: impl FnOnce() -> Result<(), AddressSpaceError>,
 ) -> Result<(), AddressSpaceError> {
-    let Some(address_space_id) = current_address_space_id() else {
-        return publish();
-    };
     let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
         return publish();
     };
@@ -545,7 +590,9 @@ pub(crate) fn publish_current_punch(
 /// overlapping mappings diverge and the last writeback can overwrite a newer
 /// change through the other mapping.
 struct SharedFilePage {
-    ops: Arc<dyn FileOps>,
+    /// Weak to avoid making the global cache keep an unlinked inode alive.
+    /// Every active mapping independently owns a strong FileOps reference.
+    ops: Weak<dyn FileOps>,
     offset: u64,
     phys: PhysAddr,
     mappings: usize,
@@ -553,6 +600,9 @@ struct SharedFilePage {
     /// committed a VMA reference or aborted. Reclaim requires both counters
     /// to reach zero.
     pending: usize,
+    /// `Some` opts this page into bounded retention after its final unmap.
+    /// It must still match `FileOps::mmap_cache_generation` before reuse.
+    cache_generation: Option<u64>,
     /// Exact bytes last read from, or successfully written to, the backing
     /// file. Generic mappings cannot rely on hardware dirty bits here, so an
     /// exact snapshot lets fsync skip clean pages without risking a hash
@@ -580,15 +630,16 @@ impl SharedFilePages {
     }
 
     fn key(ops: &Arc<dyn FileOps>, offset: u64) -> SharedFileKey {
-        SharedFileKey {
-            file: Arc::as_ptr(ops) as *const () as usize,
-            offset,
-        }
+        Self::key_from_ptr(Arc::as_ptr(ops) as *const () as usize, offset)
+    }
+
+    fn key_from_ptr(file: usize, offset: u64) -> SharedFileKey {
+        SharedFileKey { file, offset }
     }
 
     fn remove_phys(&mut self, phys: u64) -> Option<SharedFilePage> {
         let page = self.by_phys.remove(&phys)?;
-        let key = Self::key(&page.ops, page.offset);
+        let key = Self::key_from_ptr(Weak::as_ptr(&page.ops) as *const () as usize, page.offset);
         assert_eq!(
             self.by_file.remove(&key),
             Some(phys),
@@ -601,12 +652,96 @@ impl SharedFilePages {
 static SHARED_FILE_PAGES: IrqSafeSpinLock<SharedFilePages> =
     IrqSafeSpinLock::new(SharedFilePages::new());
 
+/// Clean idle pages retained between mappings. Dirty pages remain cached
+/// until an explicit writeback makes them reclaimable; dropping them would
+/// lose MAP_SHARED writes. Linux makes the same distinction in its page cache.
+const MAX_RETAINED_SHARED_FILE_PAGES: usize = 1024;
+
+fn shared_page_matches_ops(page: &SharedFilePage, ops: &Arc<dyn FileOps>) -> bool {
+    page.ops
+        .upgrade()
+        .is_some_and(|owner| Arc::ptr_eq(&owner, ops))
+}
+
+fn retain_pending_shared_page(page: &mut SharedFilePage) {
+    page.pending = page
+        .pending
+        .checked_add(1)
+        .expect("shared-file pending hold overflow");
+}
+
+fn shared_page_is_clean(page: &SharedFilePage) -> bool {
+    // SAFETY: the cache entry owns `phys` while this function is called under
+    // SHARED_FILE_PAGES. No final mapping release can free it concurrently.
+    let current = unsafe { core::slice::from_raw_parts(page.phys.kernel_ptr::<u8>(), 4096) };
+    page.clean.as_slice() == current
+}
+
+fn should_retire_idle_shared_page(page: &SharedFilePage, cache_len: usize) -> bool {
+    if page.ops.upgrade().is_none() || page.cache_generation.is_none() {
+        return true;
+    }
+    cache_len > MAX_RETAINED_SHARED_FILE_PAGES && shared_page_is_clean(page)
+}
+
 /// Consumable reservation for the canonical pages selected by one mmap
 /// attempt. Drop is abort. A successful VMA publication calls [`Self::commit`]
 /// after memory's SHARED retain hooks have recorded committed mappings.
 pub(crate) struct SharedFilePublication {
     phys: Vec<PhysAddr>,
     active: bool,
+}
+
+/// Reuse a complete generation-valid run of generic shared-file pages.
+/// Pending holds close the gap between this lookup and VMA publication.
+pub(crate) fn reserve_cached_shared_file_pages(
+    ops: &Arc<dyn FileOps>,
+    offset: u64,
+    count: usize,
+) -> Option<(Vec<PhysAddr>, SharedFilePublication)> {
+    let generation = ops.mmap_cache_generation()?;
+    let mut canonical = Vec::new();
+    canonical.try_reserve_exact(count).ok()?;
+    {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        for index in 0..count {
+            let page_offset = offset.checked_add(index as u64 * 4096)?;
+            let key = SharedFilePages::key(ops, page_offset);
+            let phys = *pages.by_file.get(&key)?;
+            let page = pages.by_phys.get(&phys)?;
+            if !shared_page_matches_ops(page, ops)
+                || (page.mappings == 0
+                    && page.pending == 0
+                    && page.cache_generation != Some(generation))
+            {
+                return None;
+            }
+            canonical.push(PhysAddr::new(phys));
+        }
+        for phys in &canonical {
+            let page = pages
+                .by_phys
+                .get_mut(&phys.raw())
+                .expect("validated shared-file page disappeared under cache lock");
+            retain_pending_shared_page(page);
+        }
+    }
+    let publication = SharedFilePublication {
+        phys: canonical.clone(),
+        active: true,
+    };
+    if ops.mmap_cache_generation() != Some(generation) {
+        let mut pages = SHARED_FILE_PAGES.lock();
+        for phys in &canonical {
+            if let Some(page) = pages.by_phys.get_mut(&phys.raw()) {
+                page.cache_generation = None;
+            }
+        }
+        drop(pages);
+        drop(publication);
+        return None;
+    }
+    Some((canonical, publication))
 }
 
 impl SharedFilePublication {
@@ -624,13 +759,19 @@ impl SharedFilePublication {
         {
             let mut pages = SHARED_FILE_PAGES.lock();
             for phys in &self.phys {
-                let page = pages
-                    .by_phys
-                    .get_mut(&phys.raw())
-                    .expect("pending shared-file publication lost its canonical page");
-                assert!(page.pending != 0, "shared-file pending hold underflow");
-                page.pending -= 1;
-                if page.mappings == 0 && page.pending == 0 {
+                let cache_len = pages.by_phys.len();
+                let retire = {
+                    let page = pages
+                        .by_phys
+                        .get_mut(&phys.raw())
+                        .expect("pending shared-file publication lost its canonical page");
+                    assert!(page.pending != 0, "shared-file pending hold underflow");
+                    page.pending -= 1;
+                    page.mappings == 0
+                        && page.pending == 0
+                        && should_retire_idle_shared_page(page, cache_len)
+                };
+                if retire {
                     let retired = pages
                         .remove_phys(phys.raw())
                         .expect("unreferenced shared-file page disappeared");
@@ -673,7 +814,7 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
     let address_space_id = current_address_space_id()?;
     let owner_bucket = existing_mapping_owners(address_space_id)?;
-    let (offset, ops) = {
+    let (offset, ops, generic_fallback) = {
         let owners = owner_bucket.lock();
         let owner = owners.iter().find(|mapping| {
             page >= mapping.base && page < mapping.base.saturating_add(mapping.len)
@@ -681,9 +822,72 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
         (
             owner.file_offset.checked_add(page - owner.base)?,
             Arc::clone(&owner.ops),
+            owner.writeback.is_some(),
         )
     };
-    ops.mmap_fault(offset).ok()
+    if !generic_fallback {
+        return ops.mmap_fault(offset).ok();
+    }
+
+    // Linux filemap_fault first looks in the inode page cache, then reads a
+    // missing folio. The pending publication pins this canonical fallback
+    // page while the mapping owner is revalidated after filesystem I/O.
+    if offset >= ops.stat().size {
+        return None;
+    }
+    let expected_generation = ops.mmap_cache_generation();
+    let (phys, publication) = if let Some((phys, publication)) =
+        reserve_cached_shared_file_pages(&ops, offset, 1)
+    {
+        (*phys.first()?, publication)
+    } else {
+        let candidates = crate::handlers::load_file_mapping_pages(&ops, offset, 4096, 1).ok()?;
+        let (phys, publication) =
+            publish_shared_file_pages(&ops, offset, candidates, expected_generation);
+        (*phys.first()?, publication)
+    };
+    if !retain_shared_file_page(phys.raw()) {
+        drop(publication);
+        return None;
+    }
+    publication.commit();
+
+    let registered = {
+        let mut owners = owner_bucket.lock();
+        owners
+            .iter_mut()
+            .find(|mapping| {
+                page >= mapping.base
+                    && page < mapping.base.saturating_add(mapping.len)
+                    && Arc::ptr_eq(&mapping.ops, &ops)
+                    && mapping.file_offset.checked_add(page - mapping.base) == Some(offset)
+            })
+            .and_then(|mapping| {
+                let writeback = mapping.writeback.as_mut()?;
+                let index = ((page - mapping.base) >> 12) as usize;
+                if index >= writeback.phys.len() {
+                    writeback
+                        .phys
+                        .try_reserve_exact(index + 1 - writeback.phys.len())
+                        .ok()?;
+                    writeback.phys.resize(index + 1, PhysAddr::new(0));
+                }
+                let slot = &mut writeback.phys[index];
+                // A prior leaf-install failure can leave a safe, unretained
+                // cache identity in this writeback slot. The memory fault
+                // path balanced that page's mapping reference; overwrite the
+                // stale identity on retry before publication.
+                *slot = phys;
+                Some(())
+            })
+            .is_some()
+    };
+    if !registered {
+        let released = release_shared_file_page(phys.raw());
+        debug_assert!(released);
+        return None;
+    }
+    Some(phys.raw())
 }
 
 /// Publish freshly loaded fallback pages into the process-independent file
@@ -694,6 +898,7 @@ pub(crate) fn publish_shared_file_pages(
     ops: &Arc<dyn FileOps>,
     offset: u64,
     candidates: Vec<PhysAddr>,
+    expected_generation: Option<u64>,
 ) -> (Vec<PhysAddr>, SharedFilePublication) {
     // Snapshot candidate contents before entering the IRQ-safe cache lock.
     // A candidate selected as canonical consumes its image; a losing
@@ -707,7 +912,10 @@ pub(crate) fn publish_shared_file_pages(
         prepared.push((candidate, clean));
     }
     let mut rejected = Vec::with_capacity(prepared.len());
+    let mut retired = Vec::new();
     let mut canonical = Vec::with_capacity(prepared.len());
+    let cache_generation =
+        expected_generation.filter(|generation| ops.mmap_cache_generation() == Some(*generation));
     {
         let mut pages = SHARED_FILE_PAGES.lock();
         for (index, (candidate, clean)) in prepared.into_iter().enumerate() {
@@ -715,7 +923,25 @@ pub(crate) fn publish_shared_file_pages(
                 .checked_add(index as u64 * 4096)
                 .expect("validated mmap file offset overflowed");
             let key = SharedFilePages::key(ops, page_offset);
-            let phys = if let Some(phys) = pages.by_file.get(&key).copied() {
+            let existing = pages.by_file.get(&key).copied().filter(|phys| {
+                pages.by_phys.get(phys).is_some_and(|page| {
+                    shared_page_matches_ops(page, ops)
+                        && (page.mappings != 0
+                            || page.pending != 0
+                            || (cache_generation.is_some()
+                                && page.cache_generation == cache_generation))
+                })
+            });
+            if existing.is_none() && pages.by_file.contains_key(&key) {
+                let stale_phys = pages.by_file[&key];
+                let stale = pages
+                    .remove_phys(stale_phys)
+                    .expect("shared-file key points to no physical page");
+                debug_assert_eq!(stale.mappings, 0);
+                debug_assert_eq!(stale.pending, 0);
+                retired.push(stale.phys);
+            }
+            let phys = if let Some(phys) = existing {
                 let phys = PhysAddr::new(phys);
                 canonical.push(phys);
                 if candidate.raw() != phys.raw() {
@@ -730,11 +956,12 @@ pub(crate) fn publish_shared_file_pages(
                         .insert(
                             phys,
                             SharedFilePage {
-                                ops: Arc::clone(ops),
+                                ops: Arc::downgrade(ops),
                                 offset: page_offset,
                                 phys: candidate,
                                 mappings: 0,
                                 pending: 0,
+                                cache_generation,
                                 clean,
                             },
                         )
@@ -752,13 +979,10 @@ pub(crate) fn publish_shared_file_pages(
                 .by_phys
                 .get_mut(&phys.raw())
                 .expect("shared-file key points to no physical page");
-            page.pending = page
-                .pending
-                .checked_add(1)
-                .expect("shared-file pending hold overflow");
+            retain_pending_shared_page(page);
         }
     }
-    for phys in rejected {
+    for phys in rejected.into_iter().chain(retired) {
         if phys.raw() != 0 {
             narf_memory::free_frame(narf_memory::PhysFrame::new(phys));
         }
@@ -786,8 +1010,9 @@ pub(crate) fn retain_shared_file_page(phys: u64) -> bool {
 }
 
 pub(crate) fn release_shared_file_page(phys: u64) -> bool {
-    let page = {
+    let retired = {
         let mut pages = SHARED_FILE_PAGES.lock();
+        let cache_len = pages.by_phys.len();
         let Some(page) = pages.by_phys.get_mut(&phys) else {
             return false;
         };
@@ -796,11 +1021,19 @@ pub(crate) fn release_shared_file_page(phys: u64) -> bool {
         if page.mappings != 0 || page.pending != 0 {
             return true;
         }
-        pages
-            .remove_phys(phys)
-            .expect("unreferenced shared-file page disappeared")
+        if should_retire_idle_shared_page(page, cache_len) {
+            Some(
+                pages
+                    .remove_phys(phys)
+                    .expect("unreferenced shared-file page disappeared"),
+            )
+        } else {
+            None
+        }
     };
-    narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+    if let Some(page) = retired {
+        narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+    }
     true
 }
 
@@ -829,13 +1062,9 @@ pub(crate) fn unmap_current(base: u64) {
     }
 }
 
-/// Mirror `AddressSpace::punch_fixed` splitting for owner references.
-pub(crate) fn punch_current(base: u64, len: u64) {
-    if let Some(address_space_id) = current_address_space_id() {
-        punch(address_space_id, base, len);
-    }
-}
-
+/// Mirror `AddressSpace::punch_fixed` splitting for an explicit address-space
+/// identity. Syscall paths use `publish_current_punch` so VMA and owner
+/// publication remain one transaction; this form supports lifecycle tests.
 fn punch(address_space_id: u64, base: u64, len: u64) {
     let Some(owner_bucket) = existing_mapping_owners(address_space_id) else {
         return;
@@ -900,17 +1129,7 @@ fn prepare_aliases_locked(
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
             let pages = usize::try_from(alias_len >> 12)
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            let last = first
-                .checked_add(pages)
-                .ok_or(AddressSpaceError::AllocationFailed)?;
-            let slice = original
-                .phys
-                .get(first..last)
-                .ok_or(AddressSpaceError::Unmapped)?;
-            let mut phys = Vec::new();
-            phys.try_reserve_exact(slice.len())
-                .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            phys.extend_from_slice(slice);
+            let phys = clone_writeback_window(&original.phys, first, pages)?;
             Some(FileWriteback {
                 offset: original
                     .offset
@@ -1037,17 +1256,7 @@ fn prepare_relocated_owners_locked(
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
             let pages = usize::try_from(destination_len >> 12)
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            let last = first
-                .checked_add(pages)
-                .ok_or(AddressSpaceError::AllocationFailed)?;
-            let source = original
-                .phys
-                .get(first..last)
-                .ok_or(AddressSpaceError::Unmapped)?;
-            let mut phys = Vec::new();
-            phys.try_reserve_exact(source.len())
-                .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            phys.extend_from_slice(source);
+            let phys = clone_writeback_window(&original.phys, first, pages)?;
             Some(FileWriteback {
                 offset: original
                     .offset
@@ -1093,17 +1302,6 @@ fn prepare_relocated_owners_locked(
         let delta = new_len - old_len;
         if tail.base.saturating_add(tail.len) != new_addr + old_len {
             return Err(AddressSpaceError::Unmapped);
-        }
-        if let Some(writeback) = tail.writeback.as_mut() {
-            let pages =
-                usize::try_from(delta >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
-            writeback
-                .phys
-                .try_reserve_exact(pages)
-                .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            writeback
-                .phys
-                .resize(writeback.phys.len() + pages, PhysAddr::new(0));
         }
         tail.len = tail
             .len
@@ -1432,7 +1630,7 @@ fn snapshot_dirty_page(
 ) -> Option<Vec<u8>> {
     let pages = SHARED_FILE_PAGES.lock();
     let page = pages.by_phys.get(&phys.raw())?;
-    if page.offset != offset || !Arc::ptr_eq(&page.ops, ops) {
+    if page.offset != offset || !shared_page_matches_ops(page, ops) {
         return None;
     }
     // SAFETY: the cache entry owns `phys`; the cache lock prevents its last
@@ -1449,20 +1647,22 @@ fn snapshot_dirty_page(
 /// If userspace changes the mapped page during I/O, the stored snapshot still
 /// describes what reached the file, so the next fsync observes it as dirty.
 fn mark_page_clean(ops: &Arc<dyn FileOps>, offset: u64, phys: PhysAddr, bytes: &[u8]) {
+    let cache_generation = ops.mmap_cache_generation();
     let mut pages = SHARED_FILE_PAGES.lock();
     if let Some(page) = pages
         .by_phys
         .get_mut(&phys.raw())
-        .filter(|page| page.offset == offset && Arc::ptr_eq(&page.ops, ops))
+        .filter(|page| page.offset == offset && shared_page_matches_ops(page, ops))
     {
         page.clean[..bytes.len()].copy_from_slice(bytes);
+        page.cache_generation = cache_generation;
     }
 }
 
 mod tests {
     use super::*;
     use alloc::boxed::Box;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use narf_filesystem::{FsFuture, Mode, Stat};
     use narf_kernel_test::{kernel_test_in, TestResult};
 
@@ -1472,6 +1672,10 @@ mod tests {
     struct TestOwner;
 
     struct FixedRemapOwner;
+
+    struct CacheableOwner {
+        generation: AtomicU64,
+    }
 
     struct TestLifetime;
 
@@ -1522,6 +1726,29 @@ mod tests {
                 mode: Mode::FILE_RW,
                 mtime_cycles: 0,
             }
+        }
+    }
+
+    impl FileOps for CacheableOwner {
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(buf.len()) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+
+        fn mmap_cache_generation(&self) -> Option<u64> {
+            Some(self.generation.load(Ordering::Acquire))
         }
     }
 
@@ -1689,12 +1916,7 @@ mod tests {
             None,
             Some(FileWriteback {
                 offset: 0x80_000,
-                phys: alloc::vec![
-                    PhysAddr::new(0x11_000),
-                    PhysAddr::new(0x12_000),
-                    PhysAddr::new(0x13_000),
-                    PhysAddr::new(0x14_000),
-                ],
+                phys: alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0x12_000),],
             }),
         );
         register(
@@ -1766,11 +1988,7 @@ mod tests {
                     0x80_000,
                     Some((
                         0x80_000,
-                        alloc::vec![
-                            PhysAddr::new(0x11_000),
-                            PhysAddr::new(0x12_000),
-                            PhysAddr::new(0),
-                        ],
+                        alloc::vec![PhysAddr::new(0x11_000), PhysAddr::new(0x12_000),],
                     )),
                 ))
         {
@@ -2017,9 +2235,9 @@ mod tests {
             }
         };
         let (first_phys, first) =
-            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![first_candidate]);
+            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![first_candidate], None);
         let (second_phys, second) =
-            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![second_candidate]);
+            publish_shared_file_pages(&ops, 0x7fff_0000, alloc::vec![second_candidate], None);
         if first_phys != second_phys || first_phys != alloc::vec![first_candidate] {
             return TestResult::Fail("overlapping mapper did not select canonical page");
         }
@@ -2059,5 +2277,76 @@ mod tests {
     kernel_test_in!(
         "userspace/perf",
         smoke_shared_file_pending_publications_do_not_free_peer_page
+    );
+
+    fn smoke_shared_file_idle_cache_requires_current_generation() -> TestResult {
+        const OFFSET: u64 = 0x7ffe_0000;
+        let owner = Arc::new(CacheableOwner {
+            generation: AtomicU64::new(1),
+        });
+        let ops: Arc<dyn FileOps> = owner.clone();
+        let first_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        };
+        let (first_phys, first) =
+            publish_shared_file_pages(&ops, OFFSET, alloc::vec![first_candidate], Some(1));
+        let first_canonical = first_phys == alloc::vec![first_candidate];
+        let first_retained = retain_shared_file_page(first_candidate.raw());
+        first.commit();
+        let first_released = release_shared_file_page(first_candidate.raw());
+
+        let hit = reserve_cached_shared_file_pages(&ops, OFFSET, 1);
+        let hit_same = hit
+            .as_ref()
+            .is_some_and(|(phys, _)| phys == &alloc::vec![first_candidate]);
+        if let Some((phys, publication)) = hit {
+            let _ = retain_shared_file_page(phys[0].raw());
+            publication.commit();
+            let _ = release_shared_file_page(phys[0].raw());
+        }
+
+        owner.generation.store(2, Ordering::Release);
+        let stale_rejected = reserve_cached_shared_file_pages(&ops, OFFSET, 1).is_none();
+        let second_candidate = match narf_memory::alloc_frame() {
+            Ok(frame) => frame.start_address(),
+            Err(_) => {
+                let retired = SHARED_FILE_PAGES.lock().remove_phys(first_candidate.raw());
+                if let Some(page) = retired {
+                    narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+                }
+                return TestResult::Skip("frame allocator drained");
+            }
+        };
+        let (second_phys, second) =
+            publish_shared_file_pages(&ops, OFFSET, alloc::vec![second_candidate], Some(2));
+        let generation_replaced = second_phys == alloc::vec![second_candidate];
+        let second_retained = retain_shared_file_page(second_candidate.raw());
+        second.commit();
+        let second_released = release_shared_file_page(second_candidate.raw());
+        let retired = SHARED_FILE_PAGES.lock().remove_phys(second_candidate.raw());
+        let retired_final = retired.is_some();
+        if let Some(page) = retired {
+            narf_memory::free_frame(narf_memory::PhysFrame::new(page.phys));
+        }
+
+        if !first_canonical
+            || !first_retained
+            || !first_released
+            || !hit_same
+            || !stale_rejected
+            || !generation_replaced
+            || !second_retained
+            || !second_released
+            || !retired_final
+        {
+            return TestResult::Fail("idle cache reused a stale shared-file generation");
+        }
+        TestResult::Pass
+    }
+
+    kernel_test_in!(
+        "userspace/perf",
+        smoke_shared_file_idle_cache_requires_current_generation
     );
 }

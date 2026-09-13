@@ -6135,12 +6135,36 @@ pub fn unix_listener_stall_sweep() {
 /// an entry was actually removed (the path was a live bound socket).
 pub fn unbind_path(path: &str) -> bool {
     let key = UnixPathKey::for_current_path(path);
+    unbind_path_key(&key)
+}
+
+/// Release a pathname socket after the VFS has already resolved its parent.
+///
+/// Directory-mutation syscalls already hold the exact backing filesystem and
+/// parent inode identity needed by [`UnixPathKey`]. Reusing it avoids a second
+/// complete mount/path walk for every ordinary `unlink(2)`. Legacy filesystems
+/// whose directory handles do not expose an inode still need the spelling-
+/// based fallback computed by [`unbind_path`].
+pub fn unbind_resolved_path(path: &str, filesystem: usize, parent_ino: u64, name: &str) -> bool {
+    if parent_ino == 0 {
+        return unbind_path(path);
+    }
+    let key = UnixPathKey {
+        filesystem,
+        parent_ino,
+        fallback_parent_path: None,
+        name: String::from(name),
+    };
+    unbind_path_key(&key)
+}
+
+fn unbind_path_key(key: &UnixPathKey) -> bool {
     let mut removed = false;
     if let Some(map) = LISTENERS.lock().as_mut() {
-        removed |= map.remove(&key).is_some();
+        removed |= map.remove(key).is_some();
     }
     if let Some(map) = UNIX_DGRAM_BOUND.lock().as_mut() {
-        removed |= map.remove(&key).is_some();
+        removed |= map.remove(key).is_some();
     }
     removed
 }

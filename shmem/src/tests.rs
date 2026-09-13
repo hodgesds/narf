@@ -113,6 +113,62 @@ fn smoke_shmem_removed_handle_waits_for_last_mapping() -> TestResult {
 }
 kernel_test_in!("shmem", smoke_shmem_removed_handle_waits_for_last_mapping);
 
+fn smoke_anonymous_shmem_page_refs_survive_creator_and_migration() -> TestResult {
+    use crate::{__reset_for_test, syscall_vtable};
+    use narf_memory::{PhysAddr, PhysFrame};
+
+    __reset_for_test();
+    let vtable = syscall_vtable();
+    let mut frames = alloc::vec::Vec::new();
+    if !(vtable.create_anonymous)(8192, &mut frames) || frames.len() != 2 {
+        return TestResult::Fail("anonymous create did not return two pages");
+    }
+    let first = frames[0];
+    let second = frames[1];
+    if !(vtable.owns_frame)(first) || !(vtable.owns_frame)(second) {
+        return TestResult::Fail("anonymous creator pages were not indexed");
+    }
+
+    // Model VMA publication for the first page, then release both creator
+    // references. Only the mapped page may remain owned.
+    if !(vtable.retain_frame)(first)
+        || !(vtable.release_frame)(first)
+        || !(vtable.release_frame)(second)
+    {
+        return TestResult::Fail("anonymous page reference operation missed its owner");
+    }
+    if !(vtable.owns_frame)(first) || (vtable.owns_frame)(second) {
+        return TestResult::Fail("anonymous creator release reclaimed the wrong page");
+    }
+
+    let replacement = match narf_memory::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Fail("replacement allocation failed"),
+    };
+    let replacement_phys = replacement.start_address().raw();
+    if !(vtable.replace_frame)(first, replacement_phys) {
+        narf_memory::free_frame(replacement);
+        let _ = (vtable.release_frame)(first);
+        return TestResult::Fail("anonymous page migration rejected owned backing");
+    }
+    // `replace_frame` transfers registry ownership but, like move_pages(2),
+    // leaves release of the replaced allocation to the migration caller.
+    narf_memory::free_frame(PhysFrame::new(PhysAddr::new(first)));
+    if (vtable.owns_frame)(first) || !(vtable.owns_frame)(replacement_phys) {
+        let _ = (vtable.release_frame)(replacement_phys);
+        return TestResult::Fail("anonymous page migration lost ownership");
+    }
+    if !(vtable.release_frame)(replacement_phys) || (vtable.owns_frame)(replacement_phys) {
+        return TestResult::Fail("anonymous replacement survived its final mapping drop");
+    }
+    __reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!(
+    "shmem",
+    smoke_anonymous_shmem_page_refs_survive_creator_and_migration
+);
+
 fn smoke_shmem_sg_iter_walks_pages() -> TestResult {
     use crate::{__reset_for_test, create, sg_iter, SgEntry};
     __reset_for_test();

@@ -130,6 +130,60 @@ fn normalize_abs(p: &str) -> alloc::string::String {
     r
 }
 
+/// Whether `path` is already byte-for-byte what [`normalize_abs`] would
+/// produce. This recognizes only the conservative absolute-path fast case;
+/// relative paths and any empty/dot component keep the full normalizer.
+fn is_normalized_abs(path: &str) -> bool {
+    if !path.starts_with('/') {
+        return false;
+    }
+    if path == "/" {
+        return true;
+    }
+    if path.ends_with('/') {
+        return false;
+    }
+    !path[1..]
+        .split('/')
+        .any(|component| component.is_empty() || component == "." || component == "..")
+}
+
+/// Owned form of the common pathname rewrite. A normalized absolute path for
+/// an un-chrooted task is returned in place, avoiding the normalizer's
+/// component vector and two replacement `String` allocations.
+fn resolve_cwd_path_owned(task: u64, path: alloc::string::String) -> alloc::string::String {
+    let normalized = if is_normalized_abs(&path) {
+        path
+    } else {
+        resolve_cwd_path_user(task, &path)
+    };
+    let prefix = match root_dir_prefix(task) {
+        Some(prefix) if prefix != "/" => prefix,
+        _ => return normalized,
+    };
+    let mut rooted = alloc::string::String::with_capacity(prefix.len() + normalized.len());
+    rooted.push_str(&prefix);
+    rooted.push_str(&normalized);
+    rooted
+}
+
+/// Compare a host-view normalized path with one path in the task's chroot
+/// view, without allocating the prefixed comparison string.
+fn chroot_path_matches(task: u64, path: &str, visible: &str, descendants: bool) -> bool {
+    let prefix = root_dir_prefix(task);
+    let path = match prefix.as_deref() {
+        Some(prefix) if prefix != "/" => match path.strip_prefix(prefix) {
+            Some(path) => path,
+            None => return false,
+        },
+        _ => path,
+    };
+    path == visible
+        || (descendants
+            && path.starts_with(visible)
+            && path.as_bytes().get(visible.len()) == Some(&b'/'))
+}
+
 /// Turn a user-supplied path (absolute or relative to `task`'s cwd)
 /// into a normalized absolute path. Relative paths are joined onto the
 /// task's current working directory; `.`/`..` are collapsed.
@@ -156,44 +210,23 @@ const SYMLOOP_MAX: usize = 40;
 /// `path` is an ancestor of a mount point (a component that has no real
 /// node in the covering filesystem, only a synthetic dir). Both cases mean
 /// a component "crosses a mount", which the single-fs fast walk cannot see.
-fn fast_walk_stays_in_one_mount(path: &str) -> bool {
-    // Longest mount prefix covering the full path — the mount the fast walk
-    // would descend within. `current_mount_list` is namespace-aware.
-    let mounts = current_mount_list();
-    let cover_len = mounts
-        .iter()
-        .filter(|m| {
-            path == m.as_str()
-                || m.as_str() == "/"
-                || (path.starts_with(m.as_str()) && path.as_bytes().get(m.len()) == Some(&b'/'))
-        })
-        .map(|m| m.len())
-        .max();
-    let Some(cover_len) = cover_len else {
-        // No mount covers the path (not even "/"): nothing for the fast
-        // walk to descend. Defer to the slow path.
-        return false;
+fn current_single_mount_root(
+    path: &str,
+) -> Option<(
+    alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+    &str,
+    u64,
+)> {
+    let (root, rel_start, mount_id) = if let Some(namespace) = current_mount_namespace() {
+        namespace.resolve_absolute_single_mount(path, |fs, rel, mount_id| {
+            (fs.root(), path.len() - rel.len(), mount_id)
+        })?
+    } else {
+        narf_filesystem::registry().resolve_absolute_single_mount(path, |fs, rel, mount_id| {
+            (fs.root(), path.len() - rel.len(), mount_id)
+        })?
     };
-    for m in &mounts {
-        // A deeper mount whose path lies strictly inside `path` (at a
-        // component boundary) means a proper prefix crosses into it: e.g.
-        // resolving `/a/b/c` while `/a/b` is its own mount. Bail so the
-        // per-prefix slow walk re-selects the covering mount per component.
-        if m.len() > cover_len
-            && path.starts_with(m.as_str())
-            && (path.len() == m.len() || path.as_bytes().get(m.len()) == Some(&b'/'))
-        {
-            return false;
-        }
-    }
-    // A path that is a proper ancestor of a mount point has no real node in
-    // the covering fs (only a synthetic S_IFDIR); the fast walk would miss
-    // it. Defer to the slow path, which the callers already reconcile with
-    // the mount-ancestor stat/mkdir synthesis.
-    if path_is_mount_ancestor(path) {
-        return false;
-    }
-    true
+    Some((root, &path[rel_start..], mount_id))
 }
 
 /// Fast path for [`resolve_vfs_symlink_path`]: a single O(depth) forward walk
@@ -211,22 +244,13 @@ fn resolve_vfs_symlink_path_fast(
     expanded: &str,
     follow_final: bool,
 ) -> Option<alloc::string::String> {
-    // Only sound while the whole path lives in one mount (see the helper):
-    // the walk descends within a single `fs.root()` and cannot cross a
-    // mount boundary the way the slow per-prefix resolver does.
-    if !fast_walk_stays_in_one_mount(expanded) {
-        return None;
-    }
-
     // Clone the covering mount's root `Arc` AND the path RELATIVE to that
     // mount OUT of the mount-table lock before any (block-)I/O: the lookups
     // below drive `poll_blocking`, which busy-spins on the backing device
     // IRQ. Holding the IrqSafeSpinLock across that deadlocks the box (see
     // `resolve_absolute`). `rel` has the mount prefix stripped, so the walk
     // starts at `fs.root()` and steps through the in-mount components only.
-    let (root, rel) = current_resolve_absolute(expanded, |fs, rel| {
-        (fs.root(), alloc::string::String::from(rel))
-    })?;
+    let (root, rel, _) = current_single_mount_root(expanded)?;
 
     let components: alloc::vec::Vec<&str> = rel
         .split('/')
@@ -301,6 +325,94 @@ fn resolve_vfs_symlink_path_fast(
         }
     }
     Some(alloc::string::String::from(expanded))
+}
+
+enum FastCreateResolution {
+    Existing {
+        node: alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+        mount_id: u64,
+    },
+    Missing {
+        parent: alloc::sync::Arc<dyn narf_filesystem::DirOps>,
+        leaf: alloc::string::String,
+        mount_id: u64,
+    },
+}
+
+impl FastCreateResolution {
+    fn mount_id(&self) -> u64 {
+        match self {
+            Self::Existing { mount_id, .. } | Self::Missing { mount_id, .. } => *mount_id,
+        }
+    }
+}
+
+/// Resolve the common `open(O_CREAT)` hit or miss in one forward VFS walk.
+///
+/// The ordinary open path first proves that no component is a symlink, then
+/// resolves the missing leaf, then resolves its parent again for creation.
+/// An existing regular leaf used to be looked up three times (miss probe,
+/// symlink probe, and final resolution). When the path stays in one mount and
+/// contains no symlink, retain either that already-resolved leaf or its proven
+/// missing parent. Returning `None` is deliberately conservative: a symlink,
+/// directory-only leaf, mount crossing, or lookup error takes the complete
+/// resolver and retains all of its semantics.
+fn resolve_create_fast(expanded: &str) -> Option<FastCreateResolution> {
+    let (root, rel, mount_id) = current_single_mount_root(expanded)?;
+    let mut components = rel
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .peekable();
+    let mut current_dir = root;
+
+    while let Some(component) = components.next() {
+        if components.peek().is_some() {
+            current_dir = if let Some(dir) = current_dir.lookup_dir(component) {
+                dir
+            } else {
+                match poll_blocking(current_dir.lookup_dir_async(component)) {
+                    Some(Ok(dir)) => dir,
+                    _ => return None,
+                }
+            };
+            continue;
+        }
+
+        let leaf = if let Some(node) = current_dir.lookup(component) {
+            Some(Ok(node))
+        } else {
+            poll_blocking(current_dir.lookup_async(component))
+        };
+        match leaf {
+            Some(Ok(node)) => {
+                // Ordinary open follows a final symlink. Defer that case to
+                // the mount-aware resolver; only a proven non-symlink leaf is
+                // safe to carry directly into open_impl.
+                if node.stat().mode.file_type == narf_filesystem::FileType::Symlink {
+                    return None;
+                }
+                return Some(FastCreateResolution::Existing { node, mount_id });
+            }
+            Some(Err(narf_filesystem::FsError::NotFound)) => {}
+            _ => return None,
+        }
+
+        // Both file and directory namespaces must report a definite miss.
+        // A directory-only final leaf falls back so the ordinary directory
+        // open path can recover its DirOps shape.
+        if !matches!(
+            poll_blocking(current_dir.lookup_dir_async(component)),
+            Some(Err(narf_filesystem::FsError::NotFound))
+        ) {
+            return None;
+        }
+        return Some(FastCreateResolution::Missing {
+            parent: current_dir,
+            leaf: alloc::string::String::from(component),
+            mount_id,
+        });
+    }
+    None
 }
 
 /// Expand symlinks component-by-component through the current task's mount
@@ -1608,9 +1720,7 @@ fn copy_user_str(ptr: *const u8, len: usize, cap: usize) -> Result<alloc::string
     let mut buf = alloc::vec![0u8; len];
     // SAFETY: ptr is a user VA; SMAP bracket inside copy_from_user.
     unsafe { copy_from_user(&mut buf, ptr as u64) }.map_err(|_| ())?;
-    core::str::from_utf8(&buf)
-        .map(alloc::string::String::from)
-        .map_err(|_| ())
+    alloc::string::String::from_utf8(buf).map_err(|_| ())
 }
 
 /// Copy a path string from userspace into a kernel-owned `String`.
@@ -1679,20 +1789,24 @@ pub(crate) fn copy_user_cstr_checked(
     // page boundary). Read in page-sized chunks until we find the
     // NUL or hit `max_len`.
     let mut out = alloc::vec::Vec::with_capacity(64);
+    let mut chunk = [0u8; 64];
     let mut cursor = ptr;
     let end_cap = ptr.saturating_add(max_len as u64);
     while cursor < end_cap {
-        // Read up to the next page boundary, capped at the remaining
-        // budget.
+        // Never cross a page boundary: bytes beyond a NUL are irrelevant but
+        // the following page may legitimately be unmapped. A small stack
+        // chunk covers ordinary path components without allocating and
+        // copying the entire remainder of the page on every syscall.
         let next_page = (cursor + 0x1000) & !0xFFF;
-        let chunk_end = next_page.min(end_cap);
+        let chunk_end = next_page
+            .min(end_cap)
+            .min(cursor.saturating_add(chunk.len() as u64));
         let chunk_len = (chunk_end - cursor) as usize;
-        let mut chunk = alloc::vec![0u8; chunk_len];
         // SAFETY: SMAP bracket inside copy_from_user; pointer
         // validated against canonical range there.
         // SAFETY: Valid memory or trusted environment
-        unsafe { copy_from_user(&mut chunk, cursor) }.map_err(|_| EFAULT)?;
-        if let Some(nul_pos) = chunk.iter().position(|&b| b == 0) {
+        unsafe { copy_from_user(&mut chunk[..chunk_len], cursor) }.map_err(|_| EFAULT)?;
+        if let Some(nul_pos) = chunk[..chunk_len].iter().position(|&b| b == 0) {
             out.extend_from_slice(&chunk[..nul_pos]);
             // Linux (`fs/namei.c::getname_flags`) copies a path as an opaque
             // byte string — it does NOT validate UTF-8. The bytes here were
@@ -1712,7 +1826,7 @@ pub(crate) fn copy_user_cstr_checked(
                 Err(err) => Ok(alloc::string::String::from_utf8_lossy(err.as_bytes()).into_owned()),
             };
         }
-        out.extend_from_slice(&chunk);
+        out.extend_from_slice(&chunk[..chunk_len]);
         cursor = chunk_end;
     }
     // `len == PATH_MAX` with no terminator — the path is too long, the
@@ -1760,9 +1874,7 @@ fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
     let mut buf = alloc::vec![0u8; len];
     // SAFETY: ptr is a user VA; SMAP bracket inside copy_from_user.
     unsafe { copy_from_user(&mut buf, ptr) }.ok()?;
-    core::str::from_utf8(&buf)
-        .map(alloc::string::String::from)
-        .ok()
+    alloc::string::String::from_utf8(buf).ok()
 }
 
 // ── SMAP-safe user-memory copy helpers ────────────────────────────
@@ -2235,6 +2347,8 @@ fn fill_statfs_for_path(path: &str, buf_ptr: u64) -> bool {
 static TASK_MOUNT_NS: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::sync::Arc<narf_filesystem::MountNamespace>>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
+static TASK_MOUNT_NS_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 fn task_mount_ns_init() {
     let mut g = TASK_MOUNT_NS.lock();
@@ -2246,6 +2360,12 @@ fn task_mount_ns_init() {
 /// Look up the calling task's mount namespace. None means the task
 /// shares the global registry (the default).
 pub fn current_mount_namespace() -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
+    // The initial namespace is overwhelmingly the common case. Linux keeps
+    // the namespace pointer directly in task state; avoid bouncing NARF's
+    // compatibility side-table lock while that table is globally empty.
+    if TASK_MOUNT_NS_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
     let task = current_task_id();
     let g = TASK_MOUNT_NS.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
@@ -2285,10 +2405,7 @@ pub(crate) fn ns_owner_for(
 }
 
 pub(crate) fn clear_current_mount_namespace_for_test() {
-    let task = current_task_id();
-    if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
-        namespaces.remove(&task);
-    }
+    remove_mount_namespace(current_task_id());
 }
 
 /// Test hook — ABI smokes share one kernel image, so reset every task's
@@ -2297,6 +2414,7 @@ pub(crate) fn clear_current_mount_namespace_for_test() {
 #[doc(hidden)]
 pub fn __test_mount_namespaces_reset() {
     *TASK_MOUNT_NS.lock() = Some(alloc::collections::BTreeMap::new());
+    TASK_MOUNT_NS_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 
 pub(crate) fn current_resolve_absolute<R, F>(path: &str, resolve: F) -> Option<R>
@@ -2495,6 +2613,9 @@ fn current_move_mount(
 
 /// Look up the mount namespace of an arbitrary task by id.
 pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem::MountNamespace>> {
+    if TASK_MOUNT_NS_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
     let g = TASK_MOUNT_NS.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
@@ -2554,9 +2675,7 @@ pub fn namespace_fd_for_task(
 /// Rejoin the shared initial mount namespace represented by `MntGlobal`.
 #[cfg(feature = "container")]
 pub fn install_initial_mount_namespace(task: u64) {
-    if let Some(namespaces) = TASK_MOUNT_NS.lock().as_mut() {
-        namespaces.remove(&task);
-    }
+    remove_mount_namespace(task);
 }
 
 /// Wave-67 — install a private mount namespace for `task`. Replaces
@@ -2566,7 +2685,23 @@ pub fn install_mount_namespace(task: u64, ns: alloc::sync::Arc<narf_filesystem::
     task_mount_ns_init();
     let mut g = TASK_MOUNT_NS.lock();
     if let Some(m) = g.as_mut() {
-        m.insert(task, ns);
+        if m.insert(task, ns).is_none() {
+            TASK_MOUNT_NS_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+fn remove_mount_namespace(task: u64) {
+    if TASK_MOUNT_NS_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    if TASK_MOUNT_NS
+        .lock()
+        .as_mut()
+        .and_then(|namespaces| namespaces.remove(&task))
+        .is_some()
+    {
+        TASK_MOUNT_NS_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2741,11 +2876,50 @@ pub fn proc_ns_idmap_write(
 
 static ROOT_DIR_TABLE: TaskMapTable<alloc::string::String> =
     [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
+static ROOT_DIR_COUNT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+#[inline]
+fn root_dir_prefix(task: u64) -> Option<alloc::string::String> {
+    // Most tasks see the initial root. Like Linux's direct fs_struct pointer,
+    // avoid consulting the compatibility side table while it is globally
+    // empty; open_impl otherwise reads it for normalization and special-path
+    // comparisons on every open.
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return None;
+    }
+    task_map_get(&ROOT_DIR_TABLE, task)
+}
+
+fn set_root_dir(task: u64, root: alloc::string::String) {
+    let mut shard = ROOT_DIR_TABLE[task_map_shard(task)].map.lock();
+    let roots = shard.get_or_insert_with(BTreeMap::new);
+    if !roots.contains_key(&task) {
+        // Publish the non-empty hint before the row. A racing reader that sees
+        // it blocks on this shard lock until the insertion completes.
+        ROOT_DIR_COUNT.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+    roots.insert(task, root);
+}
+
+fn remove_root_dir(task: u64) {
+    if ROOT_DIR_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    let removed = ROOT_DIR_TABLE[task_map_shard(task)]
+        .map
+        .lock()
+        .as_mut()
+        .and_then(|roots| roots.remove(&task));
+    if removed.is_some() {
+        ROOT_DIR_COUNT.fetch_sub(1, core::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Diagnostic: read the chroot prefix for `task`, or `None` if the
 /// task sees the global root. Used by tests + procfs.
 pub fn root_dir_of(task: u64) -> Option<alloc::string::String> {
-    task_map_get(&ROOT_DIR_TABLE, task)
+    root_dir_prefix(task)
 }
 
 /// Install the filesystem root for a task before its first instruction.
@@ -2760,20 +2934,23 @@ pub fn install_root_dir(task: u64, root: &str) -> bool {
     }
     let root = root.trim_end_matches('/');
     let root = if root.is_empty() { "/" } else { root };
-    task_map_set(&ROOT_DIR_TABLE, task, alloc::string::String::from(root));
+    set_root_dir(task, alloc::string::String::from(root));
     true
 }
 
 
 /// fork(2) inheritance — child inherits parent's chroot.
 pub fn root_dir_fork(parent: u64, child: u64) {
-    task_map_fork(&ROOT_DIR_TABLE, parent, child);
+    if let Some(root) = root_dir_prefix(parent) {
+        set_root_dir(child, root);
+    }
 }
 
 /// Test hook — drop every per-task entry.
 #[doc(hidden)]
 pub fn __test_root_dir_reset() {
     task_map_init(&ROOT_DIR_TABLE);
+    ROOT_DIR_COUNT.store(0, core::sync::atomic::Ordering::Release);
 }
 
 /// Rewrite `path` under the calling task's chroot, if any. Absolute
@@ -2782,7 +2959,7 @@ pub fn __test_root_dir_reset() {
 /// the result has no double-slash.
 pub(crate) fn apply_chroot(path: &str) -> alloc::string::String {
     let task = current_task_id();
-    let prefix = match task_map_get(&ROOT_DIR_TABLE, task) {
+    let prefix = match root_dir_prefix(task) {
         Some(p) => p,
         None => return alloc::string::String::from(path),
     };
@@ -4676,11 +4853,10 @@ pub fn proc_pid_report(outer: u64) -> Option<u64> {
 /// pid. (Was every raw TaskId — threads included, un-namespaced.)
 pub fn proc_list_pids() -> alloc::vec::Vec<u64> {
     let reader = current_task_id();
-    let outers: alloc::vec::Vec<u64> = PID_TO_TASK
-        .lock()
-        .as_ref()
-        .map(|m| m.keys().copied().collect())
-        .unwrap_or_default();
+    let outers: alloc::vec::Vec<u64> = pid_task_snapshot()
+        .into_iter()
+        .map(|(pid, _)| pid)
+        .collect();
     #[cfg(feature = "container")]
     {
         outers
@@ -5502,17 +5678,11 @@ fn kill_process(pid: u64, signum: u32) -> bool {
     // the same visible pid) under the TASK_TO_PID lock, THEN filter by
     // liveness — `task_get` takes the TASKS lock, which must never be
     // acquired while holding TASK_TO_PID (lock-order discipline).
-    let candidates: alloc::vec::Vec<u64> = {
-        let g = TASK_TO_PID.lock();
-        g.as_ref()
-            .map(|m| {
-                m.iter()
-                    .filter(|&(_, &p)| p == pid)
-                    .map(|(&t, _)| t)
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
+    let candidates: alloc::vec::Vec<u64> = task_pid_snapshot()
+        .into_iter()
+        .filter(|&(_, process)| process == pid)
+        .map(|(task, _)| task)
+        .collect();
     let members: alloc::vec::Vec<u64> = candidates
         .into_iter()
         .filter(|&t| {
@@ -5560,7 +5730,8 @@ fn signal_target_exists(tid: u64) -> bool {
     if crate::task::task_get(tid).is_some() || tid == current_task_id() {
         return true;
     }
-    TASK_TO_PID
+    TASK_TO_PID[pid_task_shard(tid)]
+        .map
         .lock()
         .as_ref()
         .is_some_and(|m| m.contains_key(&tid))
@@ -10392,6 +10563,7 @@ mod handler_sys_mlock2;
 mod handler_sys_mlockall;
 #[path = "sys_mmap.rs"]
 mod handler_sys_mmap;
+pub(crate) use handler_sys_mmap::load_file_mapping_pages;
 #[path = "sys_mount.rs"]
 mod handler_sys_mount;
 #[path = "sys_mount_for_test.rs"]

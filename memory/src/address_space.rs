@@ -26,9 +26,31 @@ mod region_index;
 use region_index::RegionIndex;
 
 /// Serializes creation and replacement of externally-owned shared aliases.
-/// The closure must not await or enter code that can recursively map SHARED
-/// memory.
-static SHARED_MAPPING_TRANSACTION: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+///
+/// Ordinary VMA mutations need exclude only a cross-address-space shared-page
+/// migration, so they lock the shard selected by their address-space
+/// incarnation. A migration locks every shard in ascending order. This
+/// preserves the old global exclusion contract for migration while allowing
+/// unrelated processes to publish and retire shared mappings concurrently,
+/// matching Linux's per-`mm` mmap-lock scope.
+const SHARED_MAPPING_TRANSACTION_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct SharedMappingTransactionShard {
+    lock: IrqSafeSpinLock<()>,
+}
+
+impl SharedMappingTransactionShard {
+    const fn new() -> Self {
+        Self {
+            lock: IrqSafeSpinLock::new(()),
+        }
+    }
+}
+
+static SHARED_MAPPING_TRANSACTIONS: [SharedMappingTransactionShard;
+    SHARED_MAPPING_TRANSACTION_SHARDS] =
+    [const { SharedMappingTransactionShard::new() }; SHARED_MAPPING_TRANSACTION_SHARDS];
 type SharedFrameHooks = (fn(u64), fn(u64));
 static SHARED_FRAME_HOOKS: IrqSafeSpinLock<Option<SharedFrameHooks>> = IrqSafeSpinLock::new(None);
 type AddressSpaceDropHook = fn(u64);
@@ -135,8 +157,39 @@ fn release_shared_phys(phys: PhysAddr) {
     }
 }
 
+#[inline]
+fn shared_mapping_transaction_index(address_space_id: u64) -> usize {
+    address_space_id as usize & (SHARED_MAPPING_TRANSACTION_SHARDS - 1)
+}
+
+#[inline]
+fn lock_address_space_shared_mapping_transaction(
+    address_space_id: u64,
+) -> narf_lib::sync::IrqSafeSpinLockGuard<'static, ()> {
+    SHARED_MAPPING_TRANSACTIONS[shared_mapping_transaction_index(address_space_id)]
+        .lock
+        .lock()
+}
+
+/// Run an ordinary shared-mapping mutation for one address space.
+///
+/// The closure must not await or recursively enter either shared-mapping
+/// transaction helper. Callers take their per-address-space VMA transaction
+/// before entering this helper.
+pub fn with_address_space_shared_mapping_transaction<R>(
+    address_space_id: u64,
+    f: impl FnOnce() -> R,
+) -> R {
+    let _guard = lock_address_space_shared_mapping_transaction(address_space_id);
+    f()
+}
+
+/// Run a transaction excluding shared-mapping mutations in every address
+/// space. This is reserved for operations such as NUMA migration which must
+/// replace all aliases of an externally-owned frame atomically.
 pub fn with_shared_mapping_transaction<R>(f: impl FnOnce() -> R) -> R {
-    let _guard = SHARED_MAPPING_TRANSACTION.lock();
+    let _guards: [_; SHARED_MAPPING_TRANSACTION_SHARDS] =
+        core::array::from_fn(|index| SHARED_MAPPING_TRANSACTIONS[index].lock.lock());
     f()
 }
 
@@ -312,6 +365,14 @@ impl RegionPerms {
     /// on the result: per-page refcounts remain authoritative.
     pub const ANON_MERGEABLE: RegionPerms = RegionPerms(1 << 17);
 
+    /// Internal provenance marker for a System V `shmat(2)` VMA. The generic
+    /// SHARED bit describes frame ownership but cannot distinguish SysV from
+    /// anonymous or file mappings. Syscall teardown uses this marker to invoke
+    /// attachment/nattch close accounting only for an overlapping SysV VMA,
+    /// mirroring Linux's per-VMA `shm_vm_ops.close`. Bit 18; preserved by VMA
+    /// splits, mprotect, mremap, and fork like the other internal flags.
+    pub const SYSV_SHM: RegionPerms = RegionPerms(1 << 18);
+
     /// Mask isolating the POSIX prot bits (READ | WRITE | EXEC).
     /// Used by callers that want to compare permissions without
     /// caring about the internal LOCKED bit.
@@ -436,8 +497,9 @@ pub struct Region {
     pub len: u64,
     pub perms: RegionPerms,
     /// Per-page phys backing. Length normally equals `len / 4096`.
-    /// Demand-grown heap and stack regions may keep only a materialized
-    /// prefix; missing entries and `PhysAddr::new(0)` are both unbacked.
+    /// Demand-grown heap/stack and FILE_DEMAND regions may keep only a
+    /// materialized prefix; missing entries and `PhysAddr::new(0)` are both
+    /// unbacked.
     pub phys: Vec<PhysAddr>,
 }
 
@@ -907,22 +969,54 @@ impl RegionTable {
             return;
         }
 
+        // `Region::phys` is a materialized prefix: entries past `phys.len()`
+        // and explicit `PhysAddr::new(0)` slots both mean demand-zero.
+        // Appending a source's prefix directly after a destination whose own
+        // prefix is short would shift the source's resident frames to lower
+        // virtual pages, so a sparse destination is first zero-padded out to
+        // its page count when the source carries resident entries; the pad
+        // slots describe exactly the demand-zero tail the destination already
+        // had. A source with an empty prefix appends nothing, so the merged
+        // tail simply stays demand-zero with no padding. Capacity for every
+        // pad and append below is reserved before any region is removed, so
+        // the merge either completes or leaves the tables untouched. The
+        // successor terms use the destination's post-predecessor-merge page
+        // count, mirroring the second absorption below.
+        let page_count = |len: u64| (len >> 12) as usize;
+        let current_pages = page_count(current.len);
+        let current_phys_len = current.phys.len();
+        let successor_phys_len = successor_base
+            .and_then(|successor_base| self.get(successor_base))
+            .map_or(0, |successor| successor.phys.len());
+
         let destination_base = predecessor_base.unwrap_or(base);
-        let additional_pages = if predecessor_base.is_some() {
-            current.phys.len()
-        } else {
-            0
+        let destination = self
+            .get(destination_base)
+            .expect("anonymous merge destination disappeared");
+        let mut destination_pages = page_count(destination.len);
+        let mut destination_phys_len = destination.phys.len();
+        let mut additional_entries = 0usize;
+        if predecessor_base.is_some() {
+            if current_phys_len > 0 {
+                additional_entries = destination_pages
+                    .saturating_sub(destination_phys_len)
+                    .saturating_add(current_phys_len);
+                destination_phys_len = destination_pages.saturating_add(current_phys_len);
+            }
+            destination_pages = destination_pages.saturating_add(current_pages);
         }
-        .saturating_add(
-            successor_base
-                .and_then(|successor_base| self.get(successor_base))
-                .map_or(0, |successor| successor.phys.len()),
-        );
+        if successor_phys_len > 0 {
+            additional_entries = additional_entries.saturating_add(
+                destination_pages
+                    .saturating_sub(destination_phys_len)
+                    .saturating_add(successor_phys_len),
+            );
+        }
         if self
             .get_mut(destination_base)
             .expect("anonymous merge destination disappeared")
             .phys
-            .try_reserve(additional_pages)
+            .try_reserve(additional_entries)
             .is_err()
         {
             return;
@@ -939,23 +1033,30 @@ impl RegionTable {
         let destination = self
             .get_mut(destination_base)
             .expect("anonymous merge destination disappeared after source removal");
-        if let Some(source) = current.as_mut() {
+        let absorb = |destination: &mut Region, source: &mut Region| {
             debug_assert_eq!(
                 destination.base.as_u64().saturating_add(destination.len),
                 source.base.as_u64()
             );
+            if !source.phys.is_empty() {
+                // Zero-pad a short destination prefix to its page count so
+                // the appended source entries keep their virtual offsets.
+                // The reservation above covers this growth, so neither the
+                // resize nor the append can allocate here.
+                let destination_pages = page_count(destination.len);
+                if destination.phys.len() < destination_pages {
+                    destination.phys.resize(destination_pages, PhysAddr::new(0));
+                }
+                destination.phys.append(&mut source.phys);
+            }
             destination.len = destination.len.saturating_add(source.len);
             destination.perms.0 |= source.perms.0 & RegionPerms::COW.0;
-            destination.phys.append(&mut source.phys);
+        };
+        if let Some(source) = current.as_mut() {
+            absorb(destination, source);
         }
         if let Some(source) = successor.as_mut() {
-            debug_assert_eq!(
-                destination.base.as_u64().saturating_add(destination.len),
-                source.base.as_u64()
-            );
-            destination.len = destination.len.saturating_add(source.len);
-            destination.perms.0 |= source.perms.0 & RegionPerms::COW.0;
-            destination.phys.append(&mut source.phys);
+            absorb(destination, source);
         }
         self.invalidate_mapping(destination_base);
     }
@@ -1645,9 +1746,10 @@ impl AddressSpace {
     /// Run one compound VMA mutation while excluding CLONE_VM peers.
     ///
     /// Callers that must snapshot externally-owned shared backing use this as
-    /// the outer transaction, then take [`with_shared_mapping_transaction`]
-    /// before calling a `*_shared_region_locked` method. The lock order is
-    /// therefore always AS VMA -> shared-owner -> huge table -> regular table.
+    /// the outer transaction, then take
+    /// [`with_address_space_shared_mapping_transaction`] before calling a
+    /// `*_shared_region_locked` method. The lock order is therefore always AS
+    /// VMA -> shared-owner shard -> huge table -> regular table.
     pub fn with_vma_transaction<R>(&self, body: impl FnOnce() -> R) -> R {
         let _guard = self.vma_transaction.lock();
         body()
@@ -1691,6 +1793,25 @@ impl AddressSpace {
             .containing(lo)
             .filter(|region| hi <= region.base.as_u64().saturating_add(region.len))
             .map(|region| region.perms)
+    }
+
+    /// Whether any base-page VMA overlapping `[base, base + len)` carries
+    /// `perms`, without cloning proportional backing metadata.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`] while using the
+    /// answer to choose a subsequent structural operation.
+    pub unsafe fn range_intersects_perms_locked(
+        &self,
+        base: VirtAddr,
+        len: u64,
+        perms: RegionPerms,
+    ) -> bool {
+        let lo = base.as_u64();
+        let hi = lo.saturating_add(len);
+        self.regions
+            .lock()
+            .overlapping_any(lo, hi, |region| region.perms.contains(perms))
     }
 
     /// Atomically reserve `bytes` of contiguous virtual address
@@ -1751,6 +1872,28 @@ impl AddressSpace {
             .filter(|end| *end <= Self::MMAP_WINDOW_TOP)
             .ok_or(AddressSpaceError::MappingLimit)?;
         Ok(VirtAddr::new(candidate))
+    }
+
+    /// Select the first aligned free interval in the ordinary mmap window
+    /// without consuming the monotonic compatibility cursor. Linux uses its
+    /// regular unmapped-area search when `mremap(MREMAP_MAYMOVE)` must choose
+    /// a destination; doing the same lets repeated moves reuse holes instead
+    /// of spreading sparse VMAs and page tables across the high arena.
+    ///
+    /// # Safety
+    /// The caller must hold this address space's VMA transaction continuously
+    /// through publication or abandonment of the selected interval.
+    pub unsafe fn mmap_unmapped_candidate_locked(
+        &self,
+        len: u64,
+        align: u64,
+    ) -> Result<VirtAddr, AddressSpaceError> {
+        if len == 0 || len & 0xFFF != 0 || align < 4096 || !align.is_power_of_two() {
+            return Err(AddressSpaceError::AlignmentMismatch);
+        }
+        let huge = self.huge_regions.lock();
+        let regions = self.regions.lock();
+        Self::find_unmapped_area_locked(&regions, &huge, 0, len, align).map(VirtAddr::new)
     }
 
     /// Reserve an mmap window with an aligned base. Any alignment padding is
@@ -2190,7 +2333,7 @@ impl AddressSpace {
         let shared_guard = region
             .perms
             .contains(RegionPerms::SHARED)
-            .then(|| SHARED_MAPPING_TRANSACTION.lock());
+            .then(|| lock_address_space_shared_mapping_transaction(self.identity()));
         let (receipt, eager) = self.map_region_inner(region, None, None)?;
         drop(shared_guard);
         drop(vma_guard);
@@ -2260,7 +2403,7 @@ impl AddressSpace {
         let shared_guard = region
             .perms
             .contains(RegionPerms::SHARED)
-            .then(|| SHARED_MAPPING_TRANSACTION.lock());
+            .then(|| lock_address_space_shared_mapping_transaction(self.identity()));
         let requested = explicit_lock.then_some(FutureLockPolicy::Eager);
         let (receipt, eager) =
             self.map_region_inner(region, requested, Some((limit_bytes, bypass_limit)))?;
@@ -2324,7 +2467,8 @@ impl AddressSpace {
     }
 
     /// Select and publish an ordinary private-anonymous VMA in one VMA
-    /// transaction, using the first aligned hole in the mmap window.
+    /// transaction, accepting a usable caller hint or selecting the first
+    /// aligned hole in the mmap window.
     ///
     /// This is the Linux `get_unmapped_area()` shape: a non-zero hint is used
     /// when that complete interval is free, otherwise placement searches the
@@ -2530,7 +2674,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`]. If `region` is
-    /// shared it must then hold [`with_shared_mapping_transaction`].
+    /// shared it must then hold
+    /// [`with_address_space_shared_mapping_transaction`].
     pub unsafe fn map_region_locked_limited_receipt(
         &self,
         region: Region,
@@ -2594,7 +2739,7 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`]. Shared regions
-    /// additionally require [`with_shared_mapping_transaction`].
+    /// additionally require [`with_address_space_shared_mapping_transaction`].
     pub unsafe fn replace_region_locked_limited_receipt(
         &self,
         region: Region,
@@ -2627,14 +2772,16 @@ impl AddressSpace {
         // which would silently leave pages unbacked or leak frames during
         // materialize.
         //
-        // EXCEPTION: a demand-grown BRK_HEAP or STACK_SEGMENT region may carry
-        // a SHORTER phys list than its page count. Growth extends only VMA
-        // metadata; each page materializes its slot on first fault
-        // (finish_demand_page resizes the prefix). Pages past the prefix are
-        // demand-zero, so teardown has no absent frame to release.
+        // EXCEPTION: a demand-backed BRK_HEAP, STACK_SEGMENT, or FILE_DEMAND
+        // region may carry a SHORTER phys list than its page count. Growth or
+        // initial file mapping extends only VMA metadata; each page
+        // materializes its slot on first fault (finish_demand_page resizes the
+        // prefix). Pages past the prefix are demand-zero/file-absent, so
+        // teardown has no frame to release.
         let region_pages = region.len >> 12;
         let phys_covers = if region.perms.contains(RegionPerms::BRK_HEAP)
             || region.perms.contains(RegionPerms::STACK_SEGMENT)
+            || region.perms.contains(RegionPerms::FILE_DEMAND)
         {
             region.phys.len() as u64 <= region_pages
         } else {
@@ -2775,7 +2922,7 @@ impl AddressSpace {
 
     /// Register a SHARED region while the caller already holds this address
     /// space's [`Self::with_vma_transaction`] and then
-    /// [`with_shared_mapping_transaction`].
+    /// [`with_address_space_shared_mapping_transaction`].
     ///
     /// # Safety
     /// The caller must hold both transactions, in that order, across
@@ -2806,8 +2953,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] and then
-    /// [`with_shared_mapping_transaction`] across the backing snapshot and
-    /// this call.
+    /// [`with_address_space_shared_mapping_transaction`] across the backing
+    /// snapshot and this call.
     pub unsafe fn map_shared_region_locked_limited(
         &self,
         region: Region,
@@ -2888,7 +3035,7 @@ impl AddressSpace {
         bypass_limit: bool,
     ) -> Result<MappingReceipt, AddressSpaceError> {
         let _vma_guard = self.vma_transaction.lock();
-        let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+        let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
         // SAFETY: both required transactions are held in documented order and
         // the caller supplies the external-backing lifetime contract.
         unsafe {
@@ -2905,8 +3052,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] and then
-    /// [`with_shared_mapping_transaction`] across the backing snapshot and
-    /// this call.
+    /// [`with_address_space_shared_mapping_transaction`] across the backing
+    /// snapshot and this call.
     pub unsafe fn replace_shared_region_locked_limited(
         &self,
         region: Region,
@@ -3539,7 +3686,6 @@ impl AddressSpace {
         {
             return Err(AddressSpaceError::Overlap);
         }
-        let add_pages = ((new_len - old_len) >> 12) as usize;
         let region = regions
             .get_mut(base.as_u64())
             .ok_or(AddressSpaceError::Unmapped)?;
@@ -3552,12 +3698,15 @@ impl AddressSpace {
         // mremap reach the kernel allocator's abort path while IRQs and the
         // address-space transaction are held. Reserve before publishing any
         // length/backing change so ENOMEM leaves the source untouched.
-        region
-            .phys
-            .try_reserve_exact(add_pages)
-            .map_err(|_| AddressSpaceError::AllocationFailed)?;
-        for _ in 0..add_pages {
-            region.phys.push(PhysAddr::new(0));
+        if !region.perms.contains(RegionPerms::FILE_DEMAND) {
+            let add_pages = ((new_len - old_len) >> 12) as usize;
+            region
+                .phys
+                .try_reserve_exact(add_pages)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            for _ in 0..add_pages {
+                region.phys.push(PhysAddr::new(0));
+            }
         }
         region.len = new_len;
         let (rb, rl) = (base.as_u64(), new_len);
@@ -3748,7 +3897,7 @@ impl AddressSpace {
                 }
             };
             if shared {
-                let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+                let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
                 relocate()
             } else {
                 relocate()
@@ -3768,9 +3917,10 @@ impl AddressSpace {
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`]. If
     /// `shared_transaction_held` is true it must additionally hold
-    /// [`with_shared_mapping_transaction`]; if false, target classification
-    /// under the VMA transaction must have proven no shared overlap. The
-    /// live-root contract from [`Self::relocate_region`] continues to apply.
+    /// [`with_address_space_shared_mapping_transaction`]; if false, target
+    /// classification under the VMA transaction must have proven no shared
+    /// overlap. The live-root contract from [`Self::relocate_region`]
+    /// continues to apply.
     pub unsafe fn relocate_region_fixed_locked_limited(
         &self,
         old_base: VirtAddr,
@@ -4131,10 +4281,10 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] followed by
-    /// [`with_shared_mapping_transaction`], and `self.root` must satisfy the
-    /// live-root contract from [`Self::relocate_region`]. External file/SysV
-    /// ownership must be moved in the same outer transaction before faults can
-    /// observe a lazy `FILE_DEMAND` destination.
+    /// [`with_address_space_shared_mapping_transaction`], and `self.root` must
+    /// satisfy the live-root contract from [`Self::relocate_region`]. External
+    /// file/SysV ownership must be moved in the same outer transaction before
+    /// faults can observe a lazy `FILE_DEMAND` destination.
     pub unsafe fn relocate_shared_region_locked_limited(
         &self,
         old_base: VirtAddr,
@@ -4214,13 +4364,24 @@ impl AddressSpace {
         let new_pages =
             usize::try_from(new_len >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
         let kept_pages = core::cmp::min(old_pages, new_pages);
+        let sparse_file = source_perms.contains(RegionPerms::FILE_DEMAND);
+        let requested_end = first
+            .checked_add(old_pages)
+            .ok_or(AddressSpaceError::AllocationFailed)?;
+        if !sparse_file && requested_end > source_region.phys.len() {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        // FILE_DEMAND backing is a materialized prefix. A selected interval
+        // may begin or end in its implicit absent tail, so copy only the
+        // prefix portion relative to the destination.
+        let materialized_end = requested_end.min(source_region.phys.len());
         let source_pages = source_region
             .phys
-            .get(first..first.saturating_add(old_pages))
+            .get(first.min(materialized_end)..materialized_end)
             .ok_or(AddressSpaceError::Unmapped)?;
         let mut source_phys = Vec::new();
         source_phys
-            .try_reserve_exact(old_pages)
+            .try_reserve_exact(source_pages.len())
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
         source_phys.extend_from_slice(source_pages);
 
@@ -4229,16 +4390,22 @@ impl AddressSpace {
         // table lock still hides them; any page-table allocation failure can
         // remove those nodes and leave the original source fully authoritative.
         let mut destination_phys = Vec::new();
+        let destination_slots = if sparse_file {
+            source_phys.len().min(kept_pages)
+        } else {
+            new_pages
+        };
         destination_phys
-            .try_reserve_exact(new_pages)
+            .try_reserve_exact(destination_slots)
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
         destination_phys.extend(source_phys.iter().take(kept_pages).copied());
-        destination_phys.resize(new_pages, PhysAddr::new(0));
+        destination_phys.resize(destination_slots, PhysAddr::new(0));
 
         let head_pages = first;
         let tail_first = first
             .checked_add(old_pages)
             .ok_or(AddressSpaceError::AllocationFailed)?;
+        let tail_len = source_region_end - old_hi;
         let tail_pages = source_region.phys.len().saturating_sub(tail_first);
         let mut head_phys = Vec::new();
         if head_pages != 0 {
@@ -4261,10 +4428,11 @@ impl AddressSpace {
         }
         let mut truncated_phys = Vec::new();
         if old_pages > kept_pages {
+            let truncated = source_phys.get(kept_pages..).unwrap_or_default();
             truncated_phys
-                .try_reserve_exact(old_pages - kept_pages)
+                .try_reserve_exact(truncated.len())
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
-            truncated_phys.extend_from_slice(&source_phys[kept_pages..]);
+            truncated_phys.extend_from_slice(truncated);
         }
 
         let destination_region = Region {
@@ -4273,9 +4441,9 @@ impl AddressSpace {
             perms: source_perms,
             phys: destination_phys,
         };
-        let tail_region = (tail_pages != 0).then(|| Region {
+        let tail_region = (tail_len != 0).then(|| Region {
             base: VirtAddr::new(old_hi),
-            len: source_region_end - old_hi,
+            len: tail_len,
             perms: source_perms,
             phys: tail_phys,
         });
@@ -4287,7 +4455,7 @@ impl AddressSpace {
         let mut leaf_phys = Vec::new();
         if tracks_resident_leaves {
             leaf_phys
-                .try_reserve_exact(new_pages)
+                .try_reserve_exact(destination_slots)
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
             for (index, &phys) in source_phys.iter().take(kept_pages).enumerate() {
                 if phys.raw() == 0 {
@@ -4315,7 +4483,7 @@ impl AddressSpace {
                     None => leaf_phys.push(PhysAddr::new(0)),
                 }
             }
-            leaf_phys.resize(new_pages, PhysAddr::new(0));
+            leaf_phys.resize(destination_slots, PhysAddr::new(0));
         }
         let destination_leaf_view = Region {
             base: new_base,
@@ -4327,7 +4495,7 @@ impl AddressSpace {
         // A contained sub-VMA move publishes the destination and, when the
         // selected interval has a suffix, one preserved tail. Reserve both
         // arena slots before installing any destination leaf.
-        regions.try_reserve_nodes(1 + usize::from(tail_pages != 0))?;
+        regions.try_reserve_nodes(1 + usize::from(tail_len != 0))?;
 
         // Publish the provisional tree nodes before the first PTE mutation.
         // They temporarily overlap the old source only inside this locked
@@ -4347,7 +4515,7 @@ impl AddressSpace {
                 let _destination = regions
                     .remove(new_lo)
                     .expect("failed shared relocation lost provisional destination");
-                if tail_pages != 0 {
+                if tail_len != 0 {
                     let _tail = regions
                         .remove(old_hi)
                         .expect("failed shared relocation lost provisional suffix");
@@ -4368,7 +4536,7 @@ impl AddressSpace {
                 let _destination = regions
                     .remove(new_lo)
                     .expect("injected shared relocation lost provisional destination");
-                if tail_pages != 0 {
+                if tail_len != 0 {
                     let _tail = regions
                         .remove(old_hi)
                         .expect("injected shared relocation lost provisional suffix");
@@ -4381,15 +4549,9 @@ impl AddressSpace {
                 return Err(AddressSpaceError::AllocationFailed);
             }
 
-            let source_view = Region {
-                base: old_base,
-                len: old_len,
-                perms: source_perms,
-                phys: Vec::new(),
-            };
             // SAFETY: names exactly the validated source interval; kept
             // translations are already installed at their new coordinates.
-            unsafe { self.unmap_region_leaves_local(&source_view) };
+            unsafe { self.unmap_virtual_range_local(old_base, old_len >> 12) };
             if tracks_resident_leaves {
                 for (index, &phys) in source_phys.iter().enumerate() {
                     if phys.raw() == 0 {
@@ -4463,7 +4625,7 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let eager_range = {
             let _vma_guard = self.vma_transaction.lock();
-            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
             // SAFETY: wrapper supplies both required transactions and forwards
             // the caller's live-root contract.
             unsafe {
@@ -4539,7 +4701,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] followed by
-    /// [`with_shared_mapping_transaction`] and uphold the live-root contract.
+    /// [`with_address_space_shared_mapping_transaction`] and uphold the
+    /// live-root contract.
     pub unsafe fn relocate_shared_region_fixed_locked_limited(
         &self,
         old_base: VirtAddr,
@@ -4620,7 +4783,7 @@ impl AddressSpace {
     ) -> Result<(), FixedRelocationError> {
         let eager_range = {
             let _vma_guard = self.vma_transaction.lock();
-            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
             // SAFETY: wrapper supplies both structural transactions and
             // forwards the caller's live-root contract.
             unsafe {
@@ -4735,15 +4898,9 @@ impl AddressSpace {
                 self.flush_region_broadcast(new_base, len >> 12);
                 return Err(error);
             }
-            let old_view = Region {
-                base: old_base,
-                len,
-                perms: source_perms,
-                phys: Vec::new(),
-            };
-            // SAFETY: old_view names exactly the source leaves; backing stays
-            // owned by `moved` throughout the transition.
-            unsafe { self.unmap_region_leaves_local(&old_view) };
+            // SAFETY: the validated interval names exactly the source leaves;
+            // backing stays owned by `moved` throughout the transition.
+            unsafe { self.unmap_virtual_range_local(old_base, len >> 12) };
             for (index, &phys) in moved.phys.iter().enumerate() {
                 if phys.raw() == 0 {
                     continue;
@@ -4914,8 +5071,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] followed by
-    /// [`with_shared_mapping_transaction`], and `self.root` must satisfy the
-    /// live-root contract from [`Self::relocate_region`].
+    /// [`with_address_space_shared_mapping_transaction`], and `self.root` must
+    /// satisfy the live-root contract from [`Self::relocate_region`].
     pub unsafe fn alias_shared_region_locked_limited(
         &self,
         source: VirtAddr,
@@ -4990,13 +5147,21 @@ impl AddressSpace {
         let first = usize::try_from((source_lo - source_region_base) >> 12)
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
         let pages = usize::try_from(len >> 12).map_err(|_| AddressSpaceError::AllocationFailed)?;
+        let sparse_file = source_perms.contains(RegionPerms::FILE_DEMAND);
+        let requested_end = first
+            .checked_add(pages)
+            .ok_or(AddressSpaceError::AllocationFailed)?;
+        if !sparse_file && requested_end > source_region.phys.len() {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let materialized_end = requested_end.min(source_region.phys.len());
         let source_phys = source_region
             .phys
-            .get(first..first.saturating_add(pages))
+            .get(first.min(materialized_end)..materialized_end)
             .ok_or(AddressSpaceError::Unmapped)?;
         let mut alias_phys = Vec::new();
         alias_phys
-            .try_reserve_exact(pages)
+            .try_reserve_exact(source_phys.len())
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
         alias_phys.extend_from_slice(source_phys);
         let alias = Region {
@@ -5011,11 +5176,11 @@ impl AddressSpace {
         let mut reserved_phys = Vec::new();
         if tracks_resident_leaves {
             leaf_phys
-                .try_reserve_exact(pages)
+                .try_reserve_exact(alias.phys.len())
                 .map_err(|_| AddressSpaceError::AllocationFailed)?;
             if mode == SharedMremapMode::Duplicate {
                 reserved_phys
-                    .try_reserve_exact(pages)
+                    .try_reserve_exact(alias.phys.len())
                     .map_err(|_| AddressSpaceError::AllocationFailed)?;
             }
             for (index, &phys) in alias.phys.iter().enumerate() {
@@ -5119,16 +5284,10 @@ impl AddressSpace {
                         }
                     }
                     SharedMremapMode::DontUnmap => {
-                        let source_view = Region {
-                            base: source,
-                            len,
-                            perms: source_perms,
-                            phys: Vec::new(),
-                        };
-                        // SAFETY: source_view names exactly the validated
-                        // source interval. Its backing remains owned by the
+                        // SAFETY: the validated interval names exactly the
+                        // source leaves. Their backing remains owned by the
                         // source Region and the newly retained alias.
-                        unsafe { self.unmap_region_leaves_local(&source_view) };
+                        unsafe { self.unmap_virtual_range_local(source, len >> 12) };
                         for (index, &phys) in leaf_view.phys.iter().enumerate() {
                             if phys.raw() == 0 {
                                 continue;
@@ -5185,7 +5344,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] followed by
-    /// [`with_shared_mapping_transaction`] and uphold the live-root contract.
+    /// [`with_address_space_shared_mapping_transaction`] and uphold the
+    /// live-root contract.
     pub unsafe fn alias_shared_region_hint_locked_limited(
         &self,
         source: VirtAddr,
@@ -5238,7 +5398,7 @@ impl AddressSpace {
     ) -> Result<(), AddressSpaceError> {
         let eager_range = {
             let _vma_guard = self.vma_transaction.lock();
-            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
             // SAFETY: this wrapper supplies both required transactions and
             // forwards the caller's live-root contract.
             unsafe {
@@ -5256,7 +5416,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] followed by
-    /// [`with_shared_mapping_transaction`] and uphold the live-root contract.
+    /// [`with_address_space_shared_mapping_transaction`] and uphold the
+    /// live-root contract.
     pub unsafe fn alias_shared_region_fixed_locked_limited(
         &self,
         source: VirtAddr,
@@ -5321,7 +5482,7 @@ impl AddressSpace {
     ) -> Result<(), FixedRelocationError> {
         let eager_range = {
             let _vma_guard = self.vma_transaction.lock();
-            let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+            let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
             // SAFETY: this wrapper supplies both required transactions and
             // forwards the caller's live-root contract.
             unsafe {
@@ -5421,10 +5582,10 @@ impl AddressSpace {
         // SHARED check and swap_remove would let a racing MAP_FIXED replace a
         // private mapping with a shared one and bypass the transaction.
         //
-        // Shared regions retain the original global transaction ordering:
-        // drop the region lock, acquire transaction -> region lock, re-find
-        // the mapping, and hold the transaction through TLB invalidation and
-        // the owner's release hook below.
+        // Shared regions retain the transaction ordering: drop the region
+        // lock, acquire this address space's shared-owner shard -> region lock,
+        // re-find the mapping, and hold both through TLB invalidation and the
+        // owner's release hook below.
         let mut regions = self.regions.lock();
         let shared = regions
             .get(base.as_u64())
@@ -5433,7 +5594,7 @@ impl AddressSpace {
             .contains(RegionPerms::SHARED);
         let _shared_transaction = if shared {
             drop(regions);
-            let transaction = SHARED_MAPPING_TRANSACTION.lock();
+            let transaction = lock_address_space_shared_mapping_transaction(self.identity());
             regions = self.regions.lock();
             Some(transaction)
         } else {
@@ -5543,7 +5704,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`] and, when
-    /// `shared_transaction_held` is true, [`with_shared_mapping_transaction`].
+    /// `shared_transaction_held` is true,
+    /// [`with_address_space_shared_mapping_transaction`].
     pub unsafe fn punch_fixed_locked_for_syscall_with_shared(
         &self,
         base: VirtAddr,
@@ -5594,7 +5756,7 @@ impl AddressSpace {
         let _shared_transaction = if shared && !shared_transaction_held {
             drop(regions);
             drop(huge);
-            let transaction = SHARED_MAPPING_TRANSACTION.lock();
+            let transaction = lock_address_space_shared_mapping_transaction(self.identity());
             huge = self.huge_regions.lock();
             regions = self.regions.lock();
             Some(transaction)
@@ -5620,6 +5782,37 @@ impl AddressSpace {
             overlaps && !(lo <= rb && hi >= re)
         }) {
             return Err(AddressSpaceError::AlignmentMismatch);
+        }
+
+        // `munmap(addr, vma_len)` is overwhelmingly the common case (glibc
+        // malloc arenas and short-lived file mappings both use it). Once the
+        // exact node and an empty huge/swap intersection are known under the
+        // same locks, no split can occur and therefore none of the fallible
+        // scratch plan below is needed. This is the same semantic operation
+        // as `unmap_region`, kept here so syscall-side file-owner retirement
+        // remains in the enclosing VMA transaction.
+        let exact_regular = !huge.iter().any(|region| {
+            let rb = region.base.as_u64();
+            let re = rb.saturating_add(region.len);
+            re > lo && rb < hi
+        }) && regions.get(lo).is_some_and(|region| region.len == len);
+        if exact_regular {
+            let region = regions
+                .remove(lo)
+                .expect("exact VMA disappeared under region lock");
+            if self.root.as_u64() != 0 {
+                // SAFETY: the removed node's authoritative backing remains
+                // owned by `region`, and both structural locks still exclude
+                // a replacement until every local leaf has been retired.
+                unsafe { self.unmap_region_leaves_local(&region) };
+            }
+            drop(regions);
+            drop(huge);
+            self.flush_region_broadcast(region.base, region.len >> 12);
+            if self.root.as_u64() != 0 {
+                self.free_region_frames(&region);
+            }
+            return Ok(());
         }
 
         // Build the complete proportional scratch plan before retiring a huge
@@ -5693,6 +5886,9 @@ impl AddressSpace {
                 .iter()
                 .filter(|phys| phys.raw() != 0)
                 .count();
+            punched_pages = punched_pages
+                .checked_add(resident as u64)
+                .ok_or(AddressSpaceError::OutOfRange)?;
             if old.perms.contains(RegionPerms::SHARED) {
                 shared_release_count = shared_release_count
                     .checked_add(resident)
@@ -5703,7 +5899,6 @@ impl AddressSpace {
                     .ok_or(AddressSpaceError::AllocationFailed)?;
             }
         }
-
         let mut kept_regions = Vec::new();
         kept_regions
             .try_reserve_exact(replacement_count)
@@ -5716,7 +5911,6 @@ impl AddressSpace {
         shared_to_release
             .try_reserve_exact(shared_release_count)
             .map_err(|_| AddressSpaceError::AllocationFailed)?;
-
         // Every preserved prefix/suffix is published only after the original
         // nodes and leaves have been retired. Prepare their arena capacity
         // while the old topology is still authoritative.
@@ -5876,32 +6070,16 @@ impl AddressSpace {
                 let total = (old.len >> 12) as usize;
                 let first = ((lo.max(rb) - rb) >> 12) as usize;
                 let last = (((hi.min(re) - rb) >> 12) as usize).min(total);
-                #[cfg(target_arch = "x86_64")]
-                if self.root.as_u64() != 0 && first < last {
-                    let start = VirtAddr::new(rb + first as u64 * 4096);
-                    // SAFETY: the range is the page-aligned intersection of
-                    // the live region and the punch window. The address-space
-                    // region lock prevents a concurrent replacement while the
-                    // range helper holds the root's PTE mutation lock once.
-                    let _ = unsafe {
-                        crate::x86_64::paging::unmap_4kb_local_range(
-                            self.root,
-                            start,
-                            (last - first) as u64,
-                        )
-                    };
-                }
-                #[cfg(target_arch = "aarch64")]
-                if self.root.as_u64() != 0 && first < last {
-                    let start = VirtAddr::new(rb + first as u64 * 4096);
-                    // SAFETY: same transaction and range proof as the x86_64
-                    // arm; aarch64 performs the shareable TLBI in hardware.
-                    let _ = unsafe {
-                        crate::aarch64::paging::unmap_4kb_range(
-                            self.root,
-                            start,
-                            (last - first) as u64,
-                        )
+                let leaf_last = last.min(old.phys.len());
+                let leaf_first = first.min(leaf_last);
+                if self.root.as_u64() != 0 && leaf_first < leaf_last {
+                    let start = VirtAddr::new(rb + leaf_first as u64 * 4096);
+                    // SAFETY: this is the page-aligned intersection of the
+                    // live region's authoritative backing and the punch
+                    // window. The region lock prevents replacement while the
+                    // helper clears each resident run.
+                    unsafe {
+                        self.unmap_backing_leaves_local(start, &old.phys[leaf_first..leaf_last])
                     };
                 }
             }
@@ -6157,24 +6335,82 @@ impl AddressSpace {
     /// must be a valid root and `region`'s pages were installed via it.
     #[cfg(target_arch = "x86_64")]
     unsafe fn unmap_region_leaves_local(&self, region: &Region) {
-        let pages = (region.len + 0xFFF) >> 12;
-        // SAFETY: contract documented on the function. The range helper keeps
-        // the existing per-leaf walk + INVLPG semantics but acquires the
-        // per-root page-table mutation lock once for the complete region.
-        let _ =
-            unsafe { crate::x86_64::paging::unmap_4kb_local_range(self.root, region.base, pages) };
+        // SAFETY: contract documented on the function; `region.phys` is the
+        // authoritative list of leaves which can exist.
+        unsafe { self.unmap_backing_leaves_local(region.base, &region.phys) };
     }
 
     #[cfg(target_arch = "aarch64")]
     unsafe fn unmap_region_leaves_local(&self, region: &Region) {
-        let pages = (region.len + 0xFFF) >> 12;
-        // SAFETY: see the x86_64 variant. aarch64's helper broadcasts the
-        // complete range in hardware with one barrier pair.
-        let _ = unsafe { crate::aarch64::paging::unmap_4kb_range(self.root, region.base, pages) };
+        // SAFETY: see the x86_64 variant.
+        unsafe { self.unmap_backing_leaves_local(region.base, &region.phys) };
     }
 
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe fn unmap_region_leaves_local(&self, _region: &Region) {}
+
+    /// Tear down only runs whose authoritative backing contains a resident
+    /// frame. Sparse anonymous mappings may have a long zero-filled metadata
+    /// prefix when their first fault lands far from the VMA base; walking a
+    /// page-table leaf for every such zero made `munmap` proportional to the
+    /// virtual allocation size. Linux's unmap walk skips absent upper-level
+    /// tables and consecutive empty PTEs. Grouping the non-zero slots gives
+    /// NARF the same shape while retaining the existing range helpers and TLB
+    /// ordering for every leaf that can actually be present.
+    ///
+    /// # Safety
+    /// `self.root` must be live and identity-reachable, and `backing` must stay
+    /// authoritative for the supplied virtual window through the call.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe fn unmap_backing_leaves_local(&self, base: VirtAddr, backing: &[PhysAddr]) {
+        let mut cursor = 0usize;
+        while cursor < backing.len() {
+            while cursor < backing.len() && backing[cursor].raw() == 0 {
+                cursor += 1;
+            }
+            let start = cursor;
+            while cursor < backing.len() && backing[cursor].raw() != 0 {
+                cursor += 1;
+            }
+            if start == cursor {
+                break;
+            }
+            let Some(offset) = (start as u64).checked_mul(4096) else {
+                return;
+            };
+            let Some(run_base) = base.as_u64().checked_add(offset) else {
+                return;
+            };
+            let pages = (cursor - start) as u64;
+            // SAFETY: the run is page-aligned, names authoritative live
+            // backing, and inherits the caller's live-root contract.
+            unsafe { self.unmap_virtual_range_local(VirtAddr::new(run_base), pages) };
+        }
+    }
+
+    /// Tear down every leaf descriptor in an explicit virtual interval. This
+    /// is distinct from [`Self::unmap_backing_leaves_local`]: relocation paths
+    /// can transfer backing out of their source metadata before retiring its
+    /// still-live leaves, so a synthetic empty backing vector cannot describe
+    /// whether the source page table is populated.
+    ///
+    /// # Safety
+    /// `self.root` must be live and identity-reachable, and the interval must
+    /// remain owned by this address-space transaction through the call.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    unsafe fn unmap_virtual_range_local(&self, base: VirtAddr, pages: u64) {
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: caller supplies the live-root and interval proof.
+            let _ = unsafe { crate::x86_64::paging::unmap_4kb_local_range(self.root, base, pages) };
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            // SAFETY: same contract as the x86_64 arm; the architecture
+            // helper supplies the shareable invalidation.
+            let _ = unsafe { crate::aarch64::paging::unmap_4kb_range(self.root, base, pages) };
+        }
+    }
 
     /// Install every resident leaf of one already-validated region without
     /// consulting or locking the region table. Callers hold the table lock so
@@ -6478,7 +6714,7 @@ impl AddressSpace {
             let last = ((end - rb) >> 12) as usize;
             for index in first..last {
                 let out = ((rb + index as u64 * 4096 - lo) >> 12) as usize;
-                let phys = region.phys[index];
+                let phys = region.phys.get(index).copied().unwrap_or(PhysAddr::new(0));
                 let va = VirtAddr::new(rb + index as u64 * 4096);
                 let resident = if phys.raw() == 0 {
                     false
@@ -6666,24 +6902,40 @@ impl AddressSpace {
         repair_backed: impl FnOnce(PhysAddr, RegionPerms) -> Result<(), AddressSpaceError>,
     ) -> Result<DemandPageClaim, AddressSpaceError> {
         let mut regions = self.regions.lock();
-        let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
-        let rb = region.base.as_u64();
-        if region.perms.prot_only().0 == 0 {
-            return Err(AddressSpaceError::Unmapped);
-        }
-        let index = ((v - rb) >> 12) as usize;
-        // `containing(v)` proved the page lies in this region, so `index` is a
-        // valid page. A demand-paged heap or stack can grow its VMA without
-        // materializing per-page phys slots, so an index past the materialized
-        // prefix is an unfaulted demand-zero page, just like `phys[i] == 0`.
-        let phys = region.phys.get(index).copied().unwrap_or(PhysAddr::new(0));
-        let perms = region.perms;
+        let (index, phys, perms) = {
+            let region = regions.containing(v).ok_or(AddressSpaceError::Unmapped)?;
+            let rb = region.base.as_u64();
+            if region.perms.prot_only().0 == 0 {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            let index = ((v - rb) >> 12) as usize;
+            // `containing(v)` proved the page lies in this region, so `index`
+            // is valid. A sparse demand region treats a missing prefix entry
+            // exactly like an explicit zero slot.
+            let phys = region.phys.get(index).copied().unwrap_or(PhysAddr::new(0));
+            (index, phys, region.perms)
+        };
         if phys.raw() != 0 {
             repair_backed(phys, perms)?;
             return Ok(DemandPageClaim::Resolved);
         }
         if regions.demand_pages.get(v).is_some() {
             return Ok(DemandPageClaim::InProgress);
+        }
+        // Reserve the authoritative slot before the filesystem hook can take
+        // an external page-cache reference. If metadata growth fails, no
+        // owner outside memory has observed the fault; once the hook returns,
+        // finish_demand_page is allocation-free and can publish or reject it.
+        let region = regions
+            .containing_backing_mut(v)
+            .ok_or(AddressSpaceError::Unmapped)?;
+        if index >= region.phys.len() {
+            let additional = index + 1 - region.phys.len();
+            region
+                .phys
+                .try_reserve_exact(additional)
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            region.phys.resize(index + 1, PhysAddr::new(0));
         }
         let ticket = regions.demand_pages.insert_new(v)?;
         Ok(DemandPageClaim::Owner {
@@ -6712,16 +6964,12 @@ impl AddressSpace {
         };
         let rb = region.base.as_u64();
         let index = ((v - rb) >> 12) as usize;
-        // Grow the materialized phys prefix to cover this page for a demand-paged
-        // region whose phys list is shorter than its length (heap or stack):
-        // growth extended only the VMA, so the first fault of each page installs
-        // its slot here. Intermediate pages fill with demand-zero sentinels,
-        // keeping every page independently faultable. Sequential touches are
-        // amortized O(1) per fault.
-        if index >= region.phys.len() {
-            region.phys.resize(index + 1, PhysAddr::new(0));
-        }
-        let slot = &mut region.phys[index];
+        // claim_demand_page reserved this slot before it dropped the lock and
+        // entered an allocator or filesystem callback.
+        let Some(slot) = region.phys.get_mut(index) else {
+            regions.demand_pages.remove(v);
+            return Ok(false);
+        };
         if slot.raw() != 0 {
             regions.demand_pages.remove(v);
             return Ok(false);
@@ -9106,7 +9354,9 @@ impl AddressSpace {
     /// moved it, return `StaleMapping` without touching the peer's mapping.
     pub fn rollback_mapping(&self, receipt: MappingReceipt) -> Result<(), AddressSpaceError> {
         let _vma_guard = self.vma_transaction.lock();
-        let _shared_guard = receipt.shared.then(|| SHARED_MAPPING_TRANSACTION.lock());
+        let _shared_guard = receipt
+            .shared
+            .then(|| lock_address_space_shared_mapping_transaction(self.identity()));
         // SAFETY: both structural transactions required by the receipt's
         // sharedness are held in canonical VMA -> shared order.
         unsafe { self.rollback_mapping_locked(receipt) }
@@ -9116,7 +9366,8 @@ impl AddressSpace {
     ///
     /// # Safety
     /// The caller must hold [`Self::with_vma_transaction`]. If `receipt` names
-    /// a shared VMA, it must then hold [`with_shared_mapping_transaction`].
+    /// a shared VMA, it must then hold
+    /// [`with_address_space_shared_mapping_transaction`].
     pub unsafe fn rollback_mapping_locked(
         &self,
         receipt: MappingReceipt,
@@ -9502,7 +9753,7 @@ impl AddressSpace {
         // huge metadata are owned snapshots; backing allocation/copy below
         // must not run with this IRQ-safe lock held.
         let vma_guard = self.vma_transaction.lock();
-        let _shared_guard = SHARED_MAPPING_TRANSACTION.lock();
+        let _shared_guard = lock_address_space_shared_mapping_transaction(self.identity());
 
         // Mark every private region as potentially COW-shared. Keep its POSIX
         // WRITE permission authoritative; the PTE derivation consults this
@@ -9635,8 +9886,8 @@ impl AddressSpace {
         }
         // All externally-owned regular aliases are now retained by the child.
         // Huge allocations and multi-megabyte copies below neither consult nor
-        // publish shared-owner state and must not run with this global IRQ-safe
-        // transaction held.
+        // publish shared-owner state and must not run with this IRQ-safe shard
+        // held.
         drop(_shared_guard);
 
         // Private hugetlb mappings are copied eagerly. The hugepage pool has
@@ -10990,7 +11241,8 @@ impl Drop for AddressSpace {
             // have been drained, last-Arc ownership prevents any new alias
             // from appearing and intermediate page-table reclaim needs no
             // shared-mapping exclusion.
-            let _shared_transaction = SHARED_MAPPING_TRANSACTION.lock();
+            let _shared_transaction =
+                lock_address_space_shared_mapping_transaction(self.identity());
             let huge_regions = core::mem::take(&mut *self.huge_regions.lock());
             for region in huge_regions {
                 let page_size = match region.size {
@@ -11318,6 +11570,252 @@ fn smoke_memory_numa_candidate_seeks_from_cursor() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_numa_candidate_seeks_from_cursor);
 
+/// Merge-eligible private-anonymous region for the coalescing smokes below.
+/// `phys` may be any materialized prefix of `pages`: shorter than `pages`
+/// (sparse), empty (fully lazy), or exactly `pages` (fully materialized).
+fn merge_test_region(base: u64, pages: u64, phys: Vec<PhysAddr>) -> Region {
+    Region {
+        base: VirtAddr::new(base),
+        len: pages * 4096,
+        perms: RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE,
+        phys,
+    }
+}
+
+/// Every resident frame paired with the virtual page that reaches it, in
+/// ascending virtual order. Missing-tail and explicit-zero prefix slots are
+/// demand-zero, not frames, so they carry no placement to preserve.
+fn resident_frame_placement(table: &RegionTable) -> Vec<(u64, u64)> {
+    let mut placement = Vec::new();
+    for region in table.iter() {
+        for (index, phys) in region.phys.iter().enumerate() {
+            if phys.raw() != 0 {
+                placement.push((phys.raw(), region.base.as_u64() + index as u64 * 4096));
+            }
+        }
+    }
+    placement
+}
+
+/// Insert `regions`, coalesce around `merge_base`, and require every resident
+/// frame to still be reachable at its pre-merge virtual page. Placement
+/// preservation is the coalescing invariant: `phys` is a positional prefix,
+/// so a merge that concatenates prefixes without padding a short destination
+/// would silently retarget the source's frames.
+fn coalesce_preserving_placement(
+    regions: Vec<Region>,
+    merge_base: u64,
+) -> Result<RegionTable, &'static str> {
+    let mut table = RegionTable::new();
+    for region in regions {
+        if table
+            .insert(region)
+            .expect("merge test RegionIndex reservation")
+            .is_some()
+        {
+            return Err("merge test regions share a base");
+        }
+    }
+    let before = resident_frame_placement(&table);
+    table.coalesce_anonymous_around(merge_base);
+    if resident_frame_placement(&table) != before {
+        return Err("coalescing moved a resident frame to a different virtual page");
+    }
+    Ok(table)
+}
+
+/// `(region count, len, raw phys prefix)` of the region at `base`.
+fn merged_shape(table: &RegionTable, base: u64) -> Option<(usize, u64, Vec<u64>)> {
+    let count = table.iter().count();
+    table.get(base).map(|region| {
+        (
+            count,
+            region.len,
+            region.phys.iter().map(|p| p.raw()).collect(),
+        )
+    })
+}
+
+/// A fully materialized destination absorbs a sparse source by plain append:
+/// every source frame's offset from the destination end equals its offset in
+/// the source, and the merged prefix stays shorter than the merged region.
+fn smoke_memory_anon_merge_full_destination_absorbs_sparse_source() -> TestResult {
+    let base = 0x0000_0081_0000_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(
+                base,
+                2,
+                alloc::vec![PhysAddr::new(0x41_000), PhysAddr::new(0x42_000)],
+            ),
+            merge_test_region(base + 0x2000, 3, alloc::vec![PhysAddr::new(0x43_000)]),
+        ],
+        base + 0x2000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x41_000, 0x42_000, 0x43_000]))
+    {
+        return TestResult::Fail("full destination did not append the sparse source prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_full_destination_absorbs_sparse_source
+);
+
+/// A fully lazy source (empty prefix) merges into a sparse destination
+/// without padding: the destination prefix is untouched and every page the
+/// source contributed stays demand-zero behind it.
+fn smoke_memory_anon_merge_lazy_source_leaves_sparse_destination() -> TestResult {
+    let base = 0x0000_0081_0100_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x44_000)]),
+            merge_test_region(base + 0x3000, 2, Vec::new()),
+        ],
+        base + 0x3000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 5 * 4096, alloc::vec![0x44_000])) {
+        return TestResult::Fail("lazy source merge disturbed the sparse destination prefix");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_lazy_source_leaves_sparse_destination
+);
+
+/// A source with resident frames merges into a sparse destination by
+/// zero-padding the destination prefix out to its page count first; the
+/// source frames then land at their original virtual pages past the pad.
+fn smoke_memory_anon_merge_pads_sparse_destination_for_resident_source() -> TestResult {
+    let base = 0x0000_0081_0200_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 3, alloc::vec![PhysAddr::new(0x45_000)]),
+            merge_test_region(
+                base + 0x3000,
+                2,
+                alloc::vec![PhysAddr::new(0x46_000), PhysAddr::new(0x47_000)],
+            ),
+        ],
+        base + 0x3000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base)
+        != Some((1, 5 * 4096, alloc::vec![0x45_000, 0, 0, 0x46_000, 0x47_000]))
+    {
+        return TestResult::Fail("sparse destination was not zero-padded before the append");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_sparse_destination_for_resident_source
+);
+
+/// The successor direction pads too: a sparse current region absorbing a
+/// materialized successor gains explicit zero slots for its own demand-zero
+/// tail so the successor's frames keep their virtual pages.
+fn smoke_memory_anon_merge_pads_sparse_current_for_resident_successor() -> TestResult {
+    let base = 0x0000_0081_0300_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 2, alloc::vec![PhysAddr::new(0x48_000)]),
+            merge_test_region(
+                base + 0x2000,
+                2,
+                alloc::vec![PhysAddr::new(0x49_000), PhysAddr::new(0x4A_000)],
+            ),
+        ],
+        base,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base)
+        != Some((1, 4 * 4096, alloc::vec![0x48_000, 0, 0x49_000, 0x4A_000]))
+    {
+        return TestResult::Fail("sparse current region was not zero-padded for its successor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_sparse_current_for_resident_successor
+);
+
+/// Three-way merge where the predecessor absorption grows the destination:
+/// the successor's padding target is the post-growth page count (predecessor
+/// pages + current pages), not the predecessor's original size.
+fn smoke_memory_anon_merge_pads_grown_destination_before_successor() -> TestResult {
+    let base = 0x0000_0081_0400_0000u64;
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, 1, alloc::vec![PhysAddr::new(0x4B_000)]),
+            merge_test_region(base + 0x1000, 2, Vec::new()),
+            merge_test_region(base + 0x3000, 1, alloc::vec![PhysAddr::new(0x4C_000)]),
+        ],
+        base + 0x1000,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if merged_shape(&table, base) != Some((1, 4 * 4096, alloc::vec![0x4B_000, 0, 0, 0x4C_000])) {
+        return TestResult::Fail("successor padding ignored the predecessor-merge growth");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_pads_grown_destination_before_successor
+);
+
+/// Coalescing is best-effort: when the padding reservation cannot be
+/// satisfied (here a sparse destination whose zero-pad would need terabytes),
+/// the merge declines before removing anything and both VMAs survive with
+/// their original shapes and frame placement.
+fn smoke_memory_anon_merge_reserve_failure_leaves_regions_intact() -> TestResult {
+    let base = 0x0000_0081_0500_0000u64;
+    let huge_pages = 1u64 << 40;
+    let source_base = base + (huge_pages << 12);
+    let table = match coalesce_preserving_placement(
+        alloc::vec![
+            merge_test_region(base, huge_pages, alloc::vec![PhysAddr::new(0x4D_000)]),
+            merge_test_region(source_base, 1, alloc::vec![PhysAddr::new(0x4E_000)]),
+        ],
+        source_base,
+    ) {
+        Ok(table) => table,
+        Err(reason) => return TestResult::Fail(reason),
+    };
+    if table.iter().count() != 2 {
+        return TestResult::Fail("a failed padding reservation still merged the VMAs");
+    }
+    let destination_intact = table
+        .get(base)
+        .is_some_and(|region| region.len == huge_pages << 12 && region.phys.len() == 1);
+    let source_intact = table
+        .get(source_base)
+        .is_some_and(|region| region.len == 4096 && region.phys.len() == 1);
+    if !destination_intact || !source_intact {
+        return TestResult::Fail("a declined merge changed a region's shape");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_anon_merge_reserve_failure_leaves_regions_intact
+);
+
 /// Demand ownership is page-scoped, and removing/replacing a VMA cancels an
 /// outstanding ticket before its slow path can publish into the new mapping.
 fn smoke_memory_demand_tickets_are_page_scoped() -> TestResult {
@@ -11594,12 +12092,12 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
     let vbase = 0x0000_0080_0000_0000u64;
     if a.map_region(Region {
         base: VirtAddr::new(vbase),
-        len: 0x2000,
+        len: 0x4000,
         perms: RegionPerms::READ
             | RegionPerms::WRITE
             | RegionPerms::SHARED
             | RegionPerms::FILE_DEMAND,
-        phys: alloc::vec![PhysAddr::new(0); 2],
+        phys: Vec::new(),
     })
     .is_err()
     {
@@ -11607,21 +12105,24 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
         return TestResult::Fail("map_region rejected a FILE_DEMAND region");
     }
 
-    TEST_FAULT_PAGE.store(vbase, Ordering::Relaxed);
+    let fault_page = vbase + 0x3000;
+    TEST_FAULT_PAGE.store(fault_page, Ordering::Relaxed);
     TEST_FAULT_FRAME.store(phys.raw(), Ordering::Relaxed);
     TEST_FAULT_CALLS.store(0, Ordering::Relaxed);
     arm_test_file_fault_hook();
 
     // SAFETY: `a` is a live user root from `new_for_user`; the identity map is
     // up and the frame allocator is initialised.
-    let served = unsafe { a.demand_alloc_page(VirtAddr::new(vbase + 0x40)) };
+    let served = unsafe { a.demand_alloc_page(VirtAddr::new(fault_page + 0x40)) };
     let slot = a
         .lookup(VirtAddr::new(vbase))
-        .and_then(|r| r.phys.first().copied());
-    let mapped = translate_is_mapped(&a, VirtAddr::new(vbase));
-    let untouched = a
-        .lookup(VirtAddr::new(vbase))
-        .and_then(|r| r.phys.get(1).copied());
+        .and_then(|r| r.phys.get(3).copied());
+    let mapped = translate_is_mapped(&a, VirtAddr::new(fault_page));
+    let untouched = a.lookup(VirtAddr::new(vbase)).is_some_and(|r| {
+        r.phys
+            .get(..3)
+            .is_some_and(|prefix| prefix.iter().all(|phys| phys.raw() == 0))
+    });
 
     let mut verdict = if served.is_err() {
         TestResult::Fail("a FILE_DEMAND fault was not served by the hook")
@@ -11631,9 +12132,9 @@ fn smoke_memory_file_demand_page_comes_from_the_hook() -> TestResult {
         TestResult::Fail("the region does not hold the frame the hook named")
     } else if !mapped {
         TestResult::Fail("the fault installed no leaf PTE")
-    } else if untouched != Some(PhysAddr::new(0)) {
+    } else if !untouched {
         // A routing that populated the whole region would defeat demand paging.
-        TestResult::Fail("an untouched page of the region was backed anyway")
+        TestResult::Fail("the sparse prefix did not preserve untouched pages")
     } else {
         TestResult::Pass
     };
@@ -11680,7 +12181,7 @@ fn smoke_memory_file_demand_refusal_is_a_segv() -> TestResult {
             | RegionPerms::WRITE
             | RegionPerms::SHARED
             | RegionPerms::FILE_DEMAND,
-        phys: alloc::vec![PhysAddr::new(0)],
+        phys: Vec::new(),
     })
     .is_err()
     {

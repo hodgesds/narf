@@ -225,6 +225,56 @@ fn smoke_memfs_nested_dirs_lookup() -> TestResult {
 }
 kernel_test_in!("filesystem/memfs", smoke_memfs_nested_dirs_lookup);
 
+/// Successful subdirectory lookups enter the per-CPU read cache. Warm each
+/// name before mutating it so this test proves rename/rmdir generations reject
+/// stale cache entries rather than merely exercising the BTreeMap slow path.
+fn smoke_memfs_dir_cache_invalidates_mutations() -> TestResult {
+    let fs = MemFs::new("memfs-dir-cache");
+    let root = fs.root();
+
+    let original = match poll_once(root.mkdir("old")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir old failed"),
+    };
+    let original_ino = original.ino();
+    if root.lookup_dir("old").is_none() || root.lookup_dir("old").is_none() {
+        return TestResult::Fail("could not warm old directory lookup");
+    }
+
+    if poll_once(root.rename("old", "new")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("directory rename failed");
+    }
+    if root.lookup_dir("old").is_some() {
+        return TestResult::Fail("cached old name survived rename");
+    }
+    if root.lookup_dir("new").map(|dir| dir.ino()) != Some(original_ino) {
+        return TestResult::Fail("renamed directory missing or changed identity");
+    }
+
+    if poll_once(root.rmdir("new")).map(|result| result.is_ok()) != Some(true) {
+        return TestResult::Fail("rmdir new failed");
+    }
+    if root.lookup_dir("new").is_some() {
+        return TestResult::Fail("cached directory survived rmdir");
+    }
+
+    let replacement = match poll_once(root.mkdir("new")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("replacement mkdir failed"),
+    };
+    if replacement.ino() == original_ino
+        || root.lookup_dir("new").map(|dir| dir.ino()) != Some(replacement.ino())
+    {
+        return TestResult::Fail("recreated name resolved to stale cached directory");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/memfs",
+    smoke_memfs_dir_cache_invalidates_mutations
+);
+
 // ── Smoke 4: directory listing via DirOps::enumerate ──────────────────
 //
 // Create two files and one subdir at the root, then enumerate and verify
@@ -526,6 +576,45 @@ fn smoke_memfs_truncate_grow_shrink() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/memfs", smoke_memfs_truncate_grow_shrink);
+
+fn smoke_memfs_mmap_generation_tracks_content_and_length() -> TestResult {
+    const KEEP_SIZE: u32 = 0x01;
+    const PUNCH_HOLE: u32 = 0x02;
+    let fs = MemFs::new("memfs-mmap-generation");
+    let file = match poll_once(fs.root().create("mapped")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create mapped file failed"),
+    };
+    let initial = file.mmap_cache_generation();
+    if initial.is_none() || poll_once(file.write(0, b"page")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("memfs did not opt into mmap generation tracking");
+    }
+    let after_write = file.mmap_cache_generation();
+    if after_write == initial || poll_once(file.truncate(8192)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("write did not advance mmap generation");
+    }
+    let after_truncate = file.mmap_cache_generation();
+    if after_truncate == after_write
+        || poll_once(file.fallocate(KEEP_SIZE, 4096, 4096)).map(|r| r.is_ok()) != Some(true)
+    {
+        return TestResult::Fail("truncate did not advance mmap generation");
+    }
+    let after_fallocate = file.mmap_cache_generation();
+    if after_fallocate == after_truncate
+        || poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, 4096)).map(|r| r.is_ok())
+            != Some(true)
+    {
+        return TestResult::Fail("fallocate did not advance mmap generation");
+    }
+    if file.mmap_cache_generation() == after_fallocate {
+        return TestResult::Fail("hole punch did not advance mmap generation");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/memfs",
+    smoke_memfs_mmap_generation_tracks_content_and_length
+);
 
 // ── Smoke 9: distinct inodes (rm_rf / DSO-dedup hazard guard) ──────────
 //

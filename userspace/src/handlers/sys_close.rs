@@ -14,7 +14,9 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
     let ops = &entry.ops;
     // Linux invokes the filesystem flush hook for each closing file
     // description. The descriptor remains removed even if flushing fails.
-    let _ = poll_blocking(ops.flush());
+    if ops.has_flush() {
+        let _ = poll_blocking(ops.flush());
+    }
     if let Some(sock) = ops
         .as_any()
         .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
@@ -39,7 +41,7 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
     // inotify: IN_CLOSE_WRITE for the file (before we drop its path),
     // then forget the fd → path mapping.
     {
-        crate::mqueue::notify_close_fd(task, fd);
+        crate::mqueue::notify_close_fd(task, fd, ops.mq_queue_id());
         crate::mqueue::forget_fd_path(task, fd);
     }
     ctx.set_return(SyscallReturn::ok(0));

@@ -4,9 +4,9 @@
 //! (`unlink`, `create`, `mkdir`, `rmdir`, `rename`, `symlink`).
 //! Designed for the `/tmp` mount in the validate harness — small
 //! files, nested directories, no persistence. Concurrency: a single
-//! `IrqSafeSpinLock` per directory over the entry map; mutations are
-//! serialised through it. The validate harness is single-threaded so
-//! this is uncontended.
+//! `IrqSafeSpinLock` per directory keeps mutations atomic, while successful
+//! subdirectory reads use generation-validated per-CPU weak entries instead
+//! of serializing on that writer lock.
 //!
 //! Layout: each directory owns a `BTreeMap<String, Entry>` of refcounted
 //! files, directories, links, FIFOs, and special nodes. `MemFile` carries a
@@ -23,7 +23,7 @@
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
@@ -934,6 +934,10 @@ struct MemFile {
     /// lock, per the heap-margin note above. Stamped by `write` and set
     /// explicitly through `FileOps::set_times` (utimensat/utime/utimes).
     mtime_ns: AtomicU64,
+    /// Content/length generation used by the generic shared-mmap page cache.
+    /// Zero is never published, so wrap simply skips it. A cache entry is
+    /// reusable after its final unmap only while this generation matches.
+    mmap_generation: AtomicU64,
     /// True when this node is a bound AF_UNIX socket (created by `bind()`
     /// on a pathname address). `stat`/`enumerate` then report S_IFSOCK so
     /// `stat`/`[ -S ]`/`ls -l`/`unlink` on the socket path behave like
@@ -953,15 +957,26 @@ impl MemFile {
     }
 
     fn new(superblock: &Arc<MemSuper>, bytes: &[u8]) -> Result<Self, FsError> {
-        let inode_lease = superblock.reserve_inode(0, 0)?;
+        Self::new_with_attrs(superblock, bytes, DEFAULT_PERMS, 0, 0)
+    }
+
+    fn new_with_attrs(
+        superblock: &Arc<MemSuper>,
+        bytes: &[u8],
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Self, FsError> {
+        let inode_lease = superblock.reserve_inode(uid, gid)?;
         let file = MemFile {
             ino: alloc_ino(),
             data: IrqSafeSpinLock::new(FileData::default()),
             _inode_lease: inode_lease,
-            perms: AtomicU32::new(DEFAULT_PERMS as u32),
-            uid: AtomicU32::new(0),
-            gid: AtomicU32::new(0),
+            perms: AtomicU32::new((perms & 0o7777) as u32),
+            uid: AtomicU32::new(uid),
+            gid: AtomicU32::new(gid),
             mtime_ns: AtomicU64::new(0),
+            mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
         };
@@ -985,6 +1000,7 @@ impl MemFile {
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
             mtime_ns: AtomicU64::new(0),
+            mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
         };
@@ -1003,6 +1019,7 @@ impl MemFile {
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
             mtime_ns: AtomicU64::new(0),
+            mmap_generation: AtomicU64::new(1),
             sock: true,
             xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
         })
@@ -1015,6 +1032,14 @@ impl MemFile {
         let w = narf_time::now_wall();
         let ns = (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64;
         self.mtime_ns.store(ns, Ordering::Relaxed);
+    }
+
+    fn bump_mmap_generation(&self) {
+        let _ = self
+            .mmap_generation
+            .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
+                Some(value.wrapping_add(1).max(1))
+            });
     }
 
     fn alloc_zero_page() -> Result<Box<[u8]>, FsError> {
@@ -1079,6 +1104,10 @@ impl MemFile {
             copied += chunk;
         }
         data.len = core::cmp::max(data.len, end);
+        // Publish the new generation before the data lock opens. A mapper
+        // which observes the mutated bytes can therefore never validate an
+        // idle fallback page against the preceding generation.
+        self.bump_mmap_generation();
         drop(data);
         self.touch_mtime_now();
         Ok(buf.len())
@@ -1107,6 +1136,7 @@ impl MemFile {
                 }
             }
         }
+        self.bump_mmap_generation();
         drop(data);
         self._inode_lease.superblock.release_blocks(
             self.uid.load(Ordering::Relaxed),
@@ -1375,6 +1405,7 @@ impl FileOps for MemFile {
             // Extending a tmpfs file creates a hole. No page/block is charged
             // until a write or fallocate materialises it.
             data.len = len;
+            self.bump_mmap_generation();
             drop(data);
             self.touch_mtime_now();
             Ok(())
@@ -1493,13 +1524,29 @@ impl FileOps for MemFile {
                 position += count as u64;
             }
             let mut data = self.data.lock();
-            data.len = if mode & KEEP_SIZE != 0 {
+            let new_len = if mode & KEEP_SIZE != 0 {
                 old_len
             } else {
                 core::cmp::max(old_len, end)
             };
+            // Plain fallocate over already-backed bytes is a semantic no-op.
+            // Linux leaves both the inode contents and its page-cache folios
+            // valid in that case; invalidating NARF's mmap cache here forced
+            // the next mapper to re-read and re-snapshot an unchanged page.
+            // A write_inner call above already advanced the generation while
+            // holding this same data lock. Only a pure EOF extension still
+            // needs a generation change here.
+            if data.len != new_len {
+                data.len = new_len;
+                self.bump_mmap_generation();
+            }
+            drop(data);
             Ok(())
         })
+    }
+
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        Some(self.mmap_generation.load(Ordering::Acquire))
     }
 
     fn seek<'a>(&'a self, offset: u64, whence: u32) -> FsFuture<'a, u64> {
@@ -1758,6 +1805,41 @@ enum Entry {
     Fifo(Arc<MemFifo>),
 }
 
+// Linux's dcache hashes directory/name pairs and performs the common lookup
+// without serializing all readers on the inode lock. MemFs keeps its mutable
+// BTreeMap authoritative, but remembers successful subdirectory lookups in a
+// bounded per-CPU cache. Entries hold Weak references so an unlinked directory
+// still releases its inode/quota when the last real user goes away.
+const MEMDIR_CACHE_WAYS: usize = 8;
+
+struct MemDirCacheEntry {
+    parent_ino: u64,
+    generation: u64,
+    name: String,
+    dir: Weak<MemDir>,
+}
+
+struct MemDirCache {
+    entries: [Option<MemDirCacheEntry>; MEMDIR_CACHE_WAYS],
+    replace: usize,
+}
+
+impl MemDirCache {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; MEMDIR_CACHE_WAYS],
+            replace: 0,
+        }
+    }
+}
+
+static MEMDIR_CACHES: [IrqSafeSpinLock<MemDirCache>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(MemDirCache::new()) }; narf_lib::percpu::MAX_CPUS];
+
+fn memdir_cache() -> &'static IrqSafeSpinLock<MemDirCache> {
+    &MEMDIR_CACHES[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
 impl fmt::Debug for Entry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // `Arc<dyn FileOps>` isn't `Debug`, so a derive can't cover the
@@ -1784,6 +1866,9 @@ struct MemDir {
     superblock: Arc<MemSuper>,
     _inode_lease: InodeLease,
     entries: IrqSafeSpinLock<BTreeMap<String, Entry>>,
+    /// Invalidates cached `(this directory, child name)` lookups after a
+    /// namespace mutation. Updated while `entries` is locked.
+    entry_generation: AtomicU64,
     /// Directory permission bits (low 12). Defaults to 0o777; `chmod(2)`
     /// on the directory updates it so `stat` reflects the real mode —
     /// dbus/systemd require `XDG_RUNTIME_DIR` to not be group/other-
@@ -1802,6 +1887,60 @@ impl fmt::Debug for MemDir {
 }
 
 impl MemDir {
+    #[inline]
+    fn bump_entry_generation(&self) {
+        self.entry_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn cached_dir(&self, name: &str, generation: u64) -> Option<Arc<MemDir>> {
+        let cache = memdir_cache().lock();
+        cache
+            .entries
+            .iter()
+            .flatten()
+            .find(|entry| {
+                entry.parent_ino == self.ino && entry.generation == generation && entry.name == name
+            })?
+            .dir
+            .upgrade()
+    }
+
+    fn cache_dir(&self, name: &str, generation: u64, dir: &Arc<MemDir>) {
+        if self.entry_generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        let entry = MemDirCacheEntry {
+            parent_ino: self.ino,
+            generation,
+            name: name.to_string(),
+            dir: Arc::downgrade(dir),
+        };
+        let evicted = {
+            let mut cache = memdir_cache().lock();
+            if self.entry_generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            let index = cache
+                .entries
+                .iter()
+                .position(|slot| {
+                    slot.as_ref()
+                        .map(|old| {
+                            old.parent_ino == self.ino && old.name == name
+                                || old.dir.strong_count() == 0
+                        })
+                        .unwrap_or(true)
+                })
+                .unwrap_or_else(|| {
+                    let index = cache.replace;
+                    cache.replace = (cache.replace + 1) % MEMDIR_CACHE_WAYS;
+                    index
+                });
+            cache.entries[index].replace(entry)
+        };
+        drop(evicted);
+    }
+
     fn contains_dir(&self, needle: *const MemDir) -> bool {
         if core::ptr::eq(self, needle) {
             return true;
@@ -1883,6 +2022,7 @@ impl MemDir {
                 };
                 entries.insert(old_name.to_string(), new);
                 entries.insert(new_name.to_string(), old);
+                self.bump_entry_generation();
                 return Ok(());
             }
             if flags == RENAME_NOREPLACE && entries.contains_key(new_name) {
@@ -1896,6 +2036,7 @@ impl MemDir {
                 }
             }
             entries.insert(new_name.to_string(), source);
+            self.bump_entry_generation();
             return Ok(());
         }
 
@@ -1921,6 +2062,8 @@ impl MemDir {
             };
             source_entries.insert(old_name.to_string(), new);
             destination_entries.insert(new_name.to_string(), old);
+            self.bump_entry_generation();
+            destination.bump_entry_generation();
             return Ok(());
         }
         if flags == RENAME_NOREPLACE && destination_entries.contains_key(new_name) {
@@ -1934,6 +2077,8 @@ impl MemDir {
             }
         }
         destination_entries.insert(new_name.to_string(), source);
+        self.bump_entry_generation();
+        destination.bump_entry_generation();
         Ok(())
     }
 
@@ -1971,18 +2116,28 @@ impl DirOps for MemDir {
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
-        let g = self.entries.lock();
-        match g.get(name)? {
-            Entry::Dir(d) => Some(Arc::clone(d) as Arc<dyn DirOps>),
-            Entry::File(_) | Entry::Special(_) | Entry::Node(_) => None,
-            // Symlinks are never auto-traversed: `readlink`-style
-            // callers want the target bytes via `lookup`, not a
-            // resolved DirOps. Path resolution that wants to follow
-            // a symlink chain must do so explicitly.
-            Entry::Symlink(_) => None,
-            // A FIFO is a file, not a directory — never descendable.
-            Entry::Fifo(_) => None,
+        let generation = self.entry_generation.load(Ordering::Acquire);
+        if let Some(dir) = self.cached_dir(name, generation) {
+            return Some(dir as Arc<dyn DirOps>);
         }
+        let (dir, generation) = {
+            let g = self.entries.lock();
+            let generation = self.entry_generation.load(Ordering::Acquire);
+            let dir = match g.get(name)? {
+                Entry::Dir(d) => Arc::clone(d),
+                Entry::File(_) | Entry::Special(_) | Entry::Node(_) => return None,
+                // Symlinks are never auto-traversed: `readlink`-style
+                // callers want the target bytes via `lookup`, not a
+                // resolved DirOps. Path resolution that wants to follow
+                // a symlink chain must do so explicitly.
+                Entry::Symlink(_) => return None,
+                // A FIFO is a file, not a directory — never descendable.
+                Entry::Fifo(_) => return None,
+            };
+            (dir, generation)
+        };
+        self.cache_dir(name, generation, &dir);
+        Some(dir as Arc<dyn DirOps>)
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
@@ -2052,6 +2207,30 @@ impl DirOps for MemDir {
                 return Err(FsError::Busy);
             }
             let f = Arc::new(MemFile::new(&self.superblock, &[])?);
+            g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
+            Ok(f as Arc<dyn FileOps>)
+        })
+    }
+
+    fn create_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let mut g = self.entries.lock();
+            if g.contains_key(name) {
+                return Err(FsError::Busy);
+            }
+            let f = Arc::new(MemFile::new_with_attrs(
+                &self.superblock,
+                &[],
+                perms,
+                uid,
+                gid,
+            )?);
             g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
             Ok(f as Arc<dyn FileOps>)
         })
@@ -2134,11 +2313,13 @@ impl DirOps for MemDir {
                 superblock: Arc::clone(&self.superblock),
                 _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 entries: IrqSafeSpinLock::new(BTreeMap::new()),
+                entry_generation: AtomicU64::new(1),
                 perms: AtomicU32::new(0o755),
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
             });
             g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
+            self.bump_entry_generation();
             Ok(d as Arc<dyn DirOps>)
         })
     }
@@ -2178,6 +2359,7 @@ impl DirOps for MemDir {
                         return Err(FsError::Busy);
                     }
                     g.remove(name);
+                    self.bump_entry_generation();
                     Ok(())
                 }
             }
@@ -2402,6 +2584,7 @@ impl MemFs {
             superblock: Arc::clone(&superblock),
             _inode_lease: superblock.reserve_inode(0, 0)?,
             entries: IrqSafeSpinLock::new(BTreeMap::new()),
+            entry_generation: AtomicU64::new(1),
             perms: AtomicU32::new(root_mode as u32),
             uid: AtomicU32::new(root_uid),
             gid: AtomicU32::new(root_gid),

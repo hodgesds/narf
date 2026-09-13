@@ -859,8 +859,17 @@ pub trait FileOps: Send + Sync {
     }
 
     /// Flush one open-file description's daemon-visible state.
+    ///
+    /// Implementations that override this hook must also override
+    /// [`FileOps::has_flush`] so close can avoid allocating and polling the
+    /// default no-op future for ordinary files.
     fn flush<'a>(&'a self) -> FsFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Whether [`FileOps::flush`] has observable work to perform.
+    fn has_flush(&self) -> bool {
+        false
     }
 
     /// Commit file data and metadata (`data_only` models fdatasync).
@@ -1184,6 +1193,18 @@ pub trait FileOps: Send + Sync {
     /// this falls through to the private-copy file-mapping path.
     fn mmap_fault(&self, _offset: u64) -> Result<u64, FsError> {
         Err(FsError::Unsupported)
+    }
+
+    /// Optional content generation for retaining generic `MAP_SHARED`
+    /// fallback pages between mappings. `Some` declares that this file uses
+    /// generic fallback mmap rather than `mmap_frames`/`mmap_fault`, and opts
+    /// into the bounded cache; implementations must change the value after
+    /// every mutation that can alter file bytes or length. The syscall layer
+    /// reuses an idle page only when its recorded generation still matches.
+    /// Files without such a coherent marker keep the conservative
+    /// map-lifetime-only behavior.
+    fn mmap_cache_generation(&self) -> Option<u64> {
+        None
     }
 
     /// Wave-76: if this file is a PTY master, return the slave index.
@@ -1678,6 +1699,26 @@ pub trait DirOps: Send + Sync {
     /// Create a new empty file named `name` and return a handle.
     fn create<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
         Box::pin(async move { Err(FsError::Unsupported) })
+    }
+
+    /// Create an empty file with its final mode and owner.
+    ///
+    /// Backends that can initialise inode metadata atomically override this;
+    /// the default preserves compatibility by applying the metadata after the
+    /// ordinary create operation.
+    fn create_with_attrs<'a>(
+        &'a self,
+        name: &'a str,
+        perms: u16,
+        uid: u32,
+        gid: u32,
+    ) -> FsFuture<'a, Arc<dyn FileOps>> {
+        Box::pin(async move {
+            let file = self.create(name).await?;
+            let _ = file.set_owners(uid, gid).await;
+            let _ = file.set_perms(perms).await;
+            Ok(file)
+        })
     }
 
     /// Create an S_IFSOCK node named `name` (the inode Linux materialises
@@ -2257,9 +2298,166 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
         .collect()
 }
 
-/// Global VFS mount registry. Mirrors the cap-gate pattern used by
-/// `drivers/` + `net/`: an `IrqSafeSpinLock<Vec<Mount>>` is fine
-/// because mount/unmount are control-plane events, not data-plane.
+#[inline]
+fn mount_covers_path(mount_path: &str, abs: &str) -> bool {
+    abs == mount_path
+        || mount_path == "/"
+        || (abs.starts_with(mount_path) && abs.as_bytes().get(mount_path.len()) == Some(&b'/'))
+}
+
+#[inline]
+fn path_is_proper_descendant(path: &str, ancestor: &str) -> bool {
+    path.len() > ancestor.len()
+        && if ancestor == "/" {
+            path.starts_with('/')
+        } else {
+            path.starts_with(ancestor) && path.as_bytes().get(ancestor.len()) == Some(&b'/')
+        }
+}
+
+/// Select the mount covering `abs` only when no deeper mount has `abs` as a
+/// proper ancestor. The returned filesystem and relative path can therefore
+/// be walked without consulting the mount table between components.
+fn single_mount_resolution(
+    mounts: &[Mount],
+    abs: &str,
+) -> Option<(Arc<dyn FsInstance>, usize, u64)> {
+    if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+        return None;
+    }
+    let mut best: Option<&Mount> = None;
+    for mount in mounts {
+        let covers = mount_covers_path(&mount.path, abs);
+        if covers && best.map(|old| old.path.len()).unwrap_or(0) <= mount.path.len() {
+            best = Some(mount);
+        }
+    }
+    let mount = best?;
+    let path = if abs == "/" {
+        abs
+    } else {
+        abs.trim_end_matches('/')
+    };
+    if mounts
+        .iter()
+        .any(|candidate| path_is_proper_descendant(&candidate.path, path))
+    {
+        return None;
+    }
+    let suffix = &abs[mount.path.len()..];
+    let rel_start = abs.len() - suffix.strip_prefix('/').unwrap_or(suffix).len();
+    Some((mount.fs.clone(), rel_start, mount.id))
+}
+
+// Linux keeps mount lookup off its namespace writer lock by combining an RCU
+// mount hash with a sequence counter. NARF's mount table is much smaller, so a
+// bounded per-CPU cache gives the common descendant-free mount the same
+// read-mostly property without publishing an `Arc` through a raw atomic
+// pointer. Every cache entry owns its filesystem reference and is tagged with
+// the authoritative table generation; mount mutations invalidate all slots.
+const GLOBAL_MOUNT_CACHE_WAYS: usize = 8;
+
+struct GlobalMountCacheEntry {
+    generation: u64,
+    path: String,
+    fs: Arc<dyn FsInstance>,
+    mount_id: u64,
+}
+
+struct GlobalMountCache {
+    entries: [Option<GlobalMountCacheEntry>; GLOBAL_MOUNT_CACHE_WAYS],
+    replace: usize,
+}
+
+impl GlobalMountCache {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; GLOBAL_MOUNT_CACHE_WAYS],
+            replace: 0,
+        }
+    }
+}
+
+static GLOBAL_MOUNT_CACHES: [IrqSafeSpinLock<GlobalMountCache>; narf_lib::percpu::MAX_CPUS] =
+    [const { IrqSafeSpinLock::new(GlobalMountCache::new()) }; narf_lib::percpu::MAX_CPUS];
+
+fn global_mount_cache() -> &'static IrqSafeSpinLock<GlobalMountCache> {
+    &GLOBAL_MOUNT_CACHES[narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1)]
+}
+
+fn global_mount_cache_lookup(
+    generation: u64,
+    abs: &str,
+) -> Option<(Arc<dyn FsInstance>, usize, u64)> {
+    let cache = global_mount_cache().lock();
+    let entry = cache
+        .entries
+        .iter()
+        .flatten()
+        .find(|entry| entry.generation == generation && mount_covers_path(&entry.path, abs))?;
+    let suffix = &abs[entry.path.len()..];
+    let rel_start = abs.len() - suffix.strip_prefix('/').unwrap_or(suffix).len();
+    Some((entry.fs.clone(), rel_start, entry.mount_id))
+}
+
+fn global_mount_cache_insert(entry: GlobalMountCacheEntry) {
+    // A mutation may have completed after the caller released `inner` but
+    // before it reached this per-CPU slot. Do not republish that stale Arc
+    // after the mutation's invalidation pass has already visited this CPU.
+    if REGISTRY
+        .mountinfo_generation
+        .load(core::sync::atomic::Ordering::Acquire)
+        != entry.generation
+    {
+        return;
+    }
+
+    let evicted = {
+        let mut cache = global_mount_cache().lock();
+        if REGISTRY
+            .mountinfo_generation
+            .load(core::sync::atomic::Ordering::Acquire)
+            != entry.generation
+        {
+            return;
+        }
+        let index = cache
+            .entries
+            .iter()
+            .position(|slot| {
+                slot.as_ref()
+                    .map(|old| old.generation != entry.generation || old.path == entry.path)
+                    .unwrap_or(true)
+            })
+            .unwrap_or_else(|| {
+                let index = cache.replace;
+                cache.replace = (cache.replace + 1) % GLOBAL_MOUNT_CACHE_WAYS;
+                index
+            });
+        cache.entries[index].replace(entry)
+    };
+    // An unmounted filesystem's final drop may perform slow teardown. Never
+    // run it with a cache lock (and therefore local interrupts) held.
+    drop(evicted);
+}
+
+fn invalidate_global_mount_caches() {
+    for cache in &GLOBAL_MOUNT_CACHES {
+        let evicted = {
+            let mut cache = cache.lock();
+            cache.replace = 0;
+            core::mem::replace(
+                &mut cache.entries,
+                [const { None }; GLOBAL_MOUNT_CACHE_WAYS],
+            )
+        };
+        drop(evicted);
+    }
+}
+
+/// Global VFS mount registry. Mount/unmount serialize through the authoritative
+/// table; descendant-free single-mount resolution uses generation-tagged
+/// per-CPU entries so pathname data-plane traffic does not contend on it.
 #[derive(Debug)]
 pub struct VfsRegistry {
     inner: IrqSafeSpinLock<Vec<Mount>>,
@@ -2547,6 +2745,17 @@ impl MountNamespace {
             (m.fs.clone(), alloc::string::String::from(rel))
         };
         Some(f(&*fs, &rel))
+    }
+
+    /// Resolve an absolute path whose remaining component walk cannot cross
+    /// another mount, returning the covering mount id alongside the usual
+    /// filesystem-relative path. The registry lock is released before `f`.
+    pub fn resolve_absolute_single_mount<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, &str, u64) -> R,
+    {
+        let (fs, rel_start, mount_id) = single_mount_resolution(&self.inner.lock(), abs)?;
+        Some(f(&*fs, &abs[rel_start..], mount_id))
     }
 
     /// Resolve `abs` to its parent directory + leaf within THIS namespace's
@@ -3032,6 +3241,7 @@ impl VfsRegistry {
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
+        invalidate_global_mount_caches();
         notify_mount_change();
         Ok(handle)
     }
@@ -3058,6 +3268,7 @@ impl VfsRegistry {
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
+        invalidate_global_mount_caches();
         notify_mount_change();
         Ok(handle)
     }
@@ -3169,6 +3380,7 @@ impl VfsRegistry {
         // section short — important once page-cache eviction lands.
         drop(q);
         drop(m);
+        invalidate_global_mount_caches();
         notify_mount_change();
         Ok(())
     }
@@ -3191,6 +3403,7 @@ impl VfsRegistry {
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
+        invalidate_global_mount_caches();
         notify_mount_change();
         Ok(())
     }
@@ -3271,6 +3484,52 @@ impl VfsRegistry {
             (m.fs.clone(), alloc::string::String::from(rel))
         };
         Some(f(&*fs, &rel))
+    }
+
+    /// Namespace-aware counterpart of
+    /// [`VfsRegistry::resolve_absolute_single_mount`].
+    pub fn resolve_absolute_single_mount<R, F>(&self, abs: &str, f: F) -> Option<R>
+    where
+        F: FnOnce(&dyn FsInstance, &str, u64) -> R,
+    {
+        if abs.is_empty() || abs.as_bytes()[0] != b'/' {
+            return None;
+        }
+
+        let generation = self.mountinfo_generation();
+        if core::ptr::eq(self, &REGISTRY) {
+            if let Some((fs, rel_start, mount_id)) = global_mount_cache_lookup(generation, abs) {
+                return Some(f(&*fs, &abs[rel_start..], mount_id));
+            }
+        }
+
+        let (fs, rel_start, mount_id, cacheable, mount_path_len, generation) = {
+            let mounts = self.inner.lock();
+            let generation = self.mountinfo_generation();
+            let (fs, rel_start, mount_id) = single_mount_resolution(&mounts, abs)?;
+            let mount = mounts.iter().find(|mount| mount.id == mount_id)?;
+            let cacheable = !mounts
+                .iter()
+                .any(|candidate| path_is_proper_descendant(&candidate.path, &mount.path));
+            (
+                fs,
+                rel_start,
+                mount_id,
+                cacheable,
+                mount.path.len(),
+                generation,
+            )
+        };
+
+        if cacheable && core::ptr::eq(self, &REGISTRY) {
+            global_mount_cache_insert(GlobalMountCacheEntry {
+                generation,
+                path: String::from(&abs[..mount_path_len]),
+                fs: fs.clone(),
+                mount_id,
+            });
+        }
+        Some(f(&*fs, &abs[rel_start..], mount_id))
     }
 
     /// Clone the `Arc<dyn FsInstance>` of the mount covering `abs` (the
