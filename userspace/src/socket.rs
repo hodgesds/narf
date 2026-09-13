@@ -332,8 +332,20 @@ pub const IP_MULTICAST_TTL: u32 = 33;
 /// `fcntl(F_SETFL, O_NONBLOCK)` bit. Used by the sys_fcntl path
 /// to flip per-fd nonblock state on a SocketFile.
 pub const O_NONBLOCK: u32 = 0o4000;
+/// `MSG_OOB` (include/linux/socket.h): out-of-band data. AF_UNIX supports it
+/// only under `CONFIG_AF_UNIX_OOB`, which NARF does not implement, so a send
+/// with MSG_OOB is `-EOPNOTSUPP` (Linux `unix_dgram_sendmsg`/`unix_stream_sendmsg`).
+pub const MSG_OOB: u32 = 0x01;
 pub const MSG_PEEK: u32 = 0x02;
 pub const MSG_TRUNC: u32 = 0x20;
+/// `MSG_NOSIGNAL` (include/linux/socket.h): suppress the `SIGPIPE` that a
+/// broken-pipe send would otherwise raise to the caller.
+pub const MSG_NOSIGNAL: u32 = 0x4000;
+/// AF_UNIX datagram send-buffer ceiling. Linux rejects a datagram with
+/// `len > sk_sndbuf - 32` → -EMSGSIZE (`unix_dgram_sendmsg`). NARF does not
+/// track a per-socket SO_SNDBUF, so this uses the Linux default sndbuf
+/// (net.core.wmem_default, 212992) to match the common case.
+const UNIX_DGRAM_SNDBUF: usize = 212992;
 
 // ── Address shape ───────────────────────────────────────────────
 
@@ -560,6 +572,17 @@ pub enum SockError {
     Pipe,
     InProgress,
     Range,
+    /// ENOENT — an AF_UNIX pathname connect/sendto whose path does not exist in
+    /// the filesystem (Linux `unix_find_bsd` `kern_path` failure). Distinct from
+    /// ConnectionRefused, which is "path present but no live listener".
+    NoEntry,
+    /// EMSGSIZE — a datagram larger than the socket send buffer (Linux
+    /// `unix_dgram_sendmsg`: `len > sk_sndbuf - 32`).
+    MsgSize,
+    /// EPROTOTYPE — connect/sendto to a bound socket of the WRONG type (Linux
+    /// `unix_find_bsd`: `sk->sk_type != type`), e.g. a stream connect to a path
+    /// where only a datagram socket is bound.
+    ProtoType,
 }
 
 impl SockError {
@@ -579,6 +602,9 @@ impl SockError {
             Self::Pipe => 32,               // EPIPE
             Self::InProgress => 115,        // EINPROGRESS
             Self::Range => 34,              // ERANGE
+            Self::NoEntry => 2,             // ENOENT
+            Self::MsgSize => 90,            // EMSGSIZE
+            Self::ProtoType => 91,          // EPROTOTYPE
         }
     }
 }
@@ -4006,10 +4032,69 @@ impl SocketFile {
                         .lock()
                         .clone()
                         .unwrap_or_else(|| UnixPathKey::for_current_path(&p));
-                    LISTENERS
-                        .lock()
-                        .get_or_insert_with(BTreeMap::new)
-                        .insert(key, self.clone());
+                    // Socket-activation accept-queue handoff. A pathname AF_UNIX
+                    // socket is keyed by its resolved inode, so when a daemon
+                    // takes over a socket-activation listener by unlink()+bind()+
+                    // listen() (journald over PID1's /run/systemd/journal/stdout),
+                    // the NEW listener has a different key and does NOT find the
+                    // old one via `key` — leaving every connection that queued on
+                    // the old listener orphaned forever. In real systemd the
+                    // *listening fd, with its accept queue,* is passed to the
+                    // activated service, so those queued connections are accepted,
+                    // not lost. Emulate that: find any prior listener for the SAME
+                    // path and inherit its pending connections into this one.
+                    // Without it a service's stderr that connected before the
+                    // handoff blocks on write() forever — the observed KDE-greeter
+                    // black screen (kwin's stderr stuck on the orphaned listener,
+                    // kwin never becomes ready, systemd SIGTERMs it, greeter can't
+                    // connect to the dead compositor).
+                    let stale: alloc::vec::Vec<Arc<SocketFile>> = {
+                        let map = LISTENERS.lock();
+                        map.as_ref()
+                            .map(|m| {
+                                m.values()
+                                    .filter(|old| {
+                                        !Arc::ptr_eq(old, self)
+                                            && matches!(
+                                                &*old.state.lock(),
+                                                SocketState::UnixListener {
+                                                    addr: UnixAddr::Path(op),
+                                                    ..
+                                                } if *op == p
+                                            )
+                                    })
+                                    .cloned()
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    // Drain each superseded listener's queue (its own state lock,
+                    // taken AFTER dropping the LISTENERS lock to keep the
+                    // LISTENERS→state order the connect path also uses).
+                    let mut inherited: alloc::collections::VecDeque<Arc<SocketFile>> =
+                        alloc::collections::VecDeque::new();
+                    for old in &stale {
+                        if let SocketState::UnixListener { pending, .. } = &mut *old.state.lock() {
+                            while let Some(conn) = pending.pop_front() {
+                                inherited.push_back(conn);
+                            }
+                        }
+                    }
+                    if !inherited.is_empty() {
+                        if let SocketState::UnixListener { pending, .. } = &mut *self.state.lock() {
+                            pending.append(&mut inherited);
+                        }
+                        // Wake anyone armed on THIS listener's accept cell.
+                        self.listener_readiness.set(narf_filesystem::POLL_IN, 0);
+                        self.listener_readiness.notify(narf_filesystem::POLL_IN);
+                    }
+                    {
+                        let mut guard = LISTENERS.lock();
+                        let map = guard.get_or_insert_with(BTreeMap::new);
+                        // Retire the superseded listener entries, then publish this one.
+                        map.retain(|_, v| !stale.iter().any(|o| Arc::ptr_eq(o, v)));
+                        map.insert(key, self.clone());
+                    }
                 }
                 SocketOpResult::Ok(0)
             }
@@ -4052,7 +4137,26 @@ impl SocketFile {
                 };
                 let listener = match listener {
                     Some(l) => l,
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    // Linux `unix_find_bsd` (net/unix/af_unix.c): a connect to a
+                    // PATHNAME that does not exist is -ENOENT (kern_path failure);
+                    // a path bound by a socket of the WRONG type is -EPROTOTYPE
+                    // (`sk->sk_type != type` — a datagram socket occupies the path
+                    // this stream connect targeted); any other resolvable path with
+                    // no live stream listener is -ECONNREFUSED. Abstract names have
+                    // no filesystem node, so a miss is always -ECONNREFUSED.
+                    None => {
+                        return match &uaddr {
+                            UnixAddr::Path(p)
+                                if !crate::handlers::unix_path_final_node_exists(p) =>
+                            {
+                                SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            UnixAddr::Path(p) if unix_dgram_bound_at_path(p) => {
+                                SocketOpResult::Err(SockError::ProtoType)
+                            }
+                            _ => SocketOpResult::Err(SockError::ConnectionRefused),
+                        };
+                    }
                 };
                 // Reject an already-connected (or otherwise non-connectable) fd
                 // BEFORE minting/queuing any server endpoint. The old order
@@ -4225,6 +4329,14 @@ impl SocketFile {
                 Err(e) => SocketOpResult::Err(e),
             },
             SocketOp::Shutdown { how } => {
+                // Linux `unix_shutdown` (net/unix/af_unix.c) rejects an
+                // out-of-range mode BEFORE anything else: `if (mode < SHUT_RD ||
+                // mode > SHUT_RDWR) return -EINVAL`. `how` arrives as u32, so a
+                // negative int (mode < SHUT_RD) presents as a large value caught
+                // by `how > SHUT_RDWR`.
+                if how > SHUT_RDWR {
+                    return SocketOpResult::Err(SockError::InvalidArg);
+                }
                 let state = self.state.lock();
                 match &*state {
                     SocketState::UnixConnected { tx, rx, .. } => {
@@ -4240,7 +4352,17 @@ impl SocketFile {
                         narf_net::readiness::notify(0);
                         SocketOpResult::Ok(0)
                     }
-                    _ => SocketOpResult::Err(SockError::NotConnected),
+                    // Linux `unix_shutdown` ALWAYS returns 0, even on an
+                    // unconnected AF_UNIX socket. INET/INET6 keep ENOTCONN (TCP
+                    // `inet_shutdown` on an unconnected socket → -ENOTCONN).
+                    _ => {
+                        drop(state);
+                        if self.domain == AF_UNIX {
+                            SocketOpResult::Ok(0)
+                        } else {
+                            SocketOpResult::Err(SockError::NotConnected)
+                        }
+                    }
                 }
             }
             _ => SocketOpResult::Err(SockError::NotSupported),
@@ -4782,6 +4904,32 @@ impl SocketFile {
                     Some(a @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => a,
                     _ => return SocketOpResult::Err(SockError::InvalidArg),
                 };
+                // Linux `unix_dgram_connect` resolves the target via
+                // `unix_find_other` and fails AT CONNECT (not deferred to the
+                // first send): missing pathname → -ENOENT, a stream socket at the
+                // path → -EPROTOTYPE, otherwise no bound datagram receiver →
+                // -ECONNREFUSED. Abstract names resolve only in ABSTRACT_DGRAM.
+                match &uaddr {
+                    UnixAddr::Path(p) if !unix_dgram_bound_at_path(p) => {
+                        if !crate::handlers::unix_path_final_node_exists(p) {
+                            return SocketOpResult::Err(SockError::NoEntry);
+                        } else if unix_stream_listener_at_path(p) {
+                            return SocketOpResult::Err(SockError::ProtoType);
+                        } else {
+                            return SocketOpResult::Err(SockError::ConnectionRefused);
+                        }
+                    }
+                    UnixAddr::Abstract(n) => {
+                        let bound = ABSTRACT_DGRAM
+                            .lock()
+                            .as_ref()
+                            .is_some_and(|m| m.contains_key(&(self.net_ns_id(), n.clone())));
+                        if !bound {
+                            return SocketOpResult::Err(SockError::ConnectionRefused);
+                        }
+                    }
+                    _ => {}
+                }
                 let mut state = self.state.lock();
                 if let UnixAddr::Path(p) = &uaddr {
                     *self.connected_unix_path.lock() = Some(UnixPathKey::for_connect_path(p));
@@ -4803,11 +4951,16 @@ impl SocketFile {
                     SocketOpResult::Err(SockError::InvalidArg)
                 }
             }
-            SocketOp::Send {
-                buf,
-                flags: _,
-                addr,
-            } => {
+            SocketOp::Send { buf, flags, addr } => {
+                // Linux `unix_dgram_sendmsg`: MSG_OOB → -EOPNOTSUPP (checked
+                // first), then a datagram larger than the send buffer →
+                // -EMSGSIZE (`len > sk_sndbuf - 32`).
+                if flags & MSG_OOB != 0 {
+                    return SocketOpResult::Err(SockError::NotSupported);
+                }
+                if buf.len() > UNIX_DGRAM_SNDBUF - 32 {
+                    return SocketOpResult::Err(SockError::MsgSize);
+                }
                 let explicit_dest = addr.is_some();
                 let state = self.state.lock();
                 let (local_addr, dest_addr, connected_path) = match &*state {
@@ -4820,7 +4973,11 @@ impl SocketFile {
                         } else if let Some(p) = peer {
                             p.clone()
                         } else {
-                            return SocketOpResult::Err(SockError::InvalidArg);
+                            // No destination address and no connected peer. Linux
+                            // `unix_dgram_sendmsg` (net/unix/af_unix.c): namelen==0
+                            // → `other = unix_peer_get(sk)`; `if (!other) err =
+                            // -ENOTCONN`. (A malformed dest addr above is EINVAL.)
+                            return SocketOpResult::Err(SockError::NotConnected);
                         };
                         (la.clone(), dest, self.connected_unix_path.lock().clone())
                     }
@@ -4834,7 +4991,10 @@ impl SocketFile {
                                 Some(d @ (UnixAddr::Path(_) | UnixAddr::Abstract(_))) => d,
                                 _ => return SocketOpResult::Err(SockError::InvalidArg),
                             },
-                            None => return SocketOpResult::Err(SockError::InvalidArg),
+                            // Unbound (never connected) datagram socket with no
+                            // destination. Linux `unix_dgram_sendmsg`: no peer →
+                            // -ENOTCONN (net/unix/af_unix.c), not -EINVAL.
+                            None => return SocketOpResult::Err(SockError::NotConnected),
                         };
                         (None, dest, None)
                     }
@@ -4869,9 +5029,26 @@ impl SocketFile {
                 };
                 let dest_sock = match dest_sock {
                     Some(s) => s,
-                    // No bound receiver. Linux returns ECONNREFUSED for a
-                    // datagram sent to a missing named socket.
-                    None => return SocketOpResult::Err(SockError::ConnectionRefused),
+                    // Linux `unix_dgram_sendmsg`→`unix_find_other`: a datagram to
+                    // a PATHNAME that does not exist is -ENOENT (kern_path
+                    // failure); a resolvable path with no bound receiver is
+                    // -ECONNREFUSED. Abstract names have no filesystem node → a
+                    // miss is always -ECONNREFUSED.
+                    None => {
+                        return match &dest_addr {
+                            UnixAddr::Path(p)
+                                if !crate::handlers::unix_path_final_node_exists(p) =>
+                            {
+                                SocketOpResult::Err(SockError::NoEntry)
+                            }
+                            // A STREAM listener occupies the path a datagram send
+                            // targeted → wrong type → -EPROTOTYPE (unix_find_bsd).
+                            UnixAddr::Path(p) if unix_stream_listener_at_path(p) => {
+                                SocketOpResult::Err(SockError::ProtoType)
+                            }
+                            _ => SocketOpResult::Err(SockError::ConnectionRefused),
+                        };
+                    }
                 };
                 let pkt = DgramPacket {
                     peer_unix: local_addr,
@@ -5161,12 +5338,13 @@ impl SocketFile {
         }
     }
 
-    fn do_send(
-        &self,
-        buf: &[u8],
-        _flags: u32,
-        _addr: Option<SockAddr>,
-    ) -> Result<usize, SockError> {
+    fn do_send(&self, buf: &[u8], flags: u32, _addr: Option<SockAddr>) -> Result<usize, SockError> {
+        // Linux `unix_stream_sendmsg`: without CONFIG_AF_UNIX_OOB (NARF's case) a
+        // send with MSG_OOB is -EOPNOTSUPP. Scoped to AF_UNIX — INET keeps TCP
+        // urgent-data support.
+        if self.domain == AF_UNIX && flags & MSG_OOB != 0 {
+            return Err(SockError::NotSupported);
+        }
         let state = self.state.lock();
         // InetWired sockets route through the kernel TCP-over-NIC stack.
         if let SocketState::InetWired { tcb_id, .. } = &*state {
@@ -5234,7 +5412,17 @@ impl SocketFile {
             SocketState::UnixConnected { rx, .. }
             | SocketState::InetConnected { rx, .. }
             | SocketState::Inet6Connected { rx, .. } => rx,
-            _ => return Err(SockError::NotConnected),
+            // Linux `unix_stream_read_generic` (net/unix/af_unix.c): a recv on a
+            // never-connected AF_UNIX stream socket (`sk_state != TCP_ESTABLISHED`)
+            // returns -EINVAL, NOT -ENOTCONN. INET/INET6 keep ENOTCONN (TCP
+            // recvmsg on TCP_CLOSE → -ENOTCONN), so scope EINVAL to AF_UNIX.
+            _ => {
+                return Err(if self.domain == AF_UNIX {
+                    SockError::InvalidArg
+                } else {
+                    SockError::NotConnected
+                });
+            }
         };
         // Claim this ring for the current reader (even on a WouldBlock read, so
         // a reader that parks BEFORE data arrives is still recorded), so the
@@ -5377,19 +5565,26 @@ const RING_CAP: usize = 64 * 1024;
 /// so it does not pin the refcount.)
 impl Drop for SocketFile {
     fn drop(&mut self) {
-        // `tx` is the ring THIS end writes into and the PEER reads from,
-        // so closing it is what surfaces EOF over there. `rx` belongs to
-        // this dying end and needs no marking.
-        let closed_tx = match &*self.state.lock() {
-            SocketState::UnixConnected { tx, .. }
-            | SocketState::InetConnected { tx, .. }
-            | SocketState::Inet6Connected { tx, .. } => {
+        // Closing this endpoint deads BOTH directions of the connection:
+        // - `tx` (this end writes, the PEER reads) → close surfaces EOF to the
+        //   peer's read (any buffered bytes still drain first, then EOF).
+        // - `rx` (the PEER writes, this end reads) → close surfaces EPIPE to the
+        //   peer's SEND: the reader is gone, so a subsequent peer send must fail
+        //   with -EPIPE (do_send: `tx.is_closed()` → SockError::Pipe), matching
+        //   unix_stream_sendmsg (net/unix/af_unix.c: a SOCK_DEAD peer sets
+        //   `err = -EPIPE`). Leaving rx open let a peer keep buffering into a
+        //   ring no one would ever read — a lost write reported as success.
+        let closed = match &*self.state.lock() {
+            SocketState::UnixConnected { tx, rx, .. }
+            | SocketState::InetConnected { tx, rx, .. }
+            | SocketState::Inet6Connected { tx, rx, .. } => {
                 tx.close();
+                rx.close();
                 true
             }
             _ => false,
         };
-        if closed_tx {
+        if closed {
             // Same reasoning as `do_send`: go through `readiness::notify`
             // rather than a bare wake so the generation is bumped and a
             // peer parked in an INFINITE-timeout epoll_wait/poll actually
@@ -5990,6 +6185,26 @@ static INET_DGRAM_BOUND: IrqSafeSpinLock<Option<Inet4Map>> = IrqSafeSpinLock::ne
 /// AF_UNIX datagram-bound registry: path → socket.
 static UNIX_DGRAM_BOUND: IrqSafeSpinLock<Option<BTreeMap<UnixPathKey, Arc<SocketFile>>>> =
     IrqSafeSpinLock::new(None);
+
+/// Whether a DATAGRAM socket is bound at pathname `p` (connect-key resolution).
+/// Used to report -EPROTOTYPE when a STREAM connect misses the stream listener
+/// registry but a datagram of the wrong type occupies the path (Linux
+/// `unix_find_bsd`: `sk->sk_type != type`).
+fn unix_dgram_bound_at_path(p: &str) -> bool {
+    UNIX_DGRAM_BOUND
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&UnixPathKey::for_connect_path(p)))
+}
+
+/// Whether a STREAM listener is bound at pathname `p` (connect-key resolution).
+/// The datagram-send mirror of [`unix_dgram_bound_at_path`].
+fn unix_stream_listener_at_path(p: &str) -> bool {
+    LISTENERS
+        .lock()
+        .as_ref()
+        .is_some_and(|m| m.contains_key(&UnixPathKey::for_connect_path(p)))
+}
 
 // ── Abstract-namespace registries (sun_path[0] == '\0') ─────────
 //

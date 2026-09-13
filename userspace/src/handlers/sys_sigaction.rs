@@ -7,8 +7,25 @@ pub(crate) fn sys_sigaction(ctx: &mut dyn TrapContext) {
     let new_handler = args.arg1;
     let old_out = args.arg2;
     let flags = args.arg3 as u32;
-    if signum >= NSIG {
-        ctx.set_return(SyscallReturn::invalid_op());
+    // Linux `do_sigaction` (kernel/signal.c): `!valid_signal(sig) || sig < 1`
+    // → -EINVAL. `valid_signal` is `sig <= _NSIG` (64) and `sig < 1` rejects the
+    // null signal, so the valid range is 1..=64. NARF stores signal N at slot N
+    // (array size NSIG=65), i.e. 1..=NSIG-1. The blanket-EINVAL fold used to hide
+    // this behind an `invalid_op()`; return the exact errno AND reject signal 0.
+    if signum == 0 || signum >= NSIG {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    // Linux `do_sigaction`: `act && sig_kernel_only(sig)` → -EINVAL. SIGKILL(9)
+    // and SIGSTOP(19) can never have their action changed. This flattened form
+    // ALWAYS installs an action (there is no query-only mode, unlike the
+    // pointer-to-struct `sys_rt_sigaction`), so `act` is effectively always
+    // present — reject unconditionally. Without this a narf-libc caller could
+    // install a handler for SIGKILL/SIGSTOP and the delivery path
+    // (`default_signal_delivery_restricted_active`) would then run that handler
+    // instead of terminating, breaking the uncatchable-signal invariant.
+    if signum == 9 || signum == 19 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
     let task = current_task_id();
@@ -17,7 +34,10 @@ pub(crate) fn sys_sigaction(ctx: &mut dyn TrapContext) {
         let h = match sighand_of(task) {
             Some(h) => h,
             None => {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // No handler table for the task — a NARF-internal condition, not
+                // a Linux-reachable path; EINVAL is the least-wrong answer
+                // (matches sys_rt_sigaction).
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
                 return;
             }
         };

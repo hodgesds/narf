@@ -30,9 +30,11 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     let fail = SyscallReturn::ok((-1i64) as u64);
     let _ = fail;
     // If this path is a live bound AF_UNIX socket, release its address so it
-    // can be re-bound. Reuse the authoritative parent resolution instead of
-    // performing a second complete VFS walk merely to construct the socket
-    // key; ordinary regular-file unlinks are the overwhelmingly common case.
+    // can be re-bound (Linux frees the address when the socket inode is
+    // unlinked — dbus/wayland unlink a stale socket before re-binding).
+    // Reuse the authoritative parent resolution instead of performing a
+    // second complete VFS walk merely to construct the socket key; ordinary
+    // regular-file unlinks are the overwhelmingly common case.
     let outcome = current_resolve_parent_absolute(path, |fs, parent, leaf| {
         let was_socket = crate::socket::unbind_resolved_path(
             path,

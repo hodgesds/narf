@@ -25,13 +25,12 @@ narf-console         = { path = "../../console" }
 narf-scheduler       = { path = "../../scheduler" }
 
 [features]
-# The sysfs `/sys/class/video4linux/video<N>/` registration is gated
-# behind `linux-compat`; the kernel-test smokes assert that registration
-# against a synthetic device, so the test build must compile it in.
+# The sysfs `/sys/class/video4linux/video<N>/` registration is always
+# compiled in; the kernel-test smokes assert that registration against a
+# synthetic device, so the test build must compile it in.
 kernel-test = []
-# `register_sysfs` calls into `narf_filesystem::sysfs`, which is itself
-# gated behind narf-filesystem's `linux-compat`; forward it so this
-# crate's linux-compat surface is self-consistent (builds standalone).
+# `register_sysfs` calls into `narf_filesystem::sysfs`, which is always
+# present (the Linux ABI surface is unconditional).
 
 [lints]
 workspace = true

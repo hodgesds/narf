@@ -86,9 +86,9 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Gated
-    // under linux-compat because the wire `struct flock` layout +
-    // BTreeMap lock table only matter for Linux ABI consumers.
+    // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Always
+    // compiled in (the Linux ABI surface is unconditional); the wire
+    // `struct flock` layout + BTreeMap lock table serve Linux ABI consumers.
     {
         if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
             // Resolve the open-file identity from the fd table.

@@ -4,15 +4,28 @@ use super::*;
 pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let user_pid = args.arg0;
-    let _flags = args.arg1 as u32;
+    let flags = args.arg1 as u32;
     // `kernel/pid.c::SYSCALL_DEFINE2(pidfd_open)`:
     //
     //     if (flags & ~(PIDFD_NONBLOCK | PIDFD_THREAD)) return -EINVAL;
     //     if (pid <= 0)                                 return -EINVAL;
     //
-    // A non-positive pid is a malformed argument, NOT a missing process
-    // (that is the -ESRCH below it) and not a resource failure.
-    if user_pid == 0 {
+    // PIDFD_NONBLOCK == O_NONBLOCK, PIDFD_THREAD == O_EXCL
+    // (include/uapi/linux/pidfd.h). Any other bit is a malformed argument and
+    // gets -EINVAL — distinct from the -ESRCH a valid-but-absent pid gets and
+    // the -EMFILE an exhausted table gets.
+    const PIDFD_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
+    const PIDFD_THREAD: u32 = 0o200; // O_EXCL
+    if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    // pid_t is 32-bit signed; the malformed case is `pid <= 0`, not just
+    // `== 0` — a NEGATIVE pid must also be -EINVAL, never fall through to the
+    // -ESRCH below (which is reserved for a well-formed pid that names no
+    // process). Truncate to i32 so the register's upper bits can't hide the
+    // sign.
+    if (user_pid as i32) <= 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
@@ -46,8 +59,15 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     let new_fd = match fd::install(task, crate::fd::FdEntry {
             ops: file,
             offset: 0,
-            flags: 0,
-            status_flags: 0,
+            // Linux `pidfd_create` opens the descriptor O_RDWR | O_CLOEXEC, so
+            // the pidfd is close-on-exec; PIDFD_NONBLOCK maps to O_NONBLOCK on
+            // the description (visible via `fcntl(F_GETFL)`).
+            flags: crate::fd::FD_CLOEXEC,
+            status_flags: if flags & PIDFD_NONBLOCK != 0 {
+                PIDFD_NONBLOCK
+            } else {
+                0
+            },
         }) {
         Some(n) => n,
         None => {

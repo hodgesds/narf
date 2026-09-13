@@ -28,7 +28,7 @@ kernel-test = []
 # engines (V8) see the standard kernel behaviour rather than the
 # NARF-native subset.
 
-# Per-namespace address-space tagging.  Orthogonal to linux-compat.
+# Per-namespace address-space tagging.
 container = []
 
 # cgroup-v2 memory controller accounting seam: exposes a charge/

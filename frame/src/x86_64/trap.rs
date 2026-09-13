@@ -2125,6 +2125,19 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         } else {
             self.frame.rsp.wrapping_sub(SYSV_RED_ZONE)
         };
+        // rt frames carry the interrupted context's FPU registers in a
+        // 64-byte-aligned FXSAVE64 area carved above the frame (Linux
+        // fpu__alloc_mathframe / copy_fpstate_to_sigframe); rt_sigreturn
+        // restores it via `mcontext.fpstate`. The handler may clobber
+        // XMM/MXCSR/x87 freely; without this, its vector state leaks into
+        // interrupted SSE sequences (memcpy, mallocng).
+        let rt_frame = want_siginfo || force_rt;
+        let fpstate_vaddr = if rt_frame {
+            stack_top.wrapping_sub(FXSAVE_BYTES as u64) & !63u64
+        } else {
+            0
+        };
+        let stack_top = if rt_frame { fpstate_vaddr } else { stack_top };
         let raw_rsp = stack_top.wrapping_sub(frame_size);
         let new_rsp = (raw_rsp & !0xFu64) | 0x8;
 
@@ -2176,11 +2189,27 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                     trapno: self.frame.vector,
                     oldmask: 0,
                     cr2: params.si_addr,
-                    fpstate: 0,
+                    fpstate: fpstate_vaddr,
                     reserved: [0; 8],
                 },
                 uc_sigmask: 0,
             };
+
+            // The interrupted task's FPU registers are live in hardware
+            // (kernel code is built without SSE); capture them for the frame.
+            // `clts` first: a task that has not yet touched the FPU may still
+            // have CR0.TS armed, and a CPL=0 FXSAVE would #NM.
+            let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
+            // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is a 64-byte-aligned
+            // buffer owned by this frame build.
+            unsafe {
+                core::arch::asm!(
+                    "clts",
+                    "fxsave64 [{0}]",
+                    in(reg) fx.0.as_mut_ptr(),
+                    options(nostack, preserves_flags)
+                );
+            }
 
             let mut info = [0u8; 128];
             info[0..4].copy_from_slice(&(params.signum as i32).to_ne_bytes());
@@ -2198,6 +2227,7 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 signal_copy_to_user(new_rsp, &fallback_return)
                     && signal_copy_to_user(siginfo_vaddr, &info)
                     && signal_copy_to_user(uctx_vaddr, &uctx)
+                    && signal_copy_to_user(fpstate_vaddr, &fx.0)
             };
             if !delivered {
                 return false;
@@ -2363,12 +2393,10 @@ pub struct McContext {
     pub trapno: u64,
     pub oldmask: u64,
     pub cr2: u64,
-    /// User-mode FP state pointer (0 = none). NARF doesn't yet save
-    /// FPU state through delivery (the FP register file isn't
-    /// touched by syscalls today — the user's FP state survives
-    /// untouched through the trap, and the handler is expected to
-    /// preserve it itself per the SysV ABI). Wire-stable so future
-    /// FP-save work can fill this in without an ABI bump.
+    /// User-mode FP state pointer (0 = none). For rt frames this
+    /// points at the FXSAVE64 area the delivery path carves above
+    /// the frame; rt_sigreturn restores the FPU register file from
+    /// it. Legacy frames leave it 0 (no FPU save/restore).
     pub fpstate: u64,
     pub reserved: [u64; 8],
 }
@@ -2423,6 +2451,13 @@ pub struct SigContext {
     pub signum: u64,
     pub _pad: [u64; 3],
 }
+
+/// FXSAVE64 image size; the rt frame's `mcontext.fpstate` area.
+const FXSAVE_BYTES: usize = 512;
+
+/// 64-byte-aligned FXSAVE64 staging buffer.
+#[repr(C, align(64))]
+struct FxSaveArea([u8; FXSAVE_BYTES]);
 
 /// Restore a SigContext frame at user RSP+8 into the live trap
 /// frame. Called from `sys_sigreturn`. The user RSP at entry is
@@ -2509,6 +2544,40 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: 
         sc_r14 = mc.r14;
         sc_r15 = mc.r15;
         sc_rflags = mc.rflags;
+        // Restore the FPU registers the delivery path saved into the frame's
+        // fpstate area (Linux fpu__restore_sig): the handler may have
+        // clobbered any of them. A zero fpstate (legacy/foreign frame)
+        // restores nothing.
+        if mc.fpstate != 0 {
+            let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
+            // SAFETY: `fx` is a local aligned buffer; the guarded user read
+            // opens SMAP for this read of the kernel-laid-out frame area.
+            unsafe {
+                narf_arch::x86_64::smap::with_user_access(|| {
+                    core::ptr::copy_nonoverlapping(
+                        mc.fpstate as *const u8,
+                        fx.0.as_mut_ptr(),
+                        FXSAVE_BYTES,
+                    );
+                });
+            }
+            // Sanitize MXCSR (bytes 24..28): reserved bits would #GP the
+            // CPL=0 FXRSTOR on user-controlled input (Linux masks with
+            // mxcsr_feature_mask).
+            let mut mxcsr = u32::from_ne_bytes([fx.0[24], fx.0[25], fx.0[26], fx.0[27]]);
+            mxcsr &= 0xffff;
+            fx.0[24..28].copy_from_slice(&mxcsr.to_ne_bytes());
+            // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` holds a sanitized
+            // 64-byte-aligned FXSAVE image. `clts` first — see delivery.
+            unsafe {
+                core::arch::asm!(
+                    "clts",
+                    "fxrstor64 [{0}]",
+                    in(reg) fx.0.as_ptr(),
+                    options(nostack, preserves_flags)
+                );
+            }
+        }
     } else {
         // Legacy SigContext.
         // SAFETY: legacy-frame path — `sc_vaddr` points at the `SigContext`
@@ -2559,7 +2628,11 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: 
     ctx.frame.rax = sc_rax;
     ctx.frame.rip = sc_rip;
 
-    const SAFE_RFLAGS: u64 = (1 << 9) | (1 << 8) | (1 << 0); // IF, TF, CF
+    // CF | PF | AF | ZF | SF | TF | IF | DF | OF — every flag user code may
+    // depend on across a signal (arithmetic flags decide branches; DF steers
+    // rep movs). Privileged bits (IOPL, NT, RF, VM, AC, VIF, VIP) stay under
+    // kernel control, matching Linux's sigreturn policy.
+    const SAFE_RFLAGS: u64 = 0xFD5;
     let preserved = sc_rflags & SAFE_RFLAGS;
     let kept_kernel = ctx.frame.rflags & !SAFE_RFLAGS;
     ctx.frame.rflags = preserved | kept_kernel;
@@ -2587,8 +2660,9 @@ use narf_kernel_test::{kernel_test_in, TestResult};
 
 /// Aligned scratch region used as a synthetic user stack for the
 /// SA_* smokes. 4 KiB is well over the largest sigframe NARF lays
-/// (~432 B for SA_SIGINFO + the SysV red-zone reserve), so the
-/// alignment-rounded base + frame_size never escapes the buffer.
+/// (~440 B for SA_SIGINFO + the 512 B aligned fpstate carve + the
+/// SysV red-zone reserve, ~1.1 KiB total), so the alignment-rounded
+/// base + frame_size never escapes the buffer.
 #[repr(C, align(16))]
 struct SmokeStack {
     bytes: [u8; 4096],
@@ -3045,3 +3119,177 @@ fn smoke_x86_64_sa_siginfo_sets_three_args() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("frame/x86_64", smoke_x86_64_sa_siginfo_sets_three_args);
+
+/// rt frames carry FPU state: `deliver_signal` FXSAVEs the live
+/// register file into a 64-byte-aligned area carved above the frame
+/// and publishes it via `mcontext.fpstate`; rt sigreturn FXRSTORs it
+/// so a handler's XMM/MXCSR/x87 clobbers do not leak into the
+/// interrupted context.
+fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
+    let stack = SmokeStack::new();
+    let interrupted_rsp = stack.top();
+    let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, interrupted_rsp);
+
+    // Plant a recognizable pattern in XMM6 — the "interrupted user
+    // context" FPU state the frame must round-trip. `clts` first: TS
+    // may be armed and a CPL=0 SSE touch would #NM.
+    const XMM6_PATTERN: u64 = 0x5EED_F00D_CAFE_D00D;
+    // SAFETY: CPL=0 with CR4.OSFXSR set; touches only XMM6.
+    unsafe {
+        core::arch::asm!(
+            "clts",
+            "movq xmm6, {0}",
+            in(reg) XMM6_PATTERN,
+            options(nostack, preserves_flags)
+        );
+    }
+
+    let params = SigDeliveryParams {
+        handler: 0xCAFE_F00D,
+        restorer: 0,
+        signum: 10,
+        flags: SA_SIGINFO,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code: 0,
+        si_addr: 0,
+        si_value: 0,
+        si_pid: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    if !ctx.deliver_signal(&params) {
+        return TestResult::Fail("deliver_signal returned false");
+    }
+
+    // The written UContext must point at a live fpstate area: nonzero,
+    // 64-byte aligned, wholly below the interrupted RSP's red zone.
+    let uctx_vaddr = frame.rsp + 8 + 128;
+    let fpstate_off =
+        core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, fpstate);
+    // SAFETY: the arch just wrote the UContext into the kernel-resident
+    // smoke stack; reading it back from the same process is sound.
+    // SAFETY: Valid memory or trusted environment
+    let fpstate = unsafe { ((uctx_vaddr + fpstate_off as u64) as *const u64).read_unaligned() };
+    if fpstate == 0 {
+        return TestResult::Fail("mcontext.fpstate is 0 on an rt frame");
+    }
+    if fpstate & 63 != 0 {
+        return TestResult::Fail("fpstate area not 64-byte aligned");
+    }
+    if fpstate + FXSAVE_BYTES as u64 > interrupted_rsp - 128 {
+        return TestResult::Fail("fpstate area intrudes on the interrupted red zone");
+    }
+    // The saved image must hold the delivery-time XMM6 (FXSAVE64
+    // layout: XMM registers start at byte 160, 16 bytes each).
+    // SAFETY: fpstate points into the smoke stack, verified above.
+    // SAFETY: Valid memory or trusted environment
+    let saved_xmm6 = unsafe { ((fpstate + 160 + 6 * 16) as *const u64).read_unaligned() };
+    if saved_xmm6 != XMM6_PATTERN {
+        return TestResult::Fail("fpstate image does not hold delivery-time XMM6");
+    }
+
+    // "Handler body": clobber XMM6 (pcmpeqb xmm6, xmm6 = all-ones).
+    // SAFETY: CPL=0, OSFXSR set, TS cleared at delivery; touches only XMM6.
+    unsafe {
+        core::arch::asm!("pcmpeqb xmm6, xmm6", options(nostack, preserves_flags));
+    }
+
+    // rt sigreturn: user RSP at rt_sigreturn entry points at siginfo
+    // (the restorer popped the return slot) — sc_vaddr = frame.rsp + 8.
+    let sc_vaddr = frame.rsp + 8;
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    // SAFETY: synthetic trap-handler context — the test-built frame is
+    // the "live" trap frame, and sc_vaddr points at the rt frame the
+    // arch itself laid out above.
+    if !unsafe { perform_sigreturn(&mut ctx, sc_vaddr, true) } {
+        return TestResult::Fail("perform_sigreturn returned false");
+    }
+
+    // XMM6 must be back to its delivery-time value.
+    let restored: u64;
+    // SAFETY: CPL=0 with CR4.OSFXSR set; reads only XMM6.
+    unsafe {
+        core::arch::asm!(
+            "movq {0}, xmm6",
+            out(reg) restored,
+            options(nostack, preserves_flags)
+        );
+    }
+    if restored != XMM6_PATTERN {
+        return TestResult::Fail("sigreturn did not restore handler-clobbered XMM6");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("frame/x86_64", smoke_x86_64_rt_fpstate_saved_and_restored);
+
+/// sigreturn restores the interrupted context's arithmetic RFLAGS
+/// (CF/PF/AF/ZF/SF/OF) and DF from the frame — a signal landing
+/// between a `cmp` and its branch must not misfire the branch, and
+/// DF steers `rep movs` — while privileged bits (AC, IOPL) from
+/// user-controlled frame input stay under kernel control.
+fn smoke_x86_64_sigreturn_restores_arithmetic_rflags() -> TestResult {
+    const ZF: u64 = 1 << 6;
+    const DF: u64 = 1 << 10;
+    const AC: u64 = 1 << 18;
+    const IOPL: u64 = 3 << 12;
+
+    let stack = SmokeStack::new();
+    let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, stack.top());
+
+    let params = SigDeliveryParams {
+        handler: 0xCAFE_F00D,
+        restorer: 0,
+        signum: 10,
+        flags: SA_SIGINFO,
+        altstack_sp: 0,
+        altstack_size: 0,
+        restartable_syscall: false,
+        si_code: 0,
+        si_addr: 0,
+        si_value: 0,
+        si_pid: 0,
+    };
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    if !ctx.deliver_signal(&params) {
+        return TestResult::Fail("deliver_signal returned false");
+    }
+
+    // Rewrite the saved mcontext rflags the way user code can: the
+    // flags the interrupted context depends on, alongside privileged
+    // bits an attacker would love sigreturn to launder.
+    let uctx_vaddr = frame.rsp + 8 + 128;
+    let rflags_vaddr = uctx_vaddr
+        + (core::mem::offset_of!(UContext, uc_mcontext) + core::mem::offset_of!(McContext, rflags))
+            as u64;
+    // SAFETY: rewrites one field of the UContext the arch just wrote
+    // into the kernel-resident smoke stack.
+    // SAFETY: Valid memory or trusted environment
+    unsafe { (rflags_vaddr as *mut u64).write_unaligned(0x202 | ZF | DF | AC | IOPL) };
+
+    let sc_vaddr = frame.rsp + 8;
+    let mut ctx = X86TrapContext::from_int80(&mut frame);
+    // SAFETY: as in the fpstate smoke — synthetic trap-handler context
+    // over the frame the arch laid out.
+    if !unsafe { perform_sigreturn(&mut ctx, sc_vaddr, true) } {
+        return TestResult::Fail("perform_sigreturn returned false");
+    }
+
+    if frame.rflags & ZF == 0 {
+        return TestResult::Fail("sigreturn dropped ZF");
+    }
+    if frame.rflags & DF == 0 {
+        return TestResult::Fail("sigreturn dropped DF");
+    }
+    if frame.rflags & AC != 0 {
+        return TestResult::Fail("sigreturn let user frame input set AC");
+    }
+    if frame.rflags & IOPL != 0 {
+        return TestResult::Fail("sigreturn let user frame input raise IOPL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "frame/x86_64",
+    smoke_x86_64_sigreturn_restores_arithmetic_rflags
+);

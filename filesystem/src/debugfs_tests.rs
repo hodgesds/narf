@@ -1,8 +1,8 @@
 //! debugfs `sched/` knob suite.
 //!
 //! Drives the [`crate::debugfs::DebugFs`] `FsInstance`/`DirOps`/`FileOps`
-//! surface directly (no VFS): the `wake_placement` core feature flag
-//! round-trips through write→state→read, and the read-only reflectors
+//! surface directly (no VFS): the `wake_next` / `wake_preempt` feature flags
+//! round-trip through write→state→read, and the read-only reflectors
 //! (`policy`, `steal_strategy`) render a value yet reject writes.
 
 extern crate alloc;
@@ -51,53 +51,6 @@ fn sched_knob(name: &str) -> Option<Arc<dyn FileOps>> {
     let fs = DebugFs::new();
     fs.root().lookup_dir("sched")?.lookup(name)
 }
-
-fn smoke_debugfs_wake_placement_toggle() -> TestResult {
-    let file = match sched_knob("wake_placement") {
-        Some(f) => f,
-        None => return TestResult::Fail("sched/wake_placement knob missing"),
-    };
-    let initial = narf_scheduler::wake_placement_enabled();
-    let restore = |on: bool| {
-        if on {
-            narf_scheduler::enable_wake_placement();
-        } else {
-            narf_scheduler::disable_wake_placement();
-        }
-    };
-
-    // `echo 1` enables; state + read reflect it.
-    if poll_once(file.write(0, b"1\n")).map(|r| r.is_ok()) != Some(true) {
-        restore(initial);
-        return TestResult::Fail("write '1' failed");
-    }
-    if !narf_scheduler::wake_placement_enabled() {
-        restore(initial);
-        return TestResult::Fail("write '1' did not enable wake placement");
-    }
-    if read_str(&file) != "1\n" {
-        restore(initial);
-        return TestResult::Fail("read after enable did not return \"1\\n\"");
-    }
-
-    // `echo 0` disables.
-    if poll_once(file.write(0, b"0")).map(|r| r.is_ok()) != Some(true) {
-        restore(initial);
-        return TestResult::Fail("write '0' failed");
-    }
-    if narf_scheduler::wake_placement_enabled() {
-        restore(initial);
-        return TestResult::Fail("write '0' did not disable wake placement");
-    }
-    if read_str(&file) != "0\n" {
-        restore(initial);
-        return TestResult::Fail("read after disable did not return \"0\\n\"");
-    }
-
-    restore(initial);
-    TestResult::Pass
-}
-kernel_test_in!("filesystem/debugfs", smoke_debugfs_wake_placement_toggle);
 
 fn smoke_debugfs_wake_next_toggle() -> TestResult {
     let file = match sched_knob("wake_next") {

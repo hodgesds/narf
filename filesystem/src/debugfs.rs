@@ -8,10 +8,6 @@
 //! contribute its own knobs (appearing/disappearing on `install_*`).
 //!
 //! `sched/` entries:
-//! - `wake_placement` (rw) — a CORE executor feature flag (à la Linux
-//!   `SCHED_FEAT(WAKE_AFFINE)`): whether the waker consults the loaded steal
-//!   strategy's `select_wake_cpu` to push a woken task onto an idle sibling.
-//!   Off by default (helps producer-consumer IPC, can thrash contended locks).
 //! - `wake_next` (rw) — a CORE executor feature flag (à la Linux
 //!   `SCHED_FEAT(NEXT_BUDDY)`): whether a just-woken task is dispatched ahead
 //!   of the tasks already queued in front of it (its home CPU's "next buddy").
@@ -21,10 +17,9 @@
 //!   cede at its next syscall exit so the wakee runs promptly instead of after a
 //!   fair quantum. Off by default. Collapses producer/consumer handoff latency
 //!   (stress-ng `--futex`) at some cost to batching.
-//! - `policy` (ro) — the installed [`Scheduler`] name. The `wake_placement`
-//!   flag's EFFECT depends on the loaded strategy (a strategy whose
-//!   `select_wake_cpu` returns `None` makes the flag a no-op), so an operator
-//!   needs to see what is active.
+//! - `policy` (ro) — the installed [`Scheduler`] name. Wake-time CPU placement
+//!   is the policy's `select_task_rq` (a policy that returns `None` does no
+//!   placement), so an operator needs to see what is active.
 //! - `steal_strategy` (ro) — the installed `StealStrategy` name.
 
 use alloc::boxed::Box;
@@ -44,28 +39,9 @@ struct SchedKnob {
 }
 
 /// The core executor's `sched/` knob table. Read-only reflectors surface the
-/// active pluggable policy/strategy; `wake_placement` is a core feature flag.
+/// active pluggable policy/strategy; `wake_next` / `wake_preempt` are core
+/// feature flags.
 static SCHED_KNOBS: &[SchedKnob] = &[
-    SchedKnob {
-        name: "wake_placement",
-        read: || {
-            if narf_scheduler::wake_placement_enabled() {
-                String::from("1\n")
-            } else {
-                String::from("0\n")
-            }
-        },
-        write: Some(|buf| {
-            // Toggle on the first non-whitespace byte, `echo 1 > …` style.
-            if let Some(&b) = buf.iter().find(|b| !b.is_ascii_whitespace()) {
-                match b {
-                    b'1' | b'y' | b'Y' | b't' | b'T' => narf_scheduler::enable_wake_placement(),
-                    b'0' | b'n' | b'N' | b'f' | b'F' => narf_scheduler::disable_wake_placement(),
-                    _ => {}
-                }
-            }
-        }),
-    },
     SchedKnob {
         name: "wake_next",
         read: || {

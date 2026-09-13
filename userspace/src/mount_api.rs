@@ -206,7 +206,7 @@ pub fn build_fs_with_options(
         // writable directory is enough for systemd's mount unit to succeed.
         "securityfs" => empty("securityfs"),
         // Real debugfs: a small synthetic tree of runtime kernel-debug knobs
-        // (sched/wake_placement, …). Linux mounts debugfs at /sys/kernel/debug.
+        // (sched/wake_next, …). Linux mounts debugfs at /sys/kernel/debug.
         "debugfs" => Some(Arc::new(narf_filesystem::debugfs::DebugFs::new())),
         "tracefs" => empty("tracefs"),
         "configfs" => empty("configfs"),

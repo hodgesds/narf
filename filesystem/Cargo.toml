@@ -41,7 +41,7 @@ container = []
 # Base feature: organizational tree + process-membership tracking +
 # freeze/kill/events. Resource controllers are additive sub-features
 # below, each implying `cgroup`. `cgroup-all` turns on everything.
-# Orthogonal to linux-compat and container.
+# Orthogonal to the container feature.
 cgroup = []
 
 # Resource controllers (each implies the base `cgroup`).

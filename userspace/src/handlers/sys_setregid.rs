@@ -15,5 +15,11 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
             e.fsgid = egid;
         }
     });
-    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 }));
+    // write_uidgid only fails when the per-task uid/gid table is uninitialised
+    // — an internal condition unreachable for a live task. If it were reached,
+    // -1 folds to EPERM, which is exactly setregid(2)'s dominant failure
+    // (kernel/sys.c __sys_setregid: `retval = -EPERM` for an unprivileged
+    // identity change; -EINVAL only for an out-of-range gid, which this
+    // permissive impl does not range-check). Verified correct as EPERM.
+    ctx.set_return(SyscallReturn::ok(if ok { 0 } else { (-1i64) as u64 })); // -EPERM
 }
