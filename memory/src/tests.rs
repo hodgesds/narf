@@ -240,6 +240,106 @@ fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_fixed_anonymous_mmaps_coalesce);
 
+/// An interior interval of a coalesced anonymous VMA can be carved into its
+/// own exact VMA (Linux's mremap split shape): each fragment keeps exactly
+/// its own pages' backing at unchanged virtual addresses, the demand-zero
+/// tail past the materialized prefix stays lazy, an exact fit never splits,
+/// and non-mergeable mappings keep their exact-fit-only contract.
+fn smoke_memory_carve_exact_private_region_splits_coalesced_vma() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_7000_0000u64;
+    let perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE;
+    // Four pages, the last demand-zero. Sentinels sit below the allocator's
+    // reserved 1 MiB floor so teardown cannot donate them to the live buddy.
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 4 * 4096,
+            perms,
+            phys: vec![
+                PhysAddr::new(0x10_000),
+                PhysAddr::new(0x11_000),
+                PhysAddr::new(0x12_000),
+                PhysAddr::new(0),
+            ],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("carve fixture failed to map");
+    }
+    let carved = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(base + 4096), 2 * 4096) }
+    });
+    if carved != Ok(perms) {
+        return TestResult::Fail("interior carve failed");
+    }
+    let regions = aspace.regions_snapshot();
+    if regions.len() != 3 {
+        return TestResult::Fail("interior carve did not produce three fragments");
+    }
+    let head = &regions[0];
+    let mid = &regions[1];
+    let tail = &regions[2];
+    if head.base.as_u64() != base
+        || head.len != 4096
+        || head.phys[..] != [PhysAddr::new(0x10_000)]
+        || head.perms != perms
+    {
+        return TestResult::Fail("carve head lost shape or backing");
+    }
+    if mid.base.as_u64() != base + 4096
+        || mid.len != 2 * 4096
+        || mid.phys[..] != [PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)]
+        || mid.perms != perms
+    {
+        return TestResult::Fail("carved interval lost shape or backing");
+    }
+    if tail.base.as_u64() != base + 3 * 4096
+        || tail.len != 4096
+        || tail.phys[..] != [PhysAddr::new(0)]
+    {
+        return TestResult::Fail("carve tail must stay demand-zero");
+    }
+    // An exact fit is returned as-is without further splitting.
+    let exact = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(base + 4096), 2 * 4096) }
+    });
+    if exact != Ok(perms) || aspace.regions_snapshot().len() != 3 {
+        return TestResult::Fail("exact-fit carve must not split again");
+    }
+    // A covering VMA without anonymous-merge provenance keeps the exact-fit
+    // requirement.
+    let special = 0x0000_0100_7800_0000u64;
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(special),
+            len: 2 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("non-mergeable carve fixture failed to map");
+    }
+    let refused = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(special), 4096) }
+    });
+    if refused != Err(AddressSpaceError::Unmapped) {
+        return TestResult::Fail("non-mergeable covering VMA must not be carved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_carve_exact_private_region_splits_coalesced_vma
+);
+
 /// Identical permissions are insufficient for coalescing: a mapping without
 /// anonymous provenance may have file or bespoke ownership semantics.
 fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {
@@ -4478,6 +4578,187 @@ fn smoke_memory_failed_fork_rolls_back_unpublished_cow_refs() -> TestResult {
 kernel_test_in!(
     "memory",
     smoke_memory_failed_fork_rolls_back_unpublished_cow_refs
+);
+
+/// The first fork write-protects exactly the resident writable private
+/// pages it newly shares; a repeated fork of the unchanged parent selects
+/// none of them again — settled read-only leaves are skipped without a
+/// page-table re-walk, and lazy (phys == 0) slots are never selected.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_repeated_fork_skips_settled_cow_pages() -> TestResult {
+    use crate::address_space::__test_fork_write_protected_pages;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging is live in the kernel-test harness and this test owns
+    // the fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("repeated-fork parent root unavailable"),
+    };
+    let first = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("repeated-fork first frame unavailable"),
+    };
+    let second = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => {
+            frame::free_frame(first);
+            return TestResult::Skip("repeated-fork second frame unavailable");
+        }
+    };
+    let first_phys = first.start_address();
+    let second_phys = second.start_address();
+    // Two resident writable pages split by a lazy slot, so each fork sees
+    // two distinct protect runs rather than one.
+    if parent
+        .map_region(Region {
+            base: VirtAddr::new(0x0000_0080_3b00_0000),
+            len: 3 * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![first_phys, crate::PhysAddr::new(0), second_phys],
+        })
+        .is_err()
+    {
+        frame::free_frame(first);
+        frame::free_frame(second);
+        return TestResult::Fail("repeated-fork VMA setup failed");
+    }
+
+    let before = __test_fork_write_protected_pages();
+    // SAFETY: the inactive parent is exclusively owned and paging is live.
+    let first_child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("repeated-fork first fork failed"),
+    };
+    let after_first = __test_fork_write_protected_pages();
+    if after_first - before != 2 {
+        return TestResult::Fail("first fork must select exactly the resident writable pages");
+    }
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let second_child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("repeated-fork second fork failed"),
+    };
+    if __test_fork_write_protected_pages() != after_first {
+        return TestResult::Fail("repeated fork re-protected already-shared pages");
+    }
+    if cow::count(first_phys) != 3 || cow::count(second_phys) != 3 {
+        return TestResult::Fail("repeated fork lost a COW owner");
+    }
+
+    drop(second_child);
+    drop(first_child);
+    if cow::count(first_phys) > 1 || cow::count(second_phys) > 1 {
+        return TestResult::Fail("child teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(first_phys) == 0 && cow::count(second_phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left repeated-fork COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!("memory", smoke_memory_repeated_fork_skips_settled_cow_pages);
+
+/// The fused fork pass builds each child region directly: a failure of the
+/// very first child index reservation publishes nothing and rolls back that
+/// region's already-taken COW retains in place, and a subsequent successful
+/// fork's child regions replicate the parent's exact shape and backing.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_failed_fork_first_reservation_retains_nothing() -> TestResult {
+    use crate::address_space::__test_fail_fork_child_region_reserve_after;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging is live in the kernel-test harness and this test owns
+    // the fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("first-reservation parent root unavailable"),
+    };
+    let frame = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("first-reservation frame unavailable"),
+    };
+    let phys = frame.start_address();
+    let base = VirtAddr::new(0x0000_0080_3c00_0000);
+    if parent
+        .map_region(Region {
+            base,
+            len: 2 * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys, crate::PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        frame::free_frame(frame);
+        return TestResult::Fail("first-reservation VMA setup failed");
+    }
+
+    __test_fail_fork_child_region_reserve_after(1);
+    // SAFETY: the inactive parent is exclusively owned; the injected failure
+    // occurs on the first child reservation, before any publication.
+    let failure = unsafe { parent.clone_for_fork() };
+    if !matches!(failure, Err(AddressSpaceError::AllocationFailed)) {
+        return TestResult::Fail("first-reservation failure did not surface AllocationFailed");
+    }
+    if cow::count(phys) > 1 {
+        return TestResult::Fail("empty-prefix fork failure leaked a COW owner");
+    }
+    let parent_intact = parent.lookup(base).is_some_and(|region| {
+        region.phys[..] == [phys, crate::PhysAddr::new(0)]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !parent_intact {
+        return TestResult::Fail("empty-prefix fork failure changed the parent");
+    }
+
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("post-failure fork failed"),
+    };
+    let child_faithful = child.lookup(base).is_some_and(|region| {
+        region.base == base
+            && region.len == 2 * 0x1000
+            && region.phys[..] == [phys, crate::PhysAddr::new(0)]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !child_faithful || cow::count(phys) != 2 {
+        return TestResult::Fail("fused fork did not replicate the parent region");
+    }
+
+    drop(child);
+    if cow::count(phys) > 1 {
+        return TestResult::Fail("child teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left first-reservation COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_failed_fork_first_reservation_retains_nothing
 );
 
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
