@@ -23,7 +23,7 @@ path = "src/lib.rs"
 # mprotect, madvise, and dynamic-linker plumbing.  Stub for Waves 63-67.
 
 # Namespace isolation: PID, mount, network, UTS, IPC, user namespaces.
-# Orthogonal to linux-compat.  Stub for Waves 63-67.
+# Stub for Waves 63-67.
 container = []
 
 [lints]

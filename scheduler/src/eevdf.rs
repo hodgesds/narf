@@ -154,6 +154,51 @@ impl Scheduler for EevdfScheduler {
         best.map(|(h, ..)| h).or_else(|| queue.front())
     }
 
+    fn select_task_rq(
+        &self,
+        prev_cpu: CpuId,
+        waker_cpu: CpuId,
+        is_online: &dyn Fn(CpuId) -> bool,
+        is_idle: &dyn Fn(CpuId) -> bool,
+    ) -> Option<CpuId> {
+        // Reached only when `prev_cpu` (the wakee's cache-warm home) is BUSY.
+        let node = narf_acpi::cpu_node(prev_cpu.0);
+        let same_node = |c: CpuId| node.is_none() || narf_acpi::cpu_node(c.0) == node;
+        // Wake-affine (Linux `wake_affine`): if the WAKER's CPU is idle and on
+        // prev_cpu's NUMA node, run the wakee there — producer and consumer share
+        // one cache domain. The common producer→consumer IPC case (a bus daemon
+        // waking a client, a pipe writer waking a reader).
+        if waker_cpu != prev_cpu
+            && is_online(waker_cpu)
+            && is_idle(waker_cpu)
+            && same_node(waker_cpu)
+        {
+            return Some(waker_cpu);
+        }
+        let max = narf_lib::percpu::MAX_CPUS as u32;
+        // Else the nearest node-local idle sibling, scanning from prev_cpu
+        // outward (Linux `select_idle_sibling` within the LLC/node domain) — keep
+        // the working set on-node.
+        if node.is_some() {
+            for i in 1..max {
+                let cpu = CpuId((prev_cpu.0 + i) % max);
+                if is_online(cpu) && is_idle(cpu) && same_node(cpu) {
+                    return Some(cpu);
+                }
+            }
+        }
+        // Else ANY idle sibling (topology unknown, or no node-local idle). If
+        // none is idle, return None: the wakee stays on prev_cpu rather than
+        // being placed onto another busy CPU.
+        for i in 1..max {
+            let cpu = CpuId((prev_cpu.0 + i) % max);
+            if is_online(cpu) && is_idle(cpu) {
+                return Some(cpu);
+            }
+        }
+        None
+    }
+
     fn wakeup_preempt(&self, ctx: &CpuSchedContext, queue: &RunQueue<'_>) -> bool {
         let current = &ctx.current;
         // Best runnable sibling (highest class, then earliest deadline). The

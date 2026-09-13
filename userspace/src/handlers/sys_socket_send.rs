@@ -61,6 +61,16 @@ pub(crate) fn sys_socket_send(ctx: &mut dyn TrapContext) {
             socket_send_would_block(ctx, fd, flags, sock.as_ref());
         }
         crate::socket::SocketOpResult::Err(e) => {
+            // A broken-pipe send raises SIGPIPE to the sender unless MSG_NOSIGNAL
+            // is set, matching Linux sk_stream_error (net/core/stream.c:194) and
+            // unix_stream_sendmsg (net/unix/af_unix.c:2500). SIGPIPE's default
+            // action is Terminate, so a client that neither sets MSG_NOSIGNAL nor
+            // ignores SIGPIPE dies here exactly as on Linux.
+            if e == crate::socket::SockError::Pipe
+                && flags & crate::socket::MSG_NOSIGNAL == 0
+            {
+                raise_signal_pending(current_task_id(), 13); // SIGPIPE
+            }
             ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64));
         }
         // Send never yields Accepted/Received/Addr; keep the match total.

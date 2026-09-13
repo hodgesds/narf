@@ -8,19 +8,22 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     let off = args.arg2;
     let len = args.arg3;
     let _flags = args.arg4 as u32;
-    let fail = SyscallReturn::ok((-1i64) as u64);
+    // Per-branch errnos (the old bare -1 sentinel reached libc as EPERM for
+    // every failure). Modelled on sendmsg(2): a bad/unknown registered buffer
+    // or out-of-range slice is -EFAULT (bad send buffer), a bad fd is -EBADF,
+    // and a send failure carries the socket's own errno.
     let task = current_task_id();
     let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
     };
     let sock = match current_socket(fd) {
         Some(s) => s,
         None => {
-            ctx.set_return(fail);
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
             return;
         }
     };
@@ -33,7 +36,7 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     let mut kbuf = alloc::vec![0u8; n_bytes];
     // SAFETY: vaddr is a pinned user VA from a registered buffer.
     if unsafe { copy_from_user(&mut kbuf, vaddr) }.is_err() {
-        ctx.set_return(fail);
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
         return;
     }
     match sock.dispatch_op(crate::socket::SocketOp::Send {
@@ -42,6 +45,11 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
         addr: None,
     }) {
         crate::socket::SocketOpResult::Ok(n) => ctx.set_return(SyscallReturn::ok(n)),
-        _ => ctx.set_return(fail),
+        // Propagate the socket's real send errno (EPIPE, ECONNRESET, ENOTCONN,
+        // EAGAIN, …) instead of a blanket -1/EPERM.
+        crate::socket::SocketOpResult::Err(e) => {
+            ctx.set_return(SyscallReturn::ok((-(e.errno() as i64)) as u64))
+        }
+        _ => ctx.set_return(SyscallReturn::ok((-22i64) as u64)), // -EINVAL (no other variant expected for Send)
     }
 }

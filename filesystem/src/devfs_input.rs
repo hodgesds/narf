@@ -282,6 +282,7 @@ const EVIOC_NR_GSW: u32 = 0x1b; // EVIOCGSW(len) — current switch state
 const EVIOC_NR_GBIT_BASE: u32 = 0x20; // EVIOCGBIT(ev, len) → 0x20 + ev
 const EVIOC_NR_GABS_BASE: u32 = 0x40; // EVIOCGABS(abs) → 0x40 + abs
 const EVIOC_NR_GRAB: u32 = 0x90; // EVIOCGRAB
+const EVIOC_NR_REVOKE: u32 = 0x91; // EVIOCREVOKE
 const EVIOC_NR_SCLOCKID: u32 = 0xa0; // EVIOCSCLOCKID — set the event clock
 
 /// Synthetic device name reported by `EVIOCGNAME`.
@@ -607,6 +608,24 @@ impl FileOps for InputEventFile {
             }
             EVIOC_NR_GRAB => {
                 // EVIOCGRAB — accept and no-op (single-reader anyway).
+                Ok(0)
+            }
+            EVIOC_NR_REVOKE => {
+                // EVIOCREVOKE. Linux `drivers/input/evdev.c`:
+                //   case EVIOCREVOKE:
+                //       if (p)  return -EINVAL;     // p == the arg as a pointer
+                //       else    return evdev_revoke(...);   // returns 0
+                // systemd-logind calls `ioctl(fd, EVIOCREVOKE, NULL)` on session
+                // stop. Without this arm it fell to the generic `Unsupported`
+                // relay, which — because EVIOCREVOKE is `_IOW('E',0x91,int)` —
+                // copy_from_user'd the NULL arg and returned EFAULT, so logind
+                // logged "Failed to revoke evdev device ... Bad address".
+                // Accept the revoke (no-op: NARF is single-reader and logind
+                // revokes only when tearing the session down); a non-NULL arg is
+                // -EINVAL exactly as the kernel returns it.
+                if arg != 0 {
+                    return Err(FsError::InvalidData); // -EINVAL
+                }
                 Ok(0)
             }
             EVIOC_NR_SCLOCKID => {
@@ -982,6 +1001,37 @@ impl DirOps for DevInputDir {
         Box::pin(async move { Ok(self.enumerate(cursor, max)) })
     }
 }
+
+// ── EVIOCREVOKE errno parity (kernel test) ────────────────────────────────────
+// Constructed in-module because `InputEventFile`'s fields are private and
+// `InputEventFile::open` needs a ROUTER-registered device (absent in a test).
+// The REVOKE ioctl arm is pure argument logic — it never touches the reader.
+fn smoke_evdev_eviocrevoke_errno() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    // EVIOCREVOKE = _IOW('E', 0x91, int) = 0x4004_4591.
+    const EVIOCREVOKE: u32 = 0x4004_4591;
+    if ioc::nr(EVIOCREVOKE) != EVIOC_NR_REVOKE {
+        return TestResult::Fail("EVIOCREVOKE nr must decode to 0x91");
+    }
+    let f = InputEventFile {
+        device_id: DeviceId(1),
+        event_num: 0,
+        kind: DeviceKind::Hardware,
+        reader: IrqSafeSpinLock::new(None),
+    };
+    // Linux drivers/input/evdev.c: a NULL arg revokes and returns 0 — this is
+    // what systemd-logind issues on session stop. Must NOT fall to the generic
+    // Unsupported relay (which copy_from_user'd the NULL arg → EFAULT).
+    if !matches!(f.ioctl(EVIOCREVOKE, 0), Ok(0)) {
+        return TestResult::Fail("EVIOCREVOKE(NULL) must return Ok(0), not EFAULT/ENOTTY");
+    }
+    // `if (p) return -EINVAL;` — a non-NULL arg is -EINVAL (FsError::InvalidData).
+    if !matches!(f.ioctl(EVIOCREVOKE, 1), Err(FsError::InvalidData)) {
+        return TestResult::Fail("EVIOCREVOKE(non-NULL) must return -EINVAL");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!("filesystem/devfs_input", smoke_evdev_eviocrevoke_errno);
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

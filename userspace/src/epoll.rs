@@ -143,6 +143,29 @@ fn next_sub_id() -> u64 {
 #[derive(Debug)]
 pub struct EpollInstance {
     inner: IrqSafeSpinLock<EpollInner>,
+    /// This epoll fd's OWN durable readiness cell. An epoll fd is itself
+    /// pollable (Linux `ep_eventpoll_poll`), so a PARENT epoll / `poll(2)` that
+    /// watches this instance as a nested fd arms its per-fd waker here via
+    /// [`FileOps::arm_readiness_persistent`]. [`EpollInstance::push_ready`]
+    /// fires it, chaining a TARGETED wake UP to the parent when a child becomes
+    /// ready (Linux `ep_poll_safewake`). Without it a nested-epoll parent is not
+    /// cell-backed, gets no targeted wake, and only re-discovers a ready child on
+    /// a full re-scan driven by the ~10 ms lost-wake backstop — which on a
+    /// NO_HZ-idle CPU stops re-arming, stretching recovery to ~900 ms. That is
+    /// the CachyOS dbus-broker accept strand: the broker waits on epfd A that
+    /// nests epfd B that nests the bus listener, so a new connection reached it
+    /// only via the global `notify(0)` herd (or the dead backstop). `poll_readiness`
+    /// stays the authoritative level query; this cell carries only the wake.
+    self_readiness: narf_lib::readiness::Readiness,
+    /// Set once a parent epoll / `poll(2)` arms a persistent waiter on
+    /// [`Self::self_readiness`] (i.e. this instance is nested somewhere). The
+    /// common case — an epoll waited on DIRECTLY — never nests, so `push_ready`
+    /// (hot: fires on every inbound event of every watched fd) skips the
+    /// self-cell set+notify behind this relaxed load instead of taking the cell
+    /// lock twice per event. Latched, never cleared: a `CTL_DEL` of the nesting
+    /// parent is rare, and a stale `true` only reinstates the (correct) cell
+    /// fire — it never drops a wake.
+    has_nested_parent: core::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug)]
@@ -265,6 +288,24 @@ impl EpollInstance {
             g.ready.insert(fd);
             g.parked_waker.clone()
         };
+        // Chain the wake UP to a parent epoll / poll(2) that watches THIS
+        // instance as a nested fd: fire our own cell so its persistent per-fd
+        // waker (armed via `arm_readiness_persistent`) runs. `set` covers a
+        // rising edge (the first ready child) and `notify` covers a same-level
+        // event (a further child while we are already readable) — the same
+        // set+notify the AF_UNIX listener uses, and what Linux `ep_poll_safewake`
+        // does by walking the nested wait-queue. Skipped unless we are actually
+        // nested (`has_nested_parent`) so the direct-wait hot path pays only a
+        // relaxed load, not two cell-lock acquisitions per event. Fired OUTSIDE
+        // `self.inner` (the cell has its own lock; `wake_by_ref` under it is
+        // alloc- and lock-free). See [`EpollInstance::self_readiness`].
+        if self
+            .has_nested_parent
+            .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            self.self_readiness.set(narf_filesystem::POLL_IN, 0);
+            self.self_readiness.notify(narf_filesystem::POLL_IN);
+        }
         if let Some(w) = waker {
             w.wake();
         }
@@ -279,6 +320,8 @@ impl EpollInstance {
                 parked_waker: None,
                 scan_ctr: 0,
             }),
+            self_readiness: narf_lib::readiness::Readiness::new(0),
+            has_nested_parent: core::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -362,6 +405,21 @@ impl EpollInstance {
         }
         if seed {
             g.ready.insert(fd);
+        }
+        let ready_now = !g.ready.is_empty();
+        drop(g);
+        // Keep our OWN cell level in step with the ready-list so a parent that
+        // nests us and arms via `arm_readiness_persistent` right after this ADD
+        // seeds an accurate initial edge (a child already ready at ADD time). A
+        // rising edge here fires any already-armed parent waker (a re-ADD after
+        // the set drained), which is correct; a no-op if already level-high.
+        // Only when nested (see `push_ready`).
+        if ready_now
+            && self
+                .has_nested_parent
+                .load(core::sync::atomic::Ordering::Relaxed)
+        {
+            self.self_readiness.set(narf_filesystem::POLL_IN, 0);
         }
     }
 
@@ -707,6 +765,22 @@ impl EpollInstance {
             }
         }
 
+        // Reconcile our OWN cell level for a parent that nests us: once the
+        // ready-list has drained we are no longer level-readable, so clear the
+        // cell. Clearing is a falling edge — wake-free (`set` ignores it) — so a
+        // parent is never spuriously woken; a still-non-empty ready-list leaves
+        // the cell high so a freshly-arming parent seeds an accurate initial
+        // edge. `push_ready` re-raises it on the next child event. This runs
+        // only when THIS instance is waited on directly; for the purely-nested
+        // case the parent's `poll_readiness` query is authoritative regardless.
+        if self
+            .has_nested_parent
+            .load(core::sync::atomic::Ordering::Relaxed)
+            && self.inner.lock().ready.is_empty()
+        {
+            self.self_readiness.set(0, narf_filesystem::POLL_IN);
+        }
+
         results
     }
 
@@ -801,6 +875,41 @@ impl FileOps for EpollInstance {
             return narf_filesystem::POLL_IN;
         }
         0
+    }
+
+    /// This epoll fd's own durable readiness cell — how a PARENT epoll /
+    /// `poll(2)` arms a persistent per-fd waker on this instance when it is
+    /// nested. The wake is chained from [`EpollInstance::push_ready`];
+    /// [`EpollInstance::poll_readiness`] remains the authoritative level query.
+    fn readiness(&self) -> Option<&narf_lib::readiness::Readiness> {
+        Some(&self.self_readiness)
+    }
+
+    /// A parent epoll arming its persistent per-fd waker (Linux `eppoll_entry`)
+    /// on this nested instance: latch [`Self::has_nested_parent`] so `push_ready`
+    /// starts chaining the wake up, then arm on our own cell.
+    fn arm_readiness_persistent(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<u32> {
+        self.has_nested_parent
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Some(self.self_readiness.arm_persistent(id, interest, waker))
+    }
+
+    /// `poll(2)` over this epoll fd (the non-persistent arm). Same latch as
+    /// [`Self::arm_readiness_persistent`] so a nested `poll` also gets the wake.
+    fn arm_readiness(
+        &self,
+        id: u64,
+        interest: u32,
+        waker: &core::task::Waker,
+    ) -> Option<core::task::Poll<u32>> {
+        self.has_nested_parent
+            .store(true, core::sync::atomic::Ordering::Relaxed);
+        Some(self.self_readiness.arm(id, interest, waker))
     }
 
     /// Forward the nearest child timerfd deadline so a `poll(2)` over

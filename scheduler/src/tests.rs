@@ -3189,41 +3189,60 @@ fn smoke_scheduler_wake_next_buddy_runs_first() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_wake_next_buddy_runs_first);
 
-fn smoke_scheduler_select_wake_cpu_prefers_idle_sibling() -> TestResult {
+fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     use crate::affinity::CpuId;
-    use crate::steal::{NumaAwareSteal, StealStrategy};
+    use crate::eevdf::EevdfScheduler;
+    use crate::policy::{FifoScheduler, Scheduler};
 
-    let strat = NumaAwareSteal;
-    // CPUs 0..4 online; only cpu 2 idle. A task homed on the busy cpu 0 should
-    // be hinted to the idle sibling cpu 2 so it gets pulled there.
+    let sched = EevdfScheduler;
+    // CPUs 0..4 online.
     let online = |c: CpuId| c.0 < 4;
+
+    // prev_cpu 0 busy, waker == prev (no wake-affine), only cpu 2 idle → the
+    // wakee should be placed on the idle sibling cpu 2.
     let only_2_idle = |c: CpuId| c.0 == 2;
-    match strat.select_wake_cpu(CpuId(0), &online, &only_2_idle) {
+    match sched.select_task_rq(CpuId(0), CpuId(0), &online, &only_2_idle) {
         Some(t) if t.0 == 2 => {}
         _ => return TestResult::Fail("expected the idle sibling cpu 2"),
     }
 
-    // No idle sibling → None (leave the wake on home).
+    // Wake-affine: the waker's cpu 3 is idle → prefer it (run the consumer on
+    // the producer's CPU / cache domain) even though cpu 2 is also idle.
+    let two_and_three_idle = |c: CpuId| c.0 == 2 || c.0 == 3;
+    match sched.select_task_rq(CpuId(0), CpuId(3), &online, &two_and_three_idle) {
+        Some(t) if t.0 == 3 => {}
+        _ => return TestResult::Fail("expected the waker cpu 3 (wake-affine)"),
+    }
+
+    // No idle sibling → None (leave the wakee on prev_cpu).
     let none_idle = |_c: CpuId| false;
-    if strat
-        .select_wake_cpu(CpuId(0), &online, &none_idle)
+    if sched
+        .select_task_rq(CpuId(0), CpuId(0), &online, &none_idle)
         .is_some()
     {
         return TestResult::Fail("expected None when no sibling is idle");
     }
 
-    // Must never hint a CPU to pull the task onto its own home, and must skip
-    // offline CPUs even when they read "idle".
+    // Never place onto prev_cpu itself; skip offline CPUs even if they read
+    // "idle".
     let all_idle = |_c: CpuId| true;
-    match strat.select_wake_cpu(CpuId(1), &online, &all_idle) {
+    match sched.select_task_rq(CpuId(1), CpuId(1), &online, &all_idle) {
         Some(t) if t.0 != 1 && t.0 < 4 => {}
-        _ => return TestResult::Fail("must return an online sibling that is not home"),
+        _ => return TestResult::Fail("must return an online sibling that is not prev_cpu"),
+    }
+
+    // A policy without a wake-placement model (Fifo) declines — keeps prev_cpu.
+    if FifoScheduler
+        .select_task_rq(CpuId(0), CpuId(1), &online, &all_idle)
+        .is_some()
+    {
+        return TestResult::Fail("default select_task_rq must return None");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "scheduler",
-    smoke_scheduler_select_wake_cpu_prefers_idle_sibling
+    smoke_scheduler_select_task_rq_prefers_idle_sibling
 );
 
 fn smoke_scheduler_policy_observes_cpu_state_edges() -> TestResult {

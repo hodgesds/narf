@@ -1518,6 +1518,287 @@ fn smoke_abi_socket_shutdown_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_shutdown_neg);
 
+// ── AF_UNIX Linux-errno-parity fixes (audit vs net/unix/af_unix.c) ──
+
+// unix_shutdown ALWAYS returns 0, even on a never-connected AF_UNIX socket
+// (net/unix/af_unix.c: the only early return is the -EINVAL `how` check; the
+// tail is an unconditional `return 0`). NARF used to return -ENOTCONN here.
+fn smoke_abi_socket_shutdown_unconnected_ok() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let r = call(Syscall::SocketShutdown.raw(), a1(fd, SHUT_RDWR)).ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("shutdown() on an unconnected AF_UNIX socket must return 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_shutdown_unconnected_ok
+);
+
+// unix_shutdown rejects an out-of-range `how` with -EINVAL before anything
+// else: `if (mode < SHUT_RD || mode > SHUT_RDWR) return -EINVAL`. how=3 is
+// past SHUT_RDWR(2).
+fn smoke_abi_socket_shutdown_bad_how_einval() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        if call(Syscall::SocketShutdown.raw(), a1(fd0, 3)) != Some(EINVAL) {
+            return Err("shutdown() with how=3 (> SHUT_RDWR) must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_shutdown_bad_how_einval
+);
+
+// unix_stream_read_generic returns -EINVAL (NOT -ENOTCONN) for a recv on a
+// never-connected AF_UNIX stream socket (`sk_state != TCP_ESTABLISHED`).
+fn smoke_abi_socket_recv_unconnected_einval() -> TestResult {
+    with_setup(|| {
+        let fd = open_unix_stream()?;
+        let mut buf = [0u8; 8];
+        if call(
+            Syscall::SocketRecv.raw(),
+            a3(fd, buf.as_mut_ptr() as u64, buf.len() as u64, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("recv() on an unconnected AF_UNIX stream socket must return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_recv_unconnected_einval
+);
+
+// unix_dgram_sendmsg returns -ENOTCONN (NOT -EINVAL) for a send with no
+// destination on an unconnected datagram socket (`other = unix_peer_get(sk)`
+// is NULL → -ENOTCONN).
+fn smoke_abi_socket_dgram_send_no_dest_enotconn() -> TestResult {
+    with_setup(|| {
+        let fd = match call(Syscall::SocketOpen.raw(), a2(AF_UNIX, SOCK_DGRAM, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("socket(AF_UNIX, SOCK_DGRAM) failed"),
+        };
+        let payload = b"x";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd, payload.as_ptr() as u64, payload.len() as u64, 0),
+        ) != Some(ENOTCONN)
+        {
+            return Err("send() with no dest on an unconnected dgram socket must return -ENOTCONN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_send_no_dest_enotconn
+);
+
+// connect() to a PATHNAME that does not exist is -ENOENT, not -ECONNREFUSED
+// (Linux `unix_find_bsd` `kern_path` failure). Clients (libdbus/libwayland/Xlib)
+// treat ENOENT as "server not up yet, retry" but ECONNREFUSED as fatal.
+fn smoke_abi_socket_connect_missing_path_enoent() -> TestResult {
+    with_setup(|| {
+        let cli = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/abi-enoent-never-bound.sock");
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        ) != Some(ENOENT)
+        {
+            return Err("connect() to a missing pathname must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_missing_path_enoent
+);
+
+// sendto() to a PATHNAME datagram address that does not exist is -ENOENT
+// (Linux `unix_dgram_sendmsg`→`unix_find_other` `kern_path` failure).
+fn smoke_abi_socket_dgram_sendto_missing_path_enoent() -> TestResult {
+    with_setup(|| {
+        let tx = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/abi-enoent-dgram-missing.sock");
+        let payload = b"x";
+        let send_args = SyscallArgs {
+            arg0: tx,
+            arg1: payload.as_ptr() as u64,
+            arg2: payload.len() as u64,
+            arg3: 0,
+            arg4: addr.as_ptr() as u64,
+            arg5: alen,
+        };
+        if call(Syscall::SocketSend.raw(), send_args) != Some(ENOENT) {
+            return Err("sendto() to a missing pathname must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_sendto_missing_path_enoent
+);
+
+// connect() to a path that EXISTS but is not a live listener is -ECONNREFUSED,
+// NOT -ENOENT (Linux `unix_find_bsd`: node present, not a bound socket →
+// -ECONNREFUSED). A plain file stands in for the "present but not connectable"
+// node — this proves the ENOENT/ECONNREFUSED split keys on node existence.
+fn smoke_abi_socket_connect_existing_nonsocket_econnrefused() -> TestResult {
+    with_memfs("/m", "m", &[], || {
+        let plain = b"/m/plainfile\0";
+        if call_creat(plain.as_ptr() as u64, 0o644).ok_or("creat status")? < 0 {
+            return Err("creat of the stand-in file failed");
+        }
+        let cli = open_unix_stream()?;
+        let (addr, alen) = unix_sockaddr(b"/m/plainfile");
+        // -111 == ECONNREFUSED: the node exists, so it is NOT the ENOENT path.
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        ) != Some(-111)
+        {
+            return Err("connect() to an existing non-socket path must return -ECONNREFUSED");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_connect_existing_nonsocket_econnrefused
+);
+
+// MSG_OOB is unsupported on AF_UNIX (no CONFIG_AF_UNIX_OOB) → a send with it is
+// -EOPNOTSUPP, both stream and datagram (Linux unix_stream/dgram_sendmsg).
+fn smoke_abi_socket_send_msg_oob_eopnotsupp() -> TestResult {
+    const EOPNOTSUPP: i64 = -95;
+    const MSG_OOB: u64 = 0x1;
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        if call(
+            Syscall::SocketPair.raw(),
+            a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let p = b"x";
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, p.as_ptr() as u64, 1, MSG_OOB),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("stream send(MSG_OOB) must return -EOPNOTSUPP");
+        }
+        let d = open_unix(SOCK_DGRAM)?;
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(d, p.as_ptr() as u64, 1, MSG_OOB),
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("dgram send(MSG_OOB) must return -EOPNOTSUPP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_msg_oob_eopnotsupp
+);
+
+// A datagram larger than the send buffer is -EMSGSIZE (Linux unix_dgram_sendmsg
+// `len > sk_sndbuf - 32`), not the syscall-layer -EINVAL.
+fn smoke_abi_socket_dgram_send_oversized_emsgsize() -> TestResult {
+    with_setup(|| {
+        let d = open_unix(SOCK_DGRAM)?;
+        let big = alloc::vec![0u8; 213_000]; // > UNIX_DGRAM_SNDBUF(212992) - 32
+        if call(
+            Syscall::SocketSend.raw(),
+            a3(d, big.as_ptr() as u64, big.len() as u64, 0),
+        ) != Some(EMSGSIZE_ERR)
+        {
+            return Err("oversized datagram must return -EMSGSIZE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_send_oversized_emsgsize
+);
+
+// A stream connect to a path where a DATAGRAM socket is bound is -EPROTOTYPE
+// (Linux unix_find_bsd `sk->sk_type != type`), not ECONNREFUSED/ENOENT.
+fn smoke_abi_socket_stream_connect_wrong_type_eprototype() -> TestResult {
+    const EPROTOTYPE: i64 = -91;
+    with_memfs("/m", "m", &[], || {
+        let d = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/m/dsock");
+        if call(Syscall::SocketBind.raw(), a2(d, addr.as_ptr() as u64, alen))
+            .ok_or("bind status")?
+            != 0
+        {
+            return Err("dgram bind failed");
+        }
+        let cli = open_unix_stream()?;
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(cli, addr.as_ptr() as u64, alen),
+        ) != Some(EPROTOTYPE)
+        {
+            return Err("stream connect to a datagram-bound path must return -EPROTOTYPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_stream_connect_wrong_type_eprototype
+);
+
+// Linux `unix_dgram_connect` validates the target at connect time: a datagram
+// connect to a missing pathname is -ENOENT (not a deferred, always-Ok connect).
+fn smoke_abi_socket_dgram_connect_missing_enoent() -> TestResult {
+    with_setup(|| {
+        let d = open_unix(SOCK_DGRAM)?;
+        let (addr, alen) = unix_sockaddr(b"/abi-dgram-connect-missing.sock");
+        if call(
+            Syscall::SocketConnect.raw(),
+            a2(d, addr.as_ptr() as u64, alen),
+        ) != Some(ENOENT)
+        {
+            return Err("dgram connect to a missing path must return -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_dgram_connect_missing_enoent
+);
+
 // ──────────────────────────── SocketGetSockOpt ────────────────────────
 
 fn smoke_abi_socket_getsockopt_pos() -> TestResult {
@@ -2228,10 +2509,18 @@ kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_register_buf_pos);
 fn smoke_abi_socket_sock_register_buf_neg() -> TestResult {
     with_setup(|| {
         let n = Syscall::SockRegisterBuf.raw();
-        // ptr == 0 → register_user_buffer returns None → -1.
+        // A NULL buffer base is -EFAULT (io_uring io_buffer_validate access_ok),
+        // NOT the old bare -1 that libc read as EPERM.
         let r = call(n, a1(0, 64)).ok_or("status not Ok")?;
-        if r != -1 {
-            return Err("sock_register_buf(NULL) did not return -1");
+        if r != -14 {
+            return Err("sock_register_buf(NULL) must return -EFAULT (-14)");
+        }
+        // A zero-length registration is also -EFAULT (io_validate_user_buf_range
+        // rejects `!ulen` with -EFAULT), NOT -EINVAL.
+        let backing = [0u8; 8];
+        let r = call(n, a1(backing.as_ptr() as u64, 0)).ok_or("status not Ok")?;
+        if r != -14 {
+            return Err("sock_register_buf(len=0) must return -EFAULT (-14)");
         }
         Ok(())
     })
@@ -2274,15 +2563,170 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
     with_setup(|| {
         let fd = open_unix_stream()?;
         let n = Syscall::SockSendZc.raw();
-        // buf_id 9999 was never registered → registered_buffer_slice None → -1.
+        // An unregistered buf_id → registered_buffer_slice None → -EFAULT (a bad
+        // send buffer, sendmsg(2)), NOT the old bare -1 (EPERM).
         let r = call(n, a3(fd, 9999, 0, 8)).ok_or("status not Ok")?;
-        if r != -1 {
-            return Err("sock_send_zc() with an unregistered buf_id did not return -1");
+        if r != -14 {
+            return Err("sock_send_zc(bad buf_id) must return -EFAULT (-14)");
+        }
+        // A bad fd (after registering a valid buffer) → -EBADF, not EPERM.
+        let backing = [0u8; 8];
+        let bid = call(
+            Syscall::SockRegisterBuf.raw(),
+            a1(backing.as_ptr() as u64, 8),
+        )
+        .ok_or("status not Ok")?;
+        if bid < 0 {
+            return Err("could not register a buffer for the bad-fd case");
+        }
+        let r = call(n, a3(0xFFFF_FFFF, bid as u64, 0, 8)).ok_or("status not Ok")?;
+        if r != -9 {
+            return Err("sock_send_zc(bad fd) must return -EBADF (-9)");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_neg);
+
+/// A zero-copy send on a stream socket whose peer has CLOSED is -EPIPE, matching
+/// unix_stream_sendmsg (net/unix/af_unix.c: a dead peer sets `err = -EPIPE`).
+/// This exercises the send-failure branch (SockError::Pipe -> errno 32), which
+/// the bad-arg neg test above does not reach. NARF returns EPIPE here but does
+/// NOT raise SIGPIPE (a known parity gap vs Linux's `send_sig(SIGPIPE)` when
+/// MSG_NOSIGNAL is unset), so the syscall return is observable without the
+/// process being killed.
+fn smoke_abi_socket_sock_send_zc_pipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+
+        let backing = *b"zerocopy";
+        let buf_id = call(
+            Syscall::SockRegisterBuf.raw(),
+            a1(backing.as_ptr() as u64, 8),
+        )
+        .ok_or("register status")?;
+        if buf_id < 0 {
+            return Err("buffer registration failed");
+        }
+        // Close the peer: this closes our TX ring (see socket.rs "peer close
+        // closes the peer's rings"), so the send discovers a broken pipe.
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        let r =
+            call(Syscall::SockSendZc.raw(), a3(fd0, buf_id as u64, 0, 8)).ok_or("status not Ok")?;
+        if r != -32 {
+            return Err("sock_send_zc() to a closed peer must return -EPIPE (-32)");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi/socket", smoke_abi_socket_sock_send_zc_pipe);
+
+/// send() on a stream socket whose PEER has closed is -EPIPE, matching
+/// unix_stream_sendmsg (net/unix/af_unix.c: a SOCK_DEAD peer → `err = -EPIPE`).
+/// Covers the SocketFile::drop fix: closing an endpoint must close BOTH its
+/// rings — its rx (the peer's tx) too — so a peer send fails with EPIPE instead
+/// of silently buffering into a ring no one will read. Exercises the regular
+/// send path (not just the zero-copy wrapper). NARF does not raise SIGPIPE here,
+/// so the syscall return is observed directly.
+fn smoke_abi_socket_send_after_peer_close_epipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+        // Close the peer: its drop closes our TX ring (its rx), so the reader is
+        // gone and the next send must EPIPE.
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        // flags=0 (no MSG_NOSIGNAL): -EPIPE AND a raised SIGPIPE, matching
+        // sk_stream_error / unix_stream_sendmsg. In-kernel tests never return to
+        // user, so the pending SIGPIPE is observed via its pending bit rather
+        // than terminating the harness. Clear any stale bit first, clear after.
+        let task = crate::handlers::current_task_id();
+        crate::handlers::clear_signal_pending(task, 13);
+        let msg = *b"hello";
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, msg.as_ptr() as u64, msg.len() as u64, 0),
+        )
+        .ok_or("status not Ok")?;
+        if r != -32 {
+            crate::handlers::clear_signal_pending(task, 13);
+            return Err("send() to a closed peer must return -EPIPE (-32)");
+        }
+        let sigpipe_raised =
+            crate::handlers::signal_pending_bits(task) & crate::handlers::sig_bit(13) != 0;
+        crate::handlers::clear_signal_pending(task, 13);
+        if !sigpipe_raised {
+            return Err("send() to a closed peer (flags=0) must raise SIGPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_after_peer_close_epipe
+);
+
+/// send(MSG_NOSIGNAL) to a closed-peer stream socket still returns -EPIPE but
+/// must NOT raise SIGPIPE — the negative half of the SIGPIPE parity
+/// (net/core/stream.c:194 gates send_sig on `!(flags & MSG_NOSIGNAL)`).
+fn smoke_abi_socket_send_peer_close_nosignal_no_sigpipe() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let pair = Syscall::SocketPair.raw();
+        if call(pair, a3(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr() as u64)).ok_or("pair status")?
+            != 0
+        {
+            return Err("socketpair setup failed");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]) as u64;
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]) as u64;
+        if call(Syscall::Close.raw(), a0(fd1)) != Some(0) {
+            return Err("close(peer) failed");
+        }
+        let task = crate::handlers::current_task_id();
+        crate::handlers::clear_signal_pending(task, 13);
+        const MSG_NOSIGNAL: u64 = 0x4000;
+        let msg = *b"hello";
+        let r = call(
+            Syscall::SocketSend.raw(),
+            a3(fd0, msg.as_ptr() as u64, msg.len() as u64, MSG_NOSIGNAL),
+        )
+        .ok_or("status not Ok")?;
+        if r != -32 {
+            crate::handlers::clear_signal_pending(task, 13);
+            return Err("send(MSG_NOSIGNAL) to a closed peer must still return -EPIPE");
+        }
+        let sigpipe_raised =
+            crate::handlers::signal_pending_bits(task) & crate::handlers::sig_bit(13) != 0;
+        crate::handlers::clear_signal_pending(task, 13);
+        if sigpipe_raised {
+            return Err("send(MSG_NOSIGNAL) must NOT raise SIGPIPE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_send_peer_close_nosignal_no_sigpipe
+);
 
 // ─────────────────── AF_UNIX abstract namespace ───────────────────
 
