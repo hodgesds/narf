@@ -9212,33 +9212,42 @@ impl AddressSpace {
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     unsafe fn rewrite_perms_pages(&self, _regions: &[Region], _cow_readonly: bool) {}
 
-    /// One fused fork pass over every resident private page: retain the
-    /// child's COW owner and write-protect the parent leaf when this fork's
-    /// retain is the frame's sole→shared transition. Pages already shared
-    /// were made read-only by the fork that first shared them and are
-    /// skipped entirely, so repeated forks never re-touch settled leaves
-    /// (Linux `copy_page_range`'s wrprotect shape); absent lazy leaves need
-    /// no descriptor update. Runs of adjacent newly-shared writable pages
-    /// are protected with one descriptor walk per run, and a broadcast fork
-    /// that restricts more than a small ceiling of pages coalesces remote
-    /// invalidation into one full flush.
+    /// One fused fork pass building the child address space region by
+    /// region: each parent region's metadata and backing list are cloned
+    /// once, straight into the child's index, while every resident private
+    /// page has the child's COW owner retained and the parent leaf
+    /// write-protected when this fork's retain is the frame's sole→shared
+    /// transition. Pages already shared were made read-only by the fork
+    /// that first shared them and are skipped entirely, so repeated forks
+    /// never re-touch settled leaves (Linux `copy_page_range`'s wrprotect
+    /// shape); absent lazy leaves need no descriptor update. The child's
+    /// clones drop the LOCKED bits (Linux clears VM_LOCKED_MASK in the
+    /// child), and SHARED regions retain their externally-owned frames
+    /// instead of COW owners. Runs of adjacent newly-shared writable pages
+    /// are protected with one descriptor walk per run, and a broadcast
+    /// fork that restricts more than a small ceiling of pages coalesces
+    /// remote invalidation into one full flush.
     ///
-    /// Every retained frame is appended to `cow_frames` in region/page
-    /// order before the pass can fail, so on error the caller rolls back
-    /// exactly that prefix. Keeping the parent region lock held around this
-    /// call makes the refcount transition and its page-table restriction
-    /// one VMA transaction.
+    /// `reserve_per_region` publishes through a per-region index
+    /// reservation instead of the caller's whole-index reservation, so the
+    /// kernel-test failure hook can fail the Nth region's reservation.
+    ///
+    /// Failure contract: regions already inserted into `child_regions` are
+    /// owned by the child — its Drop balances their retains — while the
+    /// region being built has exactly its already-retained prefix rolled
+    /// back here before the error returns; later regions are untouched.
     ///
     /// # Safety
-    /// The caller must hold the VMA transaction and the `parent` region
-    /// lock, keep every backing frame stable, and `self.root` must be zero
-    /// (metadata-only address space) or a live identity-reachable
-    /// page-table root.
+    /// The caller must hold the VMA transaction, the `parent` region lock,
+    /// and the shared-owner transaction; keep every backing frame stable;
+    /// and `self.root` must be zero (metadata-only address space) or a
+    /// live identity-reachable page-table root.
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    unsafe fn fork_retain_and_write_protect(
+    unsafe fn fork_share_regions_into(
         &self,
         parent: &RegionTable,
-        cow_frames: &mut Vec<PhysAddr>,
+        child_regions: &mut RegionTable,
+        reserve_per_region: bool,
     ) -> Result<(), AddressSpaceError> {
         let mut retain = crate::frame::cow::begin_fork_retain();
         let root_live = self.root.as_u64() != 0;
@@ -9290,31 +9299,59 @@ impl AddressSpace {
         };
 
         for region in parent.iter() {
-            if region.perms.contains(RegionPerms::SHARED) {
-                continue;
-            }
-            let writable = region.perms.contains(RegionPerms::WRITE);
-            let mut run_start = None;
-            for (page_index, phys) in region.phys.iter().enumerate() {
-                let selected = if phys.raw() == 0 {
-                    false
-                } else {
-                    cow_frames.push(*phys);
-                    retain.retain(*phys) && writable
-                };
-                if selected {
-                    run_start.get_or_insert(page_index);
-                } else if let Some(start) = run_start.take() {
-                    let pages = (page_index - start) as u64;
+            // Clone the backing list once; this Vec becomes the child's.
+            let mut phys: Vec<PhysAddr> = Vec::new();
+            phys.try_reserve_exact(region.phys.len())
+                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            phys.extend_from_slice(&region.phys);
+            let mut perms = region.perms;
+            perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
+            let shared = perms.contains(RegionPerms::SHARED);
+            if !shared {
+                let writable = perms.contains(RegionPerms::WRITE);
+                let mut run_start = None;
+                for (page_index, page) in phys.iter().enumerate() {
+                    let selected = if page.raw() == 0 {
+                        false
+                    } else {
+                        retain.retain(*page) && writable
+                    };
+                    if selected {
+                        run_start.get_or_insert(page_index);
+                    } else if let Some(start) = run_start.take() {
+                        let pages = (page_index - start) as u64;
+                        let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
+                        if let Err(error) = protect_run(base, pages) {
+                            crate::frame::cow::rollback_inc_ref_batch(&phys[..=page_index]);
+                            return Err(error);
+                        }
+                    }
+                }
+                if let Some(start) = run_start {
+                    let pages = (phys.len() - start) as u64;
                     let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
-                    protect_run(base, pages)?;
+                    if let Err(error) = protect_run(base, pages) {
+                        crate::frame::cow::rollback_inc_ref_batch(&phys);
+                        return Err(error);
+                    }
                 }
             }
-            if let Some(start) = run_start {
-                let pages = (region.phys.len() - start) as u64;
-                let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
-                protect_run(base, pages)?;
+            if reserve_per_region && child_regions.try_reserve_nodes(1).is_err() {
+                if !shared {
+                    crate::frame::cow::rollback_inc_ref_batch(&phys);
+                }
+                return Err(AddressSpaceError::AllocationFailed);
             }
+            let child_region = Region {
+                base: region.base,
+                len: region.len,
+                perms,
+                phys,
+            };
+            if shared {
+                retain_shared_frames(&child_region);
+            }
+            assert!(child_regions.insert_reserved(child_region).is_none());
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -9870,9 +9907,10 @@ impl AddressSpace {
                 frames: region.frames.clone(),
             })
             .collect();
-        // Snapshot the resulting region list and retain exactly the private
-        // resident backing that the child will own.
-        let (parent_regions, cow_frames): (Vec<Region>, Vec<PhysAddr>) = {
+        // Build the child's regions directly from the parent's, in one
+        // fused retain/write-protect/publish pass — no intermediate
+        // whole-address-space snapshot or side frame vector.
+        {
             let mut g = self.regions.lock();
             if !g.swap_pages.is_empty() {
                 // Swap slots are single-owner today. Cloning phys=0 would
@@ -9907,72 +9945,32 @@ impl AddressSpace {
                 // frame-0 reuse — corruption surfacing far away.
                 r.perms = r.perms | RegionPerms::COW;
             });
-            let parent_regions = g.snapshot();
+            // The child's regions are a deep clone of the parent's
+            // (post-mark) — same vaddr base, phys list, and logical
+            // permissions. They already passed alignment, range, overlap,
+            // and backing-shape validation in the parent, so they publish
+            // through direct reserved insertion. Retaining inside the
+            // region transaction keeps munmap from freeing a source before
+            // the child's ownership is retained; the injected kernel-test
+            // failure path reserves per region so a chosen reservation can
+            // fail mid-publication to prove prefix/suffix COW rollback.
+            let mut child_regions = child.regions.lock();
             if !fork_child_reserve_failure_injected {
-                child
-                    .regions
-                    .lock()
-                    .try_reserve_nodes(parent_regions.len())?;
+                child_regions.try_reserve_nodes(g.len())?;
             }
-            // One fused walk retains every resident private frame for the
-            // child and restricts the parent leaves this fork newly shares,
-            // before the child can be returned to the scheduler. Keep it
-            // inside the region transaction: retaining below the lock would
-            // let munmap free a source before the child's ownership was
-            // retained. `cow_frames` receives exactly the retained frames in
-            // region/page order for the rollback paths below.
-            let mut cow_frames: Vec<PhysAddr> = Vec::new();
-            // SAFETY: the VMA transaction and region lock keep metadata
-            // and backing stable, and `self.root` is live by the function
+            // SAFETY: the VMA transaction, region lock, and shared-owner
+            // transaction are held, and `self.root` is live by the function
             // contract.
-            if let Err(error) =
-                unsafe { self.fork_retain_and_write_protect(&g, &mut cow_frames) }
-            {
-                crate::frame::cow::rollback_inc_ref_batch(&cow_frames);
-                return Err(error);
-            }
-            (parent_regions, cow_frames)
-        };
+            unsafe {
+                self.fork_share_regions_into(
+                    &g,
+                    &mut child_regions,
+                    fork_child_reserve_failure_injected,
+                )
+            }?;
+        }
         drop(vma_guard);
 
-        // The child's regions are a deep clone of the parent's (post-mark) —
-        // same vaddr base, phys list, and logical permissions. They already
-        // passed alignment, range, overlap, and backing-shape validation in the
-        // parent. Reserve the complete child index before retaining frames,
-        // then publish under one lock: repeated map_region_inner calls otherwise
-        // revalidated immutable metadata and allocated/locked once per VMA.
-        if fork_child_reserve_failure_injected {
-            // Keep the kernel-test failure path granular: it deliberately fails
-            // a later VMA reservation to prove prefix/suffix COW rollback.
-            let mut published_cow_frames = 0usize;
-            for mut r in parent_regions.into_iter() {
-                let region_cow_frames = if r.perms.contains(RegionPerms::SHARED) {
-                    0
-                } else {
-                    r.phys.iter().filter(|phys| phys.raw() != 0).count()
-                };
-                r.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
-                if let Err(error) = child.map_region_inner(r, None, None) {
-                    // Child Drop owns and balances the published prefix. Restore
-                    // only the suffix which never acquired a child VMA.
-                    crate::frame::cow::rollback_inc_ref_batch(&cow_frames[published_cow_frames..]);
-                    return Err(error);
-                }
-                published_cow_frames += region_cow_frames;
-            }
-            debug_assert_eq!(published_cow_frames, cow_frames.len());
-        } else {
-            let mut child_regions = child.regions.lock();
-            for mut r in parent_regions.into_iter() {
-                // Linux fork clears VM_LOCKED_MASK in the child. The parent
-                // keeps both its current locks and its future default.
-                r.perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
-                if r.perms.contains(RegionPerms::SHARED) {
-                    retain_shared_frames(&r);
-                }
-                assert!(child_regions.insert_reserved(r).is_none());
-            }
-        }
         // All externally-owned regular aliases are now retained by the child.
         // Huge allocations and multi-megabyte copies below neither consult nor
         // publish shared-owner state and must not run with this IRQ-safe shard

@@ -4668,6 +4668,99 @@ fn smoke_memory_repeated_fork_skips_settled_cow_pages() -> TestResult {
 ))]
 kernel_test_in!("memory", smoke_memory_repeated_fork_skips_settled_cow_pages);
 
+/// The fused fork pass builds each child region directly: a failure of the
+/// very first child index reservation publishes nothing and rolls back that
+/// region's already-taken COW retains in place, and a subsequent successful
+/// fork's child regions replicate the parent's exact shape and backing.
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+fn smoke_memory_failed_fork_first_reservation_retains_nothing() -> TestResult {
+    use crate::address_space::__test_fail_fork_child_region_reserve_after;
+    use crate::frame::{self, cow};
+    use crate::{AddressSpace, AddressSpaceError, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging is live in the kernel-test harness and this test owns
+    // the fresh root until teardown.
+    let parent = match unsafe { AddressSpace::new_for_user() } {
+        Ok(parent) => parent,
+        Err(_) => return TestResult::Skip("first-reservation parent root unavailable"),
+    };
+    let frame = match frame::alloc_frame() {
+        Ok(frame) => frame,
+        Err(_) => return TestResult::Skip("first-reservation frame unavailable"),
+    };
+    let phys = frame.start_address();
+    let base = VirtAddr::new(0x0000_0080_3c00_0000);
+    if parent
+        .map_region(Region {
+            base,
+            len: 2 * 0x1000,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: alloc::vec![phys, crate::PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        frame::free_frame(frame);
+        return TestResult::Fail("first-reservation VMA setup failed");
+    }
+
+    __test_fail_fork_child_region_reserve_after(1);
+    // SAFETY: the inactive parent is exclusively owned; the injected failure
+    // occurs on the first child reservation, before any publication.
+    let failure = unsafe { parent.clone_for_fork() };
+    if !matches!(failure, Err(AddressSpaceError::AllocationFailed)) {
+        return TestResult::Fail("first-reservation failure did not surface AllocationFailed");
+    }
+    if cow::count(phys) > 1 {
+        return TestResult::Fail("empty-prefix fork failure leaked a COW owner");
+    }
+    let parent_intact = parent.lookup(base).is_some_and(|region| {
+        region.phys[..] == [phys, crate::PhysAddr::new(0)]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !parent_intact {
+        return TestResult::Fail("empty-prefix fork failure changed the parent");
+    }
+
+    // SAFETY: same exclusively-owned inactive-parent contract.
+    let child = match unsafe { parent.clone_for_fork() } {
+        Ok(child) => child,
+        Err(_) => return TestResult::Fail("post-failure fork failed"),
+    };
+    let child_faithful = child.lookup(base).is_some_and(|region| {
+        region.base == base
+            && region.len == 2 * 0x1000
+            && region.phys[..] == [phys, crate::PhysAddr::new(0)]
+            && region.perms.contains(RegionPerms::WRITE)
+            && region.perms.contains(RegionPerms::COW)
+    });
+    if !child_faithful || cow::count(phys) != 2 {
+        return TestResult::Fail("fused fork did not replicate the parent region");
+    }
+
+    drop(child);
+    if cow::count(phys) > 1 {
+        return TestResult::Fail("child teardown left an extra COW owner");
+    }
+    drop(parent);
+    if cow::count(phys) == 0 {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("parent teardown left first-reservation COW metadata")
+    }
+}
+#[cfg(all(
+    any(target_arch = "x86_64", target_arch = "aarch64"),
+    feature = "kernel-test"
+))]
+kernel_test_in!(
+    "memory",
+    smoke_memory_failed_fork_first_reservation_retains_nothing
+);
+
 fn smoke_memory_clone_for_fork_shares_frames_then_splits() -> TestResult {
     // End-to-end: parent AS with one region (1 page). After
     // clone_for_fork, both ASes' Region.phys[0] equal the same
