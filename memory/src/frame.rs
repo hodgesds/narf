@@ -2155,6 +2155,7 @@ pub fn __pagetable_is_registered(phys: u64) -> bool {
 /// only for frames that go through `inc_ref`.
 pub mod cow {
     use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
     use narf_lib::sync::IrqSafeSpinLock;
 
@@ -2435,6 +2436,157 @@ pub mod cow {
         ((phys >> 12) as usize) & (REFCOUNT_SHARDS - 1)
     }
 
+    // ── Flat PFN-indexed fast path ─────────────────────────────────────
+    //
+    // Linux keeps the COW share count directly in `struct page`; the
+    // sharded hash above makes every fork and every teardown pay
+    // hash+probe+shard-lock per resident page — the dominant cost of a
+    // fork+exit cycle. `init_flat_table` (boot, after the slab heap is
+    // live) backs one `AtomicU64` per boot-managed frame via `valloc`
+    // (8 bytes per 4 KiB page, 0.2% of RAM — Linux's `struct page` pays
+    // 64), after which every in-range key uses a single lock-free
+    // atomic. Keys outside the boot RAM range (memory hotplug) and
+    // pre-init callers keep the sharded-hash path; a key is in exactly
+    // one of the two structures, decided solely by its address.
+    //
+    // Entry layout: low 32 bits = owner count (0 = unregistered, i.e.
+    // one implicit sole owner; 1 is stored after a share drops back to a
+    // sole owner, matching the hash table's retained count-1 row), high
+    // 32 bits = the `inc_ref_batch` epoch that observed the frame's most
+    // recent sole→shared transition, so a duplicate alias in the same
+    // batch also reports "newly shared" and every parent alias gets
+    // write-protected.
+    static FLAT: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
+    static FLAT_FRAMES: AtomicUsize = AtomicUsize::new(0);
+    static FLAT_EPOCH: AtomicU32 = AtomicU32::new(0);
+
+    const FLAT_COUNT_MASK: u64 = 0xFFFF_FFFF;
+
+    #[inline]
+    fn flat_slot(key: u64) -> Option<&'static AtomicU64> {
+        let ptr = FLAT.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return None;
+        }
+        let index = (key >> super::PAGE_SHIFT) as usize;
+        if index >= FLAT_FRAMES.load(Ordering::Relaxed) {
+            return None;
+        }
+        // SAFETY: `ptr` names the published, never-freed array of
+        // `FLAT_FRAMES` entries and `index` is bounds-checked above.
+        Some(unsafe { &*ptr.add(index) })
+    }
+
+    /// Reserve a batch epoch. Epoch 0 is reserved for non-batch
+    /// increments so a fresh slot can never alias a live batch.
+    /// Wraparound can only turn "already shared" into a spurious "newly
+    /// shared" for a duplicate alias — one redundant write-protect,
+    /// never a missed one.
+    fn flat_next_epoch() -> u32 {
+        let mut epoch = FLAT_EPOCH.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if epoch == 0 {
+            epoch = FLAT_EPOCH.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        }
+        epoch
+    }
+
+    /// Add one owner. Returns `(previous_count, newly_shared)` where a
+    /// missing registration reports the implicit sole owner `1`, exactly
+    /// like `RefTable::increment` / `increment_batch`.
+    fn flat_increment(slot: &AtomicU64, epoch: u32) -> (u32, bool) {
+        let mut cur = slot.load(Ordering::Relaxed);
+        loop {
+            let count = cur as u32;
+            let (next, previous, newly) = if count <= 1 {
+                ((u64::from(epoch) << 32) | 2, count.max(1), true)
+            } else {
+                let stored_epoch = (cur >> 32) as u32;
+                (
+                    (cur & !FLAT_COUNT_MASK) | u64::from(count.wrapping_add(1)),
+                    count,
+                    epoch != 0 && stored_epoch == epoch,
+                )
+            };
+            match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return (previous, newly),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Drop one owner. `None` when the frame was never registered.
+    /// Mirrors `RefTable::decrement`: an ordinary drop from 1 (and a
+    /// rollback drop from 2) returns the slot to the implicit
+    /// sole-owner representation. The stored epoch is cleared — it only
+    /// carries meaning within the `inc_ref_batch` call that wrote it,
+    /// and the VMA transaction serializes that batch against any
+    /// decrement of the same frames.
+    fn flat_decrement(slot: &AtomicU64, rollback: bool) -> Option<(u32, u32)> {
+        let mut cur = slot.load(Ordering::Relaxed);
+        loop {
+            let count = cur as u32;
+            if count == 0 {
+                return None;
+            }
+            let next_count = count.saturating_sub(1);
+            let next = if count <= 1 || (rollback && count == 2) {
+                0
+            } else {
+                u64::from(next_count)
+            };
+            match slot.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some((count, next_count)),
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// One-time boot initialisation of the flat PFN-indexed table.
+    ///
+    /// Must run after the slab heap and `init_from_map` are live and
+    /// BEFORE the first user address space exists: any refcount already
+    /// registered for an in-range key is migrated under its shard lock,
+    /// but concurrent COW traffic during the migration itself is not
+    /// supported (there is none — user tasks spawn much later in boot).
+    /// A failed `valloc` leaves the sharded hash serving everything.
+    pub fn init_flat_table() {
+        if !FLAT.load(Ordering::Acquire).is_null() {
+            return;
+        }
+        let limit = super::managed_phys_end();
+        if limit == 0 {
+            return;
+        }
+        let frames = (limit >> super::PAGE_SHIFT) as usize;
+        let bytes = frames * core::mem::size_of::<AtomicU64>();
+        let Some(ptr) = crate::vmalloc::valloc(bytes) else {
+            return;
+        };
+        // SAFETY: `valloc` returned `bytes` of exclusively-owned,
+        // frame-backed kernel memory; zero it before publication.
+        unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
+        let base = ptr.as_ptr() as *mut AtomicU64;
+        for shard in &REFCOUNTS {
+            let mut guard = shard.map.lock();
+            if let Some(table) = guard.as_mut() {
+                for slot in &mut table.slots {
+                    if let RefSlot::Occupied { key, count, .. } = *slot {
+                        let index = (key >> super::PAGE_SHIFT) as usize;
+                        if index < frames {
+                            // SAFETY: `base` holds `frames` entries.
+                            unsafe { &*base.add(index) }.store(u64::from(count), Ordering::Relaxed);
+                            *slot = RefSlot::Tombstone;
+                            table.len -= 1;
+                            table.tombstones += 1;
+                        }
+                    }
+                }
+            }
+        }
+        FLAT_FRAMES.store(frames, Ordering::Relaxed);
+        FLAT.store(base, Ordering::Release);
+    }
+
     /// Increment the refcount on `phys`. Returns the new count.
     /// First call (frame previously had count 0 / unregistered)
     /// inserts a count of 2 — the implicit "1" for the original
@@ -2442,6 +2594,10 @@ pub mod cow {
     /// `inc_ref`s add one each.
     pub fn inc_ref(phys: PhysAddr) -> u32 {
         let key = phys.raw();
+        if let Some(slot) = flat_slot(key) {
+            let (previous, _) = flat_increment(slot, 0);
+            return previous.wrapping_add(1);
+        }
         let mut g = REFCOUNTS[ref_shard(key)].map.lock();
         let map = g.get_or_insert_with(RefTable::new);
         // Bump from N to N+1; "first share" promotes the implicit
@@ -2464,6 +2620,44 @@ pub mod cow {
     /// frame occurs more than once, every occurrence is marked so every parent
     /// alias loses WRITE before the child can observe it.
     pub fn inc_ref_batch(frames: &[PhysAddr]) -> Vec<bool> {
+        if !FLAT.load(Ordering::Acquire).is_null() {
+            let epoch = flat_next_epoch();
+            let mut newly_shared = alloc::vec![false; frames.len()];
+            // Out-of-range (hotplug) keys fall back to the sharded hash;
+            // they still need the hash's own batch-epoch machinery so
+            // duplicate aliases are all marked.
+            let mut spill: Vec<(u64, usize)> = Vec::new();
+            for (index, phys) in frames.iter().enumerate() {
+                let key = phys.raw();
+                if key == 0 {
+                    continue;
+                }
+                if let Some(slot) = flat_slot(key) {
+                    let (_, newly) = flat_increment(slot, epoch);
+                    newly_shared[index] = newly;
+                } else {
+                    spill.push((key, index));
+                }
+            }
+            for (shard, refcounts) in REFCOUNTS.iter().enumerate() {
+                let mut guard = None;
+                let mut hash_epoch = 0;
+                for &(key, index) in &spill {
+                    if ref_shard(key) != shard {
+                        continue;
+                    }
+                    let g = guard.get_or_insert_with(|| refcounts.map.lock());
+                    let map = g.get_or_insert_with(RefTable::new);
+                    if hash_epoch == 0 {
+                        hash_epoch = map.begin_batch();
+                    }
+                    if map.increment_batch(key, hash_epoch) {
+                        newly_shared[index] = true;
+                    }
+                }
+            }
+            return newly_shared;
+        }
         let mut newly_shared = alloc::vec![false; frames.len()];
         let mut counts = [0usize; REFCOUNT_SHARDS];
         for phys in frames {
@@ -2535,6 +2729,12 @@ pub mod cow {
                 if key == 0 || ref_shard(key) != shard {
                     continue;
                 }
+                if let Some(slot) = flat_slot(key) {
+                    let (previous, _) = flat_decrement(slot, true)
+                        .expect("speculative COW retain must remain registered");
+                    assert!(previous > 1, "cannot roll back the original COW owner");
+                    continue;
+                }
                 let g = guard.get_or_insert_with(|| refcounts.map.lock());
                 let map = g
                     .as_mut()
@@ -2553,6 +2753,9 @@ pub mod cow {
     /// directly, matching pre-COW semantics.
     pub fn dec_ref(phys: PhysAddr) -> u32 {
         let key = phys.raw();
+        if let Some(slot) = flat_slot(key) {
+            return flat_decrement(slot, false).map_or(0, |(_, next)| next);
+        }
         let mut g = REFCOUNTS[ref_shard(key)].map.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -2572,6 +2775,30 @@ pub mod cow {
     /// are processed as distinct owner drops. Each touched shard is locked
     /// once, eliminating per-page IRQ disable/restore cycles during teardown.
     pub fn dec_ref_batch(frames: &[PhysAddr]) -> Vec<PhysAddr> {
+        if !FLAT.load(Ordering::Acquire).is_null() {
+            let mut releasable = Vec::with_capacity(frames.len());
+            for &phys in frames {
+                let key = phys.raw();
+                if key == 0 {
+                    continue;
+                }
+                match flat_slot(key) {
+                    Some(slot) => match flat_decrement(slot, false) {
+                        Some((previous, _)) if previous > 1 => {}
+                        _ => releasable.push(phys),
+                    },
+                    None => {
+                        // Hotplug key: sharded-hash drop (rare path).
+                        let mut guard = REFCOUNTS[ref_shard(key)].map.lock();
+                        match guard.as_mut().and_then(|map| map.decrement(key, false)) {
+                            Some((previous, _)) if previous > 1 => {}
+                            _ => releasable.push(phys),
+                        }
+                    }
+                }
+            }
+            return releasable;
+        }
         let mut by_shard: [Vec<usize>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
         for (index, phys) in frames.iter().enumerate() {
             let key = phys.raw();
@@ -2627,6 +2854,31 @@ pub mod cow {
             frames.len() <= super::FREE_BATCH_WINDOW,
             "COW decrement batch exceeds allocator teardown window"
         );
+        if !FLAT.load(Ordering::Acquire).is_null() {
+            // Allocation-free by construction: one lock-free atomic per
+            // in-range frame, a single transient shard lock per hotplug
+            // frame.
+            for &phys in frames {
+                let key = phys.raw();
+                if key == 0 {
+                    continue;
+                }
+                match flat_slot(key) {
+                    Some(slot) => match flat_decrement(slot, false) {
+                        Some((previous, _)) if previous > 1 => {}
+                        _ => on_release(phys),
+                    },
+                    None => {
+                        let mut guard = REFCOUNTS[ref_shard(key)].map.lock();
+                        match guard.as_mut().and_then(|map| map.decrement(key, false)) {
+                            Some((previous, _)) if previous > 1 => {}
+                            _ => on_release(phys),
+                        }
+                    }
+                }
+            }
+            return;
+        }
         let mut counts = [0usize; REFCOUNT_SHARDS];
         for &phys in frames {
             if phys.raw() != 0 {
@@ -2678,6 +2930,9 @@ pub mod cow {
     /// frame was never registered; otherwise the current count.
     pub fn count(phys: PhysAddr) -> u32 {
         let key = phys.raw();
+        if let Some(slot) = flat_slot(key) {
+            return slot.load(Ordering::Acquire) as u32;
+        }
         REFCOUNTS[ref_shard(key)]
             .map
             .lock()
@@ -2692,6 +2947,24 @@ pub mod cow {
     /// lock acquisition per leaf. Zero/unregistered frames report zero and
     /// duplicate inputs receive identical snapshots.
     pub fn count_batch(frames: &[PhysAddr]) -> Vec<u32> {
+        if !FLAT.load(Ordering::Acquire).is_null() {
+            let mut counts = alloc::vec![0; frames.len()];
+            for (index, phys) in frames.iter().enumerate() {
+                let key = phys.raw();
+                if key == 0 {
+                    continue;
+                }
+                counts[index] = match flat_slot(key) {
+                    Some(slot) => slot.load(Ordering::Acquire) as u32,
+                    None => REFCOUNTS[ref_shard(key)]
+                        .map
+                        .lock()
+                        .as_ref()
+                        .map_or(0, |map| map.count(key)),
+                };
+            }
+            return counts;
+        }
         let mut counts = alloc::vec![0; frames.len()];
         let mut by_shard: [Vec<usize>; REFCOUNT_SHARDS] = core::array::from_fn(|_| Vec::new());
         for (index, phys) in frames.iter().enumerate() {
@@ -2722,6 +2995,14 @@ pub mod cow {
     /// a clean slate.
     #[doc(hidden)]
     pub fn __test_clear() {
+        let ptr = FLAT.load(Ordering::Acquire);
+        if !ptr.is_null() {
+            let frames = FLAT_FRAMES.load(Ordering::Relaxed);
+            for index in 0..frames {
+                // SAFETY: `ptr` holds `frames` published entries.
+                unsafe { &*ptr.add(index) }.store(0, Ordering::Relaxed);
+            }
+        }
         for s in &REFCOUNTS {
             *s.map.lock() = None;
         }
@@ -2776,6 +3057,71 @@ pub mod cow {
             "memory/cow",
             smoke_cow_refcount_hash_index_grows_through_tombstones
         );
+
+        /// End-to-end owner-count transitions through the PUBLIC cow API
+        /// on a real allocated frame. In the boot kernel this exercises
+        /// the flat PFN-indexed fast path (`init_flat_table` ran); when
+        /// the flat table is absent it exercises the sharded hash — the
+        /// contract is identical either way.
+        fn smoke_cow_public_api_owner_transitions() -> TestResult {
+            let Ok(frame) = super::super::alloc_frame() else {
+                return TestResult::Fail("no frame available for COW smoke");
+            };
+            let phys = frame.start_address();
+            let result = (|| {
+                if super::count(phys) != 0 {
+                    return TestResult::Fail("fresh frame already had a COW count");
+                }
+                if super::inc_ref(phys) != 2 {
+                    return TestResult::Fail("first share must report two owners");
+                }
+                if super::dec_ref(phys) != 1 {
+                    return TestResult::Fail("share drop must report the sole owner");
+                }
+                if super::count(phys) != 1 {
+                    return TestResult::Fail("retained sole-owner row lost");
+                }
+                // Duplicate aliases in one batch: both occurrences must
+                // report the sole→shared transition.
+                let newly = super::inc_ref_batch(&[phys, phys]);
+                if newly != alloc::vec![true, true] {
+                    return TestResult::Fail("batch duplicate missed a newly-shared mark");
+                }
+                if super::count(phys) != 3 {
+                    return TestResult::Fail("batch owners not all recorded");
+                }
+                // An already-shared frame in a later batch is NOT newly
+                // shared.
+                if super::inc_ref_batch(&[phys]) != alloc::vec![false] {
+                    return TestResult::Fail("already-shared frame reported a transition");
+                }
+                if !super::dec_ref_batch(&[phys, phys]).is_empty() {
+                    return TestResult::Fail("non-final owner drop reported releasable");
+                }
+                if super::count_batch(&[phys]) != alloc::vec![2] {
+                    return TestResult::Fail("count_batch disagrees after batch drops");
+                }
+                // Drop to a single explicit share, then roll it back:
+                // a 2 -> 1 rollback restores the implicit sole-owner
+                // representation (count reads 0 = unregistered).
+                if super::dec_ref(phys) != 1 || super::count(phys) != 1 {
+                    return TestResult::Fail("owner drop to retained sole owner failed");
+                }
+                if super::inc_ref(phys) != 2 {
+                    return TestResult::Fail("re-share of retained sole owner failed");
+                }
+                super::rollback_inc_ref_batch(&[phys]);
+                if super::count(phys) != 0 {
+                    return TestResult::Fail("rollback did not restore the implicit owner");
+                }
+                TestResult::Pass
+            })();
+            // The frame's count is back to unregistered on every path
+            // above that reaches a verdict late; free unconditionally.
+            super::super::free_frame(super::super::PhysFrame::new(phys));
+            result
+        }
+        kernel_test_in!("memory/cow", smoke_cow_public_api_owner_transitions);
     }
 }
 
@@ -2788,6 +3134,19 @@ pub fn stats() -> FrameStats {
         free: 0,
         reserved: 0,
     })
+}
+
+/// One-past-the-end of the highest boot-donated RAM byte, or 0 before
+/// `init_from_map`. Sizes the flat COW refcount table: every frame the
+/// buddy can hand out lies below this bound (memory hotplug can later
+/// donate above it; those frames use the sharded-hash COW path).
+pub(crate) fn managed_phys_end() -> u64 {
+    BOOT_MEMORY_RANGES
+        .lock()
+        .iter()
+        .map(|&(start, len)| start.saturating_add(len))
+        .max()
+        .unwrap_or(0)
 }
 
 /// Buddy-backed implementation of `stats`.

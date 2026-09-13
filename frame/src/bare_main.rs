@@ -1836,6 +1836,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 "  frames: {} per-node total; slab live",
                                 totals
                             );
+                            // Flat COW refcount table: heap + vmalloc are
+                            // live and no user address space exists yet
+                            // (its precondition).
+                            narf_memory::frame::cow::init_flat_table();
                         }
                         // SAFETY: same RSDP, validated above.
                         match unsafe { narf_acpi::parse_madt(p) } {
@@ -2633,6 +2637,9 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     narf_memory::heap::promote_to_slab();
                     narf_memory::diag::set_phase(narf_memory::diag::BootPhase::HeapUp);
                     let _ = writeln!(console::Writer, "  heap: slab is live");
+                    // Flat COW refcount table: heap + vmalloc are live and
+                    // no user address space exists yet (its precondition).
+                    narf_memory::frame::cow::init_flat_table();
                 }
             }
 
