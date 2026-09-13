@@ -1773,6 +1773,102 @@ impl AddressSpace {
             .map(|region| region.perms)
     }
 
+    /// Make `[base, base + len)` its own base-page VMA and return that VMA's
+    /// permissions. An exact-fit region is returned as-is. A wider covering
+    /// region — the product of anonymous coalescing — is split metadata-only
+    /// at the interval's edges, exactly like Linux splits a VMA for an
+    /// `mremap` of an interior range. Backing pages keep their virtual
+    /// addresses, PTEs, reverse-map owners, and COW refcounts; each fragment
+    /// owns the `phys` prefix slice for its own pages, so no TLB or
+    /// page-table work happens here.
+    ///
+    /// Only ordinary mergeable private-anonymous VMAs are split: every other
+    /// kind (`SHARED`, file-backed, brk, stack, special) never coalesces
+    /// beyond what its owner published, so exact fit remains their only
+    /// legal shape and anything else reports `Unmapped`. Deferred demand and
+    /// COW page claims inside the original VMA are cancelled with the same
+    /// replacement semantics as any other structural split, and every
+    /// fragment receives a fresh publication generation.
+    ///
+    /// # Safety
+    /// The caller must hold [`Self::with_vma_transaction`].
+    pub unsafe fn carve_exact_private_region_locked(
+        &self,
+        base: VirtAddr,
+        len: u64,
+    ) -> Result<RegionPerms, AddressSpaceError> {
+        let lo = base.as_u64();
+        let hi = lo.checked_add(len).ok_or(AddressSpaceError::OutOfRange)?;
+        if len == 0 {
+            return Err(AddressSpaceError::Unmapped);
+        }
+        let mut regions = self.regions.lock();
+        let (rb, re, perms, head_pages, mid_phys, tail_phys) = {
+            let covering = regions
+                .containing(lo)
+                .filter(|region| hi <= region.base.as_u64().saturating_add(region.len))
+                .ok_or(AddressSpaceError::Unmapped)?;
+            let rb = covering.base.as_u64();
+            let re = rb.saturating_add(covering.len);
+            if rb == lo && re == hi {
+                return Ok(covering.perms);
+            }
+            if !covering.perms.contains(RegionPerms::ANON_MERGEABLE) {
+                return Err(AddressSpaceError::Unmapped);
+            }
+            // Build the detached backing fragments before any structural
+            // mutation so an allocation failure leaves the VMA untouched.
+            // `Region::phys` is a materialized prefix — slots past its
+            // length are demand-zero — so a fragment starting past the
+            // prefix simply owns an empty (all-lazy) list.
+            let head_pages = ((lo - rb) >> 12) as usize;
+            let mid_pages = ((hi - lo) >> 12) as usize;
+            let suffix = |start: usize, count: usize| {
+                let end = covering.phys.len().min(start.saturating_add(count));
+                let slice = covering.phys.get(start..end).unwrap_or(&[]);
+                let mut fragment = Vec::new();
+                fragment
+                    .try_reserve_exact(slice.len())
+                    .map_err(|_| AddressSpaceError::AllocationFailed)?;
+                fragment.extend_from_slice(slice);
+                Ok::<Vec<PhysAddr>, AddressSpaceError>(fragment)
+            };
+            let mid_phys = suffix(head_pages, mid_pages)?;
+            let tail_phys = suffix(head_pages + mid_pages, usize::MAX)?;
+            (rb, re, covering.perms, head_pages, mid_phys, tail_phys)
+        };
+        // At most two additional index nodes: the original node is reused by
+        // whichever fragment is inserted first.
+        regions.try_reserve_nodes(2)?;
+        let mut head = regions
+            .remove(rb)
+            .expect("carved VMA disappeared under the region lock");
+        if head_pages > 0 {
+            head.len = lo - rb;
+            head.phys.truncate(head_pages);
+            assert!(regions.insert_reserved(head).is_none());
+        }
+        assert!(regions
+            .insert_reserved(Region {
+                base: VirtAddr::new(lo),
+                len: hi - lo,
+                perms,
+                phys: mid_phys,
+            })
+            .is_none());
+        if re > hi {
+            assert!(regions
+                .insert_reserved(Region {
+                    base: VirtAddr::new(hi),
+                    len: re - hi,
+                    perms,
+                    phys: tail_phys,
+                })
+                .is_none());
+        }
+        Ok(perms)
+    }
+
     /// Return permissions for the one base-page VMA covering `[base, base +
     /// len)` without cloning proportional backing metadata. A zero-length
     /// query identifies the VMA containing `base`, as required by Linux's

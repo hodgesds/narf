@@ -240,6 +240,106 @@ fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_fixed_anonymous_mmaps_coalesce);
 
+/// An interior interval of a coalesced anonymous VMA can be carved into its
+/// own exact VMA (Linux's mremap split shape): each fragment keeps exactly
+/// its own pages' backing at unchanged virtual addresses, the demand-zero
+/// tail past the materialized prefix stays lazy, an exact fit never splits,
+/// and non-mergeable mappings keep their exact-fit-only contract.
+fn smoke_memory_carve_exact_private_region_splits_coalesced_vma() -> TestResult {
+    use crate::{AddressSpace, AddressSpaceError, PhysAddr, Region, RegionPerms, VirtAddr};
+    use alloc::vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_7000_0000u64;
+    let perms = RegionPerms::READ | RegionPerms::WRITE | RegionPerms::ANON_MERGEABLE;
+    // Four pages, the last demand-zero. Sentinels sit below the allocator's
+    // reserved 1 MiB floor so teardown cannot donate them to the live buddy.
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(base),
+            len: 4 * 4096,
+            perms,
+            phys: vec![
+                PhysAddr::new(0x10_000),
+                PhysAddr::new(0x11_000),
+                PhysAddr::new(0x12_000),
+                PhysAddr::new(0),
+            ],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("carve fixture failed to map");
+    }
+    let carved = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(base + 4096), 2 * 4096) }
+    });
+    if carved != Ok(perms) {
+        return TestResult::Fail("interior carve failed");
+    }
+    let regions = aspace.regions_snapshot();
+    if regions.len() != 3 {
+        return TestResult::Fail("interior carve did not produce three fragments");
+    }
+    let head = &regions[0];
+    let mid = &regions[1];
+    let tail = &regions[2];
+    if head.base.as_u64() != base
+        || head.len != 4096
+        || head.phys[..] != [PhysAddr::new(0x10_000)]
+        || head.perms != perms
+    {
+        return TestResult::Fail("carve head lost shape or backing");
+    }
+    if mid.base.as_u64() != base + 4096
+        || mid.len != 2 * 4096
+        || mid.phys[..] != [PhysAddr::new(0x11_000), PhysAddr::new(0x12_000)]
+        || mid.perms != perms
+    {
+        return TestResult::Fail("carved interval lost shape or backing");
+    }
+    if tail.base.as_u64() != base + 3 * 4096
+        || tail.len != 4096
+        || tail.phys[..] != [PhysAddr::new(0)]
+    {
+        return TestResult::Fail("carve tail must stay demand-zero");
+    }
+    // An exact fit is returned as-is without further splitting.
+    let exact = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(base + 4096), 2 * 4096) }
+    });
+    if exact != Ok(perms) || aspace.regions_snapshot().len() != 3 {
+        return TestResult::Fail("exact-fit carve must not split again");
+    }
+    // A covering VMA without anonymous-merge provenance keeps the exact-fit
+    // requirement.
+    let special = 0x0000_0100_7800_0000u64;
+    if aspace
+        .map_region(Region {
+            base: VirtAddr::new(special),
+            len: 2 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys: vec![PhysAddr::new(0), PhysAddr::new(0)],
+        })
+        .is_err()
+    {
+        return TestResult::Fail("non-mergeable carve fixture failed to map");
+    }
+    let refused = aspace.with_vma_transaction(|| {
+        // SAFETY: the VMA transaction is held.
+        unsafe { aspace.carve_exact_private_region_locked(VirtAddr::new(special), 4096) }
+    });
+    if refused != Err(AddressSpaceError::Unmapped) {
+        return TestResult::Fail("non-mergeable covering VMA must not be carved");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_carve_exact_private_region_splits_coalesced_vma
+);
+
 /// Identical permissions are insufficient for coalescing: a mapping without
 /// anonymous provenance may have file or bespoke ownership semantics.
 fn smoke_memory_anonymous_merge_respects_provenance() -> TestResult {

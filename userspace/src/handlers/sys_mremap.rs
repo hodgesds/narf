@@ -321,10 +321,12 @@ fn mremap_core_limited(
                 covering_perms
             } else {
                 // SAFETY: the enclosing closure holds the VMA transaction.
+                // An interior range of a coalesced anonymous VMA is split
+                // into its own exact VMA here, Linux's mremap shape.
                 unsafe {
-                    as_ref.exact_region_perms_locked(VirtAddr::new(old_addr), old_len)
+                    as_ref.carve_exact_private_region_locked(VirtAddr::new(old_addr), old_len)
                 }
-                .ok_or(EFAULT)?
+                .map_err(mremap_memory_errno)?
             };
             if old_end > AddressSpace::USER_HALF_END {
                 return Err(EFAULT);
@@ -493,9 +495,11 @@ fn mremap_core_limited(
         let source_perms = if old_len == 0 || source_shared {
             covering_perms
         } else {
-            // SAFETY: the enclosing closure holds the VMA transaction.
-            unsafe { as_ref.exact_region_perms_locked(VirtAddr::new(old_addr), old_len) }
-                .ok_or(EFAULT)?
+            // SAFETY: the enclosing closure holds the VMA transaction. An
+            // interior range of a coalesced anonymous VMA is split into its
+            // own exact VMA here, Linux's mremap shape.
+            unsafe { as_ref.carve_exact_private_region_locked(VirtAddr::new(old_addr), old_len) }
+                .map_err(mremap_memory_errno)?
         };
         if source_perms.contains(RegionPerms::LOCK_EXEMPT) && !source_shared {
             return Err(if flags & MREMAP_DONTUNMAP != 0 {
@@ -972,6 +976,49 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mremap_maymove_preserves_backing_and_grows_lazily
+    );
+
+    fn smoke_mremap_maymove_moves_subrange_of_coalesced_vma() -> TestResult {
+        const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE;
+        let aspace = AddressSpace::empty();
+        // One 4-page VMA standing in for two adjacent anonymous mmaps that
+        // coalescing merged. mremap of its lower half must carve that half
+        // into an exact VMA; the VMA's own upper half then blocks in-place
+        // growth, forcing the MAYMOVE relocation of only the carved half.
+        let mut merged = lazy_region(BASE, 4);
+        merged.perms = merged.perms | RegionPerms::ANON_MERGEABLE;
+        let expected = merged.phys.clone();
+        if aspace.map_region(merged).is_err() {
+            return TestResult::Fail("coalesced fixture failed to map");
+        }
+        let moved = match mremap_core(&aspace, BASE, 2 * 4096, 4 * 4096, MREMAP_MAYMOVE, 0) {
+            Ok(address) if address != BASE => address,
+            _ => return TestResult::Fail("coalesced-subrange MAYMOVE did not relocate"),
+        };
+        let Some(region) = aspace.lookup(VirtAddr::new(moved)) else {
+            return TestResult::Fail("moved subrange region missing");
+        };
+        if region.len != 4 * 4096
+            || region.phys[..2] != expected[..2]
+            || region.phys[2..].iter().any(|phys| phys.raw() != 0)
+        {
+            return TestResult::Fail("moved subrange lost backing or its lazy tail");
+        }
+        let Some(rest) = aspace.lookup(VirtAddr::new(BASE + 2 * 4096)) else {
+            return TestResult::Fail("unmoved remainder of the coalesced VMA disappeared");
+        };
+        if rest.base.as_u64() != BASE + 2 * 4096
+            || rest.len != 2 * 4096
+            || rest.phys[..] != expected[2..]
+            || aspace.lookup(VirtAddr::new(BASE)).is_some()
+        {
+            return TestResult::Fail("remainder changed shape or backing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mremap_maymove_moves_subrange_of_coalesced_vma
     );
 
     fn smoke_mremap_maymove_at_user_ceiling_relocates() -> TestResult {
