@@ -577,45 +577,167 @@ fn smoke_memfs_truncate_grow_shrink() -> TestResult {
 }
 kernel_test_in!("filesystem/memfs", smoke_memfs_truncate_grow_shrink);
 
-fn smoke_memfs_mmap_generation_tracks_content_and_length() -> TestResult {
-    const KEEP_SIZE: u32 = 0x01;
-    const PUNCH_HOLE: u32 = 0x02;
-    let fs = MemFs::new("memfs-mmap-generation");
-    let file = match poll_once(fs.root().create("mapped")) {
+/// A `MAP_SHARED` mapping of a tmpfs file aliases the FILE'S OWN page.
+///
+/// On Linux a tmpfs page and its mapped page are one object: the folio
+/// `shmem_get_folio` returns is the page `filemap_map_pages` installs, and
+/// `read`/`write` reach it through the same `address_space`. So a store
+/// through the mapping IS a store to the file and vice versa, with no
+/// `msync` anywhere.
+///
+/// NARF used to route tmpfs onto the generic fallback in `mapped_file`,
+/// which gives each `(file, offset)` a PRIVATE frame, copies the bytes in
+/// at fault time and back out on `msync`/`fsync`. Neither direction
+/// worked: a store through the mapping was invisible to `read(2)` until an
+/// explicit flush, and a `write(2)` was invisible to an already-faulted
+/// mapping forever. `memfd_create` + `mmap` — Wayland buffers, dbus,
+/// PulseAudio — is exactly that shape.
+///
+/// This drives `FileOps::mmap_fault` and the frame it hands back directly,
+/// which is the object `sys_mmap` installs into the PTE; a full user
+/// mapping adds an address space but not a different page.
+fn smoke_memfs_mmap_fault_aliases_the_file_page() -> TestResult {
+    let fs = MemFs::new("memfs-mmap-shared");
+    let file = match poll_once(fs.root().create("shared")) {
         Some(Ok(file)) => file,
         _ => return TestResult::Fail("create mapped file failed"),
     };
-    let initial = file.mmap_cache_generation();
-    if initial.is_none() || poll_once(file.write(0, b"page")).map(|r| r.is_ok()) != Some(true) {
-        return TestResult::Fail("memfs did not opt into mmap generation tracking");
+    // The generic copy path is opted into by `mmap_cache_generation`, and
+    // `sys_mmap` picks between the two on exactly that. tmpfs must not
+    // advertise it, or none of the below is reachable from a real mmap.
+    if file.mmap_cache_generation().is_some() {
+        return TestResult::Fail("tmpfs still opts into the private-copy mmap path");
     }
-    let after_write = file.mmap_cache_generation();
-    if after_write == initial || poll_once(file.truncate(8192)).map(|r| r.is_ok()) != Some(true) {
-        return TestResult::Fail("write did not advance mmap generation");
+    if poll_once(file.write(0, b"from-write")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("seed write failed");
     }
-    let after_truncate = file.mmap_cache_generation();
-    if after_truncate == after_write
-        || poll_once(file.fallocate(KEEP_SIZE, 4096, 4096)).map(|r| r.is_ok()) != Some(true)
-    {
-        return TestResult::Fail("truncate did not advance mmap generation");
+    let phys = match file.mmap_fault(0) {
+        Ok(phys) => phys,
+        Err(_) => return TestResult::Fail("tmpfs does not support demand-paged mmap"),
+    };
+    if phys == 0 || phys % 4096 != 0 {
+        return TestResult::Fail("mmap_fault returned an unusable frame address");
     }
-    let after_fallocate = file.mmap_cache_generation();
-    if after_fallocate == after_truncate
-        || poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, 4096)).map(|r| r.is_ok())
-            != Some(true)
-    {
-        return TestResult::Fail("fallocate did not advance mmap generation");
+    // SAFETY: `phys` is a live frame owned by the file, which this test
+    // holds; `kernel_mut_ptr` is its direct-map address.
+    let mapped = unsafe {
+        core::slice::from_raw_parts_mut(
+            narf_memory::PhysAddr::new(phys).kernel_mut_ptr::<u8>(),
+            4096,
+        )
+    };
+    // Direction 1: a write(2) is visible through the mapping.
+    if &mapped[..10] != b"from-write" {
+        return TestResult::Fail("a write(2) was not visible through the mapping");
     }
-    if file.mmap_cache_generation() == after_fallocate {
-        return TestResult::Fail("hole punch did not advance mmap generation");
+    // Direction 2: a store through the mapping is visible to read(2),
+    // with no msync.
+    mapped[..9].copy_from_slice(b"from-mmap");
+    let mut back = [0u8; 9];
+    if poll_once(file.read(0, &mut back)) != Some(Ok(9)) || &back != b"from-mmap" {
+        return TestResult::Fail("a store through the mapping was not visible to read(2)");
+    }
+    // Idempotent per offset: the fault handler can run twice for one page
+    // on two CPUs, and a second frame would simply be dropped.
+    if file.mmap_fault(0) != Ok(phys) {
+        return TestResult::Fail("mmap_fault is not idempotent for one offset");
+    }
+    // A fault past the end grows the file — the mapping TRACKS the file
+    // rather than snapshotting it, which is the whole reason this is
+    // `mmap_fault` and not `mmap_frames`.
+    let grown = match file.mmap_fault(8192) {
+        Ok(phys) => phys,
+        Err(_) => return TestResult::Fail("mmap_fault of a hole failed"),
+    };
+    if grown == phys {
+        return TestResult::Fail("two different offsets share one frame");
+    }
+    if file.stat().size < 8192 + 4096 {
+        return TestResult::Fail("a fault past the end did not grow the file");
+    }
+    // The page is real file content: readable, and charged.
+    if file.stat().blocks != 2 * (4096 / 512) {
+        return TestResult::Fail("mmap_fault did not charge its pages as blocks");
     }
     TestResult::Pass
 }
 kernel_test_in!(
     "filesystem/memfs",
-    smoke_memfs_mmap_generation_tracks_content_and_length
+    smoke_memfs_mmap_fault_aliases_the_file_page
 );
 
+/// A mapped page survives being truncated away, and keeps its charge.
+///
+/// Linux would `unmap_mapping_range` the inode and let further accesses
+/// take SIGBUS. NARF has no reverse map from a file range to the mappings
+/// of it and no cross-address-space PTE invalidation, so freeing the frame
+/// would hand the buddy allocator a page userspace can still write —
+/// the hazard `mapped_file`'s module header exists to describe.
+///
+/// So a page that has been handed to `mmap_fault` is RETIRED rather than
+/// freed: dropped from the file's contents, kept as a frame until the
+/// inode dies. It keeps its block charge, which is the part that matters
+/// for more than safety — without it, `mmap` a page, punch it, repeat
+/// would be an unbounded allocation the mount's own accounting reports as
+/// empty. See `filesystem/specification/tmpfs-shared-mappings.md`.
+fn smoke_memfs_mapped_page_is_retired_not_freed() -> TestResult {
+    const PUNCH_HOLE: u32 = 0x02;
+    const KEEP_SIZE: u32 = 0x01;
+    let fs = match TmpFs::from_options_with_total("size=64K,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("mapped")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.write(0, &[0xA5u8; 8192])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("seed write failed");
+    }
+    // Map the FIRST page only; the second stays unmapped so the two
+    // removal paths can be told apart.
+    if file.mmap_fault(0).is_err() {
+        return TestResult::Fail("mmap_fault failed");
+    }
+    let used = |fs: &TmpFs| match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.blocks - stat.blocks_free,
+        _ => u64::MAX,
+    };
+    if used(&fs) != 2 {
+        return TestResult::Fail("two written pages are not two charged blocks");
+    }
+    // Punch the UNMAPPED page: its frame is freed and its charge released.
+    if poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 4096, 4096)).map(|r| r.is_ok())
+        != Some(true)
+    {
+        return TestResult::Fail("hole punch of the unmapped page failed");
+    }
+    if used(&fs) != 1 {
+        return TestResult::Fail("punching an unmapped page did not release its block");
+    }
+    // Punch the MAPPED page: it leaves the file's contents — the read is a
+    // hole now — but the frame and its charge stay.
+    if poll_once(file.fallocate(PUNCH_HOLE | KEEP_SIZE, 0, 4096)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("hole punch of the mapped page failed");
+    }
+    let mut back = [0xFFu8; 8];
+    if poll_once(file.read(0, &mut back)) != Some(Ok(8)) || back != [0u8; 8] {
+        return TestResult::Fail("the punched page did not read back as a hole");
+    }
+    if used(&fs) != 1 {
+        return TestResult::Fail("a retired page lost its charge — mmap-then-punch would be free");
+    }
+    // The mount still works afterwards: retention is bounded by what was
+    // mapped, not a wedge.
+    if poll_once(fs.root().create("after")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("the filesystem was unusable after a retirement");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/memfs",
+    smoke_memfs_mapped_page_is_retired_not_freed
+);
 // ── Smoke 9: distinct inodes (rm_rf / DSO-dedup hazard guard) ──────────
 //
 // MemFs assigns a unique, stable st_ino to every node from a high base.

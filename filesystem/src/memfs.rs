@@ -1602,13 +1602,120 @@ fn alloc_ino() -> u64 {
     NEXT_INO.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Debug, Default)]
+/// One 4-KiB page of a tmpfs file, owned as a physical frame.
+///
+/// A frame rather than a heap allocation because that is what makes
+/// `MAP_SHARED` coherent: `FileOps::mmap_fault` hands this exact frame to
+/// the address space, so the bytes a mapping stores ARE the file's bytes.
+/// On Linux the same object — the page-cache folio — is what `read`,
+/// `write` and the PTE all reach; a copy per mapping is what this replaces.
+///
+/// Access goes through raw pointers rather than a `&[u8]`/`&mut [u8]`
+/// slice on purpose. Once handed to `mmap_fault` the page can be written
+/// by userspace at any moment, which is precisely what `MAP_SHARED` means,
+/// so no Rust reference to it could honestly claim the aliasing guarantees
+/// a slice carries.
+struct FilePage {
+    frame: narf_memory::frame::PhysFrame,
+    /// Set once this page has been handed out by
+    /// [`FileOps::mmap_fault`](crate::FileOps::mmap_fault). From then on
+    /// the frame must not return to the buddy allocator while the inode
+    /// lives: a mapping may still hold a PTE for it, and freeing it would
+    /// leave userspace a writable window onto whatever is allocated next.
+    /// See `filesystem/specification/tmpfs-shared-mappings.md`.
+    mapped: bool,
+}
+
+impl FilePage {
+    /// Allocate a zeroed page. `NoSpace` on allocator exhaustion, which is
+    /// the same answer the heap path gave.
+    fn new_zeroed() -> Result<Self, FsError> {
+        let frame = narf_memory::frame::alloc_frame().map_err(|_| FsError::NoSpace)?;
+        let page = Self {
+            frame,
+            mapped: false,
+        };
+        // SAFETY: the frame was just allocated and is owned exclusively by
+        // this `FilePage`; `kernel_ptr` is its direct-map address and the
+        // buddy allocator hands out whole 4-KiB frames.
+        unsafe {
+            core::ptr::write_bytes(page.ptr(), 0, PAGE_SIZE as usize);
+        }
+        Ok(page)
+    }
+
+    /// Direct-map pointer to the page's bytes.
+    fn ptr(&self) -> *mut u8 {
+        self.frame.start_address().kernel_mut_ptr::<u8>()
+    }
+
+    fn phys(&self) -> u64 {
+        self.frame.start_address().raw()
+    }
+
+    /// Copy `len` bytes out of the page at `within`.
+    fn copy_out(&self, within: usize, out: &mut [u8]) {
+        debug_assert!(within + out.len() <= PAGE_SIZE as usize);
+        // SAFETY: the range is inside the frame (asserted above), the
+        // source is live for this call, and `out` cannot alias it — it is a
+        // caller-owned buffer, never a mapping of this frame.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.ptr().add(within), out.as_mut_ptr(), out.len());
+        }
+    }
+
+    /// Copy `src` into the page at `within`.
+    fn copy_in(&self, within: usize, src: &[u8]) {
+        debug_assert!(within + src.len() <= PAGE_SIZE as usize);
+        // SAFETY: as `copy_out`. `&self` rather than `&mut self` because a
+        // user mapping may be writing the same frame concurrently; the
+        // exclusivity a `&mut` implies would be a false claim.
+        unsafe {
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.ptr().add(within), src.len());
+        }
+    }
+
+    /// Zero `[within, within + len)` of the page.
+    fn zero_range(&self, within: usize, len: usize) {
+        debug_assert!(within + len <= PAGE_SIZE as usize);
+        // SAFETY: as `copy_out`.
+        unsafe {
+            core::ptr::write_bytes(self.ptr().add(within), 0, len);
+        }
+    }
+}
+
+impl Drop for FilePage {
+    fn drop(&mut self) {
+        debug_assert!(
+            !self.mapped,
+            "a mapped tmpfs page reached Drop; it must be retired instead"
+        );
+        narf_memory::frame::free_frame(self.frame);
+    }
+}
+
 struct FileData {
     len: u64,
-    pages: BTreeMap<u64, Box<[u8]>>,
+    pages: BTreeMap<u64, FilePage>,
+    /// Pages removed from the file's contents while a mapping could still
+    /// reach them. They are no longer part of the file — reads see a hole —
+    /// but their frames stay owned until the inode dies, and stay CHARGED
+    /// against the mount and the owner's quota so `mmap`-then-punch cannot
+    /// become an unaccounted allocation.
+    retired: Vec<FilePage>,
 }
 
 impl FileData {
+    /// An empty file: no pages, no length, nothing retired.
+    fn empty() -> Self {
+        Self {
+            len: 0,
+            pages: BTreeMap::new(),
+            retired: Vec::new(),
+        }
+    }
+
     fn read(&self, offset: u64, buf: &mut [u8]) -> usize {
         if offset >= self.len {
             return 0;
@@ -1622,8 +1729,9 @@ impl FileData {
             let index = absolute / PAGE_SIZE;
             let within = (absolute % PAGE_SIZE) as usize;
             let chunk = core::cmp::min(count - copied, PAGE_SIZE as usize - within);
+            // An absent page is a hole, already zeroed by the fill above.
             if let Some(page) = self.pages.get(&index) {
-                buf[copied..copied + chunk].copy_from_slice(&page[within..within + chunk]);
+                page.copy_out(within, &mut buf[copied..copied + chunk]);
             }
             copied += chunk;
         }
@@ -1645,17 +1753,37 @@ impl FileData {
             .collect())
     }
 
+    /// Drop a page from the file's contents, returning whether its block
+    /// charge should be released.
+    ///
+    /// A page that has been handed to `mmap_fault` is RETIRED rather than
+    /// freed: a mapping may still hold a PTE for it. It keeps its charge,
+    /// so removing mapped pages can never be a way to hold frames the
+    /// mount's accounting does not see.
+    fn release_page(&mut self, page: FilePage) -> bool {
+        if page.mapped {
+            self.retired.push(page);
+            false
+        } else {
+            true
+        }
+    }
+
+    /// Remove every page from `first` onward, returning how many had their
+    /// block charge released (retired pages keep theirs).
     fn remove_pages_from(&mut self, first: u64) -> u64 {
         let old = core::mem::take(&mut self.pages);
-        let mut removed = 0;
+        let mut released = 0;
         for (index, page) in old {
             if index >= first {
-                removed += 1;
+                if self.release_page(page) {
+                    released += 1;
+                }
             } else {
                 self.pages.insert(index, page);
             }
         }
-        removed
+        released
     }
 }
 
@@ -1693,10 +1821,6 @@ struct MemFile {
     /// so `fstat` on the fd reporting 0 is the documented way to tell an
     /// unlinked temporary apart from a named file.
     nlink: AtomicU32,
-    /// Content/length generation used by the generic shared-mmap page cache.
-    /// Zero is never published, so wrap simply skips it. A cache entry is
-    /// reusable after its final unmap only while this generation matches.
-    mmap_generation: AtomicU64,
     /// True when this node is a bound AF_UNIX socket (created by `bind()`
     /// on a pathname address). `stat`/`enumerate` then report S_IFSOCK so
     /// `stat`/`[ -S ]`/`ls -l`/`unlink` on the socket path behave like
@@ -1729,7 +1853,7 @@ impl MemFile {
         let inode_lease = superblock.reserve_inode(uid, gid)?;
         let file = MemFile {
             ino: alloc_ino(),
-            data: IrqSafeSpinLock::new(FileData::default()),
+            data: IrqSafeSpinLock::new(FileData::empty()),
             _inode_lease: inode_lease,
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(uid),
@@ -1737,7 +1861,6 @@ impl MemFile {
             times: Times::now(),
             nlink: AtomicU32::new(1),
             iflags: AtomicU32::new(0),
-            mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
         };
@@ -1759,7 +1882,7 @@ impl MemFile {
         let superblock = MemSuper::new(MemFsKind::Generic, None, None);
         let file = MemFile {
             ino: alloc_ino(),
-            data: IrqSafeSpinLock::new(FileData::default()),
+            data: IrqSafeSpinLock::new(FileData::empty()),
             _inode_lease: superblock
                 .reserve_inode(uid, gid)
                 .expect("unlimited memfs inode reservation"),
@@ -1769,7 +1892,6 @@ impl MemFile {
             times: Times::now(),
             nlink: AtomicU32::new(1),
             iflags: AtomicU32::new(0),
-            mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
         };
@@ -1784,7 +1906,7 @@ impl MemFile {
     fn new_socket(superblock: &Arc<MemSuper>, perms: u16) -> Result<Self, FsError> {
         Ok(MemFile {
             ino: alloc_ino(),
-            data: IrqSafeSpinLock::new(FileData::default()),
+            data: IrqSafeSpinLock::new(FileData::empty()),
             _inode_lease: superblock.reserve_inode(0, 0)?,
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(0),
@@ -1792,7 +1914,6 @@ impl MemFile {
             times: Times::now(),
             nlink: AtomicU32::new(1),
             iflags: AtomicU32::new(0),
-            mmap_generation: AtomicU64::new(1),
             sock: true,
             xattrs: Xattrs::new(),
         })
@@ -1805,20 +1926,8 @@ impl MemFile {
         self.times.touch_mtime();
     }
 
-    fn bump_mmap_generation(&self) {
-        let _ = self
-            .mmap_generation
-            .fetch_update(Ordering::Release, Ordering::Relaxed, |value| {
-                Some(value.wrapping_add(1).max(1))
-            });
-    }
-
-    fn alloc_zero_page() -> Result<Box<[u8]>, FsError> {
-        let mut page = Vec::new();
-        page.try_reserve_exact(PAGE_SIZE as usize)
-            .map_err(|_| FsError::NoSpace)?;
-        page.resize(PAGE_SIZE as usize, 0);
-        Ok(page.into_boxed_slice())
+    fn alloc_zero_page() -> Result<FilePage, FsError> {
+        FilePage::new_zeroed()
     }
 
     /// Write `buf` at `offset`, returning how much of it landed.
@@ -1887,7 +1996,6 @@ impl MemFile {
                     // A mapper which observes the mutated bytes can therefore
                     // never validate an idle fallback page against the
                     // preceding generation.
-                    self.bump_mmap_generation();
                     drop(data);
                     self.touch_mtime_now();
                     return Ok(buf.len());
@@ -1930,9 +2038,9 @@ impl MemFile {
             }
             let page = data
                 .pages
-                .get_mut(&index)
+                .get(&index)
                 .expect("write materialised this page");
-            page[within..within + chunk].copy_from_slice(&buf[written..written + chunk]);
+            page.copy_in(within, &buf[written..written + chunk]);
             written += chunk;
         }
         if written == 0 {
@@ -1940,7 +2048,6 @@ impl MemFile {
             return Err(refusal.unwrap_or(FsError::NoSpace));
         }
         data.len = core::cmp::max(data.len, offset + written as u64);
-        self.bump_mmap_generation();
         drop(data);
         self.touch_mtime_now();
         Ok(written)
@@ -1957,9 +2064,9 @@ impl MemFile {
             let chunk = core::cmp::min(buf.len() - copied, PAGE_SIZE as usize - within);
             let page = data
                 .pages
-                .get_mut(&index)
+                .get(&index)
                 .expect("write reserved every missing page");
-            page[within..within + chunk].copy_from_slice(&buf[copied..copied + chunk]);
+            page.copy_in(within, &buf[copied..copied + chunk]);
             copied += chunk;
         }
         copied
@@ -1978,17 +2085,21 @@ impl MemFile {
             let page_start = index * PAGE_SIZE;
             let page_end = page_start + PAGE_SIZE;
             if offset <= page_start && end >= page_end {
-                data.pages.remove(&index);
-                released += 1;
-            } else if let Some(page) = data.pages.get_mut(&index) {
+                if let Some(page) = data.pages.remove(&index) {
+                    // A page a mapping may still reach is retired, not
+                    // freed, and keeps its charge — see `release_page`.
+                    if data.release_page(page) {
+                        released += 1;
+                    }
+                }
+            } else if let Some(page) = data.pages.get(&index) {
                 let start = offset.saturating_sub(page_start) as usize;
                 let stop = core::cmp::min(end.saturating_sub(page_start), PAGE_SIZE) as usize;
                 if start < stop {
-                    page[start..stop].fill(0);
+                    page.zero_range(start, stop - start);
                 }
             }
         }
-        self.bump_mmap_generation();
         drop(data);
         self._inode_lease.superblock.release_blocks(
             self.uid.load(Ordering::Relaxed),
@@ -2215,8 +2326,9 @@ impl FileOps for MemFile {
                 let first_removed = len.div_ceil(PAGE_SIZE);
                 let released = data.remove_pages_from(first_removed);
                 if len % PAGE_SIZE != 0 {
-                    if let Some(page) = data.pages.get_mut(&(len / PAGE_SIZE)) {
-                        page[(len % PAGE_SIZE) as usize..].fill(0);
+                    if let Some(page) = data.pages.get(&(len / PAGE_SIZE)) {
+                        let from = (len % PAGE_SIZE) as usize;
+                        page.zero_range(from, PAGE_SIZE as usize - from);
                     }
                 }
                 self._inode_lease.superblock.release_blocks(
@@ -2228,7 +2340,6 @@ impl FileOps for MemFile {
             // Extending a tmpfs file creates a hole. No page/block is charged
             // until a write or fallocate materialises it.
             data.len = len;
-            self.bump_mmap_generation();
             drop(data);
             self.touch_mtime_now();
             Ok(())
@@ -2350,15 +2461,58 @@ impl FileOps for MemFile {
             // needs a generation change here.
             if data.len != new_len {
                 data.len = new_len;
-                self.bump_mmap_generation();
             }
             drop(data);
             Ok(())
         })
     }
 
-    fn mmap_cache_generation(&self) -> Option<u64> {
-        Some(self.mmap_generation.load(Ordering::Acquire))
+    /// `mmap(MAP_SHARED)` backing: the frame that holds the file's page at
+    /// `offset`, materialising it if this is a hole.
+    ///
+    /// Returning the file's OWN frame is what makes the mapping coherent.
+    /// On Linux a tmpfs page and its mapped page are one object — the
+    /// page-cache folio `shmem_get_folio` returns is the page
+    /// `filemap_map_pages` installs — so a store through the mapping is a
+    /// store to the file, and a `write(2)` lands in the page the mapping
+    /// already has. The generic fallback this replaces gave each mapping a
+    /// private copy, so neither could see the other.
+    ///
+    /// Materialising charges blocks and quota exactly as a write does: a
+    /// mapping must not be a way around `size=`. And the page is marked
+    /// mapped, which stops `truncate`/hole-punch from returning its frame
+    /// to the buddy allocator while a PTE may still point at it — see
+    /// `FilePage::mapped`.
+    ///
+    /// Idempotent per offset, as the contract requires: a second call for
+    /// the same page finds it present and returns the same frame.
+    fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
+        let index = offset / PAGE_SIZE;
+        let uid = self.uid.load(Ordering::Relaxed);
+        let gid = self.gid.load(Ordering::Relaxed);
+        let mut data = self.data.lock();
+        if let Some(page) = data.pages.get_mut(&index) {
+            page.mapped = true;
+            return Ok(page.phys());
+        }
+        let superblock = &self._inode_lease.superblock;
+        superblock.reserve_blocks(uid, gid, 1)?;
+        let mut page = match FilePage::new_zeroed() {
+            Ok(page) => page,
+            Err(error) => {
+                superblock.release_blocks(uid, gid, 1);
+                return Err(error);
+            }
+        };
+        page.mapped = true;
+        let phys = page.phys();
+        data.pages.insert(index, page);
+        // A fault past the end grows the file the way a write would: the
+        // mapping tracks the file rather than snapshotting it.
+        data.len = core::cmp::max(data.len, offset + PAGE_SIZE);
+        drop(data);
+        self.touch_mtime_now();
+        Ok(phys)
     }
 
     fn seek<'a>(&'a self, offset: u64, whence: u32) -> FsFuture<'a, u64> {
