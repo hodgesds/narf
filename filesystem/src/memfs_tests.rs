@@ -1309,6 +1309,114 @@ fn smoke_tmpfs_xattr_flag_semantics() -> TestResult {
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattr_flag_semantics);
 
+/// A write that fills the mount part-way returns a SHORT COUNT.
+///
+/// `shmem_file_write_iter` runs `mm/filemap.c::generic_perform_write`,
+/// which breaks out of its per-folio loop when `write_begin` fails and
+/// then does:
+///
+/// ```text
+/// if (!written)
+///         return status;
+/// iocb->ki_pos += written;
+/// return written;
+/// ```
+///
+/// so ENOSPC surfaces only when NOTHING was written — the next write is
+/// the one that reports it. NARF was all-or-nothing, which is visible from
+/// userspace: `cp` onto a nearly-full `/tmp` left a zero-length file and
+/// reported ENOSPC where Linux fills the filesystem and reports how much
+/// it wrote.
+///
+/// The short write must also be a PREFIX. A page-at-a-time fallback that
+/// charged pages out of order would leave a file with a hole in the middle
+/// and a length that claims the whole range.
+fn smoke_tmpfs_short_write_at_enospc() -> TestResult {
+    // 4 blocks total; the root inode costs none of them.
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let file = match poll_once(root.create("filler")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // Ask for 6 pages when only 4 exist: 4 land, and the call reports it.
+    let payload = alloc::vec![0x5Au8; 6 * 4096];
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == 4 * 4096 => {}
+        Some(Ok(n)) => {
+            let _ = n;
+            return TestResult::Fail("write past the mount limit reported the wrong count");
+        }
+        _ => return TestResult::Fail("write past the mount limit failed instead of short-writing"),
+    }
+    // What landed is the prefix, and the file's length matches it exactly.
+    if file.stat().size != 4 * 4096 || file.stat().blocks != 4 * (4096 / 512) {
+        return TestResult::Fail("short write left the wrong length or block count");
+    }
+    let mut back = alloc::vec![0u8; 4 * 4096];
+    if poll_once(file.read(0, &mut back)) != Some(Ok(4 * 4096)) || back.iter().any(|&b| b != 0x5A) {
+        return TestResult::Fail("short write did not land as a contiguous prefix");
+    }
+    // NOW the filesystem is full, so the next write is the one that errors.
+    if !matches!(
+        poll_once(file.write(4 * 4096, &payload)),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("a write with no room at all did not report ENOSPC");
+    }
+    // Rewriting bytes that are already resident needs no new block and must
+    // still complete in full.
+    if poll_once(file.write(0, &[1u8; 4096])) != Some(Ok(4096)) {
+        return TestResult::Fail("overwriting a resident page failed on a full mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_short_write_at_enospc);
+
+/// The same short-write rule when a per-owner QUOTA is what runs out.
+///
+/// `shmem_inode_acct_blocks` returns -EDQUOT from `dquot_alloc_block_nodirty`
+/// through the same `write_begin` failure path, so the loop breaks
+/// identically and the partial count is returned. A quota that stopped a
+/// write dead would make `cp` behave differently on a quota'd tmpfs than on
+/// a full one, for no reason Linux has.
+fn smoke_tmpfs_short_write_at_edquot() -> TestResult {
+    const U: u32 = 7007;
+    let fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("quota'd")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.set_owners(U, U)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown to the limited uid failed");
+    }
+    // The owner may hold 8 KiB = two pages; ask for five.
+    let payload = alloc::vec![0xC3u8; 5 * 4096];
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == 2 * 4096 => {}
+        _ => return TestResult::Fail("hitting a block quota did not produce a short write"),
+    }
+    if !matches!(
+        poll_once(file.write(2 * 4096, &payload)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("a write with no quota left did not report EDQUOT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_short_write_at_edquot);
+
 /// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
 /// users are unaffected, and chown transfers the charge to the new owner.
 fn smoke_tmpfs_usrquota_blocks_and_transfer() -> TestResult {

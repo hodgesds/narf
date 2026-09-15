@@ -1526,7 +1526,13 @@ impl MemFile {
             xattrs: Xattrs::new(),
         };
         if !bytes.is_empty() {
-            file.write_inner(0, bytes)?;
+            // A seed is all-or-nothing: unlike a userspace write there is no
+            // caller to hand a short count back to, so a partial fill would
+            // silently create a truncated file. Dropping `file` here
+            // releases both its inode and whatever blocks it did get.
+            if file.write_inner(0, bytes)? != bytes.len() {
+                return Err(FsError::NoSpace);
+            }
         }
         Ok(file)
     }
@@ -1549,8 +1555,10 @@ impl MemFile {
             sock: false,
             xattrs: Xattrs::new(),
         };
-        file.write_inner(0, &bytes)
+        let written = file
+            .write_inner(0, &bytes)
             .expect("unlimited memfs seed write");
+        assert_eq!(written, bytes.len(), "unlimited memfs seed write was short");
         file
     }
 
@@ -1595,6 +1603,30 @@ impl MemFile {
         Ok(page.into_boxed_slice())
     }
 
+    /// Write `buf` at `offset`, returning how much of it landed.
+    ///
+    /// A write that runs out of room part-way returns a SHORT COUNT, not an
+    /// error. `mm/filemap.c::generic_perform_write` — the loop tmpfs's
+    /// `shmem_file_write_iter` runs — breaks out of its per-folio loop when
+    /// `write_begin` fails and ends with:
+    ///
+    /// ```text
+    /// if (!written)
+    ///         return status;
+    /// iocb->ki_pos += written;
+    /// return written;
+    /// ```
+    ///
+    /// so the error surfaces only when nothing at all was written; the next
+    /// write is the one that reports ENOSPC. All-or-nothing was visibly
+    /// wrong: `cp` onto a nearly-full `/tmp` left an EMPTY file and
+    /// reported ENOSPC, where Linux fills the filesystem and reports the
+    /// short write.
+    ///
+    /// The common case still charges every page it needs in one go; the
+    /// per-page walk is only the fallback once that bulk reservation has
+    /// been refused, so a successful write takes the superblock counters
+    /// exactly once regardless of size.
     fn write_inner(&self, offset: u64, buf: &[u8]) -> Result<usize, FsError> {
         if buf.is_empty() {
             return Ok(0);
@@ -1602,39 +1634,103 @@ impl MemFile {
         let end = offset
             .checked_add(buf.len() as u64)
             .ok_or(FsError::NoSpace)?;
+        let uid = self.uid.load(Ordering::Relaxed);
+        let gid = self.gid.load(Ordering::Relaxed);
         let mut data = self.data.lock();
         let missing = data.missing_pages(offset, buf.len())?;
         let count = missing.len() as u64;
-        self._inode_lease.superblock.reserve_blocks(
-            self.uid.load(Ordering::Relaxed),
-            self.gid.load(Ordering::Relaxed),
-            count,
-        )?;
-        let mut allocated = Vec::new();
-        if allocated.try_reserve_exact(missing.len()).is_err() {
-            self._inode_lease.superblock.release_blocks(
-                self.uid.load(Ordering::Relaxed),
-                self.gid.load(Ordering::Relaxed),
-                count,
-            );
-            return Err(FsError::NoSpace);
-        }
-        for index in missing {
-            match Self::alloc_zero_page() {
-                Ok(page) => allocated.push((index, page)),
-                Err(error) => {
-                    self._inode_lease.superblock.release_blocks(
-                        self.uid.load(Ordering::Relaxed),
-                        self.gid.load(Ordering::Relaxed),
-                        count,
-                    );
-                    return Err(error);
+        let superblock = &self._inode_lease.superblock;
+        let bulk = superblock.reserve_blocks(uid, gid, count);
+        if bulk.is_ok() {
+            let mut allocated = Vec::new();
+            let mut failure = None;
+            if allocated.try_reserve_exact(missing.len()).is_err() {
+                failure = Some(FsError::NoSpace);
+            } else {
+                for index in missing {
+                    match Self::alloc_zero_page() {
+                        Ok(page) => allocated.push((index, page)),
+                        Err(error) => {
+                            failure = Some(error);
+                            break;
+                        }
+                    }
+                }
+            }
+            match failure {
+                None => {
+                    for (index, page) in allocated {
+                        data.pages.insert(index, page);
+                    }
+                    let copied = Self::fill_pages(&mut data, offset, buf);
+                    debug_assert_eq!(copied, buf.len());
+                    data.len = core::cmp::max(data.len, end);
+                    // Publish the new generation before the data lock opens.
+                    // A mapper which observes the mutated bytes can therefore
+                    // never validate an idle fallback page against the
+                    // preceding generation.
+                    self.bump_mmap_generation();
+                    drop(data);
+                    self.touch_mtime_now();
+                    return Ok(buf.len());
+                }
+                Some(error) => {
+                    // The heap, not the mount, ran out. Hand the blocks back
+                    // and fall through to the page-at-a-time walk, which can
+                    // still place whatever pages it does manage to allocate.
+                    drop(allocated);
+                    superblock.release_blocks(uid, gid, count);
+                    let _ = error;
                 }
             }
         }
-        for (index, page) in allocated {
-            data.pages.insert(index, page);
+        // Slow path: charge and materialise one page at a time, in ascending
+        // order, so what lands is the PREFIX of the write — a short write is
+        // only meaningful if the bytes that made it are the first ones.
+        let mut written = 0usize;
+        let mut refusal = bulk.err();
+        while written < buf.len() {
+            let absolute = offset + written as u64;
+            let index = absolute / PAGE_SIZE;
+            let within = (absolute % PAGE_SIZE) as usize;
+            let chunk = core::cmp::min(buf.len() - written, PAGE_SIZE as usize - within);
+            if let alloc::collections::btree_map::Entry::Vacant(slot) = data.pages.entry(index) {
+                if let Err(error) = superblock.reserve_blocks(uid, gid, 1) {
+                    refusal = Some(error);
+                    break;
+                }
+                match Self::alloc_zero_page() {
+                    Ok(page) => {
+                        slot.insert(page);
+                    }
+                    Err(error) => {
+                        superblock.release_blocks(uid, gid, 1);
+                        refusal = Some(error);
+                        break;
+                    }
+                }
+            }
+            let page = data
+                .pages
+                .get_mut(&index)
+                .expect("write materialised this page");
+            page[within..within + chunk].copy_from_slice(&buf[written..written + chunk]);
+            written += chunk;
         }
+        if written == 0 {
+            // `if (!written) return status;`
+            return Err(refusal.unwrap_or(FsError::NoSpace));
+        }
+        data.len = core::cmp::max(data.len, offset + written as u64);
+        self.bump_mmap_generation();
+        drop(data);
+        self.touch_mtime_now();
+        Ok(written)
+    }
+
+    /// Copy `buf` into pages that are already materialised, returning the
+    /// byte count. The caller guarantees every page in range exists.
+    fn fill_pages(data: &mut FileData, offset: u64, buf: &[u8]) -> usize {
         let mut copied = 0;
         while copied < buf.len() {
             let absolute = offset + copied as u64;
@@ -1648,14 +1744,7 @@ impl MemFile {
             page[within..within + chunk].copy_from_slice(&buf[copied..copied + chunk]);
             copied += chunk;
         }
-        data.len = core::cmp::max(data.len, end);
-        // Publish the new generation before the data lock opens. A mapper
-        // which observes the mutated bytes can therefore never validate an
-        // idle fallback page against the preceding generation.
-        self.bump_mmap_generation();
-        drop(data);
-        self.touch_mtime_now();
-        Ok(buf.len())
+        copied
     }
 
     fn punch_hole(&self, offset: u64, len: u64) -> Result<(), FsError> {
