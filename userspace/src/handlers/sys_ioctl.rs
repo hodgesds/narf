@@ -28,6 +28,71 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // ── FS_IOC_GETFLAGS / FS_IOC_SETFLAGS — `chattr`'s inode flags ────
+    //
+    // `fs/file_attr.c`. Handled here rather than in `FileOps::ioctl`
+    // because the flags are a VFS concept the VFS enforces; a filesystem
+    // only stores them.
+    const FS_IOC_GETFLAGS: u32 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+    if cmd == FS_IOC_GETFLAGS {
+        let flags = ops.inode_flags();
+        // SAFETY: the UAPI argument is a single `int`; copy_to_user
+        // range-validates the four bytes.
+        if unsafe { copy_to_user(arg as u64, &flags.to_ne_bytes()) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
+    if cmd == FS_IOC_SETFLAGS {
+        let mut raw = [0u8; 4];
+        // SAFETY: as above — a single `int` argument.
+        if unsafe { copy_from_user(&mut raw, arg as u64) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        let requested = u32::from_ne_bytes(raw);
+        let current = ops.inode_flags();
+        // `fileattr_set_prepare`:
+        //
+        //     /*
+        //      * The IMMUTABLE and APPEND_ONLY flags can only be changed by
+        //      * the relevant capability.
+        //      */
+        //     if ((fa->flags ^ old_ma->flags) & (FS_APPEND_FL | FS_IMMUTABLE_FL) &&
+        //         !capable(CAP_LINUX_IMMUTABLE))
+        //             return -EPERM;
+        //
+        // Note it is the CHANGE that is privileged, not the value: a
+        // caller may rewrite the word as long as these two bits keep the
+        // value they already had.
+        if (requested ^ current) & narf_filesystem::FS_PRIVILEGED_FL != 0
+            && !capable(CAP_LINUX_IMMUTABLE)
+        {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+        // `vfs_fileattr_set` -> `may_fileattr_set` requires ownership:
+        // "Verify that we are the owner or have CAP_FOWNER".
+        let (uid, gid) = ops.owners();
+        if !inode_owner_or_capable(task, uid, gid) {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+        let result = match ops.set_inode_flags(requested) {
+            Ok(()) => 0,
+            // A filesystem that cannot store them must not pretend it
+            // did: userspace would believe a file is immutable while
+            // nothing enforces it. ENOTTY is what an unsupported ioctl
+            // reports.
+            Err(_) => -25i64,
+        };
+        ctx.set_return(SyscallReturn::ok(result as u64));
+        return;
+    }
+
     // Btrfs snapshot ioctls embed a source directory fd in their 4096-byte
     // argument. Resolve that process-local fd here, then pass a stable DirOps
     // object through the VFS snapshot surface; filesystem drivers must never

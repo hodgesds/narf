@@ -96,6 +96,12 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    if path_inode_flags(&old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
+        || path_inode_flags(&new_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let perm_task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {

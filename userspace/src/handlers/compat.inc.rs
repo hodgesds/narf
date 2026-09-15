@@ -589,15 +589,13 @@ pub(crate) struct InheritedAcls {
 /// the creator's fsgid unconditionally, so the group never propagated and
 /// the bit never appeared on a child directory.
 ///
-/// LINUX-GAP: `vfs_prepare_mode` also runs `mode_strip_sgid`, which
-/// removes a CALLER-supplied S_ISGID from a group-executable regular file
-/// when the creator is not in the directory's group. NARF's create paths
-/// mask the caller's mode down before this point, so the bit can only
-/// arrive by inheritance, where the strip does not apply.
-fn inode_init_owner(parent: &dyn narf_filesystem::DirOps, is_dir: bool, mode: &mut u16) -> (u32, u32) {
+fn inode_init_owner(
+    parent: &dyn narf_filesystem::DirOps,
+    is_dir: bool,
+    mode: &mut u16,
+) -> (u32, u32) {
     let (fsuid, fsgid) = current_fs_ids();
-    let (dir_uid, dir_gid) = parent.dir_owners();
-    let _ = dir_uid;
+    let (_, dir_gid) = parent.dir_owners();
     if parent.dir_mode() & 0o2000 != 0 {
         if is_dir {
             *mode |= 0o2000;
@@ -606,6 +604,37 @@ fn inode_init_owner(parent: &dyn narf_filesystem::DirOps, is_dir: bool, mode: &m
     } else {
         (fsuid, fsgid)
     }
+}
+
+/// `fs/inode.c::mode_strip_sgid`, run by `vfs_prepare_mode` before the
+/// filesystem ever sees the mode:
+///
+/// ```text
+/// if ((mode & (S_ISGID | S_IXGRP)) != (S_ISGID | S_IXGRP)) return mode;
+/// if (S_ISDIR(mode) || !dir || !(dir->i_mode & S_ISGID))   return mode;
+/// if (in_group_or_capable(idmap, dir, i_gid_into_vfsgid(idmap, dir)))
+///                                                          return mode;
+/// return mode & ~S_ISGID;
+/// ```
+///
+/// The case it closes: a setgid directory hands its group to every new
+/// file, so a caller who is NOT in that group could otherwise create a
+/// group-executable set-group-ID binary owned by a group it does not
+/// belong to — manufacturing privilege out of write access to a shared
+/// directory. Directories are exempt because their S_ISGID is
+/// inheritance, not privilege.
+fn mode_strip_sgid(parent: &dyn narf_filesystem::DirOps, is_dir: bool, mode: u16) -> u16 {
+    if mode & 0o2010 != 0o2010 || is_dir {
+        return mode;
+    }
+    if parent.dir_mode() & 0o2000 == 0 {
+        return mode;
+    }
+    let (dir_uid, dir_gid) = parent.dir_owners();
+    if crate::handlers::task_in_group_or_capable(current_task_id(), dir_uid, dir_gid) {
+        return mode;
+    }
+    mode & !0o2000
 }
 
 pub(crate) fn inherit_acls_from_parent(
@@ -619,6 +648,7 @@ pub(crate) fn inherit_acls_from_parent(
     // (`posix_acl_create_masq` re-applies `*mode_p & ~S_IRWXUGO`), so an
     // inherited S_ISGID survives it.
     let (uid, gid) = inode_init_owner(parent, is_dir, &mut mode);
+    mode = mode_strip_sgid(parent, is_dir, mode);
     let umask = current_umask() as u16;
     let parent_default = parent
         .default_acl()
@@ -1422,6 +1452,11 @@ fn do_execve_resolved(
     let mut cur_path = alloc::string::String::from(path);
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let elf_buf;
+    // Whether the image came from an fd rather than a path, and whether a
+    // `#!` line was followed to reach it — both decide whether the file's
+    // set-user-ID bits may be honoured below.
+    let image_override_used = image_override.is_some();
+    let mut followed_shebang = false;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -1448,6 +1483,7 @@ fn do_execve_resolved(
                     return;
                 }
                 depth += 1;
+                followed_shebang = true;
                 let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
                 let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
                 // interpreter = first whitespace-delimited token; the remainder
@@ -1487,6 +1523,17 @@ fn do_execve_resolved(
     let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
     let task = current_task_id();
+
+    // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
+    // transition, applied to the file actually being executed and only
+    // once the image is known good. `image_override` is a memfd/fd image
+    // with no mount and no inode bits behind it, so it confers nothing —
+    // as in Linux, where there is no file to read them from.
+    if image_override_used {
+        let _ = task;
+    } else {
+        let _ = bprm_fill_uid(task, &cur_path, followed_shebang);
+    }
 
     // Step 4: load the new image. exec REPLACES this process's image, so the
     // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
@@ -2995,6 +3042,17 @@ pub fn proc_ns_readlink(pid: u64, tag: u8) -> Option<alloc::string::String> {
 /// cannot use a driver to reach past its namespace.
 pub fn caller_capable(cap: u32) -> bool {
     task_capable(current_task_id(), cap)
+}
+
+/// Answer `narf_filesystem::caller_in_group_or_capable` for the task
+/// currently running — `fs/inode.c::in_group_or_capable` for one inode.
+///
+/// Installed as the filesystem layer's hook so `posix_acl_update_mode`
+/// can decide whether setting an access ACL keeps the file's S_ISGID.
+/// Like the capability hook, it hands out an ANSWER about one inode, not
+/// a credential the filesystem could reuse.
+pub fn caller_in_group_or_capable(uid: u32, gid: u32) -> bool {
+    task_in_group_or_capable(current_task_id(), uid, gid)
 }
 
 pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {

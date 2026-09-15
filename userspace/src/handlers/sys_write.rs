@@ -52,6 +52,19 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         None
     };
 
+    // `inode_permission`'s "Nobody gets write access to an immutable
+    // file", and the append-only half: the data may grow but never be
+    // rewritten, so only an O_APPEND write is allowed through.
+    if let Err(errno) = immutable_check(endpoint.ops.inode_flags(), true, endpoint.append()) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `vfs_write` -> `file_remove_privs`: a write strips the set-user-ID
+    // bit (and set-group-ID, when it is a privilege rather than the
+    // mandatory-locking marker). Without this, anyone who can write a
+    // set-user-ID-root binary keeps it set-user-ID-root.
+    file_remove_privs(endpoint.ops.as_ref(), task);
+
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = if endpoint.append() {

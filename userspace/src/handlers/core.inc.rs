@@ -1399,6 +1399,16 @@ fn open_impl(
             // `simple_acl_create`. A parent with a default ACL replaces the
             // umask with it, so `permissions` cannot be computed until the
             // parent is known — see `inherit_acls_from_parent`.
+            //
+            // The mode mask is `S_IALLUGO` (07777), not 0777:
+            // `vfs_create` passes the caller's set-user-ID and set-group-ID
+            // bits through. That is safe because the new file is owned by
+            // the CREATOR, so setuid-to-yourself confers nothing, and the
+            // dangerous half — a group-executable set-group-ID file in a
+            // setgid directory whose group the creator is not in — is what
+            // `mode_strip_sgid` removes. Masking the bits off instead
+            // meant `open(path, O_CREAT, 02755)` silently produced a
+            // non-setgid file and `mode_strip_sgid` had nothing to guard.
             let mut inherited_access: Option<alloc::vec::Vec<u8>> = None;
             let mut permissions = (create_mode & !current_umask() & 0o777) as u16;
             // `inode_init_owner` hands the new file the parent's group when
@@ -1427,7 +1437,7 @@ fn open_impl(
                         return Some(Err(narf_filesystem::FsError::PermissionDenied));
                     }
                     let inherited =
-                        inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                        inherit_acls_from_parent(&*parent, (create_mode & 0o7777) as u16, false);
                     permissions = inherited.mode;
                     inherited_access = inherited.access;
                     owner = (inherited.uid, inherited.gid);
@@ -1439,7 +1449,7 @@ fn open_impl(
                             return Some(Err(narf_filesystem::FsError::PermissionDenied));
                         }
                         let inherited =
-                            inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                            inherit_acls_from_parent(&*parent, (create_mode & 0o7777) as u16, false);
                         permissions = inherited.mode;
                         inherited_access = inherited.access;
                         owner = (inherited.uid, inherited.gid);
@@ -1680,6 +1690,31 @@ fn open_impl(
                 ctx.set_return(SyscallReturn::ok((-13i64) as u64));
                 return;
             }
+        }
+    }
+
+    // `inode_permission`'s "Nobody gets write access to an immutable
+    // file", plus `may_open`'s append-only arm:
+    //
+    //     if (IS_APPEND(inode)) {
+    //             if ((flag & O_ACCMODE) != O_RDONLY && !(flag & O_APPEND))
+    //                     return -EPERM;
+    //             if (flag & O_TRUNC)
+    //                     return -EPERM;
+    //     }
+    {
+        const O_APPEND: u64 = 0o2000;
+        const O_TRUNC: u64 = 0o1000;
+        let iflags = ops.inode_flags();
+        if want_w && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+        if iflags & narf_filesystem::FS_APPEND_FL != 0
+            && ((want_w && flags & O_APPEND == 0) || flags & O_TRUNC != 0)
+        {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
         }
     }
 
@@ -2360,6 +2395,21 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         return SyscallReturn::ok(errno as u64);
     }
     let fmt = mode & S_IFMT;
+    // `vfs_mknod`:
+    //
+    //     if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
+    //         !capable(CAP_MKNOD))
+    //             return -EPERM;
+    //
+    // A device node is a direct handle on a driver, so creating one is a
+    // privileged act however permissive the directory is: an unprivileged
+    // task that could mknod its own `/dev/sda` would read the disk past
+    // every file permission on it. FIFOs and sockets are NOT covered —
+    // they carry no such authority, which is why the check names only the
+    // two device types.
+    if (fmt == S_IFCHR || fmt == S_IFBLK) && !capable(CAP_MKNOD) {
+        return SyscallReturn::ok((-1i64) as u64); // -EPERM
+    }
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
         if (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
@@ -2416,7 +2466,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // setgid parent hands down its group. A device node or FIFO in
             // a shared group directory has to land in that group like
             // anything else.
-            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o777) as u16, false);
+            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o7777) as u16, false);
             let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
             let _ = poll_blocking(n.set_perms(inherited.mode));
             if let Some(blob) = inherited.access.as_ref() {
@@ -3323,6 +3373,12 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     // writable one is legal.
     if let Err(errno) = mnt_want_write(&new_path) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `vfs_link`: `if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) return
+    // -EPERM;` — a new NAME for an immutable inode is a change to it.
+    if path_inode_flags(&old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
@@ -4788,6 +4844,262 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     }
 }
 
+/// `security/commoncap.c::handle_privileged_root` — the half of
+/// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
+/// actually privileged.
+///
+/// Without it a setuid-root exec would move euid to 0 and stop there, and
+/// on a task that had already dropped root the permitted set is empty, so
+/// the new program would be "root" with no capabilities — the one state
+/// Linux never leaves a process in.
+///
+/// ```text
+/// if (__is_eff(root_uid, new) || __is_real(root_uid, new)) {
+///         /* pP' = (cap_bset & ~0) | (pI & ~0) */
+///         new->cap_permitted = cap_combine(old->cap_bset, old->cap_inheritable);
+/// }
+/// if (__is_eff(root_uid, new))
+///         *effective = true;
+/// ```
+///
+/// The permitted set is REGENERATED from the bounding set rather than
+/// inherited, which is what lets an unprivileged caller gain privilege
+/// through a setuid-root binary at all. The effective set follows only
+/// when the EFFECTIVE uid is root: a binary that merely leaves the real
+/// uid at 0 gets the permissions but must raise them itself.
+fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
+    if new_ids.euid != 0 && new_ids.uid != 0 {
+        return;
+    }
+    let mut caps = read_caps(task);
+    caps.permitted = caps.bounding | caps.inheritable;
+    if new_ids.euid == 0 {
+        caps.effective = caps.permitted;
+    }
+    write_caps(task, caps);
+}
+
+/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
+/// an `execve` of a privileged binary performs.
+///
+/// Every guard here is load-bearing, because this is the one place in the
+/// tree where an unprivileged task can gain privilege:
+///
+///   * `mnt_may_suid` — a `nosuid` mount confers nothing. That is what
+///     the flag is FOR, and until this existed there was nothing for it
+///     to suppress.
+///   * `task_no_new_privs` — a task that asked to be unable to gain
+///     privilege does not gain it. One-way, so a sandbox cannot be
+///     talked out of it.
+///   * the execute permission is re-checked (`inode_permission(MAY_EXEC)`)
+///     so a binary that lost its exec bit between the open and here
+///     confers nothing.
+///   * S_ISGID alone does nothing; Linux requires `S_ISGID | S_IXGRP`
+///     together, because S_ISGID without group-execute is the mandatory
+///     file-locking marker, not a privilege request.
+///
+/// Returns the new credential when a transition happened.
+fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
+    // Linux ignores the set-user-ID bits on a `#!` script: the kernel
+    // executes the INTERPRETER, and honouring the script's bits would hand
+    // its privilege to an interpreter that was never audited for it. NARF
+    // resolves the shebang itself, so the equivalent is to confer nothing
+    // once a shebang has been followed.
+    if from_script {
+        return None;
+    }
+    if narf_filesystem::any_restricted_mounts()
+        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOSUID != 0
+    {
+        return None;
+    }
+    if read_prctl(task).no_new_privs {
+        return None;
+    }
+    let file = resolve_file_absolute_ext(path, true)?;
+    let stat = file.stat();
+    let mode = stat.mode.perms;
+    if mode & 0o6000 == 0 {
+        return None;
+    }
+    let (file_uid, file_gid) = file.owners();
+    // "Did the exec bit vanish out from under us? Give up."
+    let permitted = narf_filesystem::posix_access_ok(
+        narf_filesystem::FileOwner {
+            uid: file_uid,
+            gid: file_gid,
+            perms: mode,
+            is_dir: false,
+        },
+        &accessor_for_inode(task, file_uid, file_gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: false,
+            exec: true,
+        },
+    );
+    if !permitted {
+        return None;
+    }
+    let old = read_uidgid(task);
+    let mut new = old;
+    if mode & 0o4000 != 0 {
+        new.euid = file_uid;
+    }
+    // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
+    if mode & 0o2010 == 0o2010 {
+        new.egid = file_gid;
+    }
+    if new.euid == old.euid && new.egid == old.egid {
+        return None;
+    }
+    // `commit_creds` keeps the filesystem ids in step with the effective
+    // ones; every DAC decision reads fsuid/fsgid, so leaving them behind
+    // would grant the privilege for `access()` and deny it for `open()`.
+    new.fsuid = new.euid;
+    new.fsgid = new.egid;
+    // The saved set-ids record where the privilege came from, which is how
+    // a setuid program drops and regains it (`seteuid` back to `suid`).
+    new.suid = new.euid;
+    new.sgid = new.egid;
+    write_uidgid(task, |e| *e = new);
+    cap_exec_privileged_root(task, new);
+    Some(new)
+}
+
+/// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
+/// bits when a file is modified".
+pub(crate) const CAP_FSETID: u32 = 4;
+
+/// Linux `CAP_MKNOD` — "create special files using mknod(2)".
+pub(crate) const CAP_MKNOD: u32 = 27;
+
+/// Linux `CAP_LINUX_IMMUTABLE` — "set the FS_APPEND_FL and
+/// FS_IMMUTABLE_FL inode flags".
+pub(crate) const CAP_LINUX_IMMUTABLE: u32 = 9;
+
+/// The immutable / append-only refusals the VFS makes on an inode's
+/// `chattr` flags, in one place because Linux asks the same question from
+/// six different call sites (`inode_permission`, `may_delete`,
+/// `may_setattr`, `may_write_xattr`, `vfs_link`, `do_truncate`).
+///
+/// `write` selects `inode_permission`'s rule — "Nobody gets write access
+/// to an immutable file" — which holds for root as well; that is the
+/// whole point of `chattr +i`. Append-only is the weaker form: the data
+/// may grow but never be rewritten, so a non-appending write is refused
+/// while an appending one is not.
+fn immutable_check(flags: u32, write: bool, appending: bool) -> Result<(), i64> {
+    if flags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        return Err(-1); // -EPERM
+    }
+    if write && !appending && flags & narf_filesystem::FS_APPEND_FL != 0 {
+        return Err(-1);
+    }
+    Ok(())
+}
+
+/// The `chattr` flags of the inode at `path`, or 0 when nothing there
+/// models them.
+fn path_inode_flags(path: &str) -> u32 {
+    resolve_file_absolute_ext(path, true)
+        .map(|file| file.inode_flags())
+        .unwrap_or(0)
+}
+
+/// `fs/attr.c::setattr_should_drop_suidgid`, applied by
+/// `file_remove_privs` on every write and by `do_truncate`:
+///
+/// ```text
+/// /* suid always must be killed */
+/// if (unlikely(mode & S_ISUID))
+///         kill = ATTR_KILL_SUID;
+/// kill |= setattr_should_drop_sgid(idmap, inode);
+/// if (unlikely(kill && !capable(CAP_FSETID) && S_ISREG(mode)))
+///         return kill;
+/// ```
+///
+/// and `setattr_should_drop_sgid`, which spares an S_ISGID that is the
+/// mandatory-locking marker (no group-execute) held by someone in the
+/// file's own group:
+///
+/// ```text
+/// if (!(mode & S_ISGID))  return 0;
+/// if (mode & S_IXGRP)     return ATTR_KILL_SGID;
+/// if (!in_group_or_capable(idmap, inode, i_gid_into_vfsgid(idmap, inode)))
+///                         return ATTR_KILL_SGID;
+/// return 0;
+/// ```
+///
+/// This became load-bearing the moment set-user-ID execution started
+/// working: without it, anyone who can write a set-user-ID-root binary
+/// keeps it set-user-ID-root, which turns "can modify this file" into
+/// "can become root".
+fn file_remove_privs(file: &dyn narf_filesystem::FileOps, task: u64) {
+    let stat = file.stat();
+    // "!S_ISREG(inode->i_mode)" — only regular files carry these as
+    // privilege, and only they are stripped.
+    if stat.mode.file_type != narf_filesystem::FileType::File {
+        return;
+    }
+    let mode = stat.mode.perms;
+    if mode & 0o6000 == 0 {
+        return;
+    }
+    let (uid, gid) = file.owners();
+    let mut kill = 0u16;
+    if mode & 0o4000 != 0 {
+        kill |= 0o4000;
+    }
+    if mode & 0o2000 != 0 && (mode & 0o010 != 0 || !in_group_or_capable(task, uid, gid)) {
+        kill |= 0o2000;
+    }
+    if kill == 0 {
+        return;
+    }
+    // A CAP_FSETID holder keeps the bits — that is the capability's entire
+    // definition.
+    if capable_wrt_inode(task, uid, gid, CAP_FSETID) {
+        return;
+    }
+    let _ = poll_blocking(file.set_perms(mode & !kill));
+}
+
+/// `fs/inode.c::in_group_or_capable` — is the caller in the file's group,
+/// or privileged enough over it to act as if it were?
+///
+/// ```text
+/// if (vfsgid_in_group_p(vfsgid)) return true;
+/// if (capable_wrt_inode_uidgid(idmap, inode, CAP_FSETID)) return true;
+/// return false;
+/// ```
+/// [`in_group_or_capable`] for callers outside this file.
+pub(crate) fn task_in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    in_group_or_capable(task, file_uid, file_gid)
+}
+
+fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    let ids = read_uidgid(task);
+    if ids.fsgid == file_gid || read_groups(task).contains(&file_gid) {
+        return true;
+    }
+    capable_wrt_inode(task, file_uid, file_gid, CAP_FSETID)
+}
+
+/// Test window onto [`bprm_fill_uid`]. A full `execve` needs a loadable
+/// image and a task switch, neither of which the ABI harness can stage, so
+/// the smoke drives the DECISION — which is the part that decides whether
+/// privilege is granted — directly.
+///
+/// Returns `(euid, egid, fsuid, effective caps)` after the call, so a test
+/// can assert both the credential transition and the capability
+/// regeneration a setuid-root binary depends on.
+#[doc(hidden)]
+pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
+    let _ = bprm_fill_uid(task, path, from_script);
+    let ids = read_uidgid(task);
+    (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
 /// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
 /// parent's `struct cred` wholesale; capabilities are transformed at
 /// EXECVE, not at fork).
@@ -5219,6 +5531,19 @@ fn xattr_permission_check(
     write: bool,
     task: u64,
 ) -> Result<(), i64> {
+    // `fs/xattr.c::may_write_xattr` comes first, before any namespace or
+    // ownership question: "we can never set or remove an extended
+    // attribute on a read-only filesystem or on an immutable /
+    // append-only inode".
+    if write {
+        let iflags = match target {
+            XattrTarget::File(file) => file.inode_flags(),
+            XattrTarget::Dir(_) => 0,
+        };
+        if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+            return Err(XE_PERM);
+        }
+    }
     let (uid, gid, perms, is_dir) = target.meta();
     if is_acl_xattr(name) {
         if !write {

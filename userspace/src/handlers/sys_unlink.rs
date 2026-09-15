@@ -48,6 +48,14 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `may_delete`: `if (check_sticky(..) || IS_APPEND(inode) ||
+    // IS_IMMUTABLE(inode) || ...) return -EPERM;` — an immutable or
+    // append-only file cannot be removed, which is what makes `chattr +i`
+    // survive an `rm -f` by root.
+    if path_inode_flags(path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(path, |fs, parent, leaf| {

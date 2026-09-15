@@ -1118,6 +1118,771 @@ kernel_test_in!(
     smoke_abi_fsx_noexec_nodev_are_enforced_and_reported
 );
 
+/// `execve` of a set-user-ID binary raises privilege, and every guard on
+/// that is real.
+///
+/// `fs/exec.c::bprm_fill_uid` is the one place an unprivileged task can
+/// gain privilege, and NARF did not implement it at all — set-user-ID
+/// binaries simply did not work, which is also why `MS_NOSUID` had nothing
+/// to suppress.
+///
+/// This drives the decision directly rather than through a real `execve`:
+/// a full exec needs a loadable image and a task switch that the ABI
+/// harness cannot stage. The decision is the security-critical half.
+///
+/// Each guard is asserted separately because each one, missing, is a
+/// privilege-escalation bug on its own.
+fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
+    const OWNER: u32 = 4000;
+    const GROUP: u32 = 4100;
+    const CALLER: u32 = 1000;
+    with_memfs("/abi-suid", "abi-suid", &[("prog", b"\x7fELF")], || {
+        let path = "/abi-suid/prog";
+        let cpath = b"/abi-suid/prog\0";
+        let task = crate::handlers::current_task_id();
+        let stage = |mode: u64| -> Result<(), &'static str> {
+            if call(
+                Syscall::Chown.raw(),
+                a2(cpath.as_ptr() as u64, OWNER as u64, GROUP as u64),
+            ) != Some(0)
+            {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, mode)) != Some(0) {
+                return Err("chmod of the test binary failed");
+            }
+            Ok(())
+        };
+        let as_caller = || {
+            crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        };
+
+        // ── set-user-ID: euid becomes the file's owner ────────────────
+        stage(0o4755)?;
+        as_caller();
+        let (euid, _, fsuid, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if euid != OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-user-ID binary did not move the effective uid");
+        }
+        // Every DAC decision reads fsuid, so leaving it behind would grant
+        // the privilege for `access()` and deny it for `open()`.
+        if fsuid != OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("the filesystem uid did not follow the effective uid");
+        }
+
+        // ── S_ISGID WITHOUT group-execute is not a privilege request ──
+        // It is the mandatory file-locking marker; Linux requires
+        // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
+        stage(0o2745)?;
+        as_caller();
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if egid == GROUP {
+            crate::handlers::__test_uidgid_reset();
+            return Err("S_ISGID without group-execute granted the file's group");
+        }
+
+        // ── S_ISGID WITH group-execute does transition ───────────────
+        stage(0o2755)?;
+        as_caller();
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if egid != GROUP {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-group-ID binary did not move the effective gid");
+        }
+
+        // ── a shebang confers nothing ────────────────────────────────
+        // The kernel executes the INTERPRETER; honouring the script's bits
+        // would hand its privilege to an interpreter never audited for it.
+        stage(0o4755)?;
+        as_caller();
+        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, true);
+        if euid == OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-user-ID script granted privilege through its interpreter");
+        }
+
+        // ── no_new_privs refuses the transition ──────────────────────
+        stage(0o4755)?;
+        as_caller();
+        const PR_SET_NO_NEW_PRIVS: u64 = 38;
+        if call(Syscall::Prctl.raw(), a2(PR_SET_NO_NEW_PRIVS, 1, 0)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("prctl(PR_SET_NO_NEW_PRIVS) failed");
+        }
+        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_prctl_reset();
+        if euid == OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("no_new_privs did not stop a set-user-ID transition");
+        }
+
+        // ── a setuid-ROOT binary regenerates capabilities ────────────
+        // Without this the new program would be uid 0 with an empty
+        // permitted set — the one state Linux never leaves a process in.
+        if call(Syscall::Chown.raw(), a2(cpath.as_ptr() as u64, 0, 0)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chown root of the test binary failed");
+        }
+        // The chmod must come AFTER the chown: changing an owner clears
+        // the set-user-ID bit (`setattr_should_drop_suidgid`), so staging
+        // them the other way round would leave an ordinary 0755 binary and
+        // the assertion below would be about nothing.
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chmod setuid-root of the test binary failed");
+        }
+        as_caller();
+        let (euid, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_uidgid_reset();
+        if euid != 0 {
+            return Err("a set-user-ID-root binary did not reach uid 0");
+        }
+        if effective == 0 {
+            return Err("a set-user-ID-root binary got uid 0 with no capabilities");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setuid_exec_transition_and_its_guards
+);
+
+/// `nosuid` is what it says: a set-user-ID binary on such a mount confers
+/// nothing.
+///
+/// `bprm_fill_uid` opens with `if (!mnt_may_suid(file->f_path.mnt))
+/// return;`, and `mnt_may_suid` is `!(mnt->mnt_flags & MNT_NOSUID) && ...`.
+/// This is the pairing that makes both halves worth having: storing the
+/// flag was pointless while nothing could be suppressed, and implementing
+/// set-user-ID execution without honouring the flag would have handed
+/// every sandbox a privilege-escalation path it had explicitly asked to
+/// close.
+fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
+    const OWNER: u32 = 4200;
+    const CALLER: u32 = 1200;
+    const MS_NOSUID: u64 = 1 << 1;
+    with_setup(|| {
+        let target = b"/abi-nosuid\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        let mount_with = |flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: source.as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg2: fstype.as_ptr() as u64,
+                    arg3: flags,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        let cpath = b"/abi-nosuid/prog\0";
+        let path = "/abi-nosuid/prog";
+        let task = crate::handlers::current_task_id();
+        let finish = |outcome: Result<(), &'static str>| {
+            crate::handlers::__test_uidgid_reset();
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        let stage = || -> Result<(), &'static str> {
+            match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, cpath.as_ptr() as u64, 0o100 | 0o2, 0o755),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("creating the test binary failed"),
+            }
+            // chown first: it clears the set-user-ID bit.
+            if call(
+                Syscall::Chown.raw(),
+                a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),
+            ) != Some(0)
+            {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0) {
+                return Err("chmod setuid of the test binary failed");
+            }
+            Ok(())
+        };
+
+        // Baseline on a PLAIN mount: the transition must happen, or the
+        // nosuid assertion below would pass for the wrong reason.
+        if mount_with(0) != Some(0) {
+            return Err("mounting a plain tmpfs failed");
+        }
+        if let Err(msg) = stage() {
+            return finish(Err(msg));
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_uidgid_reset();
+        if euid != OWNER {
+            return finish(Err(
+                "the baseline setuid transition did not happen — test is vacuous",
+            ));
+        }
+        let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+
+        // Same binary, same bits, on a `nosuid` mount: nothing.
+        if mount_with(MS_NOSUID) != Some(0) {
+            return Err("mounting a nosuid tmpfs failed");
+        }
+        if let Err(msg) = stage() {
+            return finish(Err(msg));
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if euid == OWNER {
+            return finish(Err("a nosuid mount granted a set-user-ID transition"));
+        }
+        if euid != CALLER {
+            return finish(Err("a nosuid mount changed the effective uid at all"));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_nosuid_mount_confers_no_privilege
+);
+
+/// Writing to a file strips its set-user-ID bit.
+///
+/// `vfs_write` -> `file_remove_privs` -> `setattr_should_drop_suidgid`:
+///
+/// ```text
+/// /* suid always must be killed */
+/// if (unlikely(mode & S_ISUID))
+///         kill = ATTR_KILL_SUID;
+/// kill |= setattr_should_drop_sgid(idmap, inode);
+/// if (unlikely(kill && !capable(CAP_FSETID) && S_ISREG(mode)))
+///         return kill;
+/// ```
+///
+/// This became load-bearing the moment set-user-ID execution started
+/// working: without it, "can write this file" silently means "can become
+/// whoever owns it", because an attacker appends their payload to a
+/// set-user-ID-root binary and it stays set-user-ID-root.
+///
+/// The set-group-ID half is conditional, and the condition is the point:
+/// S_ISGID WITHOUT group-execute is the mandatory file-locking marker, and
+/// `setattr_should_drop_sgid` spares it for a writer who is in the file's
+/// own group.
+fn smoke_abi_fsx_write_strips_setuid() -> TestResult {
+    with_memfs(
+        "/abi-privs",
+        "abi-privs",
+        &[("prog", b"x"), ("locked", b"x")],
+        || {
+            let prog = b"/abi-privs/prog\0";
+            let locked = b"/abi-privs/locked\0";
+            let mode_of = |path: &[u8]| -> Option<u32> {
+                let mut sb = [0u8; 144];
+                if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                    return None;
+                }
+                Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+            };
+            // Stage BOTH files while still fully privileged. Dropping uid
+            // also drops capabilities, and there is no way back, so every
+            // chown/chmod has to happen before the single drop below.
+            //
+            // chown comes before chmod in each pair: changing an owner
+            // clears the very bits being staged.
+            //
+            // `prog` is a set-user-ID, set-group-ID EXECUTABLE owned by the
+            // caller, so the caller can write it at all.
+            if call(Syscall::Chown.raw(), a2(prog.as_ptr() as u64, 1000, 1000)) != Some(0) {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(prog.as_ptr() as u64, 0o6755)) != Some(0) {
+                return Err("chmod 6755 setup failed");
+            }
+            // `locked` is 02666: set-group-ID with NO group-execute — the
+            // mandatory-locking marker — and group-writable.
+            //
+            // Its group is 0 because `setresuid` below moves only the UIDs;
+            // the writer keeps fsgid 0, so group 0 is the group it is
+            // actually IN. Staging this as group 1000 would make the writer
+            // a non-member, and `setattr_should_drop_sgid` would then
+            // correctly strip the bit — testing the opposite rule by
+            // accident.
+            if call(Syscall::Chown.raw(), a2(locked.as_ptr() as u64, 0, 0)) != Some(0) {
+                return Err("chgrp of the locked file failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(locked.as_ptr() as u64, 0o2666)) != Some(0) {
+                return Err("chmod 2666 setup failed");
+            }
+            if mode_of(prog) != Some(0o6755) || mode_of(locked) != Some(0o2666) {
+                return Err("the setuid bits did not stick — staging is vacuous");
+            }
+
+            // Write as an UNPRIVILEGED task: CAP_FSETID is precisely the
+            // right to KEEP these bits, so as root the write would
+            // legitimately preserve them and this test would prove nothing.
+            if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+                crate::handlers::__test_uidgid_reset();
+                return Err("setresuid(1000) setup failed");
+            }
+            let write_to = |path: &[u8]| -> Option<i64> {
+                let fd = call(
+                    Syscall::Openat.raw(),
+                    a3(AT_FDCWD, path.as_ptr() as u64, 0o1, 0),
+                );
+                match fd {
+                    Some(fd) if fd >= 0 => {
+                        let payload = b"payload";
+                        let n = call(
+                            Syscall::Write.raw(),
+                            a2(fd as u64, payload.as_ptr() as u64, payload.len() as u64),
+                        );
+                        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                        n
+                    }
+                    _ => None,
+                }
+            };
+            let wrote_prog = write_to(prog);
+            let wrote_locked = write_to(locked);
+            crate::handlers::__test_uidgid_reset();
+
+            if wrote_prog.map(|n| n <= 0).unwrap_or(true) {
+                return Err("the unprivileged write did not happen — staging is vacuous");
+            }
+            if wrote_locked.map(|n| n <= 0).unwrap_or(true) {
+                return Err("the group-member write did not happen — staging is vacuous");
+            }
+            match mode_of(prog) {
+                Some(mode) if mode & 0o4000 != 0 => {
+                    return Err("a write left the set-user-ID bit in place")
+                }
+                Some(mode) if mode & 0o2000 != 0 => {
+                    return Err("a write left a set-group-ID EXECUTABLE bit in place")
+                }
+                Some(0o755) => {}
+                Some(_) => return Err("a write changed more than the privilege bits"),
+                None => return Err("stat after the write failed"),
+            }
+            // S_ISGID without group-execute is the mandatory-locking marker,
+            // not a privilege, and `setattr_should_drop_sgid` spares it for a
+            // writer who is in the file's own group.
+            match mode_of(locked) {
+                Some(mode) if mode & 0o2000 == 0 => {
+                    Err("a write stripped the mandatory-locking S_ISGID from a group member")
+                }
+                Some(_) => Ok(()),
+                None => Err("stat after the locked-file write failed"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_write_strips_setuid);
+
+/// Creating a device node needs CAP_MKNOD; a FIFO does not.
+///
+/// `vfs_mknod`:
+///
+/// ```text
+/// if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
+///     !capable(CAP_MKNOD))
+///         return -EPERM;
+/// ```
+///
+/// A device node is a direct handle on a driver, so an unprivileged task
+/// that could `mknod` its own `/dev/sda` would read the disk past every
+/// file permission on it. NARF let anyone with write access to a
+/// directory create one. The check deliberately names only the two device
+/// types: a FIFO or socket carries no such authority, and requiring
+/// privilege for `mkfifo` would break ordinary programs.
+fn smoke_abi_fsx_mknod_device_requires_cap_mknod() -> TestResult {
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFIFO: u64 = 0o010000;
+    with_memfs("/abi-mknod", "abi-mknod", &[], || {
+        let dev = b"/abi-mknod/dev\0";
+        let fifo = b"/abi-mknod/fifo\0";
+        let root_dev = b"/abi-mknod/rootdev\0";
+        // Make the directory world-writable, so the refusal below can only
+        // come from the capability check and not from `may_create`.
+        let dir = b"/abi-mknod\0";
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o777)) != Some(0) {
+            return Err("chmod 0777 of the test directory failed");
+        }
+        // Privileged baseline: a device node IS creatable with CAP_MKNOD,
+        // or the denial below would prove nothing.
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, root_dev.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        ) != Some(0)
+        {
+            return Err("a privileged mknod of a device node failed — test is vacuous");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let made_dev = call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, dev.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        );
+        let made_fifo = call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, fifo.as_ptr() as u64, S_IFIFO | 0o666, 0),
+        );
+        crate::handlers::__test_uidgid_reset();
+        if made_dev != Some(EPERM) {
+            return Err("an unprivileged mknod of a device node must return -EPERM");
+        }
+        if made_fifo != Some(0) {
+            return Err("an unprivileged mkfifo was refused; CAP_MKNOD covers device nodes only");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mknod_device_requires_cap_mknod);
+
+/// A setgid directory cannot be used to manufacture a set-group-ID binary.
+///
+/// `vfs_prepare_mode` -> `fs/inode.c::mode_strip_sgid`:
+///
+/// ```text
+/// if ((mode & (S_ISGID | S_IXGRP)) != (S_ISGID | S_IXGRP)) return mode;
+/// if (S_ISDIR(mode) || !dir || !(dir->i_mode & S_ISGID))   return mode;
+/// if (in_group_or_capable(idmap, dir, i_gid_into_vfsgid(idmap, dir)))
+///                                                          return mode;
+/// return mode & ~S_ISGID;
+/// ```
+///
+/// The attack it closes: a setgid directory hands its group to every new
+/// file, so a caller who is NOT in that group could otherwise create a
+/// group-executable set-group-ID binary owned by a group it does not
+/// belong to — privilege manufactured out of write access to a shared
+/// directory.
+///
+/// NARF masked the set-group-ID bit off every create instead, which
+/// blocked the attack by blocking the feature: `open(path, O_CREAT,
+/// 02755)` silently produced a plain file. The mask is now Linux's
+/// `S_IALLUGO`, and this is the guard.
+fn smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary() -> TestResult {
+    const GROUP: u32 = 7700;
+    with_memfs("/abi-sgidstrip", "abi-sgidstrip", &[], || {
+        let dir = b"/abi-sgidstrip/shared\0";
+        let member = b"/abi-sgidstrip/shared/member\0";
+        let stranger = b"/abi-sgidstrip/shared/stranger\0";
+        let mode_of = |path: &[u8]| -> Option<u32> {
+            let mut sb = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                return None;
+            }
+            Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+        };
+        if call_mkdir(dir.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the shared directory failed");
+        }
+        // Group 0 — which the root-credentialed creator below IS in.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o2777)) != Some(0) {
+            return Err("chmod g+s of the shared directory failed");
+        }
+        let create = |path: &[u8]| {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, 0o100 | 0o2, 0o2755),
+            )
+        };
+        // A member of the directory's group KEEPS the bit — otherwise this
+        // test would pass on a blanket "always strip", which is the
+        // behaviour it exists to rule out.
+        match create(member) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating the member's file failed"),
+        }
+        match mode_of(member) {
+            Some(mode) if mode & 0o2000 != 0 => {}
+            Some(_) => return Err("a group member's set-group-ID request was stripped"),
+            None => return Err("stat of the member's file failed"),
+        }
+        // Now a caller in a DIFFERENT group. The directory hands down its
+        // own group, so the file would end up set-group-ID to a group the
+        // creator is not in.
+        if call(
+            Syscall::Chown.raw(),
+            a2(dir.as_ptr() as u64, 0, GROUP as u64),
+        ) != Some(0)
+        {
+            return Err("chgrp of the shared directory failed");
+        }
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o2777)) != Some(0) {
+            return Err("re-chmod g+s of the shared directory failed");
+        }
+        // The caller must be UNPRIVILEGED: CAP_FSETID is exactly the right
+        // to KEEP the bit, and a root creator legitimately holds it — so
+        // staging this as root would be asserting the opposite rule.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let made = create(stranger);
+        if let Some(fd) = made {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        crate::handlers::__test_uidgid_reset();
+        if made.map(|fd| fd < 0).unwrap_or(true) {
+            return Err("creating the stranger's file failed");
+        }
+        match mode_of(stranger) {
+            Some(mode) if mode & 0o2000 != 0 => {
+                Err("a non-member manufactured a set-group-ID binary in a setgid directory")
+            }
+            Some(_) => Ok(()),
+            None => Err("stat of the stranger's file failed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary
+);
+
+/// `chattr +i` — an immutable file refuses every change, including by
+/// root.
+///
+/// The flags themselves come from `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`
+/// (`fs/file_attr.c`), and the refusals are spread across the VFS:
+/// `inode_permission`'s "Nobody gets write access to an immutable file",
+/// `may_delete`, `may_setattr`, `may_write_xattr` and `vfs_link`. NARF
+/// modelled none of it, so `chattr +i` had nowhere to be stored and
+/// nothing to enforce it.
+///
+/// Everything below runs as ROOT on purpose: immutability that root can
+/// undo by ignoring it is not immutability. Root can only lift the flag
+/// first, which is the last thing this checks.
+fn smoke_abi_fsx_immutable_file_refuses_changes() -> TestResult {
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+    with_memfs(
+        "/abi-imm",
+        "abi-imm",
+        &[("f", b"data"), ("other", b"x")],
+        || {
+            let path = b"/abi-imm/f\0";
+            let other = b"/abi-imm/other\0";
+            let moved = b"/abi-imm/moved\0";
+            let set_flags = |flags: u32| -> Option<i64> {
+                let fd = call_open(path.as_ptr() as u64, 0)?;
+                if fd < 0 {
+                    return None;
+                }
+                let word = flags;
+                let r = call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, FS_IOC_SETFLAGS, &word as *const u32 as u64),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                r
+            };
+            let get_flags = || -> Option<u32> {
+                let fd = call_open(path.as_ptr() as u64, 0)?;
+                if fd < 0 {
+                    return None;
+                }
+                let mut word = 0u32;
+                let r = call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, FS_IOC_GETFLAGS, &mut word as *mut u32 as u64),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                (r == Some(0)).then_some(word)
+            };
+
+            // Baseline: writable before the flag, or nothing below is a test.
+            let writable_now = call_open(path.as_ptr() as u64, 0o1);
+            match writable_now {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("the file was not writable to begin with — test is vacuous"),
+            }
+
+            if set_flags(FS_IMMUTABLE_FL) != Some(0) {
+                return Err("FS_IOC_SETFLAGS(FS_IMMUTABLE_FL) failed");
+            }
+            if get_flags() != Some(FS_IMMUTABLE_FL) {
+                return Err("FS_IOC_GETFLAGS did not read the flag back");
+            }
+
+            // Opening for write is refused — `inode_permission` bars it, and
+            // this is root.
+            if call_open(path.as_ptr() as u64, 0o1) != Some(EPERM) {
+                return Err("an immutable file allowed a write open");
+            }
+            // Reading is untouched.
+            match call_open(path.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("an immutable file refused a READ open"),
+            }
+            if call(Syscall::Truncate.raw(), a1(path.as_ptr() as u64, 0)) != Some(EPERM) {
+                return Err("an immutable file allowed truncate");
+            }
+            if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o600)) != Some(EPERM) {
+                return Err("an immutable file allowed chmod");
+            }
+            if call(Syscall::Chown.raw(), a2(path.as_ptr() as u64, 1000, 1000)) != Some(EPERM) {
+                return Err("an immutable file allowed chown");
+            }
+            if call_unlink(path.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed unlink");
+            }
+            if call_rename(path.as_ptr() as u64, moved.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed rename");
+            }
+            let name = b"user.k\0";
+            let value = b"v";
+            if call(
+                Syscall::Setxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: value.as_ptr() as u64,
+                    arg3: value.len() as u64,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            ) != Some(EPERM)
+            {
+                return Err("an immutable file allowed setxattr");
+            }
+            // A NEW name for the inode is a change to it (`vfs_link`).
+            //
+            // Through `call_link`, not `Syscall::Link` directly: arm64
+            // wires no legacy `link` (only the `*at` form), so the raw
+            // number is `u32::MAX` there and the call would report "the
+            // syscall misbehaved" rather than the errno under test.
+            if call_link(path.as_ptr() as u64, other.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed a hard link");
+            }
+
+            // Lifting the flag restores everything — the file is protected,
+            // not destroyed.
+            if set_flags(0) != Some(0) {
+                return Err("clearing FS_IMMUTABLE_FL failed");
+            }
+            match call_open(path.as_ptr() as u64, 0o1) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                    Ok(())
+                }
+                _ => Err("clearing the flag did not make the file writable again"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_immutable_file_refuses_changes);
+
+/// `chattr +a` — append-only lets the data grow and nothing else.
+///
+/// `may_open`:
+///
+/// ```text
+/// if (IS_APPEND(inode)) {
+///         if  ((flag & O_ACCMODE) != O_RDONLY && !(flag & O_APPEND))
+///                 return -EPERM;
+///         if (flag & O_TRUNC)
+///                 return -EPERM;
+/// }
+/// ```
+///
+/// This is the weaker of the two flags and the distinction is the point:
+/// an append-only log must accept new records while refusing to have its
+/// history rewritten, so an O_APPEND open succeeds where a plain one is
+/// EPERM. Setting either flag needs CAP_LINUX_IMMUTABLE, which is the
+/// other half tested here.
+fn smoke_abi_fsx_append_only_allows_appends_only() -> TestResult {
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    const FS_APPEND_FL: u32 = 0x0000_0020;
+    const O_APPEND: u64 = 0o2000;
+    const O_TRUNC: u64 = 0o1000;
+    with_memfs("/abi-append", "abi-append", &[("log", b"start")], || {
+        let path = b"/abi-append/log\0";
+        let set_flags = |flags: u32| -> Option<i64> {
+            let fd = call_open(path.as_ptr() as u64, 0)?;
+            if fd < 0 {
+                return None;
+            }
+            let word = flags;
+            let r = call(
+                Syscall::Ioctl.raw(),
+                a2(fd as u64, FS_IOC_SETFLAGS, &word as *const u32 as u64),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            r
+        };
+        if set_flags(FS_APPEND_FL) != Some(0) {
+            return Err("FS_IOC_SETFLAGS(FS_APPEND_FL) failed");
+        }
+        // A plain write open is refused; an appending one is not.
+        if call_open(path.as_ptr() as u64, 0o1) != Some(EPERM) {
+            return Err("an append-only file allowed a non-appending write open");
+        }
+        if call_open(path.as_ptr() as u64, 0o1 | O_TRUNC | O_APPEND) != Some(EPERM) {
+            return Err("an append-only file allowed O_TRUNC");
+        }
+        let fd = match call_open(path.as_ptr() as u64, 0o1 | O_APPEND) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("an append-only file refused an O_APPEND open"),
+        };
+        let payload = b"more";
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd, payload.as_ptr() as u64, payload.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if wrote != Some(payload.len() as i64) {
+            return Err("an append-only file refused an appending write");
+        }
+        // Unlinking is still barred: the history cannot be dropped either.
+        if call_unlink(path.as_ptr() as u64) != Some(EPERM) {
+            return Err("an append-only file allowed unlink");
+        }
+        // A privileged caller CAN lift it — the file is protected, not
+        // destroyed. Checked before the drop below, because dropping uid
+        // also drops the capability and there is no way back.
+        if set_flags(0) != Some(0) {
+            return Err("a privileged caller could not clear FS_APPEND_FL");
+        }
+        if set_flags(FS_APPEND_FL) != Some(0) {
+            return Err("re-setting FS_APPEND_FL failed");
+        }
+        // Setting or clearing either flag needs CAP_LINUX_IMMUTABLE
+        // (`fileattr_set_prepare`), or the protection would be decorative:
+        // anyone it applies to could simply remove it.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let cleared = set_flags(0);
+        crate::handlers::__test_uidgid_reset();
+        if cleared == Some(0) {
+            return Err("an unprivileged caller cleared FS_APPEND_FL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_append_only_allows_appends_only);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

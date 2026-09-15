@@ -61,6 +61,16 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
             return;
         }
     }
+    // Truncation rewrites data, so BOTH flags refuse it: `do_truncate`
+    // reaches `notify_change`, whose `may_setattr` bars an immutable or
+    // append-only inode from an ATTR_SIZE change.
+    if let Err(errno) = immutable_check(ops.inode_flags(), true, false) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `do_truncate` passes `ATTR_KILL_SUID | ATTR_KILL_SGID` alongside the
+    // size change, for the same reason a write does.
+    file_remove_privs(ops.as_ref(), current_task_id());
     match poll_blocking(ops.truncate(new_size)) {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.

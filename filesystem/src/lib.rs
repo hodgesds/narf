@@ -235,6 +235,26 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// `FS_IMMUTABLE_FL` (`include/uapi/linux/fs.h`) — "Immutable file".
+///
+/// The VFS refuses every write to such an inode, including by root:
+/// `inode_permission` has "Nobody gets write access to an immutable file",
+/// and the checks are spread across `may_delete`, `may_setattr`,
+/// `may_write_xattr` and `vfs_link` besides. `chattr +i /etc/resolv.conf`
+/// is the canonical use.
+pub const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+
+/// `FS_APPEND_FL` — "writes to file may only append".
+///
+/// Weaker than immutable: the data can grow but never be rewritten,
+/// truncated, unlinked or re-permissioned. `may_open` enforces the open
+/// half (`O_APPEND` required, `O_TRUNC` refused).
+pub const FS_APPEND_FL: u32 = 0x0000_0020;
+
+/// The flags a caller may not change without `CAP_LINUX_IMMUTABLE`
+/// (`fs/file_attr.c::fileattr_set_prepare`).
+pub const FS_PRIVILEGED_FL: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL;
+
 /// Inode attributes Linux reports in `struct stat` that [`Stat`] does not
 /// carry.
 ///
@@ -951,6 +971,27 @@ pub trait FileOps: Send + Sync {
 
     fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// The inode's `FS_*_FL` flag word — `chattr`'s bits, read by
+    /// `FS_IOC_GETFLAGS`.
+    ///
+    /// Only [`FS_IMMUTABLE_FL`] and [`FS_APPEND_FL`] carry meaning here;
+    /// both are enforced by the VFS rather than by the filesystem, which
+    /// is why they live on the inode and are read from the syscall layer.
+    /// Default 0 — a filesystem that does not model them has none set.
+    fn inode_flags(&self) -> u32 {
+        0
+    }
+
+    /// Replace the inode's `FS_*_FL` flag word (`FS_IOC_SETFLAGS`).
+    ///
+    /// `Unsupported` by default, which the ioctl reports as ENOTTY: a
+    /// filesystem that cannot store the flags must not pretend the call
+    /// worked, because userspace would then believe a file is immutable
+    /// when nothing will enforce it.
+    fn set_inode_flags(&self, _flags: u32) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
     }
 
     /// Link count, device number and the two timestamps [`Stat`] omits.
@@ -2838,6 +2879,37 @@ pub fn caller_capable(cap: u32) -> bool {
     // pointer; non-zero confirms it was installed.
     let f: fn(u32) -> bool = unsafe { core::mem::transmute::<usize, fn(u32) -> bool>(v) };
     f(cap)
+}
+
+/// The caller's answer to `fs/inode.c::in_group_or_capable` for one inode.
+///
+/// `posix_acl_update_mode` needs it — setting an access ACL drops S_ISGID
+/// unless the caller is in the file's group or holds CAP_FSETID over it —
+/// and no `FileOps`/`DirOps` method carries a credential to compute it
+/// with. Passing a hardcoded `true` was the documented gap: it kept the
+/// bit in every case, including the one Linux clears it for.
+///
+/// Fails CLOSED, like [`CALLER_CAPABLE_HOOK`], but note that "closed" here
+/// means DROPPING the setgid bit: with no hook installed the safe answer
+/// is the one that removes privilege, not the one that keeps it.
+static IN_GROUP_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the `in_group_or_capable` query (userspace's).
+pub fn install_in_group_hook(f: fn(u32, u32) -> bool) {
+    IN_GROUP_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the calling process is in `(uid, gid)`'s group, or holds
+/// CAP_FSETID over that inode. `false` when no hook is installed.
+pub fn caller_in_group_or_capable(uid: u32, gid: u32) -> bool {
+    let v = IN_GROUP_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return false;
+    }
+    // SAFETY: v was stored by install_in_group_hook as a
+    // `fn(u32, u32) -> bool` pointer; non-zero confirms it was installed.
+    let f: fn(u32, u32) -> bool = unsafe { core::mem::transmute::<usize, fn(u32, u32) -> bool>(v) };
+    f(uid, gid)
 }
 
 /// Hook exporting a DRM GEM handle as an mmap-able dma-buf `FileOps`.
