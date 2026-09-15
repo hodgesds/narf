@@ -7103,6 +7103,34 @@ pub fn install_shmem_syscall_vtable(v: &'static ShmemSyscallVtable) {
     );
 }
 
+/// Test hook — swap the installed shmem vtable, returning the previous one
+/// so a case can put it back.
+///
+/// The "no shmem backend" arms of `shmget`/`shmat`/`shmctl` are unreachable
+/// in a booted kernel, where `install_shmem_syscall_vtable` runs at init.
+/// They are still worth answering correctly — each used to return
+/// `invalid_op()`, i.e. 0 in the register the Linux ABI reads, so `shmget`
+/// reported segment id 0 and `shmat` reported an attach at address 0 — and
+/// an arm nothing can reach is an arm nothing can check. This makes them
+/// reachable from a test and nowhere else.
+#[doc(hidden)]
+pub fn __test_swap_shmem_vtable(
+    next: Option<&'static ShmemSyscallVtable>,
+) -> Option<&'static ShmemSyscallVtable> {
+    let raw = match next {
+        Some(v) => v as *const ShmemSyscallVtable as *mut ShmemSyscallVtable,
+        None => core::ptr::null_mut(),
+    };
+    let prev = SHMEM_VTABLE.swap(raw, core::sync::atomic::Ordering::AcqRel);
+    if prev.is_null() {
+        None
+    } else {
+        // SAFETY: only ever stored from a `&'static` input, by
+        // `install_shmem_syscall_vtable` or this function.
+        Some(unsafe { &*prev })
+    }
+}
+
 fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     let p = SHMEM_VTABLE.load(core::sync::atomic::Ordering::Acquire);
     if p.is_null() {
@@ -7284,6 +7312,33 @@ fn mprotect_core(
 //     the staged wstatus is still recorded and we mark the syscall's
 //     return as Ok(0); test harnesses fire `notify_task_exited`
 //     manually.
+/// The answer a memory syscall gives when it finds no address space to
+/// operate on.
+///
+/// Every one of `mmap`/`munmap`/`mprotect`/`mremap`/`madvise`/`mlock*`/
+/// `munlock*`/`mincore`/`mbind`/`migrate_pages`/`move_pages`/
+/// `pkey_mprotect`/`process_madvise` used to answer this with
+/// `SyscallReturn::invalid_op()`, whose `value` — the register the Linux ABI
+/// returns — is 0. Every one of them therefore reported that an operation
+/// which did not happen had succeeded. For most that is merely a lie; for
+/// `mmap` and `mremap` it is a lie shaped like an address, since 0 is a
+/// plausible mapping result and libc only screens for MAP_FAILED.
+///
+/// -ENOMEM is what Linux documents for these calls when the address range
+/// cannot be served: "addresses in the specified range are not currently
+/// mapped" (`madvise`, `mincore`, `mprotect`), "some of the specified
+/// address range does not correspond to mapped pages" (`mlock`), and
+/// ENOMEM generally for `mmap`/`mremap`.
+///
+/// Linux has no equivalent state — a task running a syscall always has an
+/// `mm` — so this is not a path a booted NARF reaches either; it is the
+/// kernel-test harness, which deliberately establishes a no-AS baseline.
+/// That makes the arm unreachable in production and permanently reachable in
+/// tests, which is the combination that lets a wrong answer sit unnoticed.
+fn no_address_space() -> SyscallReturn {
+    SyscallReturn::ok((-12i64) as u64) // -ENOMEM
+}
+
 pub(crate) fn terminate_current_task(
     ctx: &mut dyn TrapContext,
     task: u64,

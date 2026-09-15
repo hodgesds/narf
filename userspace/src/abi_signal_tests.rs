@@ -1012,21 +1012,61 @@ fn smoke_abi_signal_sigprocmask_neg() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_signal_sigprocmask_neg);
 
 // ── Sigreturn ───────────────────────────────────────────────────────
-// sys_sigreturn(sc_vaddr): resolves a recorded sigframe and restores
-// it; on a failed perform_sigreturn it returns invalid_op(). In the
-// harness no frame was delivered, so it can only fail. The success
-// path (restore live user regs) is unreachable without a real delivery,
-// so only the negative/stub case is written.
+// sys_sigreturn(sc_vaddr): resolves a recorded sigframe and restores it.
+// A frame that will not restore is `badframe:` in
+// `arch/x86/kernel/signal_64.c::SYSCALL_DEFINE0(rt_sigreturn)`, which ends
+// in `signal_fault()` -> `force_sig(SIGSEGV)`. In the harness no frame was
+// delivered, so the restore can only fail — which makes this the one place
+// the kill can be observed. The success path (restore live user regs) is
+// unreachable without a real delivery.
 
+/// An unrestorable sigreturn frame must raise SIGSEGV, not return.
+///
+/// This used to assert `invalid_op()` — value 0, i.e. success on the Linux
+/// ABI — and carried a LINUX-GAP marker saying a real sigreturn never
+/// returns to its caller. The gap had teeth: the task CONTINUED, running on
+/// whatever register state the failed restore left behind. sigreturn is the
+/// one syscall that rewrites the entire user register file, so "it didn't
+/// work, carry on" resumes a thread whose state nothing vouches for.
+///
+/// The case installs its own sync-fault hook and restores it afterwards.
+/// That is not only to keep the harness task alive — the production hook
+/// would terminate it — but because routing through `sync_signal_hook()` is
+/// the behaviour under test: the handler records the vector it was asked
+/// for, and vector 13 is what `vector_to_signum` maps to SIGSEGV.
 fn smoke_abi_signal_sigreturn_neg() -> TestResult {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static VECTOR: AtomicU64 = AtomicU64::new(u64::MAX);
+    static ADDR: AtomicU64 = AtomicU64::new(u64::MAX);
+    fn recording(_ctx: &mut dyn TrapContext, vector: u64, info: crate::SyncFaultInfo) -> bool {
+        VECTOR.store(vector, Ordering::Relaxed);
+        ADDR.store(info.addr, Ordering::Relaxed);
+        true
+    }
     with_setup(|| {
-        // No delivered sigframe + bogus vaddr → perform_sigreturn fails
-        // → invalid_op() (call() decodes that as None).
-        // LINUX-GAP: a real sigreturn does not return to the caller at
-        // all; it resumes the interrupted context. Unreachable here.
-        let r = call(Syscall::Sigreturn.raw(), a0(0));
-        if r.is_some() {
-            return Err("sigreturn with no frame should be a non-Ok (InvalidOp) status");
+        // `with_setup` runs `install_core_syscalls`, which reinstalls the
+        // production hook, so the swap has to happen inside the closure.
+        let old = crate::sync_signal_hook();
+        VECTOR.store(u64::MAX, Ordering::Relaxed);
+        ADDR.store(u64::MAX, Ordering::Relaxed);
+        crate::install_sync_signal_hook(recording);
+        let r = call_raw(Syscall::Sigreturn.raw(), a0(0));
+        if let Some(prev) = old {
+            crate::install_sync_signal_hook(prev);
+        }
+        let vector = VECTOR.load(Ordering::Relaxed);
+        if vector == u64::MAX {
+            // The old behaviour: returned to the caller with nothing raised.
+            let _ = r;
+            return Err("sigreturn with an unrestorable frame did not raise a signal");
+        }
+        if vector != 13 {
+            return Err("sigreturn's bad-frame kill used a vector that is not SIGSEGV");
+        }
+        // `force_sig(SIGSEGV)` leaves si_addr NULL; the frame address belongs
+        // in a log line, not in the siginfo the handler reads.
+        if ADDR.load(Ordering::Relaxed) != 0 {
+            return Err("sigreturn's bad-frame kill passed a non-NULL si_addr");
         }
         Ok(())
     })

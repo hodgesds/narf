@@ -806,7 +806,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
     let as_ref = match current_address_space() {
         Some(a) => a,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(no_address_space());
             return;
         }
     };

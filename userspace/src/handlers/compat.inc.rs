@@ -1718,7 +1718,15 @@ fn do_execve_resolved(
             // No active user-task ctx — execve called outside a
             // polling future (e.g. from a kernel-test stub). Roll
             // back the slot AS swap and bail.
-            ctx.set_return(SyscallReturn::invalid_op());
+            //
+            // -ENOSYS, not the old `invalid_op()`. `invalid_op` leaves
+            // `value` at 0, and 0 from execve means the exec SUCCEEDED —
+            // which for execve is a claim nothing else makes: the caller
+            // continues as though it were now the new program, inside the
+            // old one. Linux's execve returns only on failure, so any value
+            // a caller can observe must be an error, and -ENOSYS says this
+            // kernel could not perform the exec here.
+            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
             return;
         }
     };
@@ -1772,8 +1780,10 @@ fn do_execve_resolved(
         // longjmp doesn't return; if it does (no jmp buf installed),
         // surface a clean error.
     }
-    // Fallback path — execve not wired (e.g. early boot or test).
-    ctx.set_return(SyscallReturn::invalid_op());
+    // Fallback path — execve not wired (e.g. early boot or test). -ENOSYS
+    // for the same reason as the no-user-ctx arm above: 0 from execve is
+    // "you are now the new program".
+    ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
 }
 
 /// A `TrapContext` proxy that overrides the syscall args while forwarding
@@ -3325,6 +3335,34 @@ const CLOCK_MONOTONIC_RAW: u64 = 4;
 const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
 const CLOCK_BOOTTIME: u64 = 7;
+
+/// The clock ids this kernel can actually answer — the single list behind
+/// both `clock_gettime` and `clock_getres`.
+///
+/// They used to carry separate lists, and the shorter one belonged to
+/// `clock_getres`: it refused `CLOCK_PROCESS_CPUTIME_ID`,
+/// `CLOCK_THREAD_CPUTIME_ID` and the two `_COARSE` clocks that
+/// `clock_gettime` serves. Refused, moreover, by returning the old
+/// `invalid_op()` — value 0, i.e. success on the Linux ABI — with the
+/// caller's `struct timespec` left untouched.
+///
+/// Ids outside this set (CLOCK_TAI, the ALARM clocks, and the negative
+/// dynamic-clock ids that address a PTP device) are -EINVAL, which is what
+/// `clockid_to_kclock` returning NULL produces in
+/// `kernel/time/posix-timers.c`.
+fn clock_id_supported(id: u64) -> bool {
+    matches!(
+        id,
+        CLOCK_REALTIME
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+    )
+}
 
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
 //

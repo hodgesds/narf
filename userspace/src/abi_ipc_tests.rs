@@ -3461,10 +3461,25 @@ fn smoke_abi_ipc_shmat_neg() -> TestResult {
         if call(Syscall::Shmat.raw(), a2(id, 0x123, SHM_RND | SHM_REMAP)) != Some(EINVAL) {
             return Err("SHM_RND|SHM_REMAP accepted an address rounded to NULL");
         }
-        // Linux ignores unknown shmat bits. With no fixture AS, reaching the
-        // normal mapping guard yields InvalidOp/None rather than EINVAL.
-        if call(Syscall::Shmat.raw(), a2(id, 0, 0x2)).is_some() {
-            return Err("shmat rejected an otherwise ignored unknown flag bit");
+        // Linux ignores unknown shmat bits. With no fixture AS the call gets
+        // as far as the mapping guard and stops there, which is the signal
+        // that the flag was accepted rather than rejected.
+        //
+        // That guard used to answer `invalid_op()` and this case tested for
+        // its absence from the value register (`is_some()` being false).
+        // `invalid_op` leaves `value` at 0 though, and 0 is a legitimate
+        // shmat return — an attachment at address 0 — so the guard now
+        // answers -ENOMEM, the same thing this function already returns two
+        // arms up when `reserve_mmap_va_aligned` comes back empty. Asserting
+        // that specific value is strictly better than asserting a
+        // non-answer: -EINVAL still means the flag was rejected, but so did
+        // every other non-Ok status before.
+        match call(Syscall::Shmat.raw(), a2(id, 0, 0x2)) {
+            Some(v) if v == ENOMEM => {}
+            Some(v) if v == EINVAL => {
+                return Err("shmat rejected an otherwise ignored unknown flag bit")
+            }
+            _ => return Err("shmat with an unknown flag bit did not reach the mapping guard"),
         }
         let _ = call(Syscall::Shmctl.raw(), a2(id, IPC_RMID, 0));
         Ok(())
@@ -4251,3 +4266,71 @@ fn smoke_abi_ipc_shmem_destroy_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_destroy_neg);
+
+// ── SysV shm with no shmem backend ─────────────────────────────────────
+//
+// Each of `shmget`, `shmat` and `shmctl(IPC_INFO)` has an arm for "this
+// kernel has no shmem vtable installed". All three used to take it with
+// `SyscallReturn::invalid_op()`, whose `value` — the register the Linux ABI
+// returns — is 0. So `shmget` reported segment id 0 as though it had
+// allocated one, `shmat` reported an attachment at address 0, and IPC_INFO
+// reported a filled-in `struct shminfo` over a buffer nothing wrote.
+//
+// The arms are unreachable in a booted kernel, where the vtable is installed
+// at init — which is exactly why they went unnoticed. `__test_swap_shmem_
+// vtable` makes them reachable from a test and nowhere else.
+
+/// With the backend removed, all three report -ENOSYS.
+///
+/// ENOSYS rather than ENOMEM: the resource is not scarce, the subsystem is
+/// absent, and a caller that reads ENOSYS falls back to a file-backed or
+/// anonymous shared mapping instead of retrying.
+fn smoke_abi_ipc_shm_without_backend_is_enosys() -> TestResult {
+    with_setup(|| {
+        // Create a real segment first — `shmat` resolves the segment before
+        // it consults the vtable, so without one it would stop at EINVAL and
+        // never reach the arm under test.
+        let shmid = match call(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)) {
+            Some(id) if id > 0 => id as u64,
+            _ => return Err("shmget create should succeed while the backend is installed"),
+        };
+
+        let saved = crate::handlers::__test_swap_shmem_vtable(None);
+        if saved.is_none() {
+            // Nothing to remove: the harness booted without the backend, so
+            // the arms under test are already the only ones reachable and
+            // the case cannot distinguish the fix from the bug.
+            return Err("no shmem vtable was installed, so this case proves nothing");
+        }
+        let get = call_raw(Syscall::Shmget.raw(), a2(0, 4096, IPC_CREAT)).value as i64;
+        let at = call_raw(Syscall::Shmat.raw(), a2(shmid, 0, 0)).value as i64;
+        let mut info = [0u64; 8];
+        let ctl = call_raw(
+            Syscall::Shmctl.raw(),
+            a2(shmid, IPC_INFO, info.as_mut_ptr() as u64),
+        )
+        .value as i64;
+        crate::handlers::__test_swap_shmem_vtable(saved);
+
+        // Each failure is named separately: 0 from `shmget` is a segment id,
+        // 0 from `shmat` is an attach address, and either one is handed
+        // straight into the caller's next operation.
+        if get == 0 {
+            return Err("shmget with no backend reported segment id 0");
+        }
+        if at == 0 {
+            return Err("shmat with no backend reported an attachment at address 0");
+        }
+        if ctl == 0 {
+            return Err("shmctl(IPC_INFO) with no backend reported a filled-in shminfo");
+        }
+        if get != ENOSYS || at != ENOSYS || ctl != ENOSYS {
+            return Err("SysV shm with no backend must report -ENOSYS");
+        }
+        if info != [0u64; 8] {
+            return Err("shmctl(IPC_INFO) wrote to the caller's buffer after failing");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ipc_shm_without_backend_is_enosys);

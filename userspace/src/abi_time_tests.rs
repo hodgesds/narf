@@ -316,13 +316,18 @@ kernel_test_in!("syscall_abi", smoke_abi_time_clock_getres_pos);
 
 fn smoke_abi_time_clock_getres_neg() -> TestResult {
     with_setup(|| {
-        // Unknown clockid → invalid_op (None).
-        // LINUX-GAP: Linux returns -EINVAL; NARF reports a non-Ok status.
+        // `SYSCALL_DEFINE2(clock_getres)`: `if (!kc) return -EINVAL;`.
+        //
+        // This case asserted `INVALID_OP` and carried a LINUX-GAP marker for
+        // the divergence. The gap was not cosmetic: `invalid_op()` leaves
+        // `value` — the register the Linux ABI returns — at 0, so userspace
+        // read success. `call_raw` is kept so the value register is in reach,
+        // since inspecting only the status is what hid this.
         let r = call_raw(Syscall::ClockGetres.raw(), a1(99, 0));
-        if r.status == SyscallReturn::INVALID_OP {
-            Ok(())
-        } else {
-            Err("clock_getres on an unknown clockid should report invalid_op")
+        match r.value as i64 {
+            v if v == EINVAL => Ok(()),
+            0 => Err("clock_getres on an unknown clockid reported success"),
+            _ => Err("clock_getres on an unknown clockid must return -EINVAL"),
         }
     })
 }
@@ -1739,3 +1744,130 @@ fn smoke_abi_time_ioprio_default() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_ioprio_default);
+
+// ── clock id validation: the fabricated-success class ──────────────────
+//
+// `clockid_to_kclock()` returning NULL is -EINVAL in both
+// `SYSCALL_DEFINE2(clock_gettime)` and `SYSCALL_DEFINE2(clock_getres)`.
+// NARF answered `invalid_op()`, which leaves `value` at 0 — success on the
+// Linux ABI — while skipping the write of the caller's timespec entirely.
+
+/// An unsupported clock must not report success over an untouched buffer.
+///
+/// The buffer is prefilled with a recognisable sentinel: the failure this
+/// pins is not "the errno is wrong" but "the caller was told to read a
+/// timespec that was never written", so the case has to prove the bytes did
+/// not change. CLOCK_TAI (11) is the realistic instance — a real clock that
+/// Linux serves and NARF does not — and 99 covers the plainly-unknown id.
+fn smoke_abi_time_gettime_unknown_clock_is_einval() -> TestResult {
+    const CLOCK_TAI: u64 = 11;
+    const SENTINEL: u64 = 0xDEAD_BEEF_F00D_1234;
+    with_setup(|| {
+        for id in [CLOCK_TAI, 99, CLOCK_TABLE_HOLE] {
+            let mut ts = [SENTINEL; 2];
+            let r = call_raw(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64));
+            match r.value as i64 {
+                v if v == EINVAL => {}
+                0 => return Err("clock_gettime on an unsupported clock reported success"),
+                _ => return Err("clock_gettime on an unsupported clock must be -EINVAL"),
+            }
+            if ts[0] != SENTINEL || ts[1] != SENTINEL {
+                return Err("clock_gettime wrote a timespec for a clock it rejected");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_gettime_unknown_clock_is_einval
+);
+
+/// Precedence: the clock id is validated before the timespec pointer.
+///
+/// Linux looks the clock up first (`clockid_to_kclock`) and only reaches its
+/// sole -EFAULT source (`put_timespec64`) afterwards, so a bad clock with a
+/// NULL pointer is -EINVAL. NARF checked the pointer first and answered
+/// -EFAULT, which sends a caller looking at its buffer instead of its clock.
+fn smoke_abi_time_gettime_bad_clock_beats_null_buf() -> TestResult {
+    with_setup(|| match call(Syscall::ClockGetTime.raw(), a1(99, 0)) {
+        Some(v) if v == EINVAL => Ok(()),
+        Some(v) if v == EFAULT => {
+            Err("clock_gettime blamed the NULL buffer for an unsupported clock")
+        }
+        _ => Err("clock_gettime(bad_clock, NULL) must return -EINVAL"),
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_gettime_bad_clock_beats_null_buf
+);
+
+/// The two syscalls must accept exactly the same set of clock ids.
+///
+/// They did not: `clock_getres` carried its own shorter list and rejected
+/// CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, CLOCK_REALTIME_COARSE
+/// and CLOCK_MONOTONIC_COARSE — all of which `clock_gettime` serves — by
+/// fabricating success and leaving the resolution unwritten. Both now go
+/// through `clock_id_supported`.
+///
+/// This walks the id space rather than listing the agreed ids, so the two
+/// cannot drift apart again without failing here: a clock added to one and
+/// not the other shows up as a disagreement whatever its number.
+fn smoke_abi_time_getres_matches_gettime_ids() -> TestResult {
+    with_setup(|| {
+        for id in 0u64..16 {
+            let mut ts = [0u64; 2];
+            let gettime =
+                call_raw(Syscall::ClockGetTime.raw(), a1(id, ts.as_mut_ptr() as u64)).value as i64;
+            let mut res = [0u64; 2];
+            let getres =
+                call_raw(Syscall::ClockGetres.raw(), a1(id, res.as_mut_ptr() as u64)).value as i64;
+            match (gettime, getres) {
+                (0, 0) => {
+                    // A clock both serve: getres must have written a
+                    // resolution, not merely returned 0.
+                    if res[0] != 0 || res[1] == 0 {
+                        return Err("clock_getres returned 0 without writing a resolution");
+                    }
+                }
+                (g, r) if g == EINVAL && r == EINVAL => {}
+                (0, _) => {
+                    return Err("clock_getres rejects a clock that clock_gettime serves");
+                }
+                (_, 0) => {
+                    return Err("clock_getres accepts a clock that clock_gettime rejects");
+                }
+                _ => return Err("clock_gettime and clock_getres disagree on a clock id"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_getres_matches_gettime_ids);
+
+/// Positive pin for the widened set: the four clocks `clock_getres` used to
+/// refuse now return 0 *and* fill the timespec with {0, 1}.
+fn smoke_abi_time_getres_serves_cpu_and_coarse_clocks() -> TestResult {
+    with_setup(|| {
+        for id in [
+            CLOCK_PROCESS_CPUTIME_ID,
+            CLOCK_THREAD_CPUTIME_ID,
+            CLOCK_REALTIME_COARSE,
+            CLOCK_MONOTONIC_COARSE,
+        ] {
+            let mut res = [0xFFu64; 2];
+            if call(Syscall::ClockGetres.raw(), a1(id, res.as_mut_ptr() as u64)) != Some(0) {
+                return Err("clock_getres must serve every clock clock_gettime serves");
+            }
+            if res != [0, 1] {
+                return Err("clock_getres did not write {0, 1} for a supported clock");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_getres_serves_cpu_and_coarse_clocks
+);

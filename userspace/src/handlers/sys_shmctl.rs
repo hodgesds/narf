@@ -158,7 +158,11 @@ pub(crate) fn sys_shmctl(ctx: &mut dyn TrapContext) {
     match cmd {
         IPC_INFO => {
             let Some(vtable) = shmem_vtable() else {
-                ctx.set_return(SyscallReturn::invalid_op());
+                // No shmem backend — as in `shmget`/`shmat`. `invalid_op()`
+                // here returned 0, which IPC_INFO's caller reads as "the
+                // struct shminfo you asked for is filled in", over a buffer
+                // nothing wrote.
+                ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
                 return;
             };
             let shmmax = (vtable.max_len)();

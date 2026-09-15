@@ -88,7 +88,16 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
     let v = match shmem_vtable() {
         Some(v) => v,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // No shmem backend wired into this kernel at all — SysV shared
+            // memory is absent, not merely unavailable for this request.
+            // -ENOSYS is the answer a caller can act on (fall back to a
+            // file-backed or anonymous shared mapping).
+            //
+            // This was `invalid_op()`, whose `value` is 0 — the register the
+            // Linux ABI returns — so `shmget` handed back segment id 0 as if
+            // it had allocated one, and the caller carried that id into
+            // `shmat`.
+            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
             return;
         }
     };
