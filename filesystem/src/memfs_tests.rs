@@ -1540,8 +1540,10 @@ fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
         Some(Ok(file)) => file,
         _ => return TestResult::Fail("tmpfs create failed"),
     };
-    // Plant known atime/mtime. `notify_change` stamps ctime as well, so
-    // ctime is "now" — far beyond these two small values.
+    // ctime from creation, to compare the explicit set against.
+    let created_ctime = file.inode_attrs().ctime_ns;
+    // Plant known atime/mtime. `notify_change` stamps ctime as well — with
+    // NOW, not with either planted value.
     if file.set_times(Some(SECOND), Some(2 * SECOND)).is_err() {
         return TestResult::Fail("set_times failed");
     }
@@ -1549,8 +1551,22 @@ fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
     if attrs.atime_ns != SECOND || narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
         return TestResult::Fail("set_times did not plant atime/mtime");
     }
-    if attrs.ctime_ns <= 2 * SECOND {
+    // Asserted RELATIVE to the inode's own creation stamp, never against an
+    // absolute instant. `ctime_ns > 2 * SECOND` reads as "ctime is a real
+    // wall-clock now", but it is only true once the wall clock has passed
+    // two seconds — which on a machine with no RTC depends on how far into
+    // the boot this case happens to run. It passed for several runs and
+    // then failed, having moved earlier in the schedule.
+    //
+    // Strict `>`: an unstamped ctime keeps exactly the creation value, so
+    // `>=` would hold whether or not `set_times` stamped anything. The
+    // clock is TSC-derived with nanosecond resolution and the two reads are
+    // separated by a lock, a store and several calls, so it always moves.
+    if attrs.ctime_ns <= created_ctime {
         return TestResult::Fail("an explicit utimensat did not stamp ctime");
+    }
+    if attrs.ctime_ns == SECOND || attrs.ctime_ns == 2 * SECOND {
+        return TestResult::Fail("an explicit utimensat stamped ctime with the PASSED time");
     }
     // chmod moves ctime and leaves mtime alone. Making a file executable
     // must not make `make` think it was rebuilt.
