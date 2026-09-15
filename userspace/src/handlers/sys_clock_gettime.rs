@@ -5,12 +5,6 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let id = args.arg0;
     let buf = args.arg1;
-    // Linux never checks timespec alignment (copy_to_user handles unaligned
-    // stores); only a NULL/faulting pointer is an error → EFAULT.
-    if buf == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
-        return;
-    }
     let (sec, nsec) = match id {
         CLOCK_REALTIME | CLOCK_REALTIME_COARSE => {
             let w = narf_scheduler::narf_time::now_wall();
@@ -31,11 +25,31 @@ pub(crate) fn sys_clock_gettime(ctx: &mut dyn TrapContext) {
                 .saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
             ((ns / 1_000_000_000) as i64, (ns % 1_000_000_000) as i64)
         }
+        // `SYSCALL_DEFINE2(clock_gettime)` looks the clock up first:
+        //
+        //   const struct k_clock *kc = clockid_to_kclock(which_clock);
+        //   if (!kc) return -EINVAL;
+        //
+        // This arm was `invalid_op()`, whose `value` is 0 and so reads as
+        // success on the Linux ABI — while the timespec below is never
+        // written. `clock_gettime(CLOCK_TAI, &ts)` therefore returned "fine"
+        // and left `ts` holding stack garbage, which the caller then used as
+        // a wall-clock reading. An error the caller can see is the whole
+        // point: on -EINVAL it falls back to a clock this kernel does have.
         _ => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
             return;
         }
     };
+    // The NULL/faulting-pointer check comes AFTER the clock lookup, which is
+    // Linux's order: `clockid_to_kclock` runs first and `put_timespec64` —
+    // the only source of -EFAULT — runs after. `clock_gettime(bad_clock,
+    // NULL)` is therefore -EINVAL, not -EFAULT. Linux never checks timespec
+    // alignment either (copy_to_user handles unaligned stores).
+    if buf == 0 {
+        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        return;
+    }
     // Write the timespec (two i64s: tv_sec, tv_nsec) under the SMAP bracket.
     let mut kbuf = [0u8; 16];
     kbuf[..8].copy_from_slice(&sec.to_ne_bytes());

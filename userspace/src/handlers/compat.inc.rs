@@ -3101,6 +3101,34 @@ const CLOCK_REALTIME_COARSE: u64 = 5;
 const CLOCK_MONOTONIC_COARSE: u64 = 6;
 const CLOCK_BOOTTIME: u64 = 7;
 
+/// The clock ids this kernel can actually answer — the single list behind
+/// both `clock_gettime` and `clock_getres`.
+///
+/// They used to carry separate lists, and the shorter one belonged to
+/// `clock_getres`: it refused `CLOCK_PROCESS_CPUTIME_ID`,
+/// `CLOCK_THREAD_CPUTIME_ID` and the two `_COARSE` clocks that
+/// `clock_gettime` serves. Refused, moreover, by returning the old
+/// `invalid_op()` — value 0, i.e. success on the Linux ABI — with the
+/// caller's `struct timespec` left untouched.
+///
+/// Ids outside this set (CLOCK_TAI, the ALARM clocks, and the negative
+/// dynamic-clock ids that address a PTP device) are -EINVAL, which is what
+/// `clockid_to_kclock` returning NULL produces in
+/// `kernel/time/posix-timers.c`.
+fn clock_id_supported(id: u64) -> bool {
+    matches!(
+        id,
+        CLOCK_REALTIME
+            | CLOCK_REALTIME_COARSE
+            | CLOCK_MONOTONIC
+            | CLOCK_MONOTONIC_RAW
+            | CLOCK_MONOTONIC_COARSE
+            | CLOCK_BOOTTIME
+            | CLOCK_PROCESS_CPUTIME_ID
+            | CLOCK_THREAD_CPUTIME_ID
+    )
+}
+
 // ── I/O Priority (ioprio_set / ioprio_get) ─────────────────────────
 //
 // Keyed PER TASK, as in Linux, where `ioprio` lives in `task_struct->
