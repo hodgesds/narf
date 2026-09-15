@@ -93,6 +93,8 @@ not making.
 | ACL writes | unchecked — any task that could name an inode could rewrite its ACL, and through `posix_acl_update_mode` its mode | `set_posix_acl`'s `inode_owner_or_capable`, EPERM |
 | Ordinary xattr writes/reads | unchecked | `xattr_permission`'s closing `inode_permission(inode, mask)`, EACCES, plus the sticky-directory `user.*` rule |
 | `mknod` umask | ignored | applied — `mode_strip_umask` defers umask stripping on a POSIX-ACL filesystem rather than skipping it, and `shmem_mknod` reaches `posix_acl_create` through `simple_acl_create` |
+| `MS_RDONLY` / `MS_NODEV` / `MS_NOEXEC` | accepted and dropped | translated into the mount's `MNT_*` set (`path_mount`), replaced wholesale by `MS_REMOUNT` (`do_reconfigure_mnt`), copied by a namespace clone, and enforced: `mnt_want_write` → EROFS on every write-shaped syscall, `may_open`'s device arm → EACCES on a `nodev` mount, `path_noexec` → EACCES from `do_open_execat` |
+| Per-mount options in `/proc/mounts` | a flat `rw` | the real flags, in the column `show_vfsmnt`/`show_mountinfo` put them in — separate from the filesystem's `show_options` text |
 
 Ramfs deliberately ignores unknown mount parameters, following
 `ramfs_parse_param`, and has no `show_options` (its `super_operations`
@@ -138,10 +140,11 @@ These are explicit implementation gaps, not claimed compatibility:
 2. Transparent huge pages, nontrivial NUMA policies, idmapped mounts,
    casefolding (`CONFIG_UNICODE`), and fscrypt are not implemented.
    Unsupported mount policies are rejected rather than accepted as no-ops.
-3. Generic VFS `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV` and `MS_NOEXEC`
-   enforcement remains mount-layer work, and `/proc/mounts` therefore
-   prints `rw` for the per-mount flags regardless of how the mount was
-   made. The filesystem-specific half of that line is now correct.
+3. `MS_NOSUID` is stored and reported but has nothing to suppress: NARF's
+   execve does not implement set-user-ID binaries, so there is no
+   privilege transition for it to block. `MS_REC` and `MS_RELATIME` are
+   accepted and dropped — there is no mount propagation to recurse over
+   and no per-inode atime policy to relax.
 4. `noswap` cannot be relaxed because no swap path exists. Remount
    validates accepted policy spellings but does not add a behavior NARF
    lacks.
