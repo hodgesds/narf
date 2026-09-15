@@ -67,7 +67,7 @@ pub(crate) fn sys_clone(ctx: &mut dyn TrapContext) {
         set_tid_size: 0,
         cgroup: 0,
     };
-    do_clone3(ctx, ca, true);
+    do_clone3(ctx, ca, true, &[]);
 }
 
 /// Linux `clone(2)` — same semantics as `clone3(2)` but the

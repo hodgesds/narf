@@ -1827,6 +1827,31 @@ impl FpuArea {
     }
 }
 
+/// Complete Linux's CLONE_CHILD_SETTID contract after the scheduler has made
+/// the child's address space active but before its first userspace instruction.
+/// Linux does this in schedule_tail() and deliberately ignores put_user faults.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn write_set_child_tid(task: &crate::task::Task, uaddr: u64) {
+    let tid = crate::handlers::linux_tid_for_task(task.tid) as u32;
+    let bytes = tid.to_ne_bytes();
+    // SAFETY: the caller has activated this task's address space. The guarded
+    // copy validates the range and converts an unmapped/write-protected target
+    // into an ignored EFAULT, matching Linux schedule_tail's best-effort write.
+    unsafe {
+        let _ = crate::handlers::copy_to_user(uaddr, &bytes);
+    }
+}
+
+/// Consume a prepared child-TID write exactly once. Keeping the take and write
+/// in one helper makes the Linux schedule_tail failure rule testable: an EFAULT
+/// is ignored and never causes the next poll to retry the user access.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn complete_set_child_tid(slot: &mut Option<u64>, task: &crate::task::Task) {
+    if let Some(uaddr) = slot.take() {
+        write_set_child_tid(task, uaddr);
+    }
+}
+
 /// Polling future that drives a user-mode process to completion via
 /// the scheduler's ready queue. Construct with [`UserTaskFuture::new`]
 /// and spawn via `narf_scheduler::spawn_user`.
@@ -1869,6 +1894,10 @@ pub struct UserTaskFuture {
     /// wl_xdg slab free-block canary corruption). The Box keeps the
     /// future a small struct; the FPU image lives on the heap.
     fpu: alloc::boxed::Box<FpuArea>,
+    /// One-shot CLONE_CHILD_SETTID target. Consumed only after the child's
+    /// address space is active, immediately before its first userspace entry,
+    /// matching Linux schedule_tail().
+    set_child_tid: Option<u64>,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1907,6 +1936,7 @@ impl UserTaskFuture {
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
             fpu: FpuArea::reset_boxed(),
+            set_child_tid: None,
         }
     }
 
@@ -1948,6 +1978,7 @@ impl UserTaskFuture {
             // syscall per the SysV ABI, so a canonical reset image (not
             // the parent's live FPU) is the correct seed.
             fpu: FpuArea::reset_boxed(),
+            set_child_tid: None,
         }
     }
 
@@ -1959,6 +1990,10 @@ impl UserTaskFuture {
     /// Inspect the current lifecycle stamp.
     pub fn task_state(&self) -> TaskState {
         self.state
+    }
+
+    fn set_child_tid(&mut self, uaddr: u64) {
+        self.set_child_tid = Some(uaddr);
     }
 }
 
@@ -2564,6 +2599,10 @@ impl core::future::Future for UserTaskFuture {
             narf_scheduler::stackful::set_current_user_cr3(cr3);
         }
 
+        // Linux schedule_tail performs this only after switching to the new
+        // task's mm. Taking the slot makes a fault one-shot as well: put_user
+        // failure does not make clone fail and is not retried.
+        complete_set_child_tid(&mut this.set_child_tid, &this.task);
         // Program the per-task TLS thread pointer. Done after CR3
         // is in place — `IA32_FS_BASE` doesn't depend on the
         // page-table root, but pairing the writes here keeps the
@@ -2870,6 +2909,9 @@ pub struct UserTaskFuture {
     /// the scheduler remains stable across task migration and adapter moves.
     fp: alloc::boxed::Box<narf_scheduler::UserFpState>,
     state: TaskState,
+    /// One-shot CLONE_CHILD_SETTID target, consumed after TTBR0 switches to
+    /// the child and before its first EL0 instruction.
+    set_child_tid: Option<u64>,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2901,6 +2943,7 @@ impl UserTaskFuture {
             jmp: UnsafeCell::new(JmpBuf::default()),
             fp: alloc::boxed::Box::new(narf_scheduler::UserFpState::zeroed()),
             state: TaskState::Initial,
+            set_child_tid: None,
         }
     }
 
@@ -2933,6 +2976,7 @@ impl UserTaskFuture {
             jmp: UnsafeCell::new(JmpBuf::default()),
             fp,
             state: TaskState::Running,
+            set_child_tid: None,
         }
     }
 
@@ -2942,6 +2986,10 @@ impl UserTaskFuture {
 
     pub fn task_state(&self) -> TaskState {
         self.state
+    }
+
+    fn set_child_tid(&mut self, uaddr: u64) {
+        self.set_child_tid = Some(uaddr);
     }
 }
 
@@ -3129,6 +3177,10 @@ impl core::future::Future for UserTaskFuture {
         install_current(&this.task.uctx as *const UserTaskCtx as *mut UserTaskCtx);
         publish_current_task(&this.task);
         jmp_slot().store(this.jmp.get(), Ordering::Release);
+
+        // Linux schedule_tail performs this only after switching to the new
+        // task's mm. Faults are ignored and the slot is never retried.
+        complete_set_child_tid(&mut this.set_child_tid, &this.task);
 
         // Program an explicit per-task TPIDR_EL0 after activating the task AS.
         // Fresh images start at zero until their runtime writes TPIDR_EL0;
@@ -3367,6 +3419,12 @@ impl PendingUserProcess {
     /// [`Self::spawn`] publishes the task to the scheduler.
     pub const fn task_id(&self) -> narf_scheduler::TaskId {
         self.id
+    }
+
+    /// Arm the one-shot CLONE_CHILD_SETTID write before publishing this task.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    pub(crate) fn set_child_tid(&mut self, uaddr: u64) {
+        self.future.set_child_tid(uaddr);
     }
 
     /// Publish this fully initialized task to the scheduler.

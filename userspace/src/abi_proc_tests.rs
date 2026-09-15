@@ -1123,6 +1123,107 @@ fn smoke_abi_proc_wait4_wnohang_no_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_wait4_wnohang_no_child);
 
+fn smoke_abi_proc_wait_rejects_invalid_options() -> TestResult {
+    with_setup(|| {
+        // Linux kernel_wait4 rejects bits outside its six supported options
+        // before walking the child list.
+        if call(Syscall::Wait4.raw(), a3((-1i64) as u64, 0, 0x10, 0)) != Some(EINVAL) {
+            return Err("wait4 accepted an unknown option bit");
+        }
+
+        // Linux waitid additionally requires at least one requested event
+        // class (WEXITED, WSTOPPED, or WCONTINUED).
+        if call(Syscall::Waitid.raw(), a3(0, 0, 0, 1)) != Some(EINVAL) {
+            return Err("waitid without an event class did not return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_wait_rejects_invalid_options);
+
+fn smoke_abi_proc_wait_clone_child_classes() -> TestResult {
+    fn peek_pid(options: u64) -> Result<u64, &'static str> {
+        let mut si = [0u8; 128];
+        match call(
+            Syscall::Waitid.raw(),
+            a3(0, 0, si.as_mut_ptr() as u64, options),
+        ) {
+            Some(0) => Ok(u32::from_ne_bytes([si[16], si[17], si[18], si[19]]) as u64),
+            _ => Err("waitid clone-class peek failed"),
+        }
+    }
+
+    with_setup(|| {
+        const CLONE_CHILD: u64 = 0x6a01;
+        const FORK_CHILD: u64 = 0x6a02;
+        const WNOHANG: u64 = 1;
+        const WEXITED: u64 = 4;
+        const WNOWAIT: u64 = 0x0100_0000;
+        const __WALL: u64 = 0x4000_0000;
+        const __WCLONE: u64 = 0x8000_0000;
+        let base = WNOHANG | WEXITED | WNOWAIT;
+
+        // Queue the clone child first so an implementation that ignores
+        // eligible_child will visibly choose the wrong record.
+        crate::handlers::__test_stage_pending_exit_with_signal(FAKE_TASK, CLONE_CHILD, 0, 0);
+        crate::handlers::__test_stage_pending_exit_with_signal(FAKE_TASK, FORK_CHILD, 0, 17);
+
+        let result = (|| {
+            if peek_pid(base)? != FORK_CHILD {
+                return Err("ordinary wait selected a non-SIGCHLD clone child");
+            }
+            if peek_pid(base | __WCLONE)? != CLONE_CHILD {
+                return Err("__WCLONE did not select the clone child");
+            }
+            if peek_pid(base | __WALL)? != CLONE_CHILD {
+                return Err("__WALL did not select both child classes");
+            }
+            Ok(())
+        })();
+        crate::handlers::__test_clear_pending_exits(FAKE_TASK);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_wait_clone_child_classes);
+fn smoke_abi_proc_wait_thread_group_and_wnothread() -> TestResult {
+    with_setup(|| {
+        const SIBLING: u64 = 0x6a10;
+        const SIBLING_CHILD: u64 = 0x6a11;
+        const BASE: u64 = 1 | 4 | 0x0100_0000; // WNOHANG|WEXITED|WNOWAIT
+        const __WNOTHREAD: u64 = 0x2000_0000;
+
+        crate::handlers::register_task_to_pid(SIBLING, FAKE_TASK);
+        crate::handlers::thread_group_live_inc(FAKE_TASK);
+        crate::handlers::__test_stage_pending_exit_with_signal(SIBLING, SIBLING_CHILD, 0, 17);
+
+        let mut si = [0u8; 128];
+        let private = call(
+            Syscall::Waitid.raw(),
+            a3(0, 0, si.as_mut_ptr() as u64, BASE | __WNOTHREAD),
+        );
+        if private != Some(ECHILD) {
+            crate::handlers::__test_thread_group_live_reset();
+            return Err("__WNOTHREAD saw a sibling thread's child");
+        }
+
+        let shared = call(
+            Syscall::Waitid.raw(),
+            a3(0, 0, si.as_mut_ptr() as u64, BASE),
+        );
+        let reported = u32::from_ne_bytes([si[16], si[17], si[18], si[19]]) as u64;
+        crate::handlers::__test_clear_pending_exits(SIBLING);
+        crate::handlers::__test_thread_group_live_reset();
+        if shared != Some(0) || reported != SIBLING_CHILD {
+            return Err("default wait did not see a sibling thread's child");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_wait_thread_group_and_wnothread
+);
+
 // The blocking (non-WNOHANG, no-child) wait4 path is only exercised via the
 // polling future, so the immediate-return WNOHANG path above is the
 // reachable surface here. Both now return -ECHILD, matching Linux.
@@ -1140,9 +1241,10 @@ fn smoke_abi_proc_waitid_wnohang_no_child() -> TestResult {
         const P_ALL: u64 = 0;
         const WNOHANG: u64 = 1;
         let mut si = [0u8; 128];
+        const WEXITED: u64 = 4;
         match call(
             Syscall::Waitid.raw(),
-            a3(P_ALL, 0, si.as_mut_ptr() as u64, WNOHANG),
+            a3(P_ALL, 0, si.as_mut_ptr() as u64, WNOHANG | WEXITED),
         ) {
             Some(v) if v == ECHILD => Ok(()),
             _ => Err("waitid WNOHANG with no child must return -ECHILD"),
@@ -1155,7 +1257,7 @@ fn smoke_abi_proc_waitid_neg() -> TestResult {
     with_setup(|| {
         // An unrecognised idtype → EINVAL. idtype 3 is P_PIDFD (a *valid*
         // idtype since Linux 5.4), so 4 is the first genuinely-unknown value.
-        match call(Syscall::Waitid.raw(), a3(4, 0, 0, 0)) {
+        match call(Syscall::Waitid.raw(), a3(4, 0, 0, 4)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("waitid with a bad idtype did not return -EINVAL"),
         }
@@ -1169,7 +1271,7 @@ fn smoke_abi_proc_waitid_pidfd_badfd() -> TestResult {
         // that names no open fd → EBADF (not EINVAL). glibc's
         // __clone_pidfd_supported() probes exactly this and requires EBADF
         // to enable pidfd_spawn (systemd 258's only service-exec path).
-        match call(Syscall::Waitid.raw(), a3(3, 0x7fff_ffff, 0, 0)) {
+        match call(Syscall::Waitid.raw(), a3(3, 0x7fff_ffff, 0, 5)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("waitid(P_PIDFD, bad fd) did not return -EBADF"),
         }
@@ -1489,6 +1591,64 @@ fn smoke_abi_proc_legacy_clone_pidfd_pointer() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_legacy_clone_pidfd_pointer);
 
+fn smoke_abi_proc_clone_parent_linux_semantics() -> TestResult {
+    with_setup(|| {
+        const CLONE_PARENT: u64 = 0x0000_8000;
+        const GRANDPARENT: u64 = 0x6b00;
+        const FORK_CHILD: u64 = 0x6b01;
+        const SIGUSR1: u8 = 10;
+        const SIGCHLD: u8 = 17;
+
+        // fork() publishes the ordinary Linux child class.
+        crate::handlers::__test_parent_of_set(FORK_CHILD, FAKE_TASK);
+        if crate::handlers::__test_parent_link(FORK_CHILD) != Some((FAKE_TASK, SIGCHLD)) {
+            return Err("fork child link did not default to SIGCHLD");
+        }
+
+        // CLONE_PARENT reuses current->real_parent and copies the caller's
+        // group-leader exit_signal; the new clone3 exit_signal is not used.
+        crate::handlers::__test_parent_of_set_with_signal(FAKE_TASK, GRANDPARENT, SIGUSR1);
+        if crate::handlers::__test_clone_parent_link(FAKE_TASK, CLONE_PARENT, 0)
+            != Ok((GRANDPARENT, SIGUSR1))
+        {
+            return Err("CLONE_PARENT did not inherit parent and exit signal");
+        }
+        if crate::handlers::__test_clone_parent_link(FAKE_TASK, 0, SIGCHLD)
+            != Ok((FAKE_TASK, SIGCHLD))
+        {
+            return Err("ordinary clone did not retain its requested exit signal");
+        }
+
+        // clone3 forbids a non-zero exit_signal with CLONE_PARENT.
+        let mut clone3 = [0u8; 64];
+        clone3[..8].copy_from_slice(&CLONE_PARENT.to_ne_bytes());
+        clone3[32..40].copy_from_slice(&(SIGCHLD as u64).to_ne_bytes());
+        if call(
+            Syscall::Clone3.raw(),
+            a1(clone3.as_ptr() as u64, clone3.len() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("clone3(CLONE_PARENT, exit_signal) did not return -EINVAL");
+        }
+
+        // Legacy clone does not have clone3's restriction. Linux accepts the
+        // low-byte signal and CLONE_PARENT then inherits the caller's signal.
+        // The ABI harness has no address space, so acceptance reaches ENOMEM.
+        if call(Syscall::Clone.raw(), a0(CLONE_PARENT | SIGCHLD as u64)) != Some(ENOMEM) {
+            return Err("legacy clone incorrectly rejected CLONE_PARENT plus CSIGNAL");
+        }
+
+        // Linux rejects CLONE_PARENT from a namespace init, which has no
+        // reusable real parent.
+        crate::handlers::__test_wait_reset();
+        if crate::handlers::__test_clone_parent_link(FAKE_TASK, CLONE_PARENT, 0) != Err(22) {
+            return Err("parentless CLONE_PARENT did not return EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_clone_parent_linux_semantics);
+
 // ── clone3(2) — struct validation + no live address space ──
 
 fn smoke_abi_proc_clone3_badarg() -> TestResult {
@@ -1596,8 +1756,8 @@ fn smoke_abi_proc_clone3_errno_matrix() -> TestResult {
         }
 
         // Linux copies the set_tid pid_t array before capability checks:
-        // a bad array is EFAULT, while a readable request is denied by NARF's
-        // explicit checkpoint/restore capability policy with EPERM.
+        // a bad array is EFAULT, while a readable request without either
+        // checkpoint/restore capability is EPERM.
         let mut set_tid_args = [0u8; 80];
         set_tid_args[64..72].copy_from_slice(&u64::MAX.to_ne_bytes());
         set_tid_args[72..80].copy_from_slice(&1u64.to_ne_bytes());
@@ -1611,11 +1771,14 @@ fn smoke_abi_proc_clone3_errno_matrix() -> TestResult {
         let requested_pid = 123i32;
         set_tid_args[64..72]
             .copy_from_slice(&(core::ptr::addr_of!(requested_pid) as u64).to_ne_bytes());
-        if call(
+        install_test_address_space()?;
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        let set_tid_result = call(
             Syscall::Clone3.raw(),
             a1(set_tid_args.as_ptr() as u64, set_tid_args.len() as u64),
-        ) != Some(-1)
-        {
+        );
+        crate::handlers::__test_set_caps(FAKE_TASK, !0, !0);
+        if set_tid_result != Some(-1) {
             return Err("clone3 set_tid request must return -EPERM");
         }
 

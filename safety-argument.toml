@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "e49174a1ef054b05bd171157e7721b6efcd31f4240e1dd9c8702fdec67228020"
+prompt_hash = "dedcf75a9d3e95cb4588f2e0d70b5a2a44f39a42e888346d68dfc31f323cf606"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -923,3 +923,11 @@ argument = "Generic MAP_SHARED fallback pages remain owned by the shared-file ca
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Unlocked, non-prefaulted generic MAP_SHARED VMAs publish FILE_DEMAND with empty Region and writeback prefixes under the existing VMA, shared-mapping, and owner transactions, so neither per-page metadata nor physical authority exists before a fault; omitted tail entries are defined as absent. The page-scoped memory ticket excludes duplicate publication for one virtual page and fallibly reserves the authoritative Region prefix before filesystem I/O runs without address-space locks. The fault hook obtains one pending canonical-cache hold, takes one explicit mapping reference, then revalidates the live owner row and fallibly grows and records its exact writeback slot before returning; a removed or relocated owner releases that reference and fails closed. Memory publishes the retained frame, leaf, reverse map, and reserved Region slot in one region-lock transaction, or balances the reference after cancellation or installation failure. Shared alias, split, growth, and relocation preserve only the selected materialized prefix and the implicit absent tail. Eager MAP_LOCKED and blocking MAP_POPULATE paths retain their prior admission, backing, and rollback behavior. Thus demand publication does not grant an unowned frame, outlive its file owner, or widen mapping permissions, domain rights, or capability authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The scheduler edit remains inside the existing executor TCB and changes only the read-mostly consumption of established per-CPU syscall-exit yield hints. It adds no trusted subsystem, authority, capability, mapping, domain transition, or task-selection path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A published true hint is still consumed by the original Acquire/Release exchange and remains one-shot. A false Acquire load performs no write; a producer racing that load leaves true sticky for a later syscall exit, just as a producer racing immediately after the former exchange did. The optimization therefore cannot erase a yield request, and context switching, affinity validation, saved-domain restoration, and task security state are unchanged."

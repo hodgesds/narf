@@ -63,7 +63,10 @@ fn smoke_userspace_clone_shares_address_space() -> TestResult {
     if ret.value == 0 {
         return TestResult::Fail("clone returned tid=0");
     }
-    let child_tid = narf_scheduler::TaskId(ret.value);
+    let Some(child_task) = crate::handlers::linux_tid_to_task_raw(ret.value) else {
+        return TestResult::Fail("child Linux tid has no scheduler task mapping");
+    };
+    let child_tid = narf_scheduler::TaskId(child_task);
     let child_as = match narf_scheduler::address_space_of(child_tid) {
         Some(a) => a,
         None => return TestResult::Fail("child has no AS attached"),
@@ -1572,8 +1575,10 @@ fn smoke_userspace_clone_distinct_tids_same_as() -> TestResult {
         *PARENT_AS.lock() = None;
         return TestResult::Fail("two clones returned the same tid");
     }
-    let a1 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t1));
-    let a2 = narf_scheduler::address_space_of(narf_scheduler::TaskId(t2));
+    let a1 = crate::handlers::linux_tid_to_task_raw(t1)
+        .and_then(|task| narf_scheduler::address_space_of(narf_scheduler::TaskId(task)));
+    let a2 = crate::handlers::linux_tid_to_task_raw(t2)
+        .and_then(|task| narf_scheduler::address_space_of(narf_scheduler::TaskId(task)));
     let pass = match (a1, a2) {
         (Some(a), Some(b)) => Arc::ptr_eq(&a, &parent_as) && Arc::ptr_eq(&b, &parent_as),
         _ => false,

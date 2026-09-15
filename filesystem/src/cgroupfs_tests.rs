@@ -3119,3 +3119,62 @@ kernel_test_in!(
     "filesystem/cgroupfs",
     smoke_cgroup_events_emits_inotify_modify
 );
+
+fn smoke_clone_thread_cgroup_domain_rules() -> TestResult {
+    let root = root_dir();
+    let threaded_name = "t_clone_threaded";
+    let domain_name = "t_clone_domain";
+    let _ = poll_once(root.rmdir(threaded_name));
+    let _ = poll_once(root.rmdir(domain_name));
+    let threaded = match poll_once(root.mkdir(threaded_name)) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir threaded clone target failed"),
+    };
+    let domain = match poll_once(root.mkdir(domain_name)) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir cross-domain clone target failed"),
+    };
+    if write_attr(&threaded, "cgroup.type", b"threaded").is_err() {
+        return TestResult::Fail("could not create threaded clone target");
+    }
+
+    const TGID: u64 = 920_000;
+    const FIRST_TID: u64 = 920_001;
+    const SECOND_TID: u64 = 920_002;
+    let same_domain =
+        crate::cgroupfs::attach_thread_by_path("/t_clone_threaded", TGID, TGID, FIRST_TID);
+    if same_domain.is_err() {
+        return TestResult::Fail("CLONE_THREAD placement within one threaded domain failed");
+    }
+    crate::cgroupfs::fork_thread_inherit(FIRST_TID, TGID, SECOND_TID);
+    let threads = read_attr(&threaded, "cgroup.threads").unwrap_or_default();
+    if !threads.lines().any(|line| line == FIRST_TID.to_string())
+        || !threads.lines().any(|line| line == SECOND_TID.to_string())
+    {
+        return TestResult::Fail("thread cgroup did not retain clone TIDs");
+    }
+
+    if !matches!(
+        crate::cgroupfs::attach_thread_by_path("/t_clone_domain", TGID, TGID, 920_003,),
+        Err(crate::FsError::Unsupported)
+    ) {
+        return TestResult::Fail("cross-domain CLONE_THREAD placement was not EOPNOTSUPP");
+    }
+
+    crate::cgroupfs::thread_exited(FIRST_TID);
+    crate::cgroupfs::thread_exited(SECOND_TID);
+    if !read_attr(&threaded, "cgroup.threads")
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return TestResult::Fail("thread exit leaked cgroup.threads membership");
+    }
+    let _ = domain;
+    let _ = poll_once(root.rmdir(threaded_name));
+    let _ = poll_once(root.rmdir(domain_name));
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/cgroupfs",
+    smoke_clone_thread_cgroup_domain_rules
+);

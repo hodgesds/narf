@@ -8,6 +8,12 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     let options = args.arg2 as u32;
     let rusage_ptr = args.arg3; // filled with the reaped child's CPU time
     const WNOHANG: u32 = 1;
+    const VALID_WAIT_OPTIONS: u32 =
+        WNOHANG | WUNTRACED | WCONTINUED | __WNOTHREAD | __WCLONE | __WALL;
+    if options & !VALID_WAIT_OPTIONS != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
 
     let parent = current_task_id();
 
@@ -57,13 +63,8 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // parent's queue. Matching is by specific pid, process group, or any child
     // per `wait_child_matches`.
     let try_reap = |parent: u64, want: i64, want_pgid: u64| -> Option<(u64, i32)> {
-        let mut g = PENDING_EXITS.lock();
-        let m = g.as_mut()?;
-        let q = m.get_mut(&parent)?;
-        let idx = q
-            .iter()
-            .position(|&(p, _)| wait_child_matches(p, want, want_pgid))?;
-        Some(q.remove(idx))
+        let entry = reap_pending_exit(parent, want, want_pgid, options, false)?;
+        Some((entry.child_pid, entry.status))
     };
 
     // Job-control stop/continue FIRST (WUNTRACED/WCONTINUED). A state
@@ -119,7 +120,7 @@ pub(crate) fn sys_wait4(ctx: &mut dyn TrapContext) {
     // semantics. Without this, a parent that has already reaped its last child
     // blocks forever (observed: stress-ng's parent `wait4(-1)` hanging after
     // its only worker exited, so the whole run never completes).
-    if !has_living_child(parent, want_pid, want_pgid) {
+    if !has_living_child(parent, want_pid, want_pgid, options) {
         const ECHILD: i64 = 10;
         ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
         return;

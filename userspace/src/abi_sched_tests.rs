@@ -300,6 +300,19 @@ fn smoke_abi_sched_prlimit64_error_order_and_missing_pid() -> TestResult {
         if call(Syscall::Prlimit64.raw(), a3(MISSING_PID, 7, 0, 0)) != Some(ESRCH) {
             return Err("prlimit64 of a nonexistent PID should return -ESRCH");
         }
+        if call(Syscall::Prlimit64.raw(), a3((-1i64) as u64, 7, 0, 0)) != Some(ESRCH) {
+            return Err("prlimit64 of a negative pid_t should return -ESRCH");
+        }
+
+        // SYSCALL_DEFINE4's generated wrapper narrows pid to pid_t and
+        // resource to unsigned int. High register bits therefore cannot turn
+        // self/resource-7 into a missing PID or invalid resource.
+        let raw_self = 1u64 << 32;
+        let raw_resource_7 = (1u64 << 32) | 7;
+        if call(Syscall::Prlimit64.raw(), a3(raw_self, raw_resource_7, 0, 0)) != Some(0) {
+            return Err("prlimit64 did not apply Linux 32-bit argument narrowing");
+        }
+
         Ok(())
     })
 }
@@ -1169,6 +1182,34 @@ fn smoke_abi_sched_ioprio_scopes_share_one_per_task_value() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_ioprio_scopes_share_one_per_task_value
+);
+
+fn smoke_abi_sched_clone_io_shares_context_fork_copies() -> TestResult {
+    with_setup(|| {
+        const PARENT: u64 = 0xC1_10;
+        const SHARED: u64 = 0xC1_11;
+        const COPIED: u64 = 0xC1_12;
+        const INITIAL: u32 = (2 << 13) | 3;
+        const UPDATED: u32 = (3 << 13) | 7;
+
+        crate::handlers::ioprio_init();
+        crate::handlers::__test_ioprio_set_task(PARENT, INITIAL);
+        crate::handlers::__test_ioprio_fork(PARENT, SHARED, true);
+        crate::handlers::__test_ioprio_fork(PARENT, COPIED, false);
+        crate::handlers::__test_ioprio_set_task(SHARED, UPDATED);
+
+        if crate::handlers::__test_ioprio_of_task(PARENT) != UPDATED {
+            return Err("CLONE_IO child did not share the parent's io_context");
+        }
+        if crate::handlers::__test_ioprio_of_task(COPIED) != INITIAL {
+            return Err("ordinary fork did not retain an independent io_context copy");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_clone_io_shares_context_fork_copies
 );
 
 fn smoke_abi_sched_ioprio_set_rejects_a_bad_class() -> TestResult {

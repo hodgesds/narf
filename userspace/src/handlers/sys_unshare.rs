@@ -176,7 +176,10 @@ pub(crate) fn sys_unshare(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     if flags & CLONE_NEWPID != 0 {
         let task = current_task_id();
-        let _ns = crate::pid_ns::unshare_pid_ns_for_children(task);
+        if let Err(errno) = crate::pid_ns::unshare_pid_ns_for_children(task) {
+            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            return;
+        }
         any = true;
     }
 

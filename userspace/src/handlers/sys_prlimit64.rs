@@ -3,8 +3,8 @@ use super::*;
 
 pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
-    let pid = args.arg0;
-    let resource = args.arg1 as usize;
+    let pid = args.arg0 as i32;
+    let resource = args.arg1 as u32 as usize;
     let new_ptr = args.arg2;
     let old_ptr = args.arg3;
     // Linux copies the proposed value before PID lookup, permission checks, or
@@ -28,22 +28,40 @@ pub(crate) fn sys_prlimit64(ctx: &mut dyn TrapContext) {
     };
 
     let caller = current_task_id();
-    let Some(task) = prlimit_target_task(caller, pid) else {
-        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
-        return;
-    };
-    if !prlimit_permission(caller, task.tid) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
-        return;
-    }
-
-    // Snapshot/validate/publish under one process-row transaction. The prior
-    // value is what Linux copies out even when a new value is installed.
-    let prior = match update_rlimit_atomic(task.tid, task.owner.as_ref(), resource, new_value) {
-        Ok(prior) => prior,
-        Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+    // Linux's read-only pid=0 path selects `current` directly and snapshots
+    // `current->signal->rlim[resource]`. Use NARF's sparse read path too:
+    // when every process has default limits this avoids task-registry lookup,
+    // task↔pid translation, and the global update transaction.
+    let prior = if pid == 0 && new_value.is_none() {
+        match read_rlimit(caller, resource) {
+            Some(prior) => prior,
+            None => {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                return;
+            }
+        }
+    } else {
+        // The generated Linux syscall wrapper casts the raw register to
+        // signed 32-bit pid_t before find_task_by_vpid.
+        let Some(task) = (pid >= 0)
+            .then(|| prlimit_target_task(caller, pid as u64))
+            .flatten() else {
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
             return;
+        };
+        if !prlimit_permission(caller, task.tid) {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            return;
+        }
+
+        // Snapshot/validate/publish under one process-row transaction. The
+        // prior value is what Linux copies out even when a new value is installed.
+        match update_rlimit_atomic(task.tid, task.owner.as_ref(), resource, new_value) {
+            Ok(prior) => prior,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
+            }
         }
     };
     if old_ptr != 0 {

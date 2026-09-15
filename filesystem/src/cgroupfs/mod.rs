@@ -336,7 +336,7 @@ impl Cgroup {
 
     /// `true` if this cgroup or any descendant has a member process.
     fn populated(&self) -> bool {
-        if !self.members.lock().is_empty() {
+        if !self.members.lock().is_empty() || !self.threads.lock().is_empty() {
             return true;
         }
         self.children.lock().values().any(|c| c.populated())
@@ -455,6 +455,11 @@ static CGROUP_ROOT: OnceLock<Arc<Cgroup>> = OnceLock::new();
 
 /// pid → its cgroup. Absent ⇒ implicitly the root cgroup.
 static TASK_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
+    IrqSafeSpinLock::new(BTreeMap::new());
+
+/// Linux TID -> cgroup override for members of a threaded subtree. Absent
+/// means the thread uses its process's `TASK_CGROUP` membership.
+static THREAD_CGROUP: IrqSafeSpinLock<BTreeMap<u64, Arc<Cgroup>>> =
     IrqSafeSpinLock::new(BTreeMap::new());
 
 /// Mutate the reverse index without recursively charging allocations made by
@@ -708,6 +713,87 @@ pub fn fork_inherit(parent_pid: u64, child_pid: u64) {
     place_forced(child_pid, &dst);
 }
 
+fn threaded_domain(cg: &Arc<Cgroup>) -> Arc<Cgroup> {
+    let mut current = cg.clone();
+    loop {
+        let kind = *current.cg_type.lock();
+        if !matches!(kind, CgroupType::Threaded | CgroupType::DomainInvalid) {
+            return current;
+        }
+        let Some(parent) = current.parent.clone() else {
+            return current;
+        };
+        current = parent;
+    }
+}
+
+fn thread_cgroup_of(tid: u64, tgid: u64) -> Arc<Cgroup> {
+    THREAD_CGROUP
+        .lock()
+        .get(&tid)
+        .cloned()
+        .unwrap_or_else(|| cgroup_of(tgid))
+}
+
+fn place_thread(tid: u64, dst: &Arc<Cgroup>) -> Result<(), FsError> {
+    let kind = *dst.cg_type.lock();
+    if kind == CgroupType::DomainInvalid {
+        return Err(FsError::Unsupported);
+    }
+    if kind == CgroupType::Domain && !dst.is_root() && !dst.enabled.lock().is_empty() {
+        return Err(FsError::Busy);
+    }
+    let previous = THREAD_CGROUP.lock().get(&tid).cloned();
+    if previous.as_ref().is_some_and(|old| Arc::ptr_eq(old, dst)) {
+        return Ok(());
+    }
+    if let Some(old) = &previous {
+        detach_chain(old, tid);
+    }
+    if let Err(error) = attach_chain(dst, tid) {
+        if let Some(old) = &previous {
+            let _ = attach_chain(old, tid);
+        }
+        return Err(error);
+    }
+    if let Some(old) = &previous {
+        old.threads.lock().remove(&tid);
+        old.notify_events();
+    }
+    dst.threads.lock().insert(tid);
+    THREAD_CGROUP.lock().insert(tid, dst.clone());
+    dst.notify_events();
+    Ok(())
+}
+
+/// Ordinary CLONE_THREAD inheritance: the new Linux TID starts in the
+/// creating thread's css_set, which may be a threaded-subtree override.
+pub fn fork_thread_inherit(parent_tid: u64, parent_tgid: u64, child_tid: u64) {
+    let dst = thread_cgroup_of(parent_tid, parent_tgid);
+    let _ = place_thread(child_tid, &dst);
+}
+
+/// `clone3(CLONE_INTO_CGROUP|CLONE_THREAD)` placement. Linux permits a
+/// single-thread move only within one threaded domain; crossing domain roots
+/// is `EOPNOTSUPP` (`cgroup_attach_permissions(..., threadgroup=false)`).
+pub fn attach_thread_by_path(
+    path: &str,
+    parent_tid: u64,
+    parent_tgid: u64,
+    child_tid: u64,
+) -> Result<(), FsError> {
+    let src = thread_cgroup_of(parent_tid, parent_tgid);
+    let mut dst = root();
+    for component in path.split('/').filter(|part| !part.is_empty()) {
+        let next = dst.children.lock().get(component).cloned();
+        dst = next.ok_or(FsError::NotFound)?;
+    }
+    if !Arc::ptr_eq(&threaded_domain(&src), &threaded_domain(&dst)) {
+        return Err(FsError::Unsupported);
+    }
+    place_thread(child_tid, &dst)
+}
+
 /// `CLONE_INTO_CGROUP` (clone3): place the freshly-cloned `pid` into the
 /// cgroup at `path` (cgroupfs-relative, e.g. `/system.slice/foo.service`;
 /// `""` or `"/"` = the root cgroup). Controller vetoes are honoured
@@ -724,6 +810,17 @@ pub fn attach_by_path(path: &str, pid: u64) -> Result<(), FsError> {
         }
     }
     place(pid, &cur)
+}
+
+/// A non-leader thread exited: drop its threaded-subtree override and
+/// controller charges. Process membership remains owned by `task_exited`.
+pub fn thread_exited(tid: u64) {
+    let previous = THREAD_CGROUP.lock().remove(&tid);
+    if let Some(cgroup) = previous {
+        detach_chain(&cgroup, tid);
+        cgroup.threads.lock().remove(&tid);
+        cgroup.notify_events();
+    }
 }
 
 /// A process exited: drop its membership and uncharge controllers.

@@ -131,7 +131,28 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     };
 
     let parent_pid = current_task_id();
-    let child_pid = crate::alloc_pid();
+    #[cfg(feature = "container")]
+    let pid_plan = match crate::pid_ns::prepare_clone(parent_pid, &[], false, None) {
+        Ok(plan) => plan,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            return;
+        }
+    };
+    #[cfg(feature = "container")]
+    let child_pid = crate::ProcessId(pid_plan.outer());
+    #[cfg(feature = "container")]
+    let child_ns_pid = pid_plan.parent_visible();
+
+    #[cfg(not(feature = "container"))]
+    let child_pid = {
+        let pid = crate::alloc_pid();
+        if pid.raw() == 0 {
+            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            return;
+        }
+        pid
+    };
     // Parent-of bookkeeping MUST be published BEFORE the child is spawned:
     // `spawn_user_process*` makes the child immediately runnable, and under SMP
     // it can begin executing on ANOTHER CPU before this handler finishes. A
@@ -224,11 +245,15 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    #[cfg(feature = "container")]
+    pid_plan.install(child_tid.raw());
     // Record the explicit ProcessId ↔ TaskId binding.  Must happen
     // before any code that crosses the ID-space boundary.
     register_pid_task_mapping(child_pid.raw(), child_tid.raw());
     rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
+    // fork(2) copies (never shares) a pre-existing io_context.
+    ioprio_fork(parent_pid, child_tid.raw(), false);
     // POSIX inheritance — fd / cwd / brk / sigaction handlers are
     // copied; pending signals reset (handled by sigaction_fork
     // not touching the pending bitmap).
@@ -248,19 +273,6 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     pgid_fork(parent_pid, child_tid.raw());
     sid_fork(parent_pid, child_tid.raw());
     ctty_fork(parent_pid, child_tid.raw());
-    // Wave-67 — propagate the parent's PID + mount namespaces into
-    // the child. Tasks in the root namespace skip the rebind (no
-    // translation needed) but inherit_into_child returns None
-    // silently in that case.
-    // `child_ns_pid` tracks the child's SELF view — the pid the child's own
-    // getpid() reports (its inner pid in whatever namespace `inherit_into_child`
-    // places it into). fork(2)'s return value to the PARENT is derived from this
-    // below via `pid_ns::fork_return_to_parent`, which resolves the child's pid
-    // in the PARENT's namespace (Linux `pid_vnr` in the caller's ns). The two
-    // agree for an ordinary same-namespace fork but DIVERGE across a
-    // `unshare(CLONE_NEWPID)` boundary (see that function's contract).
-    #[cfg(feature = "container")]
-    let mut child_ns_pid = child_pid.raw();
     // Mount namespaces are implemented by the Linux-compat layer itself, not
     // by the optional container feature. A child always shares its parent's
     // current mount namespace until it explicitly unshares a new one.
@@ -269,11 +281,6 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     #[cfg(feature = "container")]
     {
         let parent_task = current_task_id();
-        if let Some(inner) =
-            crate::pid_ns::inherit_into_child(parent_task, child_tid.raw(), child_pid.raw())
-        {
-            child_ns_pid = inner;
-        }
         // UTS / NET / IPC / User namespaces share the parent's Arc.
         crate::namespaces::inherit_into_child(parent_task, child_tid.raw());
     }

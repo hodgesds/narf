@@ -32,6 +32,12 @@ pub(crate) fn sys_setsid(ctx: &mut dyn TrapContext) {
             .get_or_insert_with(BTreeMap::new)
             .insert(task, CTTY_DETACHED);
     }
+    // Drop the colder state locks first, then mirror PGID while still holding
+    // the authoritative PGID writer lock. This prevents a concurrent setpgid
+    // from being overwritten by a delayed cache publication.
+    drop(cttys);
+    drop(sids);
+    crate::task::set_process_group_id(task, task);
     // setsid(2) returns the new session id = the caller's pid, in the
     // visible-pid space userspace sees.
     ctx.set_return(SyscallReturn::ok(pgid_to_user(task)));

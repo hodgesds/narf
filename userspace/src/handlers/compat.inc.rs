@@ -3113,7 +3113,9 @@ const CLOCK_BOOTTIME: u64 = 7;
 // `ioprio_get(IOPRIO_WHO_PGRP, pgid)` covering that same process, because
 // they landed on different keys. That is not a missing feature, it is a
 // wrong answer — and it could not be fixed without re-keying first.
-static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
+static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<
+    Option<BTreeMap<u64, alloc::sync::Arc<core::sync::atomic::AtomicU32>>>,
+> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// Linux's default when a task has no io_context: `IOPRIO_CLASS_BE` in the
@@ -3129,6 +3131,78 @@ const IOPRIO_DEFAULT: u32 = (2u32 << 13) | 4;
 /// tuple-keyed version's obscurity had been hiding.
 pub fn ioprio_init() {
     *IOPRIO_TABLE.lock() = Some(BTreeMap::new());
+}
+
+/// Read the task's current Linux I/O-priority word. An absent `io_context`
+/// has the normal best-effort/default priority.
+fn ioprio_of_task(task: u64) -> u32 {
+    IOPRIO_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).cloned())
+        .map(|value| value.load(core::sync::atomic::Ordering::Acquire))
+        .unwrap_or(IOPRIO_DEFAULT)
+}
+
+/// Materialise/update a task's `io_context`. The Arc is load-bearing:
+/// `clone(CLONE_IO)` installs the same Arc in parent and child, so a later
+/// ioprio_set through either task is immediately visible through the other.
+fn ioprio_set_task(task: u64, value: u32) {
+    let shared = {
+        let mut guard = IOPRIO_TABLE.lock();
+        let map = guard.get_or_insert_with(BTreeMap::new);
+        map.entry(task)
+            .or_insert_with(|| {
+                alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(IOPRIO_DEFAULT))
+            })
+            .clone()
+    };
+    shared.store(value, core::sync::atomic::Ordering::Release);
+}
+
+/// Linux `copy_io()`: share a pre-existing io_context for `CLONE_IO`, copy it
+/// for an ordinary clone/fork, and leave the child context-less when the
+/// parent had never allocated one.
+fn ioprio_fork(parent: u64, child: u64, share_io: bool) {
+    let parent_ctx = IOPRIO_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&parent).cloned());
+    let Some(parent_ctx) = parent_ctx else {
+        return;
+    };
+    let child_ctx = if share_io {
+        parent_ctx
+    } else {
+        alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(
+            parent_ctx.load(core::sync::atomic::Ordering::Acquire),
+        ))
+    };
+    IOPRIO_TABLE
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(child, child_ctx);
+}
+
+fn ioprio_release(task: u64) {
+    if let Some(map) = IOPRIO_TABLE.lock().as_mut() {
+        map.remove(&task);
+    }
+}
+
+#[doc(hidden)]
+pub fn __test_ioprio_set_task(task: u64, value: u32) {
+    ioprio_set_task(task, value);
+}
+
+#[doc(hidden)]
+pub fn __test_ioprio_of_task(task: u64) -> u32 {
+    ioprio_of_task(task)
+}
+
+#[doc(hidden)]
+pub fn __test_ioprio_fork(parent: u64, child: u64, share_io: bool) {
+    ioprio_fork(parent, child, share_io);
 }
 
 // ── Signal delivery: pending + mask + delivery hook ────────────────
@@ -5821,31 +5895,30 @@ fn signal_tid_from_user(caller: u64, tid: u64) -> Option<u64> {
     if tid == linux_tid_for_task(caller) {
         return Some(caller);
     }
-    // A CLONE_THREAD sibling is a raw TaskId whose thread-group leader lives at
-    // task_to_pid_raw(tid) but is a DIFFERENT task. Its gettid() is that raw
-    // TaskId, so intra-process tkill must accept it directly.
-    if let Some(group_pid) = task_to_pid_raw(tid) {
-        if pid_to_task_raw(group_pid) != Some(tid) {
-            // #26: only accept the raw sibling tid if its thread group is
-            // visible in the CALLER's pid namespace. Without this a container
-            // that passed a raw TaskId numerically matching a HOST (or
-            // sibling-namespace) thread signalled across the boundary. Linux
-            // resolves tkill/tgkill tids via the caller's ns
-            // (kernel/signal.c find_task_by_vpid on the thread's pid).
-            // Identity/visible in the root ns → unchanged there.
-            #[cfg(feature = "container")]
-            crate::pid_ns::ns_visible_inner(caller, group_pid)?;
-            return Some(tid);
-        }
+    // Resolve the user number in the caller's active PID namespace first.
+    // The resulting root-visible ID can name either a non-leader thread or a
+    // process leader.
+    let outer = accept_pid_from(caller, tid)?;
+    if let Some(task) = linux_tid_to_task_raw(outer) {
+        return Some(task);
     }
-    let pid = accept_pid_from(caller, tid)?;
-    Some(pid_to_task_raw(pid).unwrap_or(pid))
+    Some(pid_to_task_raw(outer).unwrap_or(outer))
 }
 
 /// Linux-visible gettid(2) value for `task`. A thread-group leader reports
 /// its process ID (translated into its own PID namespace); a CLONE_THREAD
 /// sibling reports its distinct scheduler-derived TID.
-fn linux_tid_for_task(task: u64) -> u64 {
+pub(crate) fn linux_tid_for_task(task: u64) -> u64 {
+    if let Some(tid) = task_to_linux_tid_raw(task) {
+        #[cfg(feature = "container")]
+        {
+            return crate::pid_ns::self_inner_pid(task, tid);
+        }
+        #[cfg(not(feature = "container"))]
+        {
+            return tid;
+        }
+    }
     match task_to_pid_raw(task) {
         Some(pid) if pid_to_task_raw(pid) == Some(task) => {
             #[cfg(feature = "container")]

@@ -35,15 +35,28 @@ kernel_test_in!("syscall_abi", smoke_abi_proc2_getppid_injected_parent);
 
 fn smoke_abi_proc2_getpgid_other_pid() -> TestResult {
     with_setup(|| {
-        // The base file only does getpgid(0) (the self arm). Passing a
-        // non-zero pid takes the `pgid_from_user(pid)` translation arm; the
-        // value is unmapped so read_pgid defaults to the (translated) pid
-        // itself and the call still reports Ok with a non-negative pgid.
-        match call(Syscall::Getpgid.raw(), a0(200)) {
-            Some(v) if v >= 0 => Ok(()),
-            Some(_) => Err("getpgid(other) returned negative pgid"),
-            None => Err("getpgid(other) returned non-Ok status"),
+        // Linux first resolves a non-zero pid with find_task_by_vpid. Register
+        // a real target so the success arm is distinct from missing-PID ESRCH.
+        const OTHER: u64 = 200;
+        let owner = crate::task::Task::new_registered(OTHER, OTHER);
+        crate::handlers::register_pid_task_mapping(OTHER, OTHER);
+        let existing = call(Syscall::Getpgid.raw(), a0(OTHER));
+        crate::task::release_task(OTHER);
+        drop(owner);
+        if existing != Some(OTHER as i64) {
+            return Err("getpgid(other) did not return the registered task's pgid");
         }
+
+        // kernel/sys.c::do_getpgid initializes retval=-ESRCH before
+        // find_task_by_vpid. An arbitrary absent pid and a negative pid_t both
+        // miss that lookup; neither may manufacture a default pgid.
+        if call(Syscall::Getpgid.raw(), a0(123_456)) != Some(ESRCH) {
+            return Err("getpgid of a nonexistent PID did not return -ESRCH");
+        }
+        if call(Syscall::Getpgid.raw(), a0((-1i64) as u64)) != Some(ESRCH) {
+            return Err("getpgid of a negative pid_t did not return -ESRCH");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc2_getpgid_other_pid);
@@ -332,9 +345,10 @@ fn smoke_abi_proc2_waitid_ppid_no_child() -> TestResult {
         const P_PID: u64 = 1;
         const WNOHANG: u64 = 1;
         let mut si = [0u8; 128];
+        const WEXITED: u64 = 4;
         match call(
             Syscall::Waitid.raw(),
-            a3(P_PID, 4242, si.as_mut_ptr() as u64, WNOHANG),
+            a3(P_PID, 4242, si.as_mut_ptr() as u64, WNOHANG | WEXITED),
         ) {
             Some(v) if v == ECHILD => Ok(()),
             _ => Err("waitid(P_PID, WNOHANG) with no child must return -ECHILD"),
@@ -351,9 +365,10 @@ fn smoke_abi_proc2_waitid_blocking_without_executor_echild() -> TestResult {
         // exists; the kernel-test harness has no executor on which to park.
         const P_ALL: u64 = 0;
         let mut si = [0u8; 128];
+        const WEXITED: u64 = 4;
         match call(
             Syscall::Waitid.raw(),
-            a3(P_ALL, 0, si.as_mut_ptr() as u64, 0),
+            a3(P_ALL, 0, si.as_mut_ptr() as u64, WEXITED),
         ) {
             Some(v) if v == ECHILD => Ok(()),
             _ => Err("waitid without a child/executor did not return -ECHILD"),
@@ -655,7 +670,7 @@ fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
                 let _ = crate::task::Task::new_registered(t, t);
             }
         }
-        crate::handlers::__test_inject_parent_of(KID, MID);
+        crate::handlers::__test_parent_of_set_with_signal(KID, MID, 10);
         crate::handlers::__test_inject_parent_of(MID, SUB);
         // Switch identity to configure per-task prctl state through the
         // real syscall: SUB volunteers as subreaper, KID arms pdeathsig.
@@ -673,7 +688,7 @@ fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
         if crate::handlers::signal_pending_of(KID) & crate::handlers::sig_bit(10) == 0 {
             return Err("KID must receive its pdeathsig when MID exits");
         }
-        let reparented = crate::handlers::parent_of_get(KID);
+        let reparented = crate::handlers::__test_parent_link(KID);
         // Release the synthetic tasks — the refcounted TASKS registry is
         // NOT swept by setup()/teardown(), and stale entries are exactly
         // the persistent-state class behind the pause_neg ordering saga
@@ -681,8 +696,8 @@ fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
         for t in [SUB, MID, KID] {
             crate::handlers::release_reaped_task(t);
         }
-        if reparented != Some(SUB) {
-            return Err("KID must be reparented to the subreaper SUB");
+        if reparented != Some((SUB, 17)) {
+            return Err("external reparent did not reset the child signal to SIGCHLD");
         }
         Ok(())
     })
@@ -690,6 +705,36 @@ fn smoke_abi_proc2_pdeathsig_and_subreaper_on_exit() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_pdeathsig_and_subreaper_on_exit
+);
+fn smoke_abi_proc2_threaded_reparent_preserves_clone_signal() -> TestResult {
+    with_setup(|| {
+        const GROUP: u64 = 0x7B00;
+        const LEADER: u64 = 0x7B01;
+        const SIBLING: u64 = 0x7B02;
+        const CHILD: u64 = 0x7B03;
+        const SIGUSR1: u8 = 10;
+
+        for task in [LEADER, SIBLING, CHILD] {
+            let _ = crate::task::Task::new_registered(task, task);
+        }
+        crate::handlers::register_pid_task_mapping(GROUP, LEADER);
+        crate::handlers::register_task_to_pid(SIBLING, GROUP);
+        crate::handlers::__test_parent_of_set_with_signal(CHILD, SIBLING, SIGUSR1);
+
+        crate::handlers::__test_orphanize_children_of(SIBLING);
+        let link = crate::handlers::__test_parent_link(CHILD);
+        for task in [LEADER, SIBLING, CHILD] {
+            crate::task::release_task(task);
+        }
+        if link != Some((LEADER, SIGUSR1)) {
+            return Err("threaded reparent did not preserve the clone exit signal");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_threaded_reparent_preserves_clone_signal
 );
 
 // ── /proc/<pid>/* end-to-end renderer coverage ──────────────────────

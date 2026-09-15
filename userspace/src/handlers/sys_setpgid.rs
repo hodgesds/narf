@@ -172,6 +172,7 @@ pub(crate) fn sys_setpgid(ctx: &mut dyn TrapContext) {
         return;
     };
     m.insert(target, value);
+    crate::task::set_process_group_id(target, value);
     drop(g);
     ctx.set_return(SyscallReturn::ok(0));
 }

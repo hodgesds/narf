@@ -61,6 +61,26 @@ static TASK_SLOT: AtomicU64 = AtomicU64::new(FAKE_TASK);
 type TestAsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 static SAVED_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<TestAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static TEST_AS: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn test_as_lookup() -> Option<Arc<AddressSpace>> {
+    TEST_AS.lock().clone()
+}
+
+/// Give an ABI test a real, empty user address space. Most ABI tests
+/// deliberately exercise the no-mm validation path; clone allocation-order
+/// tests opt in here when they must reach a check that Linux performs after
+/// `copy_mm()`.
+pub fn install_test_address_space() -> Result<(), &'static str> {
+    // SAFETY: kernel tests run after paging is enabled. `new_for_user` creates
+    // an inactive user root inheriting only the kernel half.
+    let address_space =
+        unsafe { AddressSpace::new_for_user() }.map_err(|_| "AddressSpace::new_for_user failed")?;
+    *TEST_AS.lock() = Some(Arc::new(address_space));
+    crate::handlers::install_address_space_lookup(test_as_lookup);
+    Ok(())
+}
 
 fn task_lookup() -> u64 {
     TASK_SLOT.load(Ordering::Relaxed)
@@ -105,6 +125,7 @@ impl TrapContext for AbiCtx {
 /// test; pair with [`teardown`].
 pub fn setup() {
     TASK_SLOT.store(FAKE_TASK, Ordering::Relaxed);
+    *TEST_AS.lock() = None;
     // The kernel-test registry shares one image, and process/VM tests install
     // a global scheduler bridge. ABI smokes promise a no-AS baseline unless
     // their own body installs one, so save and clear that bridge explicitly
@@ -180,6 +201,7 @@ pub fn teardown() {
     crate::namespaces::__test_reset_all();
     __test_clear_global();
     fd::__test_reset();
+    *TEST_AS.lock() = None;
     crate::handlers::restore_address_space_lookup(*SAVED_AS_LOOKUP.lock());
 }
 
