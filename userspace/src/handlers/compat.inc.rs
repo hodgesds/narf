@@ -7309,11 +7309,7 @@ fn default_signal_delivery_restricted_active(
     // occurrence falls through to the default action. Cleared in the
     // (possibly shared) live sighand, per Linux thread-group semantics.
     if (action.flags & SA_RESETHAND) != 0 {
-        let h = {
-            let g = SIGACTION_TABLE.lock();
-            g.as_ref().and_then(|m| m.get(&task).cloned())
-        };
-        if let Some(h) = h {
+        if let Some(h) = task_map_get(&SIGACTION_TABLE, task) {
             h.lock()[signum as usize] = None;
         }
     }
@@ -7704,14 +7700,19 @@ fn new_sighand() -> SigHand {
     alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new([None; NSIG]))
 }
 
-static SIGACTION_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, SigHand>>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+// Linux reaches `current->sighand` directly and then takes only that
+// thread-group's siglock. Keep the compatibility registry sharded by task id
+// so unrelated processes installing or delivering signals never bounce one
+// global registry lock between CPUs. The inner SigHand remains the authority
+// for CLONE_SIGHAND serialization.
+static SIGACTION_TABLE: TaskMapTable<SigHand> =
+    [const { TaskMapShard::new() }; TASK_MAP_SHARDS];
 
 /// Get (or create) `task`'s sighand reference. The `Arc` clone lets
 /// callers operate on the table after the registry lock is released;
-/// lock ordering is always SIGACTION_TABLE → inner sighand.
+/// lock ordering is always the task's registry shard → inner sighand.
 fn sighand_of(task: u64) -> Option<SigHand> {
-    let mut g = SIGACTION_TABLE.lock();
+    let mut g = SIGACTION_TABLE[task_map_shard(task)].map.lock();
     let map = g.as_mut()?;
     Some(map.entry(task).or_insert_with(new_sighand).clone())
 }
@@ -7719,27 +7720,20 @@ fn sighand_of(task: u64) -> Option<SigHand> {
 /// Initialise the per-task sigaction registry. Boot calls this once
 /// before any user task can issue `Syscall::Sigaction`.
 pub fn sigaction_init() {
-    *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&SIGACTION_TABLE);
 }
 
 /// fork(2) inheritance: DEEP-copy `parent`'s handler table to `child`
 /// (a post-fork sigaction() in one process must not affect the other).
 /// POSIX: handlers are inherited; pending signals are not.
 pub fn sigaction_fork(parent: u64, child: u64) {
-    let snapshot = {
-        let g = SIGACTION_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&parent).cloned())
-            .map(|h| *h.lock())
-    };
+    let snapshot = task_map_get(&SIGACTION_TABLE, parent).map(|h| *h.lock());
     if let Some(v) = snapshot {
-        let mut g = SIGACTION_TABLE.lock();
-        if let Some(map) = g.as_mut() {
-            map.insert(
-                child,
-                alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
-            );
-        }
+        task_map_set(
+            &SIGACTION_TABLE,
+            child,
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
+        );
     }
 }
 
@@ -7749,10 +7743,8 @@ pub fn sigaction_fork(parent: u64, child: u64) {
 /// pthreads rely on (musl installs its setxid/cancel handlers once,
 /// from one thread, for the whole group).
 pub fn sigaction_share(parent: u64, child: u64) {
-    let mut g = SIGACTION_TABLE.lock();
-    if let Some(map) = g.as_mut() {
-        let h = map.entry(parent).or_insert_with(new_sighand).clone();
-        map.insert(child, h);
+    if let Some(h) = sighand_of(parent) {
+        task_map_set(&SIGACTION_TABLE, child, h);
     }
 }
 
@@ -7772,12 +7764,7 @@ pub fn sigaction_share(parent: u64, child: u64) {
 /// `unshare_sighand` in execve: the post-exec image must not keep a
 /// live handler table shared with pre-exec CLONE_SIGHAND siblings.
 pub fn sigaction_exec_reset(task: u64) {
-    let snapshot = {
-        let g = SIGACTION_TABLE.lock();
-        g.as_ref()
-            .and_then(|m| m.get(&task).cloned())
-            .map(|h| *h.lock())
-    };
+    let snapshot = task_map_get(&SIGACTION_TABLE, task).map(|h| *h.lock());
     if let Some(mut v) = snapshot {
         for slot in v.iter_mut() {
             // handler > 1 ⇒ a real caught handler (0 = SIG_DFL, 1 = SIG_IGN).
@@ -7785,20 +7772,18 @@ pub fn sigaction_exec_reset(task: u64) {
                 *slot = None;
             }
         }
-        let mut g = SIGACTION_TABLE.lock();
-        if let Some(map) = g.as_mut() {
-            map.insert(
-                task,
-                alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
-            );
-        }
+        task_map_set(
+            &SIGACTION_TABLE,
+            task,
+            alloc::sync::Arc::new(narf_lib::sync::IrqSafeSpinLock::new(v)),
+        );
     }
 }
 
 /// Reset the registry — test hook.
 #[doc(hidden)]
 pub fn __test_sigaction_reset() {
-    *SIGACTION_TABLE.lock() = Some(BTreeMap::new());
+    task_map_init(&SIGACTION_TABLE);
 }
 
 /// Test hook: install a handler vaddr for `(task, signum)` directly,
@@ -7835,13 +7820,54 @@ pub fn sigaction_lookup_full(task: u64, signum: usize) -> Option<SigAction> {
     if signum >= NSIG {
         return None;
     }
-    let h = {
-        let g = SIGACTION_TABLE.lock();
-        g.as_ref()?.get(&task)?.clone()
-    };
+    let h = task_map_get(&SIGACTION_TABLE, task)?;
     let slot = h.lock()[signum];
     slot
 }
+
+/// The sharded registry must preserve both levels of Linux signal-handler
+/// identity: distinct tasks remain isolated even when their ids collide in a
+/// shard, while CLONE_SIGHAND aliases one live table across different shards.
+#[cfg(feature = "kernel-test")]
+fn smoke_sigaction_shards_preserve_inheritance() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+
+    const PARENT: u64 = 0x5a00;
+    const SAME_SHARD: u64 = PARENT + TASK_MAP_SHARDS as u64;
+    const SHARED_CHILD: u64 = PARENT + 1;
+    const FORK_CHILD: u64 = PARENT + 2;
+    const SIGUSR1: usize = 10;
+
+    __test_sigaction_reset();
+    __test_set_sigaction(PARENT, SIGUSR1, 0x1111);
+    __test_set_sigaction(SAME_SHARD, SIGUSR1, 0x2222);
+    if sigaction_lookup(PARENT, SIGUSR1) != Some(0x1111)
+        || sigaction_lookup(SAME_SHARD, SIGUSR1) != Some(0x2222)
+    {
+        __test_sigaction_reset();
+        return TestResult::Fail("same-shard sighands aliased");
+    }
+
+    sigaction_share(PARENT, SHARED_CHILD);
+    sigaction_fork(PARENT, FORK_CHILD);
+    __test_set_sigaction(SHARED_CHILD, SIGUSR1, 0x3333);
+    if sigaction_lookup(PARENT, SIGUSR1) != Some(0x3333) {
+        __test_sigaction_reset();
+        return TestResult::Fail("cross-shard CLONE_SIGHAND did not stay live");
+    }
+    if sigaction_lookup(FORK_CHILD, SIGUSR1) != Some(0x1111) {
+        __test_sigaction_reset();
+        return TestResult::Fail("cross-shard fork did not retain an independent copy");
+    }
+
+    __test_sigaction_reset();
+    TestResult::Pass
+}
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "userspace",
+    smoke_sigaction_shards_preserve_inheritance
+);
 
 // ── Sockets — POSIX shims over the SocketOp dispatcher ───────────
 //
