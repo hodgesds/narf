@@ -168,6 +168,34 @@ fn smoke_abi_fsx_setxattr_vfs_rejections() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_vfs_rejections);
 
+/// Mount a private tmpfs for a test, at a target no other test uses.
+///
+/// These tests must NOT reach for `/tmp`. The `userspace/mount` smokes
+/// unmount it as their cleanup and never put it back, so whether `/tmp`
+/// exists depends on test ordering — which is exactly the kind of
+/// dependency that makes a suite pass in one selection and fail in
+/// another. A fresh mount also guarantees the filesystem under test IS
+/// tmpfs, which is what these tests are about.
+fn mount_private_tmpfs(target: &[u8]) -> bool {
+    let source = b"tmpfs\0";
+    let fstype = b"tmpfs\0";
+    call(
+        Syscall::Mount.raw(),
+        SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        },
+    ) == Some(0)
+}
+
+fn unmount_private_tmpfs(target: &[u8]) {
+    let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+}
+
 /// A DIRECTORY is an inode with extended attributes.
 ///
 /// Path resolution hands back `DirOps` for a directory, so the xattr
@@ -178,20 +206,23 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_vfs_rejections);
 /// RENAMING the directory is what tells the two apart, and it is the
 /// user-visible consequence: an attribute stored against the inode moves
 /// with it, while one stored against a path string stays behind on a name
-/// that no longer exists. (Testing it this way also keeps the whole check
-/// inside the syscall ABI, so it does not depend on the harness's mount
-/// layout or on whether some earlier test left the task chrooted.)
+/// that no longer exists.
 fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
     with_setup(|| {
-        let first = b"/tmp/abi-xattr-dir\0";
-        let second = b"/tmp/abi-xattr-dir2\0";
+        let mount = b"/abi-xattr-mnt\0";
+        if !mount_private_tmpfs(mount) {
+            return Err("mounting a private tmpfs for the test failed");
+        }
+        let first = b"/abi-xattr-mnt/dir\0";
+        let second = b"/abi-xattr-mnt/dir2\0";
         let name = b"user.label\0";
         let val = b"dir";
-        // Start from a clean slate even if an earlier run left these.
-        let _ = call_rmdir(first.as_ptr() as u64);
-        let _ = call_rmdir(second.as_ptr() as u64);
+        let finish = |outcome: Result<(), &'static str>| {
+            unmount_private_tmpfs(mount);
+            outcome
+        };
         if call_mkdir(first.as_ptr() as u64, 0o755) != Some(0) {
-            return Err("mkdir of the test directory failed");
+            return finish(Err("mkdir of the test directory failed"));
         }
         let set = call(
             Syscall::Setxattr.raw(),
@@ -205,8 +236,7 @@ fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
             },
         );
         if set != Some(0) {
-            let _ = call_rmdir(first.as_ptr() as u64);
-            return Err("setxattr on a directory should succeed");
+            return finish(Err("setxattr on a directory should succeed"));
         }
         let getxattr = |path: &[u8], out: &mut [u8]| {
             call(
@@ -222,30 +252,24 @@ fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
         };
         let mut out = [0u8; 8];
         if getxattr(first, &mut out) != Some(val.len() as i64) || &out[..val.len()] != val {
-            let _ = call_rmdir(first.as_ptr() as u64);
-            return Err("getxattr on a directory did not read back the value");
+            return finish(Err("getxattr on a directory did not read back the value"));
         }
         // The attribute belongs to the INODE, so it follows the rename.
         if call_rename(first.as_ptr() as u64, second.as_ptr() as u64) != Some(0) {
-            let _ = call_rmdir(first.as_ptr() as u64);
-            return Err("renaming the test directory failed");
+            return finish(Err("renaming the test directory failed"));
         }
         let mut moved = [0u8; 8];
         let followed = getxattr(second, &mut moved);
         let left_behind = getxattr(first, &mut out);
-        // Clean up before reporting, so a failure does not poison later runs.
-        let _ = call(
-            Syscall::Removexattr.raw(),
-            a1(second.as_ptr() as u64, name.as_ptr() as u64),
-        );
-        let _ = call_rmdir(second.as_ptr() as u64);
         if followed != Some(val.len() as i64) || &moved[..val.len()] != val {
-            return Err("the directory xattr did not follow its inode through a rename");
+            return finish(Err(
+                "the directory xattr did not follow its inode through a rename",
+            ));
         }
         if left_behind != Some(ENODATA) {
-            return Err("the old directory name still answered for the xattr");
+            return finish(Err("the old directory name still answered for the xattr"));
         }
-        Ok(())
+        finish(Ok(()))
     })
 }
 kernel_test_in!(
@@ -273,14 +297,19 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
         ACL_EXECUTE, ACL_GROUP_OBJ, ACL_OTHER, ACL_READ, ACL_USER_OBJ, ACL_WRITE,
     };
     with_setup(|| {
-        let parent = b"/tmp/abi-acl-parent\0";
-        let child_dir = b"/tmp/abi-acl-parent/sub\0";
-        let child_file = b"/tmp/abi-acl-parent/file\0";
-        let _ = call_rmdir(child_dir.as_ptr() as u64);
-        let _ = call_unlink(child_file.as_ptr() as u64);
-        let _ = call_rmdir(parent.as_ptr() as u64);
+        let mount = b"/abi-acl-mnt\0";
+        if !mount_private_tmpfs(mount) {
+            return Err("mounting a private tmpfs for the test failed");
+        }
+        let parent = b"/abi-acl-mnt/parent\0";
+        let child_dir = b"/abi-acl-mnt/parent/sub\0";
+        let child_file = b"/abi-acl-mnt/parent/file\0";
+        let finish = |outcome: Result<(), &'static str>| {
+            unmount_private_tmpfs(mount);
+            outcome
+        };
         if call_mkdir(parent.as_ptr() as u64, 0o777) != Some(0) {
-            return Err("mkdir of the ACL parent failed");
+            return finish(Err("mkdir of the ACL parent failed"));
         }
         // u::rwx, g::rwx, o::r-x — group-writable by inheritance.
         let default = PosixAcl::from_entries(alloc::vec![
@@ -289,8 +318,7 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
             AclEntry::tagged(ACL_OTHER, ACL_READ | ACL_EXECUTE),
         ])
         .to_xattr();
-        let name = AclType::Default.xattr_name();
-        let mut name_c = alloc::vec::Vec::from(name.as_bytes());
+        let mut name_c = alloc::vec::Vec::from(AclType::Default.xattr_name().as_bytes());
         name_c.push(0);
         let set = call(
             Syscall::Setxattr.raw(),
@@ -303,22 +331,11 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
                 ..Default::default()
             },
         );
-        let cleanup = || {
-            let _ = call_rmdir(child_dir.as_ptr() as u64);
-            let _ = call_unlink(child_file.as_ptr() as u64);
-            let _ = call_rmdir(parent.as_ptr() as u64);
-        };
         if set != Some(0) {
-            cleanup();
-            return Err("setxattr of a default ACL on a directory failed");
+            return finish(Err("setxattr of a default ACL on a directory failed"));
         }
         // A umask that would visibly bite if it were still applied.
         let previous = call(Syscall::Umask.raw(), a0(0o077));
-        let restore = |mask: Option<i64>| {
-            if let Some(mask) = mask {
-                let _ = call(Syscall::Umask.raw(), a0(mask as u64));
-            }
-        };
         let mode_of = |path: &[u8]| -> Option<u32> {
             let mut st = [0u8; 144];
             if call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0) {
@@ -345,24 +362,25 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
         }
         let dir_mode = mode_of(child_dir);
         let file_mode = mode_of(child_file);
-        restore(previous);
-        cleanup();
+        if let Some(mask) = previous {
+            let _ = call(Syscall::Umask.raw(), a0(mask as u64));
+        }
         if dir_made != Some(0) {
-            return Err("mkdir inside the ACL parent failed");
+            return finish(Err("mkdir inside the ACL parent failed"));
         }
         if created.map(|fd| fd < 0).unwrap_or(true) {
-            return Err("creating a file inside the ACL parent failed");
+            return finish(Err("creating a file inside the ACL parent failed"));
         }
         // 0o777 narrowed through the default ACL is 0o775; the 0o077 umask
         // would have produced 0o700.
         if dir_mode != Some(0o775) {
-            return Err("a subdirectory did not inherit the default ACL's mode");
+            return finish(Err("a subdirectory did not inherit the default ACL's mode"));
         }
         // 0o666 narrowed through the same ACL is 0o664; umask would give 0o600.
         if file_mode != Some(0o664) {
-            return Err("a new file did not inherit the default ACL's mode");
+            return finish(Err("a new file did not inherit the default ACL's mode"));
         }
-        Ok(())
+        finish(Ok(()))
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_default_acl_replaces_umask);
