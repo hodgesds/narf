@@ -1693,6 +1693,31 @@ fn open_impl(
         }
     }
 
+    // `inode_permission`'s "Nobody gets write access to an immutable
+    // file", plus `may_open`'s append-only arm:
+    //
+    //     if (IS_APPEND(inode)) {
+    //             if ((flag & O_ACCMODE) != O_RDONLY && !(flag & O_APPEND))
+    //                     return -EPERM;
+    //             if (flag & O_TRUNC)
+    //                     return -EPERM;
+    //     }
+    {
+        const O_APPEND: u64 = 0o2000;
+        const O_TRUNC: u64 = 0o1000;
+        let iflags = ops.inode_flags();
+        if want_w && iflags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+        if iflags & narf_filesystem::FS_APPEND_FL != 0
+            && ((want_w && flags & O_APPEND == 0) || flags & O_TRUNC != 0)
+        {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+    }
+
     // Landlock: a self-restricted task's open must be permitted by its
     // active rulesets, else EACCES.
     if !created {
@@ -3350,6 +3375,12 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `vfs_link`: `if (IS_APPEND(inode) || IS_IMMUTABLE(inode)) return
+    // -EPERM;` — a new NAME for an immutable inode is a change to it.
+    if path_inode_flags(&old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
     // OLD name is only read, so it needs no directory write permission —
     // only the directory gaining a name does.
@@ -4943,6 +4974,38 @@ pub(crate) const CAP_FSETID: u32 = 4;
 /// Linux `CAP_MKNOD` — "create special files using mknod(2)".
 pub(crate) const CAP_MKNOD: u32 = 27;
 
+/// Linux `CAP_LINUX_IMMUTABLE` — "set the FS_APPEND_FL and
+/// FS_IMMUTABLE_FL inode flags".
+pub(crate) const CAP_LINUX_IMMUTABLE: u32 = 9;
+
+/// The immutable / append-only refusals the VFS makes on an inode's
+/// `chattr` flags, in one place because Linux asks the same question from
+/// six different call sites (`inode_permission`, `may_delete`,
+/// `may_setattr`, `may_write_xattr`, `vfs_link`, `do_truncate`).
+///
+/// `write` selects `inode_permission`'s rule — "Nobody gets write access
+/// to an immutable file" — which holds for root as well; that is the
+/// whole point of `chattr +i`. Append-only is the weaker form: the data
+/// may grow but never be rewritten, so a non-appending write is refused
+/// while an appending one is not.
+fn immutable_check(flags: u32, write: bool, appending: bool) -> Result<(), i64> {
+    if flags & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        return Err(-1); // -EPERM
+    }
+    if write && !appending && flags & narf_filesystem::FS_APPEND_FL != 0 {
+        return Err(-1);
+    }
+    Ok(())
+}
+
+/// The `chattr` flags of the inode at `path`, or 0 when nothing there
+/// models them.
+fn path_inode_flags(path: &str) -> u32 {
+    resolve_file_absolute_ext(path, true)
+        .map(|file| file.inode_flags())
+        .unwrap_or(0)
+}
+
 /// `fs/attr.c::setattr_should_drop_suidgid`, applied by
 /// `file_remove_privs` on every write and by `do_truncate`:
 ///
@@ -5468,6 +5531,19 @@ fn xattr_permission_check(
     write: bool,
     task: u64,
 ) -> Result<(), i64> {
+    // `fs/xattr.c::may_write_xattr` comes first, before any namespace or
+    // ownership question: "we can never set or remove an extended
+    // attribute on a read-only filesystem or on an immutable /
+    // append-only inode".
+    if write {
+        let iflags = match target {
+            XattrTarget::File(file) => file.inode_flags(),
+            XattrTarget::Dir(_) => 0,
+        };
+        if iflags & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+            return Err(XE_PERM);
+        }
+    }
     let (uid, gid, perms, is_dir) = target.meta();
     if is_acl_xattr(name) {
         if !write {

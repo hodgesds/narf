@@ -77,6 +77,14 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `may_delete` on the source name, and on a destination about to be
+    // replaced: renaming an immutable file away is a removal.
+    if path_inode_flags(old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
+        || path_inode_flags(new_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {

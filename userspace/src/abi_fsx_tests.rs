@@ -1654,6 +1654,235 @@ kernel_test_in!(
     smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary
 );
 
+/// `chattr +i` — an immutable file refuses every change, including by
+/// root.
+///
+/// The flags themselves come from `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS`
+/// (`fs/file_attr.c`), and the refusals are spread across the VFS:
+/// `inode_permission`'s "Nobody gets write access to an immutable file",
+/// `may_delete`, `may_setattr`, `may_write_xattr` and `vfs_link`. NARF
+/// modelled none of it, so `chattr +i` had nowhere to be stored and
+/// nothing to enforce it.
+///
+/// Everything below runs as ROOT on purpose: immutability that root can
+/// undo by ignoring it is not immutability. Root can only lift the flag
+/// first, which is the last thing this checks.
+fn smoke_abi_fsx_immutable_file_refuses_changes() -> TestResult {
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+    with_memfs(
+        "/abi-imm",
+        "abi-imm",
+        &[("f", b"data"), ("other", b"x")],
+        || {
+            let path = b"/abi-imm/f\0";
+            let other = b"/abi-imm/other\0";
+            let moved = b"/abi-imm/moved\0";
+            let set_flags = |flags: u32| -> Option<i64> {
+                let fd = call_open(path.as_ptr() as u64, 0)?;
+                if fd < 0 {
+                    return None;
+                }
+                let word = flags;
+                let r = call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, FS_IOC_SETFLAGS, &word as *const u32 as u64),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                r
+            };
+            let get_flags = || -> Option<u32> {
+                let fd = call_open(path.as_ptr() as u64, 0)?;
+                if fd < 0 {
+                    return None;
+                }
+                let mut word = 0u32;
+                let r = call(
+                    Syscall::Ioctl.raw(),
+                    a2(fd as u64, FS_IOC_GETFLAGS, &mut word as *mut u32 as u64),
+                );
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                (r == Some(0)).then_some(word)
+            };
+
+            // Baseline: writable before the flag, or nothing below is a test.
+            let writable_now = call_open(path.as_ptr() as u64, 0o1);
+            match writable_now {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("the file was not writable to begin with — test is vacuous"),
+            }
+
+            if set_flags(FS_IMMUTABLE_FL) != Some(0) {
+                return Err("FS_IOC_SETFLAGS(FS_IMMUTABLE_FL) failed");
+            }
+            if get_flags() != Some(FS_IMMUTABLE_FL) {
+                return Err("FS_IOC_GETFLAGS did not read the flag back");
+            }
+
+            // Opening for write is refused — `inode_permission` bars it, and
+            // this is root.
+            if call_open(path.as_ptr() as u64, 0o1) != Some(EPERM) {
+                return Err("an immutable file allowed a write open");
+            }
+            // Reading is untouched.
+            match call_open(path.as_ptr() as u64, 0) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("an immutable file refused a READ open"),
+            }
+            if call(Syscall::Truncate.raw(), a1(path.as_ptr() as u64, 0)) != Some(EPERM) {
+                return Err("an immutable file allowed truncate");
+            }
+            if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o600)) != Some(EPERM) {
+                return Err("an immutable file allowed chmod");
+            }
+            if call(Syscall::Chown.raw(), a2(path.as_ptr() as u64, 1000, 1000)) != Some(EPERM) {
+                return Err("an immutable file allowed chown");
+            }
+            if call_unlink(path.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed unlink");
+            }
+            if call_rename(path.as_ptr() as u64, moved.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed rename");
+            }
+            let name = b"user.k\0";
+            let value = b"v";
+            if call(
+                Syscall::Setxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: value.as_ptr() as u64,
+                    arg3: value.len() as u64,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            ) != Some(EPERM)
+            {
+                return Err("an immutable file allowed setxattr");
+            }
+            // A NEW name for the inode is a change to it (`vfs_link`).
+            //
+            // Through `call_link`, not `Syscall::Link` directly: arm64
+            // wires no legacy `link` (only the `*at` form), so the raw
+            // number is `u32::MAX` there and the call would report "the
+            // syscall misbehaved" rather than the errno under test.
+            if call_link(path.as_ptr() as u64, other.as_ptr() as u64) != Some(EPERM) {
+                return Err("an immutable file allowed a hard link");
+            }
+
+            // Lifting the flag restores everything — the file is protected,
+            // not destroyed.
+            if set_flags(0) != Some(0) {
+                return Err("clearing FS_IMMUTABLE_FL failed");
+            }
+            match call_open(path.as_ptr() as u64, 0o1) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                    Ok(())
+                }
+                _ => Err("clearing the flag did not make the file writable again"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_immutable_file_refuses_changes);
+
+/// `chattr +a` — append-only lets the data grow and nothing else.
+///
+/// `may_open`:
+///
+/// ```text
+/// if (IS_APPEND(inode)) {
+///         if  ((flag & O_ACCMODE) != O_RDONLY && !(flag & O_APPEND))
+///                 return -EPERM;
+///         if (flag & O_TRUNC)
+///                 return -EPERM;
+/// }
+/// ```
+///
+/// This is the weaker of the two flags and the distinction is the point:
+/// an append-only log must accept new records while refusing to have its
+/// history rewritten, so an O_APPEND open succeeds where a plain one is
+/// EPERM. Setting either flag needs CAP_LINUX_IMMUTABLE, which is the
+/// other half tested here.
+fn smoke_abi_fsx_append_only_allows_appends_only() -> TestResult {
+    const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    const FS_APPEND_FL: u32 = 0x0000_0020;
+    const O_APPEND: u64 = 0o2000;
+    const O_TRUNC: u64 = 0o1000;
+    with_memfs("/abi-append", "abi-append", &[("log", b"start")], || {
+        let path = b"/abi-append/log\0";
+        let set_flags = |flags: u32| -> Option<i64> {
+            let fd = call_open(path.as_ptr() as u64, 0)?;
+            if fd < 0 {
+                return None;
+            }
+            let word = flags;
+            let r = call(
+                Syscall::Ioctl.raw(),
+                a2(fd as u64, FS_IOC_SETFLAGS, &word as *const u32 as u64),
+            );
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            r
+        };
+        if set_flags(FS_APPEND_FL) != Some(0) {
+            return Err("FS_IOC_SETFLAGS(FS_APPEND_FL) failed");
+        }
+        // A plain write open is refused; an appending one is not.
+        if call_open(path.as_ptr() as u64, 0o1) != Some(EPERM) {
+            return Err("an append-only file allowed a non-appending write open");
+        }
+        if call_open(path.as_ptr() as u64, 0o1 | O_TRUNC | O_APPEND) != Some(EPERM) {
+            return Err("an append-only file allowed O_TRUNC");
+        }
+        let fd = match call_open(path.as_ptr() as u64, 0o1 | O_APPEND) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("an append-only file refused an O_APPEND open"),
+        };
+        let payload = b"more";
+        let wrote = call(
+            Syscall::Write.raw(),
+            a2(fd, payload.as_ptr() as u64, payload.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if wrote != Some(payload.len() as i64) {
+            return Err("an append-only file refused an appending write");
+        }
+        // Unlinking is still barred: the history cannot be dropped either.
+        if call_unlink(path.as_ptr() as u64) != Some(EPERM) {
+            return Err("an append-only file allowed unlink");
+        }
+        // A privileged caller CAN lift it — the file is protected, not
+        // destroyed. Checked before the drop below, because dropping uid
+        // also drops the capability and there is no way back.
+        if set_flags(0) != Some(0) {
+            return Err("a privileged caller could not clear FS_APPEND_FL");
+        }
+        if set_flags(FS_APPEND_FL) != Some(0) {
+            return Err("re-setting FS_APPEND_FL failed");
+        }
+        // Setting or clearing either flag needs CAP_LINUX_IMMUTABLE
+        // (`fileattr_set_prepare`), or the protection would be decorative:
+        // anyone it applies to could simply remove it.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let cleared = set_flags(0);
+        crate::handlers::__test_uidgid_reset();
+        if cleared == Some(0) {
+            return Err("an unprivileged caller cleared FS_APPEND_FL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_append_only_allows_appends_only);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

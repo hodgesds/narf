@@ -1683,6 +1683,10 @@ struct MemFile {
     /// explicitly through `FileOps::set_times` (utimensat/utime/utimes);
     /// ctime moves with every metadata change; atime follows relatime.
     times: Times,
+    /// `chattr` flags (`FS_IMMUTABLE_FL` / `FS_APPEND_FL`). One more
+    /// `AtomicU32` per node, and the same reasoning as the DAC atoms
+    /// above: a lock here would cost more than the field is worth.
+    iflags: AtomicU32,
     /// Hard links to this inode. Starts at 1 for a named file and at **0**
     /// for an `O_TMPFILE` inode — Linux creates that one with
     /// `inode->i_nlink == 0` and `linkat(AT_EMPTY_PATH)` is what raises it,
@@ -1732,6 +1736,7 @@ impl MemFile {
             gid: AtomicU32::new(gid),
             times: Times::now(),
             nlink: AtomicU32::new(1),
+            iflags: AtomicU32::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
@@ -1763,6 +1768,7 @@ impl MemFile {
             gid: AtomicU32::new(gid),
             times: Times::now(),
             nlink: AtomicU32::new(1),
+            iflags: AtomicU32::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
@@ -1785,6 +1791,7 @@ impl MemFile {
             gid: AtomicU32::new(0),
             times: Times::now(),
             nlink: AtomicU32::new(1),
+            iflags: AtomicU32::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: true,
             xattrs: Xattrs::new(),
@@ -2088,6 +2095,17 @@ impl FileOps for MemFile {
         if atime_ns.is_some() || mtime_ns.is_some() {
             self.times.touch_ctime();
         }
+        Ok(())
+    }
+
+    fn inode_flags(&self) -> u32 {
+        self.iflags.load(Ordering::Acquire)
+    }
+
+    fn set_inode_flags(&self, flags: u32) -> Result<(), FsError> {
+        self.iflags.store(flags, Ordering::Release);
+        // `vfs_fileattr_set` ends at `inode_set_ctime_current`.
+        self.times.touch_ctime();
         Ok(())
     }
 

@@ -97,6 +97,12 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `may_setattr` bars ATTR_UID/ATTR_GID on an immutable or append-only
+    // inode.
+    if path_inode_flags(&path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
     let requested_uid = args.arg2 as u32;
     let requested_gid = args.arg3 as u32;

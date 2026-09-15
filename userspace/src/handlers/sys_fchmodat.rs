@@ -100,6 +100,14 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `may_setattr`: `if (ia_valid & (ATTR_MODE | ATTR_UID | ATTR_GID |
+    // ATTR_TIMES_SET)) { if (IS_IMMUTABLE(inode) || IS_APPEND(inode))
+    // return -EPERM; }` — an append-only file's PERMISSIONS are frozen
+    // too, or the restriction could be lifted by re-permissioning it.
+    if path_inode_flags(&path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let mode = (args.arg2 as u32 & 0o7777) as u16;
     let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
 
