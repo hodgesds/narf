@@ -2016,10 +2016,10 @@ kernel_test_in!("userspace", smoke_userspace_futex_park_word_revalidation);
 /// compares) its snapshot and `IO_WAKERS` is unlatched, so a wake racing
 /// scan→register is otherwise LOST and the task strands forever (the CachyOS
 /// greeter wedge: PARK-CENSUS with every task parked on socket I/O, SMP=1
-/// included). Every OTHER case stays the identity: a non-io infinite park
-/// (pause/futex/signal — they re-check their own condition after registering) is
-/// inert (`u64::MAX`), and any finite park fires at its REAL deadline (the
-/// durable io-waiter wake normally revives an io-wait park earlier in practice).
+/// included). A per-fd `Readiness` arm is also inert (`u64::MAX`) because its
+/// check-and-arm is already lost-wake-free. Every OTHER case stays the identity:
+/// a non-io infinite park (pause/futex/signal — they re-check their own condition
+/// after registering) is inert, and any finite park fires at its REAL deadline.
 #[cfg(target_arch = "x86_64")]
 fn smoke_userspace_park_fire_deadline_net_io_backstop() -> TestResult {
     use crate::user_task::{park_fire_deadline_ns, NET_IO_WAIT_BACKSTOP_NS};
@@ -2027,35 +2027,41 @@ fn smoke_userspace_park_fire_deadline_net_io_backstop() -> TestResult {
 
     // POSITIVE (the fix): infinite io-wait park → bounded backstop, NOT inert.
     let want = now + NET_IO_WAIT_BACKSTOP_NS;
-    if park_fire_deadline_ns(u64::MAX, now, true) != want {
+    if park_fire_deadline_ns(u64::MAX, now, true, false) != want {
         return TestResult::Fail("infinite io-wait park must arm the lost-wake backstop");
+    }
+
+    // A per-fd Readiness arm serializes check-vs-wake under one lock. It needs
+    // no fallback timer; u64::MAX means truly timerless until that waker fires.
+    if park_fire_deadline_ns(u64::MAX, now, true, true) != u64::MAX {
+        return TestResult::Fail("durable per-fd I/O park must not arm a backstop timer");
     }
 
     // NEGATIVE: infinite NON-io park (pause/futex/signal) stays inert (u64::MAX)
     // — those paths re-check their own condition after registering, so a backstop
     // would be needless idle wakeups.
-    if park_fire_deadline_ns(u64::MAX, now, false) != u64::MAX {
+    if park_fire_deadline_ns(u64::MAX, now, false, false) != u64::MAX {
         return TestResult::Fail("infinite non-io park must stay inert (u64::MAX)");
     }
 
     // Finite io-wait park with a FAR deadline (25 s) → its REAL deadline, NOT
     // clamped to the backstop (the durable io-waiter wake revives it earlier).
     let far = now + 25_000_000_000;
-    if park_fire_deadline_ns(far, now, true) != far {
+    if park_fire_deadline_ns(far, now, true, false) != far {
         return TestResult::Fail("finite io-wait park must fire at its real deadline (no clamp)");
     }
 
     // Finite NON-io park (plain sleep) → its real deadline.
-    if park_fire_deadline_ns(far, now, false) != far {
+    if park_fire_deadline_ns(far, now, false, false) != far {
         return TestResult::Fail("finite sleep park must fire at its real deadline");
     }
 
     // A near deadline (< backstop) is returned unchanged for BOTH io and non-io.
     let near = now + 2_000_000; // 2 ms < 10 ms backstop
-    if park_fire_deadline_ns(near, now, true) != near {
+    if park_fire_deadline_ns(near, now, true, false) != near {
         return TestResult::Fail("near io-wait deadline must be returned unchanged");
     }
-    if park_fire_deadline_ns(near, now, false) != near {
+    if park_fire_deadline_ns(near, now, false, false) != near {
         return TestResult::Fail("near sleep deadline must be returned unchanged");
     }
     TestResult::Pass

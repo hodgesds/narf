@@ -100,6 +100,12 @@ pub struct UserTaskCtx {
     /// re-polls readiness immediately instead of waiting out its wheel
     /// deadline (~100 ms for redis's serverCron). Cleared on wake.
     pub net_io_wait: AtomicBool,
+    /// True only when `net_io_wait` is backed by a per-fd `Readiness` arm.
+    /// That arm checks the level and installs the waker under the same lock as
+    /// the producer's state transition, so it needs neither the global I/O
+    /// waiter nor the timer-wheel lost-wake backstop. Generic poll/epoll and
+    /// providers without a `Readiness` cell leave this false.
+    pub(crate) durable_io_wait: AtomicBool,
     /// Set while a System V semaphore operation is queued. The park loop
     /// installs its current task waker in the queue record and rechecks the
     /// terminal status before sleeping, so migration and wake-before-register
@@ -468,6 +474,7 @@ impl UserTaskCtx {
             exit_reason: UnsafeCell::new(0),
             sleep_deadline_ns: AtomicU64::new(0),
             net_io_wait: AtomicBool::new(false),
+            durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
             msg_wait_pending: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
@@ -814,9 +821,10 @@ pub(crate) const NET_IO_WAIT_BACKSTOP_NS: u64 = 10_000_000;
 /// Absolute-ns time at which a park's wheel timer should fire.
 ///
 /// Task #32 removed the global 10 ms lost-wake backstop on the premise that every
-/// readiness source fires a durable targeted wake. That holds for finite parks
-/// and for the gen/word-guarded futex & signal parks, but NOT for an infinite
-/// `net_io_wait` park: `IO_WAKERS` is unlatched and this park's generation
+/// readiness source fires a durable targeted wake. That holds for per-fd
+/// `Readiness` arms, finite parks, and the gen/word-guarded futex & signal parks,
+/// but NOT for a generic infinite `net_io_wait` park: `IO_WAKERS` is unlatched
+/// and this park's generation
 /// "guard" only REFRESHES — never COMPARES — its snapshot (see
 /// `refresh_io_wait_generation_after_registration`), so a `notify` /
 /// `wake_io_owner` landing in the scan→`register_io_waiter` window is dropped and
@@ -829,12 +837,20 @@ pub(crate) const NET_IO_WAIT_BACKSTOP_NS: u64 = 10_000_000;
 /// for the io-wait case only:
 /// - a FINITE park fires at its real `deadline_ns` (the io-waiter normally wakes
 ///   it earlier);
-/// - an INFINITE `net_io_wait` park re-polls after `NET_IO_WAIT_BACKSTOP_NS`, so
-///   a lost inbound-I/O wake costs one backstop period, not a permanent wedge;
+/// - an INFINITE generic `net_io_wait` park re-polls after
+///   `NET_IO_WAIT_BACKSTOP_NS`, so a lost inbound-I/O wake costs one backstop
+///   period, not a permanent wedge;
+/// - an INFINITE per-fd `Readiness` park stays timerless because its arm-vs-set
+///   lock makes a wake durable;
 /// - any OTHER infinite park keeps `u64::MAX` (inert timer): futex/signal
 ///   re-check their own condition after registering and cannot lose a wake.
-pub(crate) fn park_fire_deadline_ns(deadline_ns: u64, now_ns: u64, net_io_wait: bool) -> u64 {
-    if deadline_ns == u64::MAX && net_io_wait {
+pub(crate) fn park_fire_deadline_ns(
+    deadline_ns: u64,
+    now_ns: u64,
+    net_io_wait: bool,
+    durable_io_wait: bool,
+) -> u64 {
+    if deadline_ns == u64::MAX && net_io_wait && !durable_io_wait {
         now_ns.saturating_add(NET_IO_WAIT_BACKSTOP_NS)
     } else {
         deadline_ns
@@ -940,7 +956,8 @@ fn park_should_block(
                 }
             }
             // Net I/O wait (epoll/poll flagged inbound TCP): register + lost-wake guard.
-            if uc.net_io_wait.load(Ordering::Acquire) {
+            let durable_io_wait = uc.durable_io_wait.load(Ordering::Acquire);
+            if uc.net_io_wait.load(Ordering::Acquire) && !durable_io_wait {
                 if crate::handlers::register_io_waiter(task_id, waker.clone()) {
                     // A targeted wake (wake_io_owner) landed in the scan→register
                     // window and was latched; re-execute instead of parking so the
@@ -1071,9 +1088,8 @@ fn park_should_block(
                 }
             }
             // Park on the timer wheel. Finite sleeps/timeouts arm at their real
-            // deadline; infinite parks (u64::MAX) get an inert never-firing timer
-            // (task #32 deleted the ~10ms lost-wake backstop) and rely purely on
-            // the durable io/futex/signal/per-fd Readiness waker.
+            // deadline; infinite parks with a durable condition arm no timer and
+            // rely purely on their io/futex/signal/per-fd Readiness waker.
             //
             // The wheel deadline is ABSOLUTE TSC cycles compared against
             // `now_cycles()` in `fire_due`. `deadline`/`now` are absolute
@@ -1085,8 +1101,18 @@ fn park_should_block(
             // `accept()` with no io/futex waker) NEVER fires and the task
             // strands. This only bit the own-stack park path; the longjmp
             // `UserTaskFuture::poll` already used `ns_to_cycles`.
-            let fire_ns =
-                park_fire_deadline_ns(deadline, now, uc.net_io_wait.load(Ordering::Acquire));
+            let fire_ns = park_fire_deadline_ns(
+                deadline,
+                now,
+                uc.net_io_wait.load(Ordering::Acquire),
+                durable_io_wait,
+            );
+            // An infinite park with a durable condition waker needs no timer
+            // slot. Registering an inert u64::MAX entry still takes the global
+            // wheel lock on every park and cancel, serializing unrelated CPUs.
+            if fire_ns == u64::MAX {
+                return true;
+            }
             let fire_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
             // `refresh_waker_at`, NOT `refresh_waker`: the handle can outlive
             // an earlier park with a DIFFERENT deadline (a futex park broken
@@ -1138,6 +1164,7 @@ fn park_should_block(
         crate::handlers::drop_signal_waker(task_id);
         uc.sleep_deadline_ns.store(0, Ordering::Release);
         uc.net_io_wait.store(false, Ordering::Release);
+        uc.durable_io_wait.store(false, Ordering::Release);
         // Unqueue the futex waiter this park registered above. Linux's
         // `futex_unqueue` removes the waiter on EVERY exit — woken, timed out,
         // OR signal-interrupted. Leaving the entry queued makes a later
@@ -1278,6 +1305,7 @@ pub fn own_stack_park() {
         if uc.net_io_wait.load(Ordering::Acquire) {
             uc.sleep_deadline_ns.store(0, Ordering::Release);
             uc.net_io_wait.store(false, Ordering::Release);
+            uc.durable_io_wait.store(false, Ordering::Release);
             if let Some(h) = sleep_handle.take() {
                 narf_scheduler::narf_time::timer_wheel::cancel(h);
             }
@@ -2128,7 +2156,8 @@ impl core::future::Future for UserTaskFuture {
                 // our waker so inbound TCP data wakes us immediately
                 // (crate::handlers::wake_io_waiters via the net
                 // readiness hook) instead of waiting out the deadline.
-                if this.task.uctx.net_io_wait.load(Ordering::Acquire) {
+                let durable_io_wait = this.task.uctx.durable_io_wait.load(Ordering::Acquire);
+                if this.task.uctx.net_io_wait.load(Ordering::Acquire) && !durable_io_wait {
                     if crate::handlers::register_io_waiter(
                         crate::handlers::current_task_id(),
                         cx.waker().clone(),
@@ -2274,12 +2303,14 @@ impl core::future::Future for UserTaskFuture {
                     // `park_fire_deadline_ns`): `IO_WAKERS` is unlatched and the
                     // io-wait gen guard only refreshes its snapshot, so a wake
                     // racing scan→register would otherwise strand the task forever
-                    // (the CachyOS greeter wedge). sleep_pumps still run in the
-                    // executor's own idle path.
+                    // (the CachyOS greeter wedge). A per-fd Readiness arm sets
+                    // `durable_io_wait` and stays timerless. sleep_pumps still run
+                    // in the executor's own idle path.
                     let fire_ns = park_fire_deadline_ns(
                         deadline,
                         now,
                         this.task.uctx.net_io_wait.load(Ordering::Acquire),
+                        durable_io_wait,
                     );
                     if fire_ns != u64::MAX {
                         let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
@@ -2325,6 +2356,7 @@ impl core::future::Future for UserTaskFuture {
                     deadline,
                     now,
                     this.task.uctx.net_io_wait.load(Ordering::Acquire),
+                    durable_io_wait,
                 );
                 let deadline_cycles = narf_scheduler::narf_time::ns_to_cycles(fire_ns);
                 // `refresh_waker_at` — see the infinite-park note above.
@@ -2359,6 +2391,10 @@ impl core::future::Future for UserTaskFuture {
             crate::handlers::drop_signal_waker(crate::handlers::current_task_id());
             this.task.uctx.sleep_deadline_ns.store(0, Ordering::Release);
             this.task.uctx.net_io_wait.store(false, Ordering::Release);
+            this.task
+                .uctx
+                .durable_io_wait
+                .store(false, Ordering::Release);
             this.task
                 .uctx
                 .sem_wait_pending

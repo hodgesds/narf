@@ -9219,15 +9219,19 @@ pub(crate) fn own_stack_block(_ctx: &mut dyn TrapContext) {
 /// caller must fall back to a synchronous result.
 pub(crate) fn park_reexecute_on_io(ctx: &mut dyn TrapContext) -> bool {
     let deadline = narf_scheduler::narf_time::monotonic_ns().saturating_add(1_000_000);
-    park_reexecute_on_io_until(ctx, deadline)
+    park_reexecute_on_io_until(ctx, deadline, false)
 }
 
 /// Common net-I/O park setup. A durable per-fd [`Readiness`] arm passes
-/// `u64::MAX`: its arm-vs-set lock closes the lost-wake window, so a periodic
-/// retry would only create timer interrupts and spurious syscall re-execution.
-/// Providers without such a cell retain [`park_reexecute_on_io`]'s bounded
-/// backstop.
-fn park_reexecute_on_io_until(ctx: &mut dyn TrapContext, deadline: u64) -> bool {
+/// `u64::MAX` with `durable_io_wait`: its arm-vs-set lock closes the lost-wake
+/// window, so a periodic retry would only create timer interrupts and spurious
+/// syscall re-execution. Providers without such a cell retain
+/// [`park_reexecute_on_io`]'s bounded backstop.
+fn park_reexecute_on_io_until(
+    ctx: &mut dyn TrapContext,
+    deadline: u64,
+    durable_io_wait: bool,
+) -> bool {
     use core::sync::atomic::Ordering;
     if let (Some(uctx), Some(hook)) = (
         crate::user_task::current_user_task(),
@@ -9254,12 +9258,18 @@ fn park_reexecute_on_io_until(ctx: &mut dyn TrapContext, deadline: u64) -> bool 
             // check→park lost-wake guard.
             uc.futex_uaddr.store(0, Ordering::Release);
             uc.net_io_wait.store(true, Ordering::Release);
+            uc.durable_io_wait
+                .store(durable_io_wait, Ordering::Release);
             uc.epoll_park_gen
                 .store(narf_net::readiness::generation(), Ordering::Release);
             ctx.save_user_state(uc.state.get() as *mut u8);
             *uc.exit_reason.get() = crate::user_task::EXIT_REASON_YIELDED;
             if narf_scheduler::stackful::user_own_stack_enabled() {
                 own_stack_block(ctx);
+                // `own_stack_block` returns only after the park has ended. It
+                // normally clears the marker itself; cover the arm-raced-ready
+                // path too so a later generic I/O wait cannot inherit it.
+                uc.durable_io_wait.store(false, Ordering::Release);
                 return true;
             }
             hook(uctx);
@@ -9307,7 +9317,7 @@ pub(crate) fn park_reexecute_on_fd(
             // The provider checked the level and installed this task's waker
             // under the same per-fd lock used by `Readiness::set`.
             // There is no lost-wake window to poll with a 1 ms timer.
-            let parked = park_reexecute_on_io_until(ctx, u64::MAX);
+            let parked = park_reexecute_on_io_until(ctx, u64::MAX, true);
             ops.disarm_readiness(task);
             parked
         }
