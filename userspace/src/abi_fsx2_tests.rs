@@ -572,15 +572,18 @@ fn smoke_abi_fsx2_getxattr_copyout_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_getxattr_copyout_pos);
 
-// ── getxattr: EINVAL on an empty name ─────────────────────────────────
+// ── getxattr: ERANGE on an empty name ─────────────────────────────────
 //
 // xattr_get_core rejects an empty name before any lookup. Distinct from the
 // first file's getxattr ENODATA (unset attribute) case.
+// An empty xattr name is -ERANGE, not -EINVAL: `fs/xattr.c`'s
+// `import_xattr_name` takes the `error == 0` arm of
+// `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_getxattr_emptyname_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi/gn\0";
-        let name = b"\0"; // empty → EINVAL
+        let name = b"\0"; // empty → ERANGE
         let gargs = SyscallArgs {
             arg0: path.as_ptr() as u64,
             arg1: name.as_ptr() as u64,
@@ -589,8 +592,8 @@ fn smoke_abi_fsx2_getxattr_emptyname_neg() -> TestResult {
             ..Default::default()
         };
         match call(Syscall::Getxattr.raw(), gargs) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("getxattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("getxattr with an empty name must return -ERANGE"),
         }
     })
 }
@@ -645,19 +648,22 @@ fn smoke_abi_fsx2_listxattr_empty_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattr_empty_pos);
 
-// ── removexattr: EINVAL on an empty name ──────────────────────────────
+// ── removexattr: ERANGE on an empty name ──────────────────────────────
 //
 // xattr_remove_core rejects an empty name. The first file pins removexattr
 // ENODATA (unset attribute) but not the empty-name branch.
+// An empty xattr name is -ERANGE, not -EINVAL: `fs/xattr.c`'s
+// `import_xattr_name` takes the `error == 0` arm of
+// `if (error == 0 || error == sizeof(kname->name)) return -ERANGE;`.
 
 fn smoke_abi_fsx2_removexattr_emptyname_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi/rn\0";
-        let name = b"\0"; // empty → EINVAL
+        let name = b"\0"; // empty → ERANGE
         let rargs = a1(path.as_ptr() as u64, name.as_ptr() as u64);
         match call(Syscall::Removexattr.raw(), rargs) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("removexattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("removexattr with an empty name must return -ERANGE"),
         }
     })
 }

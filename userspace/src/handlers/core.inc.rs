@@ -4879,6 +4879,129 @@ fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
     fd_path_string_of(current_task_id(), fd)
 }
 
+// ── VFS-level xattr checks (fs/xattr.c) ──────────────────────────────
+//
+// These run BEFORE the filesystem is consulted, and in Linux's order, so
+// the errno a caller sees does not depend on which filesystem the path
+// landed on.
+
+/// `XATTR_NAME_MAX + 1` — the `struct xattr_name` buffer `import_xattr_name`
+/// copies into.
+const XATTR_NAME_BUF: usize = 256;
+/// `XATTR_SIZE_MAX` (include/uapi/linux/limits.h).
+const XATTR_SIZE_MAX: usize = 65536;
+
+/// `fs/xattr.c::import_xattr_name`.
+///
+/// `strncpy_from_user` into a 256-byte buffer, then:
+///
+/// ```text
+/// if (error == 0 || error == sizeof(kname->name))
+///         return -ERANGE;
+/// ```
+///
+/// So an EMPTY name and a name that fills the buffer are both **ERANGE**,
+/// not EINVAL — `getfattr -n ''` gets "Numerical result out of range", and
+/// a caller testing for ERANGE to grow a buffer must not be told EINVAL.
+fn xattr_import_name(ptr: u64) -> Result<alloc::string::String, i64> {
+    // `copy_user_cstr_checked` keeps the two failures apart the way
+    // `strncpy_from_user` does: a bad pointer is EFAULT (14), a string that
+    // fills the buffer with no terminator is "too long" (36). Only the
+    // latter is `error == sizeof(kname->name)`, and an xattr name reports
+    // it as ERANGE rather than the ENAMETOOLONG a pathname would.
+    const TOO_LONG: i64 = 36;
+    match copy_user_cstr_checked(ptr, XATTR_NAME_BUF) {
+        Ok(name) if !name.is_empty() => Ok(name),
+        Ok(_) | Err(TOO_LONG) => Err(XE_RANGE),
+        Err(_) => Err(XE_FAULT),
+    }
+}
+
+/// `fs/xattr.c::xattr_resolve_name` + `xattr_permission`, for the handler
+/// set every NARF filesystem with xattrs presents (`security`, `trusted`,
+/// `user`, and `system` for the two POSIX ACL names).
+///
+/// `write` selects Linux's asymmetry: a namespace the caller may not touch
+/// answers `-EPERM` to a set/remove and `-ENODATA` to a get, so a
+/// `getxattr` can never be used to probe for the existence of an attribute
+/// the caller is not allowed to read.
+fn xattr_namespace_ok(name: &str, write: bool) -> Result<(), i64> {
+    if name.starts_with("security.") {
+        return Ok(());
+    }
+    // `xattr_permission` waves `system.*` through to the filesystem, but on
+    // every filesystem NARF has the only `system.*` handlers are the two
+    // POSIX ACL names; anything else fails to resolve to a handler, which
+    // is `xattr_resolve_name`'s -EOPNOTSUPP.
+    if name.starts_with("system.") {
+        return if is_acl_xattr(name) {
+            Ok(())
+        } else {
+            Err(XE_OPNOTSUPP)
+        };
+    }
+    if name.starts_with("trusted.") {
+        // "The trusted.* namespace can only be accessed by privileged
+        // users."
+        if !capable(CAP_SYS_ADMIN) {
+            return Err(if write { XE_PERM } else { XE_NODATA });
+        }
+        return Ok(());
+    }
+    if name.starts_with("user.") {
+        return Ok(());
+    }
+    // No handler for this prefix: `xattr_resolve_name` returns -EOPNOTSUPP.
+    Err(XE_OPNOTSUPP)
+}
+
+// Negative errno values for the xattr family, as the syscall return
+// convention wants them. Prefixed so they cannot be confused with the
+// positive-errno constants elsewhere in this file.
+const XE_RANGE: i64 = -34;
+const XE_NODATA: i64 = -61;
+const XE_OPNOTSUPP: i64 = -95;
+const XE_PERM: i64 = -1;
+const XE_2BIG: i64 = -7;
+const XE_EXIST: i64 = -17;
+const XE_INVAL: i64 = -22;
+const XE_FAULT: i64 = -14;
+const XE_ACCES: i64 = -13;
+const XE_NOSPC: i64 = -28;
+const XE_DQUOT: i64 = -122;
+const XE_IO: i64 = -5;
+
+/// Map an `FsError` from an xattr operation onto Linux's errno.
+///
+/// `Unsupported` is the one that must NOT be translated here: it means the
+/// backing filesystem has no xattr store, and the caller falls through to
+/// the generic side table instead.
+fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
+    use narf_filesystem::FsError;
+    Some(match error {
+        FsError::Unsupported => return None,
+        // `simple_xattr_set`: XATTR_CREATE on an existing attribute.
+        FsError::Busy => XE_EXIST,
+        FsError::NotFound => XE_NODATA,
+        // `xattr_permission`: `user.*` on an inode that is neither a
+        // regular file nor a directory.
+        FsError::OperationNotPermitted => XE_PERM,
+        FsError::PermissionDenied => XE_ACCES,
+        // `shmem_xattr_handler_set` when the mount's inode space is gone.
+        FsError::NoSpace => XE_NOSPC,
+        FsError::QuotaExceeded => XE_DQUOT,
+        FsError::InvalidData => XE_INVAL,
+        _ => XE_IO,
+    })
+}
+
+/// The directory at `path`, for the xattr calls — a directory is an inode
+/// with extended attributes, but path resolution hands back `DirOps` for
+/// one, so `xattr_file` can never see it.
+fn xattr_dir(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
+    resolve_dir_absolute(path)
+}
+
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
     let (root, rel) = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
         (fs.root(), alloc::string::String::from(rel))
@@ -4903,14 +5026,31 @@ fn is_acl_xattr(name: &str) -> bool {
 
 fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let name = match copy_user_cstr(a.arg1, 256) {
-        Some(n) if !n.is_empty() => n,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    let size = a.arg3 as usize;
+    let flags = a.arg4;
+    // `setxattr_copy` order: flags, then the name, then the value size.
+    // Only the two documented bits are legal; note that CREATE|REPLACE
+    // TOGETHER is not rejected here — `simple_xattr_set` fails it with
+    // EEXIST or ENODATA depending on whether the attribute exists.
+    if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+        ctx.set_return(SyscallReturn::ok(XE_INVAL as u64));
+        return;
+    }
+    let name = match xattr_import_name(a.arg1) {
+        Ok(name) => name,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
-    let size = a.arg3 as usize;
+    if size > XATTR_SIZE_MAX {
+        ctx.set_return(SyscallReturn::ok(XE_2BIG as u64));
+        return;
+    }
+    if let Err(errno) = xattr_namespace_ok(&name, true) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let value = if size == 0 {
         alloc::vec::Vec::new()
     } else {
@@ -4918,75 +5058,53 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         match unsafe { copy_from_user_vec(a.arg2, size) } {
             Ok(v) => v,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(SyscallReturn::ok(XE_FAULT as u64));
                 return;
             }
         }
     };
-    let flags = a.arg4;
-    if let Some(file) = xattr_file(&path) {
-        match poll_blocking(file.set_xattr(&name, &value, flags as u32)) {
-            Some(Ok(())) => {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            // `Unsupported` is ambiguous and the two readings need
-            // different answers. For an ORDINARY xattr it means "this
-            // filesystem has no xattr store", and falling through to the
-            // generic table below is right. For an ACL name it is
-            // `posix_acl_fix_xattr_common`'s `a_version !=
-            // POSIX_ACL_XATTR_VERSION` -> -EOPNOTSUPP, and falling through
-            // would STORE the rejected bytes raw — worse than any errno,
-            // because a later read would hand back an ACL the kernel
-            // refused.
-            Some(Err(narf_filesystem::FsError::Unsupported)) if is_acl_xattr(&name) => {
-                ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
-                return;
-            }
-            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            Some(Err(narf_filesystem::FsError::Busy)) => {
-                ctx.set_return(SyscallReturn::ok((-17i64) as u64));
-                return;
-            }
-            Some(Err(narf_filesystem::FsError::NotFound)) => {
-                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
-                return;
-            }
-            Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
-                ctx.set_return(SyscallReturn::ok((-122i64) as u64));
-                return;
-            }
-            // `posix_acl_fix_xattr_common` rejects a short or ragged buffer
-            // and an unknown tag with -EINVAL, and `posix_acl_valid` uses
-            // the same. These reached the -EIO arm below, so `setfacl` on a
-            // malformed ACL reported an I/O error — which sends the reader
-            // looking at the disk instead of at their ACL.
-            Some(Err(narf_filesystem::FsError::InvalidData)) => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
-                return;
-            }
-            // `if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode))
-            //      return acl ? -EACCES : 0;`
-            Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-                ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
-                return;
-            }
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+    // A path can name a file or a directory; both are inodes with xattrs.
+    let stored = match xattr_file(&path) {
+        Some(file) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
+        None => {
+            xattr_dir(&path).and_then(|dir| poll_blocking(dir.set_xattr(&name, &value, flags as u32)))
+        }
+    };
+    match stored {
+        Some(Ok(())) => {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        // `Unsupported` is ambiguous and the two readings need different
+        // answers. For an ORDINARY xattr it means "this filesystem has no
+        // xattr store", and falling through to the generic table below is
+        // right. For an ACL name it is `posix_acl_fix_xattr_common`'s
+        // `a_version != POSIX_ACL_XATTR_VERSION` -> -EOPNOTSUPP, and
+        // falling through would STORE the rejected bytes raw — worse than
+        // any errno, because a later read would hand back an ACL the
+        // kernel refused.
+        Some(Err(narf_filesystem::FsError::Unsupported)) if is_acl_xattr(&name) => {
+            ctx.set_return(SyscallReturn::ok(XE_OPNOTSUPP as u64));
+            return;
+        }
+        Some(Err(error)) => {
+            if let Some(errno) = xattr_errno(error) {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
                 return;
             }
         }
+        None => {}
     }
     let key = (path, name);
     let mut g = XATTR_TABLE.lock();
     let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     let exists = m.contains_key(&key);
     if flags & XATTR_CREATE != 0 && exists {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+        ctx.set_return(SyscallReturn::ok(XE_EXIST as u64));
         return;
     }
     if flags & XATTR_REPLACE != 0 && !exists {
-        ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+        ctx.set_return(SyscallReturn::ok(XE_NODATA as u64));
         return;
     }
     m.insert(key, value);
@@ -4997,36 +5115,40 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 /// arg2, size at arg3).
 fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let name = match copy_user_cstr(a.arg1, 256) {
-        Some(n) if !n.is_empty() => n,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    let name = match xattr_import_name(a.arg1) {
+        Ok(name) => name,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
+    if let Err(errno) = xattr_namespace_ok(&name, false) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let size = a.arg3 as usize;
-    if let Some(file) = xattr_file(&path) {
-        match poll_blocking(file.get_xattr(&name)) {
-            Some(Ok(value)) => {
-                return xattr_copy_value(ctx, a.arg2, size, &value);
-            }
-            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            Some(Err(narf_filesystem::FsError::NotFound)) => {
-                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
-                return;
-            }
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+    let fetched = match xattr_file(&path) {
+        Some(file) => poll_blocking(file.get_xattr(&name)),
+        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.get_xattr(&name))),
+    };
+    match fetched {
+        Some(Ok(value)) => {
+            return xattr_copy_value(ctx, a.arg2, size, &value);
+        }
+        Some(Err(error)) => {
+            if let Some(errno) = xattr_errno(error) {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
                 return;
             }
         }
+        None => {}
     }
     let value = {
         let g = XATTR_TABLE.lock();
         match g.as_ref().and_then(|m| m.get(&(path, name)).cloned()) {
             Some(v) => v,
             None => {
-                ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+                ctx.set_return(SyscallReturn::ok(XE_NODATA as u64));
                 return;
             }
         }
@@ -5052,17 +5174,21 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
-    if let Some(file) = xattr_file(&path) {
-        match poll_blocking(file.list_xattr()) {
-            Some(Ok(names)) => {
-                return xattr_copy_value(ctx, a.arg1, size, &names);
-            }
-            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+    let listed = match xattr_file(&path) {
+        Some(file) => poll_blocking(file.list_xattr()),
+        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.list_xattr())),
+    };
+    match listed {
+        Some(Ok(names)) => {
+            return xattr_copy_value(ctx, a.arg1, size, &names);
+        }
+        Some(Err(error)) => {
+            if let Some(errno) = xattr_errno(error) {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
                 return;
             }
         }
+        None => {}
     }
     let mut names: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
     {
@@ -5095,29 +5221,33 @@ fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
 /// `removexattr` / `lremovexattr` / `fremovexattr` core (name at arg1).
 fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
-    let name = match copy_user_cstr(a.arg1, 256) {
-        Some(n) if !n.is_empty() => n,
-        _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+    let name = match xattr_import_name(a.arg1) {
+        Ok(name) => name,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
             return;
         }
     };
-    if let Some(file) = xattr_file(&path) {
-        match poll_blocking(file.remove_xattr(&name)) {
-            Some(Ok(())) => {
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
-            Some(Err(narf_filesystem::FsError::NotFound)) => {
-                ctx.set_return(SyscallReturn::ok((-61i64) as u64));
-                return;
-            }
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+    if let Err(errno) = xattr_namespace_ok(&name, true) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let removed = match xattr_file(&path) {
+        Some(file) => poll_blocking(file.remove_xattr(&name)),
+        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.remove_xattr(&name))),
+    };
+    match removed {
+        Some(Ok(())) => {
+            ctx.set_return(SyscallReturn::ok(0));
+            return;
+        }
+        Some(Err(error)) => {
+            if let Some(errno) = xattr_errno(error) {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
                 return;
             }
         }
+        None => {}
     }
     let removed = {
         let mut g = XATTR_TABLE.lock();
@@ -5126,7 +5256,7 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     if removed == Some(true) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
-        ctx.set_return(SyscallReturn::ok((-61i64) as u64)); // ENODATA
+        ctx.set_return(SyscallReturn::ok(XE_NODATA as u64));
     }
 }
 

@@ -716,8 +716,14 @@ fn smoke_acl_memfs_mode_coherence() -> TestResult {
     if file.stat().mode.perms != before {
         return TestResult::Fail("removexattr of an ACL changed the mode");
     }
-    if poll_once(file.remove_xattr(XATTR_NAME_POSIX_ACL_ACCESS)) != Some(Err(FsError::NotFound)) {
-        return TestResult::Fail("removexattr of an absent access ACL did not report ENODATA");
+    // An ABSENT access ACL is also a silent success, not ENODATA.
+    // `fs/xattr.c::removexattr` sends both ACL names to `vfs_remove_acl`,
+    // which ends at `set_posix_acl(type, NULL)` -> `simple_set_acl(NULL)`
+    // -> `set_cached_acl(inode, type, NULL); return 0;`. Nothing on that
+    // path asks whether an ACL was cached, so there is no arm that can
+    // produce ENODATA — this test used to assert the opposite.
+    if poll_once(file.remove_xattr(XATTR_NAME_POSIX_ACL_ACCESS)) != Some(Ok(())) {
+        return TestResult::Fail("removexattr of an absent access ACL must still return 0");
     }
     TestResult::Pass
 }

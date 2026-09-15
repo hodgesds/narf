@@ -24,6 +24,10 @@ const ENODATA: i64 = -61;
 // "loop, on the same file system" arm needs it.
 const EBUSY: i64 = -16;
 
+// E2BIG isn't in the shared harness errno set; `setxattr`'s
+// XATTR_SIZE_MAX rejection needs it. (ERANGE and EOPNOTSUPP are.)
+const E2BIG: i64 = -7;
+
 // A user-half address with nothing mapped behind it: every copy_from_user
 // against it faults, which is how the -EFAULT arms below are reached.
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
@@ -67,9 +71,16 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_pos);
 
 fn smoke_abi_fsx_setxattr_neg() -> TestResult {
     with_setup(|| {
-        // Empty/unreadable name → EINVAL (name pointer is NUL-terminated
-        // empty string here: copy_user_cstr returns "" which the handler
-        // rejects).
+        // An empty name is -ERANGE, not -EINVAL.
+        // `fs/xattr.c::import_xattr_name`:
+        //
+        //     error = strncpy_from_user(kname->name, name, sizeof(kname->name));
+        //     if (error == 0 || error == sizeof(kname->name))
+        //             return -ERANGE;
+        //
+        // `strncpy_from_user` returns the copied length, so an empty string
+        // returns 0 and takes the ERANGE arm. NARF reported EINVAL, which
+        // sends a caller looking at its flags instead of its name buffer.
         let path = b"/abi/x\0";
         let name = b"\0";
         let val = b"v";
@@ -82,12 +93,151 @@ fn smoke_abi_fsx_setxattr_neg() -> TestResult {
             ..Default::default()
         };
         match call(Syscall::Setxattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("setxattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("setxattr with an empty name must return -ERANGE"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_neg);
+
+/// The VFS-level `setxattr` rejections, in `setxattr_copy`'s order.
+///
+/// All four were missing, so a caller got either success or the wrong
+/// errno: an unknown namespace was silently stored in NARF's side table
+/// and read back, which is worse than any errno — `getfattr` then reports
+/// an attribute the kernel never accepted.
+fn smoke_abi_fsx_setxattr_vfs_rejections() -> TestResult {
+    with_setup(|| {
+        let path = b"/abi/x\0";
+        let val = b"v";
+        let set = |name: &[u8], size: u64, flags: u64| {
+            call(
+                Syscall::Setxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: val.as_ptr() as u64,
+                    arg3: size,
+                    arg4: flags,
+                    ..Default::default()
+                },
+            )
+        };
+        // `if (ctx->flags & ~(XATTR_CREATE|XATTR_REPLACE)) return -EINVAL;`
+        if set(b"user.k\0", 1, 4) != Some(EINVAL) {
+            return Err("an unknown setxattr flag must return -EINVAL");
+        }
+        // A name that fills the 256-byte `struct xattr_name` buffer: ERANGE.
+        let mut long = [b'a'; 300];
+        long[..5].copy_from_slice(b"user.");
+        long[299] = 0;
+        if set(&long, 1, 0) != Some(ERANGE) {
+            return Err("an over-long xattr name must return -ERANGE");
+        }
+        // `if (ctx->size > XATTR_SIZE_MAX) return -E2BIG;` — checked
+        // before the value is copied, so the bogus length is enough.
+        if set(b"user.k\0", 65537, 0) != Some(E2BIG) {
+            return Err("a value over XATTR_SIZE_MAX must return -E2BIG");
+        }
+        // `xattr_resolve_name` finds no handler for an unknown prefix.
+        if set(b"nosuch.k\0", 1, 0) != Some(EOPNOTSUPP) {
+            return Err("an unknown xattr namespace must return -EOPNOTSUPP");
+        }
+        // `system.*` resolves only for the two POSIX ACL names.
+        if set(b"system.bogus\0", 1, 0) != Some(EOPNOTSUPP) {
+            return Err("a non-ACL system.* name must return -EOPNOTSUPP");
+        }
+        // The read side of an unresolvable name is ENODATA, never a
+        // success that would let a caller probe the namespace.
+        let unknown = b"nosuch.k\0";
+        let get = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: unknown.as_ptr() as u64,
+                arg2: 0,
+                arg3: 0,
+                ..Default::default()
+            },
+        );
+        if get != Some(EOPNOTSUPP) {
+            return Err("getxattr of an unknown namespace must return -EOPNOTSUPP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_vfs_rejections);
+
+/// A DIRECTORY is an inode with extended attributes.
+///
+/// Path resolution hands back `DirOps` for a directory, so the xattr
+/// handlers — which only ever asked for `FileOps` — could never reach one.
+/// Every `setfattr` on a directory silently landed in the path-keyed side
+/// table instead: it survived the directory being removed, did not follow a
+/// rename, and was invisible to the filesystem that owned the inode.
+fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
+    with_setup(|| {
+        // `/tmp` is a MemFs mount in the harness, so its root is a real
+        // tmpfs directory inode.
+        let path = b"/tmp\0";
+        let name = b"user.label\0";
+        let val = b"dir";
+        let set = call(
+            Syscall::Setxattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: name.as_ptr() as u64,
+                arg2: val.as_ptr() as u64,
+                arg3: val.len() as u64,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if set != Some(0) {
+            return Err("setxattr on a directory should succeed");
+        }
+        let mut out = [0u8; 8];
+        let got = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: name.as_ptr() as u64,
+                arg2: out.as_mut_ptr() as u64,
+                arg3: out.len() as u64,
+                ..Default::default()
+            },
+        );
+        if got != Some(val.len() as i64) || &out[..val.len()] != val {
+            return Err("getxattr on a directory did not read back the value");
+        }
+        // The attribute must live on the INODE, which is what makes it
+        // visible through the filesystem rather than through a path table.
+        let dir = match narf_filesystem::registry().resolve_absolute("/tmp", |fs, _| fs.root()) {
+            Some(dir) => dir,
+            None => return Err("/tmp is not mounted in this harness"),
+        };
+        match crate::handlers::poll_blocking(dir.get_xattr("user.label")) {
+            Some(Ok(stored)) if stored == val => {}
+            _ => return Err("the directory xattr did not reach the filesystem inode"),
+        }
+        if call(
+            Syscall::Removexattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: name.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("removexattr on a directory should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_directory_xattr_reaches_the_inode
+);
 
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
@@ -268,7 +418,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_lsetxattr_pos);
 fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi/lx\0";
-        let name = b"\0"; // empty name → EINVAL
+        // Empty name → ERANGE (`import_xattr_name`), not EINVAL.
+        let name = b"\0";
         let val = b"v";
         let args = SyscallArgs {
             arg0: path.as_ptr() as u64,
@@ -279,8 +430,8 @@ fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
             ..Default::default()
         };
         match call(Syscall::Lsetxattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("lsetxattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("lsetxattr with an empty name must return -ERANGE"),
         }
     })
 }

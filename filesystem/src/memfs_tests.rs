@@ -1072,6 +1072,243 @@ fn smoke_tmpfs_show_options_matches_shmem() -> TestResult {
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_show_options_matches_shmem);
 
+/// Every tmpfs inode type holds extended attributes, with Linux's
+/// `user.*` restriction.
+///
+/// `shmem_xattr_handlers` hangs off the SUPERBLOCK and
+/// `shmem_{inode,dir,special,symlink}_inode_operations` all carry
+/// `.listxattr`, so a directory, a symlink, a device node and a FIFO take
+/// attributes just as a regular file does. NARF had them on regular files
+/// only, so an SELinux label on a directory, or `setfattr` on `/tmp`
+/// itself, had nowhere to go — the syscall layer silently diverted it into
+/// a path-keyed side table that no `unlink` or `rename` ever cleaned up.
+///
+/// `fs/xattr.c::xattr_permission` is the other half: "In the `user.*`
+/// namespace, only regular files and directories can have extended
+/// attributes", and a write to one elsewhere is EPERM.
+fn smoke_tmpfs_xattrs_on_every_inode_type() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=32", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+
+    // A directory takes `user.*`, and round-trips through DirOps.
+    let dir = match poll_once(root.mkdir("labelled")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if poll_once(dir.set_xattr("user.owner", b"narf", 0)).map(|r| r.is_ok()) != Some(true)
+        || poll_once(dir.get_xattr("user.owner")) != Some(Ok(b"narf".to_vec()))
+        || poll_once(dir.list_xattr()) != Some(Ok(b"user.owner\0".to_vec()))
+    {
+        return TestResult::Fail("tmpfs directory xattr round-trip failed");
+    }
+    if poll_once(dir.set_xattr("security.selinux", b"ctx", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs directory rejected a security.* xattr");
+    }
+    if poll_once(dir.remove_xattr("user.owner")).map(|r| r.is_ok()) != Some(true)
+        || !matches!(
+            poll_once(dir.remove_xattr("user.owner")),
+            Some(Err(FsError::NotFound))
+        )
+    {
+        return TestResult::Fail("tmpfs directory xattr removal is wrong");
+    }
+
+    // A symlink, a device node and a FIFO take the privileged namespaces
+    // but refuse `user.*` with EPERM.
+    let link = match poll_once(root.symlink("link", "/target")) {
+        Some(Ok(link)) => link,
+        _ => return TestResult::Fail("tmpfs symlink failed"),
+    };
+    let dev = match poll_once(root.mknod("dev", FileType::Special, 0x0103)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mknod failed"),
+    };
+    let fifo = match poll_once(root.mknod("pipe", FileType::Fifo, 0)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mkfifo failed"),
+    };
+    for node in [&link, &dev, &fifo] {
+        if poll_once(node.set_xattr("security.selinux", b"ctx", 0)).map(|r| r.is_ok()) != Some(true)
+            || poll_once(node.get_xattr("security.selinux")) != Some(Ok(b"ctx".to_vec()))
+        {
+            return TestResult::Fail("tmpfs non-regular inode lost a security.* xattr");
+        }
+        if !matches!(
+            poll_once(node.set_xattr("user.nope", b"x", 0)),
+            Some(Err(FsError::OperationNotPermitted))
+        ) {
+            return TestResult::Fail("user.* was accepted on a non-regular, non-directory inode");
+        }
+        // A remove carries MAY_WRITE too, so it is EPERM and not ENODATA.
+        if !matches!(
+            poll_once(node.remove_xattr("user.nope")),
+            Some(Err(FsError::OperationNotPermitted))
+        ) {
+            return TestResult::Fail("removexattr of user.* did not report EPERM");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattrs_on_every_inode_type);
+
+/// Extended attributes are charged against the `nr_inodes=` budget.
+///
+/// tmpfs does not count inodes: it budgets `free_ispace` BYTES, where an
+/// inode costs `BOGO_INODE_SIZE` (1024) and an attribute costs
+/// `simple_xattr_space(name, size)` = `40 + size + strlen(name)`
+/// (`mm/shmem.c::shmem_xattr_handler_set`). So attributes make `statfs`
+/// report fewer free inodes, a full mount refuses a new one with ENOSPC,
+/// and evicting the inode returns `BOGO_INODE_SIZE + freed_ispace` in one
+/// step (`shmem_free_inode`).
+fn smoke_tmpfs_xattr_inode_space_budget() -> TestResult {
+    // 8 inodes = 8192 bytes of inode space.
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let free = || match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => u64::MAX,
+    };
+    // Root inode only: 8192 - 1024 = 7168 bytes -> 7 free inodes.
+    if free() != 7 {
+        return TestResult::Fail("fresh tmpfs did not report free inodes as free_ispace/1024");
+    }
+    let file = match poll_once(root.create("charged")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if free() != 6 {
+        return TestResult::Fail("an inode did not cost BOGO_INODE_SIZE of inode space");
+    }
+    // simple_xattr_space("user.big", 2048) = 40 + 2048 + 8 = 2096 bytes.
+    // Used inode space becomes 2048 + 2096 = 4144, so the free count is
+    // (8192 - 4144) / 1024 = 3 — an xattr is not free, and it is not
+    // rounded to a whole notional inode either.
+    let big = alloc::vec![0xA5u8; 2048];
+    if poll_once(file.set_xattr("user.big", &big, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs xattr set failed");
+    }
+    if free() != 3 {
+        return TestResult::Fail("an xattr did not consume the inode-space budget");
+    }
+    // Replacing it with a small value gives the difference back:
+    // 2048 + (40 + 4 + 8) = 2100 used, so (8192 - 2100) / 1024 = 5.
+    if poll_once(file.set_xattr("user.big", b"tiny", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs xattr replace failed");
+    }
+    if free() != 5 {
+        return TestResult::Fail("replacing an xattr did not release the old value's space");
+    }
+    // Fill the remaining space with attributes and confirm the mount then
+    // refuses BOTH a new attribute and a new inode, with ENOSPC.
+    let filler = alloc::vec![0u8; 1024];
+    let mut set = 0;
+    loop {
+        let name = alloc::format!("user.f{}", set);
+        match poll_once(file.set_xattr(&name, &filler, 0)) {
+            Some(Ok(())) => set += 1,
+            Some(Err(FsError::NoSpace)) => break,
+            _ => return TestResult::Fail("unexpected error filling the inode-space budget"),
+        }
+        if set > 16 {
+            return TestResult::Fail("xattrs never exhausted the inode-space budget");
+        }
+    }
+    if !matches!(
+        poll_once(root.create("denied")),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("xattrs did not consume the budget a new inode needs");
+    }
+    // Evicting the inode returns its BOGO_INODE_SIZE *and* every byte its
+    // attributes held, so the mount is usable again.
+    if poll_once(root.unlink("charged")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs unlink failed");
+    }
+    drop(file);
+    // Only the root inode is left: (8192 - 1024) / 1024 = 7.
+    if free() != 7 {
+        return TestResult::Fail("evicting an inode did not return its xattr space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattr_inode_space_budget);
+
+/// `XATTR_CREATE` / `XATTR_REPLACE` follow `fs/xattr.c::simple_xattr_set`.
+///
+/// It tests the flag BITS, and tests CREATE first. Passing both is
+/// therefore not EINVAL: it is EEXIST when the attribute is present and
+/// ENODATA when it is not. Only a bit outside the pair is EINVAL, and that
+/// check lives in `setxattr_copy` before the filesystem is reached.
+fn smoke_tmpfs_xattr_flag_semantics() -> TestResult {
+    const XATTR_CREATE: u32 = 1;
+    const XATTR_REPLACE: u32 = 2;
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("flags")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // REPLACE before the attribute exists → ENODATA.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_REPLACE)),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("XATTR_REPLACE on a missing attribute is not ENODATA");
+    }
+    // Both flags, attribute missing → ENODATA (not EINVAL).
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE | XATTR_REPLACE)),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("CREATE|REPLACE on a missing attribute is not ENODATA");
+    }
+    if poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("XATTR_CREATE of a new attribute failed");
+    }
+    // CREATE over an existing attribute → EEXIST, and so does both-flags.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE)),
+        Some(Err(FsError::Busy))
+    ) || !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE | XATTR_REPLACE)),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("XATTR_CREATE over an existing attribute is not EEXIST");
+    }
+    // A bit outside the documented pair → EINVAL.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", 4)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an unknown setxattr flag was accepted");
+    }
+    // A failed set must not leak the inode space it provisionally charged.
+    let before = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => return TestResult::Fail("tmpfs statfs failed"),
+    };
+    for _ in 0..8 {
+        let _ = poll_once(file.set_xattr("user.k", b"vvvv", XATTR_CREATE));
+    }
+    let after = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => return TestResult::Fail("tmpfs statfs failed"),
+    };
+    if before != after {
+        return TestResult::Fail("a rejected setxattr leaked inode space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattr_flag_semantics);
+
 /// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
 /// users are unaffected, and chown transfers the charge to the new owner.
 fn smoke_tmpfs_usrquota_blocks_and_transfer() -> TestResult {

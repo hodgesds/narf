@@ -510,41 +510,23 @@ impl QuotaTable {
     }
 }
 
+/// The per-id quota tables — the only superblock state that needs a lock.
+///
+/// Capacity counters deliberately live OUTSIDE this, as atomics on
+/// [`MemSuper`]. Linux keeps `used_blocks` in a `percpu_counter` and reaches
+/// for `sbinfo->stat_lock` only for the inode-space bookkeeping and remount
+/// (`shmem_inode_acct_blocks` uses `percpu_counter_limited_add`), precisely
+/// so a mount-wide lock is not in the path of every page a writer dirties.
+/// A single spinlock covering the counters made every concurrent writer on
+/// one tmpfs serialise against every other, which is the wrong shape for
+/// `/tmp` under parallel builds.
 #[derive(Debug)]
-struct SuperState {
-    max_blocks: Option<u64>,
-    used_blocks: u64,
-    /// `nr_inodes=` as a count; `None` is unlimited.
-    max_inodes: Option<u64>,
-    /// Inode space in USE, in bytes — the complement of Linux's
-    /// `free_ispace`. An inode costs [`BOGO_INODE_SIZE`] and an extended
-    /// attribute costs `simple_xattr_space()`, so xattrs eat into the same
-    /// budget `nr_inodes=` sets and show up in `statfs`'s `f_ffree`,
-    /// exactly as on Linux.
-    used_ispace: u64,
+struct QuotaState {
     usr: QuotaTable,
     grp: QuotaTable,
 }
 
-impl SuperState {
-    /// Inode-space budget in bytes, or `None` when `nr_inodes=0` made the
-    /// mount unlimited.
-    fn max_ispace(&self) -> Option<u64> {
-        self.max_inodes
-            .map(|count| count.saturating_mul(BOGO_INODE_SIZE))
-    }
-
-    /// Inodes still chargeable — Linux `shmem_statfs`'s
-    /// `free_ispace / BOGO_INODE_SIZE`.
-    fn free_inodes(&self) -> u64 {
-        match self.max_ispace() {
-            Some(max) => max.saturating_sub(self.used_ispace) / BOGO_INODE_SIZE,
-            None => 0,
-        }
-    }
-}
-
-impl SuperState {
+impl QuotaState {
     /// Charge `blocks`/`inodes` to the file owner (`uid`,`gid`) against every
     /// active quota, all-or-nothing: if any per-id limit would be exceeded,
     /// nothing is mutated and `QuotaExceeded` is returned.
@@ -626,7 +608,27 @@ impl SuperState {
 #[derive(Debug)]
 struct MemSuper {
     kind: MemFsKind,
-    state: IrqSafeSpinLock<SuperState>,
+    /// Mount-wide block limit in 4-KiB pages. **0 is unlimited**, which is
+    /// Linux's own encoding for `sbinfo->max_blocks` — keeping the same
+    /// sentinel lets this be a plain atomic instead of a locked `Option`.
+    max_blocks: AtomicU64,
+    /// Blocks in use. Atomic, not lock-protected: this is the counter every
+    /// page of every write touches, and Linux keeps its equivalent in a
+    /// `percpu_counter` for exactly that reason.
+    used_blocks: AtomicU64,
+    /// `nr_inodes=` as a count; 0 is unlimited.
+    max_inodes: AtomicU64,
+    /// Inode space in USE, in bytes — the complement of Linux's
+    /// `free_ispace`. An inode costs [`BOGO_INODE_SIZE`] and an extended
+    /// attribute costs `simple_xattr_space()`, so xattrs eat into the same
+    /// budget `nr_inodes=` sets and show up in `statfs`'s `f_ffree`,
+    /// exactly as on Linux.
+    used_ispace: AtomicU64,
+    /// True while either quota kind is on. Read before taking [`Self::quotas`]
+    /// so the overwhelmingly common quota-free mount never takes the lock at
+    /// all on an allocation.
+    quota_active: core::sync::atomic::AtomicBool,
+    quotas: IrqSafeSpinLock<QuotaState>,
     /// True for a superblock minted by [`new_anon_file`] — an inode that
     /// belongs to no MOUNTED filesystem.
     ///
@@ -689,21 +691,32 @@ impl MemSuper {
         Arc::new(Self {
             anonymous: core::sync::atomic::AtomicBool::new(false),
             kind,
-            state: IrqSafeSpinLock::new(SuperState {
-                max_blocks,
-                used_blocks: 0,
-                max_inodes,
-                used_ispace: 0,
-                usr,
-                grp,
-            }),
+            max_blocks: AtomicU64::new(max_blocks.unwrap_or(0)),
+            used_blocks: AtomicU64::new(0),
+            max_inodes: AtomicU64::new(max_inodes.unwrap_or(0)),
+            used_ispace: AtomicU64::new(0),
+            quota_active: core::sync::atomic::AtomicBool::new(usrquota || grpquota),
+            quotas: IrqSafeSpinLock::new(QuotaState { usr, grp }),
         })
+    }
+
+    /// Inode-space budget in bytes; 0 when the mount is unlimited.
+    fn max_ispace(&self) -> u64 {
+        self.max_inodes
+            .load(Ordering::Relaxed)
+            .saturating_mul(BOGO_INODE_SIZE)
+    }
+
+    /// Recompute `quota_active` after a `quotactl` turned a kind on or off.
+    fn refresh_quota_active(&self, state: &QuotaState) {
+        self.quota_active
+            .store(state.usr.on || state.grp.on, Ordering::Release);
     }
 
     /// The mount's default quota hard limits, as parsed from its mount
     /// options. Used by remount validation and `show_options`.
     fn quota_defaults(&self) -> QuotaDefaults {
-        let state = self.state.lock();
+        let state = self.quotas.lock();
         QuotaDefaults {
             usrquota_bhardlimit: state.usr.default_space_hard,
             usrquota_ihardlimit: state.usr.default_inodes_hard,
@@ -712,59 +725,117 @@ impl MemSuper {
         }
     }
 
-    /// Reserve `blocks` for the file owned by (`uid`,`gid`): enforces the
-    /// mount-wide limit (`NoSpace`/ENOSPC) and each active per-owner quota
-    /// (`QuotaExceeded`/EDQUOT), all-or-nothing.
+    /// Bounded add against a mount-wide ceiling — Linux's
+    /// `percpu_counter_limited_add`. A `limit` of 0 is unlimited, in which
+    /// case the counter still moves (so `statfs` and remount see real usage)
+    /// but nothing can fail.
+    fn limited_add(counter: &AtomicU64, limit: u64, amount: u64) -> Result<(), FsError> {
+        counter
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                let new = used.checked_add(amount)?;
+                (limit == 0 || new <= limit).then_some(new)
+            })
+            .map(|_| ())
+            .map_err(|_| FsError::NoSpace)
+    }
+
+    /// Reserve `blocks` for the file owned by (`uid`,`gid`).
+    ///
+    /// `mm/shmem.c::shmem_inode_acct_blocks` fixes the order, and with it
+    /// which error wins when both limits bite: the mount-wide limit is
+    /// taken first (ENOSPC), the per-owner quota second (EDQUOT), and a
+    /// quota failure rolls the block counter back
+    /// (`percpu_counter_sub(&sbinfo->used_blocks, pages)`).
     fn reserve_blocks(&self, uid: u32, gid: u32, blocks: u64) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        let new = state
-            .used_blocks
-            .checked_add(blocks)
-            .ok_or(FsError::NoSpace)?;
-        if state.max_blocks.is_some_and(|limit| new > limit) {
-            return Err(FsError::NoSpace);
+        if blocks == 0 {
+            return Ok(());
         }
-        state.charge_owner(uid, gid, blocks, 0)?;
-        state.used_blocks = new;
+        Self::limited_add(
+            &self.used_blocks,
+            self.max_blocks.load(Ordering::Relaxed),
+            blocks,
+        )?;
+        if self.quota_active.load(Ordering::Acquire) {
+            let mut quotas = self.quotas.lock();
+            if let Err(error) = quotas.charge_owner(uid, gid, blocks, 0) {
+                drop(quotas);
+                self.used_blocks.fetch_sub(blocks, Ordering::AcqRel);
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
     fn release_blocks(&self, uid: u32, gid: u32, blocks: u64) {
-        let mut state = self.state.lock();
-        state.used_blocks = state.used_blocks.saturating_sub(blocks);
-        state.uncharge_owner(uid, gid, blocks, 0);
+        if blocks == 0 {
+            return;
+        }
+        let _ = self
+            .used_blocks
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(blocks))
+            });
+        if self.quota_active.load(Ordering::Acquire) {
+            self.quotas.lock().uncharge_owner(uid, gid, blocks, 0);
+        }
     }
 
-    fn reserve_inode(self: &Arc<Self>, uid: u32, gid: u32) -> Result<InodeLease, FsError> {
-        let mut state = self.state.lock();
-        let new = state
+    /// Charge `bytes` of inode space — the budget `nr_inodes=` sets, which
+    /// extended attributes share with inodes themselves
+    /// (`shmem_xattr_handler_set`).
+    fn reserve_ispace(&self, bytes: u64) -> Result<(), FsError> {
+        Self::limited_add(&self.used_ispace, self.max_ispace(), bytes)
+    }
+
+    fn release_ispace(&self, bytes: u64) {
+        let _ = self
             .used_ispace
-            .checked_add(BOGO_INODE_SIZE)
-            .ok_or(FsError::NoSpace)?;
-        if state.max_ispace().is_some_and(|limit| new > limit) {
-            return Err(FsError::NoSpace);
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                Some(used.saturating_sub(bytes))
+            });
+    }
+
+    /// `shmem_reserve_inode` then `dquot_alloc_inode`: ENOSPC when the
+    /// mount's inode space is exhausted, EDQUOT when the owner's is.
+    fn reserve_inode(self: &Arc<Self>, uid: u32, gid: u32) -> Result<InodeLease, FsError> {
+        self.reserve_ispace(BOGO_INODE_SIZE)?;
+        if self.quota_active.load(Ordering::Acquire) {
+            let mut quotas = self.quotas.lock();
+            if let Err(error) = quotas.charge_owner(uid, gid, 0, 1) {
+                drop(quotas);
+                self.release_ispace(BOGO_INODE_SIZE);
+                return Err(error);
+            }
         }
-        state.charge_owner(uid, gid, 0, 1)?;
-        state.used_ispace = new;
         Ok(InodeLease {
             superblock: Arc::clone(self),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
+            xattr_space: AtomicU64::new(0),
         })
     }
 
     fn statfs(&self) -> FsStat {
-        let state = self.state.lock();
-        let (blocks, blocks_free) = match state.max_blocks {
-            Some(max) => (max, max.saturating_sub(state.used_blocks)),
-            None => (0, 0),
+        let max_blocks = self.max_blocks.load(Ordering::Relaxed);
+        let used_blocks = self.used_blocks.load(Ordering::Relaxed);
+        let blocks_free = max_blocks.saturating_sub(used_blocks);
+        // `shmem_statfs` leaves `f_blocks`/`f_bfree` at 0 on an unlimited
+        // mount — that zero IS how userspace spells "no limit here".
+        let (blocks, blocks_free) = if max_blocks == 0 {
+            (0, 0)
+        } else {
+            (max_blocks, blocks_free)
         };
-        // `shmem_statfs`: `f_files = max_inodes`, `f_ffree = free_ispace /
-        // BOGO_INODE_SIZE`. Both are 0 on an unlimited mount, which is how
-        // userspace spells "this filesystem has no inode limit".
-        let (files, files_free) = match state.max_inodes {
-            Some(max) => (max, state.free_inodes()),
-            None => (0, 0),
+        // `f_files = max_inodes`, `f_ffree = free_ispace / BOGO_INODE_SIZE`.
+        let max_inodes = self.max_inodes.load(Ordering::Relaxed);
+        let files_free = self
+            .max_ispace()
+            .saturating_sub(self.used_ispace.load(Ordering::Relaxed))
+            / BOGO_INODE_SIZE;
+        let (files, files_free) = if max_inodes == 0 {
+            (0, 0)
+        } else {
+            (max_inodes, files_free)
         };
         FsStat {
             blocks,
@@ -778,13 +849,6 @@ impl MemSuper {
         }
     }
 
-    /// Linux `mm/shmem.c::shmem_reconfigure` — `mount -o remount`.
-    ///
-    /// Every rejection there is `invalfc()`, i.e. **-EINVAL**, including
-    /// "Too small a size for current use"; a remount that would strand
-    /// live data is not an ENOSPC condition. Root mode/uid/gid are parsed
-    /// and then ignored: `shmem_reconfigure` never copies them back into
-    /// the superblock.
     fn reconfigure_tmpfs(&self, options: &str, total_pages: u64) -> Result<(), FsError> {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
@@ -858,40 +922,47 @@ impl MemSuper {
                 _ => return Err(FsError::InvalidData),
             }
         }
-        let mut state = self.state.lock();
-        if seen_quota && !(state.usr.on || state.grp.on) {
+        // `shmem_reconfigure` takes `sbinfo->stat_lock` for the whole
+        // validate-then-apply sequence. Remount is rare and must not
+        // interleave with another remount, so the quota lock serves as that
+        // lock here even when no quota is on; the capacity counters it
+        // guards are atomics read under it.
+        let quotas = self.quotas.lock();
+        if seen_quota && !(quotas.usr.on || quotas.grp.on) {
             return Err(FsError::InvalidData);
         }
         // Linux only validates a NONZERO request; `size=0` / `nr_inodes=0`
         // lift the limit unconditionally.
         if let Some(blocks) = requested_blocks {
             if blocks != 0 {
-                if state.max_blocks.is_none() {
+                if self.max_blocks.load(Ordering::Relaxed) == 0 {
                     return Err(FsError::InvalidData); // "Cannot retroactively limit size"
                 }
-                if state.used_blocks > blocks {
+                if self.used_blocks.load(Ordering::Relaxed) > blocks {
                     return Err(FsError::InvalidData); // "Too small a size for current use"
                 }
             }
-            state.max_blocks = (blocks != 0).then_some(blocks);
+            self.max_blocks.store(blocks, Ordering::Relaxed);
         }
         if let Some(inodes) = requested_inodes {
             if inodes != 0 {
-                if state.max_inodes.is_none() {
+                if self.max_inodes.load(Ordering::Relaxed) == 0 {
                     return Err(FsError::InvalidData);
                 }
-                if inodes.saturating_mul(BOGO_INODE_SIZE) < state.used_ispace {
+                if inodes.saturating_mul(BOGO_INODE_SIZE) < self.used_ispace.load(Ordering::Relaxed)
+                {
                     return Err(FsError::InvalidData); // "Too few inodes for current use"
                 }
             }
-            state.max_inodes = (inodes != 0).then_some(inodes);
+            self.max_inodes.store(inodes, Ordering::Relaxed);
         }
+        drop(quotas);
         Ok(())
     }
 
     // ── quotactl backing (only meaningful on a tmpfs mount) ─────────
 
-    fn quota_table_mut(state: &mut SuperState, kind: QuotaKind) -> &mut QuotaTable {
+    fn quota_table_mut(state: &mut QuotaState, kind: QuotaKind) -> &mut QuotaTable {
         match kind {
             QuotaKind::User => &mut state.usr,
             QuotaKind::Group => &mut state.grp,
@@ -902,7 +973,9 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        Self::quota_table_mut(&mut self.state.lock(), kind).on = true;
+        let mut state = self.quotas.lock();
+        Self::quota_table_mut(&mut state, kind).on = true;
+        self.refresh_quota_active(&state);
         Ok(())
     }
 
@@ -910,7 +983,9 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        Self::quota_table_mut(&mut self.state.lock(), kind).on = false;
+        let mut state = self.quotas.lock();
+        Self::quota_table_mut(&mut state, kind).on = false;
+        self.refresh_quota_active(&state);
         Ok(())
     }
 
@@ -918,7 +993,7 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        let mut state = self.state.lock();
+        let mut state = self.quotas.lock();
         let table = Self::quota_table_mut(&mut state, kind);
         if !table.on {
             return Err(FsError::Unsupported);
@@ -930,7 +1005,7 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        let mut state = self.state.lock();
+        let mut state = self.quotas.lock();
         let table = Self::quota_table_mut(&mut state, kind);
         if !table.on {
             return Err(FsError::Unsupported);
@@ -946,7 +1021,7 @@ impl MemSuper {
             return Err(FsError::Unsupported);
         }
         let now = quota_now_secs();
-        let mut state = self.state.lock();
+        let mut state = self.quotas.lock();
         let table = Self::quota_table_mut(&mut state, kind);
         if !table.on {
             return Err(FsError::Unsupported);
@@ -998,7 +1073,7 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        let mut state = self.state.lock();
+        let mut state = self.quotas.lock();
         let table = Self::quota_table_mut(&mut state, kind);
         if !table.on {
             return Err(FsError::Unsupported);
@@ -1015,7 +1090,7 @@ impl MemSuper {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
-        let mut state = self.state.lock();
+        let mut state = self.quotas.lock();
         let table = Self::quota_table_mut(&mut state, kind);
         if !table.on {
             return Err(FsError::Unsupported);
@@ -1057,6 +1132,12 @@ struct InodeLease {
     /// `set_owners` (chown transfers the inode + block charge to the new owner).
     uid: AtomicU32,
     gid: AtomicU32,
+    /// Inode space this node's extended attributes hold, in bytes. Tracked
+    /// on the lease rather than the node so every node type releases it on
+    /// the same path the inode charge is released on — `simple_xattrs_free`
+    /// runs from `shmem_evict_inode` for files, directories, symlinks and
+    /// special nodes alike.
+    xattr_space: AtomicU64,
 }
 
 impl InodeLease {
@@ -1067,26 +1148,229 @@ impl InodeLease {
     fn rechown(&self, new_uid: u32, new_gid: u32, blocks: u64) -> Result<(), FsError> {
         let old_uid = self.uid.load(Ordering::Relaxed);
         let old_gid = self.gid.load(Ordering::Relaxed);
-        self.superblock
-            .state
-            .lock()
-            .transfer_owner(old_uid, old_gid, new_uid, new_gid, blocks, 1)?;
+        if self.superblock.quota_active.load(Ordering::Acquire) {
+            self.superblock
+                .quotas
+                .lock()
+                .transfer_owner(old_uid, old_gid, new_uid, new_gid, blocks, 1)?;
+        }
         self.uid.store(new_uid, Ordering::Relaxed);
         self.gid.store(new_gid, Ordering::Relaxed);
         Ok(())
     }
 }
 
+impl InodeLease {
+    /// Charge an extended attribute's inode space to this inode.
+    fn charge_xattr(&self, bytes: u64) -> Result<(), FsError> {
+        self.superblock.reserve_ispace(bytes)?;
+        self.xattr_space.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Give back the inode space of an attribute that was replaced or
+    /// removed.
+    fn uncharge_xattr(&self, bytes: u64) {
+        self.superblock.release_ispace(bytes);
+        let _ = self
+            .xattr_space
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                Some(held.saturating_sub(bytes))
+            });
+    }
+}
+
 impl Drop for InodeLease {
     fn drop(&mut self) {
-        let mut state = self.superblock.state.lock();
-        state.used_ispace = state.used_ispace.saturating_sub(BOGO_INODE_SIZE);
-        state.uncharge_owner(
-            self.uid.load(Ordering::Relaxed),
-            self.gid.load(Ordering::Relaxed),
-            0,
-            1,
-        );
+        // `shmem_free_inode(sb, freed_ispace)` returns BOGO_INODE_SIZE plus
+        // whatever `simple_xattrs_free` gave back, in one step.
+        let held = self.xattr_space.load(Ordering::Relaxed);
+        self.superblock.release_ispace(held + BOGO_INODE_SIZE);
+        if self.superblock.quota_active.load(Ordering::Acquire) {
+            self.superblock.quotas.lock().uncharge_owner(
+                self.uid.load(Ordering::Relaxed),
+                self.gid.load(Ordering::Relaxed),
+                0,
+                1,
+            );
+        }
+    }
+}
+
+/// Linux `fs/xattr.c::simple_xattr_space` — the deterministic inode-space
+/// charge for one extended attribute. The 40 is upstream's fixed stand-in
+/// for `sizeof(struct simple_xattr)`, chosen so the number does not move
+/// with the allocator or the word size.
+fn simple_xattr_space(name: &str, size: usize) -> u64 {
+    40 + size as u64 + name.len() as u64
+}
+
+/// An inode's extended attributes, with Linux's inode-space accounting.
+///
+/// tmpfs keeps xattrs in RAM like everything else, so they are budgeted
+/// against the same `nr_inodes=` inode space an inode itself costs
+/// (`shmem_xattr_handler_set`): setting one on a full mount returns ENOSPC,
+/// and `statfs`'s `f_ffree` falls as attributes accumulate.
+///
+/// Every tmpfs inode type has one. `shmem_xattr_handlers` hangs off the
+/// SUPERBLOCK, and `shmem_{inode,dir,special,symlink}_inode_operations` all
+/// carry `.listxattr`, so directories, symlinks, sockets, FIFOs and device
+/// nodes take attributes exactly as regular files do.
+///
+/// The map is boxed behind an `Option` and stays `None` until the first
+/// attribute is set. That matters at MemFs's scale: a node exists for every
+/// file the kernel-test suite and a booted userspace create, the vast
+/// majority never carry an xattr, and the per-node heap margin here is
+/// already tight enough that three extra spinlocks once tipped it (see the
+/// atomics note on `MemFile`). An empty store is one pointer.
+/// The attribute map itself. Boxed so an inode with no attributes — the
+/// overwhelming majority — costs one pointer rather than a `BTreeMap`.
+type XattrMap = Box<BTreeMap<String, Vec<u8>>>;
+
+#[derive(Debug)]
+struct Xattrs {
+    entries: IrqSafeSpinLock<Option<XattrMap>>,
+}
+
+impl Xattrs {
+    const fn new() -> Self {
+        Self {
+            entries: IrqSafeSpinLock::new(None),
+        }
+    }
+
+    /// The half of `fs/xattr.c::xattr_permission` that needs the inode.
+    ///
+    /// `user.*` is refused on anything that is not a regular file or a
+    /// directory, and the answer is asymmetric:
+    ///
+    /// ```text
+    /// if (!S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
+    ///         return (mask & MAY_WRITE) ? -EPERM : -ENODATA;
+    /// ```
+    ///
+    /// A set or a remove is a write, so both get EPERM; a get is already
+    /// ENODATA here because the attribute cannot have been stored.
+    ///
+    /// Name length, the `trusted.*` capability, and resolving the prefix to
+    /// a handler at all are VFS decisions that do not need the inode, so
+    /// they live in the syscall layer where Linux keeps them
+    /// (`import_xattr_name`, `xattr_resolve_name`) — reaching this with an
+    /// unknown prefix is possible only from an in-kernel caller, and
+    /// `Unsupported` is the EOPNOTSUPP that produces.
+    fn check_name(name: &str, allow_user: bool) -> Result<(), FsError> {
+        if name.starts_with("user.") {
+            return if allow_user {
+                Ok(())
+            } else {
+                Err(FsError::OperationNotPermitted)
+            };
+        }
+        if name.starts_with("trusted.") || name.starts_with("security.") {
+            return Ok(());
+        }
+        Err(FsError::Unsupported)
+    }
+
+    fn set(
+        &self,
+        lease: &InodeLease,
+        name: &str,
+        value: &[u8],
+        flags: u32,
+        allow_user: bool,
+    ) -> Result<(), FsError> {
+        Self::check_name(name, allow_user)?;
+        const XATTR_CREATE: u32 = 1;
+        const XATTR_REPLACE: u32 = 2;
+        if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+            return Err(FsError::InvalidData);
+        }
+        // Reserve BEFORE mutating, and give back only the space the
+        // replaced value held — the order `shmem_xattr_handler_set` uses,
+        // so a failed set leaves the budget exactly as it found it.
+        let charge = simple_xattr_space(name, value.len());
+        lease.charge_xattr(charge)?;
+        let mut guard = self.entries.lock();
+        let attrs = guard.get_or_insert_with(|| Box::new(BTreeMap::new()));
+        let previous = attrs.get(name).map(|old| old.len());
+        // `simple_xattr_set` tests the flag BITS, and tests CREATE first:
+        // passing both is not EINVAL, it is EEXIST when the attribute is
+        // there and ENODATA when it is not.
+        let refusal = if previous.is_some() {
+            (flags & XATTR_CREATE != 0).then_some(FsError::Busy)
+        } else {
+            (flags & XATTR_REPLACE != 0).then_some(FsError::NotFound)
+        };
+        if let Some(error) = refusal {
+            drop(guard);
+            lease.uncharge_xattr(charge);
+            return Err(error);
+        }
+        attrs.insert(name.to_string(), value.to_vec());
+        drop(guard);
+        if let Some(old_len) = previous {
+            lease.uncharge_xattr(simple_xattr_space(name, old_len));
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Result<Vec<u8>, FsError> {
+        self.raw_get(name).ok_or(FsError::NotFound)
+    }
+
+    fn list(&self) -> Vec<u8> {
+        let guard = self.entries.lock();
+        let mut list = Vec::new();
+        if let Some(attrs) = guard.as_ref() {
+            for name in attrs.keys() {
+                list.extend_from_slice(name.as_bytes());
+                list.push(0);
+            }
+        }
+        list
+    }
+
+    fn remove(&self, lease: &InodeLease, name: &str, allow_user: bool) -> Result<(), FsError> {
+        // A remove carries MAY_WRITE, so `user.*` on a symlink or device
+        // node is EPERM whether or not the attribute is there.
+        Self::check_name(name, allow_user)?;
+        match self.raw_remove(name) {
+            Some(value) => {
+                lease.uncharge_xattr(simple_xattr_space(name, value.len()));
+                Ok(())
+            }
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    // ── uncharged accessors, for POSIX ACLs ───────────────────────────
+    //
+    // A tmpfs ACL is not a `simple_xattr`: `simple_set_acl` stores it in
+    // the inode's cached-ACL pointer and `shmem_xattr_handler_set` never
+    // sees it, so it costs no inode space. NARF keeps the encoded blob in
+    // the same map for storage, and these three skip the accounting to
+    // match.
+
+    fn raw_get(&self, name: &str) -> Option<Vec<u8>> {
+        self.entries
+            .lock()
+            .as_ref()
+            .and_then(|attrs| attrs.get(name).cloned())
+    }
+
+    fn raw_insert(&self, name: &str, value: Vec<u8>) {
+        self.entries
+            .lock()
+            .get_or_insert_with(|| Box::new(BTreeMap::new()))
+            .insert(String::from(name), value);
+    }
+
+    fn raw_remove(&self, name: &str) -> Option<Vec<u8>> {
+        self.entries
+            .lock()
+            .as_mut()
+            .and_then(|attrs| attrs.remove(name))
     }
 }
 
@@ -1206,7 +1490,7 @@ struct MemFile {
     /// after creation — a plain `bool`, not an atomic, to stay off the
     /// per-node heap-cost path the atomics above were chosen for.
     sock: bool,
-    xattrs: IrqSafeSpinLock<BTreeMap<String, Vec<u8>>>,
+    xattrs: Xattrs,
 }
 
 impl MemFile {
@@ -1239,7 +1523,7 @@ impl MemFile {
             mtime_ns: AtomicU64::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: false,
-            xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            xattrs: Xattrs::new(),
         };
         if !bytes.is_empty() {
             file.write_inner(0, bytes)?;
@@ -1263,7 +1547,7 @@ impl MemFile {
             mtime_ns: AtomicU64::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: false,
-            xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            xattrs: Xattrs::new(),
         };
         file.write_inner(0, &bytes)
             .expect("unlimited memfs seed write");
@@ -1282,7 +1566,7 @@ impl MemFile {
             mtime_ns: AtomicU64::new(0),
             mmap_generation: AtomicU64::new(1),
             sock: true,
-            xattrs: IrqSafeSpinLock::new(BTreeMap::new()),
+            xattrs: Xattrs::new(),
         })
     }
 
@@ -1445,7 +1729,7 @@ impl MemFile {
         let acl = match acl {
             Some(acl) => acl,
             None => {
-                self.xattrs.lock().remove(XATTR_NAME_POSIX_ACL_ACCESS);
+                self.xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
                 return Ok(());
             }
         };
@@ -1465,16 +1749,14 @@ impl MemFile {
             acl,
             true,
         )?;
-        let mut attrs = self.xattrs.lock();
         match stored {
-            Some(acl) => {
-                attrs.insert(String::from(XATTR_NAME_POSIX_ACL_ACCESS), acl.to_xattr());
-            }
+            Some(acl) => self
+                .xattrs
+                .raw_insert(XATTR_NAME_POSIX_ACL_ACCESS, acl.to_xattr()),
             None => {
-                attrs.remove(XATTR_NAME_POSIX_ACL_ACCESS);
+                self.xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
             }
         }
-        drop(attrs);
         self.perms.store(mode as u32, Ordering::Relaxed);
         Ok(())
     }
@@ -1629,18 +1911,17 @@ impl FileOps for MemFile {
             // the old rights — and since the mode's group triplet IS the
             // ACL_MASK, dropping it makes `chmod g-w` a no-op for every
             // maskable entry.
-            let mut attrs = self.xattrs.lock();
-            if let Some(raw) = attrs.get(XATTR_NAME_POSIX_ACL_ACCESS) {
+            if let Some(raw) = self.xattrs.raw_get(XATTR_NAME_POSIX_ACL_ACCESS) {
                 // The stored blob is always a canonical `to_xattr()` of an
                 // ACL that already passed `valid()` in `set_acl`, so the
                 // decode cannot fail; the non-matching arm is unreachable
                 // rather than a silent skip of a corrupt ACL.
-                if let Ok(Some(mut acl)) = PosixAcl::from_xattr(raw) {
+                if let Ok(Some(mut acl)) = PosixAcl::from_xattr(&raw) {
                     acl.chmod_masq(perms)?;
-                    attrs.insert(String::from(XATTR_NAME_POSIX_ACL_ACCESS), acl.to_xattr());
+                    self.xattrs
+                        .raw_insert(XATTR_NAME_POSIX_ACL_ACCESS, acl.to_xattr());
                 }
             }
-            drop(attrs);
             self.perms.store(perms as u32, Ordering::Relaxed);
             Ok(())
         })
@@ -1683,52 +1964,21 @@ impl FileOps for MemFile {
             if let Some(ty) = AclType::from_xattr_name(name) {
                 return self.set_acl(ty, value);
             }
-            if !(name.starts_with("user.")
-                || name.starts_with("trusted.")
-                || name.starts_with("security."))
-                || name.len() > 255
-            {
-                return Err(FsError::InvalidData);
-            }
-            const XATTR_CREATE: u32 = 1;
-            const XATTR_REPLACE: u32 = 2;
-            if flags & !(XATTR_CREATE | XATTR_REPLACE) != 0 || flags == XATTR_CREATE | XATTR_REPLACE
-            {
-                return Err(FsError::InvalidData);
-            }
-            let mut attrs = self.xattrs.lock();
-            let exists = attrs.contains_key(name);
-            if flags == XATTR_CREATE && exists {
-                return Err(FsError::Busy);
-            }
-            if flags == XATTR_REPLACE && !exists {
-                return Err(FsError::NotFound);
-            }
-            attrs.insert(name.to_string(), value.to_vec());
-            Ok(())
+            // `xattr_permission` bars `user.*` on anything that is not a
+            // regular file or a directory — including the S_IFSOCK inode a
+            // bound pathname AF_UNIX socket leaves behind, which `MemFile`
+            // also backs. Every attribute is charged inode space.
+            self.xattrs
+                .set(&self._inode_lease, name, value, flags, !self.sock)
         })
     }
 
     fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            self.xattrs
-                .lock()
-                .get(name)
-                .cloned()
-                .ok_or(FsError::NotFound)
-        })
+        Box::pin(async move { self.xattrs.get(name) })
     }
 
     fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
-        Box::pin(async move {
-            let attrs = self.xattrs.lock();
-            let mut list = Vec::new();
-            for name in attrs.keys() {
-                list.extend_from_slice(name.as_bytes());
-                list.push(0);
-            }
-            Ok(list)
-        })
+        Box::pin(async move { Ok(self.xattrs.list()) })
     }
 
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
@@ -1745,14 +1995,29 @@ impl FileOps for MemFile {
             // a NULL acl, and `posix_acl_equiv_mode` returns 0 immediately
             // for a NULL acl without touching `*mode_p`. So the mode must
             // survive the removal untouched.
-            if AclType::from_xattr_name(name) == Some(AclType::Default) {
+            // `fs/xattr.c::removexattr` routes BOTH ACL names away from
+            // the generic path entirely:
+            //
+            //     if (is_posix_acl_xattr(name))
+            //             return vfs_remove_acl(idmap, d, name);
+            //
+            // and `vfs_remove_acl` ends at `set_posix_acl(type, NULL)`.
+            // For tmpfs that is `simple_set_acl(NULL)`, which caches a
+            // NULL ACL and returns **0** — so removing an ACL that is not
+            // there is a silent success, not ENODATA. (An absent DEFAULT
+            // ACL on a non-directory takes `set_posix_acl`'s
+            // `return acl ? -EACCES : 0` to the same 0.)
+            //
+            // The mode must survive either way: `posix_acl_update_mode`
+            // hands a NULL acl to `posix_acl_equiv_mode`, which returns
+            // immediately without touching `*mode_p`.
+            if AclType::from_xattr_name(name).is_some() {
+                if name == XATTR_NAME_POSIX_ACL_ACCESS {
+                    self.xattrs.raw_remove(name);
+                }
                 return Ok(());
             }
-            self.xattrs
-                .lock()
-                .remove(name)
-                .map(|_| ())
-                .ok_or(FsError::NotFound)
+            self.xattrs.remove(&self._inode_lease, name, !self.sock)
         })
     }
 
@@ -1859,6 +2124,7 @@ struct MemSymlink {
     _inode_lease: InodeLease,
     uid: AtomicU32,
     gid: AtomicU32,
+    xattrs: Xattrs,
 }
 
 impl fmt::Debug for MemSymlink {
@@ -1919,6 +2185,29 @@ impl FileOps for MemSymlink {
             Ok(())
         })
     }
+
+    // `shmem_symlink_inode_operations` carries `.listxattr`, and the
+    // handlers hang off the superblock, so a tmpfs symlink holds extended
+    // attributes. `user.*` is not among them: `xattr_permission` allows
+    // that namespace only on regular files and directories.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.xattrs
+                .set(&self._inode_lease, name, value, flags, false)
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.xattrs.get(name) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { Ok(self.xattrs.list()) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.xattrs.remove(&self._inode_lease, name, false) })
+    }
 }
 
 struct MemSpecial {
@@ -1929,6 +2218,7 @@ struct MemSpecial {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    xattrs: Xattrs,
 }
 
 impl fmt::Debug for MemSpecial {
@@ -1995,6 +2285,28 @@ impl FileOps for MemSpecial {
     fn rdev(&self) -> u64 {
         self.rdev
     }
+
+    // `shmem_special_inode_operations` carries `.listxattr`; a device node
+    // or socket on tmpfs holds `trusted.*`/`security.*` attributes (SELinux
+    // labels device nodes this way) but not `user.*`.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.xattrs
+                .set(&self._inode_lease, name, value, flags, false)
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.xattrs.get(name) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { Ok(self.xattrs.list()) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.xattrs.remove(&self._inode_lease, name, false) })
+    }
 }
 
 /// A named FIFO plus its tmpfs/ramfs inode reservation. Open descriptions
@@ -2002,6 +2314,7 @@ impl FileOps for MemSpecial {
 struct MemFifo {
     node: Arc<crate::fifo::FifoNode>,
     _inode_lease: InodeLease,
+    xattrs: Xattrs,
 }
 
 impl FileOps for MemFifo {
@@ -2039,6 +2352,28 @@ impl FileOps for MemFifo {
 
     fn fifo_shared(&self) -> Option<Arc<crate::fifo::FifoShared>> {
         self.node.fifo_shared()
+    }
+
+    // A FIFO is one of `shmem_special_inode_operations`' inodes, so it holds
+    // extended attributes — `trusted.*`/`security.*` only, since
+    // `xattr_permission` confines `user.*` to regular files and directories.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.xattrs
+                .set(&self._inode_lease, name, value, flags, false)
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.xattrs.get(name) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { Ok(self.xattrs.list()) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.xattrs.remove(&self._inode_lease, name, false) })
     }
 }
 
@@ -2137,6 +2472,10 @@ struct MemDir {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    /// `shmem_dir_inode_operations` carries `.listxattr`, so a tmpfs
+    /// directory takes extended attributes like any other inode — this is
+    /// where an SELinux label on `/tmp` itself lives.
+    xattrs: Xattrs,
 }
 
 impl fmt::Debug for MemDir {
@@ -2544,6 +2883,7 @@ impl DirOps for MemDir {
                 let fifo = Arc::new(MemFifo {
                     node: Arc::new(crate::fifo::FifoNode::new(alloc_ino(), DEFAULT_PERMS)),
                     _inode_lease: self.superblock.reserve_inode(0, 0)?,
+                    xattrs: Xattrs::new(),
                 });
                 g.insert(name.to_string(), Entry::Fifo(Arc::clone(&fifo)));
                 Ok(fifo as Arc<dyn FileOps>)
@@ -2556,6 +2896,7 @@ impl DirOps for MemDir {
                     perms: AtomicU32::new(DEFAULT_PERMS as u32),
                     uid: AtomicU32::new(0),
                     gid: AtomicU32::new(0),
+                    xattrs: Xattrs::new(),
                 });
                 g.insert(name.to_string(), Entry::Special(Arc::clone(&node)));
                 Ok(node as Arc<dyn FileOps>)
@@ -2578,6 +2919,7 @@ impl DirOps for MemDir {
                 perms: AtomicU32::new(0o755),
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
+                xattrs: Xattrs::new(),
             });
             g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
             self.bump_entry_generation();
@@ -2639,6 +2981,7 @@ impl DirOps for MemDir {
                 _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
+                xattrs: Xattrs::new(),
             });
             g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
             Ok(s as Arc<dyn FileOps>)
@@ -2788,6 +3131,27 @@ impl DirOps for MemDir {
         })
     }
 
+    // A directory takes `user.*` as well: `xattr_permission` allows that
+    // namespace on regular files AND directories.
+    fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async move {
+            self.xattrs
+                .set(&self._inode_lease, name, value, flags, true)
+        })
+    }
+
+    fn get_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.xattrs.get(name) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async move { Ok(self.xattrs.list()) })
+    }
+
+    fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async move { self.xattrs.remove(&self._inode_lease, name, true) })
+    }
+
     fn supports_tmpfile(&self) -> bool {
         true
     }
@@ -2866,6 +3230,7 @@ impl MemFs {
             perms: AtomicU32::new(root_mode as u32),
             uid: AtomicU32::new(root_uid),
             gid: AtomicU32::new(root_gid),
+            xattrs: Xattrs::new(),
         });
         Ok(Self {
             name,
@@ -3005,18 +3370,21 @@ impl TmpFs {
     pub fn show_options(&self) -> String {
         use core::fmt::Write as _;
         let mut out = String::new();
-        let (max_blocks, max_inodes) = {
-            let state = self.inner.superblock.state.lock();
-            (state.max_blocks, state.max_inodes)
-        };
-        let default_half = (self.total_pages / 2 != 0).then_some(self.total_pages / 2);
+        let superblock = &self.inner.superblock;
+        let max_blocks = superblock.max_blocks.load(Ordering::Relaxed);
+        let max_inodes = superblock.max_inodes.load(Ordering::Relaxed);
+        // `shmem_default_max_{blocks,inodes}()` — half of RAM, in pages.
+        let default_half = self.total_pages / 2;
         if max_blocks != default_half {
             // K(x) = x << (PAGE_SHIFT - 10): pages to KiB.
-            let kib = max_blocks.unwrap_or(0).saturating_mul(PAGE_SIZE / 1024);
-            let _ = write!(out, ",size={}k", kib);
+            let _ = write!(
+                out,
+                ",size={}k",
+                max_blocks.saturating_mul(PAGE_SIZE / 1024)
+            );
         }
         if max_inodes != default_half {
-            let _ = write!(out, ",nr_inodes={}", max_inodes.unwrap_or(0));
+            let _ = write!(out, ",nr_inodes={}", max_inodes);
         }
         let root = self.inner.root();
         let mode = root.dir_mode();
@@ -3038,7 +3406,7 @@ impl TmpFs {
             out.push_str(",noswap");
         }
         let (usr_on, grp_on) = {
-            let state = self.inner.superblock.state.lock();
+            let state = superblock.quotas.lock();
             (state.usr.on, state.grp.on)
         };
         if usr_on {

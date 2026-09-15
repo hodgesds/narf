@@ -1836,6 +1836,34 @@ pub trait DirOps: Send + Sync {
     fn supports_tmpfile(&self) -> bool {
         false
     }
+
+    // ── extended attributes ───────────────────────────────────────────
+    //
+    // A directory is an inode, and on any filesystem with xattr support it
+    // holds them: `setfattr` on a directory, an SELinux label on `/tmp`,
+    // and `security.*` defaults for children all live here. `FileOps` alone
+    // could not express that, because path resolution hands back a
+    // `DirOps` for a directory and there is no `FileOps` to ask.
+    //
+    // Default `Unsupported`, which the syscall layer reads as "this
+    // filesystem has no xattr store" and answers from its generic
+    // side-table — the behaviour every directory had before.
+
+    fn set_xattr<'a>(&'a self, _name: &'a str, _value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
 }
 
 // ── FsInstance ─────────────────────────────────────────────────────
