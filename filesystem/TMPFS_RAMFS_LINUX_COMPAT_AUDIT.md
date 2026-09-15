@@ -154,3 +154,9 @@ These are explicit implementation gaps, not claimed compatibility:
    as C does, so `size=16E` fails instead of silently meaning "unlimited".
    This is a deliberate divergence: the wrap turns an over-large size into
    a silent "unlimited", which is a worse answer than refusing the mount.
+6. File leases (`shmem_file_operations.setlease = generic_setlease`) are not
+   implemented: there is no lease break on a conflicting open, no
+   `lease_break_time` timer and no SIGIO to deliver the break with. NARF now
+   answers the way Linux's own `!CONFIG_FILE_LOCKING` stubs in
+   `include/linux/filelock.h` do — `F_SETLEASE` is -EINVAL and `F_GETLEASE`
+   is `F_UNLCK` — rather than the fabricated success it used to report.

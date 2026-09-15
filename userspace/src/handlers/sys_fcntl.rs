@@ -1,6 +1,13 @@
 #[allow(unused_imports)]
 use super::*;
 
+/// `F_UNLCK` from `include/uapi/asm-generic/fcntl.h` (`#define F_UNLCK 2`),
+/// as returned by the `!CONFIG_FILE_LOCKING` `fcntl_getlease` stub to mean
+/// "no lease is held". Spelled out here because the neighbouring `F_RDLCK`
+/// is 0, and 0 is also what a missing arm returns by accident — the whole
+/// point of the F_GETLEASE arm below is that those two must not coincide.
+const F_UNLCK_LEASE: u64 = 2;
+
 fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
     let mut bytes = alloc::vec![0u8; flock_size()];
     // SAFETY: `UFlock` is repr(C) and `bytes` has the architecture's
@@ -477,7 +484,61 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     },
                 }
             }
-            _ => SyscallReturn::invalid_op(),
+            // F_GETLEASE (1024+1). NARF has no lease machinery: there is no
+            // lease break on a conflicting open, no `lease_break_time` timer
+            // and no SIGIO to deliver the break. Linux ships an answer for
+            // exactly that configuration — `include/linux/filelock.h` under
+            // `#else /* !CONFIG_FILE_LOCKING */`:
+            //
+            //   static inline int fcntl_getlease(struct file *filp)
+            //   { return F_UNLCK; }
+            //
+            // F_UNLCK (2) is "no lease is held on this file", which is the
+            // truth here. The default arm below used to answer this with
+            // `invalid_op()`, whose `value` is 0 — and 0 is F_RDLCK, so every
+            // caller that asked was told a read lease existed. A file server
+            // reading that answer concludes it may serve cached content
+            // without revalidating, because it believes the kernel will break
+            // the lease if anyone else opens the file.
+            1025 => SyscallReturn::ok(F_UNLCK_LEASE),
+            // F_SETLEASE (1024). Same stub block, one line up:
+            //
+            //   static inline int fcntl_setlease(unsigned int fd,
+            //                   struct file *filp, int arg) { return -EINVAL; }
+            //
+            // `shmem_file_operations.setlease = generic_setlease`, so tmpfs
+            // does support leases on Linux and this is a real gap rather than
+            // a nonexistent command — but -EINVAL is the answer Linux itself
+            // gives when the machinery is compiled out, and it is the one a
+            // caller can act on. `fcntl_setlease` also rejects directories
+            // with -EINVAL regardless of config, so both shapes agree.
+            1024 => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
+            // Every command NARF does not implement. `fs/fcntl.c::do_fcntl`
+            // opens with `long err = -EINVAL;` and its `default:` arm is a
+            // bare `break`, so an unhandled command is -EINVAL.
+            //
+            // This arm was `invalid_op()`, which sets `value = 0` and reports
+            // the real status in rdx/x1 — a register the Linux ABI does not
+            // read. Userspace therefore saw rax = 0: success. Every
+            // unimplemented command was silently granted. The concrete
+            // damage, beyond the leases above:
+            //
+            //   * F_OFD_SETLK / F_OFD_SETLKW (37/38) returned "lock acquired"
+            //     to every caller at once, so two processes could each believe
+            //     they held the same exclusive range. Callers that probe for
+            //     OFD support (sqlite, LMDB) take EINVAL as "not available"
+            //     and fall back to POSIX locks, which NARF does implement.
+            //   * F_SETOWN / F_SETSIG (8/10) returned "owner installed", so a
+            //     caller waiting for SIGIO on that descriptor waits forever
+            //     instead of learning async I/O is unavailable.
+            //   * F_NOTIFY (1026) returned "directory watch armed".
+            //
+            // Answering -EINVAL cannot regress a working command: the arms
+            // above, and the F_DUPFD / F_GETLK / F_SETLK / F_SETLKW /
+            // F_ADD_SEALS / F_GET_SEALS blocks earlier in this function, all
+            // return before reaching here. Only commands whose sole previous
+            // answer was a fabricated 0 land in this arm.
+            _ => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
         })
     });
     match outcome {
