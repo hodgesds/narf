@@ -253,6 +253,120 @@ kernel_test_in!(
     smoke_abi_fsx_directory_xattr_reaches_the_inode
 );
 
+/// A default ACL on a parent directory REPLACES the umask for everything
+/// created inside it.
+///
+/// This is the whole reason `setfacl -d` exists: a shared group directory
+/// sets one so that files land group-writable no matter what umask the
+/// creating process happens to carry. `fs/posix_acl.c::posix_acl_create`
+/// implements it by applying the umask only on the `!dir_default` path —
+/// where a default ACL exists it narrows the mode through the ACL and
+/// leaves the umask entirely alone.
+///
+/// The umask is a property of the task, so this can only be tested through
+/// the syscalls: the filesystem layer never sees it. The 0o077 umask below
+/// is the discriminator — without inheritance it would force 0o700 and
+/// 0o600, which is exactly what NARF produced before.
+fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
+    use narf_filesystem::{AclEntry, AclType, PosixAcl};
+    use narf_filesystem::{
+        ACL_EXECUTE, ACL_GROUP_OBJ, ACL_OTHER, ACL_READ, ACL_USER_OBJ, ACL_WRITE,
+    };
+    with_setup(|| {
+        let parent = b"/tmp/abi-acl-parent\0";
+        let child_dir = b"/tmp/abi-acl-parent/sub\0";
+        let child_file = b"/tmp/abi-acl-parent/file\0";
+        let _ = call_rmdir(child_dir.as_ptr() as u64);
+        let _ = call_unlink(child_file.as_ptr() as u64);
+        let _ = call_rmdir(parent.as_ptr() as u64);
+        if call_mkdir(parent.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the ACL parent failed");
+        }
+        // u::rwx, g::rwx, o::r-x — group-writable by inheritance.
+        let default = PosixAcl::from_entries(alloc::vec![
+            AclEntry::tagged(ACL_USER_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_GROUP_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_OTHER, ACL_READ | ACL_EXECUTE),
+        ])
+        .to_xattr();
+        let name = AclType::Default.xattr_name();
+        let mut name_c = alloc::vec::Vec::from(name.as_bytes());
+        name_c.push(0);
+        let set = call(
+            Syscall::Setxattr.raw(),
+            SyscallArgs {
+                arg0: parent.as_ptr() as u64,
+                arg1: name_c.as_ptr() as u64,
+                arg2: default.as_ptr() as u64,
+                arg3: default.len() as u64,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        let cleanup = || {
+            let _ = call_rmdir(child_dir.as_ptr() as u64);
+            let _ = call_unlink(child_file.as_ptr() as u64);
+            let _ = call_rmdir(parent.as_ptr() as u64);
+        };
+        if set != Some(0) {
+            cleanup();
+            return Err("setxattr of a default ACL on a directory failed");
+        }
+        // A umask that would visibly bite if it were still applied.
+        let previous = call(Syscall::Umask.raw(), a0(0o077));
+        let restore = |mask: Option<i64>| {
+            if let Some(mask) = mask {
+                let _ = call(Syscall::Umask.raw(), a0(mask as u64));
+            }
+        };
+        let mode_of = |path: &[u8]| -> Option<u32> {
+            let mut st = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0) {
+                return None;
+            }
+            // `struct stat` x86_64: st_mode is a u32 at offset 24.
+            Some(u32::from_ne_bytes([st[24], st[25], st[26], st[27]]) & 0o7777)
+        };
+        let dir_made = call_mkdir(child_dir.as_ptr() as u64, 0o777);
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                child_file.as_ptr() as u64,
+                // O_CREAT | O_RDWR
+                0o100 | 0o2,
+                0o666,
+            ),
+        );
+        if let Some(fd) = created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let dir_mode = mode_of(child_dir);
+        let file_mode = mode_of(child_file);
+        restore(previous);
+        cleanup();
+        if dir_made != Some(0) {
+            return Err("mkdir inside the ACL parent failed");
+        }
+        if created.map(|fd| fd < 0).unwrap_or(true) {
+            return Err("creating a file inside the ACL parent failed");
+        }
+        // 0o777 narrowed through the default ACL is 0o775; the 0o077 umask
+        // would have produced 0o700.
+        if dir_mode != Some(0o775) {
+            return Err("a subdirectory did not inherit the default ACL's mode");
+        }
+        // 0o666 narrowed through the same ACL is 0o664; umask would give 0o600.
+        if file_mode != Some(0o664) {
+            return Err("a new file did not inherit the default ACL's mode");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_default_acl_replaces_umask);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

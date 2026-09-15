@@ -1881,6 +1881,22 @@ pub trait DirOps: Send + Sync {
         false
     }
 
+    /// This directory's `system.posix_acl_default`, raw, if it has one.
+    ///
+    /// Creating anything inside a directory with a default ACL is not a
+    /// umask operation: `fs/posix_acl.c::posix_acl_create` replaces the
+    /// umask entirely with the inherited ACL, narrows the creation mode
+    /// through it, and copies the default itself onto a new
+    /// SUBDIRECTORY so inheritance keeps propagating. The umask lives in
+    /// the syscall layer, so the decision has to be made there — this is
+    /// what lets it ask.
+    ///
+    /// `None` by default: a filesystem without POSIX ACLs inherits nothing
+    /// and the caller applies its umask as before.
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        None
+    }
+
     /// The directory inode's modification time, in wall-clock nanoseconds
     /// since the epoch; 0 means the filesystem does not track one.
     ///

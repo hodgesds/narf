@@ -79,6 +79,11 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
         return;
     }
+    // `fs/namei.c::do_mkdirat` -> `vfs_mkdir` -> `shmem_mkdir` ->
+    // `simple_acl_create`: a parent carrying a default ACL passes it down
+    // instead of the umask, and a new DIRECTORY also keeps a copy so
+    // inheritance continues below it.
+    let inherited = inherit_acls_from_parent(&*parent, (mode & 0o1777) as u16, true);
     match poll_blocking(parent.mkdir(&leaf)) {
         Some(Ok(directory)) => {
             {
@@ -88,8 +93,26 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                     // Linux mkdir accepts rwx + sticky. setuid is ignored;
                     // setgid is inherited from the parent, which NARF's
                     // simplified credential model does not yet implement.
-                    directory.set_dir_mode_async((mode & !current_umask() & 0o1777) as u16),
+                    directory.set_dir_mode_async(inherited.mode),
                 );
+                // Install the inherited ACLs before anything can observe
+                // the directory: an inode that is briefly visible without
+                // the ACL it should have been born with is a permission
+                // hole, not a cosmetic delay.
+                if let Some(blob) = inherited.access.as_ref() {
+                    let _ = poll_blocking(directory.set_xattr(
+                        narf_filesystem::AclType::Access.xattr_name(),
+                        blob,
+                        0,
+                    ));
+                }
+                if let Some(blob) = inherited.default.as_ref() {
+                    let _ = poll_blocking(directory.set_xattr(
+                        narf_filesystem::AclType::Default.xattr_name(),
+                        blob,
+                        0,
+                    ));
+                }
                 let metadata_error = owner_result
                     .and_then(Result::err)
                     .or_else(|| mode_result.and_then(Result::err));

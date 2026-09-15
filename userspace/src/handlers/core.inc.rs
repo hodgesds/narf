@@ -1395,7 +1395,12 @@ fn open_impl(
                 return;
             }
             let accessor = current_accessor(task);
-            let permissions = (create_mode & !current_umask() & 0o777) as u16;
+            // `open(O_CREAT)` -> `vfs_create` -> `shmem_create` ->
+            // `simple_acl_create`. A parent with a default ACL replaces the
+            // umask with it, so `permissions` cannot be computed until the
+            // parent is known — see `inherit_acls_from_parent`.
+            let mut inherited_access: Option<alloc::vec::Vec<u8>> = None;
+            let mut permissions = (create_mode & !current_umask() & 0o777) as u16;
             // Async parent resolution so O_CREAT works in subdirectories of
             // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
             let create_result = fast_create
@@ -1405,6 +1410,10 @@ fn open_impl(
                     FastCreateResolution::Existing { .. } => None,
                 })
                 .map(|(parent, leaf)| {
+                    let inherited =
+                        inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                    permissions = inherited.mode;
+                    inherited_access = inherited.access;
                     poll_blocking(parent.create_with_attrs(
                         &leaf,
                         permissions,
@@ -1414,6 +1423,10 @@ fn open_impl(
                 })
                 .or_else(|| {
                     resolve_parent_dir_async(path).map(|(parent, leaf)| {
+                        let inherited =
+                            inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                        permissions = inherited.mode;
+                        inherited_access = inherited.access;
                         poll_blocking(parent.create_with_attrs(
                             &leaf,
                             permissions,
@@ -1426,6 +1439,16 @@ fn open_impl(
                 Some(Some(Ok(o))) => {
                     {
                         created = true;
+                    }
+                    // An inherited access ACL goes on before the fd is
+                    // published: a file briefly visible without the ACL it
+                    // should have been born with is a permission hole.
+                    if let Some(blob) = inherited_access.as_ref() {
+                        let _ = poll_blocking(o.set_xattr(
+                            narf_filesystem::AclType::Access.xattr_name(),
+                            blob,
+                            0,
+                        ));
                     }
                     o
                 }

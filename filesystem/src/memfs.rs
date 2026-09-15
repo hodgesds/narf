@@ -31,7 +31,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::posix_acl::{AclType, PosixAcl, XATTR_NAME_POSIX_ACL_ACCESS};
+use crate::posix_acl::{
+    AclType, PosixAcl, XATTR_NAME_POSIX_ACL_ACCESS, XATTR_NAME_POSIX_ACL_DEFAULT,
+};
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture, FsInstance, FsStat,
     InodeAttrs, Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS,
@@ -1485,6 +1487,96 @@ impl Xattrs {
     }
 }
 
+/// `fs/xattr.c::do_setxattr` -> `fs/posix_acl.c::do_set_acl` ->
+/// `vfs_set_acl` -> `set_posix_acl` -> `simple_set_acl`, collapsed onto one
+/// node and shared by every `MemFs` inode that can hold an ACL.
+///
+/// `value` is the raw `system.posix_acl_{access,default}` payload. An EMPTY
+/// value, or a well-formed header with zero entries, removes the ACL:
+/// `do_set_acl` only decodes `if (size)`, and `posix_acl_from_xattr`
+/// returns NULL for a zero-entry header, so both reach
+/// `vfs_set_acl(..., NULL)`.
+///
+/// `setxattr`'s `XATTR_CREATE`/`XATTR_REPLACE` flags are deliberately
+/// ignored — `do_setxattr` drops them on the POSIX-ACL path, passing only
+/// name/value/size to `do_set_acl`.
+///
+/// `is_dir` is `set_posix_acl`'s
+/// `if (type == ACL_TYPE_DEFAULT && !S_ISDIR(inode->i_mode)) return acl ?
+/// -EACCES : 0;` — a default ACL is storable only on a directory, which is
+/// what makes `setfacl -d` a directory-only operation and what stops the
+/// inheritance chain at the first non-directory.
+///
+/// LINUX-GAP: `set_posix_acl` also requires `inode_owner_or_capable()`
+/// (`-EPERM` otherwise). `FileOps`/`DirOps` methods carry no credential, so
+/// that check has to live in the syscall layer; nothing calls it there yet,
+/// so today any task that can reach the inode can set its ACL.
+fn memfs_set_acl(
+    xattrs: &Xattrs,
+    perms: &AtomicU32,
+    is_dir: bool,
+    ty: AclType,
+    value: &[u8],
+) -> Result<(), FsError> {
+    let acl = if value.is_empty() {
+        None
+    } else {
+        PosixAcl::from_xattr(value)?
+    };
+    if ty == AclType::Default {
+        if !is_dir {
+            return match acl {
+                Some(_) => Err(FsError::PermissionDenied),
+                None => Ok(()),
+            };
+        }
+        // A default ACL is inherited, never enforced, so unlike the access
+        // ACL it does not touch the directory's mode.
+        return match acl {
+            Some(acl) => {
+                acl.valid()?;
+                xattrs.raw_insert(XATTR_NAME_POSIX_ACL_DEFAULT, acl.to_xattr());
+                Ok(())
+            }
+            None => {
+                xattrs.raw_remove(XATTR_NAME_POSIX_ACL_DEFAULT);
+                Ok(())
+            }
+        };
+    }
+    let acl = match acl {
+        Some(acl) => acl,
+        None => {
+            xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
+            return Ok(());
+        }
+    };
+    acl.valid()?;
+    // `simple_set_acl` -> `posix_acl_update_mode`: the mode's low 9 bits
+    // become whatever the ACL says, and an ACL that is exactly expressible
+    // as mode bits is not stored at all.
+    //
+    // LINUX-GAP: the `in_group_or_capable()` half of
+    // `posix_acl_update_mode` drops S_ISGID when the caller is neither in
+    // the file's group nor CAP_FSETID-privileged. There is no credential to
+    // test here, so NARF passes `true` (keep the bit) — the same answer
+    // Linux gives for the common case of the owner acting on their own
+    // file, and never a widening of the rwx bits.
+    let (mode, stored) = crate::posix_acl::posix_acl_update_mode(
+        (perms.load(Ordering::Relaxed) & 0o7777) as u16,
+        acl,
+        true,
+    )?;
+    match stored {
+        Some(acl) => xattrs.raw_insert(XATTR_NAME_POSIX_ACL_ACCESS, acl.to_xattr()),
+        None => {
+            xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
+        }
+    }
+    perms.store(mode as u32, Ordering::Relaxed);
+    Ok(())
+}
+
 /// Default permission bits for a freshly minted `MemFile`: 0o666
 /// (rw-rw-rw-), owned by root (0, 0). This preserves the historical
 /// "root-can-do-anything, everyone has rw" behaviour so DAC enforcement
@@ -1898,74 +1990,10 @@ impl MemFile {
         Ok(())
     }
 
-    /// `fs/xattr.c::do_setxattr` -> `fs/posix_acl.c::do_set_acl` ->
-    /// `vfs_set_acl` -> `set_posix_acl` -> `simple_set_acl`, collapsed onto
-    /// one node.
-    ///
-    /// `value` is the raw `system.posix_acl_{access,default}` payload.
-    /// An EMPTY value, or a well-formed header with zero entries, removes
-    /// the ACL: `do_set_acl` only decodes `if (size)`, and
-    /// `posix_acl_from_xattr` returns NULL for a zero-entry header, so
-    /// both reach `vfs_set_acl(..., NULL)`.
-    ///
-    /// `setxattr`'s `XATTR_CREATE`/`XATTR_REPLACE` flags are deliberately
-    /// ignored — `fs/xattr.c::do_setxattr` drops them on the POSIX-ACL
-    /// path, passing only name/value/size to `do_set_acl`.
-    ///
-    /// A `MemFile` is never a directory, so a DEFAULT ACL is rejected with
-    /// `-EACCES` (and accepted as a no-op when it is a removal), which is
-    /// `set_posix_acl`'s `return acl ? -EACCES : 0`.
-    ///
-    /// LINUX-GAP: `set_posix_acl` also requires
-    /// `inode_owner_or_capable()` (`-EPERM` otherwise). `FileOps` methods
-    /// carry no credential, so that check has to live in the syscall
-    /// layer; nothing calls it there yet, so today any task that can reach
-    /// the inode can set its ACL.
+    /// `set_posix_acl` on a regular file — never a directory, so a DEFAULT
+    /// ACL is refused. See [`memfs_set_acl`].
     fn set_acl(&self, ty: AclType, value: &[u8]) -> Result<(), FsError> {
-        let acl = if value.is_empty() {
-            None
-        } else {
-            PosixAcl::from_xattr(value)?
-        };
-        if ty == AclType::Default {
-            return match acl {
-                Some(_) => Err(FsError::PermissionDenied),
-                None => Ok(()),
-            };
-        }
-        let acl = match acl {
-            Some(acl) => acl,
-            None => {
-                self.xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
-                return Ok(());
-            }
-        };
-        acl.valid()?;
-        // `simple_set_acl` -> `posix_acl_update_mode`: the mode's low 9
-        // bits become whatever the ACL says, and an ACL that is exactly
-        // expressible as mode bits is not stored at all.
-        //
-        // LINUX-GAP: the `in_group_or_capable()` half of
-        // `posix_acl_update_mode` drops S_ISGID when the caller is neither
-        // in the file's group nor CAP_FSETID-privileged. `FileOps` has no
-        // credential to test, so NARF passes `true` (keep the bit) — the
-        // same answer Linux gives for the common case of the owner acting
-        // on their own file, and never a widening of the rwx bits.
-        let (mode, stored) = crate::posix_acl::posix_acl_update_mode(
-            (self.perms.load(Ordering::Relaxed) & 0o7777) as u16,
-            acl,
-            true,
-        )?;
-        match stored {
-            Some(acl) => self
-                .xattrs
-                .raw_insert(XATTR_NAME_POSIX_ACL_ACCESS, acl.to_xattr()),
-            None => {
-                self.xattrs.raw_remove(XATTR_NAME_POSIX_ACL_ACCESS);
-            }
-        }
-        self.perms.store(mode as u32, Ordering::Relaxed);
-        Ok(())
+        memfs_set_acl(&self.xattrs, &self.perms, false, ty, value)
     }
 }
 
@@ -2746,6 +2774,14 @@ struct MemDir {
     uid: AtomicU32,
     gid: AtomicU32,
     times: Times,
+    /// Whether this directory carries a `system.posix_acl_default`.
+    ///
+    /// Every create in this directory has to ask — inheritance replaces the
+    /// umask — and almost no directory has one, so the answer is kept in a
+    /// byte instead of behind the xattr lock. Set and cleared by
+    /// `set_xattr`/`remove_xattr` on the two ACL paths, which are the only
+    /// writers of that entry.
+    has_default_acl: core::sync::atomic::AtomicBool,
     /// Immediate SUBDIRECTORIES, so `st_nlink` can be Linux's
     /// `2 + subdirs` without walking the entry map on every `stat`.
     /// Maintained under the `entries` lock alongside the map itself.
@@ -3325,6 +3361,7 @@ impl DirOps for MemDir {
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
                 times: Times::now(),
+                has_default_acl: core::sync::atomic::AtomicBool::new(false),
                 subdirs: AtomicU32::new(0),
                 xattrs: Xattrs::new(),
             });
@@ -3341,6 +3378,14 @@ impl DirOps for MemDir {
 
     fn dir_mtime_ns(&self) -> u64 {
         self.times.mtime()
+    }
+
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        // The common directory has none, and this is on the create path.
+        if !self.has_default_acl.load(Ordering::Acquire) {
+            return None;
+        }
+        self.xattrs.raw_get(XATTR_NAME_POSIX_ACL_DEFAULT)
     }
 
     fn inode_attrs(&self) -> InodeAttrs {
@@ -3592,6 +3637,21 @@ impl DirOps for MemDir {
     // namespace on regular files AND directories.
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // The two POSIX ACL names are not opaque blobs; a DIRECTORY is
+            // also the only inode that can hold a DEFAULT ACL, which is
+            // what `setfacl -d` installs and what every file created below
+            // inherits.
+            if let Some(ty) = AclType::from_xattr_name(name) {
+                memfs_set_acl(&self.xattrs, &self.perms, true, ty, value)?;
+                if ty == AclType::Default {
+                    self.has_default_acl.store(
+                        self.xattrs.raw_get(XATTR_NAME_POSIX_ACL_DEFAULT).is_some(),
+                        Ordering::Release,
+                    );
+                }
+                self.times.touch_ctime();
+                return Ok(());
+            }
             self.xattrs
                 .set(&self._inode_lease, name, value, flags, true)?;
             self.times.touch_ctime();
@@ -3609,6 +3669,17 @@ impl DirOps for MemDir {
 
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
+            // `removexattr` routes both ACL names to `vfs_remove_acl` ->
+            // `set_posix_acl(type, NULL)`, which returns 0 whether or not
+            // an ACL was cached.
+            if AclType::from_xattr_name(name).is_some() {
+                self.xattrs.raw_remove(name);
+                if name == XATTR_NAME_POSIX_ACL_DEFAULT {
+                    self.has_default_acl.store(false, Ordering::Release);
+                }
+                self.times.touch_ctime();
+                return Ok(());
+            }
             self.xattrs.remove(&self._inode_lease, name, true)?;
             self.times.touch_ctime();
             Ok(())
@@ -3694,6 +3765,7 @@ impl MemFs {
             uid: AtomicU32::new(root_uid),
             gid: AtomicU32::new(root_gid),
             times: Times::now(),
+            has_default_acl: core::sync::atomic::AtomicBool::new(false),
             subdirs: AtomicU32::new(0),
             xattrs: Xattrs::new(),
         });

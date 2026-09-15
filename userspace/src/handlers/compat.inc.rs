@@ -544,6 +544,57 @@ fn path_is_mount_ancestor(path: &str) -> bool {
         .any(|m| m.len() > p.len() && m.starts_with(p) && m.as_bytes()[p.len()] == b'/')
 }
 
+/// `fs/posix_acl.c::posix_acl_create` at the syscall boundary: what a new
+/// inode's mode should be, and which ACLs it should carry, given the parent
+/// directory it is being created in.
+///
+/// The umask lives here, not in the filesystem, and Linux's rule is that
+/// the two are alternatives — "the umask applies ONLY when the parent has
+/// no default ACL". A directory with `setfacl -d` set is exactly the case
+/// where a process umask must NOT narrow the result, which is the whole
+/// point of setting one on a shared group directory.
+///
+/// Returns the creation mode plus the raw `system.posix_acl_{access,
+/// default}` payloads to install, if any.
+pub(crate) struct InheritedAcls {
+    pub mode: u16,
+    pub access: Option<alloc::vec::Vec<u8>>,
+    pub default: Option<alloc::vec::Vec<u8>>,
+}
+
+pub(crate) fn inherit_acls_from_parent(
+    parent: &dyn narf_filesystem::DirOps,
+    raw_mode: u16,
+    is_dir: bool,
+) -> InheritedAcls {
+    let mut mode = raw_mode;
+    let umask = current_umask() as u16;
+    let parent_default = parent
+        .default_acl()
+        .and_then(|blob| narf_filesystem::PosixAcl::from_xattr(&blob).ok().flatten());
+    match narf_filesystem::posix_acl_create(
+        parent_default.as_ref(),
+        is_dir,
+        false,
+        &mut mode,
+        umask,
+    ) {
+        Ok(inherited) => InheritedAcls {
+            mode,
+            access: inherited.access_acl.map(|acl| acl.to_xattr()),
+            default: inherited.default_acl.map(|acl| acl.to_xattr()),
+        },
+        // A parent whose stored default ACL will not decode cannot be
+        // inherited from; fall back to the plain umask path rather than
+        // failing a create.
+        Err(_) => InheritedAcls {
+            mode: raw_mode & !(umask & 0o777),
+            access: None,
+            default: None,
+        },
+    }
+}
+
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
     current_resolve_absolute(path, |fs, rel| {
         let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
