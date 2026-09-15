@@ -95,6 +95,7 @@ not making.
 | `mknod` umask | ignored | applied — `mode_strip_umask` defers umask stripping on a POSIX-ACL filesystem rather than skipping it, and `shmem_mknod` reaches `posix_acl_create` through `simple_acl_create` |
 | `MS_RDONLY` / `MS_NODEV` / `MS_NOEXEC` | accepted and dropped | translated into the mount's `MNT_*` set (`path_mount`), replaced wholesale by `MS_REMOUNT` (`do_reconfigure_mnt`), copied by a namespace clone, and enforced: `mnt_want_write` → EROFS on every write-shaped syscall, `may_open`'s device arm → EACCES on a `nodev` mount, `path_noexec` → EACCES from `do_open_execat` |
 | Per-mount options in `/proc/mounts` | a flat `rw` | the real flags, in the column `show_vfsmnt`/`show_mountinfo` put them in — separate from the filesystem's `show_options` text |
+| set-user-ID / set-group-ID execution | not implemented at all — the bits were inert, which is also why `MS_NOSUID` had nothing to suppress | `bprm_fill_uid`, with every guard: `mnt_may_suid`, `task_no_new_privs`, a re-checked execute permission, `S_ISGID` only in company with `S_IXGRP`, and nothing conferred through a `#!` script. A set-user-ID-**root** binary additionally regenerates its permitted set from the bounding set (`handle_privileged_root`), without which it would reach uid 0 holding no capabilities |
 
 Ramfs deliberately ignores unknown mount parameters, following
 `ramfs_parse_param`, and has no `show_options` (its `super_operations`
@@ -140,11 +141,10 @@ These are explicit implementation gaps, not claimed compatibility:
 2. Transparent huge pages, nontrivial NUMA policies, idmapped mounts,
    casefolding (`CONFIG_UNICODE`), and fscrypt are not implemented.
    Unsupported mount policies are rejected rather than accepted as no-ops.
-3. `MS_NOSUID` is stored and reported but has nothing to suppress: NARF's
-   execve does not implement set-user-ID binaries, so there is no
-   privilege transition for it to block. `MS_REC` and `MS_RELATIME` are
-   accepted and dropped — there is no mount propagation to recurse over
-   and no per-inode atime policy to relax.
+3. `MS_REC` and `MS_RELATIME` are accepted and dropped — there is no mount
+   propagation to recurse over and no per-inode atime policy to relax.
+   (`MS_NOSUID` is now enforced: `bprm_fill_uid` consults `mnt_may_suid`
+   before granting a set-user-ID transition.)
 4. `noswap` cannot be relaxed because no swap path exists. Remount
    validates accepted policy spellings but does not add a behavior NARF
    lacks.

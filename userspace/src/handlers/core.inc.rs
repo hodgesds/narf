@@ -4788,6 +4788,144 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     }
 }
 
+/// `security/commoncap.c::handle_privileged_root` — the half of
+/// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
+/// actually privileged.
+///
+/// Without it a setuid-root exec would move euid to 0 and stop there, and
+/// on a task that had already dropped root the permitted set is empty, so
+/// the new program would be "root" with no capabilities — the one state
+/// Linux never leaves a process in.
+///
+/// ```text
+/// if (__is_eff(root_uid, new) || __is_real(root_uid, new)) {
+///         /* pP' = (cap_bset & ~0) | (pI & ~0) */
+///         new->cap_permitted = cap_combine(old->cap_bset, old->cap_inheritable);
+/// }
+/// if (__is_eff(root_uid, new))
+///         *effective = true;
+/// ```
+///
+/// The permitted set is REGENERATED from the bounding set rather than
+/// inherited, which is what lets an unprivileged caller gain privilege
+/// through a setuid-root binary at all. The effective set follows only
+/// when the EFFECTIVE uid is root: a binary that merely leaves the real
+/// uid at 0 gets the permissions but must raise them itself.
+fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
+    if new_ids.euid != 0 && new_ids.uid != 0 {
+        return;
+    }
+    let mut caps = read_caps(task);
+    caps.permitted = caps.bounding | caps.inheritable;
+    if new_ids.euid == 0 {
+        caps.effective = caps.permitted;
+    }
+    write_caps(task, caps);
+}
+
+/// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
+/// an `execve` of a privileged binary performs.
+///
+/// Every guard here is load-bearing, because this is the one place in the
+/// tree where an unprivileged task can gain privilege:
+///
+///   * `mnt_may_suid` — a `nosuid` mount confers nothing. That is what
+///     the flag is FOR, and until this existed there was nothing for it
+///     to suppress.
+///   * `task_no_new_privs` — a task that asked to be unable to gain
+///     privilege does not gain it. One-way, so a sandbox cannot be
+///     talked out of it.
+///   * the execute permission is re-checked (`inode_permission(MAY_EXEC)`)
+///     so a binary that lost its exec bit between the open and here
+///     confers nothing.
+///   * S_ISGID alone does nothing; Linux requires `S_ISGID | S_IXGRP`
+///     together, because S_ISGID without group-execute is the mandatory
+///     file-locking marker, not a privilege request.
+///
+/// Returns the new credential when a transition happened.
+fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
+    // Linux ignores the set-user-ID bits on a `#!` script: the kernel
+    // executes the INTERPRETER, and honouring the script's bits would hand
+    // its privilege to an interpreter that was never audited for it. NARF
+    // resolves the shebang itself, so the equivalent is to confer nothing
+    // once a shebang has been followed.
+    if from_script {
+        return None;
+    }
+    if narf_filesystem::any_restricted_mounts()
+        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOSUID != 0
+    {
+        return None;
+    }
+    if read_prctl(task).no_new_privs {
+        return None;
+    }
+    let file = resolve_file_absolute_ext(path, true)?;
+    let stat = file.stat();
+    let mode = stat.mode.perms;
+    if mode & 0o6000 == 0 {
+        return None;
+    }
+    let (file_uid, file_gid) = file.owners();
+    // "Did the exec bit vanish out from under us? Give up."
+    let permitted = narf_filesystem::posix_access_ok(
+        narf_filesystem::FileOwner {
+            uid: file_uid,
+            gid: file_gid,
+            perms: mode,
+            is_dir: false,
+        },
+        &accessor_for_inode(task, file_uid, file_gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: false,
+            exec: true,
+        },
+    );
+    if !permitted {
+        return None;
+    }
+    let old = read_uidgid(task);
+    let mut new = old;
+    if mode & 0o4000 != 0 {
+        new.euid = file_uid;
+    }
+    // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
+    if mode & 0o2010 == 0o2010 {
+        new.egid = file_gid;
+    }
+    if new.euid == old.euid && new.egid == old.egid {
+        return None;
+    }
+    // `commit_creds` keeps the filesystem ids in step with the effective
+    // ones; every DAC decision reads fsuid/fsgid, so leaving them behind
+    // would grant the privilege for `access()` and deny it for `open()`.
+    new.fsuid = new.euid;
+    new.fsgid = new.egid;
+    // The saved set-ids record where the privilege came from, which is how
+    // a setuid program drops and regains it (`seteuid` back to `suid`).
+    new.suid = new.euid;
+    new.sgid = new.egid;
+    write_uidgid(task, |e| *e = new);
+    cap_exec_privileged_root(task, new);
+    Some(new)
+}
+
+/// Test window onto [`bprm_fill_uid`]. A full `execve` needs a loadable
+/// image and a task switch, neither of which the ABI harness can stage, so
+/// the smoke drives the DECISION — which is the part that decides whether
+/// privilege is granted — directly.
+///
+/// Returns `(euid, egid, fsuid, effective caps)` after the call, so a test
+/// can assert both the credential transition and the capability
+/// regeneration a setuid-root binary depends on.
+#[doc(hidden)]
+pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
+    let _ = bprm_fill_uid(task, path, from_script);
+    let ids = read_uidgid(task);
+    (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
 /// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
 /// parent's `struct cred` wholesale; capabilities are transformed at
 /// EXECVE, not at fork).

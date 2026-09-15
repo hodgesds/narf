@@ -1118,6 +1118,242 @@ kernel_test_in!(
     smoke_abi_fsx_noexec_nodev_are_enforced_and_reported
 );
 
+/// `execve` of a set-user-ID binary raises privilege, and every guard on
+/// that is real.
+///
+/// `fs/exec.c::bprm_fill_uid` is the one place an unprivileged task can
+/// gain privilege, and NARF did not implement it at all — set-user-ID
+/// binaries simply did not work, which is also why `MS_NOSUID` had nothing
+/// to suppress.
+///
+/// This drives the decision directly rather than through a real `execve`:
+/// a full exec needs a loadable image and a task switch that the ABI
+/// harness cannot stage. The decision is the security-critical half.
+///
+/// Each guard is asserted separately because each one, missing, is a
+/// privilege-escalation bug on its own.
+fn smoke_abi_fsx_setuid_exec_transition_and_its_guards() -> TestResult {
+    const OWNER: u32 = 4000;
+    const GROUP: u32 = 4100;
+    const CALLER: u32 = 1000;
+    with_memfs("/abi-suid", "abi-suid", &[("prog", b"\x7fELF")], || {
+        let path = "/abi-suid/prog";
+        let cpath = b"/abi-suid/prog\0";
+        let task = crate::handlers::current_task_id();
+        let stage = |mode: u64| -> Result<(), &'static str> {
+            if call(
+                Syscall::Chown.raw(),
+                a2(cpath.as_ptr() as u64, OWNER as u64, GROUP as u64),
+            ) != Some(0)
+            {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, mode)) != Some(0) {
+                return Err("chmod of the test binary failed");
+            }
+            Ok(())
+        };
+        let as_caller = || {
+            crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        };
+
+        // ── set-user-ID: euid becomes the file's owner ────────────────
+        stage(0o4755)?;
+        as_caller();
+        let (euid, _, fsuid, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if euid != OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-user-ID binary did not move the effective uid");
+        }
+        // Every DAC decision reads fsuid, so leaving it behind would grant
+        // the privilege for `access()` and deny it for `open()`.
+        if fsuid != OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("the filesystem uid did not follow the effective uid");
+        }
+
+        // ── S_ISGID WITHOUT group-execute is not a privilege request ──
+        // It is the mandatory file-locking marker; Linux requires
+        // `(mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP)`.
+        stage(0o2745)?;
+        as_caller();
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if egid == GROUP {
+            crate::handlers::__test_uidgid_reset();
+            return Err("S_ISGID without group-execute granted the file's group");
+        }
+
+        // ── S_ISGID WITH group-execute does transition ───────────────
+        stage(0o2755)?;
+        as_caller();
+        let (_, egid, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if egid != GROUP {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-group-ID binary did not move the effective gid");
+        }
+
+        // ── a shebang confers nothing ────────────────────────────────
+        // The kernel executes the INTERPRETER; honouring the script's bits
+        // would hand its privilege to an interpreter never audited for it.
+        stage(0o4755)?;
+        as_caller();
+        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, true);
+        if euid == OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("a set-user-ID script granted privilege through its interpreter");
+        }
+
+        // ── no_new_privs refuses the transition ──────────────────────
+        stage(0o4755)?;
+        as_caller();
+        const PR_SET_NO_NEW_PRIVS: u64 = 38;
+        if call(Syscall::Prctl.raw(), a2(PR_SET_NO_NEW_PRIVS, 1, 0)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("prctl(PR_SET_NO_NEW_PRIVS) failed");
+        }
+        let (euid, _, _, _) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_prctl_reset();
+        if euid == OWNER {
+            crate::handlers::__test_uidgid_reset();
+            return Err("no_new_privs did not stop a set-user-ID transition");
+        }
+
+        // ── a setuid-ROOT binary regenerates capabilities ────────────
+        // Without this the new program would be uid 0 with an empty
+        // permitted set — the one state Linux never leaves a process in.
+        if call(Syscall::Chown.raw(), a2(cpath.as_ptr() as u64, 0, 0)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chown root of the test binary failed");
+        }
+        // The chmod must come AFTER the chown: changing an owner clears
+        // the set-user-ID bit (`setattr_should_drop_suidgid`), so staging
+        // them the other way round would leave an ordinary 0755 binary and
+        // the assertion below would be about nothing.
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chmod setuid-root of the test binary failed");
+        }
+        as_caller();
+        let (euid, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_uidgid_reset();
+        if euid != 0 {
+            return Err("a set-user-ID-root binary did not reach uid 0");
+        }
+        if effective == 0 {
+            return Err("a set-user-ID-root binary got uid 0 with no capabilities");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setuid_exec_transition_and_its_guards
+);
+
+/// `nosuid` is what it says: a set-user-ID binary on such a mount confers
+/// nothing.
+///
+/// `bprm_fill_uid` opens with `if (!mnt_may_suid(file->f_path.mnt))
+/// return;`, and `mnt_may_suid` is `!(mnt->mnt_flags & MNT_NOSUID) && ...`.
+/// This is the pairing that makes both halves worth having: storing the
+/// flag was pointless while nothing could be suppressed, and implementing
+/// set-user-ID execution without honouring the flag would have handed
+/// every sandbox a privilege-escalation path it had explicitly asked to
+/// close.
+fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
+    const OWNER: u32 = 4200;
+    const CALLER: u32 = 1200;
+    const MS_NOSUID: u64 = 1 << 1;
+    with_setup(|| {
+        let target = b"/abi-nosuid\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        let mount_with = |flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: source.as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg2: fstype.as_ptr() as u64,
+                    arg3: flags,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        let cpath = b"/abi-nosuid/prog\0";
+        let path = "/abi-nosuid/prog";
+        let task = crate::handlers::current_task_id();
+        let finish = |outcome: Result<(), &'static str>| {
+            crate::handlers::__test_uidgid_reset();
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        let stage = || -> Result<(), &'static str> {
+            match call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, cpath.as_ptr() as u64, 0o100 | 0o2, 0o755),
+            ) {
+                Some(fd) if fd >= 0 => {
+                    let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                }
+                _ => return Err("creating the test binary failed"),
+            }
+            // chown first: it clears the set-user-ID bit.
+            if call(
+                Syscall::Chown.raw(),
+                a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),
+            ) != Some(0)
+            {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0) {
+                return Err("chmod setuid of the test binary failed");
+            }
+            Ok(())
+        };
+
+        // Baseline on a PLAIN mount: the transition must happen, or the
+        // nosuid assertion below would pass for the wrong reason.
+        if mount_with(0) != Some(0) {
+            return Err("mounting a plain tmpfs failed");
+        }
+        if let Err(msg) = stage() {
+            return finish(Err(msg));
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        crate::handlers::__test_uidgid_reset();
+        if euid != OWNER {
+            return finish(Err(
+                "the baseline setuid transition did not happen — test is vacuous",
+            ));
+        }
+        let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+
+        // Same binary, same bits, on a `nosuid` mount: nothing.
+        if mount_with(MS_NOSUID) != Some(0) {
+            return Err("mounting a nosuid tmpfs failed");
+        }
+        if let Err(msg) = stage() {
+            return finish(Err(msg));
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if euid == OWNER {
+            return finish(Err("a nosuid mount granted a set-user-ID transition"));
+        }
+        if euid != CALLER {
+            return finish(Err("a nosuid mount changed the effective uid at all"));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_nosuid_mount_confers_no_privilege
+);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

@@ -1422,6 +1422,11 @@ fn do_execve_resolved(
     let mut cur_path = alloc::string::String::from(path);
     let mut cur_argv: alloc::vec::Vec<alloc::string::String> = argv_strs.clone();
     let elf_buf;
+    // Whether the image came from an fd rather than a path, and whether a
+    // `#!` line was followed to reach it — both decide whether the file's
+    // set-user-ID bits may be honoured below.
+    let image_override_used = image_override.is_some();
+    let mut followed_shebang = false;
     // fexecve fast path: the bytes are already in hand (a memfd fd with no
     // filesystem path). Skip path resolution + shebang — a fexecve'd image is
     // a real binary, and argv[0] is whatever the caller passed.
@@ -1448,6 +1453,7 @@ fn do_execve_resolved(
                     return;
                 }
                 depth += 1;
+                followed_shebang = true;
                 let line_end = buf.iter().position(|&c| c == b'\n').unwrap_or(buf.len());
                 let line = core::str::from_utf8(&buf[2..line_end]).unwrap_or("").trim();
                 // interpreter = first whitespace-delimited token; the remainder
@@ -1487,6 +1493,17 @@ fn do_execve_resolved(
     let argv_refs: alloc::vec::Vec<&str> = cur_argv.iter().map(|s| s.as_str()).collect();
 
     let task = current_task_id();
+
+    // `prepare_binprm` -> `bprm_fill_uid`: the set-user-ID / set-group-ID
+    // transition, applied to the file actually being executed and only
+    // once the image is known good. `image_override` is a memfd/fd image
+    // with no mount and no inode bits behind it, so it confers nothing —
+    // as in Linux, where there is no file to read them from.
+    if image_override_used {
+        let _ = task;
+    } else {
+        let _ = bprm_fill_uid(task, &cur_path, followed_shebang);
+    }
 
     // Step 4: load the new image. exec REPLACES this process's image, so the
     // loaded `UserProcess` carries the caller's EXISTING pid — minting a fresh
