@@ -487,11 +487,22 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_pos);
 fn smoke_abi_fdio_fcntl_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"hi")], || {
         let fd = open_fd(b"/abi/f\0")?;
-        // An unknown fcntl cmd falls through to InvalidOp.
-        // LINUX-GAP: Linux returns -EINVAL for an unknown command.
+        // An unknown fcntl command is -EINVAL: `fs/fcntl.c::do_fcntl` opens
+        // with `long err = -EINVAL;` and its `default:` arm is a bare `break`.
+        //
+        // This case used to assert `SyscallReturn::INVALID_OP` and carried a
+        // LINUX-GAP marker for the divergence. The gap was not cosmetic —
+        // `invalid_op()` carries its status in rdx/x1 and leaves `value` at 0,
+        // and 0 is what the Linux ABI reads as the return value. So every
+        // unimplemented command reported success to userspace. `call_raw` is
+        // kept rather than `call` so the status word is still in reach: the
+        // point of the fix is that the *value* register now carries the
+        // answer, and a case that only inspected the status could not tell
+        // the difference.
         match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, 9999, 0)) {
-            r if r.status == SyscallReturn::INVALID_OP => Ok(()),
-            _ => Err("fcntl unknown cmd was not InvalidOp"),
+            r if r.value as i64 == EINVAL => Ok(()),
+            r if r.value == 0 => Err("fcntl unknown cmd reported success to userspace"),
+            _ => Err("fcntl unknown cmd was not -EINVAL"),
         }
     })
 }
@@ -4012,4 +4023,183 @@ fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio_getlk_reports_owner_visible_pid
+);
+
+// ── fcntl: commands NARF does not implement ────────────────────────
+//
+// `fs/fcntl.c::do_fcntl` opens with `long err = -EINVAL;` and ends with a
+// bare `default: break;`, so an unhandled command is -EINVAL. NARF's default
+// arm used to be `SyscallReturn::invalid_op()`, which puts its real status in
+// rdx/x1 — a register the Linux ABI never reads — and leaves rax = 0. Every
+// unimplemented command therefore reported success, which is a worse answer
+// than "unsupported" for every caller that probes before relying on one.
+
+/// F_GETLEASE must report F_UNLCK (2), not the accidental 0 that is F_RDLCK.
+///
+/// `include/linux/filelock.h`, `#else /* !CONFIG_FILE_LOCKING */`:
+///
+///   static inline int fcntl_getlease(struct file *filp) { return F_UNLCK; }
+///
+/// That is the configuration NARF is in — no lease break, no break timer, no
+/// SIGIO — and F_UNLCK is the honest answer. The value matters rather than
+/// merely the sign: 0 means F_RDLCK, i.e. "a read lease is held and the
+/// kernel will break it for you", so a cache that trusts it serves stale
+/// content forever. This is the one case in the group where the old answer
+/// was not just a fabricated success but a specific false statement.
+fn smoke_abi_fdio_fcntl_getlease_reports_unlck() -> TestResult {
+    const F_GETLEASE: u64 = 1025;
+    const F_RDLCK: i64 = 0;
+    const F_UNLCK: i64 = 2;
+    with_memfs("/abi-fcntl-gap", "abi-fcntl-gap", &[("f", b"x")], || {
+        let fd = open_fd(b"/abi-fcntl-gap/f\0")?;
+        // `call_raw` rather than `call`: the harness's `call` maps a
+        // non-OK status word to None, but the Linux ABI hands userspace
+        // only the value register. Reading `.value` is what a real caller
+        // sees, and that register is what this fix is about.
+        match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, F_GETLEASE, 0)).value as i64 {
+            v if v == F_UNLCK => Ok(()),
+            v if v == F_RDLCK => Err("F_GETLEASE reported F_RDLCK — a read lease that is not held"),
+            _ => Err("F_GETLEASE must report F_UNLCK on a kernel without leases"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_getlease_reports_unlck);
+
+/// F_SETLEASE must fail rather than claim a lease was installed.
+///
+/// Same stub block: `fcntl_setlease(...) { return -EINVAL; }`. tmpfs really
+/// does support leases upstream (`shmem_file_operations.setlease =
+/// generic_setlease`), so this is a genuine gap — but a caller that is told
+/// "granted" stops revalidating, while one told EINVAL keeps doing so.
+fn smoke_abi_fdio_fcntl_setlease_is_einval() -> TestResult {
+    const F_SETLEASE: u64 = 1024;
+    const F_WRLCK: u64 = 1;
+    with_memfs(
+        "/abi-fcntl-lease",
+        "abi-fcntl-lease",
+        &[("f", b"x")],
+        || {
+            let fd = open_fd(b"/abi-fcntl-lease/f\0")?;
+            match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, F_SETLEASE, F_WRLCK)).value as i64 {
+                v if v == EINVAL => Ok(()),
+                0 => Err("F_SETLEASE reported a write lease that was never installed"),
+                _ => Err("F_SETLEASE must be -EINVAL without lease machinery"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_setlease_is_einval);
+
+/// The dangerous member of the group: open-file-description locks.
+///
+/// NARF implements POSIX record locks (F_SETLK/F_GETLK/F_SETLKW above) but
+/// not OFD locks, whose owner is the open file description rather than the
+/// process — a different conflict rule, so routing them into the POSIX table
+/// would answer confidently and wrongly. Reporting 0 was worse still: every
+/// caller was told the range was theirs, so two processes could each believe
+/// they held the same exclusive lock. Probers (sqlite, LMDB) read EINVAL as
+/// "no OFD support here" and fall back to POSIX locks, which do work.
+///
+/// Both commands are checked: a fallback path keyed on F_OFD_SETLK alone
+/// still deadlocks if F_OFD_SETLKW fabricates a grant.
+fn smoke_abi_fdio_fcntl_ofd_locks_are_einval() -> TestResult {
+    const F_OFD_SETLK: u64 = 37;
+    const F_OFD_SETLKW: u64 = 38;
+    const F_WRLCK: i16 = 1;
+    const SEEK_SET: i16 = 0;
+    with_memfs("/abi-fcntl-ofd", "abi-fcntl-ofd", &[("f", b"xxxx")], || {
+        // O_RDWR (2).
+        let fd = open_fd_flags(b"/abi-fcntl-ofd/f\0", 2)?;
+        // struct flock: l_type@0(i16) l_whence@2(i16) l_start@8(i64)
+        // l_len@16(i64) l_pid@24(i32) — the layout the F_GETLK cases above
+        // already write by hand.
+        let mut bytes = [0u8; 32];
+        bytes[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
+        bytes[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+        let arg = bytes.as_mut_ptr() as u64;
+        for (cmd, name) in [(F_OFD_SETLK, "F_OFD_SETLK"), (F_OFD_SETLKW, "F_OFD_SETLKW")] {
+            let _ = name;
+            match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, cmd, arg)).value as i64 {
+                v if v == EINVAL => {}
+                0 => return Err("an OFD lock command reported a lock that was never taken"),
+                _ => return Err("OFD lock commands must be -EINVAL, not a fabricated grant"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_ofd_locks_are_einval);
+
+/// F_SETOWN/F_SETSIG must not promise SIGIO that never arrives.
+///
+/// NARF has no async-I/O owner and no SIGIO delivery. Answering 0 leaves a
+/// caller blocked forever on a signal the kernel will not send; EINVAL sends
+/// it to poll/epoll, which NARF does implement.
+fn smoke_abi_fdio_fcntl_async_owner_is_einval() -> TestResult {
+    const F_SETOWN: u64 = 8;
+    const F_SETSIG: u64 = 10;
+    const F_NOTIFY: u64 = 1026;
+    with_memfs("/abi-fcntl-own", "abi-fcntl-own", &[("f", b"x")], || {
+        let fd = open_fd(b"/abi-fcntl-own/f\0")?;
+        for cmd in [F_SETOWN, F_SETSIG, F_NOTIFY] {
+            match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, cmd, 1)).value as i64 {
+                v if v == EINVAL => {}
+                0 => return Err("an unimplemented fcntl command reported success"),
+                _ => return Err("unimplemented fcntl commands must be -EINVAL"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_async_owner_is_einval);
+
+/// Positive pin: the commands NARF does implement still work. The change
+/// above widens an arm that every unhandled command falls into, so this is
+/// the guard that it did not swallow a handled one — F_DUPFD, F_GETFD,
+/// F_GETFL, F_GETLK and F_GET_SEALS all return before reaching it.
+fn smoke_abi_fdio_fcntl_handled_commands_still_work() -> TestResult {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_GETFL: u64 = 3;
+    const F_GETLK: u64 = 5;
+    const F_UNLCK: i16 = 2;
+    const F_WRLCK: i16 = 1;
+    const SEEK_SET: i16 = 0;
+    with_memfs("/abi-fcntl-pos", "abi-fcntl-pos", &[("f", b"xxxx")], || {
+        let fd = open_fd_flags(b"/abi-fcntl-pos/f\0", 2)?; // O_RDWR
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_DUPFD, 0)) {
+            Some(v) if v >= 0 && v as u32 != fd => {}
+            _ => return Err("F_DUPFD stopped duplicating"),
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) {
+            Some(v) if v >= 0 => {}
+            _ => return Err("F_GETFD stopped reporting descriptor flags"),
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFL, 0)) {
+            Some(v) if v >= 0 => {}
+            _ => return Err("F_GETFL stopped reporting status flags"),
+        }
+        // F_GETLK on an unlocked file reports F_UNLCK in l_type, and must do
+        // so by writing the caller's struct — not by falling through to the
+        // new EINVAL arm.
+        let mut bytes = [0u8; 32];
+        bytes[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
+        bytes[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+        match call(
+            Syscall::Fcntl.raw(),
+            a2(fd as u64, F_GETLK, bytes.as_mut_ptr() as u64),
+        ) {
+            Some(0) => {}
+            _ => return Err("F_GETLK stopped answering on an unlocked file"),
+        }
+        let reported = i16::from_le_bytes([bytes[0], bytes[1]]);
+        if reported != F_UNLCK {
+            return Err("F_GETLK no longer reports F_UNLCK for an unlocked range");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_fcntl_handled_commands_still_work
 );
