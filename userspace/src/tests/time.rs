@@ -157,7 +157,7 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
     // ClockGetTime now honours arg0:
     //   0 = CLOCK_REALTIME  (wall via time::now_wall)
     //   1 = CLOCK_MONOTONIC (monotonic_ns)
-    //   anything else → InvalidOp.
+    //   anything else → -EINVAL.
     use crate::{
         install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
         Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
@@ -241,7 +241,17 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
         return TestResult::Fail("realtime clock surfaced a negative timespec");
     }
 
-    // Bogus clock id rejected with InvalidOp status.
+    // Bogus clock id rejected with -EINVAL, and the caller's timespec left
+    // alone. `SYSCALL_DEFINE2(clock_gettime)`: `if (!kc) return -EINVAL;`.
+    //
+    // This asserted an `INVALID_OP` status, which is what the handler used to
+    // answer. `invalid_op()` leaves `value` at 0 — the register the Linux ABI
+    // returns — so userspace read success over a timespec the handler had
+    // skipped writing. The sentinel below is the part that matters: what this
+    // pins is not the errno but that nothing was reported as written.
+    const SENTINEL: i64 = 0x0BAD_0BAD_0BAD_0BADi64;
+    buf[0] = SENTINEL;
+    buf[1] = SENTINEL;
     let mut ctx = FakeCtx {
         args: SyscallArgs {
             arg0: 99,
@@ -253,10 +263,13 @@ fn smoke_userspace_clock_gettime_distinguishes_clocks() -> TestResult {
     kernel_syscall_entry(Syscall::ClockGetTime.raw(), &mut ctx);
     let bogus_rejected = matches!(
         ctx.ret,
-        Some(r) if r.status == SyscallReturn::INVALID_OP,
+        Some(r) if r.status == SyscallReturn::OK && r.value as i64 == -22,
     );
     if !bogus_rejected {
-        return TestResult::Fail("unknown clock id was not rejected");
+        return TestResult::Fail("unknown clock id was not rejected with -EINVAL");
+    }
+    if buf[0] != SENTINEL || buf[1] != SENTINEL {
+        return TestResult::Fail("clock_gettime wrote a timespec for a clock it rejected");
     }
 
     __test_clear_global();
