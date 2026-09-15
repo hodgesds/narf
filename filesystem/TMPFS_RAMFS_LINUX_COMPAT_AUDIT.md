@@ -131,15 +131,35 @@ to set an attribute, and without that guard the test would have asserted
 the opposite — which is what its first version did, having staged the
 mode before an ACL write that reset it.
 
+### Shared mappings (2026-09-15)
+
+| Linux-visible area | Before | Implemented result |
+| --- | --- | --- |
+| `MAP_SHARED` coherence (tmpfs FILES; `memfd_create` has its own frame-backed store and was already coherent) | each mapping got a PRIVATE frame copied in at fault time and back out on `msync`/`fsync`, so a store through the mapping was invisible to `read(2)` and a `write(2)` was invisible to an already-faulted mapping forever | tmpfs pages are physical frames and `FileOps::mmap_fault` hands the file's OWN frame to the address space, so there is one copy as on Linux (the folio `shmem_get_folio` returns is the page `filemap_map_pages` installs). `MAP_PRIVATE` keeps its copy semantics — `sys_mmap` reaches the demand path only for `MAP_SHARED` |
+
+Verified end to end by
+`verification/data/musl-demo/tmpfs_share_smoke_x86_64.c`, which passes on
+the host's real Linux kernel and on NARF, and fails with `mapped store not
+visible to read(2)` when the private-copy path is restored.
+
 ## Remaining gaps
 
 These are explicit implementation gaps, not claimed compatibility:
 
-1. NARF tmpfs pages are kernel-heap pages, not unified VM/page-cache
-   objects. Consequently coherent shared file mappings, memory-pressure
-   reclaim, swap, shmem counters, and Linux's internal shmem mount are
-   absent. Closing this requires a page-cache/VM design rather than another
-   `MemFs` patch.
+1. Memory-pressure reclaim, swap, shmem counters, and Linux's internal
+   shmem mount are absent. tmpfs pages are now physical frames and a
+   `MAP_SHARED` mapping aliases the file's own page
+   (`filesystem/specification/tmpfs-shared-mappings.md`), so shared file
+   mappings are coherent; what remains is the reclaim/swap half, which
+   needs a VM design rather than another `MemFs` patch.
+
+   The one divergence that came with it: a page truncated away while
+   mapped is RETIRED rather than freed — its frame is kept, and kept
+   charged, until the inode dies — where Linux calls
+   `unmap_mapping_range` and lets later accesses take SIGBUS. NARF has no
+   reverse map from a file range to its mappings and no
+   cross-address-space PTE invalidation, and freeing the frame would hand
+   the buddy allocator a page userspace can still write.
 2. Transparent huge pages, nontrivial NUMA policies, idmapped mounts,
    casefolding (`CONFIG_UNICODE`), and fscrypt are not implemented.
    Unsupported mount policies are rejected rather than accepted as no-ops.
