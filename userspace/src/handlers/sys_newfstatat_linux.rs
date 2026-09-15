@@ -66,9 +66,17 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         let task = current_task_id();
         let stat = fd::with_table(task, |t| {
             t.get(dirfd as u32)
-                .map(|e| (e.ops.stat(), e.ops.owners(), e.ops.rdev(), e.ops.ino()))
+                .map(|e| {
+                (
+                    e.ops.stat(),
+                    e.ops.owners(),
+                    e.ops.rdev(),
+                    e.ops.ino(),
+                    e.ops.inode_attrs(),
+                )
+            })
         });
-        let (s, (uid, gid), rdev, ino) = match stat {
+        let (s, (uid, gid), rdev, ino, attrs) = match stat {
             Some(Some(tuple)) => tuple,
             _ => {
                 ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
@@ -80,7 +88,7 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
             return;
         }
-        let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
+        let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
         // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size.
         let bytes: &[u8] = unsafe {
             core::slice::from_raw_parts(

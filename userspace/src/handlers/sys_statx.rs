@@ -104,7 +104,14 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         let st = fd::with_table(task, |t| {
             t.get(dirfd as u32).map(|e| {
                 let (uid, gid) = e.ops.owners();
-                (e.ops.stat(), e.ops.ino(), e.ops.rdev(), uid, gid)
+                (
+                    e.ops.stat(),
+                    e.ops.ino(),
+                    e.ops.rdev(),
+                    uid,
+                    gid,
+                    e.ops.inode_attrs(),
+                )
             })
         })
         .flatten();
@@ -197,7 +204,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         (st, mnt, is_mount_root, path_owned)
     };
 
-    let (s, ino, rdev, uid, gid) = match fs_stat {
+    let (s, ino, rdev, uid, gid, attrs) = match fs_stat {
         Some(tuple) => tuple,
         None => {
             // File doesn't exist — report ENOENT, not the bare -1 sentinel
@@ -227,29 +234,42 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     let mode_word: u16 = ftype_bits | (s.mode.perms & 0o7777);
 
     // mtime: monotonic cycles → ns via the wall-clock calibration.
-    // Wall-clock per inode isn't tracked, so this surfaces a
-    // stable monotonic ordering, not a real wall time.
     let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
-    let mtime = StatxTimestamp {
-        tv_sec: (mtime_ns / 1_000_000_000) as i64,
-        tv_nsec: (mtime_ns % 1_000_000_000) as u32,
+    let stamp = |ns: u64| StatxTimestamp {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_nsec: (ns % 1_000_000_000) as u32,
         __reserved: 0,
     };
+    let mtime = stamp(mtime_ns);
+    // A filesystem that tracks atime/ctime separately reports them
+    // separately; one that does not keeps mtime standing in for both, which
+    // is what this did for every filesystem.
+    let atime = stamp(if attrs.atime_ns != 0 {
+        attrs.atime_ns
+    } else {
+        mtime_ns
+    });
+    let ctime = stamp(if attrs.ctime_ns != 0 {
+        attrs.ctime_ns
+    } else {
+        mtime_ns
+    });
 
     // Honour the request mask but only advertise what we filled.
     // STATX_BASIC_STATS = type|mode|nlink|uid|gid|atime|mtime|
-    // ctime|ino|size|blocks. We fill type/mode/nlink/ino/size/
-    // blocks/mtime/ctime; uid/gid/atime aren't tracked.
+    // ctime|ino|size|blocks. Every one of those is filled; atime is real
+    // on a filesystem that tracks it and mirrors mtime on one that does
+    // not, which is also what a `noatime` mount looks like.
     //
     // LINUX-GAP: past the STATX__RESERVED rejection above, `mask` is
     // advisory here — the handler computes the same fields whatever is
     // requested and reports them all in stx_mask. Linux permits returning
     // MORE than was asked for (and systemd relies on that for STATX_MNT_ID,
     // below), but it also clears result_mask bits it could not fill, whereas
-    // NARF has no source for STATX_BTIME / STATX_ATIME / STATX_DIOALIGN and
-    // simply never advertises them. A caller asking only for STATX_BTIME
-    // therefore gets a successful statx with that bit clear rather than an
-    // error — which is legal, just less informative than Linux.
+    // NARF has no source for STATX_BTIME / STATX_DIOALIGN and simply never
+    // advertises them. A caller asking only for STATX_BTIME therefore gets
+    // a successful statx with that bit clear rather than an error — which
+    // is legal, just less informative than Linux.
     let filled = STATX_TYPE
         | STATX_MODE
         | STATX_NLINK
@@ -260,6 +280,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         | STATX_BLOCKS
         | STATX_MTIME
         | STATX_CTIME
+        | STATX_ATIME
         | STATX_MNT_ID;
     // A mount ID is cheap once path resolution has identified the covering
     // mount, and Linux is permitted to return fields beyond the request.
@@ -284,18 +305,24 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         stx_size: s.size,
         stx_blocks: s.blocks,
         stx_mtime: mtime,
-        stx_ctime: mtime,
+        stx_ctime: ctime,
+        stx_atime: atime,
         stx_ino: if ino != 0 {
             ino
         } else {
             (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
         },
-        stx_nlink: 1,
+        // `tracked`, not `nlink != 0`: an O_TMPFILE inode has zero links
+        // until `linkat` names it, and that zero is meaningful.
+        stx_nlink: if attrs.tracked { attrs.nlink } else { 1 },
         stx_uid: uid,
         stx_gid: gid,
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
         stx_mnt_id: mnt_id.unwrap_or(0),
+        // `st_dev` split into the major/minor statx reports separately.
+        stx_dev_major: ((attrs.dev >> 8) & 0xfff) as u32,
+        stx_dev_minor: ((attrs.dev & 0xff) | ((attrs.dev >> 12) & !0xff)) as u32,
         stx_attributes_mask: STATX_ATTR_MOUNT_ROOT,
         stx_mask: (filled
             & if mask == 0 {

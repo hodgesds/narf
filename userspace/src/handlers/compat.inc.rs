@@ -544,6 +544,57 @@ fn path_is_mount_ancestor(path: &str) -> bool {
         .any(|m| m.len() > p.len() && m.starts_with(p) && m.as_bytes()[p.len()] == b'/')
 }
 
+/// `fs/posix_acl.c::posix_acl_create` at the syscall boundary: what a new
+/// inode's mode should be, and which ACLs it should carry, given the parent
+/// directory it is being created in.
+///
+/// The umask lives here, not in the filesystem, and Linux's rule is that
+/// the two are alternatives — "the umask applies ONLY when the parent has
+/// no default ACL". A directory with `setfacl -d` set is exactly the case
+/// where a process umask must NOT narrow the result, which is the whole
+/// point of setting one on a shared group directory.
+///
+/// Returns the creation mode plus the raw `system.posix_acl_{access,
+/// default}` payloads to install, if any.
+pub(crate) struct InheritedAcls {
+    pub mode: u16,
+    pub access: Option<alloc::vec::Vec<u8>>,
+    pub default: Option<alloc::vec::Vec<u8>>,
+}
+
+pub(crate) fn inherit_acls_from_parent(
+    parent: &dyn narf_filesystem::DirOps,
+    raw_mode: u16,
+    is_dir: bool,
+) -> InheritedAcls {
+    let mut mode = raw_mode;
+    let umask = current_umask() as u16;
+    let parent_default = parent
+        .default_acl()
+        .and_then(|blob| narf_filesystem::PosixAcl::from_xattr(&blob).ok().flatten());
+    match narf_filesystem::posix_acl_create(
+        parent_default.as_ref(),
+        is_dir,
+        false,
+        &mut mode,
+        umask,
+    ) {
+        Ok(inherited) => InheritedAcls {
+            mode,
+            access: inherited.access_acl.map(|acl| acl.to_xattr()),
+            default: inherited.default_acl.map(|acl| acl.to_xattr()),
+        },
+        // A parent whose stored default ACL will not decode cannot be
+        // inherited from; fall back to the plain umask path rather than
+        // failing a create.
+        Err(_) => InheritedAcls {
+            mode: raw_mode & !(umask & 0o777),
+            access: None,
+            default: None,
+        },
+    }
+}
+
 fn resolve_dir_absolute(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
     current_resolve_absolute(path, |fs, rel| {
         let dir: alloc::sync::Arc<dyn narf_filesystem::DirOps> = if rel.is_empty() {
@@ -612,7 +663,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, _ino, _rdev, _uid, _gid)| s)
+    stat_ino_path_dir_aware(path).map(|(s, ..)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
@@ -715,7 +766,7 @@ fn path_symlink_loop(path: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
+fn stat_ino_path_dir_aware(path: &str) -> Option<PathStat> {
     stat_ino_path_dir_aware_ext(path, true)
 }
 
@@ -724,10 +775,21 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u6
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` pass `false` so the returned stat
 /// describes the symlink itself (S_IFLNK, st_size = target length)
 /// rather than its target; plain `stat`/`fstatat` pass `true`.
-fn stat_ino_path_dir_aware_ext(
-    path: &str,
-    follow_final: bool,
-) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
+/// Everything the Linux `struct stat` needs for one path, in one tuple:
+/// `(stat, ino, rdev, uid, gid, inode attrs)`. The last field carries
+/// `st_nlink`, `st_dev` and the atime/ctime that `narf_filesystem::Stat`
+/// does not model; it is `Default` for a filesystem that tracks none of
+/// them, and the stat path then reports what it always did.
+type PathStat = (
+    narf_filesystem::Stat,
+    u64,
+    u64,
+    u32,
+    u32,
+    narf_filesystem::InodeAttrs,
+);
+
+fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
     let file = current_resolve_absolute(path, |fs, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
@@ -736,7 +798,7 @@ fn stat_ino_path_dir_aware_ext(
             // through to the resolve_dir_absolute path below.
             fs.root_file().map(|f| {
                 let (uid, gid) = f.owners();
-                (f.stat(), f.ino(), f.rdev(), uid, gid)
+                (f.stat(), f.ino(), f.rdev(), uid, gid, f.inode_attrs())
             })
         } else {
             // Drive the ASYNC resolver (same as the open/execve path):
@@ -759,7 +821,7 @@ fn stat_ino_path_dir_aware_ext(
             // evdev/drm device" and they refuse to open it.
             .map(|ops| {
                 let (uid, gid) = ops.owners();
-                (ops.stat(), ops.ino(), ops.rdev(), uid, gid)
+                (ops.stat(), ops.ino(), ops.rdev(), uid, gid, ops.inode_attrs())
             })
         }
     })
@@ -769,6 +831,11 @@ fn stat_ino_path_dir_aware_ext(
     }
     if let Some(dir) = resolve_dir_absolute(path) {
         let (uid, gid) = dir.dir_owners();
+        let attrs = dir.inode_attrs();
+        // A directory has a real mtime on any filesystem that tracks one;
+        // reporting 0 made every directory look like the epoch to `ls -l`,
+        // `make` and `rsync`.
+        let dir_mtime = dir.dir_mtime_ns();
         // Report the directory's real (chmod-settable) mode, not a
         // hardcoded 0o777 — dbus/systemd reject XDG_RUNTIME_DIR unless
         // it is not group/other-writable, so `chmod 0700` must show.
@@ -784,12 +851,13 @@ fn stat_ino_path_dir_aware_ext(
                     file_type: narf_filesystem::FileType::Dir,
                     perms: dir.dir_mode(),
                 },
-                mtime_cycles: 0,
+                mtime_cycles: narf_time::ns_to_cycles(dir_mtime),
             },
             dir.ino(),
             0,
             uid,
             gid,
+            attrs,
         ));
     }
     // A path that is an ancestor of a mount point (e.g. /sys/fs when
@@ -816,6 +884,7 @@ fn stat_ino_path_dir_aware_ext(
             0,
             0,
             0,
+            narf_filesystem::InodeAttrs::default(),
         ));
     }
     None
@@ -2774,7 +2843,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name) in rows {
+    for (id, parent, path, name, options) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -2786,7 +2855,9 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        let _ = writeln!(s, "{}\t{}\t{}\t{}", id, parent, visible, name);
+        // Fifth field is the filesystem's `show_options` text; procfs
+        // renders it as mountinfo's super-options column.
+        let _ = writeln!(s, "{}\t{}\t{}\t{}\t{}", id, parent, visible, name, options);
     }
     Some(s)
 }

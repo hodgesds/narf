@@ -716,9 +716,110 @@ fn smoke_acl_memfs_mode_coherence() -> TestResult {
     if file.stat().mode.perms != before {
         return TestResult::Fail("removexattr of an ACL changed the mode");
     }
-    if poll_once(file.remove_xattr(XATTR_NAME_POSIX_ACL_ACCESS)) != Some(Err(FsError::NotFound)) {
-        return TestResult::Fail("removexattr of an absent access ACL did not report ENODATA");
+    // An ABSENT access ACL is also a silent success, not ENODATA.
+    // `fs/xattr.c::removexattr` sends both ACL names to `vfs_remove_acl`,
+    // which ends at `set_posix_acl(type, NULL)` -> `simple_set_acl(NULL)`
+    // -> `set_cached_acl(inode, type, NULL); return 0;`. Nothing on that
+    // path asks whether an ACL was cached, so there is no arm that can
+    // produce ENODATA — this test used to assert the opposite.
+    if poll_once(file.remove_xattr(XATTR_NAME_POSIX_ACL_ACCESS)) != Some(Ok(())) {
+        return TestResult::Fail("removexattr of an absent access ACL must still return 0");
     }
     TestResult::Pass
 }
 kernel_test_in!("filesystem", smoke_acl_memfs_mode_coherence);
+
+/// A tmpfs DIRECTORY holds a default ACL, and it propagates.
+///
+/// `shmem_dir_inode_operations` carries `.set_acl = simple_set_acl`, and
+/// `set_posix_acl`'s
+/// `if (type == ACL_TYPE_DEFAULT && !S_ISDIR(...)) return acl ? -EACCES : 0`
+/// makes a directory the ONLY inode that can hold one. NARF's
+/// `posix_acl_create` — the inheritance rule itself — was written and
+/// exported but never called, and directories had no ACL storage at all,
+/// so `setfacl -d` had nowhere to land: the default silently disappeared
+/// and every file created below got plain umask permissions.
+///
+/// The two behaviours that make inheritance worth having are both pinned
+/// here: the copied default keeps propagating onto a new SUBDIRECTORY but
+/// stops at a file, and the inherited ACL *replaces* the umask rather than
+/// combining with it — which is the entire point of setting one on a
+/// shared group directory.
+fn smoke_acl_default_inheritance_on_a_directory() -> TestResult {
+    use crate::{FsInstance, MemFs};
+    let fs = MemFs::new("acl-default");
+    let root = fs.root();
+    let dir = match poll_once(root.mkdir("shared")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("mkdir failed"),
+    };
+    // A group-writable default: u::rwx, g::rwx, o::r-x.
+    let default = PosixAcl::from_entries(vec![
+        AclEntry::tagged(ACL_USER_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+        AclEntry::tagged(ACL_GROUP_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+        AclEntry::tagged(ACL_OTHER, ACL_READ | ACL_EXECUTE),
+    ]);
+    match poll_once(dir.set_xattr(XATTR_NAME_POSIX_ACL_DEFAULT, &default.to_xattr(), 0)) {
+        Some(Ok(())) => {}
+        _ => return TestResult::Fail("a directory refused a default ACL"),
+    }
+    if poll_once(dir.get_xattr(XATTR_NAME_POSIX_ACL_DEFAULT)).is_none() {
+        return TestResult::Fail("the directory's default ACL did not round-trip");
+    }
+    // A default ACL is inherited, never enforced, so it must NOT have
+    // rewritten the directory's own mode the way an access ACL would.
+    if dir.dir_mode() != 0o755 {
+        return TestResult::Fail("installing a default ACL changed the directory's mode");
+    }
+    // It is visible to the layer that does the inheriting.
+    match dir.default_acl() {
+        Some(blob) if blob == default.to_xattr() => {}
+        _ => return TestResult::Fail("default_acl did not expose the stored ACL"),
+    }
+    // A regular file is never allowed one: `-EACCES`.
+    let file = match poll_once(dir.create("f")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("create failed"),
+    };
+    if !matches!(
+        poll_once(file.set_xattr(XATTR_NAME_POSIX_ACL_DEFAULT, &default.to_xattr(), 0)),
+        Some(Err(FsError::PermissionDenied))
+    ) {
+        return TestResult::Fail("a regular file accepted a default ACL");
+    }
+    // The inheritance computation itself: with a default ACL present the
+    // umask is ignored entirely, and only a new DIRECTORY carries the
+    // default onward.
+    let mut dir_mode = 0o777;
+    let for_dir = match crate::posix_acl_create(Some(&default), true, false, &mut dir_mode, 0o077) {
+        Ok(result) => result,
+        Err(_) => return TestResult::Fail("posix_acl_create failed for a directory"),
+    };
+    if dir_mode != 0o775 {
+        return TestResult::Fail("the umask narrowed a mode the default ACL governs");
+    }
+    if for_dir.default_acl.as_ref() != Some(&default) {
+        return TestResult::Fail("a new subdirectory did not inherit the default ACL");
+    }
+    let mut file_mode = 0o666;
+    let for_file =
+        match crate::posix_acl_create(Some(&default), false, false, &mut file_mode, 0o077) {
+            Ok(result) => result,
+            Err(_) => return TestResult::Fail("posix_acl_create failed for a file"),
+        };
+    if for_file.default_acl.is_some() {
+        return TestResult::Fail("a regular file inherited a default ACL");
+    }
+    if file_mode != 0o664 {
+        return TestResult::Fail("a file's inherited mode is wrong");
+    }
+    // Removing it is `set_posix_acl(DEFAULT, NULL)` -> 0, and the
+    // directory then inherits nothing.
+    if poll_once(dir.remove_xattr(XATTR_NAME_POSIX_ACL_DEFAULT)) != Some(Ok(()))
+        || dir.default_acl().is_some()
+    {
+        return TestResult::Fail("removing a directory's default ACL failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_acl_default_inheritance_on_a_directory);

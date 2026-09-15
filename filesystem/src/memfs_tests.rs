@@ -767,8 +767,10 @@ fn smoke_tmpfs_linux_mount_options() -> TestResult {
         return TestResult::Fail("tmpfs option values were parsed incorrectly");
     }
     if TmpFsOptions::parse("huge=always", 4096, 0, 0).is_ok()
-        || TmpFsOptions::parse("size=101%", 4096, 0, 0).is_ok()
+        // `mode=888` is not octal: `fsparam_u32oct` runs kstrtouint(.., 8).
         || TmpFsOptions::parse("mode=888", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("noswap=1", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("casefold", 4096, 0, 0).is_ok()
     {
         return TestResult::Fail("unsupported or malformed tmpfs option was accepted");
     }
@@ -782,6 +784,892 @@ fn smoke_tmpfs_linux_mount_options() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_linux_mount_options);
+
+/// tmpfs sizing options parse exactly as Linux parses them.
+///
+/// `shmem_parse_one` runs every numeric option through `memparse`
+/// (`lib/cmdline.c`) and then rejects the value if anything is left over —
+/// `if (*rest) goto bad_value`. That pins four behaviours NARF used to get
+/// wrong, each of which either failed a mount Linux accepts or accepted one
+/// it rejects:
+///
+///  * suffixes are ONE letter from `K M G T P E`, either case. `1kB` leaves
+///    a `B` in `rest` and is a bad value, even though it reads like a unit.
+///  * the number is `simple_strtoull(.., 0)`, so `0x`-hex and leading-zero
+///    octal are legal spellings of a size.
+///  * `size=N%` has NO upper bound — an over-committed `size=200%` tmpfs is
+///    a legal (if unwise) mount, not EINVAL.
+///  * `mode=` is masked with 07777, not range-checked, so `mode=17777`
+///    mounts as 07777.
+fn smoke_tmpfs_memparse_matches_linux() -> TestResult {
+    let blocks = |options: &str| TmpFsOptions::parse(options, 4096, 0, 0).map(|o| o.max_blocks);
+    // 1 MiB = 256 pages, spelled four ways memparse accepts.
+    if blocks("size=1M") != Ok(Some(256))
+        || blocks("size=1m") != Ok(Some(256))
+        || blocks("size=1024K") != Ok(Some(256))
+        || blocks("size=0x100000") != Ok(Some(256))
+        // Leading zero is octal: 04000000 == 1 MiB.
+        || blocks("size=04000000") != Ok(Some(256))
+        // A bare byte count rounds UP to whole pages (DIV_ROUND_UP).
+        || blocks("size=4097") != Ok(Some(2))
+    {
+        return TestResult::Fail("tmpfs size= does not parse like Linux memparse");
+    }
+    // Trailing junk — including the plausible-looking `kB`/`MB` — is a bad
+    // value, because memparse consumes at most one suffix letter.
+    if blocks("size=1kB").is_ok()
+        || blocks("size=1MB").is_ok()
+        || blocks("size=1M2").is_ok()
+        || blocks("size=").is_ok()
+        || blocks("size=junk").is_ok()
+        || blocks("size=50%%").is_ok()
+    {
+        return TestResult::Fail("tmpfs size= accepted a value Linux rejects");
+    }
+    // Percentages: no 100% ceiling, and the arithmetic is Linux's —
+    // bytes = (N << PAGE_SHIFT) * totalram / 100, THEN rounded up to whole
+    // pages. 1% of 4096 pages is 41 blocks, not the 40 that
+    // `N * pages / 100` would give, and 1% of a ONE-page machine still
+    // rounds up to 1 block instead of collapsing to 0.
+    if blocks("size=200%") != Ok(Some(8192))
+        || blocks("size=1%") != Ok(Some(41))
+        || TmpFsOptions::parse("size=1%", 1, 0, 0).map(|o| o.max_blocks) != Ok(Some(1))
+    {
+        return TestResult::Fail("tmpfs size=N% is not Linux's percentage arithmetic");
+    }
+    // nr_blocks > LONG_MAX and nr_inodes > ULONG_MAX/BOGO_INODE_SIZE are the
+    // two explicit range rejections in shmem_parse_one.
+    if TmpFsOptions::parse("nr_blocks=0x7fffffffffffffff", 4096, 0, 0).is_err()
+        || TmpFsOptions::parse("nr_blocks=0x8000000000000000", 4096, 0, 0).is_ok()
+        // ULONG_MAX / BOGO_INODE_SIZE == 0x003f_ffff_ffff_ffff.
+        || TmpFsOptions::parse("nr_inodes=0x003fffffffffffff", 4096, 0, 0).is_err()
+        || TmpFsOptions::parse("nr_inodes=0x0040000000000000", 4096, 0, 0).is_ok()
+    {
+        return TestResult::Fail("tmpfs block/inode count range checks do not match Linux");
+    }
+    // `size=0` / `nr_inodes=0` are Linux's explicit "no limit".
+    if blocks("size=0") != Ok(None)
+        || TmpFsOptions::parse("nr_inodes=0", 4096, 0, 0).map(|o| o.max_inodes) != Ok(None)
+    {
+        return TestResult::Fail("tmpfs zero limits are not unlimited");
+    }
+    // `result.uint_32 & 07777` masks; it does not reject.
+    if TmpFsOptions::parse("mode=17777", 4096, 0, 0).map(|o| o.root_mode) != Ok(0o7777) {
+        return TestResult::Fail("tmpfs mode= is not masked with 07777");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_memparse_matches_linux);
+
+/// The quota mount options Linux tmpfs accepts, and what they mean.
+///
+/// Two things this pins that NARF had wrong:
+///
+///  * bare `quota` is `QTYPE_MASK_USR | QTYPE_MASK_GRP` — BOTH kinds — not
+///    an alias for `usrquota` (`shmem_parse_one`, `case Opt_quota`).
+///  * `{usr,grp}quota_{block,inode}_hardlimit=` exist at all. They are the
+///    limit every id starts with (`shmem_acquire_dquot` copies them into a
+///    freshly acquired dquot), so enforcement must bite for a user that
+///    `setquota` has never been run for.
+///
+/// The block limit is a BYTE count, which is why the 8 KiB limit below
+/// stops the third page rather than the third block-of-something.
+fn smoke_tmpfs_quota_mount_hardlimits() -> TestResult {
+    const U: u32 = 4242;
+    let both = match TmpFsOptions::parse("quota", 4096, 0, 0) {
+        Ok(parsed) => parsed,
+        Err(_) => return TestResult::Fail("bare `quota` was rejected"),
+    };
+    if !both.usrquota || !both.grpquota {
+        return TestResult::Fail("bare `quota` did not enable both quota kinds");
+    }
+    // Hard limits must be nonzero and within SHMEM_QUOTA_MAX_*_LIMIT.
+    if TmpFsOptions::parse("usrquota,usrquota_block_hardlimit=0", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse(
+            "usrquota,usrquota_block_hardlimit=0x8000000000000000",
+            4096,
+            0,
+            0,
+        )
+        .is_ok()
+        || TmpFsOptions::parse("usrquota,usrquota_inode_hardlimit=0", 4096, 0, 0).is_ok()
+    {
+        return TestResult::Fail("an out-of-range quota hard limit was accepted");
+    }
+    let fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K,usrquota_inode_hardlimit=4",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota hard-limit mount options were rejected"),
+    };
+    let root = fs.root();
+    let file = match poll_once(root.create("charged")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.set_owners(U, U)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown to the limited uid failed");
+    }
+    // 8 KiB of block hard limit = exactly two pages for this owner.
+    if poll_once(file.write(0, &[1u8; 4096])).map(|r| r.is_ok()) != Some(true)
+        || poll_once(file.write(4096, &[2u8; 4096])).map(|r| r.is_ok()) != Some(true)
+    {
+        return TestResult::Fail("writes inside the default block hard limit failed");
+    }
+    if !matches!(
+        poll_once(file.write(8192, &[3u8; 4096])),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("mount-default block hard limit was not enforced");
+    }
+    // The limit is the id's starting point, so a read-back reports it in
+    // fs blocks (8 KiB / 4 KiB = 2) without any setquota having run.
+    match fs.quota_get(QuotaKind::User, U) {
+        Ok(blk) if blk.blocks_hard == 2 && blk.inodes_hard == 4 => {}
+        _ => return TestResult::Fail("mount-default quota limits are not reported"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_quota_mount_hardlimits);
+
+/// `mount -o remount` follows `shmem_reconfigure`.
+///
+/// Every failure there is `invalfc()` — **-EINVAL** — including the two
+/// that read like capacity errors ("Too small a size for current use",
+/// "Too few inodes for current use"). NARF reported ENOSPC for those, which
+/// tells `mount` the filesystem is full rather than that the request was
+/// refused.
+fn smoke_tmpfs_remount_matches_shmem_reconfigure() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=16", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("live")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.write(0, &[7u8; 8192])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs write failed");
+    }
+    // Two pages are in use, so a one-page limit strands them: EINVAL.
+    if fs.reconfigure("size=4K") != Err(FsError::InvalidData) {
+        return TestResult::Fail("too-small remount did not report EINVAL");
+    }
+    // Quota cannot be turned ON by a remount, and this mount has none.
+    if fs.reconfigure("usrquota") != Err(FsError::InvalidData)
+        || fs.reconfigure("quota") != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("remount enabled quota on a mount without it");
+    }
+    // size=0 lifts the limit even though data is live, then a limit cannot
+    // be re-imposed on the now-unlimited mount ("Cannot retroactively
+    // limit size").
+    if fs.reconfigure("size=0").is_err() {
+        return TestResult::Fail("remount to unlimited was rejected");
+    }
+    if fs.reconfigure("size=1M") != Err(FsError::InvalidData) {
+        return TestResult::Fail("remount retroactively limited an unlimited mount");
+    }
+
+    let quota_fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    // Quota already loaded: naming it again is accepted and does nothing.
+    if quota_fs.reconfigure("usrquota").is_err() {
+        return TestResult::Fail("remount rejected an already-loaded quota type");
+    }
+    // "Cannot change global quota limit on remount" — but repeating the
+    // same value is fine.
+    if quota_fs.reconfigure("usrquota_block_hardlimit=8K").is_err() {
+        return TestResult::Fail("remount rejected an unchanged quota hard limit");
+    }
+    if quota_fs.reconfigure("usrquota_block_hardlimit=16K") != Err(FsError::InvalidData) {
+        return TestResult::Fail("remount changed a global quota hard limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_remount_matches_shmem_reconfigure
+);
+
+/// `/proc/mounts` and mountinfo carry tmpfs's real options.
+///
+/// Linux `mm/shmem.c::shmem_show_options` prints a field only when it
+/// differs from the default, which is why a plain `/run` reads as
+/// `rw,inode64` and a sized one as `rw,size=…k,mode=755,inode64`. NARF used
+/// to print a bare `rw` for every mount, so nothing downstream could see a
+/// tmpfs's size, mode or quota state — `findmnt -o OPTIONS`, systemd's
+/// mount-unit comparison, and any script grepping the size out of
+/// /proc/mounts all read the same empty answer for every tmpfs.
+///
+/// The units are the fiddly part and are pinned here: `size=` is KiB
+/// (`K(sbinfo->max_blocks)`), `mode=` is `%03ho` octal with no leading
+/// zero, and the quota hard limits are the raw BYTE counts memparse
+/// produced.
+fn smoke_tmpfs_show_options_matches_shmem() -> TestResult {
+    // A default mount prints nothing but the two always-on flags: its
+    // limits ARE shmem_default_max_{blocks,inodes}() and its root is 01777.
+    let plain = match TmpFs::from_options_with_total("", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("default tmpfs construction failed"),
+    };
+    if plain.show_options() != ",inode64,noswap" {
+        return TestResult::Fail("default tmpfs printed non-default options");
+    }
+    let sized = match TmpFs::from_options_with_total(
+        "size=1M,nr_inodes=16,mode=0755,uid=5,gid=6,inode32",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("sized tmpfs construction failed"),
+    };
+    if sized.show_options() != ",size=1024k,nr_inodes=16,mode=755,uid=5,gid=6,inode32,noswap" {
+        return TestResult::Fail("tmpfs show_options is not Linux-shaped");
+    }
+    // The size field tracks the LIVE limit, so a remount is visible.
+    if sized.reconfigure("size=2M").is_err() {
+        return TestResult::Fail("tmpfs remount failed");
+    }
+    if !sized.show_options().starts_with(",size=2048k,") {
+        return TestResult::Fail("tmpfs show_options did not follow a remount");
+    }
+    let quota = match TmpFs::from_options_with_total(
+        "usrquota,usrquota_block_hardlimit=8K,grpquota_inode_hardlimit=4",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    if quota.show_options()
+        != ",inode64,noswap,usrquota,usrquota_block_hardlimit=8192,grpquota_inode_hardlimit=4"
+    {
+        return TestResult::Fail("tmpfs quota options are not rendered like Linux");
+    }
+    // ramfs has no `show_options` at all in Linux — `ramfs_ops` leaves the
+    // super_operations slot empty — so it must contribute nothing.
+    let ramfs = match RamFs::from_options("mode=0700", 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("ramfs construction failed"),
+    };
+    if !FsInstance::show_options(&ramfs).is_empty() {
+        return TestResult::Fail("ramfs invented mount options");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_show_options_matches_shmem);
+
+/// Every tmpfs inode type holds extended attributes, with Linux's
+/// `user.*` restriction.
+///
+/// `shmem_xattr_handlers` hangs off the SUPERBLOCK and
+/// `shmem_{inode,dir,special,symlink}_inode_operations` all carry
+/// `.listxattr`, so a directory, a symlink, a device node and a FIFO take
+/// attributes just as a regular file does. NARF had them on regular files
+/// only, so an SELinux label on a directory, or `setfattr` on `/tmp`
+/// itself, had nowhere to go — the syscall layer silently diverted it into
+/// a path-keyed side table that no `unlink` or `rename` ever cleaned up.
+///
+/// `fs/xattr.c::xattr_permission` is the other half: "In the `user.*`
+/// namespace, only regular files and directories can have extended
+/// attributes", and a write to one elsewhere is EPERM.
+fn smoke_tmpfs_xattrs_on_every_inode_type() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=32", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+
+    // A directory takes `user.*`, and round-trips through DirOps.
+    let dir = match poll_once(root.mkdir("labelled")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if poll_once(dir.set_xattr("user.owner", b"narf", 0)).map(|r| r.is_ok()) != Some(true)
+        || poll_once(dir.get_xattr("user.owner")) != Some(Ok(b"narf".to_vec()))
+        || poll_once(dir.list_xattr()) != Some(Ok(b"user.owner\0".to_vec()))
+    {
+        return TestResult::Fail("tmpfs directory xattr round-trip failed");
+    }
+    if poll_once(dir.set_xattr("security.selinux", b"ctx", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs directory rejected a security.* xattr");
+    }
+    if poll_once(dir.remove_xattr("user.owner")).map(|r| r.is_ok()) != Some(true)
+        || !matches!(
+            poll_once(dir.remove_xattr("user.owner")),
+            Some(Err(FsError::NotFound))
+        )
+    {
+        return TestResult::Fail("tmpfs directory xattr removal is wrong");
+    }
+
+    // A symlink, a device node and a FIFO take the privileged namespaces
+    // but refuse `user.*` with EPERM.
+    let link = match poll_once(root.symlink("link", "/target")) {
+        Some(Ok(link)) => link,
+        _ => return TestResult::Fail("tmpfs symlink failed"),
+    };
+    let dev = match poll_once(root.mknod("dev", FileType::Special, 0x0103)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mknod failed"),
+    };
+    let fifo = match poll_once(root.mknod("pipe", FileType::Fifo, 0)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mkfifo failed"),
+    };
+    for node in [&link, &dev, &fifo] {
+        if poll_once(node.set_xattr("security.selinux", b"ctx", 0)).map(|r| r.is_ok()) != Some(true)
+            || poll_once(node.get_xattr("security.selinux")) != Some(Ok(b"ctx".to_vec()))
+        {
+            return TestResult::Fail("tmpfs non-regular inode lost a security.* xattr");
+        }
+        if !matches!(
+            poll_once(node.set_xattr("user.nope", b"x", 0)),
+            Some(Err(FsError::OperationNotPermitted))
+        ) {
+            return TestResult::Fail("user.* was accepted on a non-regular, non-directory inode");
+        }
+        // A remove carries MAY_WRITE too, so it is EPERM and not ENODATA.
+        if !matches!(
+            poll_once(node.remove_xattr("user.nope")),
+            Some(Err(FsError::OperationNotPermitted))
+        ) {
+            return TestResult::Fail("removexattr of user.* did not report EPERM");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattrs_on_every_inode_type);
+
+/// Extended attributes are charged against the `nr_inodes=` budget.
+///
+/// tmpfs does not count inodes: it budgets `free_ispace` BYTES, where an
+/// inode costs `BOGO_INODE_SIZE` (1024) and an attribute costs
+/// `simple_xattr_space(name, size)` = `40 + size + strlen(name)`
+/// (`mm/shmem.c::shmem_xattr_handler_set`). So attributes make `statfs`
+/// report fewer free inodes, a full mount refuses a new one with ENOSPC,
+/// and evicting the inode returns `BOGO_INODE_SIZE + freed_ispace` in one
+/// step (`shmem_free_inode`).
+fn smoke_tmpfs_xattr_inode_space_budget() -> TestResult {
+    // 8 inodes = 8192 bytes of inode space.
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let free = || match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => u64::MAX,
+    };
+    // Root inode only: 8192 - 1024 = 7168 bytes -> 7 free inodes.
+    if free() != 7 {
+        return TestResult::Fail("fresh tmpfs did not report free inodes as free_ispace/1024");
+    }
+    let file = match poll_once(root.create("charged")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if free() != 6 {
+        return TestResult::Fail("an inode did not cost BOGO_INODE_SIZE of inode space");
+    }
+    // simple_xattr_space("user.big", 2048) = 40 + 2048 + 8 = 2096 bytes.
+    // Used inode space becomes 2048 + 2096 = 4144, so the free count is
+    // (8192 - 4144) / 1024 = 3 — an xattr is not free, and it is not
+    // rounded to a whole notional inode either.
+    let big = alloc::vec![0xA5u8; 2048];
+    if poll_once(file.set_xattr("user.big", &big, 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs xattr set failed");
+    }
+    if free() != 3 {
+        return TestResult::Fail("an xattr did not consume the inode-space budget");
+    }
+    // Replacing it with a small value gives the difference back:
+    // 2048 + (40 + 4 + 8) = 2100 used, so (8192 - 2100) / 1024 = 5.
+    if poll_once(file.set_xattr("user.big", b"tiny", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs xattr replace failed");
+    }
+    if free() != 5 {
+        return TestResult::Fail("replacing an xattr did not release the old value's space");
+    }
+    // Fill the remaining space with attributes and confirm the mount then
+    // refuses BOTH a new attribute and a new inode, with ENOSPC.
+    let filler = alloc::vec![0u8; 1024];
+    let mut set = 0;
+    loop {
+        let name = alloc::format!("user.f{}", set);
+        match poll_once(file.set_xattr(&name, &filler, 0)) {
+            Some(Ok(())) => set += 1,
+            Some(Err(FsError::NoSpace)) => break,
+            _ => return TestResult::Fail("unexpected error filling the inode-space budget"),
+        }
+        if set > 16 {
+            return TestResult::Fail("xattrs never exhausted the inode-space budget");
+        }
+    }
+    if !matches!(
+        poll_once(root.create("denied")),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("xattrs did not consume the budget a new inode needs");
+    }
+    // Evicting the inode returns its BOGO_INODE_SIZE *and* every byte its
+    // attributes held, so the mount is usable again.
+    if poll_once(root.unlink("charged")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs unlink failed");
+    }
+    drop(file);
+    // Only the root inode is left: (8192 - 1024) / 1024 = 7.
+    if free() != 7 {
+        return TestResult::Fail("evicting an inode did not return its xattr space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattr_inode_space_budget);
+
+/// `XATTR_CREATE` / `XATTR_REPLACE` follow `fs/xattr.c::simple_xattr_set`.
+///
+/// It tests the flag BITS, and tests CREATE first. Passing both is
+/// therefore not EINVAL: it is EEXIST when the attribute is present and
+/// ENODATA when it is not. Only a bit outside the pair is EINVAL, and that
+/// check lives in `setxattr_copy` before the filesystem is reached.
+fn smoke_tmpfs_xattr_flag_semantics() -> TestResult {
+    const XATTR_CREATE: u32 = 1;
+    const XATTR_REPLACE: u32 = 2;
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("flags")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // REPLACE before the attribute exists → ENODATA.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_REPLACE)),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("XATTR_REPLACE on a missing attribute is not ENODATA");
+    }
+    // Both flags, attribute missing → ENODATA (not EINVAL).
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE | XATTR_REPLACE)),
+        Some(Err(FsError::NotFound))
+    ) {
+        return TestResult::Fail("CREATE|REPLACE on a missing attribute is not ENODATA");
+    }
+    if poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("XATTR_CREATE of a new attribute failed");
+    }
+    // CREATE over an existing attribute → EEXIST, and so does both-flags.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE)),
+        Some(Err(FsError::Busy))
+    ) || !matches!(
+        poll_once(file.set_xattr("user.k", b"v", XATTR_CREATE | XATTR_REPLACE)),
+        Some(Err(FsError::Busy))
+    ) {
+        return TestResult::Fail("XATTR_CREATE over an existing attribute is not EEXIST");
+    }
+    // A bit outside the documented pair → EINVAL.
+    if !matches!(
+        poll_once(file.set_xattr("user.k", b"v", 4)),
+        Some(Err(FsError::InvalidData))
+    ) {
+        return TestResult::Fail("an unknown setxattr flag was accepted");
+    }
+    // A failed set must not leak the inode space it provisionally charged.
+    let before = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => return TestResult::Fail("tmpfs statfs failed"),
+    };
+    for _ in 0..8 {
+        let _ = poll_once(file.set_xattr("user.k", b"vvvv", XATTR_CREATE));
+    }
+    let after = match poll_once(fs.statfs()) {
+        Some(Ok(stat)) => stat.files_free,
+        _ => return TestResult::Fail("tmpfs statfs failed"),
+    };
+    if before != after {
+        return TestResult::Fail("a rejected setxattr leaked inode space");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_xattr_flag_semantics);
+
+/// A write that fills the mount part-way returns a SHORT COUNT.
+///
+/// `shmem_file_write_iter` runs `mm/filemap.c::generic_perform_write`,
+/// which breaks out of its per-folio loop when `write_begin` fails and
+/// then does:
+///
+/// ```text
+/// if (!written)
+///         return status;
+/// iocb->ki_pos += written;
+/// return written;
+/// ```
+///
+/// so ENOSPC surfaces only when NOTHING was written — the next write is
+/// the one that reports it. NARF was all-or-nothing, which is visible from
+/// userspace: `cp` onto a nearly-full `/tmp` left a zero-length file and
+/// reported ENOSPC where Linux fills the filesystem and reports how much
+/// it wrote.
+///
+/// The short write must also be a PREFIX. A page-at-a-time fallback that
+/// charged pages out of order would leave a file with a hole in the middle
+/// and a length that claims the whole range.
+fn smoke_tmpfs_short_write_at_enospc() -> TestResult {
+    // 4 blocks total; the root inode costs none of them.
+    let fs = match TmpFs::from_options_with_total("size=16K,nr_inodes=8", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    let file = match poll_once(root.create("filler")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // Ask for 6 pages when only 4 exist: 4 land, and the call reports it.
+    let payload = alloc::vec![0x5Au8; 6 * 4096];
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == 4 * 4096 => {}
+        Some(Ok(n)) => {
+            let _ = n;
+            return TestResult::Fail("write past the mount limit reported the wrong count");
+        }
+        _ => return TestResult::Fail("write past the mount limit failed instead of short-writing"),
+    }
+    // What landed is the prefix, and the file's length matches it exactly.
+    if file.stat().size != 4 * 4096 || file.stat().blocks != 4 * (4096 / 512) {
+        return TestResult::Fail("short write left the wrong length or block count");
+    }
+    let mut back = alloc::vec![0u8; 4 * 4096];
+    if poll_once(file.read(0, &mut back)) != Some(Ok(4 * 4096)) || back.iter().any(|&b| b != 0x5A) {
+        return TestResult::Fail("short write did not land as a contiguous prefix");
+    }
+    // NOW the filesystem is full, so the next write is the one that errors.
+    if !matches!(
+        poll_once(file.write(4 * 4096, &payload)),
+        Some(Err(FsError::NoSpace))
+    ) {
+        return TestResult::Fail("a write with no room at all did not report ENOSPC");
+    }
+    // Rewriting bytes that are already resident needs no new block and must
+    // still complete in full.
+    if poll_once(file.write(0, &[1u8; 4096])) != Some(Ok(4096)) {
+        return TestResult::Fail("overwriting a resident page failed on a full mount");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_short_write_at_enospc);
+
+/// The same short-write rule when a per-owner QUOTA is what runs out.
+///
+/// `shmem_inode_acct_blocks` returns -EDQUOT from `dquot_alloc_block_nodirty`
+/// through the same `write_begin` failure path, so the loop breaks
+/// identically and the partial count is returned. A quota that stopped a
+/// write dead would make `cp` behave differently on a quota'd tmpfs than on
+/// a full one, for no reason Linux has.
+fn smoke_tmpfs_short_write_at_edquot() -> TestResult {
+    const U: u32 = 7007;
+    let fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("quota'd")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.set_owners(U, U)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown to the limited uid failed");
+    }
+    // The owner may hold 8 KiB = two pages; ask for five.
+    let payload = alloc::vec![0xC3u8; 5 * 4096];
+    match poll_once(file.write(0, &payload)) {
+        Some(Ok(n)) if n == 2 * 4096 => {}
+        _ => return TestResult::Fail("hitting a block quota did not produce a short write"),
+    }
+    if !matches!(
+        poll_once(file.write(2 * 4096, &payload)),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("a write with no quota left did not report EDQUOT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_short_write_at_edquot);
+
+/// `st_nlink` follows the namespace, for files AND directories.
+///
+/// Every tmpfs inode reported 1. Two things break on that. A hard link is
+/// invisible: `ls -l` shows 1, `find -links +1` finds nothing, and a
+/// backup tool that dedups by link count writes the data twice. And
+/// `find`'s leaf optimisation — "a directory whose `st_nlink` is exactly 2
+/// has no subdirectories, so its remaining children need not be stat'd" —
+/// cannot run at all, because Linux's count for a directory is
+/// `2 + subdirectories` (itself, its `.`, and one `..` per child) and a
+/// flat 1 is below the floor.
+///
+/// An `O_TMPFILE` inode is the interesting case in the other direction:
+/// `shmem_tmpfile` reaches `d_tmpfile`, which decrements the link count to
+/// **0**, and `linkat(AT_EMPTY_PATH)` is what raises it. A caller uses that
+/// zero to tell an unlinked temporary from a named file.
+fn smoke_tmpfs_link_counts_follow_the_namespace() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=64", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    // A fresh directory: itself + its own `.`.
+    if root.inode_attrs().nlink != 2 {
+        return TestResult::Fail("an empty tmpfs directory does not report 2 links");
+    }
+    let file = match poll_once(root.create("one")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if file.inode_attrs().nlink != 1 {
+        return TestResult::Fail("a newly created file does not report 1 link");
+    }
+    if poll_once(root.link("one", "two")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs hard link failed");
+    }
+    if file.inode_attrs().nlink != 2 {
+        return TestResult::Fail("a hard link did not raise the link count");
+    }
+    if poll_once(root.unlink("two")).map(|r| r.is_ok()) != Some(true)
+        || file.inode_attrs().nlink != 1
+    {
+        return TestResult::Fail("unlinking a name did not lower the link count");
+    }
+    // Directories: each child directory's `..` is another link to its parent.
+    let a = match poll_once(root.mkdir("a")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    let b = match poll_once(root.mkdir("b")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if root.inode_attrs().nlink != 4 || a.inode_attrs().nlink != 2 {
+        return TestResult::Fail("mkdir did not raise the parent's link count");
+    }
+    if poll_once(a.mkdir("x")).map(|r| r.is_ok()) != Some(true) || a.inode_attrs().nlink != 3 {
+        return TestResult::Fail("a nested mkdir did not raise its parent's link count");
+    }
+    // Moving a directory carries its `..` link to the new parent.
+    if poll_once(a.rename_to("x", &*b, "y", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("cross-directory rename failed");
+    }
+    if a.inode_attrs().nlink != 2 || b.inode_attrs().nlink != 3 {
+        return TestResult::Fail("renaming a directory did not move the parent link counts");
+    }
+    if poll_once(b.rmdir("y")).map(|r| r.is_ok()) != Some(true) || b.inode_attrs().nlink != 2 {
+        return TestResult::Fail("rmdir did not lower the parent's link count");
+    }
+    // A rename that REPLACES a file takes the replaced inode's last name.
+    let victim = match poll_once(root.create("victim")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(root.rename("one", "victim")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("replacing rename failed");
+    }
+    if victim.inode_attrs().nlink != 0 {
+        return TestResult::Fail("a replaced inode kept its link count");
+    }
+    // O_TMPFILE: nameless until linkat gives it one.
+    let tmp = match poll_once(root.tmpfile(0o600)) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs tmpfile failed"),
+    };
+    if tmp.inode_attrs().nlink != 0 || !tmp.inode_attrs().tracked {
+        return TestResult::Fail("an O_TMPFILE inode does not report zero links");
+    }
+    if poll_once(root.link_node("named", tmp.clone())).map(|r| r.is_ok()) != Some(true)
+        || tmp.inode_attrs().nlink != 1
+    {
+        return TestResult::Fail("linkat did not give the O_TMPFILE inode its first link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_link_counts_follow_the_namespace
+);
+
+/// atime, mtime and ctime are three separate stamps, with relatime.
+///
+/// NARF reported mtime for all three, so `chmod` looked like a rewrite to
+/// anything comparing ctime, and atime never moved at all. Linux moves
+/// mtime+ctime together on a data change (`file_update_time`), ctime alone
+/// on a metadata change (`setattr_copy`), and atime on read under the
+/// `relatime` rule in `fs/inode.c::relatime_need_update`:
+///
+/// ```text
+/// if (inode_get_atime <= inode_get_mtime) return 1;
+/// if (inode_get_atime <= inode_get_ctime) return 1;
+/// if ((long)(now.tv_sec - atime.tv_sec) >= 24*60*60) return 1;
+/// return 0;
+/// ```
+fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
+    const SECOND: u64 = 1_000_000_000;
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=16", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("stamped")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // Plant known atime/mtime. `notify_change` stamps ctime as well, so
+    // ctime is "now" — far beyond these two small values.
+    if file.set_times(Some(SECOND), Some(2 * SECOND)).is_err() {
+        return TestResult::Fail("set_times failed");
+    }
+    let attrs = file.inode_attrs();
+    if attrs.atime_ns != SECOND || narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+        return TestResult::Fail("set_times did not plant atime/mtime");
+    }
+    if attrs.ctime_ns <= 2 * SECOND {
+        return TestResult::Fail("an explicit utimensat did not stamp ctime");
+    }
+    // chmod moves ctime and leaves mtime alone. Making a file executable
+    // must not make `make` think it was rebuilt.
+    if poll_once(file.set_perms(0o700)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chmod failed");
+    }
+    if narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+        return TestResult::Fail("chmod moved mtime");
+    }
+    if file.inode_attrs().ctime_ns < attrs.ctime_ns {
+        return TestResult::Fail("chmod did not stamp ctime");
+    }
+    // relatime: atime is refreshed only when it is no newer than the last
+    // change. atime(1s) <= mtime(2s), so this read must move it.
+    let mut buf = [0u8; 1];
+    if poll_once(file.read(0, &mut buf)).is_none() {
+        return TestResult::Fail("read failed");
+    }
+    let after_read = file.inode_attrs().atime_ns;
+    if after_read == SECOND {
+        return TestResult::Fail("relatime did not refresh a stale atime");
+    }
+    // Now plant an atime far AHEAD of both other stamps: relatime must
+    // leave it alone, which is the whole point of the policy — a read loop
+    // over a warm file does not keep dirtying the inode.
+    let far = after_read.saturating_add(3600 * SECOND);
+    if file.set_times(Some(far), Some(2 * SECOND)).is_err() {
+        return TestResult::Fail("set_times failed");
+    }
+    if poll_once(file.read(0, &mut buf)).is_none() {
+        return TestResult::Fail("read failed");
+    }
+    if file.inode_attrs().atime_ns != far {
+        return TestResult::Fail("relatime refreshed an atime that was already current");
+    }
+    // A write moves mtime AND ctime together.
+    let before_write = file.inode_attrs().ctime_ns;
+    if poll_once(file.write(0, b"x")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("write failed");
+    }
+    if narf_time::cycles_to_ns(file.stat().mtime_cycles) == 2 * SECOND
+        || file.inode_attrs().ctime_ns < before_write
+    {
+        return TestResult::Fail("a write did not move mtime and ctime together");
+    }
+    // A directory has real timestamps too, and a namespace change moves
+    // them — `ls -l /tmp` showed the epoch for every directory before.
+    let dir = fs.root();
+    if dir.dir_mtime_ns() == 0 {
+        return TestResult::Fail("a tmpfs directory has no mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_timestamps_are_three_distinct_stamps
+);
+
+/// Each mount has its own `st_dev`, and every inode on it reports that one.
+///
+/// `st_dev` was 0 everywhere, so nothing could tell two filesystems apart:
+/// `find -xdev` never pruned, `du -x` never stopped, and systemd's
+/// mount-point probe — which compares a directory's `st_dev` to its
+/// parent's — saw one flat filesystem. Linux gives every superblock without
+/// a block device a distinct anonymous number (`fs/super.c::get_anon_bdev`).
+fn smoke_tmpfs_distinct_device_numbers() -> TestResult {
+    let first = match TmpFs::from_options_with_total("size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let second = match TmpFs::from_options_with_total("size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let first_dev = first.root().inode_attrs().dev;
+    let second_dev = second.root().inode_attrs().dev;
+    if first_dev == 0 || second_dev == 0 {
+        return TestResult::Fail("a tmpfs mount has no device number");
+    }
+    if first_dev == second_dev {
+        return TestResult::Fail("two tmpfs mounts share a device number");
+    }
+    // Every inode on a mount reports that mount's device — files,
+    // directories, symlinks and special nodes alike.
+    let root = first.root();
+    let file = match poll_once(root.create("f")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    let link = match poll_once(root.symlink("l", "/f")) {
+        Some(Ok(link)) => link,
+        _ => return TestResult::Fail("tmpfs symlink failed"),
+    };
+    let node = match poll_once(root.mknod("d", FileType::Special, 0x0103)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mknod failed"),
+    };
+    let sub = match poll_once(root.mkdir("s")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if file.inode_attrs().dev != first_dev
+        || link.inode_attrs().dev != first_dev
+        || node.inode_attrs().dev != first_dev
+        || sub.inode_attrs().dev != first_dev
+    {
+        return TestResult::Fail("an inode reported a device other than its mount's");
+    }
+    // ramfs is a separate filesystem and gets its own number.
+    let ramfs = match RamFs::from_options("", 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("ramfs construction failed"),
+    };
+    if ramfs.root().inode_attrs().dev == first_dev {
+        return TestResult::Fail("a ramfs mount shares tmpfs's device number");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_distinct_device_numbers);
 
 /// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
 /// users are unaffected, and chown transfers the charge to the new owner.

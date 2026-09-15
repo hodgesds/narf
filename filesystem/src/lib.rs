@@ -235,6 +235,42 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// Inode attributes Linux reports in `struct stat` that [`Stat`] does not
+/// carry.
+///
+/// They live in a separate struct rather than in `Stat` because `Stat` is
+/// constructed as a literal in hundreds of places across every filesystem
+/// and synthetic node in the tree; a filesystem that does not model these
+/// keeps the `Default`, and the stat path falls back to exactly the values
+/// it used before this existed.
+///
+/// Every field uses 0 for "this filesystem does not track it", which is
+/// never a legal value for any of them: an inode that exists has at least
+/// one link, a mounted filesystem has a nonzero anonymous device, and a
+/// timestamp of 0 is the epoch (`shmem_get_inode` stamps
+/// `inode_set_ctime_current`, so a real tmpfs inode is never at 0).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InodeAttrs {
+    /// `st_nlink`. An `O_TMPFILE` inode legitimately reports 0 — Linux
+    /// creates it with `inode->i_nlink == 0` and `linkat` is what raises
+    /// it — so this is reported whenever the filesystem tracks links at
+    /// all, which [`InodeAttrs::tracked`] records.
+    pub nlink: u32,
+    /// `st_dev` — the filesystem's anonymous device number
+    /// (`get_anon_bdev`). Distinguishing mounts is what makes `rename`
+    /// across them EXDEV, `find -xdev` prune, and `du -x` stop.
+    pub dev: u64,
+    /// `st_atim` in wall-clock nanoseconds since the epoch.
+    pub atime_ns: u64,
+    /// `st_ctim` in wall-clock nanoseconds since the epoch. Distinct from
+    /// mtime: a `chmod` moves ctime and leaves mtime alone.
+    pub ctime_ns: u64,
+    /// Whether this filesystem fills the struct at all. Without it a real
+    /// `nlink` of 0 (an unlinked `O_TMPFILE` inode) is indistinguishable
+    /// from "not tracked".
+    pub tracked: bool,
+}
+
 /// Filesystem-wide capacity information returned by `statfs(2)`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FsStat {
@@ -896,6 +932,14 @@ pub trait FileOps: Send + Sync {
 
     fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// Link count, device number and the two timestamps [`Stat`] omits.
+    /// Default is "not tracked", which leaves the stat path reporting what
+    /// it did before: `st_nlink = 1`, `st_dev = 0`, and mtime standing in
+    /// for atime and ctime.
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs::default()
     }
 
     /// Ask the backing filesystem to authorize Linux R_OK/W_OK/X_OK bits.
@@ -1836,6 +1880,70 @@ pub trait DirOps: Send + Sync {
     fn supports_tmpfile(&self) -> bool {
         false
     }
+
+    /// This directory's `system.posix_acl_default`, raw, if it has one.
+    ///
+    /// Creating anything inside a directory with a default ACL is not a
+    /// umask operation: `fs/posix_acl.c::posix_acl_create` replaces the
+    /// umask entirely with the inherited ACL, narrows the creation mode
+    /// through it, and copies the default itself onto a new
+    /// SUBDIRECTORY so inheritance keeps propagating. The umask lives in
+    /// the syscall layer, so the decision has to be made there — this is
+    /// what lets it ask.
+    ///
+    /// `None` by default: a filesystem without POSIX ACLs inherits nothing
+    /// and the caller applies its umask as before.
+    fn default_acl(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// The directory inode's modification time, in wall-clock nanoseconds
+    /// since the epoch; 0 means the filesystem does not track one.
+    ///
+    /// [`Stat`] carries mtime, but a directory never goes through
+    /// `FileOps::stat` — path resolution hands back `DirOps` — so the stat
+    /// path synthesised a zero. Every directory therefore looked like the
+    /// epoch to `ls -l`, `make` and `rsync`.
+    fn dir_mtime_ns(&self) -> u64 {
+        0
+    }
+
+    /// Link count, device number and timestamps for the DIRECTORY inode —
+    /// see [`FileOps::inode_attrs`]. A directory's `st_nlink` is Linux's
+    /// `2 + subdirectories` (itself, its `.`, and one `..` per child), and
+    /// `find`'s leaf optimisation reads it to decide whether a directory
+    /// can contain subdirectories at all.
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs::default()
+    }
+
+    // ── extended attributes ───────────────────────────────────────────
+    //
+    // A directory is an inode, and on any filesystem with xattr support it
+    // holds them: `setfattr` on a directory, an SELinux label on `/tmp`,
+    // and `security.*` defaults for children all live here. `FileOps` alone
+    // could not express that, because path resolution hands back a
+    // `DirOps` for a directory and there is no `FileOps` to ask.
+    //
+    // Default `Unsupported`, which the syscall layer reads as "this
+    // filesystem has no xattr store" and answers from its generic
+    // side-table — the behaviour every directory had before.
+
+    fn set_xattr<'a>(&'a self, _name: &'a str, _value: &'a [u8], _flags: u32) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn get_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn list_xattr<'a>(&'a self) -> FsFuture<'a, Vec<u8>> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
+        Box::pin(async { Err(FsError::Unsupported) })
+    }
 }
 
 // ── FsInstance ─────────────────────────────────────────────────────
@@ -1870,6 +1978,18 @@ pub trait FsInstance: Send + Sync + 'static {
     /// (226/EXIT_NAMESPACE).
     fn root_file(&self) -> Option<Arc<dyn FileOps>> {
         None
+    }
+
+    /// Filesystem-specific mount options, as Linux's
+    /// `super_operations::show_options` renders them: a `,`-prefixed list
+    /// appended to the mount's flags in `/proc/mounts` and to the super
+    /// options field of `/proc/<pid>/mountinfo`.
+    ///
+    /// Empty by default — a filesystem with no `show_options` (ramfs, and
+    /// every synthetic mount here) contributes nothing, which is exactly
+    /// what Linux prints for one.
+    fn show_options(&self) -> String {
+        String::new()
     }
 
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
@@ -2259,7 +2379,12 @@ impl fmt::Debug for Mount {
     }
 }
 
-fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
+/// One `/proc/<pid>/mountinfo` row: `(id, parent, path, fstype, super
+/// options)`. The last field is the filesystem's `show_options` string,
+/// already `,`-prefixed (empty for a filesystem with none).
+pub type MountInfoRow = (u64, u64, String, String, String);
+
+fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
     mounts
         .iter()
         .enumerate()
@@ -2293,6 +2418,7 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
                 parent,
                 mount.path.clone(),
                 String::from(mount.fs.name()),
+                mount.fs.show_options(),
             )
         })
         .collect()
@@ -2951,8 +3077,24 @@ impl MountNamespace {
             .collect()
     }
 
+    /// `(path, fs name, super options)` for every mount — the extra field
+    /// is the filesystem's `show_options` text, which `/proc/mounts` must
+    /// print after the mount flags.
+    pub fn list_with_options(&self) -> Vec<(String, String, String)> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    String::from(m.fs.name()),
+                    m.fs.show_options(),
+                )
+            })
+            .collect()
+    }
+
     /// Mount identity and hierarchy in attachment order.
-    pub fn list_mountinfo(&self) -> Vec<(u64, u64, String, String)> {
+    pub fn list_mountinfo(&self) -> Vec<MountInfoRow> {
         mountinfo_rows(&self.inner.lock())
     }
 
@@ -3334,10 +3476,28 @@ impl VfsRegistry {
             .collect()
     }
 
-    /// Mount identity and hierarchy in attachment order.
-    pub fn list_mountinfo(
+    /// `(path, fs name, super options)` for every mount in this namespace.
+    pub fn list_with_options(
         &self,
-    ) -> alloc::vec::Vec<(u64, u64, alloc::string::String, alloc::string::String)> {
+    ) -> alloc::vec::Vec<(
+        alloc::string::String,
+        alloc::string::String,
+        alloc::string::String,
+    )> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    alloc::string::String::from(m.fs.name()),
+                    m.fs.show_options(),
+                )
+            })
+            .collect()
+    }
+
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(&self) -> alloc::vec::Vec<MountInfoRow> {
         mountinfo_rows(&self.inner.lock())
     }
 

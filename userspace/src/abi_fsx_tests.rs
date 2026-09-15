@@ -24,6 +24,10 @@ const ENODATA: i64 = -61;
 // "loop, on the same file system" arm needs it.
 const EBUSY: i64 = -16;
 
+// E2BIG isn't in the shared harness errno set; `setxattr`'s
+// XATTR_SIZE_MAX rejection needs it. (ERANGE and EOPNOTSUPP are.)
+const E2BIG: i64 = -7;
+
 // A user-half address with nothing mapped behind it: every copy_from_user
 // against it faults, which is how the -EFAULT arms below are reached.
 const BAD_PTR: u64 = 0x0001_0000_0000_0000;
@@ -67,9 +71,16 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_pos);
 
 fn smoke_abi_fsx_setxattr_neg() -> TestResult {
     with_setup(|| {
-        // Empty/unreadable name → EINVAL (name pointer is NUL-terminated
-        // empty string here: copy_user_cstr returns "" which the handler
-        // rejects).
+        // An empty name is -ERANGE, not -EINVAL.
+        // `fs/xattr.c::import_xattr_name`:
+        //
+        //     error = strncpy_from_user(kname->name, name, sizeof(kname->name));
+        //     if (error == 0 || error == sizeof(kname->name))
+        //             return -ERANGE;
+        //
+        // `strncpy_from_user` returns the copied length, so an empty string
+        // returns 0 and takes the ERANGE arm. NARF reported EINVAL, which
+        // sends a caller looking at its flags instead of its name buffer.
         let path = b"/abi/x\0";
         let name = b"\0";
         let val = b"v";
@@ -82,12 +93,297 @@ fn smoke_abi_fsx_setxattr_neg() -> TestResult {
             ..Default::default()
         };
         match call(Syscall::Setxattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("setxattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("setxattr with an empty name must return -ERANGE"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_neg);
+
+/// The VFS-level `setxattr` rejections, in `setxattr_copy`'s order.
+///
+/// All four were missing, so a caller got either success or the wrong
+/// errno: an unknown namespace was silently stored in NARF's side table
+/// and read back, which is worse than any errno — `getfattr` then reports
+/// an attribute the kernel never accepted.
+fn smoke_abi_fsx_setxattr_vfs_rejections() -> TestResult {
+    with_setup(|| {
+        let path = b"/abi/x\0";
+        let val = b"v";
+        let set = |name: &[u8], size: u64, flags: u64| {
+            call(
+                Syscall::Setxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: val.as_ptr() as u64,
+                    arg3: size,
+                    arg4: flags,
+                    ..Default::default()
+                },
+            )
+        };
+        // `if (ctx->flags & ~(XATTR_CREATE|XATTR_REPLACE)) return -EINVAL;`
+        if set(b"user.k\0", 1, 4) != Some(EINVAL) {
+            return Err("an unknown setxattr flag must return -EINVAL");
+        }
+        // A name that fills the 256-byte `struct xattr_name` buffer: ERANGE.
+        let mut long = [b'a'; 300];
+        long[..5].copy_from_slice(b"user.");
+        long[299] = 0;
+        if set(&long, 1, 0) != Some(ERANGE) {
+            return Err("an over-long xattr name must return -ERANGE");
+        }
+        // `if (ctx->size > XATTR_SIZE_MAX) return -E2BIG;` — checked
+        // before the value is copied, so the bogus length is enough.
+        if set(b"user.k\0", 65537, 0) != Some(E2BIG) {
+            return Err("a value over XATTR_SIZE_MAX must return -E2BIG");
+        }
+        // `xattr_resolve_name` finds no handler for an unknown prefix.
+        if set(b"nosuch.k\0", 1, 0) != Some(EOPNOTSUPP) {
+            return Err("an unknown xattr namespace must return -EOPNOTSUPP");
+        }
+        // `system.*` resolves only for the two POSIX ACL names.
+        if set(b"system.bogus\0", 1, 0) != Some(EOPNOTSUPP) {
+            return Err("a non-ACL system.* name must return -EOPNOTSUPP");
+        }
+        // The read side of an unresolvable name is ENODATA, never a
+        // success that would let a caller probe the namespace.
+        let unknown = b"nosuch.k\0";
+        let get = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: unknown.as_ptr() as u64,
+                arg2: 0,
+                arg3: 0,
+                ..Default::default()
+            },
+        );
+        if get != Some(EOPNOTSUPP) {
+            return Err("getxattr of an unknown namespace must return -EOPNOTSUPP");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_vfs_rejections);
+
+/// Mount a private tmpfs for a test, at a target no other test uses.
+///
+/// These tests must NOT reach for `/tmp`. The `userspace/mount` smokes
+/// unmount it as their cleanup and never put it back, so whether `/tmp`
+/// exists depends on test ordering — which is exactly the kind of
+/// dependency that makes a suite pass in one selection and fail in
+/// another. A fresh mount also guarantees the filesystem under test IS
+/// tmpfs, which is what these tests are about.
+fn mount_private_tmpfs(target: &[u8]) -> bool {
+    let source = b"tmpfs\0";
+    let fstype = b"tmpfs\0";
+    call(
+        Syscall::Mount.raw(),
+        SyscallArgs {
+            arg0: source.as_ptr() as u64,
+            arg1: target.as_ptr() as u64,
+            arg2: fstype.as_ptr() as u64,
+            arg3: 0,
+            arg4: 0,
+            ..Default::default()
+        },
+    ) == Some(0)
+}
+
+fn unmount_private_tmpfs(target: &[u8]) {
+    let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+}
+
+/// A DIRECTORY is an inode with extended attributes.
+///
+/// Path resolution hands back `DirOps` for a directory, so the xattr
+/// handlers — which only ever asked for `FileOps` — could never reach one.
+/// Every `setfattr` on a directory silently landed in the path-keyed side
+/// table instead.
+///
+/// RENAMING the directory is what tells the two apart, and it is the
+/// user-visible consequence: an attribute stored against the inode moves
+/// with it, while one stored against a path string stays behind on a name
+/// that no longer exists.
+fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
+    with_setup(|| {
+        let mount = b"/abi-xattr-mnt\0";
+        if !mount_private_tmpfs(mount) {
+            return Err("mounting a private tmpfs for the test failed");
+        }
+        let first = b"/abi-xattr-mnt/dir\0";
+        let second = b"/abi-xattr-mnt/dir2\0";
+        let name = b"user.label\0";
+        let val = b"dir";
+        let finish = |outcome: Result<(), &'static str>| {
+            unmount_private_tmpfs(mount);
+            outcome
+        };
+        if call_mkdir(first.as_ptr() as u64, 0o755) != Some(0) {
+            return finish(Err("mkdir of the test directory failed"));
+        }
+        let set = call(
+            Syscall::Setxattr.raw(),
+            SyscallArgs {
+                arg0: first.as_ptr() as u64,
+                arg1: name.as_ptr() as u64,
+                arg2: val.as_ptr() as u64,
+                arg3: val.len() as u64,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if set != Some(0) {
+            return finish(Err("setxattr on a directory should succeed"));
+        }
+        let getxattr = |path: &[u8], out: &mut [u8]| {
+            call(
+                Syscall::Getxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: out.as_mut_ptr() as u64,
+                    arg3: out.len() as u64,
+                    ..Default::default()
+                },
+            )
+        };
+        let mut out = [0u8; 8];
+        if getxattr(first, &mut out) != Some(val.len() as i64) || &out[..val.len()] != val {
+            return finish(Err("getxattr on a directory did not read back the value"));
+        }
+        // The attribute belongs to the INODE, so it follows the rename.
+        if call_rename(first.as_ptr() as u64, second.as_ptr() as u64) != Some(0) {
+            return finish(Err("renaming the test directory failed"));
+        }
+        let mut moved = [0u8; 8];
+        let followed = getxattr(second, &mut moved);
+        let left_behind = getxattr(first, &mut out);
+        if followed != Some(val.len() as i64) || &moved[..val.len()] != val {
+            return finish(Err(
+                "the directory xattr did not follow its inode through a rename",
+            ));
+        }
+        if left_behind != Some(ENODATA) {
+            return finish(Err("the old directory name still answered for the xattr"));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_directory_xattr_reaches_the_inode
+);
+
+/// A default ACL on a parent directory REPLACES the umask for everything
+/// created inside it.
+///
+/// This is the whole reason `setfacl -d` exists: a shared group directory
+/// sets one so that files land group-writable no matter what umask the
+/// creating process happens to carry. `fs/posix_acl.c::posix_acl_create`
+/// implements it by applying the umask only on the `!dir_default` path —
+/// where a default ACL exists it narrows the mode through the ACL and
+/// leaves the umask entirely alone.
+///
+/// The umask is a property of the task, so this can only be tested through
+/// the syscalls: the filesystem layer never sees it. The 0o077 umask below
+/// is the discriminator — without inheritance it would force 0o700 and
+/// 0o600, which is exactly what NARF produced before.
+fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
+    use narf_filesystem::{AclEntry, AclType, PosixAcl};
+    use narf_filesystem::{
+        ACL_EXECUTE, ACL_GROUP_OBJ, ACL_OTHER, ACL_READ, ACL_USER_OBJ, ACL_WRITE,
+    };
+    with_setup(|| {
+        let mount = b"/abi-acl-mnt\0";
+        if !mount_private_tmpfs(mount) {
+            return Err("mounting a private tmpfs for the test failed");
+        }
+        let parent = b"/abi-acl-mnt/parent\0";
+        let child_dir = b"/abi-acl-mnt/parent/sub\0";
+        let child_file = b"/abi-acl-mnt/parent/file\0";
+        let finish = |outcome: Result<(), &'static str>| {
+            unmount_private_tmpfs(mount);
+            outcome
+        };
+        if call_mkdir(parent.as_ptr() as u64, 0o777) != Some(0) {
+            return finish(Err("mkdir of the ACL parent failed"));
+        }
+        // u::rwx, g::rwx, o::r-x — group-writable by inheritance.
+        let default = PosixAcl::from_entries(alloc::vec![
+            AclEntry::tagged(ACL_USER_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_GROUP_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_OTHER, ACL_READ | ACL_EXECUTE),
+        ])
+        .to_xattr();
+        let mut name_c = alloc::vec::Vec::from(AclType::Default.xattr_name().as_bytes());
+        name_c.push(0);
+        let set = call(
+            Syscall::Setxattr.raw(),
+            SyscallArgs {
+                arg0: parent.as_ptr() as u64,
+                arg1: name_c.as_ptr() as u64,
+                arg2: default.as_ptr() as u64,
+                arg3: default.len() as u64,
+                arg4: 0,
+                ..Default::default()
+            },
+        );
+        if set != Some(0) {
+            return finish(Err("setxattr of a default ACL on a directory failed"));
+        }
+        // A umask that would visibly bite if it were still applied.
+        let previous = call(Syscall::Umask.raw(), a0(0o077));
+        let mode_of = |path: &[u8]| -> Option<u32> {
+            let mut st = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, st.as_mut_ptr() as u64) != Some(0) {
+                return None;
+            }
+            // `struct stat` x86_64: st_mode is a u32 at offset 24.
+            Some(u32::from_ne_bytes([st[24], st[25], st[26], st[27]]) & 0o7777)
+        };
+        let dir_made = call_mkdir(child_dir.as_ptr() as u64, 0o777);
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(
+                AT_FDCWD,
+                child_file.as_ptr() as u64,
+                // O_CREAT | O_RDWR
+                0o100 | 0o2,
+                0o666,
+            ),
+        );
+        if let Some(fd) = created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let dir_mode = mode_of(child_dir);
+        let file_mode = mode_of(child_file);
+        if let Some(mask) = previous {
+            let _ = call(Syscall::Umask.raw(), a0(mask as u64));
+        }
+        if dir_made != Some(0) {
+            return finish(Err("mkdir inside the ACL parent failed"));
+        }
+        if created.map(|fd| fd < 0).unwrap_or(true) {
+            return finish(Err("creating a file inside the ACL parent failed"));
+        }
+        // 0o777 narrowed through the default ACL is 0o775; the 0o077 umask
+        // would have produced 0o700.
+        if dir_mode != Some(0o775) {
+            return finish(Err("a subdirectory did not inherit the default ACL's mode"));
+        }
+        // 0o666 narrowed through the same ACL is 0o664; umask would give 0o600.
+        if file_mode != Some(0o664) {
+            return finish(Err("a new file did not inherit the default ACL's mode"));
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_default_acl_replaces_umask);
 
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
@@ -268,7 +564,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_lsetxattr_pos);
 fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
     with_setup(|| {
         let path = b"/abi/lx\0";
-        let name = b"\0"; // empty name → EINVAL
+        // Empty name → ERANGE (`import_xattr_name`), not EINVAL.
+        let name = b"\0";
         let val = b"v";
         let args = SyscallArgs {
             arg0: path.as_ptr() as u64,
@@ -279,8 +576,8 @@ fn smoke_abi_fsx_lsetxattr_neg() -> TestResult {
             ..Default::default()
         };
         match call(Syscall::Lsetxattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("lsetxattr with an empty name must return -EINVAL"),
+            Some(v) if v == ERANGE => Ok(()),
+            _ => Err("lsetxattr with an empty name must return -ERANGE"),
         }
     })
 }
