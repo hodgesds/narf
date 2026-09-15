@@ -257,8 +257,15 @@ controller operations in input order (the last operation wins), enforces the
 no-internal-process rule, and refuses to withdraw a controller still delegated
 by a child. Cgroup-namespace paths are relative to the namespace root and use
 `..` components for visible sibling cgroups. The writable `cgroup.type`
-transition rejects populated groups and domain-controller conflicts; complete
-per-thread placement and threaded-subtree propagation are not yet provided.
+transition rejects populated groups and domain-controller conflicts.
+`fork_thread_inherit(parent_tid, parent_tgid, child_tid)` inherits a creating
+thread's css-set override, while
+`attach_thread_by_path(path, parent_tid, parent_tgid, child_tid)` implements
+`CLONE_INTO_CGROUP|CLONE_THREAD`: the destination must share the source's
+threaded domain or the call fails with `EOPNOTSUPP`. `thread_exited(tid)`
+removes per-thread membership and controller charges. General migration of an
+existing process's complete thread group and automatic threaded-subtree type
+propagation are not yet provided.
 
 Pressure Stall Information is optional. The `cgroup-psi` feature exposes
 `cgroup.pressure` plus `cpu.pressure`, `memory.pressure`, and `io.pressure`;

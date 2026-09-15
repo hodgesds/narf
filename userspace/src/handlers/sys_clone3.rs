@@ -89,6 +89,7 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
+    let mut requested_tids = [0i32; 32];
     if ca.set_tid != 0 {
         // Linux copies the pid_t array before checking whether the caller may
         // request specific PIDs. Preserve EFAULT precedence over the EPERM
@@ -98,10 +99,14 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-22i64) as u64));
             return;
         };
-        let mut set_tid = [0u8; 32 * core::mem::size_of::<i32>()];
+        // SAFETY: requested_tids is a contiguous i32 array and bytes is bounded
+        // by its length above, so this initializes exactly the consumed prefix.
+        let set_tid = unsafe {
+            core::slice::from_raw_parts_mut(requested_tids.as_mut_ptr().cast::<u8>(), bytes)
+        };
         // SAFETY: copy_from_user validates the checked byte range; the shape
         // checks above bound it to the fixed buffer.
-        if unsafe { copy_from_user(&mut set_tid[..bytes], ca.set_tid) }.is_err() {
+        if unsafe { copy_from_user(set_tid, ca.set_tid) }.is_err() {
             ctx.set_return(SyscallReturn::ok((-14i64) as u64));
             return;
         }
@@ -117,7 +122,12 @@ pub(crate) fn sys_clone3(ctx: &mut dyn TrapContext) {
             ca.stack_size
         ));
     }
-    do_clone3(ctx, ca, false);
+    do_clone3(
+        ctx,
+        ca,
+        false,
+        &requested_tids[..ca.set_tid_size as usize],
+    );
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

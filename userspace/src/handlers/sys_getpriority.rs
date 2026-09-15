@@ -43,6 +43,14 @@ pub(crate) fn sys_getpriority(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // Linux's PRIO_PROCESS/who=0 arm uses `p = current` and directly reads
+    // `task_nice(p)`; it does not run the generic PID/group selector. Keep
+    // NARF's equally common arm out of target-vector allocation and identity
+    // map lookup.
+    if scope == WhoScope::Process && who == 0 {
+        ctx.set_return(SyscallReturn::ok((20 - i64::from(read_current_nice())) as u64));
+        return;
+    }
     let targets = resolve_who_targets(scope, who, current_task_id());
     // `retval = -ESRCH` until a task is visited.
     let mut best: Option<i64> = None;

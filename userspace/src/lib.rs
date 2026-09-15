@@ -267,6 +267,37 @@ pub fn alloc_pid() -> ProcessId {
 /// Return `pid` to the free pool. Idempotent: a double-release is a
 /// silent no-op (the BTreeSet absorbs duplicate inserts). `0`
 /// (kernel) is rejected — it was never allocated.
+/// Reserve a caller-selected PID for clone3(2) `set_tid`.
+///
+/// Linux reports EINVAL for an out-of-range requested PID and EEXIST when
+/// that number is already allocated. Skipping the watermark publishes every
+/// intervening never-used PID into the free set so later ordinary allocations
+/// still choose the lowest available number.
+pub(crate) fn alloc_pid_specific(raw: u64) -> Result<ProcessId, u64> {
+    const EEXIST: u64 = 17;
+    const EINVAL: u64 = 22;
+    if raw == 0 || raw > PID_MAX {
+        return Err(EINVAL);
+    }
+
+    let mut guard = PID_POOL.lock();
+    pid_pool_init_if_needed(&mut guard);
+    let pool = guard.as_mut().expect("pool inited");
+    let watermark = PID_WATERMARK.load(Ordering::Relaxed);
+    if raw < watermark {
+        return if pool.remove(&raw) {
+            Ok(ProcessId(raw))
+        } else {
+            Err(EEXIST)
+        };
+    }
+
+    for skipped in watermark..raw {
+        pool.insert(skipped);
+    }
+    PID_WATERMARK.store(raw + 1, Ordering::Relaxed);
+    Ok(ProcessId(raw))
+}
 #[inline]
 pub fn release_pid(pid: ProcessId) {
     let raw = pid.raw();

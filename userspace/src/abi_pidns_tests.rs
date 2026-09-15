@@ -821,7 +821,7 @@ fn smoke_abi_pidns_wait_unbound_inner_echild() -> TestResult {
             }
 
             // waitid(P_PID, inner 3): same miss must be ECHILD before any reap.
-            match call(Syscall::Waitid.raw(), a3(P_PID, 3, 0, 0)) {
+            match call(Syscall::Waitid.raw(), a3(P_PID, 3, 0, 4)) {
                 Some(v) if v == ECHILD => Ok(()),
                 Some(0) => Err("waitid(P_PID, unbound inner) reaped a ROOT-ns collision victim instead of returning ECHILD"),
                 _ => Err("waitid(P_PID, unbound inner) returned an unexpected result"),
@@ -906,7 +906,7 @@ fn smoke_abi_pidns_fork_return_resolves_in_parent_pid_ns() -> TestResult {
             // root ns; the child becomes pid 1 in a NEW child namespace. The
             // parent must see the child's OUTER pid (so its waitpid matches),
             // NOT the child's new-ns pid 1.
-            crate::pid_ns::unshare_pid_ns_for_children(P_UN_TASK);
+            crate::pid_ns::unshare_pid_ns_for_children(P_UN_TASK).unwrap();
             let child_self = match inherit_into_child(P_UN_TASK, C_UN_TASK, C_UN_PID) {
                 Some(1) => 1u64,
                 _ => return Err("unshared child was not pid 1 in the new namespace"),

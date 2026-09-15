@@ -73,11 +73,8 @@ pub(crate) fn sys_ioprio_set(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-ESRCH) as u64));
         return;
     }
-    let mut g = IOPRIO_TABLE.lock();
-    let m = g.get_or_insert_with(BTreeMap::new);
     for t in targets {
-        m.insert(t, ioprio);
+        ioprio_set_task(t, ioprio);
     }
-    drop(g);
     ctx.set_return(SyscallReturn::ok(0));
 }

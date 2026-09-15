@@ -4105,6 +4105,9 @@ pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
+/// Linux checkpoint/restore authority accepted by clone3(set_tid), alongside
+/// CAP_SYS_ADMIN.
+pub(crate) const CAP_CHECKPOINT_RESTORE: u32 = 40;
 
 /// `CAP_FULL_SET` — every capability up to and including `CAP_LAST_CAP`
 /// (`include/linux/capability.h`: `CAP_VALID_MASK`).
@@ -4463,6 +4466,17 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
         _ => true,
     };
     if target_admin && own_admin && extra {
+        // `pidns_install` performs this after both capability checks: a task
+        // may select only its active PID namespace or a descendant for future
+        // children. Joining a parent/sibling would let descendants escape.
+        let pid_relation_ok = match held {
+            HeldNs::Pid(ns) => crate::pid_ns::may_setns_for_children(caller, Some(ns)),
+            HeldNs::PidGlobal(_) => crate::pid_ns::may_setns_for_children(caller, None),
+            _ => true,
+        };
+        if !pid_relation_ok {
+            return SetnsVerdict::Einval;
+        }
         SetnsVerdict::Ok
     } else {
         SetnsVerdict::Eperm
@@ -6774,40 +6788,56 @@ const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 /// directory fd `cgroup_fd` in `parent_task`'s fd table (systemd opens it with
 /// `open(cgroup, O_PATH|O_DIRECTORY|O_CLOEXEC)` for pidfd_spawn /
 /// POSIX_SPAWN_SETCGROUP). Resolves the fd to its recorded open path, strips the
-/// `/sys/fs/cgroup` mount prefix (present chroot-prefixed or not), and attaches
-/// `child_pid`. Returns true iff the child was placed; the caller falls back to
-/// parent-cgroup inheritance on false (the spawn itself must not fail).
+/// live cgroupfs mount prefix, and attaches `child_pid`.
 ///
-/// `cgroup_of(child_pid)` — and hence `/proc/<child_pid>/cgroup` — reflects the
-/// placement, which is how PID 1 attributes a service's sd_notify(READY=1)
-/// datagram back to its unit (`manager_get_unit_by_pidref_cgroup`).
+/// The result is a positive Linux errno. Invalid/non-cgroup descriptors are
+/// EBADF; a cgroup removed after open is ENODEV; permission/controller vetoes
+/// retain their corresponding errno. The clone caller aborts and rolls back
+/// the allocated PID and any reserved pidfd on error, like
+/// cgroup_css_set_fork() before wake_up_new_task().
 #[cfg(feature = "cgroup")]
-fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
-    let full = match crate::mqueue::fd_path(parent_task, cgroup_fd) {
-        Some(f) => f,
-        None => return false,
-    };
-    let rel = cgroup_rel_path(&full);
-    let ok = match &rel {
-        Some(rel) => narf_filesystem::cgroupfs::attach_by_path(rel, child_pid).is_ok(),
-        None => false,
-    };
-    // Diagnostic: which cgroup did the CLONE_INTO_CGROUP child actually land
-    // in? If `rel` fails to resolve (or attach fails) the caller falls back to
-    // parent inheritance, so the SERVICE cgroup never goes populated and
-    // systemd's oneshot cgroup-settle wait can hang.
+fn place_clone_into_cgroup(
+    parent_task: u64,
+    cgroup_fd: u32,
+    child_linux_id: u64,
+    thread: bool,
+) -> Result<(), u64> {
+    let full = crate::mqueue::fd_path(parent_task, cgroup_fd).ok_or(9u64)?; // EBADF
+    let rel = cgroup_rel_path(&full).ok_or(9u64)?; // not a cgroupfs fd
+    let result = if thread {
+        let parent_tgid = task_to_pid_raw(parent_task).unwrap_or(parent_task);
+        let parent_tid = task_to_linux_tid_raw(parent_task).unwrap_or(parent_tgid);
+        narf_filesystem::cgroupfs::attach_thread_by_path(
+            &rel,
+            parent_tid,
+            parent_tgid,
+            child_linux_id,
+        )
+    } else {
+        narf_filesystem::cgroupfs::attach_by_path(&rel, child_linux_id)
+    }
+    .map_err(|error| {
+        match error {
+            narf_filesystem::FsError::NotFound => 19,          // ENODEV
+            narf_filesystem::FsError::PermissionDenied => 13, // EACCES
+            narf_filesystem::FsError::Busy => 16,             // EBUSY
+            narf_filesystem::FsError::BadFd => 9,              // EBADF
+            narf_filesystem::FsError::Unsupported => 95,       // EOPNOTSUPP
+            _ => 22,                                           // EINVAL
+        }
+    });
     if narf_filesystem::cgroupfs::cgevt_trace_enabled() {
         use core::fmt::Write as _;
         let _ = writeln!(
             narf_console::Writer,
-            "CGATTACH pid={} full={} rel={:?} ok={}",
-            child_pid,
+            "CGATTACH pid={} full={} rel={} result={:?}",
+            child_linux_id,
             full,
             rel,
-            ok
+            result
         );
     }
-    ok
+    result
 }
 
 /// Resolve an absolute path that lands inside a mounted cgroup2/cgroupfs to its
@@ -6818,8 +6848,8 @@ fn place_clone_into_cgroup(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> 
 /// (`/mnt/sys/fs/cgroup/...`). So this consults the live mount table and strips
 /// the LONGEST matching `cgroup2`/`cgroupfs` mount prefix rather than assuming a
 /// literal path. Returns `None` when `abs` is not under any cgroupfs mount (the
-/// caller then falls back to parent-cgroup inheritance). The mount table is in
-/// the caller's mount namespace, which is the space the cgroup fd was opened in.
+/// clone caller reports EBADF). The mount table is in the caller's mount
+/// namespace, which is the space the cgroup fd was opened in.
 #[cfg(feature = "cgroup")]
 pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
     current_mount_list_with_names()
@@ -6846,9 +6876,10 @@ pub(crate) fn cgroup_rel_path(abs: &str) -> Option<alloc::string::String> {
 #[cfg(feature = "cgroup")]
 #[doc(hidden)]
 pub fn place_clone_into_cgroup_for_test(parent_task: u64, cgroup_fd: u32, child_pid: u64) -> bool {
-    place_clone_into_cgroup(parent_task, cgroup_fd, child_pid)
+    place_clone_into_cgroup(parent_task, cgroup_fd, child_pid, false).is_ok()
 }
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
+const CLONE_PARENT: u64 = 0x0000_8000;
 const CLONE_FS: u64 = 0x0000_0200;
 #[allow(dead_code)] // TODO(narf): unused — reserved for a not-yet-wired path
 const CLONE_FILES: u64 = 0x0000_0400;
@@ -7099,9 +7130,9 @@ struct CloneArgs {
     // Linux CLONE_ARGS_SIZE_VER1 (set_tid) + VER2 (cgroup) tail. We copy
     // only as many bytes as the user provided (the second arg to clone3
     // is the struct size), so a VER0 (64-byte) caller leaves these zero.
-    /// `set_tid` array pointer — accepted-and-ignored (checkpoint/restore).
+    /// `set_tid` array pointer — requested PIDs, innermost namespace first.
     set_tid: u64,
-    /// `set_tid` array length — accepted-and-ignored.
+    /// `set_tid` array length.
     set_tid_size: u64,
     /// CLONE_INTO_CGROUP target: an O_PATH dir fd on cgroupfs.
     cgroup: u64,
@@ -7182,7 +7213,7 @@ fn current_user_tls_base() -> Option<u64> {
 /// Validate the Linux-visible clone contract before allocating or publishing
 /// any child state. The returned value is a positive errno number.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
+fn validate_clone_args(ca: &CloneArgs, legacy: bool, requested_tids: &[i32]) -> Result<(), u64> {
     const EINVAL: u64 = 22;
     const CLONE_DETACHED: u64 = 0x0040_0000;
     const CLONE_PARENT: u64 = 0x0000_8000;
@@ -7237,10 +7268,16 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     if ca.flags & CLONE_THREAD != 0 && ca.flags & (CLONE_NEWUSER | CLONE_NEWPID) != 0 {
         return Err(EINVAL);
     }
+    #[cfg(feature = "container")]
+    if ca.flags & CLONE_THREAD != 0
+        && !crate::pid_ns::active_matches_for_children(current_task_id())
+    {
+        return Err(EINVAL);
+    }
     if ca.flags & CLONE_SIGHAND != 0 && ca.flags & CLONE_CLEAR_SIGHAND != 0 {
         return Err(EINVAL);
     }
-    if ca.flags & (CLONE_THREAD | CLONE_PARENT) != 0 && ca.exit_signal != 0 {
+    if !legacy && ca.flags & (CLONE_THREAD | CLONE_PARENT) != 0 && ca.exit_signal != 0 {
         return Err(EINVAL);
     }
     if ca.flags & CLONE_PIDFD != 0
@@ -7252,20 +7289,64 @@ fn validate_clone_args(ca: &CloneArgs, legacy: bool) -> Result<(), u64> {
     if ca.flags & CLONE_PIDFD != 0 && ca.flags & CLONE_DETACHED != 0 {
         return Err(EINVAL);
     }
-    if ca.set_tid != 0 {
-        // NARF has no ambient root/CAP_CHECKPOINT_RESTORE analogue on this
-        // syscall surface. Refuse requested PID injection instead of silently
-        // ignoring it and creating a child with a different identity.
-        return Err(1); // -EPERM
+    if requested_tids.len() != ca.set_tid_size as usize {
+        return Err(EINVAL);
+    }
+    #[cfg(feature = "container")]
+    {
+        let levels = crate::pid_ns::clone_pid_levels(
+            current_task_id(),
+            ca.flags & CLONE_NEWPID != 0,
+        )?;
+        if requested_tids.len() > levels {
+            return Err(EINVAL);
+        }
+    }
+    #[cfg(not(feature = "container"))]
+    if requested_tids.len() > 1 {
+        return Err(EINVAL);
+    }
+    if requested_tids
+        .iter()
+        .any(|&tid| tid <= 0 || tid as u64 > crate::PID_MAX)
+    {
+        return Err(EINVAL);
     }
     Ok(())
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
+fn clone_parent_link(parent_task: u64, flags: u64, requested_signal: u8) -> Result<ChildLink, u64> {
+    if flags & CLONE_PARENT == 0 {
+        return Ok(ChildLink {
+            parent: parent_task,
+            exit_signal: requested_signal,
+        });
+    }
+
+    // Linux copy_process reuses current->real_parent and inherits the
+    // caller's group-leader exit_signal. A namespace init has no reusable
+    // parent and Linux rejects CLONE_PARENT with EINVAL.
+    let parent_pid = task_to_pid_raw(parent_task).unwrap_or(parent_task);
+    child_link_get(parent_pid).ok_or(22)
+}
+
+#[doc(hidden)]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn __test_clone_parent_link(
+    parent_task: u64,
+    flags: u64,
+    requested_signal: u8,
+) -> Result<(u64, u8), u64> {
+    clone_parent_link(parent_task, flags, requested_signal)
+        .map(|link| (link.parent, link.exit_signal))
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_tids: &[i32]) {
     use crate::process::DEFAULT_USER_STACK_BYTES;
     let flags = ca.flags;
-    if let Err(errno) = validate_clone_args(&ca, legacy) {
+    if let Err(errno) = validate_clone_args(&ca, legacy, requested_tids) {
         ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
         return;
     }
@@ -7277,6 +7358,19 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         ctx.set_return(SyscallReturn::ok((-14i64) as u64));
         return;
     }
+    let parent_pid = current_task_id();
+    let child_wait_link = if flags & CLONE_THREAD == 0 {
+        match clone_parent_link(parent_pid, flags, ca.exit_signal as u8) {
+            Ok(link) => Some(link),
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     let parent_as = match current_address_space() {
         Some(a) => a,
         None => {
@@ -7338,6 +7432,32 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         // `clone_for_fork` has already write-protected only the present parent
         // leaves whose backing became newly shared.
         alloc::sync::Arc::new(dup)
+    };
+    // Reserve the pidfd number before allocating a PID or publishing child
+    // state. Linux pidfd_prepare makes descriptor exhaustion fail the entire
+    // clone with EMFILE, and put_user failure aborts with EFAULT. A reservation
+    // also closes the CLONE_FILES sibling race between a free-fd probe and the
+    // eventual install.
+    let reserved_pidfd = if flags & CLONE_PIDFD != 0 {
+        let reserved = crate::fd::with_table_alloc(parent_pid, |table| table.reserve_fds(1))
+            .flatten();
+        let Some(fd) = reserved.and_then(|fds| fds.first().copied()) else {
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // EMFILE
+            return;
+        };
+        let fd_bytes = (fd as i32).to_ne_bytes();
+        // SAFETY: the output range passed the structural check above; the
+        // guarded copy detects an actually unmapped page.
+        if unsafe { copy_to_user(ca.pidfd, &fd_bytes) }.is_err() {
+            let _ = crate::fd::with_table(parent_pid, |table| {
+                table.release_reserved(&[fd]);
+            });
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        Some(fd)
+    } else {
+        None
     };
     // Stack: for `clone3(2)`, `ca.stack` points at the LOW end
     // of the user-provided stack region and `ca.stack_size` is
@@ -7408,23 +7528,118 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         }
     };
 
-    let parent_pid = current_task_id();
+    #[cfg(feature = "container")]
+    let prepared_user_ns = if flags & crate::namespaces::CLONE_NEWUSER != 0 {
+        Some(crate::namespaces::UserNamespace::new_child(
+            crate::namespaces::current_user_ns(parent_pid),
+            read_uidgid(parent_pid).euid,
+        ))
+    } else {
+        None
+    };
+    #[cfg(feature = "container")]
+    let pid_plan = {
+        let new_pid = flags & crate::namespaces::CLONE_NEWPID != 0;
+        let pid_owner = new_pid.then(|| {
+            prepared_user_ns
+                .clone()
+                .unwrap_or_else(|| crate::namespaces::current_user_ns(parent_pid))
+        });
+        match crate::pid_ns::prepare_clone(parent_pid, requested_tids, new_pid, pid_owner) {
+            Ok(plan) => plan,
+            Err(errno) => {
+                if let Some(fd) = reserved_pidfd {
+                    let _ = crate::fd::with_table(parent_pid, |table| {
+                        table.release_reserved(&[fd]);
+                    });
+                }
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                return;
+            }
+        }
+    };
 
-    // Allocate identifiers. Two cases:
-    //   - CLONE_THREAD: child shares the parent's user-visible PID
-    //                   (its TGID). Its scheduler TaskId is fresh
-    //                   (spawn_user mints it). Record both → same
-    //                   TaskId in TASK_TO_PID so getpid() returns
-    //                   the parent's PID and gettid() returns the
-    //                   TaskId.
-    //   - else:         fresh ProcessId via alloc_pid(), same as
-    //                   sys_fork.
+    #[cfg(feature = "container")]
+    let allocated_linux_id = pid_plan.outer();
+    #[cfg(feature = "container")]
+    let child_ns_pid = pid_plan.parent_visible();
+
+    #[cfg(not(feature = "container"))]
+    let allocated_linux_id = {
+        // Linux performs the set_tid capability check from alloc_pid(), after
+        // copy_mm(). Keep it beside PID allocation so an earlier address-space
+        // allocation failure retains Linux's ENOMEM precedence.
+        if !requested_tids.is_empty()
+            && !capable(CAP_CHECKPOINT_RESTORE)
+            && !capable(CAP_SYS_ADMIN)
+        {
+            if let Some(fd) = reserved_pidfd {
+                let _ = crate::fd::with_table(parent_pid, |table| {
+                    table.release_reserved(&[fd]);
+                });
+            }
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64));
+            return;
+        }
+        let allocated = match requested_tids.first().copied() {
+            Some(requested) => crate::alloc_pid_specific(requested as u64).map(|pid| pid.raw()),
+            None => {
+                let pid = crate::alloc_pid().raw();
+                if pid == 0 {
+                    Err(EAGAIN_CODE)
+                } else {
+                    Ok(pid)
+                }
+            }
+        };
+        match allocated {
+            Ok(pid) => pid,
+            Err(errno) => {
+                if let Some(fd) = reserved_pidfd {
+                    let _ = crate::fd::with_table(parent_pid, |table| {
+                        table.release_reserved(&[fd]);
+                    });
+                }
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                return;
+            }
+        }
+    };
+
     let child_visible_pid = if share_thread {
-        // Parent's getpid() lookup — fall back to parent_pid if no
-        // mapping was registered (e.g., the parent is init).
+        // Parent's getpid() lookup — fall back to parent_pid if unregistered.
         task_to_pid_raw(parent_pid).unwrap_or(parent_pid)
     } else {
-        crate::alloc_pid().raw()
+        allocated_linux_id
+    };
+    // Linux resolves and authorizes CLONE_INTO_CGROUP before publishing the
+    // child. Do the same immediately after PID allocation: on failure the PID
+    // and pre-reserved pidfd are still private and can be rolled back exactly.
+    #[cfg(feature = "cgroup")]
+    let clone_into_cgroup_placed = if flags & CLONE_INTO_CGROUP != 0 {
+        match place_clone_into_cgroup(
+            parent_pid,
+            ca.cgroup as u32,
+            allocated_linux_id,
+            share_thread,
+        ) {
+            Ok(()) => true,
+            Err(errno) => {
+                #[cfg(feature = "container")]
+                pid_plan.rollback();
+                #[cfg(not(feature = "container"))]
+                crate::release_pid(crate::ProcessId(allocated_linux_id));
+                if let Some(fd) = reserved_pidfd {
+                    let _ = crate::fd::with_table(parent_pid, |table| {
+                        table.release_reserved(&[fd]);
+                    });
+                }
+                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                return;
+            }
+        }
+    } else {
+        false
     };
     if !share_thread {
         crate::sysvipc::clone_sem_undo(
@@ -7444,7 +7659,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // closes the window (was previously set only after all the inheritance work
     // below, well past the point the spawned child could already be running).
     if !share_thread {
-        parent_of_set(child_visible_pid, parent_pid);
+        let link = child_wait_link.expect("non-thread clone must have a wait-parent link");
+        parent_of_set_with_signal(
+            child_visible_pid,
+            link.parent,
+            link.exit_signal,
+        );
     }
 
     // CLONE_VFORK: register the parent as suspended on this child BEFORE the
@@ -7463,36 +7683,13 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
     }
 
-    // CLONE_PIDFD: Linux allocates the parent's descriptor inside
-    // `copy_process` —
-    //
-    //     retval = pidfd_prepare(pid, flags | PIDFD_STALE, &pidfile);
-    //     if (retval < 0)
-    //             goto bad_fork_free_pid;
-    //
-    // so an exhausted table fails the WHOLE clone and no child is created.
-    // NARF installs the descriptor at the end, long past the point this
-    // handler can still bail, and the old code simply skipped the install on
-    // failure: the caller got a child it had no pidfd for and no error saying
-    // why — a process it cannot wait on and cannot explain. Check here, while
-    // returning is still possible.
-    //
-    // LINUX-GAP: this is a probe, not a reservation, so a CLONE_FILES sibling
-    // allocating in the window between here and the install below can still
-    // reach that silent skip. Closing it needs the descriptor reserved this
-    // early and released on every other early return in this handler, which
-    // is a larger change than this one.
-    if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 && !crate::fd::has_free_descriptor(parent_pid) {
-        ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
-        return;
-    }
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
     // `pidfd::notify_exit` only flips entries that already exist in the
     // table — under SMP (or an exec-then-crash child) the child can exit
     // before this handler finishes, and a late mint would never observe
     // that exit (POLLIN never fires; systemd would supervise a ghost).
     // The fd itself is installed after the child's fd-table fork below.
-    let pidfd_state = if flags & CLONE_PIDFD != 0 && ca.pidfd != 0 {
+    let pidfd_state = if reserved_pidfd.is_some() {
         // tid=0: the child task does not exist yet (this mints BEFORE the
         // spawn, on purpose). `set_tid` publishes the leader TaskId once the
         // child is spawned below; until then the `exited` flag alone drives
@@ -7563,7 +7760,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
             child_spec.affinity.preferred = Some(parent_cpu);
         }
     }
-    let pending_child = match child_state {
+    let mut pending_child = match child_state {
         Some(state) => crate::user_task::prepare_user_process_resume(
             proc,
             state,
@@ -7572,8 +7769,17 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         None => crate::user_task::prepare_user_process_initial(proc, child_spec),
     };
     let child_tid = pending_child.task_id();
+    #[cfg(feature = "container")]
+    pid_plan.install(child_tid.raw());
     proc_identity_fork(parent_pid, child_tid.raw());
     // Publish the pidfd's target leader TaskId now that the child task exists.
+    // Linux records set_child_tid in copy_process and performs the best-effort
+    // put_user from schedule_tail, after switching to the child's mm and before
+    // its first return to userspace. Arm the prepared future before publication
+    // so its first poll can do the same in the active child address space.
+    if flags & CLONE_CHILD_SETTID != 0 && ca.child_tid != 0 {
+        pending_child.set_child_tid(ca.child_tid);
+    }
     // Only for a real process clone: for CLONE_THREAD the pidfd tracks the
     // existing process leader, not this new thread, so leave it unresolved and
     // let the `exited` cache drive it (unchanged from before pidfds grew a tid).
@@ -7588,34 +7794,34 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // mapping is "child TaskId → parent's PID" — gettid returns
     // the TaskId raw, getpid translates TaskId → PID.
     if share_thread {
-        register_task_to_pid(child_tid.raw(), child_visible_pid);
+        #[cfg(feature = "cgroup")]
+        if !clone_into_cgroup_placed {
+            let parent_tgid = task_to_pid_raw(parent_pid).unwrap_or(parent_pid);
+            let parent_tid = task_to_linux_tid_raw(parent_pid).unwrap_or(parent_tgid);
+            narf_filesystem::cgroupfs::fork_thread_inherit(
+                parent_tid,
+                parent_tgid,
+                allocated_linux_id,
+            );
+        }
+        register_thread_task_mapping(allocated_linux_id, child_tid.raw(), child_visible_pid);
     } else {
         register_pid_task_mapping(child_visible_pid, child_tid.raw());
         // A clone() that creates a new process (not a thread) joins
         // the parent's cgroup. Threads share the process's membership
         // and are never placed individually in the base feature.
         //
-        // CLONE_INTO_CGROUP instead starts the child directly in the
-        // cgroup named by `clone_args.cgroup` — an O_PATH dir fd on
-        // cgroupfs (glibc pidfd_spawn with POSIX_SPAWN_SETCGROUP; how
-        // systemd 258 spawns every service executor). Resolve the fd to
-        // its recorded open path, strip everything up to the cgroupfs
-        // mount ("/sys/fs/cgroup", chroot-prefixed or not), and attach.
-        // On any resolution/veto failure fall back to parent inheritance
-        // rather than failing the clone — the spawn itself must succeed;
-        // systemd migrates stragglers via cgroup.procs anyway.
+        // CLONE_INTO_CGROUP was resolved and committed before any child state
+        // became visible. Ordinary clones inherit here; explicitly placed
+        // children retain the already-committed target membership.
         #[cfg(feature = "cgroup")]
-        {
-            let placed = flags & CLONE_INTO_CGROUP != 0
-                && place_clone_into_cgroup(parent_pid, ca.cgroup as u32, child_visible_pid);
-            if !placed {
-                // cgroup membership is keyed by ProcessId — look the parent up
-                // by its ProcessId, not the raw TaskId (see sys_fork).
-                narf_filesystem::cgroupfs::fork_inherit(
-                    task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
-                    child_visible_pid,
-                );
-            }
+        if !clone_into_cgroup_placed {
+            // cgroup membership is keyed by ProcessId — look the parent up by
+            // its ProcessId, not the raw TaskId (see sys_fork).
+            narf_filesystem::cgroupfs::fork_inherit(
+                task_to_pid_raw(parent_pid).unwrap_or(parent_pid),
+                child_visible_pid,
+            );
         }
         // cgroup-namespace inheritance, and CLONE_NEWCGROUP → the child
         // gets a fresh cgroup-ns rooted at its current cgroup.
@@ -7640,6 +7846,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // both cases.
     rlimit_fork(parent_pid, child_tid.raw());
     cap_fork(parent_pid, child_tid.raw());
+    // Linux copy_io(): CLONE_IO shares the caller's existing io_context;
+    // otherwise a present context is copied. This includes ioprio state.
+    const CLONE_IO: u64 = 0x8000_0000;
+    ioprio_fork(parent_pid, child_tid.raw(), flags & CLONE_IO != 0);
 
     // fd table: CLONE_FILES (every pthread) SHARES one table with the parent —
     // an fd opened by any thread is visible to all, and close/dup affect all
@@ -7652,28 +7862,25 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     }
     crate::mqueue::fork_fd_paths(parent_pid, child_tid.raw());
 
-    // CLONE_PIDFD: install the pidfd in the PARENT's table only, AFTER the
-    // child's fd-table fork above so the child doesn't inherit it (Linux
-    // allocates it after copy_files; pidfd_prepare mints it O_CLOEXEC).
-    // Write the fd number through *clone_args.pidfd — the parent's AS is
-    // still the active CR3 here (same shape as CLONE_PARENT_SETTID below).
-    if let Some(st) = pidfd_state {
+    // CLONE_PIDFD: publish the already-reserved descriptor only after the
+    // child's fd-table copy. A non-CLONE_FILES child therefore cannot inherit
+    // it; a CLONE_FILES child sees it through the intentionally shared table,
+    // matching Linux copy_files followed by pidfd_prepare.
+    if let (Some(st), Some(reserved_fd)) = (pidfd_state, reserved_pidfd) {
         let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
             alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(st));
-        let newfd = fd::install(parent_pid, crate::fd::FdEntry {
-                ops: file,
-                offset: 0,
-                flags: crate::fd::FD_CLOEXEC,
-                status_flags: 0,
-            });
-        if let Some(n) = newfd {
-            let fd_bytes = (n as i32).to_ne_bytes();
-            // SAFETY: `ca.pidfd` is the user out-pointer (non-zero, checked at
-            // mint time); copy_to_user range-validates and SMAP-brackets the
-            // 4-byte write through the parent's still-active address space.
-            // SAFETY: Valid memory or trusted environment
-            let _ = unsafe { copy_to_user(ca.pidfd, &fd_bytes) };
-        }
+        let installed = crate::fd::with_table(parent_pid, |table| {
+            table.install_reserved_batch(alloc::vec![(
+                reserved_fd,
+                crate::fd::FdEntry {
+                    ops: file,
+                    offset: 0,
+                    flags: crate::fd::FD_CLOEXEC,
+                    status_flags: 0,
+                },
+            )])
+        }) == Some(true);
+        assert!(installed, "reserved clone pidfd slot disappeared");
     }
 
     // A child (process or thread) inherits its parent's process group,
@@ -7703,13 +7910,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // clone3 requested a fresh one via CLONE_NEW*. The per-task NS
     // tables are keyed per task id; threads share the process's ns.
     //
-    // `child_ns_pid` is the value clone(2) hands back to the PARENT: the
-    // child's pid in the parent's namespace, which must agree with the child's
-    // own getpid() (see project_pidns_flow_model — these are coupled). Defaults
-    // to the outer ProcessId; the fork-inherit below fills in the inner pid
-    // when the parent is namespaced.
-    #[cfg(feature = "container")]
-    let mut child_ns_pid = child_visible_pid;
     // Mount namespaces are part of the Linux-compat syscall surface even
     // without the optional container feature. A fork/clone child inherits the
     // parent's current mount namespace by reference, just as Linux's
@@ -7730,27 +7930,17 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     {
         let child = child_tid.raw();
         let parent_task = current_task_id();
-        // PID + mount namespaces (only meaningful for a new process).
-        if !share_thread {
-            // Binds the child into the parent's pid namespace (keyed by the
-            // child's TaskId) and yields the inner pid the parent should see;
-            // None in the root namespace leaves the outer pid unchanged.
-            if let Some(inner) =
-                crate::pid_ns::inherit_into_child(parent_task, child, child_visible_pid)
-            {
-                child_ns_pid = inner;
-            }
-            const CLONE_NEWPID: u64 = 0x20000000;
-            if flags & CLONE_NEWPID != 0 {
-                let _ = crate::pid_ns::unshare_pid_ns(child, child_visible_pid);
-            }
-        }
         // UTS / NET / IPC / User: shared by ref, then CLONE_NEW* mints
         // a fresh one for the child.
         crate::namespaces::inherit_into_child(parent_task, child);
         if flags & crate::namespaces::CLONE_NEWUSER != 0 {
-            let host_uid = read_uidgid(parent_task).euid;
-            let _ = crate::namespaces::unshare_user(child, host_uid);
+            crate::namespaces::setns_user(
+                child,
+                prepared_user_ns
+                    .clone()
+                    .expect("CLONE_NEWUSER prepared a child user namespace"),
+            );
+            set_cred_user_ns_caps(child);
             let _ = write_uidgid(child, |e| {
                 e.uid = 0;
                 e.gid = 0;
@@ -7805,7 +7995,11 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // user yet, so the parent's CR3 is in place from before the
     // trap entry).
     if (flags & CLONE_PARENT_SETTID) != 0 && ca.parent_tid != 0 {
-        let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
+        #[cfg(feature = "container")]
+        let parent_tid_value = child_ns_pid;
+        #[cfg(not(feature = "container"))]
+        let parent_tid_value = allocated_linux_id;
+        let tid_bytes = (parent_tid_value as u32).to_ne_bytes();
         // SAFETY: `ca.parent_tid` is the user *parent_tid pointer (non-zero, checked);
         // the parent's CR3 is still active here. copy_to_user range-validates it and
         // SMAP-brackets the 4-byte write.
@@ -7813,20 +8007,6 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
         let _ = unsafe { copy_to_user(ca.parent_tid, &tid_bytes) };
     }
 
-    // CLONE_CHILD_SETTID: write child TID to *child_tid in the
-    // child's AS. For CLONE_VM, parent and child share the AS so
-    // we can write through the live CR3 immediately; for non-VM
-    // we'd need to bounce CR3, which we don't support today on
-    // this branch (rare path: clone3 without CLONE_VM but with
-    // CHILD_SETTID is structurally weird).
-    if (flags & CLONE_CHILD_SETTID) != 0 && ca.child_tid != 0 && share_vm {
-        let tid_bytes = (child_tid.raw() as u32).to_ne_bytes();
-        // SAFETY: CLONE_VM means parent and child share the AS, so the live CR3 maps
-        // `ca.child_tid` (non-zero, checked). copy_to_user range-validates it and
-        // SMAP-brackets the 4-byte write.
-        // SAFETY: Valid memory or trusted environment
-        let _ = unsafe { copy_to_user(ca.child_tid, &tid_bytes) };
-    }
 
     // CLONE_CHILD_CLEARTID: stash for the exit-observer to consume.
     // Pass the child's AS root phys so the observer can write the
@@ -7862,14 +8042,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool) {
     // process the pid is translated into the parent's namespace
     // (`child_ns_pid`); in the root namespace that equals the outer pid.
     #[cfg(feature = "container")]
-    let ret_val = if share_thread {
-        child_tid.raw()
-    } else {
-        child_ns_pid
-    };
+    let ret_val = child_ns_pid;
     #[cfg(not(feature = "container"))]
     let ret_val = if share_thread {
-        child_tid.raw()
+        allocated_linux_id
     } else {
         child_visible_pid
     };
@@ -8047,7 +8223,20 @@ pub(crate) fn wake_fifo_io_waiters(ops: &dyn narf_filesystem::FileOps) {
 
 /// child_pid → parent_pid lookup. Set by fork; consumed by the
 /// exit observer to find the parent's pending-exits queue.
-static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ChildLink {
+    parent: u64,
+    exit_signal: u8,
+}
+
+static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, ChildLink>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+/// Number of unreaped children owned by each parent TaskId. Linux keeps an
+/// intrusive children list on every task; this compact companion index gives
+/// NARF the same O(1) "no children" exit test without duplicating ChildLink.
+/// It is updated under PARENT_OF's lock, so a published child link and its
+/// parent count become visible as one transaction.
+static PARENT_CHILD_COUNTS: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
 /// parent_pid → list of (child_pid, status) pairs not yet reaped.
@@ -8059,7 +8248,15 @@ static PARENT_OF: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, u64>>> =
 ///     `status = signum | (core ? 0x80 : 0)`.
 ///
 /// task_pid → queued `(child_pid, wstatus)` exit records awaiting wait4.
-type PendingExitMap = BTreeMap<u64, alloc::vec::Vec<(u64, i32)>>;
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct PendingExit {
+    child_pid: u64,
+    status: i32,
+    exit_signal: u8,
+    ptraced: bool,
+}
+
+type PendingExitMap = BTreeMap<u64, alloc::vec::Vec<PendingExit>>;
 static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<Option<PendingExitMap>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -8090,6 +8287,13 @@ static PENDING_STOPCONT: narf_lib::sync::IrqSafeSpinLock<Option<StopContMap>> =
 /// wait4/waitid `options` bits (Linux uapi).
 const WUNTRACED: u32 = 2;
 const WCONTINUED: u32 = 8;
+const WEXITED: u32 = 4;
+const WNOWAIT: u32 = 0x0100_0000;
+const __WNOTHREAD: u32 = 0x2000_0000;
+const __WALL: u32 = 0x4000_0000;
+const __WCLONE: u32 = 0x8000_0000;
+const SIGCHLD: u8 = 17;
+
 
 /// True if `task` is currently job-control stopped.
 pub fn is_task_stopped(task: u64) -> bool {
@@ -8133,6 +8337,10 @@ fn get_wait_recipient(child_pid: u64) -> Option<u64> {
 /// release the child PID — the child is still alive.
 pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: bool) {
     let child_pid = task_to_pid_raw(child_task).unwrap_or(child_task);
+    push_stopcont_report_as(child_pid, wstatus, is_continued);
+}
+
+fn push_stopcont_report_as(child_pid: u64, wstatus: i32, is_continued: bool) {
     let parent = match get_wait_recipient(child_pid) {
         Some(p) => p,
         None => return,
@@ -8149,7 +8357,7 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
     }
     // Linux notifies the parent with SIGCHLD on stop/continue too.
     let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(17));
-    crate::user_task::wake_wait_child(parent);
+    wake_wait_child_group(parent);
 }
 
 /// Pop a matching stop/continue notification for `parent`, honouring
@@ -8163,38 +8371,123 @@ pub(crate) fn push_stopcont_report(child_task: u64, wstatus: i32, is_continued: 
 /// `release_reaped_task` at the real reap) equals the TASK-space `want_pgid`.
 /// Otherwise `want_pid` decides: > 0 a specific outer pid, <= 0 any child.
 /// Linux `kernel/exit.c` `eligible_pid` / `__WNOTHREAD` filtering. (#29)
-fn wait_child_matches(child_pid: u64, want_pid: i64, want_pgid: u64) -> bool {
+fn wait_child_matches(
+    child_pid: u64,
+    want_pid: i64,
+    want_pgid: u64,
+    exit_signal: u8,
+    ptraced: bool,
+    options: u32,
+) -> bool {
     if want_pgid != 0 {
         let child_task = pid_to_task_raw(child_pid).unwrap_or(child_pid);
-        return read_pgid(child_task) == want_pgid;
+        if read_pgid(child_task) != want_pgid {
+            return false;
+        }
+    } else if want_pid > 0 && child_pid != want_pid as u64 {
+        return false;
     }
-    if want_pid > 0 {
-        child_pid == want_pid as u64
-    } else {
-        true
+
+    // Linux kernel/exit.c::eligible_child: a tracer and __WALL see both
+    // classes. Otherwise __WCLONE selects children whose termination signal
+    // is not SIGCHLD, while an ordinary wait selects only SIGCHLD children.
+    if ptraced || options & __WALL != 0 {
+        return true;
     }
+    (exit_signal != SIGCHLD) == (options & __WCLONE != 0)
+}
+
+/// Task IDs whose child lists are visible to the waiter. Linux walks every
+/// thread in the caller's thread group unless __WNOTHREAD is set.
+fn wait_parent_ids(waiter: u64, options: u32) -> alloc::vec::Vec<u64> {
+    let mut parents = alloc::vec![waiter];
+    if options & __WNOTHREAD != 0 {
+        return parents;
+    }
+    let waiter_tgid = task_to_pid_raw(waiter).unwrap_or(waiter);
+    // Single-threaded parents are overwhelmingly common (including the
+    // stress-ng fork/clone workers); keep their reap path O(1).
+    if thread_group_live_count(waiter_tgid) <= 1 {
+        return parents;
+    }
+    for (task, tgid) in task_pid_snapshot() {
+        if tgid == waiter_tgid && task != waiter {
+            parents.push(task);
+        }
+    }
+    parents
+}
+/// Wake every thread that may legally consume this parent's child event.
+fn wake_wait_child_group(parent: u64) {
+    for waiter in wait_parent_ids(parent, 0) {
+        crate::user_task::wake_wait_child(waiter);
+    }
+}
+
+/// Select (or peek) one exited child from any child list visible to the
+/// caller's thread group. Keeping the creator TaskId as the queue key retains
+/// exact __WNOTHREAD behavior while the default path matches Linux's
+/// group-wide wait.
+fn reap_pending_exit(
+    waiter: u64,
+    want_pid: i64,
+    want_pgid: u64,
+    options: u32,
+    peek: bool,
+) -> Option<PendingExit> {
+    let parents = wait_parent_ids(waiter, options);
+    let mut g = PENDING_EXITS.lock();
+    let m = g.as_mut()?;
+    for parent in parents {
+        let Some(q) = m.get_mut(&parent) else {
+            continue;
+        };
+        let Some(idx) = q.iter().position(|entry| {
+            wait_child_matches(
+                entry.child_pid,
+                want_pid,
+                want_pgid,
+                entry.exit_signal,
+                entry.ptraced,
+                options,
+            )
+        }) else {
+            continue;
+        };
+        return if peek { Some(q[idx]) } else { Some(q.remove(idx)) };
+    }
+    None
 }
 
 fn reap_stopcont(parent: u64, want: i64, want_pgid: u64, options: u32) -> Option<(u64, i32)> {
     let want_stop = options & WUNTRACED != 0;
     let want_cont = options & WCONTINUED != 0;
+    let parents = wait_parent_ids(parent, options);
     let mut g = PENDING_STOPCONT.lock();
-    let q = g.as_mut()?.get_mut(&parent)?;
-    let idx = q.iter().position(|&(p, _w, cont)| {
-        if !wait_child_matches(p, want, want_pgid) {
-            return false;
-        }
-        if cont {
-            return want_cont;
-        }
-        // A ptrace-stop is reported to the tracer's wait4 unconditionally;
-        // a job-control stop of a non-traced child needs WUNTRACED.
-        {
-            want_stop || crate::ptrace::is_ptrace_stop_recipient(parent, p)
-        }
-    })?;
-    let (pid, w, _) = q.remove(idx);
-    Some((pid, w))
+    let m = g.as_mut()?;
+    for owner in parents {
+        let Some(q) = m.get_mut(&owner) else {
+            continue;
+        };
+        let Some(idx) = q.iter().position(|&(p, _w, cont)| {
+            let ptraced = crate::ptrace::is_ptrace_stop_recipient(owner, p);
+            let exit_signal = child_link_get(p).map_or(SIGCHLD, |link| link.exit_signal);
+            if !wait_child_matches(p, want, want_pgid, exit_signal, ptraced, options) {
+                return false;
+            }
+            if cont {
+                return want_cont;
+            }
+            // A ptrace-stop is reported to the tracer's wait4
+            // unconditionally; WUNTRACED gates ordinary job-control stops.
+            want_stop || ptraced
+        }) else {
+            continue;
+        };
+        let (pid, w, _) = q.remove(idx);
+        return Some((pid, w));
+    }
+    None
 }
 
 /// Stop/continue mutual-cancellation and SIGCONT resume. Call
@@ -8318,6 +8611,7 @@ static PENDING_TERMINATION: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64,
 
 pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
+    *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
     crate::ptrace::ptrace_init();
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
@@ -8423,6 +8717,7 @@ fn cgroup_freeze_hook(pid: u64, freeze: bool) {
 #[doc(hidden)]
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
+    *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
     *PENDING_EXITS.lock() = Some(BTreeMap::new());
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
@@ -8515,24 +8810,11 @@ fn wait_child_check_fn(parent_id: u64, want_pid: i64, options: u32, out_status: 
     // Real exit reap (releases the child PID) — unless the parked waitid
     // asked WNOWAIT, which only PEEKS: the entry stays queued so a later
     // real wait can reap it (same semantics as the sys_waitid fast path).
-    const WNOWAIT: u32 = 0x0100_0000;
     let peek = options & WNOWAIT != 0;
-    let entry = {
-        let mut g = PENDING_EXITS.lock();
-        let reaped = g.as_mut().and_then(|m| {
-            let q = m.get_mut(&parent_id)?;
-            let idx = q
-                .iter()
-                .position(|&(p, _)| wait_child_matches(p, want_pid, want_pgid))?;
-            if peek {
-                Some(q[idx])
-            } else {
-                Some(q.remove(idx))
-            }
-        });
-        reaped
-    };
-    if let Some((child_pid, status)) = entry {
+    let entry = reap_pending_exit(parent_id, want_pid, want_pgid, options, peek);
+    if let Some(entry) = entry {
+        let child_pid = entry.child_pid;
+        let status = entry.status;
         // Hand the raw wstatus back to the caller (the poll routine),
         // which writes either the wait4 wstatus `int` or the waitid
         // `siginfo_t` into user space depending on which syscall parked.
@@ -8908,10 +9190,8 @@ pub fn __test_inject_parent_of(child: u64, parent: u64) {
         if g.is_none() {
             *g = Some(BTreeMap::new());
         }
-        if let Some(m) = g.as_mut() {
-            m.insert(child, parent);
-        }
     }
+    parent_of_set(child, parent);
     {
         let mut g = PENDING_EXITS.lock();
         if g.is_none() {
@@ -8926,6 +9206,17 @@ pub fn __test_inject_parent_of(child: u64, parent: u64) {
 /// (and WNOWAIT peek) paths against a synthetic zombie.
 #[doc(hidden)]
 pub fn __test_stage_pending_exit(parent: u64, child: u64, status: i32) {
+    let exit_signal = child_link_get(child).map_or(SIGCHLD, |link| link.exit_signal);
+    __test_stage_pending_exit_with_signal(parent, child, status, exit_signal);
+}
+
+#[doc(hidden)]
+pub fn __test_stage_pending_exit_with_signal(
+    parent: u64,
+    child: u64,
+    status: i32,
+    exit_signal: u8,
+) {
     let mut g = PENDING_EXITS.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
@@ -8933,7 +9224,12 @@ pub fn __test_stage_pending_exit(parent: u64, child: u64, status: i32) {
     if let Some(m) = g.as_mut() {
         m.entry(parent)
             .or_insert_with(alloc::vec::Vec::new)
-            .push((child, status));
+            .push(PendingExit {
+                child_pid: child,
+                status,
+                exit_signal,
+                ptraced: false,
+            });
     }
 }
 
@@ -8947,16 +9243,69 @@ pub fn __test_clear_pending_exits(parent: u64) {
     }
 }
 
-fn parent_of_set(child: u64, parent: u64) {
-    let mut g = PARENT_OF.lock();
-    if let Some(m) = g.as_mut() {
-        m.insert(child, parent);
+fn adjust_parent_child_count(old_parent: Option<u64>, new_parent: Option<u64>) {
+    if old_parent == new_parent {
+        return;
+    }
+    let mut counts = PARENT_CHILD_COUNTS.lock();
+    let m = counts.get_or_insert_with(BTreeMap::new);
+    if let Some(parent) = old_parent {
+        let remove = if let Some(count) = m.get_mut(&parent) {
+            if *count <= 1 {
+                true
+            } else {
+                *count -= 1;
+                false
+            }
+        } else {
+            false
+        };
+        if remove {
+            m.remove(&parent);
+        }
+    }
+    if let Some(parent) = new_parent {
+        let count = m.entry(parent).or_insert(0);
+        *count = count.saturating_add(1);
     }
 }
 
+#[inline]
+fn parent_child_count(parent: u64) -> u32 {
+    PARENT_CHILD_COUNTS
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&parent).copied())
+        .unwrap_or(0)
+}
+fn parent_of_set(child: u64, parent: u64) {
+    parent_of_set_with_signal(child, parent, SIGCHLD);
+}
+
+fn parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8) {
+    let mut links = PARENT_OF.lock();
+    if let Some(m) = links.as_mut() {
+        let old = m.insert(
+            child,
+            ChildLink {
+                parent,
+                exit_signal,
+            },
+        );
+        adjust_parent_child_count(old.map(|link| link.parent), Some(parent));
+    }
+}
+
+#[inline]
+fn child_link_get(child: u64) -> Option<ChildLink> {
+    PARENT_OF
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&child).copied())
+}
+
 pub(crate) fn parent_of_get(child: u64) -> Option<u64> {
-    let g = PARENT_OF.lock();
-    g.as_ref().and_then(|m| m.get(&child).copied())
+    child_link_get(child).map(|link| link.parent)
 }
 
 /// `parent_of_get` for the timer trap, which can interrupt a CPU already
@@ -8965,7 +9314,18 @@ pub(crate) fn parent_of_get(child: u64) -> Option<u64> {
 #[cfg(feature = "unix-latency-trace")]
 pub(crate) fn parent_of_get_try(child: u64) -> Option<u64> {
     let g = PARENT_OF.try_lock()?;
-    g.as_ref().and_then(|m| m.get(&child).copied())
+    g.as_ref()
+        .and_then(|m| m.get(&child).map(|link| link.parent))
+}
+
+#[doc(hidden)]
+pub fn __test_parent_link(child: u64) -> Option<(u64, u8)> {
+    child_link_get(child).map(|link| (link.parent, link.exit_signal))
+}
+
+#[doc(hidden)]
+pub fn __test_parent_of_set_with_signal(child: u64, parent: u64, exit_signal: u8) {
+    parent_of_set_with_signal(child, parent, exit_signal);
 }
 
 /// Drop the child→parent record once the child has been reaped (or is an
@@ -8973,9 +9333,11 @@ pub(crate) fn parent_of_get_try(child: u64) -> Option<u64> {
 /// ECHILD after the last child is reaped — without this, stale entries make
 /// `wait4` think children still exist and block forever.
 fn parent_of_remove(child: u64) {
-    let mut g = PARENT_OF.lock();
-    if let Some(m) = g.as_mut() {
-        m.remove(&child);
+    let mut links = PARENT_OF.lock();
+    if let Some(m) = links.as_mut() {
+        if let Some(old) = m.remove(&child) {
+            adjust_parent_child_count(Some(old.parent), None);
+        }
     }
 }
 
@@ -9131,7 +9493,9 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     if let Some(m) = NICE_TABLE.lock().as_mut() {
-        m.remove(&tid);
+        if m.remove(&tid).is_some() {
+            NICE_CUSTOM_ROWS.fetch_sub(1, Ordering::Release);
+        }
     }
     if let Some(m) = SCHED_PARAM_TABLE.lock().as_mut() {
         m.remove(&tid);
@@ -9181,6 +9545,7 @@ fn release_task_tables(tid: u64) {
         m.remove(&tid);
     }
     task_account_remove(&TASK_KERN_NS, tid);
+    ioprio_release(tid);
     // POSIX record locks: normally already drained (fd::detach runs
     // first in exit-observer order and wakes the waiters); this second
     // pass is the backstop for any path that tears down tables without
@@ -9288,11 +9653,36 @@ pub fn __test_orphanize_children_of(parent_tid: u64) {
     orphanize_children_of(parent_tid);
 }
 
+/// Prefer another live thread in the dying task's thread group as the
+/// reparent target. Linux find_new_reaper does this before consulting
+/// subreapers or namespace init.
+fn find_thread_group_reaper(dying: u64) -> Option<u64> {
+    let tgid = task_to_pid_raw(dying)?;
+    if let Some(leader) = pid_to_task_raw(tgid) {
+        if leader != dying && signal_target_exists(leader) {
+            return Some(leader);
+        }
+    }
+    task_pid_snapshot().into_iter().find_map(|(task, pid)| {
+        (pid == tgid && task != dying && signal_target_exists(task)).then_some(task)
+    })
+}
+
 fn orphanize_children_of(parent_tid: u64) {
-    let reaper = find_child_subreaper(parent_tid);
-    // Already-exited, never-reaped children: hand them to the subreaper
-    // (it can wait4 them like its own) or release when there is none.
-    let stale: alloc::vec::Vec<(u64, i32)> = {
+    // A short-lived leaf is the dominant fork/clone case. Without this index
+    // every exit scanned the global ChildLink map; stress-ng queues thousands
+    // of clones before reaping, making teardown O(n²).
+    if parent_child_count(parent_tid) == 0 {
+        return;
+    }
+    let thread_reaper = find_thread_group_reaper(parent_tid);
+    let reaper = thread_reaper.or_else(|| find_child_subreaper(parent_tid));
+    let reset_exit_signal = thread_reaper.is_none();
+
+    // Already-exited, never-reaped children move to the selected reaper. A
+    // same-thread-group transfer preserves the clone exit signal; an external
+    // reparent resets it to SIGCHLD, exactly like Linux reparent_leader.
+    let mut stale: alloc::vec::Vec<PendingExit> = {
         let mut g = PENDING_EXITS.lock();
         g.as_mut()
             .and_then(|m| m.remove(&parent_tid))
@@ -9300,42 +9690,55 @@ fn orphanize_children_of(parent_tid: u64) {
     };
     match reaper {
         Some(r) if !stale.is_empty() => {
-            {
-                let mut g = PENDING_EXITS.lock();
-                if let Some(m) = g.as_mut() {
-                    m.entry(r).or_default().extend(stale.iter().copied());
+            for entry in &mut stale {
+                if reset_exit_signal {
+                    entry.exit_signal = SIGCHLD;
                 }
+                entry.ptraced = false;
+                parent_of_set_with_signal(entry.child_pid, r, entry.exit_signal);
             }
-            for (child_pid, _) in &stale {
-                parent_of_set(*child_pid, r);
+            if let Some(m) = PENDING_EXITS.lock().as_mut() {
+                m.entry(r).or_default().extend(stale.iter().copied());
             }
-            // The subreaper learns about its inherited zombies the same
-            // way a real parent would: SIGCHLD + a wait4 wake.
-            raise_signal_pending(r, 17);
-            crate::user_task::wake_wait_child(r);
+            // Threaded reparenting stays inside the same wait domain and does
+            // not generate a second SIGCHLD. External reapers are notified.
+            if reset_exit_signal {
+                raise_signal_pending(r, 17);
+            }
+            wake_wait_child_group(r);
         }
         _ => {
-            for (child_pid, _status) in stale {
-                release_reaped_task(child_pid);
-                crate::release_pid(crate::ProcessId(child_pid));
-                parent_of_remove(child_pid);
+            for entry in stale {
+                release_reaped_task(entry.child_pid);
+                crate::release_pid(crate::ProcessId(entry.child_pid));
+                parent_of_remove(entry.child_pid);
             }
         }
     }
-    // Queued stop/continue job-control reports die with the waiter.
-    if let Some(m) = PENDING_STOPCONT.lock().as_mut() {
-        m.remove(&parent_tid);
+
+    // Preserve queued stop/continue reports across reparenting too.
+    let stopcont = PENDING_STOPCONT
+        .lock()
+        .as_mut()
+        .and_then(|m| m.remove(&parent_tid))
+        .unwrap_or_default();
+    if let Some(r) = reaper {
+        if !stopcont.is_empty() {
+            if let Some(m) = PENDING_STOPCONT.lock().as_mut() {
+                m.entry(r).or_default().extend(stopcont);
+            }
+            wake_wait_child_group(r);
+        }
     }
-    // Still-running children: deliver each one's PR_SET_PDEATHSIG (the
-    // runc/supervisor "kill me when my parent dies" contract) BEFORE the
-    // rows move, then reparent to the subreaper or drop the rows so an
-    // orphan's eventual exit takes the auto-release branch.
+
+    // Still-running children: deliver each one's PR_SET_PDEATHSIG before the
+    // rows move, then retarget them to the selected reaper.
     let children: alloc::vec::Vec<u64> = {
         let g = PARENT_OF.lock();
         g.as_ref()
             .map(|m| {
                 m.iter()
-                    .filter(|&(_, p)| *p == parent_tid)
+                    .filter(|(_, link)| link.parent == parent_tid)
                     .map(|(&c, _)| c)
                     .collect()
             })
@@ -9345,18 +9748,29 @@ fn orphanize_children_of(parent_tid: u64) {
         let child_tid = pid_to_task_raw(*child_pid).unwrap_or(*child_pid);
         let sig = read_prctl(child_tid).pdeathsig;
         if sig != 0 {
-            // raise_signal_pending wakes a parked target itself.
             raise_signal_pending(child_tid, sig);
         }
     }
-    if let Some(m) = PARENT_OF.lock().as_mut() {
-        match reaper {
-            Some(r) => {
-                for (_, parent) in m.iter_mut().filter(|(_, p)| **p == parent_tid) {
-                    *parent = r;
+    match reaper {
+        Some(r) => {
+            for child_pid in children {
+                if let Some(link) = child_link_get(child_pid) {
+                    parent_of_set_with_signal(
+                        child_pid,
+                        r,
+                        if reset_exit_signal {
+                            SIGCHLD
+                        } else {
+                            link.exit_signal
+                        },
+                    );
                 }
             }
-            None => m.retain(|_, parent| *parent != parent_tid),
+        }
+        None => {
+            for child_pid in children {
+                parent_of_remove(child_pid);
+            }
         }
     }
 }
@@ -9426,7 +9840,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
         PARENT_OF
             .lock()
             .as_ref()
-            .is_some_and(|m| m.values().any(|&p| p == tid)),
+            .is_some_and(|m| m.values().any(|link| link.parent == tid)),
         1 << 8,
     );
     r |= has(
@@ -9486,29 +9900,28 @@ pub fn __test_set_foreground_task(tid: u64) {
 /// by the `PENDING_EXITS` reap path, so this only gates the block-vs-ECHILD
 /// decision once no matching exit is queued: a true result means "a child is
 /// still running, block for it"; false means "no such child — return ECHILD".
-fn has_living_child(parent: u64, want: i64, want_pgid: u64) -> bool {
+fn has_living_child(parent: u64, want: i64, want_pgid: u64, options: u32) -> bool {
+    let parents = wait_parent_ids(parent, options);
     let g = PARENT_OF.lock();
-    let is_parent = match g.as_ref() {
-        // Process-group-scoped wait: a living child of `parent` whose group is
-        // `want_pgid`. Without this the any-child arm below reported "has child"
-        // for a group with none, so waitpid(-emptygroup) blocked/returned 0
-        // instead of ECHILD. (#29)
-        Some(m) if want_pgid != 0 => m.iter().any(|(&child, &p)| {
-            p == parent && {
-                let ct = pid_to_task_raw(child).unwrap_or(child);
-                read_pgid(ct) == want_pgid
-            }
-        }),
-        Some(m) if want > 0 => m.get(&(want as u64)).copied() == Some(parent),
-        Some(m) => m.values().any(|&p| p == parent),
-        None => false,
-    };
+    let is_parent = g.as_ref().is_some_and(|m| {
+        m.iter().any(|(&child, link)| {
+            parents.contains(&link.parent)
+                && wait_child_matches(
+                    child,
+                    want,
+                    want_pgid,
+                    link.exit_signal,
+                    false,
+                    options,
+                )
+        })
+    });
     if is_parent {
         return true;
     }
-    {
-        crate::ptrace::is_tracer_of_any(parent, want)
-    }
+    parents
+        .into_iter()
+        .any(|candidate| crate::ptrace::is_tracer_of_any(candidate, want))
 }
 
 // ── ProcessId ↔ TaskId translation ────────────────────────────────
@@ -9540,6 +9953,12 @@ static PID_TO_TASK: [PidTaskMapShard; PID_TASK_SHARDS] =
 
 /// TaskId.raw() → ProcessId.raw(), sharded by TaskId.
 static TASK_TO_PID: [PidTaskMapShard; PID_TASK_SHARDS] =
+    [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
+/// Scheduler TaskId -> Linux TID for non-leader threads.
+static TASK_TO_LINUX_TID: [PidTaskMapShard; PID_TASK_SHARDS] =
+    [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
+/// Linux TID -> scheduler TaskId for non-leader threads.
+static LINUX_TID_TO_TASK: [PidTaskMapShard; PID_TASK_SHARDS] =
     [const { PidTaskMapShard::new() }; PID_TASK_SHARDS];
 /// Serializes the cold registration/removal paths with whole-registry
 /// snapshots. Point lookups intentionally bypass it and take one shard only.
@@ -9586,6 +10005,12 @@ pub fn pid_task_map_init() {
     for shard in TASK_TO_PID.iter() {
         *shard.map.lock() = Some(BTreeMap::new());
     }
+    for shard in TASK_TO_LINUX_TID.iter() {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
+    for shard in LINUX_TID_TO_TASK.iter() {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
 }
 
 pub fn pid_task_map_reset() {
@@ -9593,6 +10018,12 @@ pub fn pid_task_map_reset() {
         *shard.map.lock() = None;
     }
     for shard in TASK_TO_PID.iter() {
+        *shard.map.lock() = None;
+    }
+    for shard in TASK_TO_LINUX_TID.iter() {
+        *shard.map.lock() = None;
+    }
+    for shard in LINUX_TID_TO_TASK.iter() {
         *shard.map.lock() = None;
     }
 }
@@ -9627,6 +10058,43 @@ pub fn register_task_to_pid(task_raw: u64, pid_raw: u64) {
         .insert(task_raw, pid_raw);
 }
 
+
+/// Register all Linux identity views for a non-leader thread. Linux TIDs and
+/// process IDs share one allocator; TaskId remains scheduler-private.
+fn register_thread_task_mapping(tid_raw: u64, task_raw: u64, tgid_raw: u64) {
+    let _mutation = PID_TASK_MUTATION.lock();
+    TASK_TO_PID[pid_task_shard(task_raw)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task_raw, tgid_raw);
+    TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(task_raw, tid_raw);
+    LINUX_TID_TO_TASK[pid_task_shard(tid_raw)]
+        .map
+        .lock()
+        .get_or_insert_with(BTreeMap::new)
+        .insert(tid_raw, task_raw);
+}
+
+pub(crate) fn task_to_linux_tid_raw(task_raw: u64) -> Option<u64> {
+    TASK_TO_LINUX_TID[pid_task_shard(task_raw)]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task_raw).copied())
+}
+
+pub(crate) fn linux_tid_to_task_raw(tid_raw: u64) -> Option<u64> {
+    LINUX_TID_TO_TASK[pid_task_shard(tid_raw)]
+        .map
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&tid_raw).copied())
+}
 /// Release a finished non-leader thread from the task registry. Linux does
 /// not expose CLONE_THREAD siblings as wait4-reapable zombies; retaining them
 /// until the process exits leaks one Task/TCB allocation per pthread and makes
@@ -9640,6 +10108,28 @@ pub(crate) fn release_exited_thread_task(pid: u64, tid: u64) {
     }
     crate::task::release_task(tid);
     let _mutation = PID_TASK_MUTATION.lock();
+    let linux_tid = TASK_TO_LINUX_TID[pid_task_shard(tid)]
+        .map
+        .lock()
+        .as_mut()
+        .and_then(|m| m.remove(&tid));
+    if let Some(linux_tid) = linux_tid {
+        #[cfg(feature = "cgroup")]
+        narf_filesystem::cgroupfs::thread_exited(linux_tid);
+        if let Some(m) = LINUX_TID_TO_TASK[pid_task_shard(linux_tid)].map.lock().as_mut() {
+            if m.get(&linux_tid) == Some(&tid) {
+                m.remove(&linux_tid);
+            }
+        }
+        #[cfg(feature = "container")]
+        {
+            if let Some(ns) = crate::pid_ns::ns_of(tid) {
+                ns.release_outer(linux_tid);
+            }
+            crate::pid_ns::clear_ns(tid);
+        }
+        crate::release_pid(crate::ProcessId(linux_tid));
+    }
     if let Some(m) = TASK_TO_PID[pid_task_shard(tid)].map.lock().as_mut() {
         m.remove(&tid);
     }
@@ -9831,6 +10321,12 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     // below; keep it live for the no-cgroup build.
     #[cfg(not(feature = "cgroup"))]
     let _ = child_tid;
+    // Capture ptrace routing before release_process removes the tracee row.
+    // Linux reports a traced zombie to its tracer first, irrespective of its
+    // clone-child exit-signal class.
+    let natural_link = child_link_get(child_pid);
+    let ptraced = crate::ptrace::is_task_traced(child_pid);
+    let wait_recipient = get_wait_recipient(child_pid);
     // Namespace and pid↔task cleanup is deferred to release_reaped_task so a
     // zombie's inner PID remains resolvable until wait4/waitid consumes it.
     crate::ptrace::release_process(child_pid);
@@ -9858,7 +10354,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         );
     }
 
-    let parent = match get_wait_recipient(child_pid) {
+    let parent = match wait_recipient {
         Some(p) => p,
         None => {
             // No registered parent — orphan. Drain the staged status
@@ -9871,6 +10367,13 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             return;
         }
     };
+    // A ptrace recipient gets SIGCHLD and can wait on either child class.
+    // Otherwise preserve the signal recorded at fork/clone publication.
+    let exit_signal = if ptraced {
+        SIGCHLD
+    } else {
+        natural_link.map_or(SIGCHLD, |link| link.exit_signal)
+    };
     let status = take_pending_termination(child_pid).unwrap_or(0);
     // (1) Reap entry — for wait4.
     {
@@ -9878,22 +10381,20 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
         if let Some(m) = g.as_mut() {
             m.entry(parent)
                 .or_insert_with(alloc::vec::Vec::new)
-                .push((child_pid, status));
+                .push(PendingExit {
+                    child_pid,
+                    status,
+                    exit_signal,
+                    ptraced,
+                });
         }
     }
-    // (2) SIGCHLD delivery — for the parent's sigaction(SIGCHLD) handler.
-    // Linux: kernel/signal.c::do_notify_parent sets SIGCHLD pending.
-    // SIGCHLD = 17; bypass the mask (SIGCHLD is never masked by default).
-    const SIGCHLD: u32 = 17;
-    let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(SIGCHLD));
-    // Record which child, in the PARENT's namespace, so the parent's signalfd
-    // (systemd PID 1's manager_dispatch_signal_fd) and SA_SIGINFO SIGCHLD
-    // handler name the child rather than reading si_pid == 0. Linux
-    // do_notify_parent fills si_pid = task_pid_nr_ns(child, parent_ns) and
-    // si_code = CLD_EXITED/KILLED/DUMPED. SIGCHLD is a standard signal, so
-    // this coalesces to the most recent child (Linux does too); the parent's
-    // wait loop reaps the rest.
-    {
+    // (2) Deliver the clone-selected parent signal. An exit_signal of zero
+    // deliberately sends no signal, while the zombie remains waitable via
+    // __WCLONE. Linux do_notify_parent follows the same rule.
+    if exit_signal != 0 {
+        let signum = u32::from(exit_signal);
+        let _ = pending_signal_bits_update(parent, |slot| *slot |= sig_bit(signum));
         const CLD_EXITED: i32 = 1;
         const CLD_KILLED: i32 = 2;
         const CLD_DUMPED: i32 = 3;
@@ -9905,26 +10406,17 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
             CLD_KILLED
         };
         let child_in_parent_ns = report_pid_to(parent, child_pid) as u32;
-        let _ = store_sigqueue_info(parent, SIGCHLD, si_code, 0, child_in_parent_ns);
+        let _ = store_sigqueue_info(parent, signum, si_code, 0, child_in_parent_ns);
+        // Wake signal/signalfd waiters only after the pending bit and siginfo
+        // are visible; pidfd readiness was published earlier.
+        wake_signal(parent);
+        narf_net::readiness::notify(0);
     }
-    // A parent may be parked in epoll_wait on its signalfd rather than in
-    // wait4. Publishing SIGCHLD without firing the signal waker leaves that
-    // task asleep indefinitely: the earlier pidfd readiness notification can
-    // race before SIGNAL_PENDING is set, so its re-scan observes neither
-    // source. Wake after the pending bit is visible, matching every other
-    // signal-delivery path.
-    wake_signal(parent);
-    // signalfd exposes blocked pending signals through poll/epoll readiness.
-    // `pidfd::notify_exit` ran before SIGCHLD was published, so its readiness
-    // wake can legitimately re-scan too early and re-park. Notify again after
-    // the bit is visible so an epoll waiter observes either its pidfd or
-    // signalfd as ready.
-    narf_net::readiness::notify(0);
     // (3) Wake any parent task parked in a blocking wait4.  The waker
     // was stored by `UserTaskFuture::poll` when it found the pending-
     // exits queue empty.  Now that we've pushed an entry, fire the waker
     // so the executor re-polls the parent and it can reap.
-    crate::user_task::wake_wait_child(parent);
+    wake_wait_child_group(parent);
 }
 
 // ── Per-task pgid table ────────────────────────────────────────────
@@ -9949,6 +10441,7 @@ pub fn pgid_init() {
 #[doc(hidden)]
 pub fn __test_pgid_reset() {
     *PGID_TABLE.lock() = Some(BTreeMap::new());
+    crate::task::__test_reset_process_group_ids();
 }
 
 /// Test-only: map `task` into process group `pgid` directly (bypassing
@@ -9959,6 +10452,7 @@ pub fn __test_set_pgid(task: u64, pgid: u64) {
     let mut g = PGID_TABLE.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
     m.insert(task, pgid);
+    crate::task::set_process_group_id(process_state_key(task), pgid);
 }
 
 fn read_pgid(target: u64) -> u64 {
@@ -10044,6 +10538,9 @@ pub(crate) fn pgid_from_user(user_pid: u64) -> u64 {
 /// the process or its parent calls `setpgid`). Returns 0 only
 /// when no task is currently scheduled (boot / kernel context).
 pub fn current_task_pgid() -> u64 {
+    if let Some(pgid) = crate::task::current_process_group_id() {
+        return pgid;
+    }
     let me = current_task_id();
     if me == 0 {
         return 0;
@@ -10134,7 +10631,7 @@ pub fn current_task_sid_user() -> u64 {
 /// against a userspace-supplied pgrp; see the number-space note above
 /// `pgid_to_user`.
 pub fn current_task_pgid_user() -> u64 {
-    pgid_to_user(read_pgid(process_state_key(current_task_id())))
+    pgid_to_user(current_task_pgid())
 }
 
 /// Child inherits the parent's process-group id (POSIX fork semantics).
@@ -10144,10 +10641,16 @@ pub fn current_task_pgid_user() -> u64 {
 /// console read. A job-control shell still moves the child into a new
 /// group explicitly via setpgid.
 pub fn pgid_fork(parent: u64, child: u64) {
-    let pg = read_pgid(parent);
-    if let Some(m) = PGID_TABLE.lock().as_mut() {
-        m.insert(child, pg);
-    }
+    // Keep the authoritative index and the child's lock-free cache coherent
+    // under the same writer lock. The child is registered but not runnable,
+    // so it cannot observe the pre-inheritance default.
+    let mut pgids = PGID_TABLE.lock();
+    let pg = pgids
+        .as_ref()
+        .and_then(|m| m.get(&parent).copied())
+        .unwrap_or(parent);
+    crate::task::inherit_process_group_id(parent, child, pg);
+    pgids.get_or_insert_with(BTreeMap::new).insert(child, pg);
 }
 
 /// Child inherits the parent's session id (POSIX fork semantics).
@@ -10625,11 +11128,11 @@ fn current_host_fsuid(task: u64) -> u32 {
     #[cfg(feature = "container")]
     {
         let uns = crate::namespaces::current_user_ns(task);
-        return if uns.is_initial() {
+        if uns.is_initial() {
             fsuid
         } else {
             uns.translate_uid_to_host(fsuid)
-        };
+        }
     }
     #[cfg(not(feature = "container"))]
     {
@@ -11477,29 +11980,75 @@ pub(crate) fn resolve_who_targets(scope: WhoScope, who: i32, caller: u64) -> all
 
 static NICE_TABLE: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, i32>>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+// Linux keeps nice in each task's scheduler state, so the common
+// `getpriority(PRIO_PROCESS, 0)` path never contends on one system-wide lock.
+// NARF's compatibility state is sparse instead: an absent row means nice 0.
+// Keep an exact count so the overwhelmingly common all-default case can avoid
+// the IRQ-disabling BTreeMap lock (and its cache-line bounce) entirely.
+static NICE_CUSTOM_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 pub fn nice_init() {
     *NICE_TABLE.lock() = Some(BTreeMap::new());
+    NICE_CUSTOM_ROWS.store(0, Ordering::Release);
 }
 
 #[doc(hidden)]
 pub fn __test_nice_reset() {
     *NICE_TABLE.lock() = Some(BTreeMap::new());
+    NICE_CUSTOM_ROWS.store(0, Ordering::Release);
+}
+
+#[doc(hidden)]
+pub fn __test_nice_storage_len() -> usize {
+    NICE_TABLE.lock().as_ref().map_or(0, BTreeMap::len)
 }
 
 fn read_nice(task: u64) -> i32 {
+    // A setter publishes the row before its release increment. A reader that
+    // observes a non-zero count acquires that publication; a reader racing
+    // before publication may linearize before the setter and return the old
+    // default. Once the last row is removed, zero remains the exact default.
+    if NICE_CUSTOM_ROWS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
     let g = NICE_TABLE.lock();
     g.as_ref().and_then(|m| m.get(&task).copied()).unwrap_or(0)
 }
 
+#[inline]
+fn read_current_nice() -> i32 {
+    // Match Linux's `p = current; task_nice(p)` fast branch. When the sparse
+    // store is empty, the current task's process key cannot affect the answer,
+    // so avoid both task↔pid map lookups as well as NICE_TABLE itself.
+    if NICE_CUSTOM_ROWS.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    read_nice(process_state_key(current_task_id()))
+}
 fn write_nice(task: u64, prio: i32) -> bool {
     let mut g = NICE_TABLE.lock();
     let Some(m) = g.as_mut() else {
         return false;
     };
-    m.insert(task, prio);
+    if prio == 0 {
+        // Preserve the sparse representation: nice 0 is the implicit default.
+        if m.remove(&task).is_some() {
+            NICE_CUSTOM_ROWS.fetch_sub(1, Ordering::Release);
+        }
+    } else if m.insert(task, prio).is_none() {
+        // Publish the map row before allowing lock-free readers to skip their
+        // default return and consult it.
+        NICE_CUSTOM_ROWS.fetch_add(1, Ordering::Release);
+    }
     true
 }
+/// Test-only raw state mutation. This deliberately bypasses setpriority's
+/// Linux permission checks so sparse default-row removal can be verified.
+#[doc(hidden)]
+pub fn __test_write_current_nice(prio: i32) -> bool {
+    write_nice(process_state_key(current_task_id()), prio)
+}
+
 
 // ── Times — POSIX process CPU times ───────────────────────────────
 //

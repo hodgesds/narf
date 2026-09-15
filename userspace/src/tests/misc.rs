@@ -1020,6 +1020,23 @@ fn smoke_userspace_priority_round_trip() -> TestResult {
         return TestResult::Fail("setpriority(100) did not clamp to MAX_NICE(19)");
     }
 
+    // Restoring the default removes the sparse compatibility-state row. This
+    // is what lets default-only getpriority traffic stay off the shared table
+    // lock. Use the raw hook because Linux correctly forbids an unprivileged
+    // task at nice 19 from lowering itself back to nice 0.
+    if !crate::handlers::__test_write_current_nice(0) {
+        return TestResult::Fail("raw nice reset failed");
+    }
+    if crate::handlers::__test_nice_storage_len() != 0 {
+        return TestResult::Fail("default nice retained a sparse table row");
+    }
+    let r = call(Syscall::Getpriority, 0, 0, 0)
+        .map(|r| r.value)
+        .unwrap_or(!0);
+    if r != 20 {
+        return TestResult::Fail("restored default nice wire value not 20");
+    }
+
     // Out-of-range `which` is -EINVAL, matching Linux
     // SYSCALL_DEFINE2(getpriority)'s `which > PRIO_USER || which <
     // PRIO_PROCESS` rejection.

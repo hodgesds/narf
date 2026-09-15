@@ -44,17 +44,12 @@ pub(crate) fn sys_ioprio_get(ctx: &mut dyn TrapContext) {
         }
     };
     let targets = resolve_who_targets(scope, who, current_task_id());
-    let g = IOPRIO_TABLE.lock();
     let mut best: Option<u32> = None;
     for t in targets {
-        let v = g
-            .as_ref()
-            .and_then(|m| m.get(&t).copied())
-            .unwrap_or(IOPRIO_DEFAULT);
+        let v = ioprio_of_task(t);
         // `ioprio_best` — the lower word wins.
         best = Some(best.map_or(v, |b| b.min(v)));
     }
-    drop(g);
     match best {
         Some(v) => ctx.set_return(SyscallReturn::ok(v as u64)),
         None => ctx.set_return(SyscallReturn::ok((-ESRCH) as u64)),

@@ -2510,6 +2510,15 @@ pub fn note_urgent_wake_preempt(woken: u64) {
 /// while a runnable peer starves.
 const FAIR_QUANTUM_DIV: u64 = 4;
 
+/// Consume a normally-clear syscall-exit hint without writing its cache line
+/// on the cold path. A producer racing a false load leaves the hint set for the
+/// next syscall exit, exactly like a producer racing immediately after the old
+/// unconditional exchange.
+#[inline(always)]
+fn consume_syscall_exit_hint(hint: &AtomicBool) -> bool {
+    hint.load(Ordering::Acquire) && hint.swap(false, Ordering::AcqRel)
+}
+
 /// Pure yield policy for [`maybe_resched_syscall_exit`], split out so it is
 /// unit-testable without a live executor. Yields (`true`) on an explicit
 /// back-pressure request, on full time-slice expiry, or once a fair quantum
@@ -2588,7 +2597,13 @@ pub unsafe fn maybe_resched_syscall_exit() {
     if p.is_null() {
         return;
     }
-    let backpressure = BACKPRESSURE_YIELD.inner[cpu].swap(false, Ordering::AcqRel);
+    // Both hints are cold in the ordinary syscall path.  Avoid an
+    // unconditional RMW when they are clear: the per-CPU byte arrays share
+    // cache lines, so `swap(false)` made independent CPUs contend on every
+    // syscall even though no yield had been requested.  A request racing the
+    // false load remains sticky for the next syscall exit, just as one racing
+    // immediately after the old swap did.
+    let backpressure = consume_syscall_exit_hint(&BACKPRESSURE_YIELD.inner[cpu]);
     // Wake-preemption request (gated `wake_preempt`; set by `note_wake_preempt`
     // when this task woke a peer). The eligibility-correct policy lives in the
     // EEVDF scheduler; this consume site only carries the request into the pure
@@ -2598,7 +2613,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // Urgent handoffs are one-shot. Consume the hint at this syscall exit; a
     // remote wake or a wakee that already ran must not leak urgency into a
     // later unrelated syscall.
-    let urgent_wake = URGENT_WAKE_PREEMPT.inner[cpu].swap(false, Ordering::AcqRel);
+    let urgent_wake = consume_syscall_exit_hint(&URGENT_WAKE_PREEMPT.inner[cpu]);
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
@@ -4108,6 +4123,31 @@ pub mod tests {
         }
         if decide(0, slice, 1, false, false, false, true) {
             return TestResult::Fail("unstamped urgent wake must not yield");
+        }
+        TestResult::Pass
+    }
+
+    /// A clear syscall-exit hint stays clear, while a published hint is
+    /// consumed exactly once. This pins the semantics of the read-mostly fast
+    /// path that avoids cross-CPU cache-line writes when no yield is pending.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_syscall_exit_hint_is_one_shot() -> TestResult {
+        use super::consume_syscall_exit_hint;
+
+        let hint = AtomicBool::new(false);
+        if consume_syscall_exit_hint(&hint) {
+            return TestResult::Fail("clear syscall-exit hint was consumed");
+        }
+        if hint.load(Ordering::Acquire) {
+            return TestResult::Fail("clear syscall-exit hint changed state");
+        }
+
+        hint.store(true, Ordering::Release);
+        if !consume_syscall_exit_hint(&hint) {
+            return TestResult::Fail("published syscall-exit hint was missed");
+        }
+        if consume_syscall_exit_hint(&hint) || hint.load(Ordering::Acquire) {
+            return TestResult::Fail("syscall-exit hint was not one-shot");
         }
         TestResult::Pass
     }
@@ -6134,6 +6174,8 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_syscall_exit_fair_yield_policy);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!("scheduler/stackful", smoke_syscall_exit_hint_is_one_shot);
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",

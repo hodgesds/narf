@@ -49,6 +49,15 @@ pub struct Task {
     /// POSIX pid (thread-group id). PIDs ARE reused (lowest-free
     /// pool), so pid-keyed state must be cleaned at reap.
     pub pid: AtomicU64,
+    /// Cached process-group id in internal TaskId space.
+    ///
+    /// Linux reaches this state as `current->signal->pids[PIDTYPE_PGID]`.
+    /// NARF keeps the authoritative membership index in `PGID_TABLE`, but
+    /// mirrors the current value here so self lookups do not contend on that
+    /// global table. A thread clone inherits the leader's value before it is
+    /// made runnable; the rare setpgid/setsid writers update every Task with
+    /// the same `pid` while holding the PGID table lock.
+    process_group_id: AtomicU64,
     /// [`TASK_RUNNING`] | [`TASK_ZOMBIE`].
     pub state: AtomicU32,
     /// Raw wstatus staged at exit (also mirrored in the pending-
@@ -113,6 +122,7 @@ impl Task {
         let t = Arc::new(Task {
             tid,
             pid: AtomicU64::new(pid),
+            process_group_id: AtomicU64::new(tid),
             state: AtomicU32::new(TASK_RUNNING),
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
@@ -176,6 +186,58 @@ pub fn task_get_local(tid: u64) -> Option<Arc<Task>> {
         }
     }
     task_get(tid)
+}
+
+/// Read the current stackful task's process-group cache without cloning its
+/// Arc or consulting either global identity map. This is NARF's equivalent of
+/// Linux's `current` -> `task_pgrp(current)` path.
+#[inline]
+pub(crate) fn current_process_group_id() -> Option<u64> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
+    Some(unsafe { (*ptr).process_group_id.load(Ordering::Acquire) })
+}
+
+/// Seed a just-created child before it can run. Fork and thread-clone both
+/// inherit the parent's current process group; later group-wide mutations are
+/// handled by [`set_process_group_id`].
+pub(crate) fn inherit_process_group_id(parent: u64, child: u64, fallback: u64) {
+    let inherited = task_get(parent)
+        .map(|task| task.process_group_id.load(Ordering::Acquire))
+        .unwrap_or(fallback);
+    if let Some(task) = task_get(child) {
+        task.process_group_id.store(inherited, Ordering::Release);
+    }
+}
+
+/// Mirror a process-wide PGID mutation into every registered thread. The
+/// caller serializes this with `PGID_TABLE`; observing either the old or new
+/// atomic value during a concurrent syscall is a valid before/after result.
+pub(crate) fn set_process_group_id(leader: u64, pgid: u64) {
+    let tasks = TASKS.lock();
+    let Some(process_pid) = tasks
+        .get(&leader)
+        .map(|task| task.pid.load(Ordering::Acquire))
+    else {
+        return;
+    };
+    for task in tasks.values() {
+        if task.pid.load(Ordering::Acquire) == process_pid {
+            task.process_group_id.store(pgid, Ordering::Release);
+        }
+    }
+}
+
+/// Reset mirrored PGIDs alongside the test-only authoritative table reset.
+#[doc(hidden)]
+pub(crate) fn __test_reset_process_group_ids() {
+    for task in TASKS.lock().values() {
+        task.process_group_id.store(task.tid, Ordering::Release);
+    }
 }
 
 /// Charge CPU time to the currently-published stackful user task without

@@ -205,11 +205,15 @@ pub(crate) fn __test_tracee_count() -> usize {
 }
 
 fn pid_to_tid(pid: u64) -> u64 {
-    crate::handlers::pid_to_task_raw(pid).unwrap_or(pid)
+    crate::handlers::linux_tid_to_task_raw(pid)
+        .or_else(|| crate::handlers::pid_to_task_raw(pid))
+        .unwrap_or(pid)
 }
 
 fn tid_to_pid(tid: u64) -> u64 {
-    crate::handlers::task_to_pid_raw(tid).unwrap_or(tid)
+    crate::handlers::task_to_linux_tid_raw(tid)
+        .or_else(|| crate::handlers::task_to_pid_raw(tid))
+        .unwrap_or(tid)
 }
 
 pub fn ptrace_init() {

@@ -701,6 +701,73 @@ fn smoke_process_sigchld_on_child_exit() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_process_sigchld_on_child_exit);
+// Linux clone children may request a non-SIGCHLD termination signal or no
+// signal at all. Both remain waitable through __WCLONE.
+#[cfg(target_arch = "x86_64")]
+fn smoke_process_clone_exit_signal_delivery() -> TestResult {
+    const PARENT: u64 = 0xF0_15;
+    const SIG_CHILD: u64 = 0xC0_15;
+    const QUIET_CHILD: u64 = 0xC016;
+    const SIGUSR1: u32 = 10;
+    const SIGCHLD: u32 = 17;
+    const WNOHANG_WCLONE: u64 = 1 | 0x8000_0000;
+
+    fn reap_clone() -> Option<u64> {
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: (-1i64) as u64,
+                arg1: 0,
+                arg2: WNOHANG_WCLONE,
+                arg3: 0,
+                arg4: 0,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Wait4.raw(), &mut ctx);
+        ctx.ret
+            .filter(|r| r.status == SyscallReturn::OK)
+            .map(|r| r.value)
+    }
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    setup_process_state(PARENT);
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+    LOOKUP_TASK.store(PARENT, Ordering::Relaxed);
+
+    crate::handlers::__test_parent_of_set_with_signal(SIG_CHILD, PARENT, SIGUSR1 as u8);
+    crate::user_task::notify_task_exited(SIG_CHILD, SIG_CHILD);
+    let after_signal_child = signal_pending_of(PARENT);
+    if after_signal_child & crate::handlers::sig_bit(SIGUSR1) == 0
+        || after_signal_child & crate::handlers::sig_bit(SIGCHLD) != 0
+    {
+        teardown_process_state();
+        return TestResult::Fail("custom clone exit signal did not replace SIGCHLD");
+    }
+
+    crate::handlers::__test_parent_of_set_with_signal(QUIET_CHILD, PARENT, 0);
+    crate::user_task::notify_task_exited(QUIET_CHILD, QUIET_CHILD);
+    if signal_pending_of(PARENT) & crate::handlers::sig_bit(SIGCHLD) != 0 {
+        teardown_process_state();
+        return TestResult::Fail("zero-signal clone generated SIGCHLD");
+    }
+
+    if reap_clone() != Some(SIG_CHILD) || reap_clone() != Some(QUIET_CHILD) {
+        teardown_process_state();
+        return TestResult::Fail("custom/zero-signal clone was not __WCLONE-waitable");
+    }
+
+    teardown_process_state();
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_process_clone_exit_signal_delivery
+);
 
 // ── Smoke 6: kill + signal handler ────────────────────────────────────
 //
@@ -962,8 +1029,14 @@ fn smoke_exit_sweeps_task_tables() -> TestResult {
     // Observer state is test-global and a prior test's teardown clears
     // it — re-register the real exit-observer chain (on_child_exit +
     // the table sweep) so notify_task_exited exercises production
-    // wiring, then clear again on the way out.
+    // wiring, then clear again on the way out. Initialize the sparse signal
+    // and waiter tables explicitly as well: test registration order differs
+    // by architecture, so relying on an earlier smoke made this fail only on
+    // aarch64.
     crate::user_task::__test_clear_exit_observers();
+    crate::signal_init();
+    crate::handlers::signal_waker_init();
+    crate::handlers::io_waker_init();
     crate::handlers::wait_init();
 
     let task = crate::task::Task::new_registered(TID, PID);
@@ -3965,7 +4038,12 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
     }
 
     // (2) Child shares the parent's AS Arc.
-    let child_task = narf_scheduler::TaskId(ret_tid);
+    let Some(child_task_raw) = crate::handlers::linux_tid_to_task_raw(ret_tid) else {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child Linux TID has no scheduler task mapping");
+    };
+    let child_task = narf_scheduler::TaskId(child_task_raw);
     let child_as = match narf_scheduler::address_space_of(child_task) {
         Some(a) => a,
         None => {
@@ -3997,6 +4075,239 @@ fn smoke_wave65_clone3_vm_thread_shared_as() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("userspace/process", smoke_wave65_clone3_vm_thread_shared_as);
 
+/// clone3(CLONE_PIDFD) follows Linux pidfd_prepare transactionality:
+/// descriptor exhaustion aborts with EMFILE, a failed pidfd put_user aborts
+/// with EFAULT and releases the reserved number, and only a successful clone
+/// publishes the CLOEXEC pidfd after copying a non-shared child fd table.
+#[cfg(target_arch = "x86_64")]
+fn smoke_clone3_pidfd_errno_rollback_and_publication() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    const PARENT: u64 = 0xF0_6A;
+    const CLONE_PIDFD: u64 = 0x0000_1000;
+    #[cfg(feature = "cgroup")]
+    const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+    const SIGCHLD: u64 = 17;
+
+    crate::syscall::__test_clear_global();
+    narf_scheduler::__reset_queues_for_test();
+    crate::fd::__test_reset();
+    crate::pidfd::__test_reset();
+    crate::handlers::__test_rlimit_reset();
+    crate::handlers::init_per_task_state();
+    setup_process_state(PARENT);
+
+    // SAFETY: paging is live in the in-kernel smoke harness.
+    let parent_as = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => Arc::new(a),
+        Err(_) => {
+            teardown_process_state();
+            return TestResult::Fail("AddressSpace::new_for_user");
+        }
+    };
+    *PROC_PARENT_AS.lock() = Some(parent_as);
+    install_address_space_lookup(lookup_proc_parent_as);
+
+    let mut table = SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct TestCloneArgs {
+        flags: u64,
+        pidfd: u64,
+        child_tid: u64,
+        parent_tid: u64,
+        exit_signal: u64,
+        stack: u64,
+        stack_size: u64,
+        tls: u64,
+        set_tid: u64,
+        set_tid_size: u64,
+        cgroup: u64,
+    }
+
+    let set_nofile = |cur: u64| -> bool {
+        let limit = [cur, 4096u64];
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: 7, // RLIMIT_NOFILE
+                arg1: limit.as_ptr() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Setrlimit.raw(), &mut ctx);
+        matches!(ctx.ret, Some(r) if r.status == SyscallReturn::OK && r.value == 0)
+    };
+    let run_clone = |flags: u64, pidfd_ptr: u64, cgroup: u64| -> i64 {
+        let args = TestCloneArgs {
+            flags,
+            pidfd: pidfd_ptr,
+            exit_signal: SIGCHLD,
+            cgroup,
+            ..Default::default()
+        };
+        let mut ctx = StubCtx {
+            args: SyscallArgs {
+                arg0: &args as *const TestCloneArgs as u64,
+                arg1: core::mem::size_of::<TestCloneArgs>() as u64,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
+        ctx.ret.map(|r| r.value as i64).unwrap_or(i64::MIN)
+    };
+
+    let mut child_task = None;
+    let verdict = (|| {
+        let mut pidfd_slot = -1i32;
+
+        // stdio occupies 0..=2, so a soft limit of 3 leaves no fd available.
+        if !set_nofile(3) {
+            return Err("setrlimit(RLIMIT_NOFILE=3) failed");
+        }
+        match run_clone(CLONE_PIDFD, &mut pidfd_slot as *mut i32 as u64, 0) {
+            -24 => {}
+            -11 => return Err("clone3 hit EAGAIN before the pidfd EMFILE check"),
+            -12 => return Err("clone3 hit ENOMEM before the pidfd EMFILE check"),
+            -14 => return Err("clone3 hit EFAULT before the pidfd EMFILE check"),
+            -22 => return Err("clone3 hit EINVAL before the pidfd EMFILE check"),
+            value if value > 0 => {
+                return Err("clone3 created a child despite pidfd descriptor exhaustion")
+            }
+            _ => return Err("clone3 returned an unexpected errno instead of EMFILE"),
+        }
+
+        if !set_nofile(1024) {
+            return Err("restoring RLIMIT_NOFILE failed");
+        }
+        // Canonical user address, deliberately absent from the synthetic AS.
+        if run_clone(CLONE_PIDFD, 0x0000_7000_0000_0000, 0) != -14 {
+            return Err("unmapped clone3 pidfd output did not return -EFAULT");
+        }
+
+        // Linux resolves an unopened CLONE_INTO_CGROUP fd as EBADF after
+        // pidfd_prepare. The failed clone must release both its PID and its
+        // reserved descriptor; the successful clone below must still get fd 3.
+        #[cfg(feature = "cgroup")]
+        if run_clone(
+            CLONE_PIDFD | CLONE_INTO_CGROUP,
+            &mut pidfd_slot as *mut i32 as u64,
+            1234,
+        ) != -9
+        {
+            return Err("invalid CLONE_INTO_CGROUP descriptor did not return -EBADF");
+        }
+
+        let child_pid = run_clone(CLONE_PIDFD, &mut pidfd_slot as *mut i32 as u64, 0);
+        if child_pid <= 0 {
+            return Err("clone3(CLONE_PIDFD) did not create a child");
+        }
+        if pidfd_slot != 3 {
+            return Err("failed pidfd transaction did not release the lowest fd");
+        }
+        let tid = crate::handlers::pid_to_task_raw(child_pid as u64)
+            .ok_or("clone3 pidfd child has no PID-to-TaskId mapping")?;
+        child_task = Some(tid);
+
+        let parent_entry = crate::fd::with_table(PARENT, |fds| {
+            fds.get(pidfd_slot as u32).map(|entry| {
+                (
+                    entry.ops.pidfd_target_pid(),
+                    entry.flags & crate::fd::FD_CLOEXEC,
+                )
+            })
+        })
+        .flatten();
+        if parent_entry != Some((Some(child_pid as u64), crate::fd::FD_CLOEXEC)) {
+            return Err("clone3 did not publish the expected CLOEXEC pidfd");
+        }
+        if crate::fd::with_table(tid, |fds| fds.get(pidfd_slot as u32).is_some()) != Some(false) {
+            return Err("non-CLONE_FILES child inherited the reserved pidfd");
+        }
+        Ok(())
+    })();
+
+    narf_scheduler::__reset_queues_for_test();
+    if let Some(tid) = child_task {
+        crate::fd::detach(tid);
+        let _ = crate::task::release_task(tid);
+    }
+    crate::fd::detach(PARENT);
+    crate::fd::__test_reset();
+    crate::pidfd::__test_reset();
+    crate::handlers::__test_rlimit_reset();
+    teardown_process_state();
+    *PROC_PARENT_AS.lock() = None;
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_clone3_pidfd_errno_rollback_and_publication
+);
+
+/// The CLONE_CHILD_SETTID schedule-tail hook writes the Linux-visible TID,
+/// consumes the pointer after one attempt, and ignores an unmapped target.
+#[cfg(target_arch = "x86_64")]
+fn smoke_clone_child_settid_schedule_tail_once() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    const TASK: u64 = 0xF0_6B;
+    const VISIBLE_PID: u64 = 0xC0_6B;
+
+    setup_process_state(TASK);
+    crate::handlers::register_task_to_pid(TASK, VISIBLE_PID);
+    crate::handlers::register_pid_task_mapping(VISIBLE_PID, TASK);
+    let task = match crate::task::task_get(TASK) {
+        Some(task) => task,
+        None => {
+            teardown_process_state();
+            return TestResult::Fail("registered task disappeared");
+        }
+    };
+
+    let mut tid_word = 0u32;
+    let mut target = Some(&mut tid_word as *mut u32 as u64);
+    crate::user_task::complete_set_child_tid(&mut target, &task);
+    let verdict = if tid_word != VISIBLE_PID as u32 {
+        Err("CHILD_SETTID wrote the internal scheduler TaskId")
+    } else if target.is_some() {
+        Err("CHILD_SETTID target was not consumed")
+    } else {
+        // A second completion must be a no-op: Linux schedule_tail executes
+        // once, even when the user store faults.
+        tid_word = 0xA5A5_5A5A;
+        crate::user_task::complete_set_child_tid(&mut target, &task);
+        if tid_word != 0xA5A5_5A5A {
+            Err("CHILD_SETTID retried an already-consumed target")
+        } else {
+            let mut bad_target = Some(0x0000_7000_0000_0000);
+            crate::user_task::complete_set_child_tid(&mut bad_target, &task);
+            if bad_target.is_some() {
+                Err("faulting CHILD_SETTID target was retained for retry")
+            } else {
+                Ok(())
+            }
+        }
+    };
+
+    let _ = crate::task::release_task(TASK);
+    teardown_process_state();
+    match verdict {
+        Ok(()) => TestResult::Pass,
+        Err(reason) => TestResult::Fail(reason),
+    }
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "userspace/process",
+    smoke_clone_child_settid_schedule_tail_once
+);
 /// CLONE_SIGHAND/CLONE_THREAD share the LIVE signal-handler table: a
 /// handler installed by any thread is instantly visible to the whole
 /// group. Before the thread-group parity pass, CLONE_SIGHAND was
@@ -4087,6 +4398,9 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
         Some(t) => t,
         None => return fail("thread clone3 failed"),
     };
+    let Some(thread_task) = crate::handlers::linux_tid_to_task_raw(thread_tid) else {
+        return fail("thread Linux TID has no scheduler task mapping");
+    };
     // A distinct fork-style tid whose handler table is deep-copied
     // from the parent via the fork primitive (deterministic — avoids
     // depending on the full clone3 non-VM fork path in a stub context).
@@ -4094,7 +4408,7 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     crate::handlers::sigaction_fork(PARENT, FORK_TID);
 
     // (1) The thread sees the parent's handler (shared table).
-    if crate::handlers::sigaction_lookup(thread_tid, SIGUSR1) != Some(0xCAFE_1000) {
+    if crate::handlers::sigaction_lookup(thread_task, SIGUSR1) != Some(0xCAFE_1000) {
         return fail("CLONE_SIGHAND thread did not inherit the shared handler");
     }
     // (2) The fork child sees it too (fork copies at clone time).
@@ -4104,7 +4418,7 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     // (3) A LATER install by the parent propagates to the thread
     // (shared table) but NOT to the fork child (deep copy).
     crate::handlers::__test_set_sigaction(PARENT, SIGUSR1, 0xBEEF_2000);
-    if crate::handlers::sigaction_lookup(thread_tid, SIGUSR1) != Some(0xBEEF_2000) {
+    if crate::handlers::sigaction_lookup(thread_task, SIGUSR1) != Some(0xBEEF_2000) {
         return fail("shared sighand: thread must see the parent's LATER install");
     }
     if crate::handlers::sigaction_lookup(FORK_TID, SIGUSR1) != Some(0xCAFE_1000) {
@@ -4112,7 +4426,7 @@ fn smoke_clone_thread_shares_sighand_fork_copies() -> TestResult {
     }
     // (4) And an install by the THREAD is visible to the parent —
     // proves the Arc is shared both ways, not a one-time copy.
-    crate::handlers::__test_set_sigaction(thread_tid, 12, 0x1234_0000); // SIGUSR2
+    crate::handlers::__test_set_sigaction(thread_task, 12, 0x1234_0000); // SIGUSR2
     if crate::handlers::sigaction_lookup(PARENT, 12) != Some(0x1234_0000) {
         return fail("shared sighand: parent must see the THREAD's install");
     }
@@ -4272,7 +4586,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Clone3.raw(), &mut ctx);
 
-    let child_tid_raw = match ctx.ret {
+    let child_linux_tid = match ctx.ret {
         Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
         _ => {
             teardown_process_state();
@@ -4280,9 +4594,14 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
             return TestResult::Fail("clone3 did not return a child TID");
         }
     };
+    let Some(child_task_raw) = crate::handlers::linux_tid_to_task_raw(child_linux_tid) else {
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("child Linux TID has no scheduler task mapping");
+    };
 
     // Verify the clear_child_tid slot was populated.
-    match crate::handlers::__test_peek_clear_child_tid(child_tid_raw) {
+    match crate::handlers::__test_peek_clear_child_tid(child_task_raw) {
         Some(a) if a == ca.child_tid => {}
         _ => {
             teardown_process_state();
@@ -4315,7 +4634,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     // Simulate child exit. The observer chain fires
     // fire_clear_child_tid_on_exit which bumps the futex counter at
     // ca.child_tid in both namespaces.
-    crate::user_task::notify_task_exited(child_tid_raw, child_tid_raw);
+    crate::user_task::notify_task_exited(PARENT, child_task_raw);
 
     let post_private = crate::handlers::__test_futex_wake_counter_scoped(private_ns, ca.child_tid);
     let post_shared = crate::handlers::__test_futex_wake_counter_scoped(0, ca.child_tid);
@@ -4337,7 +4656,7 @@ fn smoke_wave65_clone_child_cleartid_wakes_on_exit() -> TestResult {
     }
 
     // The slot should be drained (single-shot per Linux semantics).
-    if crate::handlers::__test_peek_clear_child_tid(child_tid_raw).is_some() {
+    if crate::handlers::__test_peek_clear_child_tid(child_task_raw).is_some() {
         teardown_process_state();
         *PROC_PARENT_AS.lock() = None;
         return TestResult::Fail("clear_child_tid slot not consumed on exit");
@@ -5608,9 +5927,11 @@ fn smoke_process_clone_thread_shares_pid() -> TestResult {
         if thread_tid == PARENT {
             return Err("clone(CLONE_THREAD) reused the caller's TaskId");
         }
+        let thread_task = crate::handlers::linux_tid_to_task_raw(thread_tid)
+            .ok_or("thread Linux TID has no scheduler task mapping")?;
 
         // Speak as the new thread: same process, so the same pid.
-        LOOKUP_TASK.store(thread_tid, Ordering::Relaxed);
+        LOOKUP_TASK.store(thread_task, Ordering::Relaxed);
         let seen = getpid_now();
         if seen != parent_pid {
             return Err("CLONE_THREAD thread getpid() did not report the shared process pid");
@@ -5707,8 +6028,10 @@ fn smoke_process_clone_thread_shares_rlimit() -> TestResult {
             Some(r) if r.status == SyscallReturn::OK && r.value != 0 => r.value,
             _ => return Err("clone3(CLONE_THREAD) did not return a thread tid"),
         };
+        let child_task = crate::handlers::linux_tid_to_task_raw(child_tid)
+            .ok_or("thread Linux TID has no scheduler task mapping")?;
 
-        LOOKUP_TASK.store(child_tid, Ordering::Relaxed);
+        LOOKUP_TASK.store(child_task, Ordering::Relaxed);
         if get_memlock_rlimit()? != (0x3000, 0x3000) {
             return Err("CLONE_THREAD child did not inherit the shared rlimit row");
         }

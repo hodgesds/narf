@@ -22,7 +22,19 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // systemd's manager_dispatch_sigchld peeks waitid(P_ALL, WEXITED|
     // WNOHANG|WNOWAIT) precisely so it can still read /proc/$PID (the
     // "is this my child" PPid check) before reaping with waitid(P_PID).
-    const WNOWAIT: u32 = 0x0100_0000;
+
+    const VALID_WAIT_OPTIONS: u32 = WNOHANG
+        | WUNTRACED
+        | WEXITED
+        | WCONTINUED
+        | WNOWAIT
+        | __WNOTHREAD
+        | __WCLONE
+        | __WALL;
+    if options & !VALID_WAIT_OPTIONS != 0 || options & (WUNTRACED | WEXITED | WCONTINUED) == 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        return;
+    }
 
     // Translate (idtype, id) to the wait4-style want_pid: P_ALL → -1
     // (any child), P_PID → the pid. P_PGID sets a process-group filter
@@ -115,21 +127,10 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // only PEEKS the entry: the child stays queued (and its Task/pid
     // tables intact) so a later wait4/waitid can still reap it.
     let peek = options & WNOWAIT != 0;
-    let reaped = {
-        let mut g = PENDING_EXITS.lock();
-        g.as_mut().and_then(|m| {
-            let q = m.get_mut(&parent)?;
-            let idx = q
-                .iter()
-                .position(|&(p, _)| wait_child_matches(p, want_pid, want_pgid))?;
-            if peek {
-                Some(q[idx])
-            } else {
-                Some(q.remove(idx))
-            }
-        })
-    };
-    if let Some((child_pid, status)) = reaped {
+    let reaped = reap_pending_exit(parent, want_pid, want_pgid, options, peek);
+    if let Some(entry) = reaped {
+        let child_pid = entry.child_pid;
+        let status = entry.status;
         if infop != 0 {
             // Report the child in the caller's namespace view (si_pid).
             let si = encode_waitid_siginfo(report_pid_to(parent, child_pid) as i64, status);
@@ -174,7 +175,7 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // re-float the task after a wake that can never come — the strand is
     // unbounded, and invisible to the park-check heuristic because that path
     // does not tick `dbg_park_checks` either.
-    if !has_living_child(parent, want_pid, want_pgid) {
+    if !has_living_child(parent, want_pid, want_pgid, options) {
         const ECHILD: i64 = 10;
         ctx.set_return(SyscallReturn::ok((-ECHILD) as u64));
         return;

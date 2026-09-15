@@ -616,9 +616,16 @@ receives its PID/TID. `clone3` enforces Linux's 64-byte v0 minimum, one-page
 maximum, zero-only unknown tail, paired stack fields, valid exit signal, and
 flag dependency rules before allocating or publishing a child. These failures
 surface as Linux `EINVAL`, `EFAULT`, or `E2BIG`; task exhaustion is `EAGAIN`
-and address-space construction failure is `ENOMEM`. Requested `set_tid` PID
-injection is refused with `EPERM` because no checkpoint/restore capability is
-present on this syscall interface.
+and address-space construction failure is `ENOMEM`. Requested `set_tid[]`
+values are interpreted innermost-first across the active PID namespace and
+each ancestor, up to Linux's 32-level limit. Every explicitly requested level
+requires `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` in that namespace's owning
+user namespace. Collisions and exhaustion preserve Linux `EEXIST`, `EAGAIN`,
+and `ENOMEM`, and partial allocation is rolled back atomically. PID-namespace
+`unshare` and `setns` affect future children; `setns` accepts the active
+namespace or one of its descendants. `CLONE_INTO_CGROUP | CLONE_THREAD`
+performs per-thread placement within the same threaded domain and returns
+`EOPNOTSUPP` for a cross-domain move.
 On both architectures, each user task enters and resumes EL0/CPL3 with a
 dedicated scheduler-owned kernel stack. Timer preemption retains the complete
 trap continuation, FP/SIMD image, address space, and TLS value; a TLS value of
@@ -1157,27 +1164,23 @@ implementation, two consumers.
 
 ### 8.3 fork/exec semantics (resolved)
 
-**Decision (was open):** **spawn-only**. NARF does not
-implement Linux-compatible `fork()`. The
-posix_spawn-equivalent native primitive is
-`spawn_process(elf, caps)` in §3.
+**Decision (was open):** NARF keeps `spawn_process(elf, caps)` as the preferred
+native primitive and implements Linux-compatible `fork()`, `vfork()`,
+`clone(2)`, and `clone3(2)` for compatibility workloads.
 
-**Rationale:** `fork()` requires copy-on-write of the parent
-address space, which interacts badly with cap tables (does
-the child get a copy of every cap? clones are an explicit
-operation in NARF, not implicit copies), with PKS/MTE domain
-state (each domain's PKRS/TCF would need cloning), and with
-the bootstrap ring pairs (you'd have two processes sharing a
-ring and immediately diverging). The semantic mess is not
-worth Linux source-compatibility for the small set of
-programs that genuinely need fork-without-exec.
+`fork()` creates a copy-on-write address space and copies the caller's
+Linux-visible process state. `vfork()` shares the address space and parks the
+parent until the child calls `execve` or exits. Clone flags select Linux's
+per-resource copy/share rules for VM, files, filesystem context, signal
+handlers, thread groups, credentials, namespaces, and SysV semaphore undo
+state. Capability and domain objects remain governed by their explicit NARF
+derivation rules; compatibility cloning does not manufacture authority.
 
-relibc's `fork()` returns `Err(ENOSYS)`. POSIX programs that
-call `posix_spawn` work; programs that `fork(); exec()` are
-patched (typically by replacing with `posix_spawn`).
-`vfork()` is similarly unsupported. This is a known porting
-cost for legacy code; the alternative is unsoundness in the
-cap+domain model.
+The child becomes runnable only after fallible validation, PID/TID allocation,
+namespace binding, pidfd installation, cgroup placement, and user-memory
+writes complete. Failure rolls those preparations back without publishing a
+partially initialized task. The child returns zero at the original syscall
+continuation; the parent receives the Linux-visible PID or TID.
 
 ### 8.4 PT_INTERP capability bootstrap (resolved)
 

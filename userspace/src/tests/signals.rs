@@ -2388,7 +2388,7 @@ fn smoke_unshare_pid_ns_for_children_assigns_child_as_pid_one() -> TestResult {
     let child_task: u64 = 0x2222;
     let child_outer: u64 = 5555;
 
-    let _ns = crate::pid_ns::unshare_pid_ns_for_children(parent_task);
+    let _ns = crate::pid_ns::unshare_pid_ns_for_children(parent_task).unwrap();
     if crate::pid_ns::self_inner_pid(parent_task, 999) == 1 {
         return TestResult::Fail("parent should remain in parent namespace");
     }
