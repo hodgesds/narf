@@ -614,6 +614,25 @@ pub async fn acl_of_file(file: &dyn FileOps, ty: AclType) -> Result<Option<Posix
     }
 }
 
+/// [`acl_of_file`] for a DIRECTORY.
+///
+/// Path resolution hands back `DirOps` for a directory, so the `FileOps`
+/// form can never see one — and a directory is exactly where an ACL most
+/// often matters, because every create and delete inside it is checked
+/// against the directory's permissions.
+pub async fn acl_of_dir(dir: &dyn DirOps, ty: AclType) -> Result<Option<PosixAcl>, FsError> {
+    // A directory that can say "no ACL here" cheaply saves the whole
+    // lookup — see [`DirOps::access_acl_present`].
+    if ty == AclType::Access && dir.access_acl_present() == Some(false) {
+        return Ok(None);
+    }
+    match dir.get_xattr(ty.xattr_name()).await {
+        Ok(raw) => PosixAcl::from_xattr(&raw),
+        Err(FsError::NotFound) | Err(FsError::Unsupported) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// Combined `(FileType, perms)` mode word.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Mode {
@@ -1879,6 +1898,22 @@ pub trait DirOps: Send + Sync {
     /// tmpfs/memfs overrides to `true`.
     fn supports_tmpfile(&self) -> bool {
         false
+    }
+
+    /// Cheap answer to "does this directory carry a `system.posix_acl_access`
+    /// attribute?", or `None` for "ask me properly".
+    ///
+    /// `may_create`/`may_delete` run on every create and every delete, and
+    /// each one needs the directory's ACL. Fetching it through `get_xattr`
+    /// builds a boxed future and takes the attribute lock for a directory
+    /// that almost never has an ACL, which puts an allocation on the path
+    /// of every `unlink`, `mkdir` and `O_CREAT`.
+    ///
+    /// The default is `None` — "I do not know" — so a filesystem that does
+    /// not override this keeps the full lookup and cannot silently lose ACL
+    /// enforcement by forgetting to implement a hint.
+    fn access_acl_present(&self) -> Option<bool> {
+        None
     }
 
     /// This directory's `system.posix_acl_default`, raw, if it has one.

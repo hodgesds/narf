@@ -23,9 +23,24 @@ pub(crate) fn sys_rmdir(ctx: &mut dyn TrapContext) {
 /// `rmdir` on an ALREADY-absolute path, so `sys_unlinkat(AT_REMOVEDIR)` can
 /// resolve against its dirfd first and share this body.
 pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
+    // `do_rmdir` -> `may_delete(dir, dentry, 1)` — the same parent-directory
+    // and sticky checks `unlink` makes, run inside the one resolution this
+    // already does rather than costing a second path walk.
+    let task = current_task_id();
+    let mut refused = None;
     let outcome = current_resolve_parent_absolute(path, |_fs, parent, leaf| {
+        if let Some((victim_uid, victim_gid)) = entry_owner(&*parent, leaf) {
+            if let Err(errno) = may_delete_in(&*parent, victim_uid, victim_gid, task) {
+                refused = Some(errno);
+                return None;
+            }
+        }
         poll_blocking(parent.rmdir(leaf))
     });
+    if let Some(errno) = refused {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     match outcome {
         Some(Some(Ok(()))) => {
             crate::mqueue::notify_delete(path, true);

@@ -89,9 +89,26 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(cross_dir_rename(&old_path, &new_path)));
         return;
     }
+    // Same `may_delete` pair `rename_absolute` makes, and for the same
+    // reason: RENAME_EXCHANGE swaps two names, so both are victims. The
+    // check rides the resolution this already does.
+    let perm_task = current_task_id();
+    let mut refused = None;
     let outcome = current_resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
+        for leaf in [old_leaf, new_leaf] {
+            if let Some((victim_uid, victim_gid)) = entry_owner(&*parent, leaf) {
+                if let Err(errno) = may_delete_in(&*parent, victim_uid, victim_gid, perm_task) {
+                    refused = Some(errno);
+                    return None;
+                }
+            }
+        }
         poll_blocking(parent.rename(old_leaf, new_leaf))
     });
+    if let Some(errno) = refused {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // Report the filesystem's ACTUAL error. Collapsing everything to ENOENT
     // reads as "the source path is not there", which is a lie whenever the
     // source exists and the filesystem simply declined the operation — and

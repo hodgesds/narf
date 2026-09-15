@@ -65,9 +65,30 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
         return;
     }
     let new_leaf = &new_path[new_split + 1..];
+    // `do_renameat2` -> `may_delete(old_dir, old_dentry, ..)` for the name
+    // being taken away, and the same again for a destination that already
+    // exists and is about to be replaced. Both live in this one directory
+    // (a differing parent took the `cross_dir_rename` path above), so both
+    // are checked inside the single resolution below. The sticky rule
+    // applies to each victim separately: moving ANOTHER user's file out of
+    // /tmp is exactly what S_ISVTX forbids.
+    let task = current_task_id();
+    let mut refused = None;
     let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {
+        for leaf in [old_leaf, new_leaf] {
+            if let Some((victim_uid, victim_gid)) = entry_owner(&*parent, leaf) {
+                if let Err(errno) = may_delete_in(&*parent, victim_uid, victim_gid, task) {
+                    refused = Some(errno);
+                    return None;
+                }
+            }
+        }
         poll_blocking(parent.rename(old_leaf, new_leaf))
     });
+    if let Some(errno) = refused {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     match outcome {
         Some(Some(Ok(()))) => {
             // inotify: paired IN_MOVED_FROM/IN_MOVED_TO sharing a cookie.

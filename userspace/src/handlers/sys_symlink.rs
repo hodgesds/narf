@@ -38,9 +38,22 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
 /// `newdirfd` and share this body. The target string stays verbatim —
 /// symlink targets may legitimately be relative and must not be rewritten.
 pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link_path: &str) {
+    // `do_symlinkat` -> `filename_create` -> `may_create`: write+exec on
+    // the directory the link is being added to, checked inside the
+    // resolution this already performs.
+    let task = current_task_id();
+    let mut refused = None;
     let outcome = current_resolve_parent_absolute(link_path, |_fs, parent, leaf| {
+        if let Err(errno) = may_create_in(&*parent, task) {
+            refused = Some(errno);
+            return None;
+        }
         poll_blocking(parent.symlink(leaf, target_str))
     });
+    if let Some(errno) = refused {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     match outcome {
         Some(Some(Ok(_))) => {
             // inotify: a new symlink is IN_CREATE on the link path.

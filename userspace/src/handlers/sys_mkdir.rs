@@ -79,6 +79,12 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
         return;
     }
+    // `do_mkdirat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
+    // on the parent before anything is created in it.
+    if let Err(errno) = may_create_in(&*parent, current_task_id()) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // `fs/namei.c::do_mkdirat` -> `vfs_mkdir` -> `shmem_mkdir` ->
     // `simple_acl_create`: a parent carrying a default ACL passes it down
     // instead of the umask, and a new DIRECTORY also keeps a copy so

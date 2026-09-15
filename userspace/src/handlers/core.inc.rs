@@ -1410,6 +1410,18 @@ fn open_impl(
                     FastCreateResolution::Existing { .. } => None,
                 })
                 .map(|(parent, leaf)| {
+                    // `path_openat` -> `open_last_lookups` -> `may_create`:
+                    // write+exec on the directory the new name lands in.
+                    // Without it any task could plant a file in any
+                    // directory. Checked against the parent this path has
+                    // ALREADY resolved — a second walk here would put a
+                    // whole path lookup on every O_CREAT.
+                    // `PermissionDenied` is the refusal the create-result
+                    // match below already maps to EACCES, which is the
+                    // errno `may_create` produces.
+                    if may_create_in(&*parent, task).is_err() {
+                        return Some(Err(narf_filesystem::FsError::PermissionDenied));
+                    }
                     let inherited =
                         inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                     permissions = inherited.mode;
@@ -1423,6 +1435,9 @@ fn open_impl(
                 })
                 .or_else(|| {
                     resolve_parent_dir_async(path).map(|(parent, leaf)| {
+                        if may_create_in(&*parent, task).is_err() {
+                            return Some(Err(narf_filesystem::FsError::PermissionDenied));
+                        }
                         let inherited =
                             inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                         permissions = inherited.mode;
@@ -2308,6 +2323,13 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-2i64) as u64); // -ENOENT
         }
     };
+    // `do_mknodat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
+    // on the directory gaining the node. CAP_MKNOD for a device node is a
+    // separate gate (`may_mknod` above screened the TYPE, not the
+    // privilege) and is not modelled here.
+    if let Err(errno) = may_create_in(&*parent, current_task_id()) {
+        return SyscallReturn::ok(errno as u64);
+    }
     let fmt = mode & S_IFMT;
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
@@ -3256,6 +3278,13 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);
+    // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
+    // OLD name is only read, so it needs no directory write permission —
+    // only the directory gaining a name does.
+    if let Err(errno) = check_may_create(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let (Some(old_split), Some(new_split)) = (old_path.rfind('/'), new_path.rfind('/')) else {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
@@ -11408,6 +11437,189 @@ pub fn __test_accessor_for_inode(
     file_gid: u32,
 ) -> narf_filesystem::Accessor {
     accessor_for_inode(task, file_uid, file_gid)
+}
+
+// ── fs/namei.c: may_create / may_delete ──────────────────────────────
+//
+// Linux runs a permission check on the PARENT DIRECTORY before any
+// namespace-changing operation, and nothing here did: `unlink`, `rmdir`,
+// `rename`, `link`, `symlink` and `mknod` all went straight to the
+// filesystem. On a world-writable directory that is the whole of `/tmp`'s
+// security model — the sticky bit exists precisely so one user cannot
+// delete another's file there, and without the check it had no effect at
+// all.
+
+/// Linux `CAP_FOWNER` — "bypass permission checks on operations that
+/// normally require the filesystem UID of the process to match the UID of
+/// the file".
+pub(crate) const CAP_FOWNER: u32 = 3;
+
+/// `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)` on a parent
+/// directory, ACL included.
+fn dir_write_permitted(dir: &dyn narf_filesystem::DirOps, task: u64) -> bool {
+    let (uid, gid) = dir.dir_owners();
+    // Mode-only fast path, for the same reason `open` has
+    // `current_host_fsuid`: this now runs on every create and every
+    // delete, and the full decision materialises a supplementary-group
+    // list and a capability snapshot that the common case never needs.
+    //
+    // It can only ever GRANT — anything it cannot settle falls through to
+    // the full check — and it mirrors `acl_permission_check`'s structure
+    // exactly, including the rule that makes each triplet EXCLUSIVE:
+    //
+    //   * the caller IS the owner: the user triplet alone decides, so
+    //     user-wx is a grant (and user-deny still has to fall through,
+    //     because CAP_DAC_OVERRIDE may yet allow it);
+    //   * the caller is NOT the owner: whichever of group/other applies,
+    //     both granting wx means the answer is yes either way — which is
+    //     the 0777 and 01777 directories that most creates land in.
+    //
+    // Only taken when the directory can cheaply say it has no ACL; an ACL
+    // replaces the group triplet, so the shortcut would not be sound.
+    if dir.access_acl_present() == Some(false) {
+        let mode = dir.dir_mode();
+        if current_host_fsuid(task) == uid {
+            if mode & 0o300 == 0o300 {
+                return true;
+            }
+        } else if mode & 0o033 == 0o033 {
+            return true;
+        }
+    }
+    // A directory's ACL is the case that matters most here: `setfacl -m
+    // g:staff:rwx /srv/shared` is how a shared directory is built, and
+    // checking the mode alone would refuse every member of that group.
+    let acl = match poll_blocking(narf_filesystem::acl_of_dir(
+        dir,
+        narf_filesystem::AclType::Access,
+    )) {
+        Some(Ok(acl)) => acl,
+        // `check_acl` propagates a decode failure rather than falling back
+        // to the mode bits; refusing is the safe reading of the same rule.
+        Some(Err(_)) => return false,
+        None => None,
+    };
+    narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms: dir.dir_mode(),
+            is_dir: true,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: true,
+            exec: true,
+        },
+        acl.as_ref(),
+    )
+}
+
+/// `fs/namei.c::may_create` — the check every create-like operation makes
+/// on the directory it is about to add a name to:
+///
+/// ```text
+/// return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+/// ```
+///
+/// -EACCES when it fails.
+pub(crate) fn may_create_in(dir: &dyn narf_filesystem::DirOps, task: u64) -> Result<(), i64> {
+    if dir_write_permitted(dir, task) {
+        Ok(())
+    } else {
+        Err(-13) // -EACCES
+    }
+}
+
+/// `capable_wrt_inode_uidgid(idmap, inode, cap)` — the capability must be
+/// held in a user namespace that maps the inode's owner, so a namespaced
+/// root cannot use it to reach an inode owned outside its namespace.
+fn capable_wrt_inode(task: u64, file_uid: u32, file_gid: u32, cap: u32) -> bool {
+    if !task_capable(task, cap) {
+        return false;
+    }
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial()
+            && (uns.translate_uid_from_host(file_uid).is_none()
+                || uns.translate_gid_from_host(file_gid).is_none())
+        {
+            return false;
+        }
+    }
+    let _ = (file_uid, file_gid);
+    true
+}
+
+/// `fs/namei.c::__check_sticky`:
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// Only consulted when the directory carries `S_ISVTX`. `/tmp` is 01777,
+/// so this is the rule that stops one user removing another's file there;
+/// the owner of the directory and the owner of the victim may both do it,
+/// and so may CAP_FOWNER.
+fn sticky_permits_removal(dir_uid: u32, victim_uid: u32, victim_gid: u32, task: u64) -> bool {
+    let fsuid = read_uidgid(task).fsuid;
+    if victim_uid == fsuid || dir_uid == fsuid {
+        return true;
+    }
+    capable_wrt_inode(task, victim_uid, victim_gid, CAP_FOWNER)
+}
+
+/// `fs/namei.c::may_delete` — what `unlink`, `rmdir` and the destination
+/// side of `rename` require before a name can be removed from `dir`:
+/// write+exec on the directory, plus the sticky rule when `S_ISVTX` is set.
+///
+/// The two failures are deliberately different errnos, as Linux's are: the
+/// permission check is -EACCES, the sticky refusal is -EPERM.
+pub(crate) fn may_delete_in(
+    dir: &dyn narf_filesystem::DirOps,
+    victim_uid: u32,
+    victim_gid: u32,
+    task: u64,
+) -> Result<(), i64> {
+    may_create_in(dir, task)?;
+    let (dir_uid, _) = dir.dir_owners();
+    if dir.dir_mode() & 0o1000 != 0 && !sticky_permits_removal(dir_uid, victim_uid, victim_gid, task)
+    {
+        return Err(-1); // -EPERM
+    }
+    Ok(())
+}
+
+/// The owner of the name `leaf` inside `dir`, for [`may_delete_in`].
+///
+/// A name that resolves to nothing yields `None`; the caller then reports
+/// the ENOENT it would have reported anyway rather than inventing a
+/// permission answer about a victim that does not exist.
+pub(crate) fn entry_owner(dir: &dyn narf_filesystem::DirOps, leaf: &str) -> Option<(u32, u32)> {
+    if let Some(file) = dir.lookup(leaf) {
+        return Some(file.owners());
+    }
+    if let Some(sub) = dir.lookup_dir(leaf) {
+        return Some(sub.dir_owners());
+    }
+    poll_blocking(dir.lookup_async(leaf))
+        .and_then(|r| r.ok())
+        .map(|file| file.owners())
+}
+
+/// [`may_create_in`] for a path whose parent has not been resolved yet.
+///
+/// A parent that does not resolve is left to the caller: it reports the
+/// ENOENT it would have reported anyway, rather than inventing a
+/// permission answer about a directory that is not there.
+pub(crate) fn check_may_create(path: &str) -> Result<(), i64> {
+    let task = current_task_id();
+    current_resolve_parent_absolute(path, |_fs, parent, _leaf| may_create_in(&*parent, task))
+        .unwrap_or(Ok(()))
 }
 
 fn dir_search_permitted(path: &str, task: u64) -> bool {

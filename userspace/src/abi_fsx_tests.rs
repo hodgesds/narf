@@ -385,6 +385,197 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_default_acl_replaces_umask);
 
+/// The sticky bit actually stops a delete.
+///
+/// `/tmp` is mode 01777: world-writable, so its permission bits alone let
+/// anyone remove anything in it. `fs/namei.c::__check_sticky` is the entire
+/// reason that is safe —
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// — and NARF checked nothing at all on unlink, so any task could delete
+/// any other user's file anywhere. The refusal is EPERM, not EACCES:
+/// `may_delete` returns `-EPERM` from the sticky arm and reserves EACCES
+/// for the directory-permission arm above it.
+fn smoke_abi_fsx_sticky_bit_protects_other_users_files() -> TestResult {
+    with_memfs("/abi-sticky", "abi-sticky", &[], || {
+        let dir = b"/abi-sticky/shared\0";
+        let victim = b"/abi-sticky/shared/theirs\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the shared directory failed");
+        }
+        // 01777, exactly as /tmp is.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o1777)) != Some(0) {
+            return Err("chmod 01777 of the shared directory failed");
+        }
+        // A file owned by uid 1000, created while still privileged.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, victim.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating the victim file failed"),
+        }
+        if call(Syscall::Chown.raw(), a2(victim.as_ptr() as u64, 1000, 1000)) != Some(0) {
+            return Err("chown of the victim file failed");
+        }
+        // A DIFFERENT unprivileged user may not remove it, even though the
+        // directory is world-writable. `setresuid` is what drops the
+        // capabilities along with the uid (`cap_emulate_setxuid`); without
+        // that, CAP_DAC_OVERRIDE would let the check pass and this test
+        // would prove nothing.
+        let task = crate::handlers::current_task_id();
+        if call(Syscall::Setresuid.raw(), a2(2000, 2000, 2000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(2000) setup failed");
+        }
+        let stranger = call_unlink(victim.as_ptr() as u64);
+        match stranger {
+            Some(v) if v == EPERM => {}
+            Some(0) => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("a stranger deleted another user's file from a sticky directory");
+            }
+            Some(v) if v == EACCES => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("sticky refusal reported EACCES; may_delete's sticky arm is EPERM");
+            }
+            _ => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("unlink in a sticky directory by a stranger must return -EPERM");
+            }
+        }
+        // The file's OWNER may remove it — the first arm of __check_sticky.
+        // Without this the test would pass on a blanket "deny everyone".
+        //
+        // The identity move goes through the test hook rather than
+        // `setresuid`: the task is already unprivileged, so it no longer
+        // holds the CAP_SETUID that switching to a third uid would need.
+        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        let owner = call_unlink(victim.as_ptr() as u64);
+        crate::handlers::__test_uidgid_reset();
+        if owner != Some(0) {
+            return Err("the file's own owner was refused by the sticky check");
+        }
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_sticky_bit_protects_other_users_files
+);
+
+/// Changing a directory's contents requires write permission ON THAT
+/// DIRECTORY.
+///
+/// `may_create` and `may_delete` both end at
+/// `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)`, and NARF ran
+/// neither: `unlink`, `rmdir`, `rename`, `link`, `symlink`, `mknod` and
+/// `open(O_CREAT)` all went straight to the filesystem. A 0755 directory
+/// owned by root was writable by everyone.
+///
+/// The errno is EACCES — the same one `open` uses for a mode denial.
+fn smoke_abi_fsx_directory_write_permission_is_required() -> TestResult {
+    with_memfs("/abi-dirperm", "abi-dirperm", &[], || {
+        let dir = b"/abi-dirperm/ro\0";
+        let existing = b"/abi-dirperm/ro/file\0";
+        let fresh = b"/abi-dirperm/ro/new\0";
+        let subdir = b"/abi-dirperm/ro/sub\0";
+        let renamed = b"/abi-dirperm/ro/moved\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the read-only directory failed");
+        }
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, existing.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("seeding a file in the directory failed"),
+        }
+        // Root-owned, 0755: other users have r-x and no write.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o755)) != Some(0) {
+            return Err("chmod 0755 of the directory failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, fresh.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if let Some(fd) = created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let made_dir = call_mkdir(subdir.as_ptr() as u64, 0o755);
+        let removed = call_unlink(existing.as_ptr() as u64);
+        let moved = call_rename(existing.as_ptr() as u64, renamed.as_ptr() as u64);
+        let linked = call(
+            Syscall::Symlinkat.raw(),
+            a2(existing.as_ptr() as u64, AT_FDCWD, fresh.as_ptr() as u64),
+        );
+        // Restore BEFORE asserting so a failure cannot strand the task.
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if created.map(|fd| fd >= 0).unwrap_or(false) {
+            return Err("O_CREAT succeeded in a directory the caller cannot write");
+        }
+        if created != Some(EACCES) {
+            return Err("O_CREAT in an unwritable directory must return -EACCES");
+        }
+        if made_dir != Some(EACCES) {
+            return Err("mkdir in an unwritable directory must return -EACCES");
+        }
+        if removed != Some(EACCES) {
+            return Err("unlink in an unwritable directory must return -EACCES");
+        }
+        if moved != Some(EACCES) {
+            return Err("rename in an unwritable directory must return -EACCES");
+        }
+        if linked != Some(EACCES) {
+            return Err("symlink in an unwritable directory must return -EACCES");
+        }
+        // Discriminator: the same operations must SUCCEED once the caller
+        // can write the directory, or every assertion above is vacuous.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o777)) != Some(0) {
+            return Err("chmod 0777 of the directory failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+        let now_created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, fresh.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if let Some(fd) = now_created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if !now_created.map(|fd| fd >= 0).unwrap_or(false) {
+            return Err("O_CREAT still failed on a world-writable directory — test is vacuous");
+        }
+        let _ = call_unlink(fresh.as_ptr() as u64);
+        let _ = call_unlink(existing.as_ptr() as u64);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_directory_write_permission_is_required
+);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";
