@@ -41,6 +41,17 @@ use crate::{
 const PAGE_SIZE: u64 = 4096;
 const SECTORS_PER_PAGE: u64 = PAGE_SIZE / 512;
 
+/// Linux `mm/shmem.c::BOGO_INODE_SIZE` — the notional bytes one tmpfs inode
+/// costs. tmpfs does not budget inodes as a count: it budgets `free_ispace`
+/// bytes, of which an inode takes 1024 and an extended attribute takes
+/// `simple_xattr_space()`. `nr_inodes=N` is the count form of an
+/// `N * BOGO_INODE_SIZE` byte budget.
+const BOGO_INODE_SIZE: u64 = 1024;
+
+/// Linux `SHMEM_QUOTA_MAX_SPC_LIMIT` / `SHMEM_QUOTA_MAX_INO_LIMIT`
+/// (`include/linux/shmem_fs.h`) — both are 2^63-1.
+const SHMEM_QUOTA_MAX_LIMIT: u64 = i64::MAX as u64;
+
 /// Linux tmpfs mount configuration.
 ///
 /// Limits use 4-KiB pages/inodes. `None` is Linux's explicit unlimited value
@@ -60,6 +71,21 @@ pub struct TmpFsOptions {
     pub usrquota: bool,
     /// `grpquota` — enable per-group disk-quota accounting + enforcement.
     pub grpquota: bool,
+    /// `{usr,grp}quota_{block,inode}_hardlimit=` — the hard limit every id
+    /// starts with on this mount, before `setquota` overrides it. Block
+    /// limits are BYTES (Linux `memparse`), inode limits are counts; 0 is
+    /// Linux's "no default limit". Mirrors `struct shmem_quota_limits`.
+    pub quota_limits: QuotaDefaults,
+}
+
+/// Linux `struct shmem_quota_limits` — the per-mount default hard limits
+/// handed to every newly seen quota id (`mm/shmem_quota.c::shmem_acquire_dquot`).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuotaDefaults {
+    pub usrquota_bhardlimit: u64,
+    pub usrquota_ihardlimit: u64,
+    pub grpquota_bhardlimit: u64,
+    pub grpquota_ihardlimit: u64,
 }
 
 impl TmpFsOptions {
@@ -77,6 +103,7 @@ impl TmpFsOptions {
             inode64: true,
             usrquota: false,
             grpquota: false,
+            quota_limits: QuotaDefaults::default(),
         }
     }
 
@@ -118,40 +145,121 @@ impl RamFsOptions {
     }
 }
 
+/// Linux `fsparam_u32oct` + `shmem_parse_one`'s `Opt_mode`:
+/// `kstrtouint(value, 8, ...)` then `result.uint_32 & 07777`. An
+/// out-of-range mode is MASKED, not rejected — `mode=17777` mounts with
+/// 07777 — so the only failure here is a value that is not octal or does
+/// not fit a `u32`.
 fn parse_octal_mode(value: &str) -> Result<u16, FsError> {
-    let value = value.strip_prefix("0o").unwrap_or(value);
-    let mode = u16::from_str_radix(value, 8).map_err(|_| FsError::InvalidData)?;
-    (mode <= 0o7777).then_some(mode).ok_or(FsError::InvalidData)
-}
-
-fn parse_u64(value: &str) -> Result<u64, FsError> {
-    value.parse::<u64>().map_err(|_| FsError::InvalidData)
-}
-
-fn parse_memparse(value: &str) -> Result<u64, FsError> {
-    if value.is_empty() {
+    // `kstrtouint` takes plain digits: no sign, no `0o`/`0x` prefix (base
+    // is fixed at 8 by the parameter spec), and rejects an empty string.
+    if value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
         return Err(FsError::InvalidData);
     }
-    let split = value
-        .find(|c: char| !c.is_ascii_digit())
-        .unwrap_or(value.len());
-    let base = parse_u64(&value[..split])?;
-    let suffix = &value[split..];
-    let power = match suffix {
-        "" => 0,
-        "k" | "K" | "kB" | "KB" => 1,
-        "m" | "M" | "mB" | "MB" => 2,
-        "g" | "G" | "gB" | "GB" => 3,
-        "t" | "T" | "tB" | "TB" => 4,
-        "p" | "P" | "pB" | "PB" => 5,
-        "e" | "E" | "eB" | "EB" => 6,
-        _ => return Err(FsError::InvalidData),
+    let raw = u32::from_str_radix(value, 8).map_err(|_| FsError::InvalidData)?;
+    Ok((raw & 0o7777) as u16)
+}
+
+/// Linux `memparse` (`lib/cmdline.c`): `simple_strtoull(ptr, &end, 0)`
+/// followed by at most ONE `K`/`M`/`G`/`T`/`P`/`E` suffix in either case.
+/// Base 0 is C's `strtoull` convention — `0x`/`0X` hex, a leading `0`
+/// octal, decimal otherwise.
+///
+/// Returns the value AND the unconsumed remainder, because every shmem
+/// caller ends with Linux's `if (*rest) goto bad_value` — and `size=`
+/// additionally consumes a trailing `%`. Note what Linux does NOT do: it
+/// never rejects a two-character suffix such as `kB` (the `B` is left in
+/// `rest`, so the caller's `*rest` test fails the mount), and it does not
+/// check the shifts for overflow. NARF keeps the first behaviour exactly
+/// and diverges on the second by returning EINVAL rather than wrapping to
+/// a nonsense limit.
+fn memparse(value: &str) -> Result<(u64, &str), FsError> {
+    let (digits, radix) = if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        (hex, 16)
+    } else if value.len() > 1 && value.starts_with('0') {
+        (&value[1..], 8)
+    } else {
+        (value, 10)
+    };
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    // `simple_strtoull` stops at the first non-digit and returns what it
+    // has; with NO digits at all it returns 0 and consumes nothing. The
+    // callers' `*rest` test then rejects the whole value, so treat an
+    // empty digit run the same way rather than parsing "" as 0.
+    if end == 0 {
+        return Err(FsError::InvalidData);
+    }
+    let base = u64::from_str_radix(&digits[..end], radix).map_err(|_| FsError::InvalidData)?;
+    let rest = &digits[end..];
+    let power = match rest.as_bytes().first() {
+        Some(b'k') | Some(b'K') => 1,
+        Some(b'm') | Some(b'M') => 2,
+        Some(b'g') | Some(b'G') => 3,
+        Some(b't') | Some(b'T') => 4,
+        Some(b'p') | Some(b'P') => 5,
+        Some(b'e') | Some(b'E') => 6,
+        _ => 0,
     };
     let mut scaled = base;
     for _ in 0..power {
         scaled = scaled.checked_mul(1024).ok_or(FsError::InvalidData)?;
     }
-    Ok(scaled)
+    Ok((scaled, if power == 0 { rest } else { &rest[1..] }))
+}
+
+/// `memparse` for an option that must consume its whole value — Linux's
+/// `size = memparse(...); if (*rest) goto bad_value;`.
+fn memparse_exact(value: &str) -> Result<u64, FsError> {
+    let (parsed, rest) = memparse(value)?;
+    rest.is_empty()
+        .then_some(parsed)
+        .ok_or(FsError::InvalidData)
+}
+
+/// Linux `Opt_size`: a byte count (optionally a percentage of RAM) rounded
+/// UP to whole pages. The percentage arm reproduces `shmem_parse_one`'s
+/// arithmetic exactly — `size <<= PAGE_SHIFT; size *= totalram_pages();
+/// do_div(size, 100)` — including its truncation, so `size=1%` of a
+/// one-page machine is Linux's 1 block and not the 0 a
+/// `percent * pages / 100` shortcut would give. Linux applies no ceiling
+/// to the percentage: `size=200%` is a legal (over-committed) tmpfs.
+fn parse_size_blocks(value: &str, total_pages: u64) -> Result<u64, FsError> {
+    let (parsed, rest) = memparse(value)?;
+    let bytes = match rest.strip_prefix('%') {
+        Some(after) => {
+            if !after.is_empty() {
+                return Err(FsError::InvalidData);
+            }
+            let scaled = (parsed as u128)
+                .saturating_mul(PAGE_SIZE as u128)
+                .saturating_mul(total_pages as u128)
+                / 100;
+            u64::try_from(scaled).map_err(|_| FsError::InvalidData)?
+        }
+        None => {
+            if !rest.is_empty() {
+                return Err(FsError::InvalidData);
+            }
+            parsed
+        }
+    };
+    Ok(bytes.div_ceil(PAGE_SIZE))
+}
+
+/// Linux `Opt_{usr,grp}quota_{block,inode}_hardlimit`: a `memparse` value
+/// that must consume the whole string, must be nonzero, and must not
+/// exceed `SHMEM_QUOTA_MAX_{SPC,INO}_LIMIT`.
+fn parse_quota_hardlimit(value: &str) -> Result<u64, FsError> {
+    let parsed = memparse_exact(value)?;
+    if parsed == 0 || parsed > SHMEM_QUOTA_MAX_LIMIT {
+        return Err(FsError::InvalidData);
+    }
+    Ok(parsed)
 }
 
 fn apply_tmpfs_options(
@@ -163,26 +271,25 @@ fn apply_tmpfs_options(
         let (key, value) = raw.split_once('=').unwrap_or((raw, ""));
         match key {
             "size" => {
-                let blocks = if let Some(percent) = value.strip_suffix('%') {
-                    let percent = parse_u64(percent)?;
-                    if percent > 100 {
-                        return Err(FsError::InvalidData);
-                    }
-                    total_pages
-                        .checked_mul(percent)
-                        .ok_or(FsError::InvalidData)?
-                        / 100
-                } else {
-                    parse_memparse(value)?.div_ceil(PAGE_SIZE)
-                };
+                let blocks = parse_size_blocks(value, total_pages)?;
                 parsed.max_blocks = (blocks != 0).then_some(blocks);
             }
             "nr_blocks" => {
-                let blocks = parse_memparse(value)?;
+                let blocks = memparse_exact(value)?;
+                // `if (*rest || ctx->blocks > LONG_MAX) goto bad_value;`
+                if blocks > i64::MAX as u64 {
+                    return Err(FsError::InvalidData);
+                }
                 parsed.max_blocks = (blocks != 0).then_some(blocks);
             }
             "nr_inodes" => {
-                let inodes = parse_memparse(value)?;
+                let inodes = memparse_exact(value)?;
+                // `if (*rest || ctx->inodes > ULONG_MAX / BOGO_INODE_SIZE)`
+                // — the count is later multiplied by BOGO_INODE_SIZE to get
+                // the inode-space budget, so it must not overflow that.
+                if inodes > u64::MAX / BOGO_INODE_SIZE {
+                    return Err(FsError::InvalidData);
+                }
                 parsed.max_inodes = (inodes != 0).then_some(inodes);
             }
             "mode" => parsed.root_mode = parse_octal_mode(value)?,
@@ -195,23 +302,39 @@ fn apply_tmpfs_options(
             "noswap" if value.is_empty() => parsed.noswap = true,
             "inode64" if value.is_empty() => parsed.inode64 = true,
             "inode32" if value.is_empty() => parsed.inode64 = false,
-            // Disk-quota mount options. `quota` is Linux's alias for usrquota;
-            // the journalled-quota spellings enable the same in-memory tracking
-            // (there is no journal to name a quota file in). NARF's page-backed
-            // quota is enforced live, so the format/file names are accepted and
-            // ignored.
-            "quota" | "usrquota" if value.is_empty() => parsed.usrquota = true,
+            // Disk-quota mount options. Bare `quota` turns on BOTH kinds —
+            // `Opt_quota` sets `QTYPE_MASK_USR | QTYPE_MASK_GRP` — it is not
+            // a synonym for `usrquota`.
+            "quota" if value.is_empty() => {
+                parsed.usrquota = true;
+                parsed.grpquota = true;
+            }
+            "usrquota" if value.is_empty() => parsed.usrquota = true,
             "grpquota" if value.is_empty() => parsed.grpquota = true,
-            "usrjquota" => parsed.usrquota = true,
-            "grpjquota" => parsed.grpquota = true,
-            "jqfmt" => {}
+            "usrquota_block_hardlimit" => {
+                parsed.quota_limits.usrquota_bhardlimit = parse_quota_hardlimit(value)?;
+            }
+            "grpquota_block_hardlimit" => {
+                parsed.quota_limits.grpquota_bhardlimit = parse_quota_hardlimit(value)?;
+            }
+            "usrquota_inode_hardlimit" => {
+                parsed.quota_limits.usrquota_ihardlimit = parse_quota_hardlimit(value)?;
+            }
+            "grpquota_inode_hardlimit" => {
+                parsed.quota_limits.grpquota_ihardlimit = parse_quota_hardlimit(value)?;
+            }
             // NARF advertises THP as disabled. Accepting another policy would
-            // make the mount option lie about allocation behavior.
+            // make the mount option lie about allocation behavior — which is
+            // also what Linux does without CONFIG_TRANSPARENT_HUGEPAGE
+            // (`goto unsupported_parameter`, i.e. -EINVAL).
             "huge" if value == "never" => {}
             // Heap allocation follows the caller/default policy. These two
             // spellings therefore describe existing behavior; node-list
             // policies require page-backed tmpfs and are rejected.
             "mpol" if value == "default" || value == "local" => {}
+            // `casefold`, `casefold=utf8-<v>` and `strict_encoding` need
+            // CONFIG_UNICODE; without it `shmem_parse_opt_casefold` reports
+            // -EINVAL, which is what falling through to the reject arm does.
             _ => return Err(FsError::InvalidData),
         }
     }
@@ -233,13 +356,20 @@ fn quota_now_secs() -> u64 {
     narf_time::now_wall().secs.max(0) as u64
 }
 
-/// Per-id disk-quota accounting + limits. Block units are 4-KiB pages (the fs
-/// block); `*_hard`/`*_soft` of 0 means "unlimited" (Linux convention).
+/// Per-id disk-quota accounting + limits.
+///
+/// Usage is counted in 4-KiB pages (the fs block), but the LIMITS are bytes,
+/// as in Linux: `dquot->dq_dqb.dqb_bhardlimit` holds a byte count and
+/// `fs/quota/dquot.c::check_bdq` compares it against `dqb_curspace`, also
+/// bytes. Keeping bytes here is what lets a sub-page mount-option limit
+/// (`usrquota_block_hardlimit=1K`) deny the first page the way Linux does
+/// instead of rounding into "one page allowed" or "unlimited".
+/// `*_hard`/`*_soft` of 0 means "unlimited" (Linux convention).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct Dquot {
     blocks_used: u64,
-    blocks_hard: u64,
-    blocks_soft: u64,
+    space_hard: u64,
+    space_soft: u64,
     inodes_used: u64,
     inodes_hard: u64,
     inodes_soft: u64,
@@ -248,16 +378,23 @@ struct Dquot {
     itime: u64,
 }
 
+/// Bytes charged for `blocks` whole tmpfs pages — Linux's
+/// `__dquot_alloc_space(inode, nr << inode->i_blkbits, ...)`.
+fn blocks_to_space(blocks: u64) -> u64 {
+    blocks.saturating_mul(PAGE_SIZE)
+}
+
 /// Evaluate charging `add` blocks against `dq` WITHOUT mutating: returns the
 /// new used count + new grace deadline, or `QuotaExceeded` if it must be
 /// denied (over hard, or over soft with the grace period expired).
 fn eval_blocks(dq: &Dquot, add: u64, grace: u64, now: u64) -> Result<(u64, u64), FsError> {
     let new = dq.blocks_used.saturating_add(add);
-    if dq.blocks_hard != 0 && new > dq.blocks_hard {
+    let space = blocks_to_space(new);
+    if dq.space_hard != 0 && space > dq.space_hard {
         return Err(FsError::QuotaExceeded);
     }
     let mut btime = dq.btime;
-    if dq.blocks_soft != 0 && new > dq.blocks_soft {
+    if dq.space_soft != 0 && space > dq.space_soft {
         if btime == 0 {
             btime = now.saturating_add(grace); // just crossed — start the clock
         } else if now >= btime {
@@ -294,6 +431,13 @@ struct QuotaTable {
     on: bool,
     grace_blocks: u64,
     grace_inodes: u64,
+    /// Mount-option default hard limits (`{usr,grp}quota_block_hardlimit=`
+    /// in bytes, `..._inode_hardlimit=` as a count). Linux stamps these onto
+    /// every id the first time it is seen
+    /// (`mm/shmem_quota.c::shmem_acquire_dquot`), so an id with no explicit
+    /// `setquota` still inherits the mount-wide ceiling.
+    default_space_hard: u64,
+    default_inodes_hard: u64,
     ids: BTreeMap<u32, Dquot>,
 }
 
@@ -303,8 +447,26 @@ impl QuotaTable {
             on: false,
             grace_blocks: DEFAULT_GRACE_SECS,
             grace_inodes: DEFAULT_GRACE_SECS,
+            default_space_hard: 0,
+            default_inodes_hard: 0,
             ids: BTreeMap::new(),
         }
+    }
+
+    /// The limits an id starts life with: Linux's freshly acquired dquot,
+    /// pre-loaded from the superblock's mount-option hard limits.
+    fn fresh(&self) -> Dquot {
+        Dquot {
+            space_hard: self.default_space_hard,
+            inodes_hard: self.default_inodes_hard,
+            ..Dquot::default()
+        }
+    }
+
+    /// The stored quota for `id`, or the mount's starting limits if this is
+    /// the first time the id has been charged.
+    fn dquot(&self, id: u32) -> Dquot {
+        self.ids.get(&id).copied().unwrap_or_else(|| self.fresh())
     }
 
     /// Evaluate charging (`blocks`,`inodes`) to `id` without mutating: returns
@@ -316,7 +478,7 @@ impl QuotaTable {
         inodes: u64,
         now: u64,
     ) -> Result<(u64, u64, u64, u64), FsError> {
-        let dq = self.ids.get(&id).copied().unwrap_or_default();
+        let dq = self.dquot(id);
         let (bu, bt) = eval_blocks(&dq, blocks, self.grace_blocks, now)?;
         let (iu, it) = eval_inodes(&dq, inodes, self.grace_inodes, now)?;
         Ok((bu, bt, iu, it))
@@ -324,7 +486,8 @@ impl QuotaTable {
 
     /// Apply an evaluated charge to `id`.
     fn commit(&mut self, id: u32, bu: u64, bt: u64, iu: u64, it: u64) {
-        let dq = self.ids.entry(id).or_default();
+        let fresh = self.fresh();
+        let dq = self.ids.entry(id).or_insert(fresh);
         dq.blocks_used = bu;
         dq.btime = bt;
         dq.inodes_used = iu;
@@ -337,7 +500,7 @@ impl QuotaTable {
         if let Some(dq) = self.ids.get_mut(&id) {
             dq.blocks_used = dq.blocks_used.saturating_sub(blocks);
             dq.inodes_used = dq.inodes_used.saturating_sub(inodes);
-            if dq.blocks_soft == 0 || dq.blocks_used <= dq.blocks_soft {
+            if dq.space_soft == 0 || blocks_to_space(dq.blocks_used) <= dq.space_soft {
                 dq.btime = 0;
             }
             if dq.inodes_soft == 0 || dq.inodes_used <= dq.inodes_soft {
@@ -351,10 +514,34 @@ impl QuotaTable {
 struct SuperState {
     max_blocks: Option<u64>,
     used_blocks: u64,
+    /// `nr_inodes=` as a count; `None` is unlimited.
     max_inodes: Option<u64>,
-    used_inodes: u64,
+    /// Inode space in USE, in bytes — the complement of Linux's
+    /// `free_ispace`. An inode costs [`BOGO_INODE_SIZE`] and an extended
+    /// attribute costs `simple_xattr_space()`, so xattrs eat into the same
+    /// budget `nr_inodes=` sets and show up in `statfs`'s `f_ffree`,
+    /// exactly as on Linux.
+    used_ispace: u64,
     usr: QuotaTable,
     grp: QuotaTable,
+}
+
+impl SuperState {
+    /// Inode-space budget in bytes, or `None` when `nr_inodes=0` made the
+    /// mount unlimited.
+    fn max_ispace(&self) -> Option<u64> {
+        self.max_inodes
+            .map(|count| count.saturating_mul(BOGO_INODE_SIZE))
+    }
+
+    /// Inodes still chargeable — Linux `shmem_statfs`'s
+    /// `free_ispace / BOGO_INODE_SIZE`.
+    fn free_inodes(&self) -> u64 {
+        match self.max_ispace() {
+            Some(max) => max.saturating_sub(self.used_ispace) / BOGO_INODE_SIZE,
+            None => 0,
+        }
+    }
 }
 
 impl SuperState {
@@ -459,7 +646,14 @@ struct MemSuper {
 
 impl MemSuper {
     fn new(kind: MemFsKind, max_blocks: Option<u64>, max_inodes: Option<u64>) -> Arc<Self> {
-        Self::with_quota(kind, max_blocks, max_inodes, false, false)
+        Self::with_quota(
+            kind,
+            max_blocks,
+            max_inodes,
+            false,
+            false,
+            QuotaDefaults::default(),
+        )
     }
 
     /// A superblock for a standalone inode that belongs to no mount.
@@ -482,11 +676,16 @@ impl MemSuper {
         max_inodes: Option<u64>,
         usrquota: bool,
         grpquota: bool,
+        limits: QuotaDefaults,
     ) -> Arc<Self> {
         let mut usr = QuotaTable::new();
         usr.on = usrquota;
+        usr.default_space_hard = limits.usrquota_bhardlimit;
+        usr.default_inodes_hard = limits.usrquota_ihardlimit;
         let mut grp = QuotaTable::new();
         grp.on = grpquota;
+        grp.default_space_hard = limits.grpquota_bhardlimit;
+        grp.default_inodes_hard = limits.grpquota_ihardlimit;
         Arc::new(Self {
             anonymous: core::sync::atomic::AtomicBool::new(false),
             kind,
@@ -494,11 +693,23 @@ impl MemSuper {
                 max_blocks,
                 used_blocks: 0,
                 max_inodes,
-                used_inodes: 0,
+                used_ispace: 0,
                 usr,
                 grp,
             }),
         })
+    }
+
+    /// The mount's default quota hard limits, as parsed from its mount
+    /// options. Used by remount validation and `show_options`.
+    fn quota_defaults(&self) -> QuotaDefaults {
+        let state = self.state.lock();
+        QuotaDefaults {
+            usrquota_bhardlimit: state.usr.default_space_hard,
+            usrquota_ihardlimit: state.usr.default_inodes_hard,
+            grpquota_bhardlimit: state.grp.default_space_hard,
+            grpquota_ihardlimit: state.grp.default_inodes_hard,
+        }
     }
 
     /// Reserve `blocks` for the file owned by (`uid`,`gid`): enforces the
@@ -526,12 +737,15 @@ impl MemSuper {
 
     fn reserve_inode(self: &Arc<Self>, uid: u32, gid: u32) -> Result<InodeLease, FsError> {
         let mut state = self.state.lock();
-        let new = state.used_inodes.checked_add(1).ok_or(FsError::NoSpace)?;
-        if state.max_inodes.is_some_and(|limit| new > limit) {
+        let new = state
+            .used_ispace
+            .checked_add(BOGO_INODE_SIZE)
+            .ok_or(FsError::NoSpace)?;
+        if state.max_ispace().is_some_and(|limit| new > limit) {
             return Err(FsError::NoSpace);
         }
         state.charge_owner(uid, gid, 0, 1)?;
-        state.used_inodes = new;
+        state.used_ispace = new;
         Ok(InodeLease {
             superblock: Arc::clone(self),
             uid: AtomicU32::new(uid),
@@ -545,8 +759,11 @@ impl MemSuper {
             Some(max) => (max, max.saturating_sub(state.used_blocks)),
             None => (0, 0),
         };
+        // `shmem_statfs`: `f_files = max_inodes`, `f_ffree = free_ispace /
+        // BOGO_INODE_SIZE`. Both are 0 on an unlimited mount, which is how
+        // userspace spells "this filesystem has no inode limit".
         let (files, files_free) = match state.max_inodes {
-            Some(max) => (max, max.saturating_sub(state.used_inodes)),
+            Some(max) => (max, state.free_inodes()),
             None => (0, 0),
         };
         FsStat {
@@ -561,37 +778,40 @@ impl MemSuper {
         }
     }
 
+    /// Linux `mm/shmem.c::shmem_reconfigure` — `mount -o remount`.
+    ///
+    /// Every rejection there is `invalfc()`, i.e. **-EINVAL**, including
+    /// "Too small a size for current use"; a remount that would strand
+    /// live data is not an ENOSPC condition. Root mode/uid/gid are parsed
+    /// and then ignored: `shmem_reconfigure` never copies them back into
+    /// the superblock.
     fn reconfigure_tmpfs(&self, options: &str, total_pages: u64) -> Result<(), FsError> {
         if self.kind != MemFsKind::Tmpfs {
             return Err(FsError::Unsupported);
         }
         let mut requested_blocks = None;
         let mut requested_inodes = None;
+        let mut seen_quota = false;
+        let limits = self.quota_defaults();
         for raw in options.split(',').filter(|part| !part.is_empty()) {
             let (key, value) = raw.split_once('=').unwrap_or((raw, ""));
             match key {
                 "size" => {
-                    let blocks = if let Some(percent) = value.strip_suffix('%') {
-                        let percent = parse_u64(percent)?;
-                        if percent > 100 {
-                            return Err(FsError::InvalidData);
-                        }
-                        total_pages
-                            .checked_mul(percent)
-                            .ok_or(FsError::InvalidData)?
-                            / 100
-                    } else {
-                        parse_memparse(value)?.div_ceil(PAGE_SIZE)
-                    };
-                    requested_blocks = Some((blocks != 0).then_some(blocks));
+                    requested_blocks = Some(parse_size_blocks(value, total_pages)?);
                 }
                 "nr_blocks" => {
-                    let blocks = parse_memparse(value)?;
-                    requested_blocks = Some((blocks != 0).then_some(blocks));
+                    let blocks = memparse_exact(value)?;
+                    if blocks > i64::MAX as u64 {
+                        return Err(FsError::InvalidData);
+                    }
+                    requested_blocks = Some(blocks);
                 }
                 "nr_inodes" => {
-                    let inodes = parse_memparse(value)?;
-                    requested_inodes = Some((inodes != 0).then_some(inodes));
+                    let inodes = memparse_exact(value)?;
+                    if inodes > u64::MAX / BOGO_INODE_SIZE {
+                        return Err(FsError::InvalidData);
+                    }
+                    requested_inodes = Some(inodes);
                 }
                 // Linux ignores root metadata on remount. The remaining
                 // accepted initial-only policies are validated here too.
@@ -601,30 +821,70 @@ impl MemSuper {
                 "uid" | "gid" => {
                     let _ = value.parse::<u32>().map_err(|_| FsError::InvalidData)?;
                 }
+                // "noswap" doesn't use fsparam_flag_no: there is no `swap`
+                // spelling to turn it back off. NARF has no swap path at
+                // all, so every mount is already noswap and this can never
+                // be the "Cannot disable swap on remount" case.
                 "noswap" | "inode64" | "inode32" if value.is_empty() => {}
+                // `SHMEM_SEEN_QUOTA` on remount is only legal while quota is
+                // already loaded — "Cannot enable quota on remount". The
+                // request is then a no-op: `shmem_reconfigure` never applies
+                // `quota_types`.
+                "quota" | "usrquota" | "grpquota" if value.is_empty() => seen_quota = true,
+                // "Cannot change global quota limit on remount" — a repeat of
+                // the SAME limit is accepted, a different one is not.
+                "usrquota_block_hardlimit" => {
+                    if parse_quota_hardlimit(value)? != limits.usrquota_bhardlimit {
+                        return Err(FsError::InvalidData);
+                    }
+                }
+                "grpquota_block_hardlimit" => {
+                    if parse_quota_hardlimit(value)? != limits.grpquota_bhardlimit {
+                        return Err(FsError::InvalidData);
+                    }
+                }
+                "usrquota_inode_hardlimit" => {
+                    if parse_quota_hardlimit(value)? != limits.usrquota_ihardlimit {
+                        return Err(FsError::InvalidData);
+                    }
+                }
+                "grpquota_inode_hardlimit" => {
+                    if parse_quota_hardlimit(value)? != limits.grpquota_ihardlimit {
+                        return Err(FsError::InvalidData);
+                    }
+                }
                 "huge" if value == "never" => {}
                 "mpol" if value == "default" || value == "local" => {}
                 _ => return Err(FsError::InvalidData),
             }
         }
         let mut state = self.state.lock();
-        if let Some(new) = requested_blocks {
-            if state.max_blocks.is_none() && new.is_some() {
-                return Err(FsError::InvalidData);
-            }
-            if new.is_some_and(|limit| state.used_blocks > limit) {
-                return Err(FsError::NoSpace);
-            }
-            state.max_blocks = new;
+        if seen_quota && !(state.usr.on || state.grp.on) {
+            return Err(FsError::InvalidData);
         }
-        if let Some(new) = requested_inodes {
-            if state.max_inodes.is_none() && new.is_some() {
-                return Err(FsError::InvalidData);
+        // Linux only validates a NONZERO request; `size=0` / `nr_inodes=0`
+        // lift the limit unconditionally.
+        if let Some(blocks) = requested_blocks {
+            if blocks != 0 {
+                if state.max_blocks.is_none() {
+                    return Err(FsError::InvalidData); // "Cannot retroactively limit size"
+                }
+                if state.used_blocks > blocks {
+                    return Err(FsError::InvalidData); // "Too small a size for current use"
+                }
             }
-            if new.is_some_and(|limit| state.used_inodes > limit) {
-                return Err(FsError::NoSpace);
+            state.max_blocks = (blocks != 0).then_some(blocks);
+        }
+        if let Some(inodes) = requested_inodes {
+            if inodes != 0 {
+                if state.max_inodes.is_none() {
+                    return Err(FsError::InvalidData);
+                }
+                if inodes.saturating_mul(BOGO_INODE_SIZE) < state.used_ispace {
+                    return Err(FsError::InvalidData); // "Too few inodes for current use"
+                }
             }
-            state.max_inodes = new;
+            state.max_inodes = (inodes != 0).then_some(inodes);
         }
         Ok(())
     }
@@ -663,9 +923,7 @@ impl MemSuper {
         if !table.on {
             return Err(FsError::Unsupported);
         }
-        Ok(dq_to_fsdqblk(
-            &table.ids.get(&id).copied().unwrap_or_default(),
-        ))
+        Ok(dq_to_fsdqblk(&table.dquot(id)))
     }
 
     fn quota_get_next(&self, kind: QuotaKind, id: u32) -> Result<(u32, FsDqBlk), FsError> {
@@ -694,10 +952,12 @@ impl MemSuper {
             return Err(FsError::Unsupported);
         }
         let (grace_b, grace_i) = (table.grace_blocks, table.grace_inodes);
-        let dq = table.ids.entry(id).or_default();
+        let fresh = table.fresh();
+        let dq = table.ids.entry(id).or_insert(fresh);
         if blk.valid & QIF_BLIMITS != 0 {
-            dq.blocks_hard = blk.blocks_hard;
-            dq.blocks_soft = blk.blocks_soft;
+            // `FsDqBlk` speaks fs blocks; the stored limit is bytes.
+            dq.space_hard = blocks_to_space(blk.blocks_hard);
+            dq.space_soft = blocks_to_space(blk.blocks_soft);
         }
         if blk.valid & QIF_ILIMITS != 0 {
             dq.inodes_hard = blk.inodes_hard;
@@ -718,7 +978,7 @@ impl MemSuper {
         // Re-arm or clear the soft-limit grace clock against the new
         // limits/usage, unless the caller set the deadline explicitly.
         if blk.valid & QIF_BTIME == 0 {
-            dq.btime = if dq.blocks_soft != 0 && dq.blocks_used > dq.blocks_soft {
+            dq.btime = if dq.space_soft != 0 && blocks_to_space(dq.blocks_used) > dq.space_soft {
                 now.saturating_add(grace_b)
             } else {
                 0
@@ -777,8 +1037,9 @@ impl MemSuper {
 /// fields valid).
 fn dq_to_fsdqblk(dq: &Dquot) -> FsDqBlk {
     FsDqBlk {
-        blocks_hard: dq.blocks_hard,
-        blocks_soft: dq.blocks_soft,
+        // Stored in bytes (Linux `dqb_bhardlimit`), reported in fs blocks.
+        blocks_hard: dq.space_hard / PAGE_SIZE,
+        blocks_soft: dq.space_soft / PAGE_SIZE,
         blocks_used: dq.blocks_used,
         inodes_hard: dq.inodes_hard,
         inodes_soft: dq.inodes_soft,
@@ -819,7 +1080,7 @@ impl InodeLease {
 impl Drop for InodeLease {
     fn drop(&mut self) {
         let mut state = self.superblock.state.lock();
-        state.used_inodes = state.used_inodes.saturating_sub(1);
+        state.used_ispace = state.used_ispace.saturating_sub(BOGO_INODE_SIZE);
         state.uncharge_owner(
             self.uid.load(Ordering::Relaxed),
             self.gid.load(Ordering::Relaxed),
@@ -2562,7 +2823,16 @@ impl MemFs {
         root_gid: u32,
     ) -> Result<Self, FsError> {
         Self::configured_quota(
-            name, kind, max_blocks, max_inodes, root_mode, root_uid, root_gid, false, false,
+            name,
+            kind,
+            max_blocks,
+            max_inodes,
+            root_mode,
+            root_uid,
+            root_gid,
+            false,
+            false,
+            QuotaDefaults::default(),
         )
     }
 
@@ -2577,8 +2847,16 @@ impl MemFs {
         root_gid: u32,
         usrquota: bool,
         grpquota: bool,
+        quota_limits: QuotaDefaults,
     ) -> Result<Self, FsError> {
-        let superblock = MemSuper::with_quota(kind, max_blocks, max_inodes, usrquota, grpquota);
+        let superblock = MemSuper::with_quota(
+            kind,
+            max_blocks,
+            max_inodes,
+            usrquota,
+            grpquota,
+            quota_limits,
+        );
         let root = Arc::new(MemDir {
             ino: alloc_ino(),
             superblock: Arc::clone(&superblock),
@@ -2661,7 +2939,14 @@ impl FsInstance for MemFs {
 /// mount-root metadata, and live statfs accounting.
 pub struct TmpFs {
     inner: MemFs,
+    /// RAM pages this mount sized itself against. Kept so a later
+    /// `remount,size=N%` resolves the percentage against the same total,
+    /// and so `show_options` can recover `shmem_default_max_blocks()`.
     total_pages: u64,
+    /// The options this mount was created with. `show_options` needs the
+    /// policy flags (`inode32`/`inode64`, `noswap`, the quota hard limits)
+    /// that are not recoverable from the live superblock counters.
+    options: TmpFsOptions,
 }
 
 impl fmt::Debug for TmpFs {
@@ -2695,8 +2980,103 @@ impl TmpFs {
             parsed.root_gid,
             parsed.usrquota,
             parsed.grpquota,
+            parsed.quota_limits,
         )?;
-        Ok(Self { inner, total_pages })
+        Ok(Self {
+            inner,
+            total_pages,
+            options: parsed,
+        })
+    }
+
+    /// Linux `mm/shmem.c::shmem_show_options` — the `,`-prefixed
+    /// filesystem-specific option list `/proc/mounts` and
+    /// `/proc/<pid>/mountinfo` carry for this mount.
+    ///
+    /// Every field is printed only when it differs from the default, which
+    /// is what makes the common `tmpfs /run tmpfs rw,inode64 0 0` line
+    /// short. Two deliberate shapes to keep:
+    ///
+    ///  * `size=` is in KiB (`K(sbinfo->max_blocks)`), not pages or bytes,
+    ///    and is printed against the LIVE limit so it tracks a remount.
+    ///  * `inode64`/`inode32` is always printed, since
+    ///    `CONFIG_TMPFS_INODE64=y` is the modern default and userspace uses
+    ///    the line to confirm which inode width it got.
+    pub fn show_options(&self) -> String {
+        use core::fmt::Write as _;
+        let mut out = String::new();
+        let (max_blocks, max_inodes) = {
+            let state = self.inner.superblock.state.lock();
+            (state.max_blocks, state.max_inodes)
+        };
+        let default_half = (self.total_pages / 2 != 0).then_some(self.total_pages / 2);
+        if max_blocks != default_half {
+            // K(x) = x << (PAGE_SHIFT - 10): pages to KiB.
+            let kib = max_blocks.unwrap_or(0).saturating_mul(PAGE_SIZE / 1024);
+            let _ = write!(out, ",size={}k", kib);
+        }
+        if max_inodes != default_half {
+            let _ = write!(out, ",nr_inodes={}", max_inodes.unwrap_or(0));
+        }
+        let root = self.inner.root();
+        let mode = root.dir_mode();
+        if mode != (0o777 | 0o1000) {
+            let _ = write!(out, ",mode={:03o}", mode);
+        }
+        let (uid, gid) = root.dir_owners();
+        if uid != 0 {
+            let _ = write!(out, ",uid={}", uid);
+        }
+        if gid != 0 {
+            let _ = write!(out, ",gid={}", gid);
+        }
+        let _ = write!(out, ",inode{}", if self.options.inode64 { 64 } else { 32 });
+        // `huge=` and `mpol=` are omitted: NARF is always `huge=never`
+        // (`if (sbinfo->huge)` is false) with no superblock mempolicy,
+        // which is exactly when Linux prints neither.
+        if self.options.noswap {
+            out.push_str(",noswap");
+        }
+        let (usr_on, grp_on) = {
+            let state = self.inner.superblock.state.lock();
+            (state.usr.on, state.grp.on)
+        };
+        if usr_on {
+            out.push_str(",usrquota");
+        }
+        if grp_on {
+            out.push_str(",grpquota");
+        }
+        let limits = self.inner.superblock.quota_defaults();
+        if limits.usrquota_bhardlimit != 0 {
+            let _ = write!(
+                out,
+                ",usrquota_block_hardlimit={}",
+                limits.usrquota_bhardlimit
+            );
+        }
+        if limits.grpquota_bhardlimit != 0 {
+            let _ = write!(
+                out,
+                ",grpquota_block_hardlimit={}",
+                limits.grpquota_bhardlimit
+            );
+        }
+        if limits.usrquota_ihardlimit != 0 {
+            let _ = write!(
+                out,
+                ",usrquota_inode_hardlimit={}",
+                limits.usrquota_ihardlimit
+            );
+        }
+        if limits.grpquota_ihardlimit != 0 {
+            let _ = write!(
+                out,
+                ",grpquota_inode_hardlimit={}",
+                limits.grpquota_ihardlimit
+            );
+        }
+        out
     }
 }
 
@@ -2707,6 +3087,10 @@ impl FsInstance for TmpFs {
 
     fn name(&self) -> &str {
         "tmpfs"
+    }
+
+    fn show_options(&self) -> String {
+        TmpFs::show_options(self)
     }
 
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {

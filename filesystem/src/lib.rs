@@ -1872,6 +1872,18 @@ pub trait FsInstance: Send + Sync + 'static {
         None
     }
 
+    /// Filesystem-specific mount options, as Linux's
+    /// `super_operations::show_options` renders them: a `,`-prefixed list
+    /// appended to the mount's flags in `/proc/mounts` and to the super
+    /// options field of `/proc/<pid>/mountinfo`.
+    ///
+    /// Empty by default — a filesystem with no `show_options` (ramfs, and
+    /// every synthetic mount here) contributes nothing, which is exactly
+    /// what Linux prints for one.
+    fn show_options(&self) -> String {
+        String::new()
+    }
+
     /// Query filesystem-wide capacity. Synthetic filesystems retain the
     /// conservative default used before this interface existed.
     fn statfs<'a>(&'a self) -> FsFuture<'a, FsStat> {
@@ -2259,7 +2271,12 @@ impl fmt::Debug for Mount {
     }
 }
 
-fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
+/// One `/proc/<pid>/mountinfo` row: `(id, parent, path, fstype, super
+/// options)`. The last field is the filesystem's `show_options` string,
+/// already `,`-prefixed (empty for a filesystem with none).
+pub type MountInfoRow = (u64, u64, String, String, String);
+
+fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
     mounts
         .iter()
         .enumerate()
@@ -2293,6 +2310,7 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<(u64, u64, String, String)> {
                 parent,
                 mount.path.clone(),
                 String::from(mount.fs.name()),
+                mount.fs.show_options(),
             )
         })
         .collect()
@@ -2951,8 +2969,24 @@ impl MountNamespace {
             .collect()
     }
 
+    /// `(path, fs name, super options)` for every mount — the extra field
+    /// is the filesystem's `show_options` text, which `/proc/mounts` must
+    /// print after the mount flags.
+    pub fn list_with_options(&self) -> Vec<(String, String, String)> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    String::from(m.fs.name()),
+                    m.fs.show_options(),
+                )
+            })
+            .collect()
+    }
+
     /// Mount identity and hierarchy in attachment order.
-    pub fn list_mountinfo(&self) -> Vec<(u64, u64, String, String)> {
+    pub fn list_mountinfo(&self) -> Vec<MountInfoRow> {
         mountinfo_rows(&self.inner.lock())
     }
 
@@ -3334,10 +3368,28 @@ impl VfsRegistry {
             .collect()
     }
 
-    /// Mount identity and hierarchy in attachment order.
-    pub fn list_mountinfo(
+    /// `(path, fs name, super options)` for every mount in this namespace.
+    pub fn list_with_options(
         &self,
-    ) -> alloc::vec::Vec<(u64, u64, alloc::string::String, alloc::string::String)> {
+    ) -> alloc::vec::Vec<(
+        alloc::string::String,
+        alloc::string::String,
+        alloc::string::String,
+    )> {
+        let q = self.inner.lock();
+        q.iter()
+            .map(|m| {
+                (
+                    m.path.clone(),
+                    alloc::string::String::from(m.fs.name()),
+                    m.fs.show_options(),
+                )
+            })
+            .collect()
+    }
+
+    /// Mount identity and hierarchy in attachment order.
+    pub fn list_mountinfo(&self) -> alloc::vec::Vec<MountInfoRow> {
         mountinfo_rows(&self.inner.lock())
     }
 

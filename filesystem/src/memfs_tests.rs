@@ -767,8 +767,10 @@ fn smoke_tmpfs_linux_mount_options() -> TestResult {
         return TestResult::Fail("tmpfs option values were parsed incorrectly");
     }
     if TmpFsOptions::parse("huge=always", 4096, 0, 0).is_ok()
-        || TmpFsOptions::parse("size=101%", 4096, 0, 0).is_ok()
+        // `mode=888` is not octal: `fsparam_u32oct` runs kstrtouint(.., 8).
         || TmpFsOptions::parse("mode=888", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("noswap=1", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse("casefold", 4096, 0, 0).is_ok()
     {
         return TestResult::Fail("unsupported or malformed tmpfs option was accepted");
     }
@@ -782,6 +784,293 @@ fn smoke_tmpfs_linux_mount_options() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_linux_mount_options);
+
+/// tmpfs sizing options parse exactly as Linux parses them.
+///
+/// `shmem_parse_one` runs every numeric option through `memparse`
+/// (`lib/cmdline.c`) and then rejects the value if anything is left over —
+/// `if (*rest) goto bad_value`. That pins four behaviours NARF used to get
+/// wrong, each of which either failed a mount Linux accepts or accepted one
+/// it rejects:
+///
+///  * suffixes are ONE letter from `K M G T P E`, either case. `1kB` leaves
+///    a `B` in `rest` and is a bad value, even though it reads like a unit.
+///  * the number is `simple_strtoull(.., 0)`, so `0x`-hex and leading-zero
+///    octal are legal spellings of a size.
+///  * `size=N%` has NO upper bound — an over-committed `size=200%` tmpfs is
+///    a legal (if unwise) mount, not EINVAL.
+///  * `mode=` is masked with 07777, not range-checked, so `mode=17777`
+///    mounts as 07777.
+fn smoke_tmpfs_memparse_matches_linux() -> TestResult {
+    let blocks = |options: &str| TmpFsOptions::parse(options, 4096, 0, 0).map(|o| o.max_blocks);
+    // 1 MiB = 256 pages, spelled four ways memparse accepts.
+    if blocks("size=1M") != Ok(Some(256))
+        || blocks("size=1m") != Ok(Some(256))
+        || blocks("size=1024K") != Ok(Some(256))
+        || blocks("size=0x100000") != Ok(Some(256))
+        // Leading zero is octal: 04000000 == 1 MiB.
+        || blocks("size=04000000") != Ok(Some(256))
+        // A bare byte count rounds UP to whole pages (DIV_ROUND_UP).
+        || blocks("size=4097") != Ok(Some(2))
+    {
+        return TestResult::Fail("tmpfs size= does not parse like Linux memparse");
+    }
+    // Trailing junk — including the plausible-looking `kB`/`MB` — is a bad
+    // value, because memparse consumes at most one suffix letter.
+    if blocks("size=1kB").is_ok()
+        || blocks("size=1MB").is_ok()
+        || blocks("size=1M2").is_ok()
+        || blocks("size=").is_ok()
+        || blocks("size=junk").is_ok()
+        || blocks("size=50%%").is_ok()
+    {
+        return TestResult::Fail("tmpfs size= accepted a value Linux rejects");
+    }
+    // Percentages: no 100% ceiling, and the arithmetic is Linux's —
+    // bytes = (N << PAGE_SHIFT) * totalram / 100, THEN rounded up to whole
+    // pages. 1% of 4096 pages is 41 blocks, not the 40 that
+    // `N * pages / 100` would give, and 1% of a ONE-page machine still
+    // rounds up to 1 block instead of collapsing to 0.
+    if blocks("size=200%") != Ok(Some(8192))
+        || blocks("size=1%") != Ok(Some(41))
+        || TmpFsOptions::parse("size=1%", 1, 0, 0).map(|o| o.max_blocks) != Ok(Some(1))
+    {
+        return TestResult::Fail("tmpfs size=N% is not Linux's percentage arithmetic");
+    }
+    // nr_blocks > LONG_MAX and nr_inodes > ULONG_MAX/BOGO_INODE_SIZE are the
+    // two explicit range rejections in shmem_parse_one.
+    if TmpFsOptions::parse("nr_blocks=0x7fffffffffffffff", 4096, 0, 0).is_err()
+        || TmpFsOptions::parse("nr_blocks=0x8000000000000000", 4096, 0, 0).is_ok()
+        // ULONG_MAX / BOGO_INODE_SIZE == 0x003f_ffff_ffff_ffff.
+        || TmpFsOptions::parse("nr_inodes=0x003fffffffffffff", 4096, 0, 0).is_err()
+        || TmpFsOptions::parse("nr_inodes=0x0040000000000000", 4096, 0, 0).is_ok()
+    {
+        return TestResult::Fail("tmpfs block/inode count range checks do not match Linux");
+    }
+    // `size=0` / `nr_inodes=0` are Linux's explicit "no limit".
+    if blocks("size=0") != Ok(None)
+        || TmpFsOptions::parse("nr_inodes=0", 4096, 0, 0).map(|o| o.max_inodes) != Ok(None)
+    {
+        return TestResult::Fail("tmpfs zero limits are not unlimited");
+    }
+    // `result.uint_32 & 07777` masks; it does not reject.
+    if TmpFsOptions::parse("mode=17777", 4096, 0, 0).map(|o| o.root_mode) != Ok(0o7777) {
+        return TestResult::Fail("tmpfs mode= is not masked with 07777");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_memparse_matches_linux);
+
+/// The quota mount options Linux tmpfs accepts, and what they mean.
+///
+/// Two things this pins that NARF had wrong:
+///
+///  * bare `quota` is `QTYPE_MASK_USR | QTYPE_MASK_GRP` — BOTH kinds — not
+///    an alias for `usrquota` (`shmem_parse_one`, `case Opt_quota`).
+///  * `{usr,grp}quota_{block,inode}_hardlimit=` exist at all. They are the
+///    limit every id starts with (`shmem_acquire_dquot` copies them into a
+///    freshly acquired dquot), so enforcement must bite for a user that
+///    `setquota` has never been run for.
+///
+/// The block limit is a BYTE count, which is why the 8 KiB limit below
+/// stops the third page rather than the third block-of-something.
+fn smoke_tmpfs_quota_mount_hardlimits() -> TestResult {
+    const U: u32 = 4242;
+    let both = match TmpFsOptions::parse("quota", 4096, 0, 0) {
+        Ok(parsed) => parsed,
+        Err(_) => return TestResult::Fail("bare `quota` was rejected"),
+    };
+    if !both.usrquota || !both.grpquota {
+        return TestResult::Fail("bare `quota` did not enable both quota kinds");
+    }
+    // Hard limits must be nonzero and within SHMEM_QUOTA_MAX_*_LIMIT.
+    if TmpFsOptions::parse("usrquota,usrquota_block_hardlimit=0", 4096, 0, 0).is_ok()
+        || TmpFsOptions::parse(
+            "usrquota,usrquota_block_hardlimit=0x8000000000000000",
+            4096,
+            0,
+            0,
+        )
+        .is_ok()
+        || TmpFsOptions::parse("usrquota,usrquota_inode_hardlimit=0", 4096, 0, 0).is_ok()
+    {
+        return TestResult::Fail("an out-of-range quota hard limit was accepted");
+    }
+    let fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K,usrquota_inode_hardlimit=4",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota hard-limit mount options were rejected"),
+    };
+    let root = fs.root();
+    let file = match poll_once(root.create("charged")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.set_owners(U, U)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chown to the limited uid failed");
+    }
+    // 8 KiB of block hard limit = exactly two pages for this owner.
+    if poll_once(file.write(0, &[1u8; 4096])).map(|r| r.is_ok()) != Some(true)
+        || poll_once(file.write(4096, &[2u8; 4096])).map(|r| r.is_ok()) != Some(true)
+    {
+        return TestResult::Fail("writes inside the default block hard limit failed");
+    }
+    if !matches!(
+        poll_once(file.write(8192, &[3u8; 4096])),
+        Some(Err(FsError::QuotaExceeded))
+    ) {
+        return TestResult::Fail("mount-default block hard limit was not enforced");
+    }
+    // The limit is the id's starting point, so a read-back reports it in
+    // fs blocks (8 KiB / 4 KiB = 2) without any setquota having run.
+    match fs.quota_get(QuotaKind::User, U) {
+        Ok(blk) if blk.blocks_hard == 2 && blk.inodes_hard == 4 => {}
+        _ => return TestResult::Fail("mount-default quota limits are not reported"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_quota_mount_hardlimits);
+
+/// `mount -o remount` follows `shmem_reconfigure`.
+///
+/// Every failure there is `invalfc()` — **-EINVAL** — including the two
+/// that read like capacity errors ("Too small a size for current use",
+/// "Too few inodes for current use"). NARF reported ENOSPC for those, which
+/// tells `mount` the filesystem is full rather than that the request was
+/// refused.
+fn smoke_tmpfs_remount_matches_shmem_reconfigure() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=16", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("live")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(file.write(0, &[7u8; 8192])).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs write failed");
+    }
+    // Two pages are in use, so a one-page limit strands them: EINVAL.
+    if fs.reconfigure("size=4K") != Err(FsError::InvalidData) {
+        return TestResult::Fail("too-small remount did not report EINVAL");
+    }
+    // Quota cannot be turned ON by a remount, and this mount has none.
+    if fs.reconfigure("usrquota") != Err(FsError::InvalidData)
+        || fs.reconfigure("quota") != Err(FsError::InvalidData)
+    {
+        return TestResult::Fail("remount enabled quota on a mount without it");
+    }
+    // size=0 lifts the limit even though data is live, then a limit cannot
+    // be re-imposed on the now-unlimited mount ("Cannot retroactively
+    // limit size").
+    if fs.reconfigure("size=0").is_err() {
+        return TestResult::Fail("remount to unlimited was rejected");
+    }
+    if fs.reconfigure("size=1M") != Err(FsError::InvalidData) {
+        return TestResult::Fail("remount retroactively limited an unlimited mount");
+    }
+
+    let quota_fs = match TmpFs::from_options_with_total(
+        "usrquota,size=1M,usrquota_block_hardlimit=8K",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    // Quota already loaded: naming it again is accepted and does nothing.
+    if quota_fs.reconfigure("usrquota").is_err() {
+        return TestResult::Fail("remount rejected an already-loaded quota type");
+    }
+    // "Cannot change global quota limit on remount" — but repeating the
+    // same value is fine.
+    if quota_fs.reconfigure("usrquota_block_hardlimit=8K").is_err() {
+        return TestResult::Fail("remount rejected an unchanged quota hard limit");
+    }
+    if quota_fs.reconfigure("usrquota_block_hardlimit=16K") != Err(FsError::InvalidData) {
+        return TestResult::Fail("remount changed a global quota hard limit");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_remount_matches_shmem_reconfigure
+);
+
+/// `/proc/mounts` and mountinfo carry tmpfs's real options.
+///
+/// Linux `mm/shmem.c::shmem_show_options` prints a field only when it
+/// differs from the default, which is why a plain `/run` reads as
+/// `rw,inode64` and a sized one as `rw,size=…k,mode=755,inode64`. NARF used
+/// to print a bare `rw` for every mount, so nothing downstream could see a
+/// tmpfs's size, mode or quota state — `findmnt -o OPTIONS`, systemd's
+/// mount-unit comparison, and any script grepping the size out of
+/// /proc/mounts all read the same empty answer for every tmpfs.
+///
+/// The units are the fiddly part and are pinned here: `size=` is KiB
+/// (`K(sbinfo->max_blocks)`), `mode=` is `%03ho` octal with no leading
+/// zero, and the quota hard limits are the raw BYTE counts memparse
+/// produced.
+fn smoke_tmpfs_show_options_matches_shmem() -> TestResult {
+    // A default mount prints nothing but the two always-on flags: its
+    // limits ARE shmem_default_max_{blocks,inodes}() and its root is 01777.
+    let plain = match TmpFs::from_options_with_total("", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("default tmpfs construction failed"),
+    };
+    if plain.show_options() != ",inode64,noswap" {
+        return TestResult::Fail("default tmpfs printed non-default options");
+    }
+    let sized = match TmpFs::from_options_with_total(
+        "size=1M,nr_inodes=16,mode=0755,uid=5,gid=6,inode32",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("sized tmpfs construction failed"),
+    };
+    if sized.show_options() != ",size=1024k,nr_inodes=16,mode=755,uid=5,gid=6,inode32,noswap" {
+        return TestResult::Fail("tmpfs show_options is not Linux-shaped");
+    }
+    // The size field tracks the LIVE limit, so a remount is visible.
+    if sized.reconfigure("size=2M").is_err() {
+        return TestResult::Fail("tmpfs remount failed");
+    }
+    if !sized.show_options().starts_with(",size=2048k,") {
+        return TestResult::Fail("tmpfs show_options did not follow a remount");
+    }
+    let quota = match TmpFs::from_options_with_total(
+        "usrquota,usrquota_block_hardlimit=8K,grpquota_inode_hardlimit=4",
+        4096,
+        0,
+        0,
+    ) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("quota tmpfs construction failed"),
+    };
+    if quota.show_options()
+        != ",inode64,noswap,usrquota,usrquota_block_hardlimit=8192,grpquota_inode_hardlimit=4"
+    {
+        return TestResult::Fail("tmpfs quota options are not rendered like Linux");
+    }
+    // ramfs has no `show_options` at all in Linux — `ramfs_ops` leaves the
+    // super_operations slot empty — so it must contribute nothing.
+    let ramfs = match RamFs::from_options("mode=0700", 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("ramfs construction failed"),
+    };
+    if !FsInstance::show_options(&ramfs).is_empty() {
+        return TestResult::Fail("ramfs invented mount options");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_show_options_matches_shmem);
 
 /// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
 /// users are unaffected, and chown transfers the charge to the new owner.

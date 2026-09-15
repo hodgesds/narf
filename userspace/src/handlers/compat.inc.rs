@@ -2774,7 +2774,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name) in rows {
+    for (id, parent, path, name, options) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -2786,7 +2786,9 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        let _ = writeln!(s, "{}\t{}\t{}\t{}", id, parent, visible, name);
+        // Fifth field is the filesystem's `show_options` text; procfs
+        // renders it as mountinfo's super-options column.
+        let _ = writeln!(s, "{}\t{}\t{}\t{}\t{}", id, parent, visible, name, options);
     }
     Some(s)
 }
