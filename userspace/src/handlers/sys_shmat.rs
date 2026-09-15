@@ -110,16 +110,20 @@ pub(crate) fn sys_shmat(ctx: &mut dyn TrapContext) {
     let vtable = match shmem_vtable() {
         Some(vtable) => vtable,
         None => {
+            // No shmem backend in this kernel — same answer `shmget` gives.
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
             return;
         }
     };
     let as_ref = match current_address_space() {
         Some(as_ref) => as_ref,
         None => {
+            // Nowhere to place the attachment. -ENOMEM is already this
+            // function's answer for that, two arms up, where
+            // `reserve_mmap_va_aligned` comes back empty.
             shm_cancel_attach(object);
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
             return;
         }
     };

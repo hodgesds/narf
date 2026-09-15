@@ -6521,6 +6521,34 @@ pub fn install_shmem_syscall_vtable(v: &'static ShmemSyscallVtable) {
     );
 }
 
+/// Test hook — swap the installed shmem vtable, returning the previous one
+/// so a case can put it back.
+///
+/// The "no shmem backend" arms of `shmget`/`shmat`/`shmctl` are unreachable
+/// in a booted kernel, where `install_shmem_syscall_vtable` runs at init.
+/// They are still worth answering correctly — each used to return
+/// `invalid_op()`, i.e. 0 in the register the Linux ABI reads, so `shmget`
+/// reported segment id 0 and `shmat` reported an attach at address 0 — and
+/// an arm nothing can reach is an arm nothing can check. This makes them
+/// reachable from a test and nowhere else.
+#[doc(hidden)]
+pub fn __test_swap_shmem_vtable(
+    next: Option<&'static ShmemSyscallVtable>,
+) -> Option<&'static ShmemSyscallVtable> {
+    let raw = match next {
+        Some(v) => v as *const ShmemSyscallVtable as *mut ShmemSyscallVtable,
+        None => core::ptr::null_mut(),
+    };
+    let prev = SHMEM_VTABLE.swap(raw, core::sync::atomic::Ordering::AcqRel);
+    if prev.is_null() {
+        None
+    } else {
+        // SAFETY: only ever stored from a `&'static` input, by
+        // `install_shmem_syscall_vtable` or this function.
+        Some(unsafe { &*prev })
+    }
+}
+
 fn shmem_vtable() -> Option<&'static ShmemSyscallVtable> {
     let p = SHMEM_VTABLE.load(core::sync::atomic::Ordering::Acquire);
     if p.is_null() {
