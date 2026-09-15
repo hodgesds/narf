@@ -1417,6 +1417,260 @@ fn smoke_tmpfs_short_write_at_edquot() -> TestResult {
 }
 kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_short_write_at_edquot);
 
+/// `st_nlink` follows the namespace, for files AND directories.
+///
+/// Every tmpfs inode reported 1. Two things break on that. A hard link is
+/// invisible: `ls -l` shows 1, `find -links +1` finds nothing, and a
+/// backup tool that dedups by link count writes the data twice. And
+/// `find`'s leaf optimisation — "a directory whose `st_nlink` is exactly 2
+/// has no subdirectories, so its remaining children need not be stat'd" —
+/// cannot run at all, because Linux's count for a directory is
+/// `2 + subdirectories` (itself, its `.`, and one `..` per child) and a
+/// flat 1 is below the floor.
+///
+/// An `O_TMPFILE` inode is the interesting case in the other direction:
+/// `shmem_tmpfile` reaches `d_tmpfile`, which decrements the link count to
+/// **0**, and `linkat(AT_EMPTY_PATH)` is what raises it. A caller uses that
+/// zero to tell an unlinked temporary from a named file.
+fn smoke_tmpfs_link_counts_follow_the_namespace() -> TestResult {
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=64", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let root = fs.root();
+    // A fresh directory: itself + its own `.`.
+    if root.inode_attrs().nlink != 2 {
+        return TestResult::Fail("an empty tmpfs directory does not report 2 links");
+    }
+    let file = match poll_once(root.create("one")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if file.inode_attrs().nlink != 1 {
+        return TestResult::Fail("a newly created file does not report 1 link");
+    }
+    if poll_once(root.link("one", "two")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("tmpfs hard link failed");
+    }
+    if file.inode_attrs().nlink != 2 {
+        return TestResult::Fail("a hard link did not raise the link count");
+    }
+    if poll_once(root.unlink("two")).map(|r| r.is_ok()) != Some(true)
+        || file.inode_attrs().nlink != 1
+    {
+        return TestResult::Fail("unlinking a name did not lower the link count");
+    }
+    // Directories: each child directory's `..` is another link to its parent.
+    let a = match poll_once(root.mkdir("a")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    let b = match poll_once(root.mkdir("b")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if root.inode_attrs().nlink != 4 || a.inode_attrs().nlink != 2 {
+        return TestResult::Fail("mkdir did not raise the parent's link count");
+    }
+    if poll_once(a.mkdir("x")).map(|r| r.is_ok()) != Some(true) || a.inode_attrs().nlink != 3 {
+        return TestResult::Fail("a nested mkdir did not raise its parent's link count");
+    }
+    // Moving a directory carries its `..` link to the new parent.
+    if poll_once(a.rename_to("x", &*b, "y", 0)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("cross-directory rename failed");
+    }
+    if a.inode_attrs().nlink != 2 || b.inode_attrs().nlink != 3 {
+        return TestResult::Fail("renaming a directory did not move the parent link counts");
+    }
+    if poll_once(b.rmdir("y")).map(|r| r.is_ok()) != Some(true) || b.inode_attrs().nlink != 2 {
+        return TestResult::Fail("rmdir did not lower the parent's link count");
+    }
+    // A rename that REPLACES a file takes the replaced inode's last name.
+    let victim = match poll_once(root.create("victim")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    if poll_once(root.rename("one", "victim")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("replacing rename failed");
+    }
+    if victim.inode_attrs().nlink != 0 {
+        return TestResult::Fail("a replaced inode kept its link count");
+    }
+    // O_TMPFILE: nameless until linkat gives it one.
+    let tmp = match poll_once(root.tmpfile(0o600)) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs tmpfile failed"),
+    };
+    if tmp.inode_attrs().nlink != 0 || !tmp.inode_attrs().tracked {
+        return TestResult::Fail("an O_TMPFILE inode does not report zero links");
+    }
+    if poll_once(root.link_node("named", tmp.clone())).map(|r| r.is_ok()) != Some(true)
+        || tmp.inode_attrs().nlink != 1
+    {
+        return TestResult::Fail("linkat did not give the O_TMPFILE inode its first link");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_link_counts_follow_the_namespace
+);
+
+/// atime, mtime and ctime are three separate stamps, with relatime.
+///
+/// NARF reported mtime for all three, so `chmod` looked like a rewrite to
+/// anything comparing ctime, and atime never moved at all. Linux moves
+/// mtime+ctime together on a data change (`file_update_time`), ctime alone
+/// on a metadata change (`setattr_copy`), and atime on read under the
+/// `relatime` rule in `fs/inode.c::relatime_need_update`:
+///
+/// ```text
+/// if (inode_get_atime <= inode_get_mtime) return 1;
+/// if (inode_get_atime <= inode_get_ctime) return 1;
+/// if ((long)(now.tv_sec - atime.tv_sec) >= 24*60*60) return 1;
+/// return 0;
+/// ```
+fn smoke_tmpfs_timestamps_are_three_distinct_stamps() -> TestResult {
+    const SECOND: u64 = 1_000_000_000;
+    let fs = match TmpFs::from_options_with_total("size=1M,nr_inodes=16", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let file = match poll_once(fs.root().create("stamped")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    // Plant known atime/mtime. `notify_change` stamps ctime as well, so
+    // ctime is "now" — far beyond these two small values.
+    if file.set_times(Some(SECOND), Some(2 * SECOND)).is_err() {
+        return TestResult::Fail("set_times failed");
+    }
+    let attrs = file.inode_attrs();
+    if attrs.atime_ns != SECOND || narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+        return TestResult::Fail("set_times did not plant atime/mtime");
+    }
+    if attrs.ctime_ns <= 2 * SECOND {
+        return TestResult::Fail("an explicit utimensat did not stamp ctime");
+    }
+    // chmod moves ctime and leaves mtime alone. Making a file executable
+    // must not make `make` think it was rebuilt.
+    if poll_once(file.set_perms(0o700)).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("chmod failed");
+    }
+    if narf_time::cycles_to_ns(file.stat().mtime_cycles) != 2 * SECOND {
+        return TestResult::Fail("chmod moved mtime");
+    }
+    if file.inode_attrs().ctime_ns < attrs.ctime_ns {
+        return TestResult::Fail("chmod did not stamp ctime");
+    }
+    // relatime: atime is refreshed only when it is no newer than the last
+    // change. atime(1s) <= mtime(2s), so this read must move it.
+    let mut buf = [0u8; 1];
+    if poll_once(file.read(0, &mut buf)).is_none() {
+        return TestResult::Fail("read failed");
+    }
+    let after_read = file.inode_attrs().atime_ns;
+    if after_read == SECOND {
+        return TestResult::Fail("relatime did not refresh a stale atime");
+    }
+    // Now plant an atime far AHEAD of both other stamps: relatime must
+    // leave it alone, which is the whole point of the policy — a read loop
+    // over a warm file does not keep dirtying the inode.
+    let far = after_read.saturating_add(3600 * SECOND);
+    if file.set_times(Some(far), Some(2 * SECOND)).is_err() {
+        return TestResult::Fail("set_times failed");
+    }
+    if poll_once(file.read(0, &mut buf)).is_none() {
+        return TestResult::Fail("read failed");
+    }
+    if file.inode_attrs().atime_ns != far {
+        return TestResult::Fail("relatime refreshed an atime that was already current");
+    }
+    // A write moves mtime AND ctime together.
+    let before_write = file.inode_attrs().ctime_ns;
+    if poll_once(file.write(0, b"x")).map(|r| r.is_ok()) != Some(true) {
+        return TestResult::Fail("write failed");
+    }
+    if narf_time::cycles_to_ns(file.stat().mtime_cycles) == 2 * SECOND
+        || file.inode_attrs().ctime_ns < before_write
+    {
+        return TestResult::Fail("a write did not move mtime and ctime together");
+    }
+    // A directory has real timestamps too, and a namespace change moves
+    // them — `ls -l /tmp` showed the epoch for every directory before.
+    let dir = fs.root();
+    if dir.dir_mtime_ns() == 0 {
+        return TestResult::Fail("a tmpfs directory has no mtime");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/tmpfs",
+    smoke_tmpfs_timestamps_are_three_distinct_stamps
+);
+
+/// Each mount has its own `st_dev`, and every inode on it reports that one.
+///
+/// `st_dev` was 0 everywhere, so nothing could tell two filesystems apart:
+/// `find -xdev` never pruned, `du -x` never stopped, and systemd's
+/// mount-point probe — which compares a directory's `st_dev` to its
+/// parent's — saw one flat filesystem. Linux gives every superblock without
+/// a block device a distinct anonymous number (`fs/super.c::get_anon_bdev`).
+fn smoke_tmpfs_distinct_device_numbers() -> TestResult {
+    let first = match TmpFs::from_options_with_total("size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let second = match TmpFs::from_options_with_total("size=1M", 4096, 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs construction failed"),
+    };
+    let first_dev = first.root().inode_attrs().dev;
+    let second_dev = second.root().inode_attrs().dev;
+    if first_dev == 0 || second_dev == 0 {
+        return TestResult::Fail("a tmpfs mount has no device number");
+    }
+    if first_dev == second_dev {
+        return TestResult::Fail("two tmpfs mounts share a device number");
+    }
+    // Every inode on a mount reports that mount's device — files,
+    // directories, symlinks and special nodes alike.
+    let root = first.root();
+    let file = match poll_once(root.create("f")) {
+        Some(Ok(file)) => file,
+        _ => return TestResult::Fail("tmpfs create failed"),
+    };
+    let link = match poll_once(root.symlink("l", "/f")) {
+        Some(Ok(link)) => link,
+        _ => return TestResult::Fail("tmpfs symlink failed"),
+    };
+    let node = match poll_once(root.mknod("d", FileType::Special, 0x0103)) {
+        Some(Ok(node)) => node,
+        _ => return TestResult::Fail("tmpfs mknod failed"),
+    };
+    let sub = match poll_once(root.mkdir("s")) {
+        Some(Ok(dir)) => dir,
+        _ => return TestResult::Fail("tmpfs mkdir failed"),
+    };
+    if file.inode_attrs().dev != first_dev
+        || link.inode_attrs().dev != first_dev
+        || node.inode_attrs().dev != first_dev
+        || sub.inode_attrs().dev != first_dev
+    {
+        return TestResult::Fail("an inode reported a device other than its mount's");
+    }
+    // ramfs is a separate filesystem and gets its own number.
+    let ramfs = match RamFs::from_options("", 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("ramfs construction failed"),
+    };
+    if ramfs.root().inode_attrs().dev == first_dev {
+        return TestResult::Fail("a ramfs mount shares tmpfs's device number");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/tmpfs", smoke_tmpfs_distinct_device_numbers);
+
 /// tmpfs `usrquota`: a per-user block hard limit is enforced (EDQUOT), other
 /// users are unaffected, and chown transfers the charge to the new owner.
 fn smoke_tmpfs_usrquota_blocks_and_transfer() -> TestResult {

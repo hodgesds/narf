@@ -235,6 +235,42 @@ pub struct Stat {
     pub mtime_cycles: u64,
 }
 
+/// Inode attributes Linux reports in `struct stat` that [`Stat`] does not
+/// carry.
+///
+/// They live in a separate struct rather than in `Stat` because `Stat` is
+/// constructed as a literal in hundreds of places across every filesystem
+/// and synthetic node in the tree; a filesystem that does not model these
+/// keeps the `Default`, and the stat path falls back to exactly the values
+/// it used before this existed.
+///
+/// Every field uses 0 for "this filesystem does not track it", which is
+/// never a legal value for any of them: an inode that exists has at least
+/// one link, a mounted filesystem has a nonzero anonymous device, and a
+/// timestamp of 0 is the epoch (`shmem_get_inode` stamps
+/// `inode_set_ctime_current`, so a real tmpfs inode is never at 0).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InodeAttrs {
+    /// `st_nlink`. An `O_TMPFILE` inode legitimately reports 0 — Linux
+    /// creates it with `inode->i_nlink == 0` and `linkat` is what raises
+    /// it — so this is reported whenever the filesystem tracks links at
+    /// all, which [`InodeAttrs::tracked`] records.
+    pub nlink: u32,
+    /// `st_dev` — the filesystem's anonymous device number
+    /// (`get_anon_bdev`). Distinguishing mounts is what makes `rename`
+    /// across them EXDEV, `find -xdev` prune, and `du -x` stop.
+    pub dev: u64,
+    /// `st_atim` in wall-clock nanoseconds since the epoch.
+    pub atime_ns: u64,
+    /// `st_ctim` in wall-clock nanoseconds since the epoch. Distinct from
+    /// mtime: a `chmod` moves ctime and leaves mtime alone.
+    pub ctime_ns: u64,
+    /// Whether this filesystem fills the struct at all. Without it a real
+    /// `nlink` of 0 (an unlinked `O_TMPFILE` inode) is indistinguishable
+    /// from "not tracked".
+    pub tracked: bool,
+}
+
 /// Filesystem-wide capacity information returned by `statfs(2)`.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FsStat {
@@ -896,6 +932,14 @@ pub trait FileOps: Send + Sync {
 
     fn remove_xattr<'a>(&'a self, _name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async { Err(FsError::Unsupported) })
+    }
+
+    /// Link count, device number and the two timestamps [`Stat`] omits.
+    /// Default is "not tracked", which leaves the stat path reporting what
+    /// it did before: `st_nlink = 1`, `st_dev = 0`, and mtime standing in
+    /// for atime and ctime.
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs::default()
     }
 
     /// Ask the backing filesystem to authorize Linux R_OK/W_OK/X_OK bits.
@@ -1835,6 +1879,26 @@ pub trait DirOps: Send + Sync {
     /// tmpfs/memfs overrides to `true`.
     fn supports_tmpfile(&self) -> bool {
         false
+    }
+
+    /// The directory inode's modification time, in wall-clock nanoseconds
+    /// since the epoch; 0 means the filesystem does not track one.
+    ///
+    /// [`Stat`] carries mtime, but a directory never goes through
+    /// `FileOps::stat` — path resolution hands back `DirOps` — so the stat
+    /// path synthesised a zero. Every directory therefore looked like the
+    /// epoch to `ls -l`, `make` and `rsync`.
+    fn dir_mtime_ns(&self) -> u64 {
+        0
+    }
+
+    /// Link count, device number and timestamps for the DIRECTORY inode —
+    /// see [`FileOps::inode_attrs`]. A directory's `st_nlink` is Linux's
+    /// `2 + subdirectories` (itself, its `.`, and one `..` per child), and
+    /// `find`'s leaf optimisation reads it to decide whether a directory
+    /// can contain subdirectories at all.
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs::default()
     }
 
     // ── extended attributes ───────────────────────────────────────────

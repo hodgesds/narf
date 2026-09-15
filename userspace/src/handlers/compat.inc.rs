@@ -612,7 +612,7 @@ fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::St
 /// sub-directories alike) synthesise a `DIR_RW`-shaped stat so callers
 /// see `S_IFDIR`. Returns `None` only when the path names nothing.
 fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
-    stat_ino_path_dir_aware(path).map(|(s, _ino, _rdev, _uid, _gid)| s)
+    stat_ino_path_dir_aware(path).map(|(s, ..)| s)
 }
 
 // Same resolution as `stat_path_dir_aware`, but also returns the file's
@@ -715,7 +715,7 @@ fn path_symlink_loop(path: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
+fn stat_ino_path_dir_aware(path: &str) -> Option<PathStat> {
     stat_ino_path_dir_aware_ext(path, true)
 }
 
@@ -724,10 +724,21 @@ fn stat_ino_path_dir_aware(path: &str) -> Option<(narf_filesystem::Stat, u64, u6
 /// `fstatat(AT_SYMLINK_NOFOLLOW)` pass `false` so the returned stat
 /// describes the symlink itself (S_IFLNK, st_size = target length)
 /// rather than its target; plain `stat`/`fstatat` pass `true`.
-fn stat_ino_path_dir_aware_ext(
-    path: &str,
-    follow_final: bool,
-) -> Option<(narf_filesystem::Stat, u64, u64, u32, u32)> {
+/// Everything the Linux `struct stat` needs for one path, in one tuple:
+/// `(stat, ino, rdev, uid, gid, inode attrs)`. The last field carries
+/// `st_nlink`, `st_dev` and the atime/ctime that `narf_filesystem::Stat`
+/// does not model; it is `Default` for a filesystem that tracks none of
+/// them, and the stat path then reports what it always did.
+type PathStat = (
+    narf_filesystem::Stat,
+    u64,
+    u64,
+    u32,
+    u32,
+    narf_filesystem::InodeAttrs,
+);
+
+fn stat_ino_path_dir_aware_ext(path: &str, follow_final: bool) -> Option<PathStat> {
     let file = current_resolve_absolute(path, |fs, rel| {
         if rel.is_empty() {
             // A file-rooted mount (mount --bind of a file, e.g. systemd's
@@ -736,7 +747,7 @@ fn stat_ino_path_dir_aware_ext(
             // through to the resolve_dir_absolute path below.
             fs.root_file().map(|f| {
                 let (uid, gid) = f.owners();
-                (f.stat(), f.ino(), f.rdev(), uid, gid)
+                (f.stat(), f.ino(), f.rdev(), uid, gid, f.inode_attrs())
             })
         } else {
             // Drive the ASYNC resolver (same as the open/execve path):
@@ -759,7 +770,7 @@ fn stat_ino_path_dir_aware_ext(
             // evdev/drm device" and they refuse to open it.
             .map(|ops| {
                 let (uid, gid) = ops.owners();
-                (ops.stat(), ops.ino(), ops.rdev(), uid, gid)
+                (ops.stat(), ops.ino(), ops.rdev(), uid, gid, ops.inode_attrs())
             })
         }
     })
@@ -769,6 +780,11 @@ fn stat_ino_path_dir_aware_ext(
     }
     if let Some(dir) = resolve_dir_absolute(path) {
         let (uid, gid) = dir.dir_owners();
+        let attrs = dir.inode_attrs();
+        // A directory has a real mtime on any filesystem that tracks one;
+        // reporting 0 made every directory look like the epoch to `ls -l`,
+        // `make` and `rsync`.
+        let dir_mtime = dir.dir_mtime_ns();
         // Report the directory's real (chmod-settable) mode, not a
         // hardcoded 0o777 — dbus/systemd reject XDG_RUNTIME_DIR unless
         // it is not group/other-writable, so `chmod 0700` must show.
@@ -784,12 +800,13 @@ fn stat_ino_path_dir_aware_ext(
                     file_type: narf_filesystem::FileType::Dir,
                     perms: dir.dir_mode(),
                 },
-                mtime_cycles: 0,
+                mtime_cycles: narf_time::ns_to_cycles(dir_mtime),
             },
             dir.ino(),
             0,
             uid,
             gid,
+            attrs,
         ));
     }
     // A path that is an ancestor of a mount point (e.g. /sys/fs when
@@ -816,6 +833,7 @@ fn stat_ino_path_dir_aware_ext(
             0,
             0,
             0,
+            narf_filesystem::InodeAttrs::default(),
         ));
     }
     None

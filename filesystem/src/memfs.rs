@@ -34,8 +34,8 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::posix_acl::{AclType, PosixAcl, XATTR_NAME_POSIX_ACL_ACCESS};
 use crate::{
     DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture, FsInstance, FsStat,
-    Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS, QIF_BTIME,
-    QIF_ILIMITS, QIF_INODES, QIF_ITIME, QIF_SPACE,
+    InodeAttrs, Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS,
+    QIF_BTIME, QIF_ILIMITS, QIF_INODES, QIF_ITIME, QIF_SPACE,
 };
 
 const PAGE_SIZE: u64 = 4096;
@@ -608,6 +608,9 @@ impl QuotaState {
 #[derive(Debug)]
 struct MemSuper {
     kind: MemFsKind,
+    /// This superblock's anonymous device number — Linux's
+    /// `get_anon_bdev` result, reported as every inode's `st_dev`.
+    dev: u64,
     /// Mount-wide block limit in 4-KiB pages. **0 is unlimited**, which is
     /// Linux's own encoding for `sbinfo->max_blocks` — keeping the same
     /// sentinel lets this be a plain atomic instead of a locked `Option`.
@@ -691,6 +694,7 @@ impl MemSuper {
         Arc::new(Self {
             anonymous: core::sync::atomic::AtomicBool::new(false),
             kind,
+            dev: alloc_anon_dev(),
             max_blocks: AtomicU64::new(max_blocks.unwrap_or(0)),
             used_blocks: AtomicU64::new(0),
             max_inodes: AtomicU64::new(max_inodes.unwrap_or(0)),
@@ -1197,6 +1201,113 @@ impl Drop for InodeLease {
     }
 }
 
+/// Anonymous device numbers, Linux `fs/super.c::get_anon_bdev`.
+///
+/// Every superblock without a block device still needs a distinct `st_dev`,
+/// because that is what makes two files on different mounts different files:
+/// `rename` across them is EXDEV, `find -xdev` prunes at the boundary, `du
+/// -x` stops, and systemd's mount-point probe compares a directory's
+/// `st_dev` with its parent's. NARF reported 0 for every mount, so every
+/// tmpfs looked like the same filesystem as every other — and as the root.
+static NEXT_ANON_MINOR: AtomicU64 = AtomicU64::new(1);
+
+/// Linux `new_encode_dev` for major 0: the low 8 bits of the minor stay
+/// put and the rest moves above the 12-bit major field.
+fn alloc_anon_dev() -> u64 {
+    let minor = NEXT_ANON_MINOR.fetch_add(1, Ordering::Relaxed);
+    (minor & 0xff) | ((minor & !0xff) << 12)
+}
+
+/// Wall-clock nanoseconds since the epoch, the unit every inode timestamp
+/// is stored in.
+fn wall_now_ns() -> u64 {
+    let w = narf_time::now_wall();
+    (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64
+}
+
+/// Linux `RELATIME_DISCARD_SECS`-equivalent: relatime refreshes an atime
+/// that is more than a day stale even when nothing else changed
+/// (`fs/inode.c::relatime_need_update`).
+const RELATIME_STALE_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// An inode's three timestamps, in wall-clock nanoseconds.
+///
+/// Kept as three atomics rather than a lock: a node exists for every file
+/// the suite and a booted userspace create, and the per-node heap margin
+/// here is tight (see the note on `MemFile`'s DAC atomics). Relaxed
+/// ordering is right — these are independent metadata, not a
+/// synchronisation point.
+#[derive(Debug)]
+struct Times {
+    atime_ns: AtomicU64,
+    mtime_ns: AtomicU64,
+    ctime_ns: AtomicU64,
+}
+
+impl Times {
+    /// A freshly created inode: `shmem_get_inode` stamps
+    /// `simple_inode_init_ts`, so all three start at "now".
+    fn now() -> Self {
+        let now = wall_now_ns();
+        Self {
+            atime_ns: AtomicU64::new(now),
+            mtime_ns: AtomicU64::new(now),
+            ctime_ns: AtomicU64::new(now),
+        }
+    }
+
+    /// A data change — `file_update_time` moves mtime AND ctime.
+    fn touch_mtime(&self) {
+        let now = wall_now_ns();
+        self.mtime_ns.store(now, Ordering::Relaxed);
+        self.ctime_ns.store(now, Ordering::Relaxed);
+    }
+
+    /// A metadata change — chmod, chown, link, rename, setxattr. Linux
+    /// moves ONLY ctime here, which is exactly what makes ctime worth
+    /// reporting separately: `chmod` must not make a file look rebuilt to
+    /// `make`.
+    fn touch_ctime(&self) {
+        self.ctime_ns.store(wall_now_ns(), Ordering::Relaxed);
+    }
+
+    /// `fs/inode.c::touch_atime` under the default `relatime` mount
+    /// policy, whose rule is `relatime_need_update`:
+    ///
+    /// ```text
+    /// if (inode_get_atime <= inode_get_mtime) return 1;
+    /// if (inode_get_atime <= inode_get_ctime) return 1;
+    /// if ((long)(now.tv_sec - atime.tv_sec) >= 24*60*60) return 1;
+    /// return 0;
+    /// ```
+    ///
+    /// i.e. atime is refreshed only when it is older than the last change
+    /// or a day stale — which is why a read loop over a warm file does not
+    /// keep dirtying its inode.
+    fn touch_atime(&self) {
+        let atime = self.atime_ns.load(Ordering::Relaxed);
+        let now = wall_now_ns();
+        let needs_update = atime <= self.mtime_ns.load(Ordering::Relaxed)
+            || atime <= self.ctime_ns.load(Ordering::Relaxed)
+            || now.saturating_sub(atime) >= RELATIME_STALE_NS;
+        if needs_update {
+            self.atime_ns.store(now, Ordering::Relaxed);
+        }
+    }
+
+    fn atime(&self) -> u64 {
+        self.atime_ns.load(Ordering::Relaxed)
+    }
+
+    fn mtime(&self) -> u64 {
+        self.mtime_ns.load(Ordering::Relaxed)
+    }
+
+    fn ctime(&self) -> u64 {
+        self.ctime_ns.load(Ordering::Relaxed)
+    }
+}
+
 /// Linux `fs/xattr.c::simple_xattr_space` — the deterministic inode-space
 /// charge for one extended attribute. The 40 is upstream's fixed stand-in
 /// for `sizeof(struct simple_xattr)`, chosen so the number does not move
@@ -1473,12 +1584,18 @@ struct MemFile {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
-    /// Modification time as wall-clock nanoseconds since the epoch; 0 =
-    /// "never stamped" (stat then reports mtime_cycles 0, the pre-mtime
-    /// behavior). One more 8-byte atomic per node — deliberately NOT a
-    /// lock, per the heap-margin note above. Stamped by `write` and set
-    /// explicitly through `FileOps::set_times` (utimensat/utime/utimes).
-    mtime_ns: AtomicU64,
+    /// The three inode timestamps as wall-clock nanoseconds since the
+    /// epoch. Three 8-byte atomics per node — deliberately NOT a lock, per
+    /// the heap-margin note above. mtime is stamped by `write` and set
+    /// explicitly through `FileOps::set_times` (utimensat/utime/utimes);
+    /// ctime moves with every metadata change; atime follows relatime.
+    times: Times,
+    /// Hard links to this inode. Starts at 1 for a named file and at **0**
+    /// for an `O_TMPFILE` inode — Linux creates that one with
+    /// `inode->i_nlink == 0` and `linkat(AT_EMPTY_PATH)` is what raises it,
+    /// so `fstat` on the fd reporting 0 is the documented way to tell an
+    /// unlinked temporary apart from a named file.
+    nlink: AtomicU32,
     /// Content/length generation used by the generic shared-mmap page cache.
     /// Zero is never published, so wrap simply skips it. A cache entry is
     /// reusable after its final unmap only while this generation matches.
@@ -1520,7 +1637,8 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
-            mtime_ns: AtomicU64::new(0),
+            times: Times::now(),
+            nlink: AtomicU32::new(1),
             mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
@@ -1550,7 +1668,8 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(uid),
             gid: AtomicU32::new(gid),
-            mtime_ns: AtomicU64::new(0),
+            times: Times::now(),
+            nlink: AtomicU32::new(1),
             mmap_generation: AtomicU64::new(1),
             sock: false,
             xattrs: Xattrs::new(),
@@ -1571,20 +1690,19 @@ impl MemFile {
             perms: AtomicU32::new((perms & 0o7777) as u32),
             uid: AtomicU32::new(0),
             gid: AtomicU32::new(0),
-            mtime_ns: AtomicU64::new(0),
+            times: Times::now(),
+            nlink: AtomicU32::new(1),
             mmap_generation: AtomicU64::new(1),
             sock: true,
             xattrs: Xattrs::new(),
         })
     }
 
-    /// Stamp mtime = wall-now. Called on every successful write so
-    /// `make`-style newer-than comparisons see fresh build outputs as
-    /// newer than their sources.
+    /// Stamp mtime (and, as `file_update_time` does, ctime) = wall-now.
+    /// Called on every successful write so `make`-style newer-than
+    /// comparisons see fresh build outputs as newer than their sources.
     fn touch_mtime_now(&self) {
-        let w = narf_time::now_wall();
-        let ns = (w.secs.max(0) as u64).saturating_mul(1_000_000_000) + w.nanos as u64;
-        self.mtime_ns.store(ns, Ordering::Relaxed);
+        self.times.touch_mtime();
     }
 
     fn bump_mmap_generation(&self) {
@@ -1917,6 +2035,9 @@ impl FileOps for MemFile {
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // `file_accessed()` -> `touch_atime()` on every read; the relatime
+        // test inside keeps a warm read loop from restamping the inode.
+        self.times.touch_atime();
         Box::pin(async move { Ok(self.data.lock().read(offset, buf)) })
     }
 
@@ -1924,13 +2045,31 @@ impl FileOps for MemFile {
         Box::pin(async move { self.write_inner(offset, buf) })
     }
 
-    fn set_times(&self, _atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
-        // atime is accepted and dropped (NARF tracks no access times —
-        // the relatime spirit); mtime round-trips through `stat`.
+    fn set_times(&self, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> Result<(), FsError> {
+        // `notify_change` with ATTR_ATIME/ATTR_MTIME also sets ctime:
+        // "For the ATTR_*TIME cases the caller ... setattr_copy() updates
+        // the ctime". So an explicit utimensat leaves a ctime of now, not
+        // the time it set.
+        if let Some(ns) = atime_ns {
+            self.times.atime_ns.store(ns, Ordering::Relaxed);
+        }
         if let Some(ns) = mtime_ns {
-            self.mtime_ns.store(ns, Ordering::Relaxed);
+            self.times.mtime_ns.store(ns, Ordering::Relaxed);
+        }
+        if atime_ns.is_some() || mtime_ns.is_some() {
+            self.times.touch_ctime();
         }
         Ok(())
+    }
+
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            nlink: self.nlink.load(Ordering::Relaxed),
+            dev: self.superblock().dev,
+            atime_ns: self.times.atime(),
+            ctime_ns: self.times.ctime(),
+            tracked: true,
+        }
     }
 
     fn stat(&self) -> Stat {
@@ -1958,7 +2097,7 @@ impl FileOps for MemFile {
             // there — self-cancelling ONLY because both were the same
             // truncated integer, which stopped being true the moment
             // either side moved to the calibrated scale.
-            mtime_cycles: narf_time::ns_to_cycles(self.mtime_ns.load(Ordering::Relaxed)),
+            mtime_cycles: narf_time::ns_to_cycles(self.times.mtime()),
         }
     }
 
@@ -1982,6 +2121,9 @@ impl FileOps for MemFile {
             self.gid.store(gid, Ordering::Relaxed);
             drop(data);
             self.perms.fetch_and(!0o6000, Ordering::Relaxed);
+            // `notify_change`/`setattr_copy`: an ownership change moves
+            // ctime and leaves mtime alone.
+            self.times.touch_ctime();
             Ok(())
         })
     }
@@ -2012,6 +2154,9 @@ impl FileOps for MemFile {
                 }
             }
             self.perms.store(perms as u32, Ordering::Relaxed);
+            // chmod is a ctime-only change: making a file executable must
+            // not make `make` think it was rebuilt.
+            self.times.touch_ctime();
             Ok(())
         })
     }
@@ -2058,7 +2203,10 @@ impl FileOps for MemFile {
             // bound pathname AF_UNIX socket leaves behind, which `MemFile`
             // also backs. Every attribute is charged inode space.
             self.xattrs
-                .set(&self._inode_lease, name, value, flags, !self.sock)
+                .set(&self._inode_lease, name, value, flags, !self.sock)?;
+            // `shmem_xattr_handler_set` ends with `inode_set_ctime_current`.
+            self.times.touch_ctime();
+            Ok(())
         })
     }
 
@@ -2106,7 +2254,9 @@ impl FileOps for MemFile {
                 }
                 return Ok(());
             }
-            self.xattrs.remove(&self._inode_lease, name, !self.sock)
+            self.xattrs.remove(&self._inode_lease, name, !self.sock)?;
+            self.times.touch_ctime();
+            Ok(())
         })
     }
 
@@ -2213,6 +2363,7 @@ struct MemSymlink {
     _inode_lease: InodeLease,
     uid: AtomicU32,
     gid: AtomicU32,
+    times: Times,
     xattrs: Xattrs,
 }
 
@@ -2275,6 +2426,17 @@ impl FileOps for MemSymlink {
         })
     }
 
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            // A symlink is never hard-linked by NARF's namespace ops.
+            nlink: 1,
+            dev: self._inode_lease.superblock.dev,
+            atime_ns: self.times.atime(),
+            ctime_ns: self.times.ctime(),
+            tracked: true,
+        }
+    }
+
     // `shmem_symlink_inode_operations` carries `.listxattr`, and the
     // handlers hang off the superblock, so a tmpfs symlink holds extended
     // attributes. `user.*` is not among them: `xattr_permission` allows
@@ -2307,6 +2469,7 @@ struct MemSpecial {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    times: Times,
     xattrs: Xattrs,
 }
 
@@ -2375,6 +2538,16 @@ impl FileOps for MemSpecial {
         self.rdev
     }
 
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            nlink: 1,
+            dev: self._inode_lease.superblock.dev,
+            atime_ns: self.times.atime(),
+            ctime_ns: self.times.ctime(),
+            tracked: true,
+        }
+    }
+
     // `shmem_special_inode_operations` carries `.listxattr`; a device node
     // or socket on tmpfs holds `trusted.*`/`security.*` attributes (SELinux
     // labels device nodes this way) but not `user.*`.
@@ -2403,6 +2576,7 @@ impl FileOps for MemSpecial {
 struct MemFifo {
     node: Arc<crate::fifo::FifoNode>,
     _inode_lease: InodeLease,
+    times: Times,
     xattrs: Xattrs,
 }
 
@@ -2441,6 +2615,16 @@ impl FileOps for MemFifo {
 
     fn fifo_shared(&self) -> Option<Arc<crate::fifo::FifoShared>> {
         self.node.fifo_shared()
+    }
+
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            nlink: 1,
+            dev: self._inode_lease.superblock.dev,
+            atime_ns: self.times.atime(),
+            ctime_ns: self.times.ctime(),
+            tracked: true,
+        }
     }
 
     // A FIFO is one of `shmem_special_inode_operations`' inodes, so it holds
@@ -2561,6 +2745,16 @@ struct MemDir {
     perms: AtomicU32,
     uid: AtomicU32,
     gid: AtomicU32,
+    times: Times,
+    /// Immediate SUBDIRECTORIES, so `st_nlink` can be Linux's
+    /// `2 + subdirs` without walking the entry map on every `stat`.
+    /// Maintained under the `entries` lock alongside the map itself.
+    ///
+    /// `find` reads a directory's link count to decide whether it can hold
+    /// subdirectories at all (the leaf optimisation): a count of exactly 2
+    /// means every remaining child is a non-directory and need not be
+    /// stat'd. Reporting a flat 1 disabled that for every directory.
+    subdirs: AtomicU32,
     /// `shmem_dir_inode_operations` carries `.listxattr`, so a tmpfs
     /// directory takes extended attributes like any other inode — this is
     /// where an SELinux label on `/tmp` itself lives.
@@ -2576,6 +2770,70 @@ impl fmt::Debug for MemDir {
 }
 
 impl MemDir {
+    /// Record that a subdirectory appeared or disappeared, so `st_nlink`
+    /// stays `2 + subdirs`.
+    fn adjust_subdirs(&self, delta: i32) {
+        if delta > 0 {
+            self.subdirs.fetch_add(delta as u32, Ordering::Relaxed);
+        } else if delta < 0 {
+            let _ = self
+                .subdirs
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(count.saturating_sub((-delta) as u32))
+                });
+        }
+    }
+
+    /// A namespace change in this directory: `shmem_{create,mkdir,unlink,
+    /// rmdir,rename2,…}` all end at `inode_set_mtime_to_ts(dir,
+    /// inode_set_ctime_current(dir))`, so both stamps move together.
+    fn touch_dir_mtime(&self) {
+        self.times.touch_mtime();
+    }
+
+    /// Adjust the link count of the inode an entry names, when the entry
+    /// itself is added or removed. Directories are not counted here — their
+    /// link count is derived from [`MemDir::subdirs`].
+    /// Whether an entry names a subdirectory, i.e. whether moving it
+    /// changes a parent's `st_nlink`.
+    fn entry_is_dir(entry: &Entry) -> bool {
+        matches!(entry, Entry::Dir(_))
+    }
+
+    /// Both directories a rename touched: `simple_rename_timestamp` stamps
+    /// mtime+ctime on the old AND new parent. The moved inode's own ctime
+    /// is stamped at the point it is re-filed, where the entry is still in
+    /// hand.
+    fn stamp_rename(&self, destination: &MemDir) {
+        self.touch_dir_mtime();
+        if !core::ptr::eq(self, destination) {
+            destination.touch_dir_mtime();
+        }
+    }
+
+    fn adjust_entry_nlink(entry: &Entry, delta: i32) {
+        let file = match entry {
+            Entry::File(file) => Some(&**file),
+            Entry::Node(node) => node.as_any().and_then(|any| any.downcast_ref::<MemFile>()),
+            _ => None,
+        };
+        if let Some(file) = file {
+            let _ = file
+                .nlink
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                    Some(if delta >= 0 {
+                        count.saturating_add(delta as u32)
+                    } else {
+                        count.saturating_sub((-delta) as u32)
+                    })
+                });
+            // Adding or dropping a name is a change to the INODE's
+            // metadata: `shmem_link`/`shmem_unlink` stamp
+            // `inode_set_ctime_current(inode)` on the target.
+            file.times.touch_ctime();
+        }
+    }
+
     #[inline]
     fn bump_entry_generation(&self) {
         self.entry_generation.fetch_add(1, Ordering::AcqRel);
@@ -2712,6 +2970,10 @@ impl MemDir {
                 entries.insert(old_name.to_string(), new);
                 entries.insert(new_name.to_string(), old);
                 self.bump_entry_generation();
+                drop(entries);
+                // Both entries keep the same parent, so no link count
+                // moves; only the timestamps do.
+                self.stamp_rename(self);
                 return Ok(());
             }
             if flags == RENAME_NOREPLACE && entries.contains_key(new_name) {
@@ -2724,8 +2986,21 @@ impl MemDir {
                     return Err(error);
                 }
             }
-            entries.insert(new_name.to_string(), source);
+            // A replaced destination loses its name — for a file that is a
+            // link count going down (and possibly to zero), for a directory
+            // it is one fewer `..` pointing at this one.
+            // The moved inode's name changed but its data did not, so it
+            // takes a ctime stamp and no link-count change.
+            Self::adjust_entry_nlink(&source, 0);
+            if let Some(replaced) = entries.insert(new_name.to_string(), source) {
+                Self::adjust_entry_nlink(&replaced, -1);
+                if Self::entry_is_dir(&replaced) {
+                    self.adjust_subdirs(-1);
+                }
+            }
             self.bump_entry_generation();
+            drop(entries);
+            self.stamp_rename(self);
             return Ok(());
         }
 
@@ -2749,10 +3024,25 @@ impl MemDir {
                     return Err(FsError::NotFound);
                 }
             };
+            // Each entry changes parent, so a directory on either side
+            // moves its `..` link with it.
+            let old_is_dir = Self::entry_is_dir(&old);
+            let new_is_dir = Self::entry_is_dir(&new);
             source_entries.insert(old_name.to_string(), new);
             destination_entries.insert(new_name.to_string(), old);
             self.bump_entry_generation();
             destination.bump_entry_generation();
+            drop(first);
+            drop(second);
+            if old_is_dir {
+                self.adjust_subdirs(-1);
+                destination.adjust_subdirs(1);
+            }
+            if new_is_dir {
+                destination.adjust_subdirs(-1);
+                self.adjust_subdirs(1);
+            }
+            self.stamp_rename(destination);
             return Ok(());
         }
         if flags == RENAME_NOREPLACE && destination_entries.contains_key(new_name) {
@@ -2765,9 +3055,23 @@ impl MemDir {
                 return Err(error);
             }
         }
-        destination_entries.insert(new_name.to_string(), source);
+        let source_is_dir = Self::entry_is_dir(&source);
+        Self::adjust_entry_nlink(&source, 0);
+        if let Some(replaced) = destination_entries.insert(new_name.to_string(), source) {
+            Self::adjust_entry_nlink(&replaced, -1);
+            if Self::entry_is_dir(&replaced) {
+                destination.adjust_subdirs(-1);
+            }
+        }
         self.bump_entry_generation();
         destination.bump_entry_generation();
+        drop(first);
+        drop(second);
+        if source_is_dir {
+            self.adjust_subdirs(-1);
+            destination.adjust_subdirs(1);
+        }
+        self.stamp_rename(destination);
         Ok(())
     }
 
@@ -2882,7 +3186,11 @@ impl DirOps for MemDir {
                 | Some(Entry::Special(_))
                 | Some(Entry::Node(_))
                 | Some(Entry::Fifo(_)) => {
-                    g.remove(name);
+                    if let Some(entry) = g.remove(name) {
+                        Self::adjust_entry_nlink(&entry, -1);
+                    }
+                    drop(g);
+                    self.touch_dir_mtime();
                     Ok(())
                 }
             }
@@ -2897,6 +3205,8 @@ impl DirOps for MemDir {
             }
             let f = Arc::new(MemFile::new(&self.superblock, &[])?);
             g.insert(name.to_string(), Entry::File(Arc::clone(&f)));
+            drop(g);
+            self.touch_dir_mtime();
             Ok(f as Arc<dyn FileOps>)
         })
     }
@@ -2972,9 +3282,12 @@ impl DirOps for MemDir {
                 let fifo = Arc::new(MemFifo {
                     node: Arc::new(crate::fifo::FifoNode::new(alloc_ino(), DEFAULT_PERMS)),
                     _inode_lease: self.superblock.reserve_inode(0, 0)?,
+                    times: Times::now(),
                     xattrs: Xattrs::new(),
                 });
                 g.insert(name.to_string(), Entry::Fifo(Arc::clone(&fifo)));
+                drop(g);
+                self.touch_dir_mtime();
                 Ok(fifo as Arc<dyn FileOps>)
             } else {
                 let node = Arc::new(MemSpecial {
@@ -2985,9 +3298,12 @@ impl DirOps for MemDir {
                     perms: AtomicU32::new(DEFAULT_PERMS as u32),
                     uid: AtomicU32::new(0),
                     gid: AtomicU32::new(0),
+                    times: Times::now(),
                     xattrs: Xattrs::new(),
                 });
                 g.insert(name.to_string(), Entry::Special(Arc::clone(&node)));
+                drop(g);
+                self.touch_dir_mtime();
                 Ok(node as Arc<dyn FileOps>)
             }
         })
@@ -3008,12 +3324,35 @@ impl DirOps for MemDir {
                 perms: AtomicU32::new(0o755),
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
+                times: Times::now(),
+                subdirs: AtomicU32::new(0),
                 xattrs: Xattrs::new(),
             });
             g.insert(name.to_string(), Entry::Dir(Arc::clone(&d)));
             self.bump_entry_generation();
+            // A new subdirectory's `..` is a link to this one, so the
+            // parent's `st_nlink` goes up (`shmem_mkdir` -> `inc_nlink(dir)`).
+            self.adjust_subdirs(1);
+            drop(g);
+            self.touch_dir_mtime();
             Ok(d as Arc<dyn DirOps>)
         })
+    }
+
+    fn dir_mtime_ns(&self) -> u64 {
+        self.times.mtime()
+    }
+
+    fn inode_attrs(&self) -> InodeAttrs {
+        InodeAttrs {
+            // Linux gives a directory one link for its name in the parent,
+            // one for its own `.`, and one more for each child's `..`.
+            nlink: 2u32.saturating_add(self.subdirs.load(Ordering::Relaxed)),
+            dev: self.superblock.dev,
+            atime_ns: self.times.atime(),
+            ctime_ns: self.times.ctime(),
+            tracked: true,
+        }
     }
 
     fn dir_mode(&self) -> u16 {
@@ -3052,6 +3391,9 @@ impl DirOps for MemDir {
                     }
                     g.remove(name);
                     self.bump_entry_generation();
+                    self.adjust_subdirs(-1);
+                    drop(g);
+                    self.touch_dir_mtime();
                     Ok(())
                 }
             }
@@ -3070,9 +3412,12 @@ impl DirOps for MemDir {
                 _inode_lease: self.superblock.reserve_inode(0, 0)?,
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
+                times: Times::now(),
                 xattrs: Xattrs::new(),
             });
             g.insert(name.to_string(), Entry::Symlink(Arc::clone(&s)));
+            drop(g);
+            self.touch_dir_mtime();
             Ok(s as Arc<dyn FileOps>)
         })
     }
@@ -3113,7 +3458,10 @@ impl DirOps for MemDir {
             // AT_SYMLINK_FOLLOW). Directories can't be hard-linked
             // (Linux: EPERM).
             let aliased = Self::clone_linkable(g.get(old_name).ok_or(FsError::NotFound)?)?;
+            Self::adjust_entry_nlink(&aliased, 1);
             g.insert(new_name.to_string(), aliased);
+            drop(g);
+            self.touch_dir_mtime();
             Ok(())
         })
     }
@@ -3144,7 +3492,10 @@ impl DirOps for MemDir {
                     return Err(FsError::Busy);
                 }
                 let linked = Self::clone_linkable(first.get(old_name).ok_or(FsError::NotFound)?)?;
+                Self::adjust_entry_nlink(&linked, 1);
                 first.insert(new_name.to_string(), linked);
+                drop(first);
+                self.touch_dir_mtime();
                 return Ok(());
             }
             let mut second = if self_first {
@@ -3161,7 +3512,11 @@ impl DirOps for MemDir {
                 return Err(FsError::Busy);
             }
             let linked = Self::clone_linkable(source.get(old_name).ok_or(FsError::NotFound)?)?;
+            Self::adjust_entry_nlink(&linked, 1);
             target.insert(new_name.to_string(), linked);
+            drop(first);
+            drop(second);
+            destination.touch_dir_mtime();
             Ok(())
         })
     }
@@ -3207,7 +3562,14 @@ impl DirOps for MemDir {
             // O_TMPFILE fd and this new name now alias the one inode, so
             // the bytes already written through the fd are visible under
             // the name the instant it appears.
-            g.insert(name.to_string(), Entry::Node(node));
+            let entry = Entry::Node(node);
+            // `linkat(AT_EMPTY_PATH)` on an O_TMPFILE fd is what gives the
+            // inode its first name: Linux's `shmem_tmpfile` leaves
+            // `i_nlink == 0` and `vfs_link` -> `inc_nlink` raises it here.
+            Self::adjust_entry_nlink(&entry, 1);
+            g.insert(name.to_string(), entry);
+            drop(g);
+            self.touch_dir_mtime();
             Ok(())
         })
     }
@@ -3216,6 +3578,12 @@ impl DirOps for MemDir {
         Box::pin(async move {
             let file = Arc::new(MemFile::new(&self.superblock, &[])?);
             file.perms.store(mode & 0o7777, Ordering::Relaxed);
+            // An O_TMPFILE inode has NO name: `shmem_tmpfile` reaches
+            // `d_tmpfile`, which does `inode_dec_link_count(inode)` from 1
+            // to 0. `fstat` on the fd reporting `st_nlink == 0` is how
+            // userspace tells an unlinked temporary from a named file, and
+            // it is also the state `linkat(AT_EMPTY_PATH)` raises.
+            file.nlink.store(0, Ordering::Relaxed);
             Ok(file as Arc<dyn FileOps>)
         })
     }
@@ -3225,7 +3593,9 @@ impl DirOps for MemDir {
     fn set_xattr<'a>(&'a self, name: &'a str, value: &'a [u8], flags: u32) -> FsFuture<'a, ()> {
         Box::pin(async move {
             self.xattrs
-                .set(&self._inode_lease, name, value, flags, true)
+                .set(&self._inode_lease, name, value, flags, true)?;
+            self.times.touch_ctime();
+            Ok(())
         })
     }
 
@@ -3238,7 +3608,11 @@ impl DirOps for MemDir {
     }
 
     fn remove_xattr<'a>(&'a self, name: &'a str) -> FsFuture<'a, ()> {
-        Box::pin(async move { self.xattrs.remove(&self._inode_lease, name, true) })
+        Box::pin(async move {
+            self.xattrs.remove(&self._inode_lease, name, true)?;
+            self.times.touch_ctime();
+            Ok(())
+        })
     }
 
     fn supports_tmpfile(&self) -> bool {
@@ -3319,6 +3693,8 @@ impl MemFs {
             perms: AtomicU32::new(root_mode as u32),
             uid: AtomicU32::new(root_uid),
             gid: AtomicU32::new(root_gid),
+            times: Times::now(),
+            subdirs: AtomicU32::new(0),
             xattrs: Xattrs::new(),
         });
         Ok(Self {

@@ -2523,14 +2523,19 @@ pub mod linux_compat {
     pub const AT_STATX_SYNC_TYPE: u32 = 0x6000;
 }
 
-// Build a Linux-shaped struct stat from a `narf_filesystem::Stat`.
-// Same conventions as sys_statx (uid/gid/atime not tracked).
+// Build a Linux-shaped struct stat from a `narf_filesystem::Stat` plus the
+// fields it does not carry (`narf_filesystem::InodeAttrs`).
+//
+// `attrs` is `Default` for a filesystem that models none of them, and each
+// field then falls back to what this reported before the attrs existed:
+// `st_nlink = 1`, `st_dev = 0`, and mtime standing in for atime and ctime.
 fn linux_stat_from_fs(
     s: narf_filesystem::Stat,
     uid: u32,
     gid: u32,
     rdev: u64,
     ino: u64,
+    attrs: narf_filesystem::InodeAttrs,
 ) -> linux_compat::Stat {
     let ftype_bits: u32 = match s.mode.file_type {
         narf_filesystem::FileType::File => 0o100000,
@@ -2543,12 +2548,27 @@ fn linux_stat_from_fs(
     };
     let mode_word: u32 = ftype_bits | (s.mode.perms as u32 & 0o7777);
     let mtime_ns = narf_time::cycles_to_ns(s.mtime_cycles);
-    let mtime = linux_compat::Timespec {
-        tv_sec: (mtime_ns / 1_000_000_000) as i64,
-        tv_nsec: (mtime_ns % 1_000_000_000) as i64,
+    let timespec = |ns: u64| linux_compat::Timespec {
+        tv_sec: (ns / 1_000_000_000) as i64,
+        tv_nsec: (ns % 1_000_000_000) as i64,
     };
+    let mtime = timespec(mtime_ns);
+    // A filesystem that tracks atime/ctime separately gets them reported
+    // separately: `chmod` must move ctime without moving mtime, or `tar`,
+    // `rsync` and incremental-backup tooling cannot tell a re-permissioned
+    // file from a rewritten one.
+    let atime = timespec(if attrs.atime_ns != 0 {
+        attrs.atime_ns
+    } else {
+        mtime_ns
+    });
+    let ctime = timespec(if attrs.ctime_ns != 0 {
+        attrs.ctime_ns
+    } else {
+        mtime_ns
+    });
     linux_compat::Stat {
-        st_dev: 0,
+        st_dev: attrs.dev,
         // Prefer the filesystem's real inode (distinct per file). Only fall
         // back to the size/mtime hash for synthetic filesystems that report
         // no inode (ino == 0) — and never for disk files, whose same-size
@@ -2558,7 +2578,11 @@ fn linux_stat_from_fs(
         } else {
             (s.mtime_cycles ^ (s.size << 1)) & 0x0fff_ffff_ffff_ffff
         },
-        st_nlink: 1,
+        // `tracked` and not `nlink != 0` is the test on purpose: an
+        // `O_TMPFILE` inode really does have zero links until `linkat`
+        // gives it a name, and that zero is how userspace tells an
+        // unlinked temporary from a named file.
+        st_nlink: if attrs.tracked { attrs.nlink as u64 } else { 1 },
         st_mode: mode_word,
         st_uid: uid,
         st_gid: gid,
@@ -2567,9 +2591,9 @@ fn linux_stat_from_fs(
         st_size: s.size as i64,
         st_blksize: 4096,
         st_blocks: s.blocks as i64,
-        st_atim: mtime,
+        st_atim: atime,
         st_mtim: mtime,
-        st_ctim: mtime,
+        st_ctim: ctime,
         __unused: [0; 3],
     }
 }
@@ -2630,7 +2654,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // `/tmp`, …) rel is empty and `resolve(_, "")` rejects with
     // InvalidPath. busybox `ls /bin` lands here, so synthesise a
     // directory-shaped stat for the mount root.
-    let (s, ino, rdev, uid, gid) = match stat_ino_path_dir_aware_ext(path, follow_final) {
+    let (s, ino, rdev, uid, gid, attrs) = match stat_ino_path_dir_aware_ext(path, follow_final) {
         Some(tuple) => tuple,
         None => {
             // Missing file → ENOENT, not the bare -1 (musl → EPERM). Probes
@@ -2655,7 +2679,7 @@ fn stat_linux_path(ctx: &mut dyn TrapContext, raw: &str, out_arg: u64, follow_fi
     // Report the device node's rdev (major:minor) for PATH stat too: seatd /
     // libudev validate a device's type from a path stat before opening it, so
     // a 0 rdev makes them reject evdev nodes (weston input never opens).
-    let out = linux_stat_from_fs(s, uid, gid, rdev, ino);
+    let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
     // SAFETY: `out` is a live repr(C) Stat; the slice spans exactly its size
     // and borrows it for the duration of the copy below.
     // SAFETY: Valid memory or trusted environment
