@@ -55,7 +55,7 @@ pub(crate) fn sys_mincore(ctx: &mut dyn TrapContext) {
     let as_ref = match current_address_space() {
         Some(x) => x,
         None => {
-            ctx.set_return(SyscallReturn::invalid_op());
+            ctx.set_return(no_address_space());
             return;
         }
     };

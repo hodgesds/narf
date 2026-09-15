@@ -144,9 +144,17 @@ fn smoke_abi_mem_memfd_secret_cloexec_pos() -> TestResult {
 kernel_test_in!("syscall_abi", smoke_abi_mem_memfd_secret_cloexec_pos);
 
 // ── Mmap (9) ─────────────────────────────────────────────────────────
-// No AS in the harness → invalid_op() (call == None). A MAP_FIXED with a
-// misaligned hint hits its own pre-check… but that pre-check is AFTER the
-// AS lookup, so it too returns invalid_op() here. Both pin the no-AS arm.
+// No AS in the harness → the shared `no_address_space()` answer, -ENOMEM. A
+// MAP_FIXED with a misaligned hint hits its own pre-check… but that
+// pre-check is AFTER the AS lookup, so it too lands here. Both pin the
+// no-AS arm.
+//
+// The arm used to answer `invalid_op()`, whose `value` is 0 — the register
+// the Linux ABI returns. For mmap that is not merely a wrong errno but a
+// wrong ADDRESS: libc screens for MAP_FAILED, so a caller took 0 as a valid
+// mapping and dereferenced it. -ENOMEM is what Linux returns when it cannot
+// serve the range, and what the LINUX-GAP markers these cases used to carry
+// already named as the right answer.
 
 fn smoke_abi_mem_mmap_no_as_neg() -> TestResult {
     with_setup(|| {
@@ -159,11 +167,12 @@ fn smoke_abi_mem_mmap_no_as_neg() -> TestResult {
             arg4: (-1i64) as u64,
             arg5: 0,
         };
-        // LINUX-GAP: Linux mmap returns a mapped address (or -ENOMEM);
-        // with no harness AS the handler returns NARF InvalidOp.
-        match call(Syscall::Mmap.raw(), args) {
-            None => Ok(()),
-            Some(_) => Err("mmap with no address space should be InvalidOp"),
+        // `Some(0)` is called out separately because for mmap a 0 is an
+        // address, not just a wrong status.
+        match call_raw(Syscall::Mmap.raw(), args).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mmap reported success with no address space"),
+            _ => Err("mmap with no address space must be -ENOMEM"),
         }
     })
 }
@@ -279,10 +288,12 @@ kernel_test_in!(
 
 fn smoke_abi_mem_munmap_no_as_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux munmap returns 0/-EINVAL; no AS → InvalidOp.
-        match call(Syscall::Munmap.raw(), a1(0x1000, 0x1000)) {
-            None => Ok(()),
-            Some(_) => Err("munmap with no address space should be InvalidOp"),
+        // Linux munmap returns 0/-EINVAL; with no AS there is nothing to
+        // unmap, and reporting 0 claimed the range had been torn down.
+        match call_raw(Syscall::Munmap.raw(), a1(0x1000, 0x1000)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("munmap reported success with no address space"),
+            _ => Err("munmap with no address space must be -ENOMEM"),
         }
     })
 }
@@ -295,11 +306,12 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_munmap_no_as_neg);
 fn smoke_abi_mem_mremap_no_as_neg() -> TestResult {
     with_setup(|| {
         // old_addr=0x1000, old_len=0x1000, new_len=0x2000, flags=0.
-        // LINUX-GAP: Linux mremap returns the (possibly moved) address or
-        // -ENOMEM/-EINVAL; no AS → InvalidOp.
-        match call(Syscall::Mremap.raw(), a3(0x1000, 0x1000, 0x2000, 0)) {
-            None => Ok(()),
-            Some(_) => Err("mremap with no address space should be InvalidOp"),
+        // Linux mremap returns the (possibly moved) address or
+        // -ENOMEM/-EINVAL. As with mmap, a 0 here reads as an address.
+        match call_raw(Syscall::Mremap.raw(), a3(0x1000, 0x1000, 0x2000, 0)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mremap reported success with no address space"),
+            _ => Err("mremap with no address space must be -ENOMEM"),
         }
     })
 }
@@ -310,11 +322,12 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mremap_no_as_neg);
 fn smoke_abi_mem_mprotect_no_as_neg() -> TestResult {
     with_setup(|| {
         // base=0x1000, len=0x1000, prot=PROT_READ(1).
-        // LINUX-GAP: Linux mprotect returns 0/-EINVAL/-EACCES; no AS →
-        // InvalidOp.
-        match call(Syscall::MProtect.raw(), a2(0x1000, 0x1000, 1)) {
-            None => Ok(()),
-            Some(_) => Err("mprotect with no address space should be InvalidOp"),
+        // Linux mprotect returns 0/-EINVAL/-EACCES; -ENOMEM is its
+        // documented answer for a range that is not mapped.
+        match call_raw(Syscall::MProtect.raw(), a2(0x1000, 0x1000, 1)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mprotect reported success with no address space"),
+            _ => Err("mprotect with no address space must be -ENOMEM"),
         }
     })
 }
@@ -324,11 +337,13 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mprotect_no_as_neg);
 
 fn smoke_abi_mem_mlock_no_as_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux mlock returns 0/-ENOMEM/-EPERM; no AS →
-        // InvalidOp.
-        match call(Syscall::MLock.raw(), a1(0x1000, 0x1000)) {
-            None => Ok(()),
-            Some(_) => Err("mlock with no address space should be InvalidOp"),
+        // Linux mlock returns 0/-ENOMEM/-EPERM; -ENOMEM is documented as
+        // "some of the specified address range does not correspond to
+        // mapped pages".
+        match call_raw(Syscall::MLock.raw(), a1(0x1000, 0x1000)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mlock reported success with no address space"),
+            _ => Err("mlock with no address space must be -ENOMEM"),
         }
     })
 }
@@ -358,10 +373,12 @@ kernel_test_in!(
 
 fn smoke_abi_mem_munlock_no_as_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux munlock returns 0/-ENOMEM; no AS → InvalidOp.
-        match call(Syscall::MUnlock.raw(), a1(0x1000, 0x1000)) {
-            None => Ok(()),
-            Some(_) => Err("munlock with no address space should be InvalidOp"),
+        // Linux munlock returns 0/-ENOMEM; reporting 0 claimed pages had
+        // been unlocked that were never locked.
+        match call_raw(Syscall::MUnlock.raw(), a1(0x1000, 0x1000)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("munlock reported success with no address space"),
+            _ => Err("munlock with no address space must be -ENOMEM"),
         }
     })
 }
@@ -390,10 +407,11 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mlock2_bad_flags_pos);
 fn smoke_abi_mem_mlock2_no_as_neg() -> TestResult {
     with_setup(|| {
         // Valid flags (MLOCK_ONFAULT) pass the pre-check, then no AS →
-        // InvalidOp.
-        match call(Syscall::Mlock2.raw(), a3(0x1000, 0x1000, 1, 0)) {
-            None => Ok(()),
-            Some(_) => Err("mlock2 (valid flags, no AS) should be InvalidOp"),
+        // -ENOMEM.
+        match call_raw(Syscall::Mlock2.raw(), a3(0x1000, 0x1000, 1, 0)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mlock2 (valid flags) reported success with no address space"),
+            _ => Err("mlock2 (valid flags) with no address space must be -ENOMEM"),
         }
     })
 }
@@ -418,40 +436,45 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mlockall_bad_flags_pos);
 fn smoke_abi_mem_mlockall_no_as_neg() -> TestResult {
     with_setup(|| {
         // MCL_CURRENT(1) is valid → passes the flag check, then no AS →
-        // InvalidOp.
-        match call(Syscall::Mlockall.raw(), a0(1)) {
-            None => Ok(()),
-            Some(_) => Err("mlockall(MCL_CURRENT, no AS) should be InvalidOp"),
+        // -ENOMEM.
+        match call_raw(Syscall::Mlockall.raw(), a0(1)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mlockall(MCL_CURRENT) reported success with no address space"),
+            _ => Err("mlockall(MCL_CURRENT) with no address space must be -ENOMEM"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mlockall_no_as_neg);
 
 // ── Munlockall (152) ─────────────────────────────────────────────────
-// Pure AS walk; no AS → InvalidOp.
+// Pure AS walk; no AS → -ENOMEM. Reporting 0 claimed every lock in the
+// process had been dropped.
 
 fn smoke_abi_mem_munlockall_no_as_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux munlockall returns 0; no AS → InvalidOp.
-        match call(Syscall::Munlockall.raw(), a0(0)) {
-            None => Ok(()),
-            Some(_) => Err("munlockall with no AS should be InvalidOp"),
+        // Linux munlockall returns 0 when it does the work. Here it does
+        // none, so 0 was a claim about locks that were never cleared.
+        match call_raw(Syscall::Munlockall.raw(), a0(0)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("munlockall reported success with no address space"),
+            _ => Err("munlockall with no address space must be -ENOMEM"),
         }
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_munlockall_no_as_neg);
 
 // ── Madvise (28) ─────────────────────────────────────────────────────
-// AS lookup first → no AS → InvalidOp for every advice value.
+// AS lookup first → no AS → -ENOMEM for every advice value.
 
 fn smoke_abi_mem_madvise_no_as_neg() -> TestResult {
     with_setup(|| {
         // base=0x1000, len=0x1000, advice=MADV_NORMAL(0).
-        // LINUX-GAP: Linux madvise returns 0 for accepted hints; no AS →
-        // InvalidOp.
-        match call(Syscall::Madvise.raw(), a2(0x1000, 0x1000, 0)) {
-            None => Ok(()),
-            Some(_) => Err("madvise with no AS should be InvalidOp"),
+        // Linux madvise returns 0 for accepted hints and -ENOMEM when the
+        // range is not mapped, which is the case here.
+        match call_raw(Syscall::Madvise.raw(), a2(0x1000, 0x1000, 0)).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("madvise reported success with no address space"),
+            _ => Err("madvise with no address space must be -ENOMEM"),
         }
     })
 }
@@ -782,7 +805,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_msync_unaligned_neg);
 
 // ── Mincore (27) ─────────────────────────────────────────────────────
 // addr misaligned → -EINVAL (before the AS lookup). Aligned + no AS →
-// InvalidOp.
+// -ENOMEM.
 
 fn smoke_abi_mem_mincore_unaligned_pos() -> TestResult {
     with_setup(|| {
@@ -800,14 +823,16 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_mincore_unaligned_pos);
 
 fn smoke_abi_mem_mincore_no_as_neg() -> TestResult {
     with_setup(|| {
-        // Aligned addr but no AS → InvalidOp.
+        // Aligned addr but no AS → -ENOMEM.
         let mut vec = [0u8; 1];
         let args = a3(0x1000, 0x1000, vec.as_mut_ptr() as u64, 0);
-        // LINUX-GAP: Linux mincore returns 0/-ENOMEM/-EFAULT; no AS →
-        // InvalidOp.
-        match call(Syscall::Mincore.raw(), args) {
-            None => Ok(()),
-            Some(_) => Err("mincore with no AS should be InvalidOp"),
+        // Linux mincore returns 0/-ENOMEM/-EFAULT. A 0 here was the worst
+        // of the three: it told the caller the residency vector it passed
+        // had been filled in, over a buffer nothing wrote.
+        match call_raw(Syscall::Mincore.raw(), args).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("mincore reported success with no address space"),
+            _ => Err("mincore with no address space must be -ENOMEM"),
         }
     })
 }
@@ -876,7 +901,7 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_pkey_free_bad_key_neg);
 
 // ── PkeyMprotect (329) ───────────────────────────────────────────────
 // arg3=pkey. An out-of-range key (not -1/0/1..16) → -EINVAL before the AS
-// lookup (reachable). A valid key (0) then hits the no-AS arm → InvalidOp.
+// lookup (reachable). A valid key (0) then hits the no-AS arm → -ENOMEM.
 
 fn smoke_abi_mem_pkey_mprotect_bad_key_pos() -> TestResult {
     with_setup(|| {
@@ -894,11 +919,12 @@ kernel_test_in!("syscall_abi", smoke_abi_mem_pkey_mprotect_bad_key_pos);
 fn smoke_abi_mem_pkey_mprotect_no_as_neg() -> TestResult {
     with_setup(|| {
         // pkey = 0 (default, always valid) → passes the key check, then no
-        // AS → InvalidOp.
+        // AS → -ENOMEM.
         let args = a3(0x1000, 0x1000, 1, 0);
-        match call(Syscall::PkeyMprotect.raw(), args) {
-            None => Ok(()),
-            Some(_) => Err("pkey_mprotect (valid key, no AS) should be InvalidOp"),
+        match call_raw(Syscall::PkeyMprotect.raw(), args).value as i64 {
+            v if v == ENOMEM => Ok(()),
+            0 => Err("pkey_mprotect (valid key) reported success with no address space"),
+            _ => Err("pkey_mprotect (valid key) with no address space must be -ENOMEM"),
         }
     })
 }

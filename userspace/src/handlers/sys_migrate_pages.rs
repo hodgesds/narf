@@ -108,7 +108,7 @@ pub(crate) fn sys_migrate_pages(ctx: &mut dyn TrapContext) {
         }
     }
     let Some(as_ref) = current_address_space() else {
-        ctx.set_return(SyscallReturn::invalid_op());
+        ctx.set_return(no_address_space());
         return;
     };
     // SAFETY: the current task owns/uses this live address space.

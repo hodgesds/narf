@@ -403,10 +403,18 @@ fn smoke_abi_pidns_move_pages_self_pid_in_caller_pid_ns() -> TestResult {
                 arg4: status.as_mut_ptr() as u64,
                 arg5: 0, // flags
             };
+            // Reaching the address-space lookup is what proves the pid
+            // check let the caller through. That arm used to answer
+            // `invalid_op()` and this case read its `None` as the signal;
+            // `invalid_op` leaves `value` at 0 though, so the signal was
+            // indistinguishable from move_pages reporting success. It is
+            // now -ENOMEM, a specific value, which says the same thing
+            // without the ambiguity.
             match call(Syscall::MovePages.raw(), args) {
-                None => Ok(()),
+                Some(v) if v == ENOMEM => Ok(()),
                 Some(-1) => Err("move_pages rejected the caller's OWN in-namespace pid with EPERM — arg0 compared untranslated against the outer self pid"),
                 Some(_) => Err("move_pages returned an unexpected result"),
+                None => Err("move_pages did not reach the address-space lookup"),
             }
         })();
         set_task(FAKE_TASK);
