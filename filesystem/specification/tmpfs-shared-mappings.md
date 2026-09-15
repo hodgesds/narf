@@ -23,10 +23,17 @@ copies them back on `msync`/`fsync`. Two consequences, both observable:
   * a `write(2)` is invisible to an already-faulted mapping, forever —
     the mapped frame is never refreshed.
 
-That is not what `mmap(MAP_SHARED)` means, and it is the whole mechanism
-behind `memfd_create` + `mmap` (Wayland buffers, dbus, PulseAudio) and
-`/dev/shm`. `new_anon_file` — what `memfd_create` returns — is a
-`MemFile`, so this affects exactly the objects built for sharing.
+That is not what `mmap(MAP_SHARED)` means. It affects every `MAP_SHARED`
+mapping of a tmpfs FILE: `shm_open` + `mmap` (POSIX shared memory lives on
+`/dev/shm`), and anything that maps a file on `/tmp` or `/run`.
+
+It does NOT affect `memfd_create`, which has its own backing type
+(`MemfdStore` in `userspace/src/linux_compat.rs`) that already stores page
+frames and already answers `mmap_frames`, so two mappings of one memfd
+already aliased the same memory — that is what makes `wl_shm` work.
+`memfs::new_anon_file` exists but only two unit tests call it. An earlier
+draft of this document claimed memfd went through `MemFile`; it does not,
+and the corrected scope is narrower.
 
 ## What already exists
 
@@ -123,3 +130,14 @@ once, then map.
 
 Each new smoke is run against a deliberately stubbed mechanism first and
 required to fail with the expected message.
+
+End-to-end, through the real syscall path rather than the trait:
+`verification/data/musl-demo/tmpfs_share_smoke_x86_64.c` opens a file on
+`/tmp`, maps it `MAP_SHARED` twice, and checks all four properties from a
+plain C program. It passes on the host's real Linux kernel — every
+assertion in it is a Linux semantic, so a failure there would mean the
+test is wrong — and on NARF. Re-advertising `mmap_cache_generation` to
+route `MAP_SHARED` back onto the private-copy path makes it fail with
+`mapped store not visible to read(2)`, which is what establishes both that
+the smoke discriminates and that the defect was reachable from ordinary
+userspace rather than only in theory.
