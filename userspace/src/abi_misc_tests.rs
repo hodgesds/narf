@@ -895,8 +895,21 @@ fn smoke_abi_misc_reserved_native_ring_entries_are_invalid_op() -> TestResult {
     with_setup(|| {
         for variant in [Syscall::Submit, Syscall::WaitCompl] {
             let ret = call_raw(variant.raw(), SyscallArgs::default());
-            if ret.status != SyscallReturn::INVALID_OP || ret.value != 0 {
-                return Err("reserved native ring entry must return InvalidOp with value zero");
+            // The tombstone contract is the STATUS. These are NARF-native
+            // numbers, and `NarfStatus::InvalidOp` is what a NARF-native
+            // caller reads; that half is unchanged.
+            if ret.status != SyscallReturn::INVALID_OP {
+                return Err("reserved native ring entry must return InvalidOp");
+            }
+            // The value half used to be pinned at 0 here. It is now -ENOSYS,
+            // because the same no-handler arm also serves Linux-numbered
+            // syscalls, and there `value` is the register userspace returns —
+            // 0 meant every unimplemented syscall reported success. Nothing
+            // reads the value of a non-Ok NARF-native return, so widening it
+            // costs these two entries nothing; asserting it is what would
+            // have blocked the fix.
+            if ret.value as i64 != ENOSYS {
+                return Err("reserved native ring entry must carry -ENOSYS in the value half");
             }
         }
         Ok(())
@@ -1234,4 +1247,86 @@ fn smoke_abi_misc_link_reports_the_old_name_first() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_misc_link_reports_the_old_name_first
+);
+
+// ── Unimplemented syscall numbers ──────────────────────────────────────
+//
+// `sys_ni_syscall` (`kernel/sys_ni.c`) is `return -ENOSYS;`, and every
+// absent entry in Linux's table points at it; a number past the end of the
+// table gets `regs->ax = -ENOSYS` in `arch/x86/entry/syscall_64.c`. Both
+// NARF dispatch arms answered `SyscallReturn::invalid_op()`, whose `value`
+// is 0 — and `value` is the register the Linux ABI returns, so every
+// syscall this kernel does not implement reported success.
+//
+// NARF implements 333 of the 385 x86_64 numbers. -ENOSYS is not a cosmetic
+// improvement on the other 52: it is the value userspace *probes* with.
+// A runtime that calls `io_uring_setup` and is told 0 concludes io_uring
+// exists and that 0 is its ring fd.
+
+/// An unimplemented number reports -ENOSYS in the value register.
+///
+/// Self-validating: each number is first checked with `Syscall::from_raw` to
+/// confirm this build really has no entry for it, so the case cannot quietly
+/// start testing an implemented syscall if one of these is added later — it
+/// skips that number and keeps testing the rest.
+fn smoke_abi_misc_unimplemented_syscall_is_enosys() -> TestResult {
+    // 425 is `io_uring_setup` on both the x86_64 table and the generic
+    // (arm64) one, so it names the same absent syscall on either arch. The
+    // other two are past the end of every table.
+    const CANDIDATES: [u32; 3] = [425, 9999, 0x0FFF_FFFF];
+    with_setup(|| {
+        let mut checked = 0;
+        for n in CANDIDATES {
+            if Syscall::from_raw(n).is_some() {
+                // Implemented in this build now — not this case's business.
+                continue;
+            }
+            checked += 1;
+            // The args are never read: dispatch answers before reaching any
+            // handler. Passing zeros keeps that obvious.
+            let r = call_raw(n, SyscallArgs::default());
+            match r.value as i64 {
+                v if v == ENOSYS => {}
+                0 => return Err("an unimplemented syscall number reported success"),
+                _ => return Err("an unimplemented syscall number must report -ENOSYS"),
+            }
+            // The status half is what NARF-native callers read, and it must
+            // not have moved: `not_implemented()` changes only the value.
+            if r.status != SyscallReturn::INVALID_OP {
+                return Err("an unimplemented syscall number lost its InvalidOp status");
+            }
+        }
+        if checked == 0 {
+            return Err("every candidate number is implemented — the case proves nothing");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_unimplemented_syscall_is_enosys
+);
+
+/// Positive pin: real dispatch is untouched.
+///
+/// The change widens an arm that every *unrouted* number falls into, so this
+/// is the guard that it did not swallow a routed one. An implemented syscall
+/// must still reach its handler, report `Ok`, and answer with its own value
+/// rather than -ENOSYS.
+fn smoke_abi_misc_implemented_syscall_still_dispatches() -> TestResult {
+    with_setup(|| {
+        let r = call_raw(Syscall::GetPid.raw(), SyscallArgs::default());
+        if r.status != SyscallReturn::OK {
+            return Err("getpid stopped reporting an Ok status");
+        }
+        match r.value as i64 {
+            v if v == ENOSYS => Err("getpid was answered by the not-implemented arm"),
+            v if v > 0 => Ok(()),
+            _ => Err("getpid did not return a pid"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_misc_implemented_syscall_still_dispatches
 );

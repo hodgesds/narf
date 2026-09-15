@@ -3206,11 +3206,14 @@ impl Syscall {
 // ── Shared entry point (called by frame/ after trap entry) ──────────
 
 /// Look up and execute the handler for syscall `num` with `args`.
-/// If `num` is unknown, returns `NarfStatus::InvalidOp`.
+///
+/// An unknown `num` returns [`SyscallReturn::not_implemented`] — -ENOSYS in
+/// the value register, `NarfStatus::InvalidOp` in the status word.
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // See the note on the same arm in `kernel_syscall_entry_plain_with_state`.
+        ctx.set_return(SyscallReturn::not_implemented());
         return;
     }
     // SAFETY: `p` is the non-null pointer just loaded (Acquire) from
@@ -3272,7 +3275,19 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             crate::handlers::close_kernel_span(uc, crate::handlers::current_task_id());
         }
     } else {
-        ctx.set_return(SyscallReturn::invalid_op());
+        // A syscall number this kernel has no entry for. Linux answers
+        // -ENOSYS twice over: `arch/x86/entry/syscall_64.c` sets
+        // `regs->ax = -ENOSYS` for a number past the end of its table, and
+        // every in-range-but-absent entry points at `sys_ni_syscall`, which
+        // is `return -ENOSYS;`.
+        //
+        // NARF implements 333 of the 385 x86_64 numbers. The other 52 — among
+        // them `io_uring_setup`, `userfaultfd`, `statmount`, `swapon`,
+        // `kexec_load` and the `setxattrat` family — used to report 0 here,
+        // which is success. That is the answer userspace feature-probes with:
+        // a runtime that calls `io_uring_setup` and gets 0 concludes io_uring
+        // is available and that 0 is its ring fd.
+        ctx.set_return(SyscallReturn::not_implemented());
     }
 }
 
@@ -3529,12 +3544,16 @@ pub fn kernel_syscall_entry_plain_with_state(
                     args.arg3,
                 );
             }
-            return SyscallReturn::invalid_op();
+            return SyscallReturn::not_implemented();
         }
     };
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
-        return SyscallReturn::invalid_op();
+        // No syscall table installed at all. Not the same condition as an
+        // absent number, but the honest answer to "can you run this syscall"
+        // is still no, and 0 — which is what `invalid_op()` put in the value
+        // register — is the one answer it must not be.
+        return SyscallReturn::not_implemented();
     }
     // SAFETY: `p` is the non-null pointer just loaded (Acquire) from
     // `GLOBAL_TABLE`, published by `install_global` via `Box::into_raw`
@@ -4282,6 +4301,31 @@ impl SyscallReturn {
             status: abi::NarfStatus::Unsupported,
         }
     }
+    /// A syscall number this kernel does not implement.
+    ///
+    /// Carries BOTH answers, because two ABIs read this struct and each
+    /// reads a different half of it.
+    ///
+    /// The Linux ABI returns only `value` (RAX / X0), so a Linux caller must
+    /// see -ENOSYS. That is what `sys_ni_syscall` returns for every absent
+    /// entry in `kernel/sys_ni.c`, and what `regs->ax` is set to for a number
+    /// past the end of the table. It is also the value userspace *tests* for:
+    /// libc and language runtimes probe a syscall and branch on -ENOSYS to
+    /// pick a fallback. `invalid_op()` was used here, and its `value` is 0,
+    /// so every unimplemented syscall reported success — which a prober reads
+    /// as "this kernel has the feature", not as "unsupported".
+    ///
+    /// NARF-native entries (the `0x4000+` extension numbers) read `status`
+    /// instead, and for them `InvalidOp` is the real answer — so the status
+    /// half is preserved exactly as `invalid_op()` set it. Nothing that
+    /// inspects the status can tell the two apart; only the value register
+    /// changes, and only a Linux-ABI caller reads that.
+    pub const fn not_implemented() -> Self {
+        Self {
+            value: (-38i64) as u64, // -ENOSYS
+            status: abi::NarfStatus::InvalidOp,
+        }
+    }
 }
 
 impl From<SyscallReturn> for u64 {
@@ -4450,7 +4494,13 @@ impl SyscallTable {
         if let Some(Some(handler)) = self.handlers.get(idx) {
             handler.handle(ctx);
         } else {
-            ctx.set_return(SyscallReturn::invalid_op());
+            // A number this build knows the name of but installed no handler
+            // for — same answer, and for the same reason, as the unknown-number
+            // arm in `kernel_syscall_entry`. `not_implemented()` keeps the
+            // `InvalidOp` status that NARF-native entries read (the reserved
+            // `Submit`/`WaitCompl` ring tombstones rely on it) and changes only
+            // the value register, which is the half the Linux ABI returns.
+            ctx.set_return(SyscallReturn::not_implemented());
         }
     }
 }
