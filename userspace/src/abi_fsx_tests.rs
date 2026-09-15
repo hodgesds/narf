@@ -385,6 +385,739 @@ fn smoke_abi_fsx_default_acl_replaces_umask() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_default_acl_replaces_umask);
 
+/// The sticky bit actually stops a delete.
+///
+/// `/tmp` is mode 01777: world-writable, so its permission bits alone let
+/// anyone remove anything in it. `fs/namei.c::__check_sticky` is the entire
+/// reason that is safe —
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// — and NARF checked nothing at all on unlink, so any task could delete
+/// any other user's file anywhere. The refusal is EPERM, not EACCES:
+/// `may_delete` returns `-EPERM` from the sticky arm and reserves EACCES
+/// for the directory-permission arm above it.
+fn smoke_abi_fsx_sticky_bit_protects_other_users_files() -> TestResult {
+    with_memfs("/abi-sticky", "abi-sticky", &[], || {
+        let dir = b"/abi-sticky/shared\0";
+        let victim = b"/abi-sticky/shared/theirs\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the shared directory failed");
+        }
+        // 01777, exactly as /tmp is.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o1777)) != Some(0) {
+            return Err("chmod 01777 of the shared directory failed");
+        }
+        // A file owned by uid 1000, created while still privileged.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, victim.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating the victim file failed"),
+        }
+        if call(Syscall::Chown.raw(), a2(victim.as_ptr() as u64, 1000, 1000)) != Some(0) {
+            return Err("chown of the victim file failed");
+        }
+        // A DIFFERENT unprivileged user may not remove it, even though the
+        // directory is world-writable. `setresuid` is what drops the
+        // capabilities along with the uid (`cap_emulate_setxuid`); without
+        // that, CAP_DAC_OVERRIDE would let the check pass and this test
+        // would prove nothing.
+        let task = crate::handlers::current_task_id();
+        if call(Syscall::Setresuid.raw(), a2(2000, 2000, 2000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(2000) setup failed");
+        }
+        let stranger = call_unlink(victim.as_ptr() as u64);
+        match stranger {
+            Some(v) if v == EPERM => {}
+            Some(0) => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("a stranger deleted another user's file from a sticky directory");
+            }
+            Some(v) if v == EACCES => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("sticky refusal reported EACCES; may_delete's sticky arm is EPERM");
+            }
+            _ => {
+                crate::handlers::__test_uidgid_reset();
+                return Err("unlink in a sticky directory by a stranger must return -EPERM");
+            }
+        }
+        // The file's OWNER may remove it — the first arm of __check_sticky.
+        // Without this the test would pass on a blanket "deny everyone".
+        //
+        // The identity move goes through the test hook rather than
+        // `setresuid`: the task is already unprivileged, so it no longer
+        // holds the CAP_SETUID that switching to a third uid would need.
+        crate::handlers::__test_set_fsids(task, 1000, 1000);
+        let owner = call_unlink(victim.as_ptr() as u64);
+        crate::handlers::__test_uidgid_reset();
+        if owner != Some(0) {
+            return Err("the file's own owner was refused by the sticky check");
+        }
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_sticky_bit_protects_other_users_files
+);
+
+/// Changing a directory's contents requires write permission ON THAT
+/// DIRECTORY.
+///
+/// `may_create` and `may_delete` both end at
+/// `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)`, and NARF ran
+/// neither: `unlink`, `rmdir`, `rename`, `link`, `symlink`, `mknod` and
+/// `open(O_CREAT)` all went straight to the filesystem. A 0755 directory
+/// owned by root was writable by everyone.
+///
+/// The errno is EACCES — the same one `open` uses for a mode denial.
+fn smoke_abi_fsx_directory_write_permission_is_required() -> TestResult {
+    with_memfs("/abi-dirperm", "abi-dirperm", &[], || {
+        let dir = b"/abi-dirperm/ro\0";
+        let existing = b"/abi-dirperm/ro/file\0";
+        let fresh = b"/abi-dirperm/ro/new\0";
+        let subdir = b"/abi-dirperm/ro/sub\0";
+        let renamed = b"/abi-dirperm/ro/moved\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the read-only directory failed");
+        }
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, existing.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("seeding a file in the directory failed"),
+        }
+        // Root-owned, 0755: other users have r-x and no write.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o755)) != Some(0) {
+            return Err("chmod 0755 of the directory failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, fresh.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if let Some(fd) = created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let made_dir = call_mkdir(subdir.as_ptr() as u64, 0o755);
+        let removed = call_unlink(existing.as_ptr() as u64);
+        let moved = call_rename(existing.as_ptr() as u64, renamed.as_ptr() as u64);
+        let linked = call(
+            Syscall::Symlinkat.raw(),
+            a2(existing.as_ptr() as u64, AT_FDCWD, fresh.as_ptr() as u64),
+        );
+        // Restore BEFORE asserting so a failure cannot strand the task.
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if created.map(|fd| fd >= 0).unwrap_or(false) {
+            return Err("O_CREAT succeeded in a directory the caller cannot write");
+        }
+        if created != Some(EACCES) {
+            return Err("O_CREAT in an unwritable directory must return -EACCES");
+        }
+        if made_dir != Some(EACCES) {
+            return Err("mkdir in an unwritable directory must return -EACCES");
+        }
+        if removed != Some(EACCES) {
+            return Err("unlink in an unwritable directory must return -EACCES");
+        }
+        if moved != Some(EACCES) {
+            return Err("rename in an unwritable directory must return -EACCES");
+        }
+        if linked != Some(EACCES) {
+            return Err("symlink in an unwritable directory must return -EACCES");
+        }
+        // Discriminator: the same operations must SUCCEED once the caller
+        // can write the directory, or every assertion above is vacuous.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o777)) != Some(0) {
+            return Err("chmod 0777 of the directory failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("setresuid(1000) setup failed");
+        }
+        let now_created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, fresh.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if let Some(fd) = now_created {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let _ = call(Syscall::Setresuid.raw(), a2(0, 0, 0));
+        if !now_created.map(|fd| fd >= 0).unwrap_or(false) {
+            return Err("O_CREAT still failed on a world-writable directory — test is vacuous");
+        }
+        let _ = call_unlink(fresh.as_ptr() as u64);
+        let _ = call_unlink(existing.as_ptr() as u64);
+        let _ = call_rmdir(dir.as_ptr() as u64);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_directory_write_permission_is_required
+);
+
+/// A setgid directory hands its group to everything created inside it.
+///
+/// `fs/inode.c::inode_init_owner`:
+///
+/// ```text
+/// inode_fsuid_set(inode, idmap);
+/// if (dir && dir->i_mode & S_ISGID) {
+///         inode->i_gid = dir->i_gid;
+///         /* Directories are special, and always inherit S_ISGID */
+///         if (S_ISDIR(mode))
+///                 mode |= S_ISGID;
+/// } else
+///         inode_fsgid_set(inode, idmap);
+/// ```
+///
+/// This is the whole mechanism behind a shared group directory: `chgrp
+/// staff dir; chmod g+s dir` makes everything created inside belong to
+/// `staff` whatever group the creator is in, and the S_ISGID copied onto a
+/// new SUBDIRECTORY is what keeps that true all the way down. NARF stamped
+/// the creator's fsgid unconditionally, so the group never propagated and
+/// the bit never appeared on a child.
+///
+/// The caller cannot ask for S_ISGID on a directory itself:
+/// `vfs_prepare_mode(.., S_IRWXUGO | S_ISVTX, 0)` masks it off, so a bit
+/// that appears can only have been inherited.
+fn smoke_abi_fsx_setgid_directory_propagates_its_group() -> TestResult {
+    with_memfs("/abi-sgid", "abi-sgid", &[], || {
+        const GROUP: u32 = 5150;
+        let dir = b"/abi-sgid/shared\0";
+        let child_dir = b"/abi-sgid/shared/sub\0";
+        let child_file = b"/abi-sgid/shared/file\0";
+        if call_mkdir(dir.as_ptr() as u64, 0o770) != Some(0) {
+            return Err("mkdir of the shared directory failed");
+        }
+        if call(
+            Syscall::Chown.raw(),
+            a2(dir.as_ptr() as u64, 0, GROUP as u64),
+        ) != Some(0)
+        {
+            return Err("chgrp of the shared directory failed");
+        }
+        // 02770: setgid + rwxrwx---.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o2770)) != Some(0) {
+            return Err("chmod g+s of the shared directory failed");
+        }
+        let stat_of = |path: &[u8]| -> Option<(u32, u32)> {
+            let mut sb = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                return None;
+            }
+            // x86_64 `struct stat`: st_mode u32 @24, st_gid u32 @32.
+            let mode = u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777;
+            let gid = u32::from_ne_bytes([sb[32], sb[33], sb[34], sb[35]]);
+            Some((mode, gid))
+        };
+        // Guard against a vacuous pass: the staging must actually have set
+        // the bit and the group on the parent.
+        match stat_of(dir) {
+            Some((mode, gid)) if mode & 0o2000 != 0 && gid == GROUP => {}
+            _ => return Err("the shared directory is not setgid and group-owned — staging failed"),
+        }
+        // A file created inside takes the directory's group, not the
+        // creator's (which is 0 here), and does NOT become setgid.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, child_file.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating a file in the shared directory failed"),
+        }
+        match stat_of(child_file) {
+            Some((mode, gid)) => {
+                if gid != GROUP {
+                    return Err("a new file did not inherit the setgid directory's group");
+                }
+                if mode & 0o2000 != 0 {
+                    return Err("a new regular file was made setgid; only directories inherit it");
+                }
+            }
+            None => return Err("stat of the new file failed"),
+        }
+        // A subdirectory takes the group AND the bit, so inheritance keeps
+        // going below it.
+        if call_mkdir(child_dir.as_ptr() as u64, 0o770) != Some(0) {
+            return Err("mkdir inside the shared directory failed");
+        }
+        match stat_of(child_dir) {
+            Some((mode, gid)) => {
+                if gid != GROUP {
+                    return Err("a new subdirectory did not inherit the setgid group");
+                }
+                if mode & 0o2000 == 0 {
+                    return Err("a new subdirectory did not inherit S_ISGID");
+                }
+            }
+            None => return Err("stat of the new subdirectory failed"),
+        }
+        // Discriminator: without the bit on the parent, the creator's own
+        // fsgid is what lands — otherwise this test would pass on a
+        // blanket "always copy the parent's group".
+        let plain = b"/abi-sgid/plain\0";
+        let plain_file = b"/abi-sgid/plain/f\0";
+        if call_mkdir(plain.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the plain directory failed");
+        }
+        if call(
+            Syscall::Chown.raw(),
+            a2(plain.as_ptr() as u64, 0, GROUP as u64),
+        ) != Some(0)
+        {
+            return Err("chgrp of the plain directory failed");
+        }
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, plain_file.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating a file in the plain directory failed"),
+        }
+        match stat_of(plain_file) {
+            Some((_, gid)) if gid == GROUP => {
+                return Err("a non-setgid directory's group was inherited anyway")
+            }
+            Some(_) => {}
+            None => return Err("stat of the plain file failed"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setgid_directory_propagates_its_group
+);
+
+/// Changing an inode's ACL needs `inode_owner_or_capable`; changing an
+/// ordinary xattr needs write permission on the inode.
+///
+/// `do_setxattr` splits the two: the POSIX ACL names go to
+/// `do_set_acl` -> `vfs_set_acl` -> `set_posix_acl`, whose only check is
+///
+/// ```text
+/// if (!inode_owner_or_capable(idmap, inode))
+///         return -EPERM;
+/// ```
+///
+/// while everything else goes through `vfs_setxattr` -> `xattr_permission`,
+/// which ends at `inode_permission(idmap, inode, mask)` — EACCES. NARF ran
+/// neither, so any task that could name an inode could rewrite its
+/// `security.*` label, or rewrite its access ACL and with it (via
+/// `posix_acl_update_mode`) its permission bits.
+///
+/// Conflating the two would get both errnos wrong, so both are pinned.
+fn smoke_abi_fsx_xattr_and_acl_writes_are_permission_checked() -> TestResult {
+    use narf_filesystem::{AclEntry, AclType, PosixAcl};
+    use narf_filesystem::{
+        ACL_EXECUTE, ACL_GROUP_OBJ, ACL_OTHER, ACL_READ, ACL_USER_OBJ, ACL_WRITE,
+    };
+    with_memfs("/abi-xperm", "abi-xperm", &[("victim", b"x")], || {
+        let path = b"/abi-xperm/victim\0";
+        let acl = PosixAcl::from_entries(alloc::vec![
+            AclEntry::tagged(ACL_USER_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_GROUP_OBJ, ACL_READ | ACL_WRITE | ACL_EXECUTE),
+            AclEntry::tagged(ACL_OTHER, ACL_READ | ACL_EXECUTE),
+        ])
+        .to_xattr();
+        let mut acl_name = alloc::vec::Vec::from(AclType::Access.xattr_name().as_bytes());
+        acl_name.push(0);
+        let setxattr = |name: &[u8], value: &[u8]| {
+            call(
+                Syscall::Setxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: value.as_ptr() as u64,
+                    arg3: value.len() as u64,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        // Both succeed while we are the owner — otherwise the denials
+        // below would prove nothing.
+        let plain_name = b"user.k\0";
+        if setxattr(plain_name, b"v") != Some(0) {
+            return Err("setxattr as the owner failed — staging is vacuous");
+        }
+        // The attribute must be on the INODE, not in the path-keyed side
+        // table: the side table is not permission-checked, so a test whose
+        // attribute lives there would report "allowed" no matter what the
+        // gate decides. Renaming the file is what tells them apart.
+        let moved = b"/abi-xperm/victim-moved\0";
+        if call_rename(path.as_ptr() as u64, moved.as_ptr() as u64) != Some(0) {
+            return Err("renaming the victim file failed");
+        }
+        let followed = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: moved.as_ptr() as u64,
+                arg1: plain_name.as_ptr() as u64,
+                arg2: 0,
+                arg3: 0,
+                ..Default::default()
+            },
+        );
+        if call_rename(moved.as_ptr() as u64, path.as_ptr() as u64) != Some(0) {
+            return Err("renaming the victim file back failed");
+        }
+        if followed != Some(1) {
+            return Err("the xattr did not reach the inode — the gate would be untested");
+        }
+        if setxattr(&acl_name, &acl) != Some(0) {
+            return Err("setting an ACL as the owner failed — staging is vacuous");
+        }
+        // Only NOW fix the mode. Installing an access ACL rewrites the mode
+        // through `posix_acl_update_mode`, so a chmod before this would be
+        // undone — which is how the first version of this test ended up
+        // staging a file the unprivileged caller could write.
+        if call(Syscall::Chmod.raw(), a1(path.as_ptr() as u64, 0o644)) != Some(0) {
+            return Err("chmod 0644 setup failed");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        // Vacuity guard: the xattr gate ends at `inode_permission(inode,
+        // MAY_WRITE)`, so if this caller can open the file for writing at
+        // all, a permitted setxattr is the CORRECT answer and the test
+        // would be asserting the wrong thing.
+        let writable = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, 0o1, 0),
+        );
+        if let Some(fd) = writable {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        let plain = setxattr(plain_name, b"w");
+        let as_acl = setxattr(&acl_name, &acl);
+        let removed = call(
+            Syscall::Removexattr.raw(),
+            a1(path.as_ptr() as u64, plain_name.as_ptr() as u64),
+        );
+        // Reading is still allowed: the file is 0644, and `vfs_get_acl`
+        // performs no check at all.
+        let read_back = call(
+            Syscall::Getxattr.raw(),
+            SyscallArgs {
+                arg0: path.as_ptr() as u64,
+                arg1: plain_name.as_ptr() as u64,
+                arg2: 0,
+                arg3: 0,
+                ..Default::default()
+            },
+        );
+        crate::handlers::__test_uidgid_reset();
+        if writable.map(|fd| fd >= 0).unwrap_or(false) {
+            return Err("the unprivileged caller can write the file — the mode staging is vacuous");
+        }
+        match plain {
+            Some(v) if v == EACCES => {}
+            Some(0) => return Err("setxattr on an unwritable file SUCCEEDED"),
+            Some(v) if v == EPERM => {
+                return Err("setxattr denial returned EPERM; xattr_permission uses EACCES")
+            }
+            _ => return Err("setxattr on an unwritable file must return -EACCES"),
+        }
+        if removed != Some(EACCES) {
+            return Err("removexattr on an unwritable file must return -EACCES");
+        }
+        // EPERM, not EACCES: the ACL path never reaches `inode_permission`.
+        if as_acl != Some(EPERM) {
+            return Err("setting an ACL as a non-owner must return -EPERM");
+        }
+        if read_back != Some(1) {
+            return Err("getxattr of a readable file was refused");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_xattr_and_acl_writes_are_permission_checked
+);
+
+/// `mount -o ro` actually makes the mount read-only.
+///
+/// `path_mount` turns the caller's `MS_*` into the mount's `MNT_*` set,
+/// and every syscall that changes something on a mount passes
+/// `fs/namespace.c::mnt_want_write` first:
+///
+/// ```text
+/// if (mnt->mnt_sb->s_readonly_remount || __mnt_is_readonly(mnt))
+///         return -EROFS;
+/// ```
+///
+/// NARF accepted the flags and dropped them — the handler's own comment
+/// called that "the dangerous kind" of divergence, because a sandbox that
+/// mounts `MS_RDONLY|MS_NOSUID|MS_NODEV` got a success reply and no
+/// enforcement at all.
+///
+/// EROFS and not EACCES: read-only is a property of the MOUNT, not of the
+/// caller, and userspace branches on the difference. It therefore holds
+/// for root too, which is the entire point of a read-only bind.
+fn smoke_abi_fsx_readonly_mount_refuses_writes() -> TestResult {
+    with_setup(|| {
+        const MS_RDONLY: u64 = 1 << 0;
+        const MS_REMOUNT: u64 = 1 << 5;
+        const EROFS: i64 = -30;
+        let target = b"/abi-ro\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        let mount_with = |flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: source.as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg2: fstype.as_ptr() as u64,
+                    arg3: flags,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        // Writable first: everything below must SUCCEED here, or the
+        // read-only assertions prove nothing.
+        if mount_with(0) != Some(0) {
+            return Err("mounting a writable tmpfs failed");
+        }
+        let file = b"/abi-ro/f\0";
+        let dir = b"/abi-ro/d\0";
+        let finish = |outcome: Result<(), &'static str>| {
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        let create = || {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, file.as_ptr() as u64, 0o100 | 0o2, 0o666),
+            )
+        };
+        match create() {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("creating a file on a writable tmpfs failed")),
+        }
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return finish(Err("mkdir on a writable tmpfs failed"));
+        }
+        // Seal it with `mount -o remount,ro` — `do_reconfigure_mnt`.
+        if mount_with(MS_REMOUNT | MS_RDONLY) != Some(0) {
+            return finish(Err("remount,ro failed"));
+        }
+        // Every shape of write now reports EROFS, as root.
+        let second = b"/abi-ro/f2\0";
+        let second_dir = b"/abi-ro/d2\0";
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, second.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if created != Some(EROFS) {
+            return finish(Err("O_CREAT on a read-only mount must return -EROFS"));
+        }
+        // Opening an EXISTING file for writing is refused too.
+        let opened_w = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0o1, 0),
+        );
+        if opened_w != Some(EROFS) {
+            return finish(Err(
+                "opening a file for write on a read-only mount must be -EROFS",
+            ));
+        }
+        if call_mkdir(second_dir.as_ptr() as u64, 0o755) != Some(EROFS) {
+            return finish(Err("mkdir on a read-only mount must return -EROFS"));
+        }
+        if call_unlink(file.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("unlink on a read-only mount must return -EROFS"));
+        }
+        if call_rmdir(dir.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("rmdir on a read-only mount must return -EROFS"));
+        }
+        if call_rename(file.as_ptr() as u64, second.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("rename on a read-only mount must return -EROFS"));
+        }
+        if call(Syscall::Chmod.raw(), a1(file.as_ptr() as u64, 0o600)) != Some(EROFS) {
+            return finish(Err("chmod on a read-only mount must return -EROFS"));
+        }
+        if call(Syscall::Truncate.raw(), a1(file.as_ptr() as u64, 0)) != Some(EROFS) {
+            return finish(Err("truncate on a read-only mount must return -EROFS"));
+        }
+        // Reading still works — read-only, not inaccessible.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("a read-only mount refused a READ open")),
+        }
+        // And `remount,rw` lifts it again: `do_reconfigure_mnt` replaces the
+        // flag set wholesale rather than accumulating it.
+        if mount_with(MS_REMOUNT) != Some(0) {
+            return finish(Err("remount,rw failed"));
+        }
+        match create() {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("remount,rw did not make the mount writable again")),
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_readonly_mount_refuses_writes);
+
+/// `noexec` and `nodev` are enforced, and `/proc/mounts` reports them.
+///
+/// `do_open_execat` opens the binary with `MAY_EXEC`, and `may_open`
+/// refuses that on a `noexec` mount (`if (path_noexec(path)) return
+/// -EACCES;`); the same function refuses to open a device node on a
+/// `nodev` mount. Both are properties of the MOUNT, so a sandbox gets them
+/// even against a privileged process inside it — which is why they are
+/// worth having at all.
+fn smoke_abi_fsx_noexec_nodev_are_enforced_and_reported() -> TestResult {
+    with_setup(|| {
+        const MS_NOSUID: u64 = 1 << 1;
+        const MS_NODEV: u64 = 1 << 2;
+        const MS_NOEXEC: u64 = 1 << 3;
+        let target = b"/abi-noexec\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        if call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: source.as_ptr() as u64,
+                arg1: target.as_ptr() as u64,
+                arg2: fstype.as_ptr() as u64,
+                arg3: MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                arg4: 0,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("mounting a nosuid,nodev,noexec tmpfs failed");
+        }
+        let finish = |outcome: Result<(), &'static str>| {
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        // A device node on the mount cannot be opened.
+        const S_IFCHR: u64 = 0o020000;
+        let node = b"/abi-noexec/null\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, node.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        ) != Some(0)
+        {
+            return finish(Err("mknod of a device node on the test mount failed"));
+        }
+        let opened = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, node.as_ptr() as u64, 0, 0),
+        );
+        if let Some(fd) = opened {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        if opened != Some(EACCES) {
+            return finish(Err(
+                "opening a device node on a nodev mount must return -EACCES",
+            ));
+        }
+        // A regular file on the same mount still opens — `nodev` bars
+        // device nodes, not everything.
+        let plain = b"/abi-noexec/plain\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, plain.as_ptr() as u64, 0o100 | 0o2, 0o755),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("a nodev mount refused an ordinary file")),
+        }
+        // Executing anything from the mount is refused before the image is
+        // even read, so a non-ELF file is still -EACCES and not ENOEXEC.
+        let execed = call(Syscall::Execve.raw(), a2(plain.as_ptr() as u64, 0, 0));
+        if execed != Some(EACCES) {
+            return finish(Err("execve from a noexec mount must return -EACCES"));
+        }
+        // And the flags are visible where userspace looks for them:
+        // `show_vfsmnt` prints this attachment's MNT_* set as the fourth
+        // column, which is what systemd compares against the options a
+        // mount unit asked for.
+        let mut buf = [0u8; 4096];
+        let proc_mounts = b"/proc/mounts\0";
+        let fd = match call_open(proc_mounts.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return finish(Err("opening /proc/mounts failed")),
+        };
+        let n = call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let n = match n {
+            Some(n) if n >= 0 => n as usize,
+            _ => return finish(Err("reading /proc/mounts failed")),
+        };
+        let text = match core::str::from_utf8(&buf[..n]) {
+            Ok(text) => text,
+            Err(_) => return finish(Err("/proc/mounts is not utf-8")),
+        };
+        match text
+            .lines()
+            .find(|line| line.split(' ').nth(1) == Some("/abi-noexec"))
+        {
+            Some(line) => {
+                let opts = line.split(' ').nth(3).unwrap_or("");
+                if !opts.starts_with("rw,nosuid,nodev,noexec") {
+                    return finish(Err("/proc/mounts did not report the mount's flags"));
+                }
+            }
+            None => return finish(Err("the test mount is missing from /proc/mounts")),
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_noexec_nodev_are_enforced_and_reported
+);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

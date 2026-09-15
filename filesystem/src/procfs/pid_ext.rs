@@ -588,19 +588,20 @@ fn render_mountinfo(pid: u64) -> String {
     if let Some(rows) = super::hook_ns_mountinfo(pid) {
         let mut s = String::new();
         for line in rows.lines() {
-            let mut it = line.splitn(5, '\t');
+            let mut it = line.splitn(6, '\t');
             let id = it.next().unwrap_or("1");
             let parent = it.next().unwrap_or("0");
             let path = it.next().unwrap_or("/");
             let fs_name = it.next().unwrap_or("rootfs");
-            // Trailing field is the filesystem's show_options text, which
-            // belongs in mountinfo's LAST column (the super options), not
-            // in the per-mount flags before the `-` separator.
-            let options = it.next().unwrap_or("");
+            // The two option fields go in DIFFERENT columns: this
+            // attachment's MNT_* flags before the `-` separator, and the
+            // filesystem's show_options text after it.
+            let mnt_opts = it.next().unwrap_or("rw");
+            let sb_opts = it.next().unwrap_or("");
             let _ = writeln!(
                 s,
-                "{} {} 0:1 / {} rw - {} {} rw{}",
-                id, parent, path, fs_name, fs_name, options
+                "{} {} 0:1 / {} {} - {} {} {}{}",
+                id, parent, path, mnt_opts, fs_name, fs_name, mnt_opts, sb_opts
             );
         }
         if s.is_empty() {
@@ -609,11 +610,11 @@ fn render_mountinfo(pid: u64) -> String {
         return s;
     }
     let mut s = String::new();
-    for (id, parent, path, fs_name, options) in crate::registry().list_mountinfo() {
+    for (id, parent, path, fs_name, mnt_opts, sb_opts) in crate::registry().list_mountinfo() {
         let _ = writeln!(
             s,
-            "{} {} 0:1 / {} rw - {} {} rw{}",
-            id, parent, path, fs_name, fs_name, options
+            "{} {} 0:1 / {} {} - {} {} {}{}",
+            id, parent, path, mnt_opts, fs_name, fs_name, mnt_opts, sb_opts
         );
     }
     if s.is_empty() {
@@ -650,11 +651,11 @@ fn render_mountstats(_pid: u64) -> String {
 ///   `device mountpoint fstype options 0 0`.
 fn render_mounts(_pid: u64) -> String {
     let mut s = String::new();
-    for (path, fs_name, options) in crate::registry().list_with_options() {
+    for (path, fs_name, mnt_opts, sb_opts) in crate::registry().list_with_options() {
         let _ = writeln!(
             s,
-            "{} {} {} rw,relatime{} 0 0",
-            fs_name, path, fs_name, options
+            "{} {} {} {},relatime{} 0 0",
+            fs_name, path, fs_name, mnt_opts, sb_opts
         );
     }
     if s.is_empty() {

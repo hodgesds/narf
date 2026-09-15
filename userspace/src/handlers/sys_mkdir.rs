@@ -79,6 +79,17 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
         return;
     }
+    // `do_mkdirat` -> `mnt_want_write` -> `filename_create` ->
+    // `may_create(dir, ..)`: the mount must be writable, then the caller
+    // must have write+exec on the parent.
+    if let Err(errno) = mnt_want_write(path_ref) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    if let Err(errno) = may_create_in(&*parent, current_task_id()) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // `fs/namei.c::do_mkdirat` -> `vfs_mkdir` -> `shmem_mkdir` ->
     // `simple_acl_create`: a parent carrying a default ACL passes it down
     // instead of the umask, and a new DIRECTORY also keeps a copy so
@@ -87,12 +98,19 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     match poll_blocking(parent.mkdir(&leaf)) {
         Some(Ok(directory)) => {
             {
-                let (uid, gid) = current_fs_ids();
-                let owner_result = poll_blocking(directory.set_dir_owners_async(uid, gid));
+                // `inode_init_owner`: a setgid parent hands its group to the
+                // new directory AND makes the new directory setgid too, which
+                // is what keeps a shared group tree shared all the way down.
+                let owner_result = poll_blocking(
+                    directory.set_dir_owners_async(inherited.uid, inherited.gid),
+                );
                 let mode_result = poll_blocking(
-                    // Linux mkdir accepts rwx + sticky. setuid is ignored;
-                    // setgid is inherited from the parent, which NARF's
-                    // simplified credential model does not yet implement.
+                    // `vfs_prepare_mode(.., S_IRWXUGO | S_ISVTX, 0)` masks
+                    // the CALLER's mode to rwx + sticky, so a caller cannot
+                    // ask for setgid — the `& 0o1777` above. S_ISGID on a
+                    // new directory comes only from `inode_init_owner`
+                    // inheriting it from a setgid parent, which
+                    // `inherited.mode` already carries.
                     directory.set_dir_mode_async(inherited.mode),
                 );
                 // Install the inherited ACLs before anything can observe

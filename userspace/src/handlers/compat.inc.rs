@@ -558,8 +558,54 @@ fn path_is_mount_ancestor(path: &str) -> bool {
 /// default}` payloads to install, if any.
 pub(crate) struct InheritedAcls {
     pub mode: u16,
+    /// Owner for the new inode — `inode_init_owner`'s `uid`, always the
+    /// creating task's fsuid.
+    pub uid: u32,
+    /// Group for the new inode. Normally the creating task's fsgid, but a
+    /// parent directory carrying S_ISGID hands down its OWN group instead.
+    pub gid: u32,
     pub access: Option<alloc::vec::Vec<u8>>,
     pub default: Option<alloc::vec::Vec<u8>>,
+}
+
+/// `fs/inode.c::inode_init_owner` — who a new inode belongs to, and
+/// whether a new directory is born setgid:
+///
+/// ```text
+/// inode_fsuid_set(inode, idmap);
+/// if (dir && dir->i_mode & S_ISGID) {
+///         inode->i_gid = dir->i_gid;
+///         /* Directories are special, and always inherit S_ISGID */
+///         if (S_ISDIR(mode))
+///                 mode |= S_ISGID;
+/// } else
+///         inode_fsgid_set(inode, idmap);
+/// ```
+///
+/// This is how a shared group directory works at all: `chgrp staff dir;
+/// chmod g+s dir` makes everything created inside it belong to `staff`
+/// whatever group the creator is in, and the S_ISGID on a new
+/// subdirectory is what keeps that true all the way down. NARF stamped
+/// the creator's fsgid unconditionally, so the group never propagated and
+/// the bit never appeared on a child directory.
+///
+/// LINUX-GAP: `vfs_prepare_mode` also runs `mode_strip_sgid`, which
+/// removes a CALLER-supplied S_ISGID from a group-executable regular file
+/// when the creator is not in the directory's group. NARF's create paths
+/// mask the caller's mode down before this point, so the bit can only
+/// arrive by inheritance, where the strip does not apply.
+fn inode_init_owner(parent: &dyn narf_filesystem::DirOps, is_dir: bool, mode: &mut u16) -> (u32, u32) {
+    let (fsuid, fsgid) = current_fs_ids();
+    let (dir_uid, dir_gid) = parent.dir_owners();
+    let _ = dir_uid;
+    if parent.dir_mode() & 0o2000 != 0 {
+        if is_dir {
+            *mode |= 0o2000;
+        }
+        (fsuid, dir_gid)
+    } else {
+        (fsuid, fsgid)
+    }
 }
 
 pub(crate) fn inherit_acls_from_parent(
@@ -568,6 +614,11 @@ pub(crate) fn inherit_acls_from_parent(
     is_dir: bool,
 ) -> InheritedAcls {
     let mut mode = raw_mode;
+    // `inode_init_owner` runs BEFORE `simple_acl_create`, and the ACL /
+    // umask narrowing below only ever touches the low nine bits
+    // (`posix_acl_create_masq` re-applies `*mode_p & ~S_IRWXUGO`), so an
+    // inherited S_ISGID survives it.
+    let (uid, gid) = inode_init_owner(parent, is_dir, &mut mode);
     let umask = current_umask() as u16;
     let parent_default = parent
         .default_acl()
@@ -581,6 +632,8 @@ pub(crate) fn inherit_acls_from_parent(
     ) {
         Ok(inherited) => InheritedAcls {
             mode,
+            uid,
+            gid,
             access: inherited.access_acl.map(|acl| acl.to_xattr()),
             default: inherited.default_acl.map(|acl| acl.to_xattr()),
         },
@@ -588,7 +641,9 @@ pub(crate) fn inherit_acls_from_parent(
         // inherited from; fall back to the plain umask path rather than
         // failing a create.
         Err(_) => InheritedAcls {
-            mode: raw_mode & !(umask & 0o777),
+            mode: mode & !(umask & 0o777),
+            uid,
+            gid,
             access: None,
             default: None,
         },
@@ -1208,6 +1263,23 @@ fn do_execve_resolved(
         }
     }
     let path: &str = &path_owned;
+
+    // `fs/exec.c::do_open_execat` opens the binary with `.acc_mode =
+    // MAY_EXEC`, and `may_open` refuses that on a `noexec` mount:
+    //
+    //     if (path_noexec(path)) return -EACCES;
+    //
+    // A mount is made `noexec` precisely so nothing on it can run, so this
+    // holds for root as well. An `image_override` is an already-read
+    // memfd/fd image with no mount behind it, and Linux likewise has no
+    // mount to test there.
+    if image_override.is_none()
+        && narf_filesystem::any_restricted_mounts()
+        && current_mount_flags_at(path) & narf_filesystem::mnt_flags::NOEXEC != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        return;
+    }
 
     // [VERIFY-PROBE] Unconditional (no trace feature, so it prints in a CLEAN
     // fast boot even while the console is otherwise quiet): mark when the
@@ -2292,11 +2364,15 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     Ok(())
 }
 
-// Wave-71: Linux MS_* flag bits — userspace passes them in arg5.
-// Only the bits NARF acts on are documented here; the rest are
-// accepted but currently a no-op (relatime, nosuid, nodev, noexec,
-// ro modulate read-only state — they're parked until the FsInstance
-// trait grows a per-mount option vector).
+// Linux MS_* flag bits — userspace passes them in arg5.
+//
+// MS_RDONLY, MS_NODEV and MS_NOEXEC become the mount's `MNT_*` set and are
+// enforced (`mnt_want_write`, `may_open`'s device arm, `do_open_execat`).
+// MS_NOSUID is stored and reported but has nothing to suppress: NARF's
+// execve does not implement set-user-ID binaries at all, so there is no
+// privilege transition for `nosuid` to block. MS_REC and MS_RELATIME are
+// accepted and dropped — there is no mount propagation to recurse over and
+// no atime policy to relax.
 const MS_RDONLY: u64 = 1 << 0;
 const MS_NOSUID: u64 = 1 << 1;
 const MS_NODEV: u64 = 1 << 2;
@@ -2645,10 +2721,96 @@ pub(crate) fn current_mount_arc(
     narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
     narf_filesystem::FsError,
 > {
+    current_mount_arc_with_flags(authority, path, fs, 0)
+}
+
+/// [`current_mount_arc`] carrying the mount's `MNT_*` flags.
+pub(crate) fn current_mount_arc_with_flags(
+    authority: &narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Grant>,
+    path: &str,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    flags: u64,
+) -> Result<
+    narf_capabilities::Cap<narf_filesystem::MountPoint, narf_capabilities::Write>,
+    narf_filesystem::FsError,
+> {
     if let Some(ns) = current_mount_namespace() {
-        ns.mount_arc(authority, path, fs)
+        ns.mount_arc_with_flags(authority, path, fs, flags)
     } else {
-        narf_filesystem::registry().mount_arc(authority, path, fs)
+        narf_filesystem::registry().mount_arc_with_flags(authority, path, fs, flags)
+    }
+}
+
+/// `fs/namespace.c::path_mount` — the `MS_*` bits a caller passes to
+/// `mount(2)` translated into the `MNT_*` set stored on the mount:
+///
+/// ```text
+/// if (flags & MS_RDONLY) mnt_flags |= MNT_READONLY;
+/// if (flags & MS_NOSUID) mnt_flags |= MNT_NOSUID;
+/// if (flags & MS_NODEV)  mnt_flags |= MNT_NODEV;
+/// if (flags & MS_NOEXEC) mnt_flags |= MNT_NOEXEC;
+/// ```
+///
+/// The two spaces are deliberately separate: `MS_*` is the syscall's
+/// request, `MNT_*` is the property the attachment carries afterwards.
+pub(crate) fn mnt_flags_from_ms(flags: u64) -> u64 {
+    use narf_filesystem::mnt_flags;
+    let mut out = 0;
+    for (ms, mnt) in [
+        (MS_RDONLY, mnt_flags::READONLY),
+        (MS_NOSUID, mnt_flags::NOSUID),
+        (MS_NODEV, mnt_flags::NODEV),
+        (MS_NOEXEC, mnt_flags::NOEXEC),
+    ] {
+        if flags & ms != 0 {
+            out |= mnt;
+        }
+    }
+    out
+}
+
+/// The `MNT_*` flags of the mount covering `path` in the caller's
+/// namespace. A path no mount covers has no restrictions.
+pub(crate) fn current_mount_flags_at(path: &str) -> u64 {
+    if let Some(ns) = current_mount_namespace() {
+        ns.flags_at(path)
+    } else {
+        narf_filesystem::registry().flags_at(path)
+    }
+    .unwrap_or(0)
+}
+
+/// `fs/namespace.c::mnt_want_write` — the gate every syscall that changes
+/// something on a mount passes through first:
+///
+/// ```text
+/// if (mnt->mnt_sb->s_readonly_remount || __mnt_is_readonly(mnt))
+///         return -EROFS;
+/// ```
+///
+/// EROFS, not EACCES: "read-only file system" is a property of the mount,
+/// not of the caller, and userspace branches on the difference — a build
+/// system retries elsewhere on EROFS and gives up on EACCES.
+///
+/// Returns immediately when no mount anywhere carries a restriction, so an
+/// ordinary system never pays for the mount-table walk.
+pub(crate) fn mnt_want_write(path: &str) -> Result<(), i64> {
+    if !narf_filesystem::any_restricted_mounts() {
+        return Ok(());
+    }
+    if current_mount_flags_at(path) & narf_filesystem::mnt_flags::READONLY != 0 {
+        return Err(-30); // -EROFS
+    }
+    Ok(())
+}
+
+/// Replace the `MNT_*` flags of the mount at exactly `path` — the
+/// `MS_REMOUNT` path's `do_reconfigure_mnt`.
+pub(crate) fn current_set_mount_flags(path: &str, flags: u64) -> bool {
+    if let Some(ns) = current_mount_namespace() {
+        ns.set_flags_at(path, flags)
+    } else {
+        narf_filesystem::registry().set_flags_at(path, flags)
     }
 }
 
@@ -2843,7 +3005,7 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
     let rows = mount_namespace_of(task)
         .map(|ns| ns.list_mountinfo())
         .unwrap_or_else(|| narf_filesystem::registry().list_mountinfo());
-    for (id, parent, path, name, options) in rows {
+    for (id, parent, path, name, mnt_opts, sb_opts) in rows {
         let visible = if process_root == "/" {
             path
         } else if path == process_root {
@@ -2855,9 +3017,14 @@ pub fn proc_ns_mountinfo(pid: u64) -> Option<alloc::string::String> {
         } else {
             continue;
         };
-        // Fifth field is the filesystem's `show_options` text; procfs
-        // renders it as mountinfo's super-options column.
-        let _ = writeln!(s, "{}\t{}\t{}\t{}\t{}", id, parent, visible, name, options);
+        // The last two fields are the two option halves: this
+        // attachment's MNT_* flags, then the filesystem's `show_options`
+        // text. procfs renders them in mountinfo's two separate columns.
+        let _ = writeln!(
+            s,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            id, parent, visible, name, mnt_opts, sb_opts
+        );
     }
     Some(s)
 }

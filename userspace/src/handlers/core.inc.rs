@@ -1401,6 +1401,10 @@ fn open_impl(
             // parent is known — see `inherit_acls_from_parent`.
             let mut inherited_access: Option<alloc::vec::Vec<u8>> = None;
             let mut permissions = (create_mode & !current_umask() & 0o777) as u16;
+            // `inode_init_owner` hands the new file the parent's group when
+            // the parent is setgid; without a parent in hand the creating
+            // task's own ids are the answer.
+            let mut owner = (accessor.uid, accessor.gid);
             // Async parent resolution so O_CREAT works in subdirectories of
             // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
             let create_result = fast_create
@@ -1410,29 +1414,36 @@ fn open_impl(
                     FastCreateResolution::Existing { .. } => None,
                 })
                 .map(|(parent, leaf)| {
+                    // `path_openat` -> `open_last_lookups` -> `may_create`:
+                    // write+exec on the directory the new name lands in.
+                    // Without it any task could plant a file in any
+                    // directory. Checked against the parent this path has
+                    // ALREADY resolved — a second walk here would put a
+                    // whole path lookup on every O_CREAT.
+                    // `PermissionDenied` is the refusal the create-result
+                    // match below already maps to EACCES, which is the
+                    // errno `may_create` produces.
+                    if may_create_in(&*parent, task).is_err() {
+                        return Some(Err(narf_filesystem::FsError::PermissionDenied));
+                    }
                     let inherited =
                         inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                     permissions = inherited.mode;
                     inherited_access = inherited.access;
-                    poll_blocking(parent.create_with_attrs(
-                        &leaf,
-                        permissions,
-                        accessor.uid,
-                        accessor.gid,
-                    ))
+                    owner = (inherited.uid, inherited.gid);
+                    poll_blocking(parent.create_with_attrs(&leaf, permissions, owner.0, owner.1))
                 })
                 .or_else(|| {
                     resolve_parent_dir_async(path).map(|(parent, leaf)| {
+                        if may_create_in(&*parent, task).is_err() {
+                            return Some(Err(narf_filesystem::FsError::PermissionDenied));
+                        }
                         let inherited =
                             inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                         permissions = inherited.mode;
                         inherited_access = inherited.access;
-                        poll_blocking(parent.create_with_attrs(
-                            &leaf,
-                            permissions,
-                            accessor.uid,
-                            accessor.gid,
-                        ))
+                        owner = (inherited.uid, inherited.gid);
+                        poll_blocking(parent.create_with_attrs(&leaf, permissions, owner.0, owner.1))
                     })
                 });
             match create_result {
@@ -1636,6 +1647,36 @@ fn open_impl(
             ) {
                 // -EACCES, not the generic `fail` (-1/-EPERM). Linux open(2)
                 // reserves EPERM for a different class of failure.
+                ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                return;
+            }
+        }
+    }
+
+    // `fs/namei.c::may_open`:
+    //
+    //     if (path->mnt->mnt_flags & MNT_NODEV && (S_ISBLK || S_ISCHR)) ...
+    //     ...
+    //     error = mnt_want_write(path->mnt);   /* for write intent */
+    //
+    // A write-intent open of anything on a read-only mount is EROFS, and a
+    // device node on a `nodev` mount cannot be opened at all. Both are
+    // properties of the MOUNT, so they hold even for root — which is the
+    // point: a sandbox mounts `nodev` precisely so a privileged process
+    // inside it still cannot reach a device.
+    if narf_filesystem::any_restricted_mounts() {
+        let mnt = current_mount_flags_at(path);
+        if want_w && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
+            ctx.set_return(SyscallReturn::ok((-30i64) as u64)); // -EROFS
+            return;
+        }
+        if mnt & narf_filesystem::mnt_flags::NODEV != 0 {
+            let kind = ops.stat().mode.file_type;
+            if matches!(
+                kind,
+                narf_filesystem::FileType::Special | narf_filesystem::FileType::Block
+            ) {
+                // `may_open`'s device arm is -EACCES, not EPERM.
                 ctx.set_return(SyscallReturn::ok((-13i64) as u64));
                 return;
             }
@@ -2308,6 +2349,16 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-2i64) as u64); // -ENOENT
         }
     };
+    if let Err(errno) = mnt_want_write(path_ref) {
+        return SyscallReturn::ok(errno as u64);
+    }
+    // `do_mknodat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
+    // on the directory gaining the node. CAP_MKNOD for a device node is a
+    // separate gate (`may_mknod` above screened the TYPE, not the
+    // privilege) and is not modelled here.
+    if let Err(errno) = may_create_in(&*parent, current_task_id()) {
+        return SyscallReturn::ok(errno as u64);
+    }
     let fmt = mode & S_IFMT;
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
@@ -2361,9 +2412,20 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // (`st_mode & 0777 == 0600`) it created it with; and the DAC open
             // check needs the owner set so the non-root creator can reopen its
             // own 0600 pipe.
-            let acc = current_accessor(current_task_id());
-            let _ = poll_blocking(n.set_owners(acc.uid, acc.gid));
-            let _ = poll_blocking(n.set_perms((mode & 0o777) as u16));
+            // `shmem_mknod` -> `shmem_get_inode` -> `inode_init_owner`: a
+            // setgid parent hands down its group. A device node or FIFO in
+            // a shared group directory has to land in that group like
+            // anything else.
+            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o777) as u16, false);
+            let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
+            let _ = poll_blocking(n.set_perms(inherited.mode));
+            if let Some(blob) = inherited.access.as_ref() {
+                let _ = poll_blocking(n.set_xattr(
+                    narf_filesystem::AclType::Access.xattr_name(),
+                    blob,
+                    0,
+                ));
+            }
             SyscallReturn::ok(0)
         }
         // The parent resolved and the type is one mknod can make, so a failure
@@ -3256,6 +3318,20 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);
+    // Only the directory GAINING a name is written, so only that mount
+    // needs to be writable — a hard link from a read-only mount into a
+    // writable one is legal.
+    if let Err(errno) = mnt_want_write(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
+    // OLD name is only read, so it needs no directory write permission —
+    // only the directory gaining a name does.
+    if let Err(errno) = check_may_create(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let (Some(old_split), Some(new_split)) = (old_path.rfind('/'), new_path.rfind('/')) else {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
         return;
@@ -5056,11 +5132,145 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
     })
 }
 
-/// The directory at `path`, for the xattr calls — a directory is an inode
-/// with extended attributes, but path resolution hands back `DirOps` for
-/// one, so `xattr_file` can never see it.
-fn xattr_dir(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
-    resolve_dir_absolute(path)
+/// `fs/inode.c::inode_owner_or_capable`:
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), current_fsuid()))
+///         return true;
+/// ns = current_user_ns();
+/// if (vfsuid_has_mapping(ns, vfsuid) && ns_capable(ns, CAP_FOWNER))
+///         return true;
+/// return false;
+/// ```
+///
+/// "You own it, or you hold CAP_FOWNER over it." This is the gate on
+/// changing an inode's ACL, and NARF had none: any task that could reach
+/// an inode could rewrite its access ACL — and with it, since
+/// `posix_acl_update_mode` writes the mode back, its permission bits.
+fn inode_owner_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    if current_host_fsuid(task) == file_uid {
+        return true;
+    }
+    capable_wrt_inode(task, file_uid, file_gid, CAP_FOWNER)
+}
+
+/// The inode an xattr call names. A directory is an inode with extended
+/// attributes, but path resolution hands back `DirOps` for one, so the
+/// `FileOps` form alone can never see it.
+pub(crate) enum XattrTarget {
+    File(alloc::sync::Arc<dyn narf_filesystem::FileOps>),
+    Dir(alloc::sync::Arc<dyn narf_filesystem::DirOps>),
+}
+
+impl XattrTarget {
+    /// `(uid, gid, perms, is_dir)` — everything `xattr_permission` needs.
+    fn meta(&self) -> (u32, u32, u16, bool) {
+        match self {
+            Self::File(file) => {
+                let (uid, gid) = file.owners();
+                (uid, gid, file.stat().mode.perms, false)
+            }
+            Self::Dir(dir) => {
+                let (uid, gid) = dir.dir_owners();
+                (uid, gid, dir.dir_mode(), true)
+            }
+        }
+    }
+
+    fn access_acl(&self) -> Option<narf_filesystem::PosixAcl> {
+        let fetched = match self {
+            Self::File(file) => poll_blocking(narf_filesystem::acl_of_file(
+                file.as_ref(),
+                narf_filesystem::AclType::Access,
+            )),
+            Self::Dir(dir) => poll_blocking(narf_filesystem::acl_of_dir(
+                dir.as_ref(),
+                narf_filesystem::AclType::Access,
+            )),
+        };
+        fetched.and_then(|r| r.ok()).flatten()
+    }
+}
+
+/// Resolve `path` to the inode an xattr call should act on, file or
+/// directory, in ONE walk.
+fn xattr_target(path: &str) -> Option<XattrTarget> {
+    if let Some(file) = xattr_file(path) {
+        return Some(XattrTarget::File(file));
+    }
+    resolve_dir_absolute(path).map(XattrTarget::Dir)
+}
+
+/// The permission gate for one xattr operation on one inode.
+///
+/// The two name classes take different routes in Linux, and conflating
+/// them gets the answer wrong in both directions. `do_setxattr` sends the
+/// POSIX ACL names to `do_set_acl` -> `vfs_set_acl` -> `set_posix_acl`,
+/// whose only check is `inode_owner_or_capable` (EPERM) — write permission
+/// on the inode is neither required nor sufficient. Everything else goes
+/// through `vfs_setxattr` -> `xattr_permission`, which ends at
+/// `inode_permission(idmap, inode, mask)`.
+///
+/// Reading an ACL has no check at all (`vfs_get_acl` performs none), which
+/// matches the mode bits being world-readable through `stat`.
+fn xattr_permission_check(
+    target: &XattrTarget,
+    name: &str,
+    write: bool,
+    task: u64,
+) -> Result<(), i64> {
+    let (uid, gid, perms, is_dir) = target.meta();
+    if is_acl_xattr(name) {
+        if !write {
+            return Ok(());
+        }
+        // `set_posix_acl` tests the DEFAULT-on-a-non-directory case FIRST
+        // and answers `acl ? -EACCES : 0` without ever consulting the
+        // owner. Leaving that arm to the filesystem keeps Linux's
+        // precedence, which putting EPERM in front of it would invert.
+        let default_on_file =
+            !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
+        if !default_on_file && !inode_owner_or_capable(task, uid, gid) {
+            return Err(XE_PERM);
+        }
+        return Ok(());
+    }
+    // The rest of `xattr_permission`. The sticky-directory rule first: on
+    // a directory with S_ISVTX, `user.*` may only be WRITTEN by someone who
+    // passes `inode_owner_or_capable`, so a shared `/tmp` cannot have its
+    // entries relabelled by passers-by.
+    if write
+        && is_dir
+        && perms & 0o1000 != 0
+        && name.starts_with("user.")
+        && !inode_owner_or_capable(task, uid, gid)
+    {
+        return Err(XE_PERM);
+    }
+    // ...ending at `inode_permission(idmap, inode, mask)`: setting an
+    // attribute needs WRITE on the inode, reading one needs READ. Nothing
+    // enforced that, so a file's `security.*` label could be rewritten by
+    // anyone who could name it.
+    let permitted = narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: !write,
+            write,
+            exec: false,
+        },
+        target.access_acl().as_ref(),
+    );
+    if permitted {
+        Ok(())
+    } else {
+        Err(XE_ACCES)
+    }
 }
 
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
@@ -5124,12 +5334,24 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
         }
     };
+    // `setxattr` -> `mnt_want_write` before anything else touches the
+    // inode: an attribute is state on the filesystem like any other.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // A path can name a file or a directory; both are inodes with xattrs.
-    let stored = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
-        None => {
-            xattr_dir(&path).and_then(|dir| poll_blocking(dir.set_xattr(&name, &value, flags as u32)))
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
+    }
+    let stored = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.set_xattr(&name, &value, flags as u32)),
+        None => None,
     };
     match stored {
         Some(Ok(())) => {
@@ -5188,9 +5410,17 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         return;
     }
     let size = a.arg3 as usize;
-    let fetched = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.get_xattr(&name)),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.get_xattr(&name))),
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, false, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let fetched = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.get_xattr(&name)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.get_xattr(&name)),
+        None => None,
     };
     match fetched {
         Some(Ok(value)) => {
@@ -5235,9 +5465,20 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
-    let listed = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.list_xattr()),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.list_xattr())),
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        // `listxattr` needs READ on the inode, like any other read of its
+        // metadata. The empty name is the whole-inode form, so there is no
+        // namespace to resolve.
+        if let Err(errno) = xattr_permission_check(target, "", false, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let listed = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.list_xattr()),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.list_xattr()),
+        None => None,
     };
     match listed {
         Some(Ok(names)) => {
@@ -5293,9 +5534,21 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
-    let removed = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.remove_xattr(&name)),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.remove_xattr(&name))),
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let removed = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.remove_xattr(&name)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.remove_xattr(&name)),
+        None => None,
     };
     match removed {
         Some(Ok(())) => {
@@ -5342,6 +5595,10 @@ fn wall_now_ns() -> u64 {
 /// resolve_async only yields files, so directories take the
 /// stat-dir-aware fallback).
 fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i64 {
+    // `do_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
+    if let Err(errno) = mnt_want_write(path) {
+        return errno;
+    }
     let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
         poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
     });
@@ -11410,6 +11667,189 @@ pub fn __test_accessor_for_inode(
     file_gid: u32,
 ) -> narf_filesystem::Accessor {
     accessor_for_inode(task, file_uid, file_gid)
+}
+
+// ── fs/namei.c: may_create / may_delete ──────────────────────────────
+//
+// Linux runs a permission check on the PARENT DIRECTORY before any
+// namespace-changing operation, and nothing here did: `unlink`, `rmdir`,
+// `rename`, `link`, `symlink` and `mknod` all went straight to the
+// filesystem. On a world-writable directory that is the whole of `/tmp`'s
+// security model — the sticky bit exists precisely so one user cannot
+// delete another's file there, and without the check it had no effect at
+// all.
+
+/// Linux `CAP_FOWNER` — "bypass permission checks on operations that
+/// normally require the filesystem UID of the process to match the UID of
+/// the file".
+pub(crate) const CAP_FOWNER: u32 = 3;
+
+/// `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)` on a parent
+/// directory, ACL included.
+fn dir_write_permitted(dir: &dyn narf_filesystem::DirOps, task: u64) -> bool {
+    let (uid, gid) = dir.dir_owners();
+    // Mode-only fast path, for the same reason `open` has
+    // `current_host_fsuid`: this now runs on every create and every
+    // delete, and the full decision materialises a supplementary-group
+    // list and a capability snapshot that the common case never needs.
+    //
+    // It can only ever GRANT — anything it cannot settle falls through to
+    // the full check — and it mirrors `acl_permission_check`'s structure
+    // exactly, including the rule that makes each triplet EXCLUSIVE:
+    //
+    //   * the caller IS the owner: the user triplet alone decides, so
+    //     user-wx is a grant (and user-deny still has to fall through,
+    //     because CAP_DAC_OVERRIDE may yet allow it);
+    //   * the caller is NOT the owner: whichever of group/other applies,
+    //     both granting wx means the answer is yes either way — which is
+    //     the 0777 and 01777 directories that most creates land in.
+    //
+    // Only taken when the directory can cheaply say it has no ACL; an ACL
+    // replaces the group triplet, so the shortcut would not be sound.
+    if dir.access_acl_present() == Some(false) {
+        let mode = dir.dir_mode();
+        if current_host_fsuid(task) == uid {
+            if mode & 0o300 == 0o300 {
+                return true;
+            }
+        } else if mode & 0o033 == 0o033 {
+            return true;
+        }
+    }
+    // A directory's ACL is the case that matters most here: `setfacl -m
+    // g:staff:rwx /srv/shared` is how a shared directory is built, and
+    // checking the mode alone would refuse every member of that group.
+    let acl = match poll_blocking(narf_filesystem::acl_of_dir(
+        dir,
+        narf_filesystem::AclType::Access,
+    )) {
+        Some(Ok(acl)) => acl,
+        // `check_acl` propagates a decode failure rather than falling back
+        // to the mode bits; refusing is the safe reading of the same rule.
+        Some(Err(_)) => return false,
+        None => None,
+    };
+    narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms: dir.dir_mode(),
+            is_dir: true,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: false,
+            write: true,
+            exec: true,
+        },
+        acl.as_ref(),
+    )
+}
+
+/// `fs/namei.c::may_create` — the check every create-like operation makes
+/// on the directory it is about to add a name to:
+///
+/// ```text
+/// return inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC);
+/// ```
+///
+/// -EACCES when it fails.
+pub(crate) fn may_create_in(dir: &dyn narf_filesystem::DirOps, task: u64) -> Result<(), i64> {
+    if dir_write_permitted(dir, task) {
+        Ok(())
+    } else {
+        Err(-13) // -EACCES
+    }
+}
+
+/// `capable_wrt_inode_uidgid(idmap, inode, cap)` — the capability must be
+/// held in a user namespace that maps the inode's owner, so a namespaced
+/// root cannot use it to reach an inode owned outside its namespace.
+fn capable_wrt_inode(task: u64, file_uid: u32, file_gid: u32, cap: u32) -> bool {
+    if !task_capable(task, cap) {
+        return false;
+    }
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial()
+            && (uns.translate_uid_from_host(file_uid).is_none()
+                || uns.translate_gid_from_host(file_gid).is_none())
+        {
+            return false;
+        }
+    }
+    let _ = (file_uid, file_gid);
+    true
+}
+
+/// `fs/namei.c::__check_sticky`:
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), fsuid)) return 0;
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, dir), fsuid)) return 0;
+/// return !capable_wrt_inode_uidgid(idmap, inode, CAP_FOWNER);
+/// ```
+///
+/// Only consulted when the directory carries `S_ISVTX`. `/tmp` is 01777,
+/// so this is the rule that stops one user removing another's file there;
+/// the owner of the directory and the owner of the victim may both do it,
+/// and so may CAP_FOWNER.
+fn sticky_permits_removal(dir_uid: u32, victim_uid: u32, victim_gid: u32, task: u64) -> bool {
+    let fsuid = read_uidgid(task).fsuid;
+    if victim_uid == fsuid || dir_uid == fsuid {
+        return true;
+    }
+    capable_wrt_inode(task, victim_uid, victim_gid, CAP_FOWNER)
+}
+
+/// `fs/namei.c::may_delete` — what `unlink`, `rmdir` and the destination
+/// side of `rename` require before a name can be removed from `dir`:
+/// write+exec on the directory, plus the sticky rule when `S_ISVTX` is set.
+///
+/// The two failures are deliberately different errnos, as Linux's are: the
+/// permission check is -EACCES, the sticky refusal is -EPERM.
+pub(crate) fn may_delete_in(
+    dir: &dyn narf_filesystem::DirOps,
+    victim_uid: u32,
+    victim_gid: u32,
+    task: u64,
+) -> Result<(), i64> {
+    may_create_in(dir, task)?;
+    let (dir_uid, _) = dir.dir_owners();
+    if dir.dir_mode() & 0o1000 != 0 && !sticky_permits_removal(dir_uid, victim_uid, victim_gid, task)
+    {
+        return Err(-1); // -EPERM
+    }
+    Ok(())
+}
+
+/// The owner of the name `leaf` inside `dir`, for [`may_delete_in`].
+///
+/// A name that resolves to nothing yields `None`; the caller then reports
+/// the ENOENT it would have reported anyway rather than inventing a
+/// permission answer about a victim that does not exist.
+pub(crate) fn entry_owner(dir: &dyn narf_filesystem::DirOps, leaf: &str) -> Option<(u32, u32)> {
+    if let Some(file) = dir.lookup(leaf) {
+        return Some(file.owners());
+    }
+    if let Some(sub) = dir.lookup_dir(leaf) {
+        return Some(sub.dir_owners());
+    }
+    poll_blocking(dir.lookup_async(leaf))
+        .and_then(|r| r.ok())
+        .map(|file| file.owners())
+}
+
+/// [`may_create_in`] for a path whose parent has not been resolved yet.
+///
+/// A parent that does not resolve is left to the caller: it reports the
+/// ENOENT it would have reported anyway, rather than inventing a
+/// permission answer about a directory that is not there.
+pub(crate) fn check_may_create(path: &str) -> Result<(), i64> {
+    let task = current_task_id();
+    current_resolve_parent_absolute(path, |_fs, parent, _leaf| may_create_in(&*parent, task))
+        .unwrap_or(Ok(()))
 }
 
 fn dir_search_permitted(path: &str, task: u64) -> bool {

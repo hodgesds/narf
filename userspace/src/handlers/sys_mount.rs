@@ -109,11 +109,10 @@ const MS_NOUSER: u64 = 1 << 31;
 ///     and -EACCES (an unsearchable target directory) have no NARF analogue:
 ///     the block layer here is a flat name→device registry with no file
 ///     identity, and there is no directory permission walk on the mount path.
-///   * MS_RDONLY / MS_NOSUID / MS_NODEV / MS_NOEXEC / MS_REC / MS_RELATIME
-///     are accepted and then IGNORED (see the swallow below) — a silent
-///     divergence rather than a wrong errno, and the more dangerous kind:
-///     a sandbox that mounts `MS_NOSUID|MS_NODEV` gets a success reply and
-///     no enforcement.
+///   * MS_REC / MS_RELATIME are accepted and then ignored: NARF has no
+///     mount propagation (every mount is private) and no per-inode atime
+///     policy to relax. MS_RDONLY / MS_NOSUID / MS_NODEV / MS_NOEXEC are
+///     translated into the mount's `MNT_*` set and enforced.
 pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // errno replies (negated-long convention). Every failure carries a
@@ -278,20 +277,18 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
         } else {
             resolve_vfs_symlink_path(source_resolved.as_str(), true).unwrap_or(source_resolved)
         };
-    // LINUX-GAP (accepted-then-ignored, NOT an errno bug): `path_mount`
-    // translates each of these into an `MNT_*` bit that the VFS then enforces
-    // per mount. NARF has nowhere to store them until `FsInstance` grows a
-    // per-mount option vector, so they are validated (they are real flags, so
-    // no EINVAL) and dropped. The dangerous members are MS_RDONLY, MS_NOSUID
-    // and MS_NODEV: a caller that mounts with them gets 0 and no enforcement.
-    let _ =
-        flags & (MS_RDONLY | MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_REMOUNT | MS_REC | MS_RELATIME);
+    // `path_mount` translates the restriction flags into the `MNT_*` set
+    // the mount carries, which the VFS then enforces per mount. MS_REC and
+    // MS_RELATIME have no NARF counterpart — there is no propagation to
+    // recurse over and no atime policy to relax — so those two alone are
+    // still accepted and dropped.
+    let mnt_flags = mnt_flags_from_ms(flags);
+    let _ = flags & (MS_REMOUNT | MS_REC | MS_RELATIME);
 
     // A bind remount changes flags on an existing mount; `source` and
     // `filesystemtype` are conventionally NULL and must not be interpreted as
     // a request to create another bind. systemd uses this after constructing
-    // each service's private mount namespace. NARF does not yet persist
-    // per-mount VFS flags, so validate the target and accept the flag update.
+    // each service's private mount namespace.
     if (flags & MS_REMOUNT) != 0 {
         let exists = current_mount_list().iter().any(|mount| mount == &target)
             || resolve_dir_absolute(target.as_str()).is_some()
@@ -300,6 +297,11 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             ctx.set_return(enoent);
             return;
         }
+        // `do_reconfigure_mnt` replaces the mount's flags wholesale, so a
+        // remount that omits MS_RDONLY makes a read-only mount writable
+        // again. This is the operation systemd uses to seal a service's
+        // filesystem view after setting it up.
+        current_set_mount_flags(&target, mnt_flags);
         if !data.is_empty() {
             let result = current_fs_arc_at(&target).map(|fs| fs.reconfigure(&data));
             ctx.set_return(match result {
@@ -453,7 +455,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
                     } else {
                         alloc::format!("{}{}", target.trim_end_matches('/'), relative)
                     };
-                    let _ = current_mount_arc(&auth, child_target.as_str(), fs);
+                    let _ = current_mount_arc_with_flags(&auth, child_target.as_str(), fs, mnt_flags);
                 }
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -480,7 +482,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             mount_gid,
         ) {
             Ok(Some(fs)) => {
-                return match current_mount_arc(&auth, target.as_str(), fs) {
+                return match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
                     Ok(_) | Err(_) => ctx.set_return(SyscallReturn::ok(0)),
                 };
             }
@@ -613,7 +615,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             }
             _ => unreachable!(),
         };
-        return match current_mount_arc(&auth, target.as_str(), fs) {
+        return match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(e) => ctx.set_return(mount_attach_errno(e)),
         };
@@ -695,7 +697,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
             let _ = init_fs.init().await;
         });
         let fs_dyn: alloc::sync::Arc<dyn narf_filesystem::FsInstance> = fs;
-        return match current_mount_arc(&auth, target.as_str(), fs_dyn) {
+        return match current_mount_arc_with_flags(&auth, target.as_str(), fs_dyn, mnt_flags) {
             Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
             Err(e) => ctx.set_return(mount_attach_errno(e)),
         };
@@ -707,7 +709,7 @@ pub(crate) fn sys_mount(ctx: &mut dyn TrapContext) {
     // block-device fallthrough. Options are passed via source/data.
     if let Some(builder) = narf_filesystem::lookup_fstype(fstype.as_str()) {
         return match builder(source_resolved.as_str(), data.as_str()) {
-            Ok(fs) => match current_mount_arc(&auth, target.as_str(), fs) {
+            Ok(fs) => match current_mount_arc_with_flags(&auth, target.as_str(), fs, mnt_flags) {
                 Ok(_h) => ctx.set_return(SyscallReturn::ok(0)),
                 Err(e) => ctx.set_return(mount_attach_errno(e)),
             },

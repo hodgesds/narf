@@ -94,6 +94,12 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
         }
     };
     let path = resolve_cwd_path(task, &effective);
+    // `chmod_common` -> `mnt_want_write`: a mode change is a write to the
+    // inode, so a read-only mount refuses it with EROFS.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let mode = (args.arg2 as u32 & 0o7777) as u16;
     let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
 

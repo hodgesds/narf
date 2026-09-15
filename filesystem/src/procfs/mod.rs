@@ -2041,13 +2041,14 @@ fn gen_meminfo() -> String {
 /// util-linux) prefers `mountinfo`, while `df` and many shell tools read
 /// `/proc/mounts` — a split view makes them disagree about whether something
 /// is a mount point at all.
-pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
+pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String, String)> {
     if let Some(rows) = hook_ns_mountinfo(pid) {
-        // Hook rows are "id\tparent\tpath\tfsname\tsuper-options".
-        let parsed: Vec<(String, String, String)> = rows
+        // Hook rows are
+        // "id\tparent\tpath\tfsname\tmount-options\tsuper-options".
+        let parsed: Vec<(String, String, String, String)> = rows
             .lines()
             .filter_map(|line| {
-                let mut it = line.splitn(5, '\t');
+                let mut it = line.splitn(6, '\t');
                 let _id = it.next()?;
                 let _parent = it.next()?;
                 let path = it.next()?;
@@ -2055,6 +2056,7 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
                 Some((
                     String::from(path),
                     String::from(fs_name),
+                    String::from(it.next().unwrap_or("rw")),
                     String::from(it.next().unwrap_or("")),
                 ))
             })
@@ -2076,10 +2078,13 @@ pub(crate) fn ns_mounts_for(pid: u64) -> Vec<(String, String, String)> {
 fn gen_mounts() -> String {
     let mut s = String::new();
     // Linux `/proc/mounts` is `/proc/self/mounts`: the CALLER's namespace.
-    for (path, fs_name, options) in ns_mounts_for(current_pid()) {
+    for (path, fs_name, mnt_opts, sb_opts) in ns_mounts_for(current_pid()) {
         let _ = core::fmt::Write::write_fmt(
             &mut s,
-            format_args!("{} {} {} rw{} 0 0\n", fs_name, path, fs_name, options),
+            format_args!(
+                "{} {} {} {}{} 0 0\n",
+                fs_name, path, fs_name, mnt_opts, sb_opts
+            ),
         );
     }
     s
@@ -3145,12 +3150,12 @@ kernel_test_in!("filesystem/procfs", smoke_attr_current_empty_and_rw);
 /// exactly the case that never broke.
 fn mounts_ns_hook_for_consistency_test(pid: u64) -> Option<alloc::string::String> {
     // Same shape the real hook emits:
-    // "id\tparent\tpath\tfsname\tsuper-options". The last field is
-    // optional — rows written before it existed still parse — so the ext2
-    // row deliberately omits it while the tmpfs row carries one.
+    // "id\tparent\tpath\tfsname\tmount-options\tsuper-options". The two
+    // option fields are optional — rows written before they existed still
+    // parse — so the ext2 row omits both while the tmpfs row carries them.
     (pid == 0x4d4e).then(|| {
         alloc::string::String::from(
-            "9\t8\t/\text2\n12\t9\t/run\ttmpfs\t,size=8192k,inode64\n25\t10\t/dev/pts\tdevpts",
+            "9\t8\t/\text2\n             12\t9\t/run\ttmpfs\tro,nosuid,nodev\t,size=8192k,inode64\n             25\t10\t/dev/pts\tdevpts",
         )
     })
 }
@@ -3163,20 +3168,20 @@ fn smoke_proc_mounts_matches_mountinfo_namespace_view() -> TestResult {
     }
     // The exact regression: /run present in the namespace view must not be
     // dropped on the /proc/mounts side.
-    if !rows
-        .iter()
-        .any(|(path, fs, opts)| path == "/run" && fs == "tmpfs" && opts == ",size=8192k,inode64")
-    {
+    if !rows.iter().any(|(path, fs, mnt, sb)| {
+        path == "/run" && fs == "tmpfs" && mnt == "ro,nosuid,nodev" && sb == ",size=8192k,inode64"
+    }) {
         return TestResult::Fail("/proc/mounts view lost the namespace's /run tmpfs");
     }
-    // A row with no options field at all still parses, and reports none.
+    // A row with no option fields at all still parses, and reports the
+    // read-write default with no super options.
     if !rows
         .iter()
-        .any(|(path, _, opts)| path == "/" && opts.is_empty())
+        .any(|(path, _, mnt, sb)| path == "/" && mnt == "rw" && sb.is_empty())
     {
-        return TestResult::Fail("a hook row without an options field did not parse");
+        return TestResult::Fail("a hook row without option fields did not parse");
     }
-    if !rows.iter().any(|(path, _, _)| path == "/dev/pts") {
+    if !rows.iter().any(|(path, ..)| path == "/dev/pts") {
         return TestResult::Fail("/proc/mounts view lost the namespace's /dev/pts");
     }
     TestResult::Pass

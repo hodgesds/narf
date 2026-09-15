@@ -33,6 +33,12 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
         }
     };
     let path = apply_chroot(&path);
+    // `do_sys_truncate` -> `mnt_want_write`: changing a file's length is a
+    // write, refused with EROFS on a read-only mount.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let ops = narf_filesystem::registry()
         .resolve_absolute(&path, |fs, rel| {
             narf_filesystem::resolve(fs.root(), rel).ok()

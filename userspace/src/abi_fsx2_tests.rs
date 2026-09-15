@@ -1280,8 +1280,7 @@ fn smoke_abi_fsx2_mount_namespace_stack_pos() -> TestResult {
             _ => return Err("stacking a mount must change the visible mount id"),
         }
         match ns.list_mountinfo().last() {
-            Some((_, parent, path, _, _))
-                if *parent == first_id && path == "/abi-private-stack" => {}
+            Some((_, parent, path, ..)) if *parent == first_id && path == "/abi-private-stack" => {}
             _ => return Err("a stacked mount must name the covered mount as its parent"),
         }
         match ns.resolve_absolute("/abi-private-stack", |fs, _| fs.name() == "stack-second") {

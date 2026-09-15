@@ -2774,6 +2774,11 @@ struct MemDir {
     uid: AtomicU32,
     gid: AtomicU32,
     times: Times,
+    /// Whether this directory carries a `system.posix_acl_access`. Read on
+    /// every create and delete in this directory (`may_create`/
+    /// `may_delete` need the ACL), so it is a byte rather than a lookup
+    /// through the attribute lock.
+    has_access_acl: core::sync::atomic::AtomicBool,
     /// Whether this directory carries a `system.posix_acl_default`.
     ///
     /// Every create in this directory has to ask — inheritance replaces the
@@ -2806,6 +2811,16 @@ impl fmt::Debug for MemDir {
 }
 
 impl MemDir {
+    /// Re-read whether this directory now holds the ACL of kind `ty`, so
+    /// the lock-free probes stay in step with the attribute map.
+    fn refresh_acl_flags(&self, ty: AclType) {
+        let (name, flag) = match ty {
+            AclType::Access => (XATTR_NAME_POSIX_ACL_ACCESS, &self.has_access_acl),
+            AclType::Default => (XATTR_NAME_POSIX_ACL_DEFAULT, &self.has_default_acl),
+        };
+        flag.store(self.xattrs.raw_get(name).is_some(), Ordering::Release);
+    }
+
     /// Record that a subdirectory appeared or disappeared, so `st_nlink`
     /// stays `2 + subdirs`.
     fn adjust_subdirs(&self, delta: i32) {
@@ -3361,6 +3376,7 @@ impl DirOps for MemDir {
                 uid: AtomicU32::new(self.uid.load(Ordering::Relaxed)),
                 gid: AtomicU32::new(self.gid.load(Ordering::Relaxed)),
                 times: Times::now(),
+                has_access_acl: core::sync::atomic::AtomicBool::new(false),
                 has_default_acl: core::sync::atomic::AtomicBool::new(false),
                 subdirs: AtomicU32::new(0),
                 xattrs: Xattrs::new(),
@@ -3378,6 +3394,10 @@ impl DirOps for MemDir {
 
     fn dir_mtime_ns(&self) -> u64 {
         self.times.mtime()
+    }
+
+    fn access_acl_present(&self) -> Option<bool> {
+        Some(self.has_access_acl.load(Ordering::Acquire))
     }
 
     fn default_acl(&self) -> Option<Vec<u8>> {
@@ -3643,12 +3663,10 @@ impl DirOps for MemDir {
             // inherits.
             if let Some(ty) = AclType::from_xattr_name(name) {
                 memfs_set_acl(&self.xattrs, &self.perms, true, ty, value)?;
-                if ty == AclType::Default {
-                    self.has_default_acl.store(
-                        self.xattrs.raw_get(XATTR_NAME_POSIX_ACL_DEFAULT).is_some(),
-                        Ordering::Release,
-                    );
-                }
+                // `memfs_set_acl` may store the ACL, remove it, or store
+                // nothing at all (an ACL exactly expressible as mode bits),
+                // so the flags are refreshed from what actually landed.
+                self.refresh_acl_flags(ty);
                 self.times.touch_ctime();
                 return Ok(());
             }
@@ -3672,11 +3690,9 @@ impl DirOps for MemDir {
             // `removexattr` routes both ACL names to `vfs_remove_acl` ->
             // `set_posix_acl(type, NULL)`, which returns 0 whether or not
             // an ACL was cached.
-            if AclType::from_xattr_name(name).is_some() {
+            if let Some(ty) = AclType::from_xattr_name(name) {
                 self.xattrs.raw_remove(name);
-                if name == XATTR_NAME_POSIX_ACL_DEFAULT {
-                    self.has_default_acl.store(false, Ordering::Release);
-                }
+                self.refresh_acl_flags(ty);
                 self.times.touch_ctime();
                 return Ok(());
             }
@@ -3765,6 +3781,7 @@ impl MemFs {
             uid: AtomicU32::new(root_uid),
             gid: AtomicU32::new(root_gid),
             times: Times::now(),
+            has_access_acl: core::sync::atomic::AtomicBool::new(false),
             has_default_acl: core::sync::atomic::AtomicBool::new(false),
             subdirs: AtomicU32::new(0),
             xattrs: Xattrs::new(),

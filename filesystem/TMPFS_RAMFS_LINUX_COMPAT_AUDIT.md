@@ -78,6 +78,24 @@ not remembered behavior:
 | atime / ctime | mtime copied into all three | three separate stamps: mtime+ctime on a data change, ctime alone on a metadata change, atime under `relatime_need_update`. Directories gained timestamps at all |
 | POSIX default ACLs | `posix_acl_create` implemented but never called; directories had no ACL storage | directories hold `system.posix_acl_default`; `mkdir` and `open(O_CREAT)` inherit it, and it REPLACES the umask rather than combining with it |
 
+### Third pass (2026-09-15) — the VFS checks tmpfs depends on
+
+These are `fs/namei.c` / `fs/xattr.c` rules rather than `mm/shmem.c`
+ones, but tmpfs is where their absence showed: `/tmp` is mode 01777 and
+`/run` is a shared group tree, so both depend entirely on checks NARF was
+not making.
+
+| Linux-visible area | Before | Implemented result |
+| --- | --- | --- |
+| `may_create` / `may_delete` | no check at all — `unlink`, `rmdir`, `rename`, `link`, `symlink`, `mknod` and `open(O_CREAT)` went straight to the filesystem | `inode_permission(dir, MAY_WRITE \| MAY_EXEC)` on the parent, EACCES when refused |
+| Sticky bit | did nothing, so any task could delete any other user's file in `/tmp` | `__check_sticky`: the victim's owner, the directory's owner, or CAP_FOWNER (tested with respect to the victim's ids), EPERM otherwise |
+| `inode_init_owner` | a new inode always took the creator's fsgid | a setgid parent hands down its group, and a new SUBDIRECTORY inherits S_ISGID so the tree stays shared |
+| ACL writes | unchecked — any task that could name an inode could rewrite its ACL, and through `posix_acl_update_mode` its mode | `set_posix_acl`'s `inode_owner_or_capable`, EPERM |
+| Ordinary xattr writes/reads | unchecked | `xattr_permission`'s closing `inode_permission(inode, mask)`, EACCES, plus the sticky-directory `user.*` rule |
+| `mknod` umask | ignored | applied — `mode_strip_umask` defers umask stripping on a POSIX-ACL filesystem rather than skipping it, and `shmem_mknod` reaches `posix_acl_create` through `simple_acl_create` |
+| `MS_RDONLY` / `MS_NODEV` / `MS_NOEXEC` | accepted and dropped | translated into the mount's `MNT_*` set (`path_mount`), replaced wholesale by `MS_REMOUNT` (`do_reconfigure_mnt`), copied by a namespace clone, and enforced: `mnt_want_write` → EROFS on every write-shaped syscall, `may_open`'s device arm → EACCES on a `nodev` mount, `path_noexec` → EACCES from `do_open_execat` |
+| Per-mount options in `/proc/mounts` | a flat `rw` | the real flags, in the column `show_vfsmnt`/`show_mountinfo` put them in — separate from the filesystem's `show_options` text |
+
 Ramfs deliberately ignores unknown mount parameters, following
 `ramfs_parse_param`, and has no `show_options` (its `super_operations`
 leaves the slot empty), so it contributes no options to `/proc/mounts`.
@@ -97,8 +115,18 @@ the three timestamps and the relatime rule, per-mount device numbers, and
 default-ACL inheritance end-to-end through `mkdir`/`open(O_CREAT)` with a
 umask that would visibly bite if inheritance were not happening.
 
+The third pass adds smokes for the sticky bit (a stranger refused with
+EPERM, the victim's owner allowed), directory write permission across
+every namespace operation, setgid group and S_ISGID propagation, and the
+EPERM/EACCES split between ACL and ordinary xattr writes.
+
 Each new smoke was run against a deliberately stubbed mechanism and
-confirmed to fail with the expected message before being kept.
+confirmed to fail with the expected message before being kept. The xattr
+smoke additionally opens its target for writing first: the gate ends at
+`inode_permission`, so a caller who CAN write the file should be allowed
+to set an attribute, and without that guard the test would have asserted
+the opposite — which is what its first version did, having staged the
+mode before an ACL write that reset it.
 
 ## Remaining gaps
 
@@ -112,19 +140,28 @@ These are explicit implementation gaps, not claimed compatibility:
 2. Transparent huge pages, nontrivial NUMA policies, idmapped mounts,
    casefolding (`CONFIG_UNICODE`), and fscrypt are not implemented.
    Unsupported mount policies are rejected rather than accepted as no-ops.
-3. Generic VFS `MS_RDONLY`, `MS_NOSUID`, `MS_NODEV` and `MS_NOEXEC`
-   enforcement remains mount-layer work, and `/proc/mounts` therefore
-   prints `rw` for the per-mount flags regardless of how the mount was
-   made. The filesystem-specific half of that line is now correct.
+3. `MS_NOSUID` is stored and reported but has nothing to suppress: NARF's
+   execve does not implement set-user-ID binaries, so there is no
+   privilege transition for it to block. `MS_REC` and `MS_RELATIME` are
+   accepted and dropped — there is no mount propagation to recurse over
+   and no per-inode atime policy to relax.
 4. `noswap` cannot be relaxed because no swap path exists. Remount
    validates accepted policy spellings but does not add a behavior NARF
    lacks.
-5. `set_posix_acl`'s `inode_owner_or_capable()` check, and
-   `posix_acl_update_mode`'s `in_group_or_capable()` S_ISGID drop, need a
-   credential the `FileOps`/`DirOps` methods do not carry. NARF keeps the
-   S_ISGID bit (Linux's answer for the common case of an owner acting on
-   their own file) and never widens the rwx bits.
-6. S_ISGID inheritance from a parent directory (`inode_init_owner`) is not
-   modelled; a new inode takes the creating task's fsuid/fsgid.
-7. `memparse`'s shift overflow is rejected with EINVAL rather than wrapping
+5. `posix_acl_update_mode`'s `in_group_or_capable()` S_ISGID drop needs a
+   credential the `FileOps`/`DirOps` methods do not carry, so NARF keeps
+   the S_ISGID bit — Linux's answer for the common case of an owner acting
+   on their own file — and never widens the rwx bits. (`set_posix_acl`'s
+   `inode_owner_or_capable` gate is now enforced, in the syscall layer
+   where the credential lives.)
+6. `vfs_prepare_mode`'s `mode_strip_sgid` — which removes a CALLER-supplied
+   S_ISGID from a group-executable regular file when the creator is not in
+   the directory's group — is not modelled. NARF's create paths mask the
+   caller's mode down before that point, so the bit can only arrive by
+   inheritance, where the strip does not apply.
+7. CAP_MKNOD is not required for a device node; `may_mknod` screens the
+   node TYPE but nothing screens the privilege.
+8. `may_write_xattr`'s immutable / append-only refusal has no counterpart,
+   because NARF models neither inode flag.
+9. `memparse`'s shift overflow is rejected with EINVAL rather than wrapping
    as C does, so `size=16E` fails instead of silently meaning "unlimited".

@@ -35,7 +35,28 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // Reuse the authoritative parent resolution instead of performing a
     // second complete VFS walk merely to construct the socket key; ordinary
     // regular-file unlinks are the overwhelmingly common case.
+    //
+    // `do_unlinkat` -> `may_delete(dir, dentry, 0)` runs inside that SAME
+    // resolution: write+exec on the parent directory, plus the sticky rule
+    // when the parent carries S_ISVTX. `/tmp` is 01777, so this is the
+    // check that stops one user removing another user's file there — and
+    // nothing checked it before, on any directory. Doing it here rather
+    // than through `check_may_delete` keeps unlink at one path walk.
+    // `do_unlinkat` -> `mnt_want_write(mnt)`: a read-only mount refuses
+    // before any permission question is asked.
+    if let Err(errno) = mnt_want_write(path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+    let task = current_task_id();
+    let mut refused = None;
     let outcome = current_resolve_parent_absolute(path, |fs, parent, leaf| {
+        if let Some((victim_uid, victim_gid)) = entry_owner(&*parent, leaf) {
+            if let Err(errno) = may_delete_in(&*parent, victim_uid, victim_gid, task) {
+                refused = Some(errno);
+                return (false, None);
+            }
+        }
         let was_socket = crate::socket::unbind_resolved_path(
             path,
             fs.backing_identity(),
@@ -44,6 +65,10 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
         );
         (was_socket, poll_blocking(parent.unlink(leaf)))
     });
+    if let Some(errno) = refused {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     match outcome {
         Some((_, Some(Ok(())))) => {
             crate::mqueue::notify_delete(path, false);
