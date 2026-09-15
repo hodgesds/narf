@@ -9617,9 +9617,7 @@ fn release_task_tables(tid: u64) {
     signal_bits_remove(&SIGNAL_READABLE_GEN, tid);
     signal_bits_remove(&SIGNAL_RAISE_GEN, tid);
     signal_bits_remove(&SIGNAL_MASK, tid);
-    if let Some(m) = SIGACTION_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
+    task_map_remove(&SIGACTION_TABLE, tid);
     if let Some(m) = SIG_ALTSTACK.lock().as_mut() {
         m.remove(&tid);
     }
@@ -9976,13 +9974,7 @@ pub fn __test_task_table_residue(tid: u64) -> u32 {
     let has = |present: bool, bit: u32| if present { bit } else { 0 };
     r |= has(signal_bits_contains(&SIGNAL_PENDING, tid), 1 << 0);
     r |= has(signal_bits_contains(&SIGNAL_MASK, tid), 1 << 1);
-    r |= has(
-        SIGACTION_TABLE
-            .lock()
-            .as_ref()
-            .is_some_and(|m| m.contains_key(&tid)),
-        1 << 2,
-    );
+    r |= has(task_map_get(&SIGACTION_TABLE, tid).is_some(), 1 << 2);
     r |= has(
         SIGNAL_WAKERS[signal_waker_shard(tid)]
             .values
