@@ -1653,6 +1653,36 @@ fn open_impl(
         }
     }
 
+    // `fs/namei.c::may_open`:
+    //
+    //     if (path->mnt->mnt_flags & MNT_NODEV && (S_ISBLK || S_ISCHR)) ...
+    //     ...
+    //     error = mnt_want_write(path->mnt);   /* for write intent */
+    //
+    // A write-intent open of anything on a read-only mount is EROFS, and a
+    // device node on a `nodev` mount cannot be opened at all. Both are
+    // properties of the MOUNT, so they hold even for root — which is the
+    // point: a sandbox mounts `nodev` precisely so a privileged process
+    // inside it still cannot reach a device.
+    if narf_filesystem::any_restricted_mounts() {
+        let mnt = current_mount_flags_at(path);
+        if want_w && mnt & narf_filesystem::mnt_flags::READONLY != 0 {
+            ctx.set_return(SyscallReturn::ok((-30i64) as u64)); // -EROFS
+            return;
+        }
+        if mnt & narf_filesystem::mnt_flags::NODEV != 0 {
+            let kind = ops.stat().mode.file_type;
+            if matches!(
+                kind,
+                narf_filesystem::FileType::Special | narf_filesystem::FileType::Block
+            ) {
+                // `may_open`'s device arm is -EACCES, not EPERM.
+                ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                return;
+            }
+        }
+    }
+
     // Landlock: a self-restricted task's open must be permitted by its
     // active rulesets, else EACCES.
     if !created {
@@ -2319,6 +2349,9 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             return SyscallReturn::ok((-2i64) as u64); // -ENOENT
         }
     };
+    if let Err(errno) = mnt_want_write(path_ref) {
+        return SyscallReturn::ok(errno as u64);
+    }
     // `do_mknodat` -> `filename_create` -> `may_create(dir, ..)`: write+exec
     // on the directory gaining the node. CAP_MKNOD for a device node is a
     // separate gate (`may_mknod` above screened the TYPE, not the
@@ -3285,6 +3318,13 @@ fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);
+    // Only the directory GAINING a name is written, so only that mount
+    // needs to be writable — a hard link from a read-only mount into a
+    // writable one is legal.
+    if let Err(errno) = mnt_want_write(&new_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // `do_linkat` -> `filename_create` -> `may_create(new_dir, ..)`. The
     // OLD name is only read, so it needs no directory write permission —
     // only the directory gaining a name does.
@@ -5294,6 +5334,12 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
             }
         }
     };
+    // `setxattr` -> `mnt_want_write` before anything else touches the
+    // inode: an attribute is state on the filesystem like any other.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     // A path can name a file or a directory; both are inodes with xattrs.
     let target = xattr_target(&path);
     if let Some(target) = target.as_ref() {
@@ -5488,6 +5534,10 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let target = xattr_target(&path);
     if let Some(target) = target.as_ref() {
         if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
@@ -5545,6 +5595,10 @@ fn wall_now_ns() -> u64 {
 /// resolve_async only yields files, so directories take the
 /// stat-dir-aware fallback).
 fn set_path_times(path: &str, atime_ns: Option<u64>, mtime_ns: Option<u64>) -> i64 {
+    // `do_utimes` -> `mnt_want_write`: stamping a timestamp is a write.
+    if let Err(errno) = mnt_want_write(path) {
+        return errno;
+    }
     let ops = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
         poll_blocking(narf_filesystem::resolve_async(fs.root(), rel))
     });

@@ -610,15 +610,15 @@ fn smoke_e2e_efi_mount_visible_inside_installed_root() -> TestResult {
     let root_id = rows
         .iter()
         .rev()
-        .find(|(_, _, path, name, _)| path == "/mnt" && name == "test-root")
-        .map(|(id, _, _, _, _)| *id);
+        .find(|(_, _, path, name, ..)| path == "/mnt" && name == "test-root")
+        .map(|(id, ..)| *id);
     let rooted_boot_parent = rows
         .iter()
         .rev()
-        .find(|(_, _, path, name, _)| {
+        .find(|(_, _, path, name, ..)| {
             path == INSTALLED_ROOT_EFI_SYSTEM_PARTITION_MOUNTPOINT && name == "test-fat"
         })
-        .map(|(_, parent, _, _, _)| *parent);
+        .map(|(_, parent, ..)| *parent);
 
     if let Ok(handle) = root_handle {
         let _ = registry().unmount(&handle, "/mnt");

@@ -26,6 +26,10 @@ pub(crate) fn rmdir_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // `do_rmdir` -> `may_delete(dir, dentry, 1)` — the same parent-directory
     // and sticky checks `unlink` makes, run inside the one resolution this
     // already does rather than costing a second path walk.
+    if let Err(errno) = mnt_want_write(path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(path, |_fs, parent, leaf| {

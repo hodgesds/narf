@@ -72,6 +72,11 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
     // are checked inside the single resolution below. The sticky rule
     // applies to each victim separately: moving ANOTHER user's file out of
     // /tmp is exactly what S_ISVTX forbids.
+    // A rename writes BOTH directories, so both mounts must be writable.
+    if let Err(errno) = mnt_want_write(old_path).and_then(|()| mnt_want_write(new_path)) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(old_path, |_fs, parent, old_leaf| {

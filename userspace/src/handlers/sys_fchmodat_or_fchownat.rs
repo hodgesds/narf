@@ -91,6 +91,12 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
         }
     };
     let path = resolve_cwd_path(task, &effective);
+    // `chown_common`'s caller does `mnt_want_write` first: an ownership
+    // change is a write to the inode.
+    if let Err(errno) = mnt_want_write(&path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let follow_final = flags & AT_SYMLINK_NOFOLLOW == 0;
     let requested_uid = args.arg2 as u32;
     let requested_gid = args.arg3 as u32;

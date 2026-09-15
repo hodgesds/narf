@@ -2403,6 +2403,74 @@ pub struct Mount {
     pub fs: Arc<dyn FsInstance>,
     pub handle: Cap<MountPoint, Write>,
     id: u64,
+    /// Per-mount VFS flags — Linux's `mnt_flags`, the `MNT_*` set that
+    /// `path_mount` derives from the caller's `MS_*`. An atomic because
+    /// `mount -o remount` changes them in place on a live mount.
+    flags: core::sync::atomic::AtomicU64,
+}
+
+/// Every `MNT_*` bit that has ever been set on any mount, OR-ed together.
+///
+/// The enforcement checks run on every write-shaped syscall, and looking
+/// up which mount covers a path means walking the mount table under its
+/// lock. On a system where no mount carries a restriction — the normal
+/// case, and every case until something asks for one — that walk can never
+/// change an answer, so this lets the checks return immediately.
+///
+/// Deliberately STICKY: unmounting the last restricted mount does not
+/// clear it. A bit that is set when it need not be only costs a lookup;
+/// one that is clear when it should not be would skip a check.
+static SEEN_MNT_FLAGS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether any mount has ever carried a restriction — see
+/// [`SEEN_MNT_FLAGS`].
+pub fn any_restricted_mounts() -> bool {
+    SEEN_MNT_FLAGS.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+fn note_mnt_flags(flags: u64) {
+    if flags != 0 {
+        SEEN_MNT_FLAGS.fetch_or(flags, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Linux `MNT_*` (`include/linux/mount.h`) — the per-MOUNT half of the
+/// flag space, distinct from the per-superblock `SB_*` half.
+///
+/// These are properties of the attachment, not the filesystem: the same
+/// tmpfs bind-mounted twice can be read-write at one path and read-only at
+/// the other, which is exactly what systemd's service sandboxing relies on.
+pub mod mnt_flags {
+    /// `MNT_READONLY` — writes through this mount fail with EROFS.
+    pub const READONLY: u64 = 1 << 0;
+    /// `MNT_NOSUID` — set-user-ID and set-group-ID bits are ignored on
+    /// execute.
+    pub const NOSUID: u64 = 1 << 1;
+    /// `MNT_NODEV` — device special files cannot be opened.
+    pub const NODEV: u64 = 1 << 2;
+    /// `MNT_NOEXEC` — nothing on this mount may be executed.
+    pub const NOEXEC: u64 = 1 << 3;
+
+    /// Render the set the way `/proc/mounts` does: `rw` or `ro` first,
+    /// then each restriction that is on. `show_mountinfo` and `show_vfsmnt`
+    /// both print this list, and userspace parses it — systemd compares it
+    /// against the options a mount unit asked for.
+    pub fn render(flags: u64) -> alloc::string::String {
+        let mut out = alloc::string::String::from(if flags & READONLY != 0 { "ro" } else { "rw" });
+        for (bit, name) in [(NOSUID, ",nosuid"), (NODEV, ",nodev"), (NOEXEC, ",noexec")] {
+            if flags & bit != 0 {
+                out.push_str(name);
+            }
+        }
+        out
+    }
+}
+
+impl Mount {
+    /// This mount's `MNT_*` flags.
+    pub fn flags(&self) -> u64 {
+        self.flags.load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl fmt::Debug for Mount {
@@ -2414,10 +2482,14 @@ impl fmt::Debug for Mount {
     }
 }
 
-/// One `/proc/<pid>/mountinfo` row: `(id, parent, path, fstype, super
-/// options)`. The last field is the filesystem's `show_options` string,
-/// already `,`-prefixed (empty for a filesystem with none).
-pub type MountInfoRow = (u64, u64, String, String, String);
+/// One `/proc/<pid>/mountinfo` row: `(id, parent, path, fstype, mount
+/// options, super options)`.
+///
+/// The two option fields are the two halves Linux keeps apart and prints
+/// in different columns: `mount options` is this ATTACHMENT's `MNT_*` set
+/// (`rw`/`ro` plus `nosuid`/`nodev`/`noexec`), while `super options` is
+/// the filesystem's own `show_options` string, already `,`-prefixed.
+pub type MountInfoRow = (u64, u64, String, String, String, String);
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
     mounts
@@ -2453,10 +2525,33 @@ fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {
                 parent,
                 mount.path.clone(),
                 String::from(mount.fs.name()),
+                mnt_flags::render(mount.flags()),
                 mount.fs.show_options(),
             )
         })
         .collect()
+}
+
+/// The flags of the mount that covers `abs`, by the same longest-prefix,
+/// last-wins rule `single_mount_resolution` uses — so the answer always
+/// describes the mount a path operation on `abs` would actually reach.
+fn mount_flags_for(mounts: &[Mount], abs: &str) -> Option<u64> {
+    let mut best: Option<&Mount> = None;
+    for mount in mounts {
+        if !mount_covers_path(&mount.path, abs) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            // Equal-length paths: the LAST mount wins, as an overmount
+            // shadows what it was stacked on.
+            Some(current) => mount.path.len() >= current.path.len(),
+        };
+        if better {
+            best = Some(mount);
+        }
+    }
+    best.map(|mount| mount.flags())
 }
 
 #[inline]
@@ -2815,6 +2910,9 @@ impl MountNamespace {
                 fs: m.fs.clone(),
                 handle: Cap::<MountPoint, Write>::bootstrap(),
                 id: alloc_mount_id(),
+                // A namespace clone copies the mount's flags with it:
+                // `copy_mnt_ns` duplicates each mount, restrictions and all.
+                flags: core::sync::atomic::AtomicU64::new(m.flags()),
             })
             .collect();
         Arc::new(Self {
@@ -3112,20 +3210,46 @@ impl MountNamespace {
             .collect()
     }
 
-    /// `(path, fs name, super options)` for every mount — the extra field
-    /// is the filesystem's `show_options` text, which `/proc/mounts` must
-    /// print after the mount flags.
-    pub fn list_with_options(&self) -> Vec<(String, String, String)> {
+    /// `(path, fs name, mount options, super options)` for every mount —
+    /// the two option fields `/proc/mounts` concatenates into its fourth
+    /// column.
+    pub fn list_with_options(&self) -> Vec<(String, String, String, String)> {
         let q = self.inner.lock();
         q.iter()
             .map(|m| {
                 (
                     m.path.clone(),
                     String::from(m.fs.name()),
+                    mnt_flags::render(m.flags()),
                     m.fs.show_options(),
                 )
             })
             .collect()
+    }
+
+    /// The `MNT_*` flags of the mount covering `abs`, by the same
+    /// longest-prefix rule resolution uses, or `None` when no mount covers
+    /// it.
+    pub fn flags_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        mount_flags_for(&q, abs)
+    }
+
+    /// Replace the `MNT_*` flags of the mount at exactly `path` — Linux's
+    /// `do_reconfigure_mnt`, which changes an existing attachment rather
+    /// than creating one.
+    pub fn set_flags_at(&self, path: &str, flags: u64) -> bool {
+        let q = self.inner.lock();
+        let Some(mount) = q.iter().rev().find(|m| m.path == path) else {
+            return false;
+        };
+        mount
+            .flags
+            .store(flags, core::sync::atomic::Ordering::Release);
+        note_mnt_flags(flags);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
     }
 
     /// Mount identity and hierarchy in attachment order.
@@ -3156,6 +3280,18 @@ impl MountNamespace {
         path: &str,
         fs: Arc<dyn FsInstance>,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.mount_arc_with_flags(authority, path, fs, 0)
+    }
+
+    /// [`Self::mount_arc`] with the mount's `MNT_*` flags — see
+    /// [`mnt_flags`].
+    pub fn mount_arc_with_flags(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let handle = Cap::<MountPoint, Write>::bootstrap();
         self.inner.lock().push(Mount {
@@ -3163,7 +3299,9 @@ impl MountNamespace {
             fs,
             handle,
             id: alloc_mount_id(),
+            flags: core::sync::atomic::AtomicU64::new(flags),
         });
+        note_mnt_flags(flags);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         notify_mount_change();
@@ -3404,6 +3542,17 @@ impl VfsRegistry {
         path: &str,
         fs: F,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.mount_with_flags(authority, path, fs, 0)
+    }
+
+    /// [`Self::mount`] with the mount's `MNT_*` flags — see [`mnt_flags`].
+    pub fn mount_with_flags<F: FsInstance>(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: F,
+        flags: u64,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
@@ -3414,7 +3563,9 @@ impl VfsRegistry {
             fs: arc,
             handle,
             id: alloc_mount_id(),
+            flags: core::sync::atomic::AtomicU64::new(flags),
         });
+        note_mnt_flags(flags);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
@@ -3432,6 +3583,18 @@ impl VfsRegistry {
         path: &str,
         fs: Arc<dyn FsInstance>,
     ) -> Result<Cap<MountPoint, Write>, FsError> {
+        self.mount_arc_with_flags(authority, path, fs, 0)
+    }
+
+    /// [`Self::mount_arc`] with the mount's `MNT_*` flags — see
+    /// [`mnt_flags`].
+    pub fn mount_arc_with_flags(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        fs: Arc<dyn FsInstance>,
+        flags: u64,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
 
         let mut q = self.inner.lock();
@@ -3441,7 +3604,9 @@ impl VfsRegistry {
             fs,
             handle,
             id: alloc_mount_id(),
+            flags: core::sync::atomic::AtomicU64::new(flags),
         });
+        note_mnt_flags(flags);
         self.mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
@@ -3511,10 +3676,13 @@ impl VfsRegistry {
             .collect()
     }
 
-    /// `(path, fs name, super options)` for every mount in this namespace.
+    /// `(path, fs name, mount options, super options)` for every mount in
+    /// this namespace.
+    #[allow(clippy::type_complexity)]
     pub fn list_with_options(
         &self,
     ) -> alloc::vec::Vec<(
+        alloc::string::String,
         alloc::string::String,
         alloc::string::String,
         alloc::string::String,
@@ -3525,10 +3693,32 @@ impl VfsRegistry {
                 (
                     m.path.clone(),
                     alloc::string::String::from(m.fs.name()),
+                    mnt_flags::render(m.flags()),
                     m.fs.show_options(),
                 )
             })
             .collect()
+    }
+
+    /// The `MNT_*` flags of the mount covering `abs` in this namespace.
+    pub fn flags_at(&self, abs: &str) -> Option<u64> {
+        let q = self.inner.lock();
+        mount_flags_for(&q, abs)
+    }
+
+    /// Replace the `MNT_*` flags of the mount at exactly `path`.
+    pub fn set_flags_at(&self, path: &str, flags: u64) -> bool {
+        let q = self.inner.lock();
+        let Some(mount) = q.iter().rev().find(|m| m.path == path) else {
+            return false;
+        };
+        mount
+            .flags
+            .store(flags, core::sync::atomic::Ordering::Release);
+        note_mnt_flags(flags);
+        self.mountinfo_generation
+            .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+        true
     }
 
     /// Mount identity and hierarchy in attachment order.

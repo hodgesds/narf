@@ -865,6 +865,259 @@ kernel_test_in!(
     smoke_abi_fsx_xattr_and_acl_writes_are_permission_checked
 );
 
+/// `mount -o ro` actually makes the mount read-only.
+///
+/// `path_mount` turns the caller's `MS_*` into the mount's `MNT_*` set,
+/// and every syscall that changes something on a mount passes
+/// `fs/namespace.c::mnt_want_write` first:
+///
+/// ```text
+/// if (mnt->mnt_sb->s_readonly_remount || __mnt_is_readonly(mnt))
+///         return -EROFS;
+/// ```
+///
+/// NARF accepted the flags and dropped them — the handler's own comment
+/// called that "the dangerous kind" of divergence, because a sandbox that
+/// mounts `MS_RDONLY|MS_NOSUID|MS_NODEV` got a success reply and no
+/// enforcement at all.
+///
+/// EROFS and not EACCES: read-only is a property of the MOUNT, not of the
+/// caller, and userspace branches on the difference. It therefore holds
+/// for root too, which is the entire point of a read-only bind.
+fn smoke_abi_fsx_readonly_mount_refuses_writes() -> TestResult {
+    with_setup(|| {
+        const MS_RDONLY: u64 = 1 << 0;
+        const MS_REMOUNT: u64 = 1 << 5;
+        const EROFS: i64 = -30;
+        let target = b"/abi-ro\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        let mount_with = |flags: u64| {
+            call(
+                Syscall::Mount.raw(),
+                SyscallArgs {
+                    arg0: source.as_ptr() as u64,
+                    arg1: target.as_ptr() as u64,
+                    arg2: fstype.as_ptr() as u64,
+                    arg3: flags,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        // Writable first: everything below must SUCCEED here, or the
+        // read-only assertions prove nothing.
+        if mount_with(0) != Some(0) {
+            return Err("mounting a writable tmpfs failed");
+        }
+        let file = b"/abi-ro/f\0";
+        let dir = b"/abi-ro/d\0";
+        let finish = |outcome: Result<(), &'static str>| {
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        let create = || {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, file.as_ptr() as u64, 0o100 | 0o2, 0o666),
+            )
+        };
+        match create() {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("creating a file on a writable tmpfs failed")),
+        }
+        if call_mkdir(dir.as_ptr() as u64, 0o755) != Some(0) {
+            return finish(Err("mkdir on a writable tmpfs failed"));
+        }
+        // Seal it with `mount -o remount,ro` — `do_reconfigure_mnt`.
+        if mount_with(MS_REMOUNT | MS_RDONLY) != Some(0) {
+            return finish(Err("remount,ro failed"));
+        }
+        // Every shape of write now reports EROFS, as root.
+        let second = b"/abi-ro/f2\0";
+        let second_dir = b"/abi-ro/d2\0";
+        let created = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, second.as_ptr() as u64, 0o100 | 0o2, 0o666),
+        );
+        if created != Some(EROFS) {
+            return finish(Err("O_CREAT on a read-only mount must return -EROFS"));
+        }
+        // Opening an EXISTING file for writing is refused too.
+        let opened_w = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0o1, 0),
+        );
+        if opened_w != Some(EROFS) {
+            return finish(Err(
+                "opening a file for write on a read-only mount must be -EROFS",
+            ));
+        }
+        if call_mkdir(second_dir.as_ptr() as u64, 0o755) != Some(EROFS) {
+            return finish(Err("mkdir on a read-only mount must return -EROFS"));
+        }
+        if call_unlink(file.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("unlink on a read-only mount must return -EROFS"));
+        }
+        if call_rmdir(dir.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("rmdir on a read-only mount must return -EROFS"));
+        }
+        if call_rename(file.as_ptr() as u64, second.as_ptr() as u64) != Some(EROFS) {
+            return finish(Err("rename on a read-only mount must return -EROFS"));
+        }
+        if call(Syscall::Chmod.raw(), a1(file.as_ptr() as u64, 0o600)) != Some(EROFS) {
+            return finish(Err("chmod on a read-only mount must return -EROFS"));
+        }
+        if call(Syscall::Truncate.raw(), a1(file.as_ptr() as u64, 0)) != Some(EROFS) {
+            return finish(Err("truncate on a read-only mount must return -EROFS"));
+        }
+        // Reading still works — read-only, not inaccessible.
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("a read-only mount refused a READ open")),
+        }
+        // And `remount,rw` lifts it again: `do_reconfigure_mnt` replaces the
+        // flag set wholesale rather than accumulating it.
+        if mount_with(MS_REMOUNT) != Some(0) {
+            return finish(Err("remount,rw failed"));
+        }
+        match create() {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("remount,rw did not make the mount writable again")),
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_readonly_mount_refuses_writes);
+
+/// `noexec` and `nodev` are enforced, and `/proc/mounts` reports them.
+///
+/// `do_open_execat` opens the binary with `MAY_EXEC`, and `may_open`
+/// refuses that on a `noexec` mount (`if (path_noexec(path)) return
+/// -EACCES;`); the same function refuses to open a device node on a
+/// `nodev` mount. Both are properties of the MOUNT, so a sandbox gets them
+/// even against a privileged process inside it — which is why they are
+/// worth having at all.
+fn smoke_abi_fsx_noexec_nodev_are_enforced_and_reported() -> TestResult {
+    with_setup(|| {
+        const MS_NOSUID: u64 = 1 << 1;
+        const MS_NODEV: u64 = 1 << 2;
+        const MS_NOEXEC: u64 = 1 << 3;
+        let target = b"/abi-noexec\0";
+        let source = b"tmpfs\0";
+        let fstype = b"tmpfs\0";
+        if call(
+            Syscall::Mount.raw(),
+            SyscallArgs {
+                arg0: source.as_ptr() as u64,
+                arg1: target.as_ptr() as u64,
+                arg2: fstype.as_ptr() as u64,
+                arg3: MS_NOSUID | MS_NODEV | MS_NOEXEC,
+                arg4: 0,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("mounting a nosuid,nodev,noexec tmpfs failed");
+        }
+        let finish = |outcome: Result<(), &'static str>| {
+            let _ = call(Syscall::Umount2.raw(), a1(target.as_ptr() as u64, 0));
+            outcome
+        };
+        // A device node on the mount cannot be opened.
+        const S_IFCHR: u64 = 0o020000;
+        let node = b"/abi-noexec/null\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, node.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        ) != Some(0)
+        {
+            return finish(Err("mknod of a device node on the test mount failed"));
+        }
+        let opened = call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, node.as_ptr() as u64, 0, 0),
+        );
+        if let Some(fd) = opened {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        if opened != Some(EACCES) {
+            return finish(Err(
+                "opening a device node on a nodev mount must return -EACCES",
+            ));
+        }
+        // A regular file on the same mount still opens — `nodev` bars
+        // device nodes, not everything.
+        let plain = b"/abi-noexec/plain\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, plain.as_ptr() as u64, 0o100 | 0o2, 0o755),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return finish(Err("a nodev mount refused an ordinary file")),
+        }
+        // Executing anything from the mount is refused before the image is
+        // even read, so a non-ELF file is still -EACCES and not ENOEXEC.
+        let execed = call(Syscall::Execve.raw(), a2(plain.as_ptr() as u64, 0, 0));
+        if execed != Some(EACCES) {
+            return finish(Err("execve from a noexec mount must return -EACCES"));
+        }
+        // And the flags are visible where userspace looks for them:
+        // `show_vfsmnt` prints this attachment's MNT_* set as the fourth
+        // column, which is what systemd compares against the options a
+        // mount unit asked for.
+        let mut buf = [0u8; 4096];
+        let proc_mounts = b"/proc/mounts\0";
+        let fd = match call_open(proc_mounts.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return finish(Err("opening /proc/mounts failed")),
+        };
+        let n = call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        let n = match n {
+            Some(n) if n >= 0 => n as usize,
+            _ => return finish(Err("reading /proc/mounts failed")),
+        };
+        let text = match core::str::from_utf8(&buf[..n]) {
+            Ok(text) => text,
+            Err(_) => return finish(Err("/proc/mounts is not utf-8")),
+        };
+        match text
+            .lines()
+            .find(|line| line.split(' ').nth(1) == Some("/abi-noexec"))
+        {
+            Some(line) => {
+                let opts = line.split(' ').nth(3).unwrap_or("");
+                if !opts.starts_with("rw,nosuid,nodev,noexec") {
+                    return finish(Err("/proc/mounts did not report the mount's flags"));
+                }
+            }
+            None => return finish(Err("the test mount is missing from /proc/mounts")),
+        }
+        finish(Ok(()))
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_noexec_nodev_are_enforced_and_reported
+);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

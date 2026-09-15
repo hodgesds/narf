@@ -41,6 +41,10 @@ pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link
     // `do_symlinkat` -> `filename_create` -> `may_create`: write+exec on
     // the directory the link is being added to, checked inside the
     // resolution this already performs.
+    if let Err(errno) = mnt_want_write(link_path) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(link_path, |_fs, parent, leaf| {

@@ -92,6 +92,10 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     // Same `may_delete` pair `rename_absolute` makes, and for the same
     // reason: RENAME_EXCHANGE swaps two names, so both are victims. The
     // check rides the resolution this already does.
+    if let Err(errno) = mnt_want_write(&old_path).and_then(|()| mnt_want_write(&new_path)) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
     let perm_task = current_task_id();
     let mut refused = None;
     let outcome = current_resolve_parent_absolute(&old_path, |_fs, parent, old_leaf| {
