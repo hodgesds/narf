@@ -173,19 +173,30 @@ kernel_test_in!("syscall_abi", smoke_abi_fsx_setxattr_vfs_rejections);
 /// Path resolution hands back `DirOps` for a directory, so the xattr
 /// handlers — which only ever asked for `FileOps` — could never reach one.
 /// Every `setfattr` on a directory silently landed in the path-keyed side
-/// table instead: it survived the directory being removed, did not follow a
-/// rename, and was invisible to the filesystem that owned the inode.
+/// table instead.
+///
+/// RENAMING the directory is what tells the two apart, and it is the
+/// user-visible consequence: an attribute stored against the inode moves
+/// with it, while one stored against a path string stays behind on a name
+/// that no longer exists. (Testing it this way also keeps the whole check
+/// inside the syscall ABI, so it does not depend on the harness's mount
+/// layout or on whether some earlier test left the task chrooted.)
 fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
     with_setup(|| {
-        // `/tmp` is a MemFs mount in the harness, so its root is a real
-        // tmpfs directory inode.
-        let path = b"/tmp\0";
+        let first = b"/tmp/abi-xattr-dir\0";
+        let second = b"/tmp/abi-xattr-dir2\0";
         let name = b"user.label\0";
         let val = b"dir";
+        // Start from a clean slate even if an earlier run left these.
+        let _ = call_rmdir(first.as_ptr() as u64);
+        let _ = call_rmdir(second.as_ptr() as u64);
+        if call_mkdir(first.as_ptr() as u64, 0o755) != Some(0) {
+            return Err("mkdir of the test directory failed");
+        }
         let set = call(
             Syscall::Setxattr.raw(),
             SyscallArgs {
-                arg0: path.as_ptr() as u64,
+                arg0: first.as_ptr() as u64,
                 arg1: name.as_ptr() as u64,
                 arg2: val.as_ptr() as u64,
                 arg3: val.len() as u64,
@@ -194,42 +205,45 @@ fn smoke_abi_fsx_directory_xattr_reaches_the_inode() -> TestResult {
             },
         );
         if set != Some(0) {
+            let _ = call_rmdir(first.as_ptr() as u64);
             return Err("setxattr on a directory should succeed");
         }
+        let getxattr = |path: &[u8], out: &mut [u8]| {
+            call(
+                Syscall::Getxattr.raw(),
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: out.as_mut_ptr() as u64,
+                    arg3: out.len() as u64,
+                    ..Default::default()
+                },
+            )
+        };
         let mut out = [0u8; 8];
-        let got = call(
-            Syscall::Getxattr.raw(),
-            SyscallArgs {
-                arg0: path.as_ptr() as u64,
-                arg1: name.as_ptr() as u64,
-                arg2: out.as_mut_ptr() as u64,
-                arg3: out.len() as u64,
-                ..Default::default()
-            },
-        );
-        if got != Some(val.len() as i64) || &out[..val.len()] != val {
+        if getxattr(first, &mut out) != Some(val.len() as i64) || &out[..val.len()] != val {
+            let _ = call_rmdir(first.as_ptr() as u64);
             return Err("getxattr on a directory did not read back the value");
         }
-        // The attribute must live on the INODE, which is what makes it
-        // visible through the filesystem rather than through a path table.
-        let dir = match narf_filesystem::registry().resolve_absolute("/tmp", |fs, _| fs.root()) {
-            Some(dir) => dir,
-            None => return Err("/tmp is not mounted in this harness"),
-        };
-        match crate::handlers::poll_blocking(dir.get_xattr("user.label")) {
-            Some(Ok(stored)) if stored == val => {}
-            _ => return Err("the directory xattr did not reach the filesystem inode"),
+        // The attribute belongs to the INODE, so it follows the rename.
+        if call_rename(first.as_ptr() as u64, second.as_ptr() as u64) != Some(0) {
+            let _ = call_rmdir(first.as_ptr() as u64);
+            return Err("renaming the test directory failed");
         }
-        if call(
+        let mut moved = [0u8; 8];
+        let followed = getxattr(second, &mut moved);
+        let left_behind = getxattr(first, &mut out);
+        // Clean up before reporting, so a failure does not poison later runs.
+        let _ = call(
             Syscall::Removexattr.raw(),
-            SyscallArgs {
-                arg0: path.as_ptr() as u64,
-                arg1: name.as_ptr() as u64,
-                ..Default::default()
-            },
-        ) != Some(0)
-        {
-            return Err("removexattr on a directory should succeed");
+            a1(second.as_ptr() as u64, name.as_ptr() as u64),
+        );
+        let _ = call_rmdir(second.as_ptr() as u64);
+        if followed != Some(val.len() as i64) || &moved[..val.len()] != val {
+            return Err("the directory xattr did not follow its inode through a rename");
+        }
+        if left_behind != Some(ENODATA) {
+            return Err("the old directory name still answered for the xattr");
         }
         Ok(())
     })
