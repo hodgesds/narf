@@ -1401,6 +1401,10 @@ fn open_impl(
             // parent is known — see `inherit_acls_from_parent`.
             let mut inherited_access: Option<alloc::vec::Vec<u8>> = None;
             let mut permissions = (create_mode & !current_umask() & 0o777) as u16;
+            // `inode_init_owner` hands the new file the parent's group when
+            // the parent is setgid; without a parent in hand the creating
+            // task's own ids are the answer.
+            let mut owner = (accessor.uid, accessor.gid);
             // Async parent resolution so O_CREAT works in subdirectories of
             // a disk-backed (ext2) rootfs, not just sync-resolvable mounts.
             let create_result = fast_create
@@ -1426,12 +1430,8 @@ fn open_impl(
                         inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                     permissions = inherited.mode;
                     inherited_access = inherited.access;
-                    poll_blocking(parent.create_with_attrs(
-                        &leaf,
-                        permissions,
-                        accessor.uid,
-                        accessor.gid,
-                    ))
+                    owner = (inherited.uid, inherited.gid);
+                    poll_blocking(parent.create_with_attrs(&leaf, permissions, owner.0, owner.1))
                 })
                 .or_else(|| {
                     resolve_parent_dir_async(path).map(|(parent, leaf)| {
@@ -1442,12 +1442,8 @@ fn open_impl(
                             inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
                         permissions = inherited.mode;
                         inherited_access = inherited.access;
-                        poll_blocking(parent.create_with_attrs(
-                            &leaf,
-                            permissions,
-                            accessor.uid,
-                            accessor.gid,
-                        ))
+                        owner = (inherited.uid, inherited.gid);
+                        poll_blocking(parent.create_with_attrs(&leaf, permissions, owner.0, owner.1))
                     })
                 });
             match create_result {
@@ -2383,9 +2379,20 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // (`st_mode & 0777 == 0600`) it created it with; and the DAC open
             // check needs the owner set so the non-root creator can reopen its
             // own 0600 pipe.
-            let acc = current_accessor(current_task_id());
-            let _ = poll_blocking(n.set_owners(acc.uid, acc.gid));
-            let _ = poll_blocking(n.set_perms((mode & 0o777) as u16));
+            // `shmem_mknod` -> `shmem_get_inode` -> `inode_init_owner`: a
+            // setgid parent hands down its group. A device node or FIFO in
+            // a shared group directory has to land in that group like
+            // anything else.
+            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o777) as u16, false);
+            let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
+            let _ = poll_blocking(n.set_perms(inherited.mode));
+            if let Some(blob) = inherited.access.as_ref() {
+                let _ = poll_blocking(n.set_xattr(
+                    narf_filesystem::AclType::Access.xattr_name(),
+                    blob,
+                    0,
+                ));
+            }
             SyscallReturn::ok(0)
         }
         // The parent resolved and the type is one mknod can make, so a failure
@@ -5085,11 +5092,145 @@ fn xattr_errno(error: narf_filesystem::FsError) -> Option<i64> {
     })
 }
 
-/// The directory at `path`, for the xattr calls — a directory is an inode
-/// with extended attributes, but path resolution hands back `DirOps` for
-/// one, so `xattr_file` can never see it.
-fn xattr_dir(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::DirOps>> {
-    resolve_dir_absolute(path)
+/// `fs/inode.c::inode_owner_or_capable`:
+///
+/// ```text
+/// if (vfsuid_eq_kuid(i_uid_into_vfsuid(idmap, inode), current_fsuid()))
+///         return true;
+/// ns = current_user_ns();
+/// if (vfsuid_has_mapping(ns, vfsuid) && ns_capable(ns, CAP_FOWNER))
+///         return true;
+/// return false;
+/// ```
+///
+/// "You own it, or you hold CAP_FOWNER over it." This is the gate on
+/// changing an inode's ACL, and NARF had none: any task that could reach
+/// an inode could rewrite its access ACL — and with it, since
+/// `posix_acl_update_mode` writes the mode back, its permission bits.
+fn inode_owner_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    if current_host_fsuid(task) == file_uid {
+        return true;
+    }
+    capable_wrt_inode(task, file_uid, file_gid, CAP_FOWNER)
+}
+
+/// The inode an xattr call names. A directory is an inode with extended
+/// attributes, but path resolution hands back `DirOps` for one, so the
+/// `FileOps` form alone can never see it.
+pub(crate) enum XattrTarget {
+    File(alloc::sync::Arc<dyn narf_filesystem::FileOps>),
+    Dir(alloc::sync::Arc<dyn narf_filesystem::DirOps>),
+}
+
+impl XattrTarget {
+    /// `(uid, gid, perms, is_dir)` — everything `xattr_permission` needs.
+    fn meta(&self) -> (u32, u32, u16, bool) {
+        match self {
+            Self::File(file) => {
+                let (uid, gid) = file.owners();
+                (uid, gid, file.stat().mode.perms, false)
+            }
+            Self::Dir(dir) => {
+                let (uid, gid) = dir.dir_owners();
+                (uid, gid, dir.dir_mode(), true)
+            }
+        }
+    }
+
+    fn access_acl(&self) -> Option<narf_filesystem::PosixAcl> {
+        let fetched = match self {
+            Self::File(file) => poll_blocking(narf_filesystem::acl_of_file(
+                file.as_ref(),
+                narf_filesystem::AclType::Access,
+            )),
+            Self::Dir(dir) => poll_blocking(narf_filesystem::acl_of_dir(
+                dir.as_ref(),
+                narf_filesystem::AclType::Access,
+            )),
+        };
+        fetched.and_then(|r| r.ok()).flatten()
+    }
+}
+
+/// Resolve `path` to the inode an xattr call should act on, file or
+/// directory, in ONE walk.
+fn xattr_target(path: &str) -> Option<XattrTarget> {
+    if let Some(file) = xattr_file(path) {
+        return Some(XattrTarget::File(file));
+    }
+    resolve_dir_absolute(path).map(XattrTarget::Dir)
+}
+
+/// The permission gate for one xattr operation on one inode.
+///
+/// The two name classes take different routes in Linux, and conflating
+/// them gets the answer wrong in both directions. `do_setxattr` sends the
+/// POSIX ACL names to `do_set_acl` -> `vfs_set_acl` -> `set_posix_acl`,
+/// whose only check is `inode_owner_or_capable` (EPERM) — write permission
+/// on the inode is neither required nor sufficient. Everything else goes
+/// through `vfs_setxattr` -> `xattr_permission`, which ends at
+/// `inode_permission(idmap, inode, mask)`.
+///
+/// Reading an ACL has no check at all (`vfs_get_acl` performs none), which
+/// matches the mode bits being world-readable through `stat`.
+fn xattr_permission_check(
+    target: &XattrTarget,
+    name: &str,
+    write: bool,
+    task: u64,
+) -> Result<(), i64> {
+    let (uid, gid, perms, is_dir) = target.meta();
+    if is_acl_xattr(name) {
+        if !write {
+            return Ok(());
+        }
+        // `set_posix_acl` tests the DEFAULT-on-a-non-directory case FIRST
+        // and answers `acl ? -EACCES : 0` without ever consulting the
+        // owner. Leaving that arm to the filesystem keeps Linux's
+        // precedence, which putting EPERM in front of it would invert.
+        let default_on_file =
+            !is_dir && name == narf_filesystem::AclType::Default.xattr_name();
+        if !default_on_file && !inode_owner_or_capable(task, uid, gid) {
+            return Err(XE_PERM);
+        }
+        return Ok(());
+    }
+    // The rest of `xattr_permission`. The sticky-directory rule first: on
+    // a directory with S_ISVTX, `user.*` may only be WRITTEN by someone who
+    // passes `inode_owner_or_capable`, so a shared `/tmp` cannot have its
+    // entries relabelled by passers-by.
+    if write
+        && is_dir
+        && perms & 0o1000 != 0
+        && name.starts_with("user.")
+        && !inode_owner_or_capable(task, uid, gid)
+    {
+        return Err(XE_PERM);
+    }
+    // ...ending at `inode_permission(idmap, inode, mask)`: setting an
+    // attribute needs WRITE on the inode, reading one needs READ. Nothing
+    // enforced that, so a file's `security.*` label could be rewritten by
+    // anyone who could name it.
+    let permitted = narf_filesystem::posix_access_ok_with_acl(
+        narf_filesystem::FileOwner {
+            uid,
+            gid,
+            perms,
+            is_dir,
+        },
+        &accessor_for_inode(task, uid, gid),
+        narf_filesystem::AccessRequest {
+            read: !write,
+            write,
+            exec: false,
+        },
+        target.access_acl().as_ref(),
+    );
+    if permitted {
+        Ok(())
+    } else {
+        Err(XE_ACCES)
+    }
 }
 
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
@@ -5154,11 +5295,17 @@ fn xattr_set_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         }
     };
     // A path can name a file or a directory; both are inodes with xattrs.
-    let stored = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
-        None => {
-            xattr_dir(&path).and_then(|dir| poll_blocking(dir.set_xattr(&name, &value, flags as u32)))
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
+    }
+    let stored = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.set_xattr(&name, &value, flags as u32)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.set_xattr(&name, &value, flags as u32)),
+        None => None,
     };
     match stored {
         Some(Ok(())) => {
@@ -5217,9 +5364,17 @@ fn xattr_get_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         return;
     }
     let size = a.arg3 as usize;
-    let fetched = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.get_xattr(&name)),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.get_xattr(&name))),
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, false, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let fetched = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.get_xattr(&name)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.get_xattr(&name)),
+        None => None,
     };
     match fetched {
         Some(Ok(value)) => {
@@ -5264,9 +5419,20 @@ fn xattr_copy_value(ctx: &mut dyn TrapContext, ptr: u64, size: usize, value: &[u
 fn xattr_list_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     let size = a.arg2 as usize;
-    let listed = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.list_xattr()),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.list_xattr())),
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        // `listxattr` needs READ on the inode, like any other read of its
+        // metadata. The empty name is the whole-inode form, so there is no
+        // namespace to resolve.
+        if let Err(errno) = xattr_permission_check(target, "", false, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let listed = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.list_xattr()),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.list_xattr()),
+        None => None,
     };
     match listed {
         Some(Ok(names)) => {
@@ -5322,9 +5488,17 @@ fn xattr_remove_core(path: alloc::string::String, ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
-    let removed = match xattr_file(&path) {
-        Some(file) => poll_blocking(file.remove_xattr(&name)),
-        None => xattr_dir(&path).and_then(|dir| poll_blocking(dir.remove_xattr(&name))),
+    let target = xattr_target(&path);
+    if let Some(target) = target.as_ref() {
+        if let Err(errno) = xattr_permission_check(target, &name, true, current_task_id()) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let removed = match target {
+        Some(XattrTarget::File(file)) => poll_blocking(file.remove_xattr(&name)),
+        Some(XattrTarget::Dir(dir)) => poll_blocking(dir.remove_xattr(&name)),
+        None => None,
     };
     match removed {
         Some(Ok(())) => {

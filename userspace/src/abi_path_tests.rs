@@ -1082,8 +1082,15 @@ fn smoke_abi_path_mknod_legacy_alias() -> TestResult {
             return Err("legacy mknod result should be reachable by lstat");
         }
         let mode = u32::from_ne_bytes(sb[24..28].try_into().unwrap()) as u64;
-        if mode & 0o170000 != S_IFIFO || mode & 0o777 != 0o620 {
-            return Err("legacy mknod must preserve FIFO type and permission bits");
+        // The umask applies to mknod like any other create. For a POSIX-ACL
+        // filesystem `mode_strip_umask` defers it rather than skipping it —
+        // "umask stripping is deferred until the filesystem calls
+        // posix_acl_create()" — and `shmem_mknod` gets there through
+        // `simple_acl_create`. With the default 0o022 umask, 0o620 becomes
+        // 0o600. This used to assert 0o620, i.e. that mknod ignored the
+        // umask, which no filesystem does.
+        if mode & 0o170000 != S_IFIFO || mode & 0o777 != 0o620 & !0o022 {
+            return Err("legacy mknod must preserve FIFO type and umask the permission bits");
         }
         Ok(())
     })

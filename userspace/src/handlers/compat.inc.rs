@@ -558,8 +558,54 @@ fn path_is_mount_ancestor(path: &str) -> bool {
 /// default}` payloads to install, if any.
 pub(crate) struct InheritedAcls {
     pub mode: u16,
+    /// Owner for the new inode — `inode_init_owner`'s `uid`, always the
+    /// creating task's fsuid.
+    pub uid: u32,
+    /// Group for the new inode. Normally the creating task's fsgid, but a
+    /// parent directory carrying S_ISGID hands down its OWN group instead.
+    pub gid: u32,
     pub access: Option<alloc::vec::Vec<u8>>,
     pub default: Option<alloc::vec::Vec<u8>>,
+}
+
+/// `fs/inode.c::inode_init_owner` — who a new inode belongs to, and
+/// whether a new directory is born setgid:
+///
+/// ```text
+/// inode_fsuid_set(inode, idmap);
+/// if (dir && dir->i_mode & S_ISGID) {
+///         inode->i_gid = dir->i_gid;
+///         /* Directories are special, and always inherit S_ISGID */
+///         if (S_ISDIR(mode))
+///                 mode |= S_ISGID;
+/// } else
+///         inode_fsgid_set(inode, idmap);
+/// ```
+///
+/// This is how a shared group directory works at all: `chgrp staff dir;
+/// chmod g+s dir` makes everything created inside it belong to `staff`
+/// whatever group the creator is in, and the S_ISGID on a new
+/// subdirectory is what keeps that true all the way down. NARF stamped
+/// the creator's fsgid unconditionally, so the group never propagated and
+/// the bit never appeared on a child directory.
+///
+/// LINUX-GAP: `vfs_prepare_mode` also runs `mode_strip_sgid`, which
+/// removes a CALLER-supplied S_ISGID from a group-executable regular file
+/// when the creator is not in the directory's group. NARF's create paths
+/// mask the caller's mode down before this point, so the bit can only
+/// arrive by inheritance, where the strip does not apply.
+fn inode_init_owner(parent: &dyn narf_filesystem::DirOps, is_dir: bool, mode: &mut u16) -> (u32, u32) {
+    let (fsuid, fsgid) = current_fs_ids();
+    let (dir_uid, dir_gid) = parent.dir_owners();
+    let _ = dir_uid;
+    if parent.dir_mode() & 0o2000 != 0 {
+        if is_dir {
+            *mode |= 0o2000;
+        }
+        (fsuid, dir_gid)
+    } else {
+        (fsuid, fsgid)
+    }
 }
 
 pub(crate) fn inherit_acls_from_parent(
@@ -568,6 +614,11 @@ pub(crate) fn inherit_acls_from_parent(
     is_dir: bool,
 ) -> InheritedAcls {
     let mut mode = raw_mode;
+    // `inode_init_owner` runs BEFORE `simple_acl_create`, and the ACL /
+    // umask narrowing below only ever touches the low nine bits
+    // (`posix_acl_create_masq` re-applies `*mode_p & ~S_IRWXUGO`), so an
+    // inherited S_ISGID survives it.
+    let (uid, gid) = inode_init_owner(parent, is_dir, &mut mode);
     let umask = current_umask() as u16;
     let parent_default = parent
         .default_acl()
@@ -581,6 +632,8 @@ pub(crate) fn inherit_acls_from_parent(
     ) {
         Ok(inherited) => InheritedAcls {
             mode,
+            uid,
+            gid,
             access: inherited.access_acl.map(|acl| acl.to_xattr()),
             default: inherited.default_acl.map(|acl| acl.to_xattr()),
         },
@@ -588,7 +641,9 @@ pub(crate) fn inherit_acls_from_parent(
         // inherited from; fall back to the plain umask path rather than
         // failing a create.
         Err(_) => InheritedAcls {
-            mode: raw_mode & !(umask & 0o777),
+            mode: mode & !(umask & 0o777),
+            uid,
+            gid,
             access: None,
             default: None,
         },
