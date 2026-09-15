@@ -2003,7 +2003,7 @@ kernel_test_in!("userspace", smoke_userspace_parse_minimal_elf64);
 // `sys_execve` (Syscall::Execve = 179) replaces the current process
 // image. Full end-to-end requires a polling user-task ctx (so the
 // EXECVE longjmp + ExecRequest pickup can fire); the no-ctx path
-// returns `invalid_op()` after the load completes, which is exactly
+// returns -ENOSYS after the load completes, which is exactly
 // what we need to validate the load-side without entering ring 3.
 
 #[cfg(target_arch = "x86_64")]
@@ -2048,9 +2048,15 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
     // (path, argv, envp)). The handler resolves + reads the file, runs
     // `load_user_process_with` to completion, updates /proc/[pid]/{argv,comm},
     // then discovers there's no active user-task ctx (kernel-test stub) and
-    // bails with `invalid_op()`. Confirms resolve→read→load→publish on clean
-    // input. (Reaching invalid_op — not -ENOENT — proves the path resolved
-    // and the image actually loaded.)
+    // bails with -ENOSYS. Confirms resolve→read→load→publish on clean input.
+    // (Reaching that bail — not -ENOENT — proves the path resolved and the
+    // image actually loaded.)
+    //
+    // The bail used to be `invalid_op()`, whose `value` is 0, and 0 from
+    // execve means the exec succeeded: the caller carries on as the new
+    // program from inside the old one. -ENOSYS is a value no caller can
+    // mistake for success, and it is still a distinct enough signal to keep
+    // serving as this fixture's "got all the way to the bail" marker.
     crate::syscall::__test_clear_global();
     // The path pointer is a kernel test address; opt into accepting it so
     // execve reaches the load+bail instead of the EFAULT user-pointer guard.
@@ -2090,10 +2096,13 @@ fn smoke_userspace_execve_loads_elf_then_bails_without_user_ctx() -> TestResult 
         let _ = narf_filesystem::registry().unmount(h, "/execve-load");
     }
     crate::syscall::__test_clear_global();
-    // load completed but no user ctx → bail with invalid_op.
+    // load completed but no user ctx → bail with -ENOSYS.
     match r {
-        Some(r) if r == SyscallReturn::invalid_op() => TestResult::Pass,
-        _ => TestResult::Fail("expected invalid_op fallback after load when no user ctx"),
+        Some(r) if r == SyscallReturn::ok((-38i64) as u64) => TestResult::Pass,
+        Some(r) if r.value == 0 => {
+            TestResult::Fail("execve reported success after bailing for lack of a user ctx")
+        }
+        _ => TestResult::Fail("expected the -ENOSYS fallback after load when no user ctx"),
     }
 }
 #[cfg(target_arch = "x86_64")]
@@ -2249,7 +2258,7 @@ fn smoke_userspace_execve_does_not_leak_pid() -> TestResult {
     }
     crate::syscall::__test_clear_global();
 
-    if ctx.ret != Some(SyscallReturn::invalid_op()) {
+    if ctx.ret != Some(SyscallReturn::ok((-38i64) as u64)) {
         return TestResult::Fail("execve fixture drifted: expected the no-user-ctx bail");
     }
     if after != before {

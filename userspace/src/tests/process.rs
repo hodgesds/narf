@@ -1467,7 +1467,7 @@ kernel_test_in!("userspace", smoke_userspace_execve_rejects_null_ptr);
 fn smoke_userspace_execve_rejects_unresolvable_path() -> TestResult {
     // Linux-ABI execve(path, argv, envp): arg0 is a path, not an inline ELF.
     // A garbage / non-resolvable path pointer must be REJECTED (as -ENOENT so
-    // execvp(3) keeps searching PATH, or invalid_op) — never a success.
+    // execvp(3) keeps searching PATH, or -ENOSYS) — never a success.
     crate::syscall::__test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -1893,7 +1893,7 @@ fn smoke_userspace_execve_sets_comm_to_argv0_basename() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Execve.raw(), &mut ctx);
-    // Handler returns invalid_op without a polling user-task ctx,
+    // Handler returns -ENOSYS without a polling user-task ctx,
     // but the load + comm publication runs before that bail-out.
 
     let pid = FAKE_TID.load(Ordering::Relaxed);
@@ -2113,9 +2113,9 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
     // Uses the Linux ABI — (path, argv, envp), each a user pointer; argv/envp
     // are NULL-terminated arrays of `char *`. Stages a minimal ELF in a MemFs
     // (like execve_loads_elf_then_bails) so the path resolves + loads, then the
-    // kernel-test stub has no user ctx and bails with invalid_op(). Reaching
-    // invalid_op — not an earlier error — proves the argv AND the multi-entry
-    // envp arrays both parsed cleanly.
+    // kernel-test stub has no user ctx and bails with -ENOSYS. Reaching that
+    // bail — not an earlier error — proves the argv AND the multi-entry envp
+    // arrays both parsed cleanly.
     //
     // (Regression: the previous version passed the stale NARF-native shape
     // (elf_ptr, elf_len, argv_ptr/len, envp_ptr/len). The handler cut over to
@@ -2173,9 +2173,12 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
         let _ = narf_filesystem::registry().unmount(h, "/execve-envp");
     }
     crate::syscall::__test_clear_global();
-    // Path resolved + image loaded + argv/envp parsed → no user ctx → invalid_op.
+    // Path resolved + image loaded + argv/envp parsed → no user ctx → -ENOSYS.
     match r {
-        Some(r) if r == SyscallReturn::invalid_op() => TestResult::Pass,
+        Some(r) if r == SyscallReturn::ok((-38i64) as u64) => TestResult::Pass,
+        Some(r) if r.value == 0 => {
+            TestResult::Fail("execve reported success after bailing for lack of a user ctx")
+        }
         _ => TestResult::Fail("execve with a populated envp didn't reach the no-user-ctx bail"),
     }
 }
