@@ -4911,6 +4911,84 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     Some(new)
 }
 
+/// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
+/// bits when a file is modified".
+pub(crate) const CAP_FSETID: u32 = 4;
+
+/// `fs/attr.c::setattr_should_drop_suidgid`, applied by
+/// `file_remove_privs` on every write and by `do_truncate`:
+///
+/// ```text
+/// /* suid always must be killed */
+/// if (unlikely(mode & S_ISUID))
+///         kill = ATTR_KILL_SUID;
+/// kill |= setattr_should_drop_sgid(idmap, inode);
+/// if (unlikely(kill && !capable(CAP_FSETID) && S_ISREG(mode)))
+///         return kill;
+/// ```
+///
+/// and `setattr_should_drop_sgid`, which spares an S_ISGID that is the
+/// mandatory-locking marker (no group-execute) held by someone in the
+/// file's own group:
+///
+/// ```text
+/// if (!(mode & S_ISGID))  return 0;
+/// if (mode & S_IXGRP)     return ATTR_KILL_SGID;
+/// if (!in_group_or_capable(idmap, inode, i_gid_into_vfsgid(idmap, inode)))
+///                         return ATTR_KILL_SGID;
+/// return 0;
+/// ```
+///
+/// This became load-bearing the moment set-user-ID execution started
+/// working: without it, anyone who can write a set-user-ID-root binary
+/// keeps it set-user-ID-root, which turns "can modify this file" into
+/// "can become root".
+fn file_remove_privs(file: &dyn narf_filesystem::FileOps, task: u64) {
+    let stat = file.stat();
+    // "!S_ISREG(inode->i_mode)" — only regular files carry these as
+    // privilege, and only they are stripped.
+    if stat.mode.file_type != narf_filesystem::FileType::File {
+        return;
+    }
+    let mode = stat.mode.perms;
+    if mode & 0o6000 == 0 {
+        return;
+    }
+    let (uid, gid) = file.owners();
+    let mut kill = 0u16;
+    if mode & 0o4000 != 0 {
+        kill |= 0o4000;
+    }
+    if mode & 0o2000 != 0 && (mode & 0o010 != 0 || !in_group_or_capable(task, uid, gid)) {
+        kill |= 0o2000;
+    }
+    if kill == 0 {
+        return;
+    }
+    // A CAP_FSETID holder keeps the bits — that is the capability's entire
+    // definition.
+    if capable_wrt_inode(task, uid, gid, CAP_FSETID) {
+        return;
+    }
+    let _ = poll_blocking(file.set_perms(mode & !kill));
+}
+
+/// `fs/inode.c::in_group_or_capable` — is the caller in the file's group,
+/// or privileged enough over it to act as if it were?
+///
+/// ```text
+/// if (vfsgid_in_group_p(vfsgid)) return true;
+/// if (capable_wrt_inode_uidgid(idmap, inode, CAP_FSETID)) return true;
+/// return false;
+/// ```
+fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    let ids = read_uidgid(task);
+    if ids.fsgid == file_gid || read_groups(task).contains(&file_gid) {
+        return true;
+    }
+    capable_wrt_inode(task, file_uid, file_gid, CAP_FSETID)
+}
+
 /// Test window onto [`bprm_fill_uid`]. A full `execve` needs a loadable
 /// image and a task switch, neither of which the ABI harness can stage, so
 /// the smoke drives the DECISION — which is the part that decides whether

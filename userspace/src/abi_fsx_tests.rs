@@ -1354,6 +1354,138 @@ kernel_test_in!(
     smoke_abi_fsx_nosuid_mount_confers_no_privilege
 );
 
+/// Writing to a file strips its set-user-ID bit.
+///
+/// `vfs_write` -> `file_remove_privs` -> `setattr_should_drop_suidgid`:
+///
+/// ```text
+/// /* suid always must be killed */
+/// if (unlikely(mode & S_ISUID))
+///         kill = ATTR_KILL_SUID;
+/// kill |= setattr_should_drop_sgid(idmap, inode);
+/// if (unlikely(kill && !capable(CAP_FSETID) && S_ISREG(mode)))
+///         return kill;
+/// ```
+///
+/// This became load-bearing the moment set-user-ID execution started
+/// working: without it, "can write this file" silently means "can become
+/// whoever owns it", because an attacker appends their payload to a
+/// set-user-ID-root binary and it stays set-user-ID-root.
+///
+/// The set-group-ID half is conditional, and the condition is the point:
+/// S_ISGID WITHOUT group-execute is the mandatory file-locking marker, and
+/// `setattr_should_drop_sgid` spares it for a writer who is in the file's
+/// own group.
+fn smoke_abi_fsx_write_strips_setuid() -> TestResult {
+    with_memfs(
+        "/abi-privs",
+        "abi-privs",
+        &[("prog", b"x"), ("locked", b"x")],
+        || {
+            let prog = b"/abi-privs/prog\0";
+            let locked = b"/abi-privs/locked\0";
+            let mode_of = |path: &[u8]| -> Option<u32> {
+                let mut sb = [0u8; 144];
+                if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                    return None;
+                }
+                Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+            };
+            // Stage BOTH files while still fully privileged. Dropping uid
+            // also drops capabilities, and there is no way back, so every
+            // chown/chmod has to happen before the single drop below.
+            //
+            // chown comes before chmod in each pair: changing an owner
+            // clears the very bits being staged.
+            //
+            // `prog` is a set-user-ID, set-group-ID EXECUTABLE owned by the
+            // caller, so the caller can write it at all.
+            if call(Syscall::Chown.raw(), a2(prog.as_ptr() as u64, 1000, 1000)) != Some(0) {
+                return Err("chown of the test binary failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(prog.as_ptr() as u64, 0o6755)) != Some(0) {
+                return Err("chmod 6755 setup failed");
+            }
+            // `locked` is 02666: set-group-ID with NO group-execute — the
+            // mandatory-locking marker — and group-writable.
+            //
+            // Its group is 0 because `setresuid` below moves only the UIDs;
+            // the writer keeps fsgid 0, so group 0 is the group it is
+            // actually IN. Staging this as group 1000 would make the writer
+            // a non-member, and `setattr_should_drop_sgid` would then
+            // correctly strip the bit — testing the opposite rule by
+            // accident.
+            if call(Syscall::Chown.raw(), a2(locked.as_ptr() as u64, 0, 0)) != Some(0) {
+                return Err("chgrp of the locked file failed");
+            }
+            if call(Syscall::Chmod.raw(), a1(locked.as_ptr() as u64, 0o2666)) != Some(0) {
+                return Err("chmod 2666 setup failed");
+            }
+            if mode_of(prog) != Some(0o6755) || mode_of(locked) != Some(0o2666) {
+                return Err("the setuid bits did not stick — staging is vacuous");
+            }
+
+            // Write as an UNPRIVILEGED task: CAP_FSETID is precisely the
+            // right to KEEP these bits, so as root the write would
+            // legitimately preserve them and this test would prove nothing.
+            if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+                crate::handlers::__test_uidgid_reset();
+                return Err("setresuid(1000) setup failed");
+            }
+            let write_to = |path: &[u8]| -> Option<i64> {
+                let fd = call(
+                    Syscall::Openat.raw(),
+                    a3(AT_FDCWD, path.as_ptr() as u64, 0o1, 0),
+                );
+                match fd {
+                    Some(fd) if fd >= 0 => {
+                        let payload = b"payload";
+                        let n = call(
+                            Syscall::Write.raw(),
+                            a2(fd as u64, payload.as_ptr() as u64, payload.len() as u64),
+                        );
+                        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                        n
+                    }
+                    _ => None,
+                }
+            };
+            let wrote_prog = write_to(prog);
+            let wrote_locked = write_to(locked);
+            crate::handlers::__test_uidgid_reset();
+
+            if wrote_prog.map(|n| n <= 0).unwrap_or(true) {
+                return Err("the unprivileged write did not happen — staging is vacuous");
+            }
+            if wrote_locked.map(|n| n <= 0).unwrap_or(true) {
+                return Err("the group-member write did not happen — staging is vacuous");
+            }
+            match mode_of(prog) {
+                Some(mode) if mode & 0o4000 != 0 => {
+                    return Err("a write left the set-user-ID bit in place")
+                }
+                Some(mode) if mode & 0o2000 != 0 => {
+                    return Err("a write left a set-group-ID EXECUTABLE bit in place")
+                }
+                Some(0o755) => {}
+                Some(_) => return Err("a write changed more than the privilege bits"),
+                None => return Err("stat after the write failed"),
+            }
+            // S_ISGID without group-execute is the mandatory-locking marker,
+            // not a privilege, and `setattr_should_drop_sgid` spares it for a
+            // writer who is in the file's own group.
+            match mode_of(locked) {
+                Some(mode) if mode & 0o2000 == 0 => {
+                    Err("a write stripped the mandatory-locking S_ISGID from a group member")
+                }
+                Some(_) => Ok(()),
+                None => Err("stat after the locked-file write failed"),
+            }
+        },
+    )
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_write_strips_setuid);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

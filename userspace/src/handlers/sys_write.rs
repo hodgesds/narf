@@ -52,6 +52,12 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         None
     };
 
+    // `vfs_write` -> `file_remove_privs`: a write strips the set-user-ID
+    // bit (and set-group-ID, when it is a privilege rather than the
+    // mandatory-locking marker). Without this, anyone who can write a
+    // set-user-ID-root binary keeps it set-user-ID-root.
+    file_remove_privs(endpoint.ops.as_ref(), task);
+
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = if endpoint.append() {
