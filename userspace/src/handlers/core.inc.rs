@@ -1399,6 +1399,16 @@ fn open_impl(
             // `simple_acl_create`. A parent with a default ACL replaces the
             // umask with it, so `permissions` cannot be computed until the
             // parent is known — see `inherit_acls_from_parent`.
+            //
+            // The mode mask is `S_IALLUGO` (07777), not 0777:
+            // `vfs_create` passes the caller's set-user-ID and set-group-ID
+            // bits through. That is safe because the new file is owned by
+            // the CREATOR, so setuid-to-yourself confers nothing, and the
+            // dangerous half — a group-executable set-group-ID file in a
+            // setgid directory whose group the creator is not in — is what
+            // `mode_strip_sgid` removes. Masking the bits off instead
+            // meant `open(path, O_CREAT, 02755)` silently produced a
+            // non-setgid file and `mode_strip_sgid` had nothing to guard.
             let mut inherited_access: Option<alloc::vec::Vec<u8>> = None;
             let mut permissions = (create_mode & !current_umask() & 0o777) as u16;
             // `inode_init_owner` hands the new file the parent's group when
@@ -1427,7 +1437,7 @@ fn open_impl(
                         return Some(Err(narf_filesystem::FsError::PermissionDenied));
                     }
                     let inherited =
-                        inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                        inherit_acls_from_parent(&*parent, (create_mode & 0o7777) as u16, false);
                     permissions = inherited.mode;
                     inherited_access = inherited.access;
                     owner = (inherited.uid, inherited.gid);
@@ -1439,7 +1449,7 @@ fn open_impl(
                             return Some(Err(narf_filesystem::FsError::PermissionDenied));
                         }
                         let inherited =
-                            inherit_acls_from_parent(&*parent, (create_mode & 0o777) as u16, false);
+                            inherit_acls_from_parent(&*parent, (create_mode & 0o7777) as u16, false);
                         permissions = inherited.mode;
                         inherited_access = inherited.access;
                         owner = (inherited.uid, inherited.gid);
@@ -2360,6 +2370,21 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
         return SyscallReturn::ok(errno as u64);
     }
     let fmt = mode & S_IFMT;
+    // `vfs_mknod`:
+    //
+    //     if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
+    //         !capable(CAP_MKNOD))
+    //             return -EPERM;
+    //
+    // A device node is a direct handle on a driver, so creating one is a
+    // privileged act however permissive the directory is: an unprivileged
+    // task that could mknod its own `/dev/sda` would read the disk past
+    // every file permission on it. FIFOs and sockets are NOT covered —
+    // they carry no such authority, which is why the check names only the
+    // two device types.
+    if (fmt == S_IFCHR || fmt == S_IFBLK) && !capable(CAP_MKNOD) {
+        return SyscallReturn::ok((-1i64) as u64); // -EPERM
+    }
     // Already exists → -EEXIST (Linux mknod semantics).
     if let Some(Ok(entry)) = poll_blocking(parent.lookup_async(&leaf)) {
         if (fmt == S_IFIFO || fmt == S_IFCHR || fmt == S_IFBLK)
@@ -2416,7 +2441,7 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             // setgid parent hands down its group. A device node or FIFO in
             // a shared group directory has to land in that group like
             // anything else.
-            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o777) as u16, false);
+            let inherited = inherit_acls_from_parent(&*parent, (mode & 0o7777) as u16, false);
             let _ = poll_blocking(n.set_owners(inherited.uid, inherited.gid));
             let _ = poll_blocking(n.set_perms(inherited.mode));
             if let Some(blob) = inherited.access.as_ref() {
@@ -4915,6 +4940,9 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
 /// bits when a file is modified".
 pub(crate) const CAP_FSETID: u32 = 4;
 
+/// Linux `CAP_MKNOD` — "create special files using mknod(2)".
+pub(crate) const CAP_MKNOD: u32 = 27;
+
 /// `fs/attr.c::setattr_should_drop_suidgid`, applied by
 /// `file_remove_privs` on every write and by `do_truncate`:
 ///
@@ -4981,6 +5009,11 @@ fn file_remove_privs(file: &dyn narf_filesystem::FileOps, task: u64) {
 /// if (capable_wrt_inode_uidgid(idmap, inode, CAP_FSETID)) return true;
 /// return false;
 /// ```
+/// [`in_group_or_capable`] for callers outside this file.
+pub(crate) fn task_in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
+    in_group_or_capable(task, file_uid, file_gid)
+}
+
 fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
     let ids = read_uidgid(task);
     if ids.fsgid == file_gid || read_groups(task).contains(&file_gid) {

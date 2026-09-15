@@ -1486,6 +1486,174 @@ fn smoke_abi_fsx_write_strips_setuid() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx_write_strips_setuid);
 
+/// Creating a device node needs CAP_MKNOD; a FIFO does not.
+///
+/// `vfs_mknod`:
+///
+/// ```text
+/// if ((S_ISCHR(mode) || S_ISBLK(mode)) && !is_whiteout &&
+///     !capable(CAP_MKNOD))
+///         return -EPERM;
+/// ```
+///
+/// A device node is a direct handle on a driver, so an unprivileged task
+/// that could `mknod` its own `/dev/sda` would read the disk past every
+/// file permission on it. NARF let anyone with write access to a
+/// directory create one. The check deliberately names only the two device
+/// types: a FIFO or socket carries no such authority, and requiring
+/// privilege for `mkfifo` would break ordinary programs.
+fn smoke_abi_fsx_mknod_device_requires_cap_mknod() -> TestResult {
+    const S_IFCHR: u64 = 0o020000;
+    const S_IFIFO: u64 = 0o010000;
+    with_memfs("/abi-mknod", "abi-mknod", &[], || {
+        let dev = b"/abi-mknod/dev\0";
+        let fifo = b"/abi-mknod/fifo\0";
+        let root_dev = b"/abi-mknod/rootdev\0";
+        // Make the directory world-writable, so the refusal below can only
+        // come from the capability check and not from `may_create`.
+        let dir = b"/abi-mknod\0";
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o777)) != Some(0) {
+            return Err("chmod 0777 of the test directory failed");
+        }
+        // Privileged baseline: a device node IS creatable with CAP_MKNOD,
+        // or the denial below would prove nothing.
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, root_dev.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        ) != Some(0)
+        {
+            return Err("a privileged mknod of a device node failed — test is vacuous");
+        }
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let made_dev = call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, dev.as_ptr() as u64, S_IFCHR | 0o666, 0x0103),
+        );
+        let made_fifo = call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, fifo.as_ptr() as u64, S_IFIFO | 0o666, 0),
+        );
+        crate::handlers::__test_uidgid_reset();
+        if made_dev != Some(EPERM) {
+            return Err("an unprivileged mknod of a device node must return -EPERM");
+        }
+        if made_fifo != Some(0) {
+            return Err("an unprivileged mkfifo was refused; CAP_MKNOD covers device nodes only");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx_mknod_device_requires_cap_mknod);
+
+/// A setgid directory cannot be used to manufacture a set-group-ID binary.
+///
+/// `vfs_prepare_mode` -> `fs/inode.c::mode_strip_sgid`:
+///
+/// ```text
+/// if ((mode & (S_ISGID | S_IXGRP)) != (S_ISGID | S_IXGRP)) return mode;
+/// if (S_ISDIR(mode) || !dir || !(dir->i_mode & S_ISGID))   return mode;
+/// if (in_group_or_capable(idmap, dir, i_gid_into_vfsgid(idmap, dir)))
+///                                                          return mode;
+/// return mode & ~S_ISGID;
+/// ```
+///
+/// The attack it closes: a setgid directory hands its group to every new
+/// file, so a caller who is NOT in that group could otherwise create a
+/// group-executable set-group-ID binary owned by a group it does not
+/// belong to — privilege manufactured out of write access to a shared
+/// directory.
+///
+/// NARF masked the set-group-ID bit off every create instead, which
+/// blocked the attack by blocking the feature: `open(path, O_CREAT,
+/// 02755)` silently produced a plain file. The mask is now Linux's
+/// `S_IALLUGO`, and this is the guard.
+fn smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary() -> TestResult {
+    const GROUP: u32 = 7700;
+    with_memfs("/abi-sgidstrip", "abi-sgidstrip", &[], || {
+        let dir = b"/abi-sgidstrip/shared\0";
+        let member = b"/abi-sgidstrip/shared/member\0";
+        let stranger = b"/abi-sgidstrip/shared/stranger\0";
+        let mode_of = |path: &[u8]| -> Option<u32> {
+            let mut sb = [0u8; 144];
+            if call_stat(path.as_ptr() as u64, sb.as_mut_ptr() as u64) != Some(0) {
+                return None;
+            }
+            Some(u32::from_ne_bytes([sb[24], sb[25], sb[26], sb[27]]) & 0o7777)
+        };
+        if call_mkdir(dir.as_ptr() as u64, 0o777) != Some(0) {
+            return Err("mkdir of the shared directory failed");
+        }
+        // Group 0 — which the root-credentialed creator below IS in.
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o2777)) != Some(0) {
+            return Err("chmod g+s of the shared directory failed");
+        }
+        let create = |path: &[u8]| {
+            call(
+                Syscall::Openat.raw(),
+                a3(AT_FDCWD, path.as_ptr() as u64, 0o100 | 0o2, 0o2755),
+            )
+        };
+        // A member of the directory's group KEEPS the bit — otherwise this
+        // test would pass on a blanket "always strip", which is the
+        // behaviour it exists to rule out.
+        match create(member) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+            _ => return Err("creating the member's file failed"),
+        }
+        match mode_of(member) {
+            Some(mode) if mode & 0o2000 != 0 => {}
+            Some(_) => return Err("a group member's set-group-ID request was stripped"),
+            None => return Err("stat of the member's file failed"),
+        }
+        // Now a caller in a DIFFERENT group. The directory hands down its
+        // own group, so the file would end up set-group-ID to a group the
+        // creator is not in.
+        if call(
+            Syscall::Chown.raw(),
+            a2(dir.as_ptr() as u64, 0, GROUP as u64),
+        ) != Some(0)
+        {
+            return Err("chgrp of the shared directory failed");
+        }
+        if call(Syscall::Chmod.raw(), a1(dir.as_ptr() as u64, 0o2777)) != Some(0) {
+            return Err("re-chmod g+s of the shared directory failed");
+        }
+        // The caller must be UNPRIVILEGED: CAP_FSETID is exactly the right
+        // to KEEP the bit, and a root creator legitimately holds it — so
+        // staging this as root would be asserting the opposite rule.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("setresuid(1000) setup failed");
+        }
+        let made = create(stranger);
+        if let Some(fd) = made {
+            if fd >= 0 {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+            }
+        }
+        crate::handlers::__test_uidgid_reset();
+        if made.map(|fd| fd < 0).unwrap_or(true) {
+            return Err("creating the stranger's file failed");
+        }
+        match mode_of(stranger) {
+            Some(mode) if mode & 0o2000 != 0 => {
+                Err("a non-member manufactured a set-group-ID binary in a setgid directory")
+            }
+            Some(_) => Ok(()),
+            None => Err("stat of the stranger's file failed"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx_setgid_dir_cannot_manufacture_setgid_binary
+);
+
 fn smoke_abi_fsx_getxattr_pos() -> TestResult {
     with_setup(|| {
         let path = b"/abi/g\0";

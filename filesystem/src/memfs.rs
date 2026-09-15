@@ -1514,10 +1514,12 @@ impl Xattrs {
 fn memfs_set_acl(
     xattrs: &Xattrs,
     perms: &AtomicU32,
+    owner: (u32, u32),
     is_dir: bool,
     ty: AclType,
     value: &[u8],
 ) -> Result<(), FsError> {
+    let (uid, gid) = owner;
     let acl = if value.is_empty() {
         None
     } else {
@@ -1556,16 +1558,15 @@ fn memfs_set_acl(
     // become whatever the ACL says, and an ACL that is exactly expressible
     // as mode bits is not stored at all.
     //
-    // LINUX-GAP: the `in_group_or_capable()` half of
-    // `posix_acl_update_mode` drops S_ISGID when the caller is neither in
-    // the file's group nor CAP_FSETID-privileged. There is no credential to
-    // test here, so NARF passes `true` (keep the bit) — the same answer
-    // Linux gives for the common case of the owner acting on their own
-    // file, and never a widening of the rwx bits.
+    // The `in_group_or_capable()` half drops S_ISGID when the caller is
+    // neither in the file's group nor CAP_FSETID-privileged. No `FileOps`
+    // method carries a credential, so the answer comes from the syscall
+    // layer through [`crate::caller_in_group_or_capable`] — which fails
+    // closed, and closed here means DROPPING the bit.
     let (mode, stored) = crate::posix_acl::posix_acl_update_mode(
         (perms.load(Ordering::Relaxed) & 0o7777) as u16,
         acl,
-        true,
+        crate::caller_in_group_or_capable(uid, gid),
     )?;
     match stored {
         Some(acl) => xattrs.raw_insert(XATTR_NAME_POSIX_ACL_ACCESS, acl.to_xattr()),
@@ -1993,7 +1994,7 @@ impl MemFile {
     /// `set_posix_acl` on a regular file — never a directory, so a DEFAULT
     /// ACL is refused. See [`memfs_set_acl`].
     fn set_acl(&self, ty: AclType, value: &[u8]) -> Result<(), FsError> {
-        memfs_set_acl(&self.xattrs, &self.perms, false, ty, value)
+        memfs_set_acl(&self.xattrs, &self.perms, self.owners(), false, ty, value)
     }
 }
 
@@ -3662,7 +3663,14 @@ impl DirOps for MemDir {
             // what `setfacl -d` installs and what every file created below
             // inherits.
             if let Some(ty) = AclType::from_xattr_name(name) {
-                memfs_set_acl(&self.xattrs, &self.perms, true, ty, value)?;
+                memfs_set_acl(
+                    &self.xattrs,
+                    &self.perms,
+                    self.dir_owners(),
+                    true,
+                    ty,
+                    value,
+                )?;
                 // `memfs_set_acl` may store the ACL, remove it, or store
                 // nothing at all (an ACL exactly expressible as mode bits),
                 // so the flags are refreshed from what actually landed.

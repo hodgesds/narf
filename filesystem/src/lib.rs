@@ -2840,6 +2840,37 @@ pub fn caller_capable(cap: u32) -> bool {
     f(cap)
 }
 
+/// The caller's answer to `fs/inode.c::in_group_or_capable` for one inode.
+///
+/// `posix_acl_update_mode` needs it — setting an access ACL drops S_ISGID
+/// unless the caller is in the file's group or holds CAP_FSETID over it —
+/// and no `FileOps`/`DirOps` method carries a credential to compute it
+/// with. Passing a hardcoded `true` was the documented gap: it kept the
+/// bit in every case, including the one Linux clears it for.
+///
+/// Fails CLOSED, like [`CALLER_CAPABLE_HOOK`], but note that "closed" here
+/// means DROPPING the setgid bit: with no hook installed the safe answer
+/// is the one that removes privilege, not the one that keeps it.
+static IN_GROUP_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the `in_group_or_capable` query (userspace's).
+pub fn install_in_group_hook(f: fn(u32, u32) -> bool) {
+    IN_GROUP_HOOK.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the calling process is in `(uid, gid)`'s group, or holds
+/// CAP_FSETID over that inode. `false` when no hook is installed.
+pub fn caller_in_group_or_capable(uid: u32, gid: u32) -> bool {
+    let v = IN_GROUP_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return false;
+    }
+    // SAFETY: v was stored by install_in_group_hook as a
+    // `fn(u32, u32) -> bool` pointer; non-zero confirms it was installed.
+    let f: fn(u32, u32) -> bool = unsafe { core::mem::transmute::<usize, fn(u32, u32) -> bool>(v) };
+    f(uid, gid)
+}
+
 /// Hook exporting a DRM GEM handle as an mmap-able dma-buf `FileOps`.
 /// Installed by the gpu driver (which owns the card / dumb-buffer tables)
 /// so `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` in the syscall layer — the

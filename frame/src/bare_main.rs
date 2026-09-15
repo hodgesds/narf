@@ -3953,6 +3953,7 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
     //
     // Same reasoning as `install_shared_frame_hooks` above.
     narf_filesystem::install_caller_capable_hook(narf_userspace::handlers::caller_capable);
+    narf_filesystem::install_in_group_hook(narf_userspace::handlers::caller_in_group_or_capable);
 
     // Run the kernel-test harness instead of the async demo when the
     // `kernel-test` feature is on. `run_all_and_exit` never returns.
