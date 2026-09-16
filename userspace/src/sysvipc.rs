@@ -150,6 +150,10 @@ const SEMMNI: usize = 32_000;
 const SEMMSL: usize = 32_000;
 const SEMMNS: usize = SEMMNI * SEMMSL;
 const SEMOPM: usize = 500;
+/// Match Linux's `SEMOPM_FAST`: ordinary small vectors stay on the kernel
+/// stack, while larger imports allocate only after the observable argument
+/// checks have completed.
+const SEMOPM_FAST: usize = 64;
 const SEMUME: i32 = SEMOPM as i32;
 const SEMUSZ: i32 = 20;
 
@@ -282,7 +286,8 @@ type SemUndoTable = Vec<SemUndo>;
 
 type SemWaitBlocker = (usize, bool); // (sem_num, waits-for-zero)
 type SemOpFailure = (i64, bool, Option<SemWaitBlocker>); // (errno, terminal, blocker)
-type SemStagedSnapshot = (usize, Option<(i64, i64)>, bool); // (nsops, timeout, linked)
+/// (nsops, timeout, linked, terminal result)
+type SemStagedSnapshot = (usize, Option<(i64, i64)>, bool, Option<i64>);
 
 struct SemWait {
     task: u64,
@@ -1171,20 +1176,32 @@ fn begin_msg_send_wait(task: u64, ipc_ns: u64, id: u64, mtype: i64, payload: Vec
     }
 }
 
-fn copy_staged_sem_wait(
-    task: u64,
-    ipc_ns: u64,
-    id: u64,
-    out: &mut [u8],
-) -> Option<SemStagedSnapshot> {
+fn staged_sem_wait_snapshot(task: u64, ipc_ns: u64, id: u64) -> Option<SemStagedSnapshot> {
     with_sem_wait_state((ipc_ns, id), |state| {
         let wait = &state.waits[sem_wait_index(&state.waits, task).ok()?];
-        if wait.ipc_ns != ipc_ns || wait.id != id || wait.result.is_some() {
+        if wait.ipc_ns != ipc_ns || wait.id != id {
             return None;
         }
-        let sops = wait.sops.as_slice();
-        out[..sops.len()].copy_from_slice(sops);
-        Some((wait.nsops, wait.timeout, wait.blocking.is_some()))
+        Some((
+            wait.nsops,
+            wait.timeout,
+            wait.blocking.is_some(),
+            wait.result,
+        ))
+    })
+}
+
+fn copy_staged_sem_wait_ops(task: u64, ipc_ns: u64, id: u64, out: &mut [u8]) -> bool {
+    with_sem_wait_state((ipc_ns, id), |state| {
+        let Ok(index) = sem_wait_index(&state.waits, task) else {
+            return false;
+        };
+        let wait = &state.waits[index];
+        if wait.ipc_ns != ipc_ns || wait.id != id || wait.sops.as_slice().len() != out.len() {
+            return false;
+        }
+        out.copy_from_slice(wait.sops.as_slice());
+        true
     })
 }
 
@@ -2742,17 +2759,21 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             return;
         }
     }
-    let mut buf = [0u8; MAX_SOPS * 6];
     let staged = if may_have_wait {
-        copy_staged_sem_wait(task, ipc_ns, semid, &mut buf)
+        staged_sem_wait_snapshot(task, ipc_ns, semid)
     } else {
         None
     };
-    let nsops = staged.map_or(a.arg2 as u32 as usize, |(nsops, _, _)| nsops);
+    if let Some((_, _, _, Some(observed))) = staged {
+        let result = take_sem_wait_result(task, ipc_ns, semid).unwrap_or(observed);
+        set_sem_wait_return(ctx, timed, result);
+        return;
+    }
+    let nsops = staged.map_or(a.arg2 as u32 as usize, |(nsops, _, _, _)| nsops);
 
     // ksys_semtimedop imports the timeout before do_semtimedop performs any
     // nsops or sops validation.  Preserve that externally visible ordering.
-    let timeout = if let Some((_, timeout, _)) = staged {
+    let timeout = if let Some((_, timeout, _, _)) = staged {
         timeout
     } else if timed && a.arg3 != 0 {
         let mut raw = [0u8; 16];
@@ -2784,15 +2805,34 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
         return;
     }
     // struct sembuf { unsigned short sem_num; short sem_op; short sem_flg; } — 6 B.
-    // Read the sops array into a fixed on-stack buffer so a semop costs no
-    // heap traffic (the hot stress path is a single-sembuf P/V pair).
+    // Linux keeps SEMOPM_FAST entries on-stack and allocates only for a larger
+    // import. The stress-ng P/V path uses one entry, so avoid zeroing the old
+    // SEMOPM-sized 3 KiB array on every syscall while retaining Linux's ENOMEM
+    // before EFAULT ordering for large vectors.
     let nbytes = nsops * 6;
-    // SAFETY: copy_from_user range-validates sops_ptr and SMAP-brackets the
-    // read of the complete sembuf array into the stack slice.
-    if staged.is_none() {
+    let mut fast_buf = [0u8; SEMOPM_FAST * 6];
+    let mut slow_buf = Vec::new();
+    let buf = if nbytes <= fast_buf.len() {
+        &mut fast_buf[..nbytes]
+    } else {
+        if slow_buf.try_reserve_exact(nbytes).is_err() {
+            finish_semtimedop_wait(timed);
+            unlink_sem_wait_if_present(object, task, may_have_wait);
+            ctx.set_return(err(ENOMEM));
+            return;
+        }
+        slow_buf.resize(nbytes, 0);
+        slow_buf.as_mut_slice()
+    };
+    if staged.is_some() {
+        assert!(
+            copy_staged_sem_wait_ops(task, ipc_ns, semid, buf),
+            "retained SysV semaphore operation disappeared"
+        );
+    } else {
         // SAFETY: this is the first execution; copy_from_user range-validates
         // and snapshots the complete operation array before any possible park.
-        if unsafe { crate::handlers::copy_from_user(&mut buf[..nbytes], sops_ptr) }.is_err() {
+        if unsafe { crate::handlers::copy_from_user(buf, sops_ptr) }.is_err() {
             finish_semtimedop_wait(timed);
             unlink_sem_wait_if_present(object, task, may_have_wait);
             ctx.set_return(err(EFAULT));
@@ -2819,7 +2859,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     }
     // A linked waiter is completed only by the queue scanner. A timeout or
     // signal can win only while its cached status is still pending.
-    if staged.is_some_and(|(_, _, linked)| linked) {
+    if staged.is_some_and(|(_, _, linked, _)| linked) {
         let reason = if semtimedop_expired(timeout) {
             Some(EAGAIN)
         } else if crate::handlers::has_interrupting_signal(task) {
@@ -2846,7 +2886,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     }
 
     let (pid, caller_uid, caller_gid, caller_groups) = current_identity();
-    let has_undo = (0..nsops).any(|i| parse_sem_op(&buf[..nbytes], i).2 & SEM_UNDO != 0);
+    let has_undo = (0..nsops).any(|i| parse_sem_op(buf, i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
     let set_ref = lookup_sem_set(object);
     let mut scanned_waiters = false;
@@ -2872,7 +2912,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                         perform_semop_locked(
                             &mut set,
                             object,
-                            &buf[..nbytes],
+                            buf,
                             nsops,
                             pid,
                             undo_owner,
@@ -2885,7 +2925,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                     perform_semop_locked(
                         &mut set,
                         object,
-                        &buf[..nbytes],
+                        buf,
                         nsops,
                         pid,
                         undo_owner,
@@ -2895,7 +2935,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                     )
                 };
                 match result {
-                    Err((EAGAIN, false, blocking)) => match SemOps::try_copy_from(&buf[..nbytes]) {
+                    Err((EAGAIN, false, blocking)) => match SemOps::try_copy_from(buf) {
                         Err(()) => SemopStart::Complete(Err((ENOMEM, true, None))),
                         Ok(retained) => match queue_new_sem_wait_locked(
                             &mut set, set_ref, object, task, retained, nsops, timeout, blocking,
