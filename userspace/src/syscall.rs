@@ -1700,6 +1700,37 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `io_pgetevents(ctx, min_nr, nr, events, timeout, sigset)` —
+    /// `io_getevents` with a signal mask applied for the duration, so a
+    /// caller waiting on AIO completions can be woken by a signal without a
+    /// window where it arrives unblocked and is lost.
+    ///
+    /// The arch numbers do NOT match: x86_64 333, generic (aarch64) 292.
+    /// Linux `io_pgetevents`.
+    IoPgetevents,
+    /// `quotactl_fd(fd, cmd, id, addr)` — `quotactl(2)`'s operations,
+    /// naming the filesystem by an open descriptor instead of a device path.
+    /// Linux `quotactl_fd` (x86_64=443, aarch64=443).
+    QuotactlFd,
+    /// `cachestat(fd, cachestat_range*, cachestat*, flags)` — how much of a
+    /// file range is in the page cache, so a caller can skip a readahead it
+    /// can prove is unnecessary.
+    /// Linux `cachestat` (x86_64=451, aarch64=451).
+    Cachestat,
+    /// `mseal(start, len, flags)` — make a range permanently immune to the
+    /// operations that could replace what is mapped there (munmap, mremap,
+    /// mprotect, MAP_FIXED, destructive madvise). Monotonic: there is no
+    /// unseal, deliberately.
+    /// Linux `mseal` (x86_64=462, aarch64=462).
+    Mseal,
+    /// `file_getattr(dfd, path, file_attr*, usize, at_flags)` — the inode
+    /// attribute word (`FS_XFLAG_*`), by PATH rather than through an ioctl
+    /// on an already-open descriptor.
+    /// Linux `file_getattr` (x86_64=468, aarch64=468).
+    FileGetattr,
+    /// `file_setattr(dfd, path, file_attr*, usize, at_flags)`.
+    /// Linux `file_setattr` (x86_64=469, aarch64=469).
+    FileSetattr,
     /// `statmount(req, buf, bufsize, flags)` — query one mount without
     /// parsing `/proc/self/mountinfo`.
     /// Linux `statmount` (x86_64=457, aarch64=457).
@@ -2537,12 +2568,18 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 195),
     (Syscall::Flistxattr, 196),
     (Syscall::Removexattr, 197),
+    (Syscall::IoPgetevents, 333),
+    (Syscall::QuotactlFd, 443),
+    (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
+    (Syscall::Mseal, 462),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),
     (Syscall::Removexattrat, 466),
+    (Syscall::FileGetattr, 468),
+    (Syscall::FileSetattr, 469),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
     (Syscall::Creat, 85),
@@ -3007,12 +3044,18 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 12),
     (Syscall::Flistxattr, 13),
     (Syscall::Removexattr, 14),
+    (Syscall::IoPgetevents, 292),
+    (Syscall::QuotactlFd, 443),
+    (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
+    (Syscall::Mseal, 462),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),
     (Syscall::Removexattrat, 466),
+    (Syscall::FileGetattr, 468),
+    (Syscall::FileSetattr, 469),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),

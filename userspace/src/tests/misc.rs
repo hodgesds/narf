@@ -100,6 +100,14 @@ fn smoke_userspace_shared_ring_kick_round_trip() -> TestResult {
 
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::fd::__test_reset();
     crate::bootstrap_init();
     __test_clear_global();
@@ -376,6 +384,14 @@ fn smoke_userspace_chdir_getcwd_round_trip() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_cwd_reset();
     crate::cwd_init();
@@ -2800,6 +2816,14 @@ fn smoke_abi_dispatcher_serves_file_ops() -> TestResult {
 
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::fd::__test_reset();
     crate::bootstrap_init();
     narf_abi::install_file_op_bridge(abi_file_op_bridge);
@@ -2965,6 +2989,14 @@ fn smoke_abi_dispatcher_serves_mmap() -> TestResult {
 
     install_address_space_lookup(as_lookup);
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::fd::__test_reset();
     crate::bootstrap_init();
     narf_abi::install_file_op_bridge(abi_file_op_bridge);
@@ -3195,6 +3227,14 @@ fn smoke_userspace_sa_nodefer_skips_auto_block() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::sigaction_init();
     crate::handlers::signal_init();
     __test_clear_global();

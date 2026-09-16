@@ -35,9 +35,9 @@ use crate::posix_acl::{
     AclType, PosixAcl, XATTR_NAME_POSIX_ACL_ACCESS, XATTR_NAME_POSIX_ACL_DEFAULT,
 };
 use crate::{
-    DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture, FsInstance, FsStat,
-    InodeAttrs, Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE, QIF_ALL, QIF_BLIMITS,
-    QIF_BTIME, QIF_ILIMITS, QIF_INODES, QIF_ITIME, QIF_SPACE,
+    CacheStat, DirEntry, DirOps, FileOps, FileType, FsDqBlk, FsDqInfo, FsError, FsFuture,
+    FsInstance, FsStat, InodeAttrs, Mode, QuotaKind, Stat, IIF_BGRACE, IIF_FLAGS, IIF_IGRACE,
+    QIF_ALL, QIF_BLIMITS, QIF_BTIME, QIF_ILIMITS, QIF_INODES, QIF_ITIME, QIF_SPACE,
 };
 
 const PAGE_SIZE: u64 = 4096;
@@ -2498,6 +2498,35 @@ impl FileOps for MemFile {
     ///
     /// Idempotent per offset, as the contract requires: a second call for
     /// the same page finds it present and returns the same frame.
+    /// `cachestat(2)` for a tmpfs file.
+    ///
+    /// Exact rather than estimated: `FileData::pages` IS the page cache for
+    /// this inode, so a present key is a resident page and an absent one is
+    /// a hole. There is nothing to approximate.
+    ///
+    /// `nr_dirty` equals `nr_cache` because a tmpfs page has nowhere to be
+    /// written back TO. Linux marks shmem folios dirty for that reason
+    /// (`shmem_write_end` -> `folio_mark_dirty`), and reporting 0 here would
+    /// tell a caller these pages could be dropped cheaply, which is the one
+    /// thing that is never true of them.
+    ///
+    /// `nr_writeback` is 0 — there is no writeback path to be in the middle
+    /// of. `nr_evicted`/`nr_recently_evicted` are 0 because nothing is ever
+    /// evicted: NARF has no reclaim and no swap, so a tmpfs page that was
+    /// written is still there. Both are honest zeroes, not unimplemented
+    /// ones.
+    fn cachestat_range(&self, first: u64, last: u64) -> Option<CacheStat> {
+        let data = self.data.lock();
+        let nr_cache = data.pages.range(first..=last).count() as u64;
+        Some(CacheStat {
+            nr_cache,
+            nr_dirty: nr_cache,
+            nr_writeback: 0,
+            nr_evicted: 0,
+            nr_recently_evicted: 0,
+        })
+    }
+
     fn mmap_fault(&self, offset: u64) -> Result<u64, FsError> {
         let index = offset / PAGE_SIZE;
         let uid = self.uid.load(Ordering::Relaxed);

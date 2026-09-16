@@ -42,6 +42,12 @@ const QFMT_VFS_V0: u32 = 2;
 const EPERM: i64 = -1;
 const ENOENT: i64 = -2;
 const ESRCH: i64 = -3;
+/// Shadows the `EBADF` from `core.inc.rs` DELIBERATELY. That one is
+/// `u64 = 9` — positive, for callers that negate at the return site — while
+/// every errno in this file is already negative and returned verbatim.
+/// Mixing the two conventions returned +9, which userspace reads as a
+/// successful `quotactl_fd` that wrote nothing.
+const EBADF: i64 = -9;
 const EIO: i64 = -5;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
@@ -148,7 +154,21 @@ fn quotactl_dispatch(subcmd: u32, type_: u32, special: u64, id: u32, addr: u64) 
         Ok(fs) => fs,
         Err(e) => return e,
     };
+    quotactl_on_fs(subcmd, kind, fs, id, addr)
+}
 
+/// Everything past "which filesystem" — shared by `quotactl` and
+/// `quotactl_fd`, which differ only in how they name it.
+///
+/// `fs/quota/quota.c` has the same shape: both syscalls resolve a
+/// `struct super_block *` their own way and hand it to `do_quotactl`.
+fn quotactl_on_fs(
+    subcmd: u32,
+    kind: QuotaKind,
+    fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance>,
+    id: u32,
+    addr: u64,
+) -> i64 {
     match subcmd {
         Q_QUOTAON => fs.quota_on(kind).map_or_else(quota_errno, |()| 0),
         Q_QUOTAOFF => fs.quota_off(kind).map_or_else(quota_errno, |()| 0),
@@ -227,4 +247,73 @@ fn write_user_bytes(addr: u64, bytes: &[u8]) -> i64 {
 
 fn write_user_u32(addr: u64, value: u32) -> i64 {
     write_user_bytes(addr, &value.to_le_bytes())
+}
+
+/// `fs/quota/quota.c::SYSCALL_DEFINE4(quotactl_fd)` — x86_64/arm64 443.
+///
+/// ```text
+/// CLASS(fd_raw, f)(fd);
+/// if (fd_empty(f))       return -EBADF;
+/// if (type >= MAXQUOTAS) return -EINVAL;
+/// if (quotactl_cmd_write(cmds)) { ret = mnt_want_write(...); if (ret) return ret; }
+/// sb = fd_file(f)->f_path.mnt->mnt_sb;
+/// ret = do_quotactl(sb, type, cmds, id, addr, ERR_PTR(-EINVAL));
+/// ```
+///
+/// The same operations as `quotactl(2)`, naming the filesystem by an open
+/// descriptor instead of by a device path — which is what lets a caller that
+/// already holds the mount avoid a second lookup, and lets it work where the
+/// device has no path it can name.
+///
+/// Note the `ERR_PTR(-EINVAL)` passed where `quotactl` passes a path: that is
+/// the quota-FILE argument, and it is deliberately unusable here. `Q_QUOTAON`
+/// names a file to switch quotas on with, and there is no path argument in
+/// this form to name one, so it is -EINVAL rather than a quotaon against
+/// something unspecified.
+pub(crate) fn sys_quotactl_fd(ctx: &mut dyn TrapContext) {
+    let args = *ctx.args();
+    let fd = args.arg0 as u32;
+    let cmd = args.arg1 as u32;
+    let id = args.arg2 as u32;
+    let addr = args.arg3;
+
+    let subcmd = cmd >> SUBCMDSHIFT;
+    let type_ = cmd & SUBCMDMASK;
+
+    // `fd_empty(f)` comes FIRST — before the type is looked at — so a closed
+    // descriptor is -EBADF whatever else is wrong with the call.
+    let task = current_task_id();
+    let open = crate::fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
+    if !open {
+        ctx.set_return(SyscallReturn::ok(EBADF as u64));
+        return;
+    }
+    let Some(kind) = quota_kind(type_) else {
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        return;
+    };
+    // `Q_QUOTAON` has no quota-file path in this form.
+    if subcmd == Q_QUOTAON {
+        ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+        return;
+    }
+    let Some(path) = fd_path_for_task(task, fd) else {
+        ctx.set_return(SyscallReturn::ok(EBADF as u64));
+        return;
+    };
+    let Some(fs) = current_fs_arc_at(&path) else {
+        ctx.set_return(SyscallReturn::ok(EBADF as u64));
+        return;
+    };
+    // `quotactl_cmd_write(cmds)` -> `mnt_want_write`: changing a quota is a
+    // write to the filesystem like any other, so a read-only mount refuses it
+    // before the quota layer is reached.
+    if matches!(subcmd, Q_SETQUOTA | Q_SETINFO | Q_QUOTAOFF) {
+        if let Err(errno) = mnt_want_write(&path) {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    }
+    let ret = quotactl_on_fs(subcmd, kind, fs, id, addr);
+    ctx.set_return(SyscallReturn::ok(ret as u64));
 }

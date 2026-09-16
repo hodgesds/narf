@@ -3264,3 +3264,408 @@ fn smoke_abi_fsx2_statmount_flags_and_overflow() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_statmount_flags_and_overflow);
+
+// ── cachestat(2) ──────────────────────────────────────────────────────
+
+/// `cachestat` reports the pages of a range that are actually resident.
+///
+/// For tmpfs this is exact rather than estimated — `FileData::pages` IS the
+/// page cache for the inode, so a present key is a resident page and an
+/// absent one is a hole. The value of the syscall is entirely in that
+/// exactness: a caller uses it to skip a read it can prove is unnecessary,
+/// so an over-report makes it skip a read it needed.
+fn smoke_abi_fsx2_cachestat_counts_resident_pages() -> TestResult {
+    // A three-page file, so the count is a number and not just "nonzero".
+    const PAGE: u64 = 4096;
+    with_memfs("/cst", "cst", &[("f", b"seed")], || {
+        // O_RDWR (2): `can_do_cachestat` accepts a writable descriptor, and
+        // the case writes through it anyway.
+        let fd = match call_open(c"/cst/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let page = [b'x'; PAGE as usize];
+        for i in 0..3u64 {
+            if call(
+                Syscall::Pwrite64.raw(),
+                a3(fd, page.as_ptr() as u64, PAGE, i * PAGE),
+            ) != Some(PAGE as i64)
+            {
+                return Err("seeding three pages should succeed");
+            }
+        }
+        let stat = |off: u64, len: u64| -> Option<[u64; 5]> {
+            let range = [off, len];
+            let mut out = [0u64; 5];
+            match call(
+                Syscall::Cachestat.raw(),
+                a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+            ) {
+                Some(0) => Some(out),
+                _ => None,
+            }
+        };
+        // len == 0 means "to the end", so the whole file: three pages.
+        let all = stat(0, 0).ok_or("cachestat over the whole file should succeed")?;
+        if all[0] != 3 {
+            return Err("cachestat did not count every resident page of the file");
+        }
+        // tmpfs pages have nowhere to be written back to, so Linux marks
+        // them dirty; reporting 0 would say they could be dropped cheaply,
+        // which is the one thing never true of them.
+        if all[1] != 3 {
+            return Err("tmpfs pages must report as dirty — they have no backing store");
+        }
+        // Nothing is under writeback, and nothing is ever evicted: NARF has
+        // no reclaim and no swap, so these are honest zeroes.
+        if all[2] != 0 || all[3] != 0 || all[4] != 0 {
+            return Err("writeback/evicted must be zero without reclaim or swap");
+        }
+        // A one-page window really is one page, so the range arithmetic is
+        // being applied rather than the whole file being counted every time.
+        let one = stat(0, PAGE).ok_or("a one-page range should succeed")?;
+        if one[0] != 1 {
+            return Err("cachestat ignored the range and counted the whole file");
+        }
+        // An unaligned range that spans a page boundary covers both pages:
+        // `first = off >> PAGE_SHIFT`, `last = (off + len - 1) >> PAGE_SHIFT`.
+        let two = stat(PAGE - 1, 2).ok_or("a boundary-spanning range should succeed")?;
+        if two[0] != 2 {
+            return Err("cachestat mis-rounded a range that spans a page boundary");
+        }
+        // Entirely past EOF: no pages, and not an error.
+        let past = stat(64 * PAGE, PAGE).ok_or("a range past EOF should still succeed")?;
+        if past[0] != 0 {
+            return Err("cachestat found pages past the end of the file");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_cachestat_counts_resident_pages
+);
+
+/// A hole really reads as a hole.
+///
+/// Written sparsely so the count is strictly less than the range: this is
+/// what separates "counts pages" from "reports the range size".
+fn smoke_abi_fsx2_cachestat_sees_holes() -> TestResult {
+    const PAGE: u64 = 4096;
+    with_memfs("/cst2", "cst2", &[("f", b"")], || {
+        let fd = match call_open(c"/cst2/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let byte = [b'z'; 1];
+        // Pages 0 and 4 only — pages 1..3 are holes.
+        for i in [0u64, 4] {
+            if call(
+                Syscall::Pwrite64.raw(),
+                a3(fd, byte.as_ptr() as u64, 1, i * PAGE),
+            ) != Some(1)
+            {
+                return Err("sparse seeding should succeed");
+            }
+        }
+        let range = [0u64, 5 * PAGE];
+        let mut out = [0u64; 5];
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("cachestat over a sparse file should succeed");
+        }
+        if out[0] != 2 {
+            return Err("cachestat counted holes as resident pages");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_cachestat_sees_holes);
+
+/// The argument checks, in Linux's order — which is not the order the
+/// arguments appear in.
+///
+/// `SYSCALL_DEFINE4(cachestat)` tests the descriptor, then copies the range,
+/// then the file type, then permission, and only THEN `flags`. A caller
+/// passing both a bad pointer and a bad flag therefore gets -EFAULT, and
+/// checking `flags` first — the obvious way to write it — would answer
+/// -EINVAL instead.
+fn smoke_abi_fsx2_cachestat_argument_order() -> TestResult {
+    // Canonical and in the user half, so `access_ok` passes and the copy is
+    // what faults — the same address the other cases in this file use.
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    with_memfs("/cst3", "cst3", &[("f", b"hi")], || {
+        let fd = match call_open(c"/cst3/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let range = [0u64, 0];
+        let mut out = [0u64; 5];
+        // A closed descriptor, before anything else is looked at.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(4242, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+        ) != Some(EBADF)
+        {
+            return Err("cachestat on a closed descriptor must be -EBADF");
+        }
+        // An unreadable range pointer.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, BAD_PTR, out.as_mut_ptr() as u64, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("an unreadable cachestat_range must be -EFAULT");
+        }
+        // A nonzero flag.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 1),
+        ) != Some(EINVAL)
+        {
+            return Err("a nonzero cachestat flag must be -EINVAL");
+        }
+        // Both wrong: the range copy runs first, so -EFAULT wins.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, BAD_PTR, out.as_mut_ptr() as u64, 1),
+        ) != Some(EFAULT)
+        {
+            return Err("cachestat checked flags before copying the range");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_cachestat_argument_order);
+
+// ── file_getattr(2) / file_setattr(2) ─────────────────────────────────
+//
+// The syscall form of the `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` ioctl pair,
+// added because an ioctl needs an already-open descriptor and these take a
+// path. They report the xfs-style `FS_XFLAG_*` word rather than the
+// `FS_*_FL` one the ioctl uses, so the two spellings must agree about the
+// same inode — which is the assertion that matters.
+
+const FILE_ATTR_SIZE: usize = 24;
+const FS_XFLAG_IMMUTABLE: u64 = 0x08;
+const FS_XFLAG_APPEND: u64 = 0x10;
+
+fn file_attr_buf(xflags: u64) -> [u8; FILE_ATTR_SIZE] {
+    let mut b = [0u8; FILE_ATTR_SIZE];
+    b[0..8].copy_from_slice(&xflags.to_ne_bytes());
+    b
+}
+
+/// Set through `file_setattr`, read back through both `file_getattr` and
+/// the `FS_IOC_GETFLAGS` ioctl.
+///
+/// The cross-check is the point: the syscall speaks `FS_XFLAG_*` and the
+/// ioctl speaks `FS_*_FL`, so a mis-mapped bit would round-trip cleanly
+/// through the syscall alone and still be wrong.
+fn smoke_abi_fsx2_file_setattr_getattr_round_trip() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IMMUTABLE_FL: u32 = 0x10;
+    with_memfs("/fattr", "fattr", &[("f", b"hi")], || {
+        let path = c"/fattr/f";
+        // Set IMMUTABLE through the syscall.
+        let set = file_attr_buf(FS_XFLAG_IMMUTABLE);
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: set.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), args) != Some(0) {
+            return Err("file_setattr(IMMUTABLE) should succeed");
+        }
+        // Read it back through the syscall.
+        let mut got = [0u8; FILE_ATTR_SIZE];
+        let gargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), gargs) != Some(0) {
+            return Err("file_getattr should succeed");
+        }
+        let xflags = u64::from_ne_bytes(got[0..8].try_into().unwrap());
+        if xflags & FS_XFLAG_IMMUTABLE == 0 {
+            return Err("file_getattr did not report the flag file_setattr set");
+        }
+        if xflags & FS_XFLAG_APPEND != 0 {
+            return Err("file_getattr reported a flag that was never set");
+        }
+        // And through the ioctl, which speaks the OTHER flag word. A
+        // mis-mapped bit would pass the syscall round trip and fail here.
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let mut fl = [0u8; 4];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd, FS_IOC_GETFLAGS, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_GETFLAGS should succeed");
+        }
+        if u32::from_ne_bytes(fl) & FS_IMMUTABLE_FL == 0 {
+            return Err("the ioctl and the syscall disagree about the same inode");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        // Clearing works too, so the set is not one-way.
+        let clear = file_attr_buf(0);
+        let cargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: clear.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), cargs) != Some(0) {
+            return Err("file_setattr clearing the flag should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_file_setattr_getattr_round_trip
+);
+
+/// The `usize` and `at_flags` rules.
+///
+/// ```text
+/// if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return -EINVAL;
+/// if (usize > PAGE_SIZE)                                       return -E2BIG;
+/// if (usize < FILE_ATTR_SIZE_VER0)                             return -EINVAL;
+/// ```
+///
+/// -E2BIG is decided BEFORE -EINVAL, so an oversized `usize` reports E2BIG
+/// even though it is also not a version this kernel knows. And an xflag
+/// outside `FS_XFLAGS_MASK` is -EINVAL, while the read-only flags inside it
+/// are silently STRIPPED rather than refused — two different answers for two
+/// kinds of unsettable bit.
+fn smoke_abi_fsx2_file_attr_size_and_flag_rules() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const E2BIG: i64 = -7;
+    const FS_XFLAG_HASATTR: u64 = 0x8000_0000; // in FS_XFLAG_RDONLY_MASK
+    with_memfs("/fattr2", "fattr2", &[("f", b"hi")], || {
+        let path = c"/fattr2/f";
+        let buf = file_attr_buf(0);
+        let mk = |usize_bytes: u64, at_flags: u64| SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: buf.as_ptr() as u64,
+            arg3: usize_bytes,
+            arg4: at_flags,
+            ..Default::default()
+        };
+        // Below VER0.
+        if call(Syscall::FileGetattr.raw(), mk(23, 0)) != Some(EINVAL) {
+            return Err("a usize below FILE_ATTR_SIZE_VER0 must be -EINVAL");
+        }
+        // Past PAGE_SIZE — E2BIG, and decided first.
+        if call(Syscall::FileGetattr.raw(), mk(4097, 0)) != Some(E2BIG) {
+            return Err("a usize above PAGE_SIZE must be -E2BIG");
+        }
+        // An at_flag outside the two legal bits.
+        if call(Syscall::FileGetattr.raw(), mk(FILE_ATTR_SIZE as u64, 0x200)) != Some(EINVAL) {
+            return Err("an at_flag outside AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH must be -EINVAL");
+        }
+        // An xflag outside FS_XFLAGS_MASK: -EINVAL.
+        let bogus = file_attr_buf(0x0004_0000);
+        let bargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: bogus.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), bargs) != Some(EINVAL) {
+            return Err("an xflag outside FS_XFLAGS_MASK must be -EINVAL");
+        }
+        // A read-only xflag INSIDE the mask: stripped, not refused.
+        let rdonly = file_attr_buf(FS_XFLAG_HASATTR);
+        let rargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: rdonly.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), rargs) != Some(0) {
+            return Err("a read-only xflag must be stripped, not refused");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_attr_size_and_flag_rules);
+
+/// AT_EMPTY_PATH names the file behind the descriptor.
+///
+/// `if (!name && dfd >= 0) { filepath = fd_file(f)->f_path; }` — and
+/// AT_FDCWD is NOT a descriptor, so it falls through to the path branch,
+/// which has no path: -EBADF.
+fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    with_memfs("/fattr3", "fattr3", &[("f", b"hi")], || {
+        let path = c"/fattr3/f";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let mut got = [0u8; FILE_ATTR_SIZE];
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: 0, // NULL path
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), args) != Some(0) {
+            return Err("file_getattr(fd, NULL, AT_EMPTY_PATH) should succeed");
+        }
+        // A closed descriptor takes the same arm and is -EBADF.
+        let bad = SyscallArgs {
+            arg0: 4242,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), bad) != Some(EBADF) {
+            return Err("AT_EMPTY_PATH on a closed descriptor must be -EBADF");
+        }
+        // AT_FDCWD is not a descriptor, so it cannot name a file.
+        let cwd = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), cwd) != Some(EBADF) {
+            return Err("AT_FDCWD with a NULL path must be -EBADF");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_getattr_empty_path);

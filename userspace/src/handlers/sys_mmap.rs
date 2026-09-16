@@ -154,6 +154,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `mm/vma.c`: a MAP_FIXED that would replace a sealed mapping is -EPERM.
+    // Only the DESTRUCTIVE form — MAP_FIXED_NOREPLACE fails with -EEXIST on
+    // its own and never replaces anything, so it has nothing to defeat.
+    // This is the arm sealing exists for: "Modifying a VMA via
+    // mmap(MAP_FIXED)" is listed alongside munmap and mremap as an operation
+    // that can put different contents at an address the caller trusted.
+    if destructive_fixed
+        && handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, args.arg1)
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     // ksys_mmap_pgoff resolves a non-anonymous fd before huge-flag and
     // do_mmap length/address validation. Thus EBADF wins over a zero length or
     // malformed MAP_FIXED address (but not over the arch offset check above).

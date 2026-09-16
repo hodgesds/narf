@@ -478,3 +478,149 @@ fn smoke_abi_aio_exit_sweep_reclaims() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_aio_exit_sweep_reclaims);
+
+// ── io_pgetevents(2) ──────────────────────────────────────────────────
+//
+// `io_getevents` with a signal mask applied for the duration. The mask is
+// the whole point: a caller that wants a signal to interrupt the wait must
+// unblock it, and doing that around the call instead of inside it leaves a
+// window where the signal arrives and is lost.
+
+/// A `struct __aio_sigset { const sigset_t *sigmask; size_t sigsetsize; }`.
+fn aio_sigset(mask_ptr: u64, sigsetsize: u64) -> [u8; 16] {
+    let mut b = [0u8; 16];
+    b[0..8].copy_from_slice(&mask_ptr.to_ne_bytes());
+    b[8..16].copy_from_slice(&sigsetsize.to_ne_bytes());
+    b
+}
+
+/// `io_pgetevents` reaps the same completions `io_getevents` does.
+///
+/// The first five arguments are `io_getevents`'s, in the same registers, so
+/// the load-bearing check is that the sixth does not disturb them — a
+/// mis-shaped forward would reap zero, or reap into the wrong buffer.
+fn smoke_abi_aio_pgetevents_reaps_completions() -> TestResult {
+    with_memfs("/paio", "paio", &[("f", b"")], || {
+        let fd = open_fd(b"/paio/f\0")?;
+        let ctx = io_setup(8)?;
+        let payload = *b"pget";
+        let iocb = make_iocb(
+            0x3131,
+            IOCB_CMD_PWRITE,
+            fd,
+            payload.as_ptr() as u64,
+            payload.len() as u64,
+            0,
+        );
+        let ptr_arr = [(&iocb as *const u8) as u64];
+        if call(Syscall::IoSubmit.raw(), a2(ctx, 1, ptr_arr.as_ptr() as u64)) != Some(1) {
+            return Err("io_submit should queue the write");
+        }
+        // No timeout, no sigset: the plain form, which must behave exactly
+        // like io_getevents.
+        let mut evbuf = [0u8; IO_EVENT_SIZE];
+        let args = SyscallArgs {
+            arg0: ctx,
+            arg1: 1,
+            arg2: 1,
+            arg3: evbuf.as_mut_ptr() as u64,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::IoPgetevents.raw(), args) != Some(1) {
+            return Err("io_pgetevents should reap the queued completion");
+        }
+        let (data, _obj, res, _res2) = decode_event(&evbuf);
+        if data != 0x3131 || res != 4 {
+            return Err("io_pgetevents returned the wrong io_event");
+        }
+        // The queue is now empty, so a second call reaps nothing — proving
+        // the first actually consumed rather than peeked.
+        let mut ev2 = [0u8; IO_EVENT_SIZE];
+        let args2 = SyscallArgs {
+            arg0: ctx,
+            arg1: 0,
+            arg2: 1,
+            arg3: ev2.as_mut_ptr() as u64,
+            arg4: 0,
+            arg5: 0,
+        };
+        if call(Syscall::IoPgetevents.raw(), args2) != Some(0) {
+            return Err("io_pgetevents should reap nothing from a drained queue");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_aio_pgetevents_reaps_completions);
+
+/// The sigset argument's rules, which are `set_user_sigmask`'s.
+///
+/// ```text
+/// if (!umask)                         return 0;
+/// if (sigsetsize != sizeof(sigset_t)) return -EINVAL;
+/// if (copy_from_user(...))            return -EFAULT;
+/// ```
+///
+/// The POINTER is tested before the SIZE, so a NULL sigmask with a nonsense
+/// sigsetsize is accepted — checking the size first, which is the obvious
+/// way to write it, would reject a call Linux allows. And the timeout is
+/// read before the sigset, so a bad timeout pointer wins over a bad sigset.
+fn smoke_abi_aio_pgetevents_sigset_rules() -> TestResult {
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    with_memfs("/paio2", "paio2", &[("f", b"")], || {
+        let ctx = io_setup(8)?;
+        let evbuf = [0u8; IO_EVENT_SIZE];
+        let mk = |timeout: u64, usig: u64| SyscallArgs {
+            arg0: ctx,
+            arg1: 0,
+            arg2: 1,
+            arg3: evbuf.as_ptr() as u64,
+            arg4: timeout,
+            arg5: usig,
+        };
+        // A NULL sigmask with a deliberately wrong sigsetsize: accepted,
+        // because `set_user_sigmask` returns before it looks at the size.
+        let null_mask = aio_sigset(0, 999);
+        if call(
+            Syscall::IoPgetevents.raw(),
+            mk(0, null_mask.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("a NULL sigmask must be accepted whatever the sigsetsize");
+        }
+        // A real sigmask with a wrong sigsetsize: -EINVAL.
+        let mask: u64 = 0;
+        let bad_size = aio_sigset(&mask as *const u64 as u64, 4);
+        if call(Syscall::IoPgetevents.raw(), mk(0, bad_size.as_ptr() as u64)) != Some(EINVAL) {
+            return Err("a sigsetsize that is not sizeof(sigset_t) must be -EINVAL");
+        }
+        // A real sigmask, right size, but unreadable: -EFAULT.
+        let bad_mask = aio_sigset(BAD_PTR, 8);
+        if call(Syscall::IoPgetevents.raw(), mk(0, bad_mask.as_ptr() as u64)) != Some(EFAULT) {
+            return Err("an unreadable sigmask must be -EFAULT");
+        }
+        // An unreadable __aio_sigset itself: -EFAULT.
+        if call(Syscall::IoPgetevents.raw(), mk(0, BAD_PTR)) != Some(EFAULT) {
+            return Err("an unreadable __aio_sigset must be -EFAULT");
+        }
+        // The timeout is read FIRST, so a bad timeout beats a bad sigset.
+        if call(Syscall::IoPgetevents.raw(), mk(BAD_PTR, BAD_PTR)) != Some(EFAULT) {
+            return Err("an unreadable timeout must be -EFAULT");
+        }
+        // A good sigmask round-trips and leaves the caller's mask alone —
+        // the mask is meant to apply for the duration of the call only.
+        // `Sigprocmask` returns the PREVIOUS mask, so BLOCK-with-an-empty-set
+        // reads it without changing it.
+        let before = call(Syscall::Sigprocmask.raw(), a1(0, 0));
+        let good = aio_sigset(&mask as *const u64 as u64, 8);
+        if call(Syscall::IoPgetevents.raw(), mk(0, good.as_ptr() as u64)) != Some(0) {
+            return Err("a well-formed sigset must be accepted");
+        }
+        let after = call(Syscall::Sigprocmask.raw(), a1(0, 0));
+        if before != after {
+            return Err("io_pgetevents left the caller under the temporary mask");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_aio_pgetevents_sigset_rules);

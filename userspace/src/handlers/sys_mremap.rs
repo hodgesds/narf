@@ -810,6 +810,13 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `mm/mremap.c`: `if (vma_is_sealed(vma)) return -EPERM;`. Moving,
+    // shrinking or expanding a sealed range all leave an address whose
+    // contents can be replaced, which is what sealing forbids.
+    if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, args.arg1) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let task = current_task_id();
     let authority = current_mlock_authority();
     let defaults = default_rlimits();

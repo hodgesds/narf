@@ -1968,6 +1968,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_statfs_ftype);
 // cmd = (subcmd << 8) | type. `if_dqblk` limits are in 1 KiB quota blocks;
 // tmpfs blocks are 4 KiB, so a 2-page limit round-trips as bhardlimit = 8.
 
+const Q_QUOTAON: u64 = 0x0080_0002;
 const Q_GETQUOTA: u64 = 0x0080_0007;
 const Q_SETQUOTA: u64 = 0x0080_0008;
 const Q_GETINFO: u64 = 0x0080_0005;
@@ -3802,3 +3803,160 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pathx_unshare_newuser_needs_single_thread
 );
+
+/// `quotactl_fd(2)` reaches the same quota state as `quotactl(2)`.
+///
+/// `fs/quota/quota.c` has both syscalls resolve a `struct super_block *`
+/// their own way — one from a device path, one from an open descriptor — and
+/// hand it to the same `do_quotactl`. The point of the fd form is a caller
+/// that already holds the mount: it avoids a second lookup, and it works
+/// where the device has no path the caller can name.
+///
+/// So the load-bearing assertion is not that the call succeeds but that the
+/// two forms see the SAME quota: set through one, read through the other.
+fn smoke_abi_quotactl_fd_shares_state_with_path_form() -> TestResult {
+    const QIF_BLIMITS: u32 = 1;
+    with_tmpfs("/qfd", "usrquota,size=1M", || {
+        let path = b"/qfd\0";
+        let uid = 7171u64;
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening the quota-enabled mount should succeed"),
+        };
+        // Set through the PATH form.
+        let mut dqblk = [0u8; 72];
+        dqblk[0..8].copy_from_slice(&16u64.to_le_bytes()); // bhardlimit
+        dqblk[8..16].copy_from_slice(&8u64.to_le_bytes()); // bsoftlimit
+        dqblk[64..68].copy_from_slice(&QIF_BLIMITS.to_le_bytes());
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_SETQUOTA, USRQUOTA),
+                path.as_ptr() as u64,
+                uid,
+                dqblk.as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_SETQUOTA through the path form should succeed");
+        }
+        // Read through the FD form.
+        let mut out = [0u8; 72];
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(
+                fd,
+                quota_cmd(Q_GETQUOTA, USRQUOTA),
+                uid,
+                out.as_mut_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_GETQUOTA through quotactl_fd should succeed");
+        }
+        let bhard = u64::from_le_bytes(out[0..8].try_into().unwrap());
+        let bsoft = u64::from_le_bytes(out[8..16].try_into().unwrap());
+        if bhard != 16 || bsoft != 8 {
+            return Err("quotactl_fd read a different quota than quotactl set");
+        }
+        // And the reverse direction, so the fd form is not read-only by
+        // accident: set through the fd, read through the path.
+        let mut dq2 = [0u8; 72];
+        dq2[0..8].copy_from_slice(&32u64.to_le_bytes());
+        dq2[64..68].copy_from_slice(&QIF_BLIMITS.to_le_bytes());
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(
+                fd,
+                quota_cmd(Q_SETQUOTA, USRQUOTA),
+                uid,
+                dq2.as_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_SETQUOTA through quotactl_fd should succeed");
+        }
+        let mut out2 = [0u8; 72];
+        if call(
+            Syscall::Quotactl.raw(),
+            a3(
+                quota_cmd(Q_GETQUOTA, USRQUOTA),
+                path.as_ptr() as u64,
+                uid,
+                out2.as_mut_ptr() as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("Q_GETQUOTA through the path form should succeed");
+        }
+        if u64::from_le_bytes(out2[0..8].try_into().unwrap()) != 32 {
+            return Err("a quota set through quotactl_fd was not visible to quotactl");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_quotactl_fd_shares_state_with_path_form
+);
+
+/// `quotactl_fd`'s own argument rules.
+///
+/// The descriptor is checked FIRST — `CLASS(fd_raw, f)(fd); if (fd_empty(f))
+/// return -EBADF;` — before the quota type, so a closed descriptor is -EBADF
+/// whatever else is wrong. And `Q_QUOTAON` is -EINVAL in this form: it names
+/// a quota FILE to switch on with, `quotactl_fd` has no path argument to
+/// name one, and Linux passes `ERR_PTR(-EINVAL)` where the path would go
+/// rather than turning quotas on against something unspecified.
+fn smoke_abi_quotactl_fd_argument_rules() -> TestResult {
+    with_tmpfs("/qfd2", "usrquota,size=1M", || {
+        let path = b"/qfd2\0";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("opening the mount should succeed"),
+        };
+        let mut out = [0u8; 72];
+        // Closed descriptor, with an otherwise valid command.
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(
+                9999,
+                quota_cmd(Q_GETQUOTA, USRQUOTA),
+                0,
+                out.as_mut_ptr() as u64,
+            ),
+        ) != Some(EBADF)
+        {
+            return Err("quotactl_fd on a closed descriptor must be -EBADF");
+        }
+        // Closed descriptor AND an unknown quota type: still -EBADF, because
+        // the descriptor is resolved before the type is looked at.
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(9999, quota_cmd(Q_GETQUOTA, 7), 0, 0),
+        ) != Some(EBADF)
+        {
+            return Err("quotactl_fd checked the quota type before the descriptor");
+        }
+        // Unknown quota type on a good descriptor.
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(fd, quota_cmd(Q_GETQUOTA, 7), 0, out.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("an unknown quota type must be -EINVAL");
+        }
+        // Q_QUOTAON has no path to name a quota file with here.
+        if call(
+            Syscall::QuotactlFd.raw(),
+            a3(fd, quota_cmd(Q_QUOTAON, USRQUOTA), 0, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("Q_QUOTAON through quotactl_fd must be -EINVAL");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_quotactl_fd_argument_rules);
