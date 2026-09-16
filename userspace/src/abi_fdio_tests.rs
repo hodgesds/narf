@@ -420,7 +420,8 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_dup2_pos);
 fn smoke_abi_fdio_dup2_neg() -> TestResult {
     with_setup(|| {
         // dup2 from a bad oldfd → InvalidOp.
-        // LINUX-GAP: Linux returns -EBADF.
+        // `dup2` resolves oldfd first, so a closed one is -EBADF whatever
+        // newfd is.
         match call_dup2(8888, 50) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
@@ -556,7 +557,7 @@ fn smoke_abi_fdio_lseek_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
         let fd = open_fd(b"/abi/f\0")?;
         // An unknown whence → InvalidOp.
-        // LINUX-GAP: Linux lseek(2) with a bad whence returns -EINVAL.
+        // `must_set_pos` has no arm for an unknown whence: -EINVAL.
         match call(Syscall::Lseek.raw(), a2(fd as u64, 0, 99)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("expected -EINVAL"),
@@ -684,7 +685,7 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fsync_pos);
 fn smoke_abi_fdio_fsync_neg() -> TestResult {
     with_setup(|| {
         // bad fd → -1 sentinel.
-        // LINUX-GAP: Linux fsync(2) returns -EBADF.
+        // `fsync` resolves the fd first, so a closed one is -EBADF.
         match call(Syscall::Fsync.raw(), a0(4040)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
@@ -706,7 +707,7 @@ kernel_test_in!("syscall_abi", smoke_abi_fdio_fdatasync_pos);
 
 fn smoke_abi_fdio_fdatasync_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux fdatasync(2) returns -EBADF.
+        // Same `fdget` as `fsync`: a closed descriptor is -EBADF.
         match call(Syscall::Fdatasync.raw(), a0(4041)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),

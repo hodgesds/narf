@@ -609,9 +609,10 @@ pub fn posix_acl_create(
 /// the caller is in the file's group or holds `CAP_FSETID` over it. When
 /// false the setgid bit is dropped, exactly as `chmod` would.
 ///
-/// LINUX-GAP: [`Accessor`] carries `CAP_DAC_OVERRIDE` and
-/// `CAP_DAC_READ_SEARCH` but not `CAP_FSETID`, so callers inside
-/// `filesystem/` cannot compute that predicate and must pass it in.
+/// Not a divergence — a plumbing note. [`Accessor`] carries
+/// `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH` but not `CAP_FSETID`, so
+/// callers inside `filesystem/` cannot compute that predicate themselves
+/// and pass it in. The behaviour that results is Linux's.
 pub fn posix_acl_update_mode(
     inode_mode: u16,
     acl: PosixAcl,

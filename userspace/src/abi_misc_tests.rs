@@ -196,7 +196,7 @@ fn smoke_abi_misc_pread64_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 4];
         // Bad fd 99, len > 0 → -1 sentinel.
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
+        // `pread64` resolves the fd through `fdget` first: -EBADF.
         let args = a3(99, buf.as_mut_ptr() as u64, buf.len() as u64, 0);
         match call(Syscall::Pread64.raw(), args) {
             Some(v) if v == EBADF => Ok(()),
@@ -224,7 +224,7 @@ fn smoke_abi_misc_pwrite64_neg() -> TestResult {
     with_setup(|| {
         let payload = b"ZZ";
         // Bad fd → -1 sentinel.
-        // LINUX-GAP: Linux returns -EBADF (-9); NARF returns -1.
+        // Same `fdget` as `pread64`: -EBADF.
         let args = a3(99, payload.as_ptr() as u64, payload.len() as u64, 0);
         match call(Syscall::Pwrite64.raw(), args) {
             Some(v) if v == EBADF => Ok(()),

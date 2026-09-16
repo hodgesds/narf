@@ -74,9 +74,9 @@ fn smoke_abi_mem_brk_shrink_neg() -> TestResult {
         // A shrink to a tiny break never errors in NARF brk(2): it records
         // the value and returns it (or 0 when the table is uninitialised).
         // Either way the status is Ok — brk has no -errno return shape.
-        // LINUX-GAP: Linux brk never fails the *value* either, but with a
-        // live heap it would clamp/return the resulting break; here with no
-        // AS the value is the requested break or 0.
+        // NOT a divergence in the errno: Linux's brk never fails the value
+        // either. What differs is the harness, which has no live heap to
+        // clamp against, so the value is the requested break or 0.
         let r = call_raw(Syscall::Brk.raw(), a0(0x1000));
         if r.status != SyscallReturn::OK {
             return Err("brk shrink should report NARF Ok");
@@ -659,8 +659,8 @@ fn smoke_abi_mem_get_mempolicy_default_query_neg() -> TestResult {
     with_setup(|| {
         // No flags, null mode/nodemask ptrs → reports the default policy,
         // returns 0 (no fault, no error arm reachable from the harness).
-        // LINUX-GAP: Linux can return -EFAULT/-EINVAL for bad ptrs/flags;
-        // those need a faulting user pointer we can't synthesise here.
+        // A coverage limit, not a divergence: Linux's -EFAULT/-EINVAL arms
+        // need a faulting user pointer this harness cannot synthesise.
         match call(Syscall::GetMempolicy.raw(), a0(0)) {
             Some(0) => Ok(()),
             Some(_) => Err("get_mempolicy default query should return 0"),

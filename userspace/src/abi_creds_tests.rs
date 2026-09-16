@@ -491,9 +491,9 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setfsuid_pos);
 
 fn smoke_abi_creds_setfsuid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: setfsuid never reports failure in Linux either — an
-        // unprivileged change just silently no-ops and still returns the
-        // old fsuid. So even an "arbitrary" target yields Ok(old) >= 0,
+        // NOT a divergence: `setfsuid` never reports failure in Linux
+        // either — an unprivileged change silently no-ops and still returns
+        // the old fsuid. So even an "arbitrary" target yields Ok(old) >= 0,
         // never an errno. This pins that no-error contract.
         let r = call(Syscall::Setfsuid.raw(), a0(4242)).ok_or("setfsuid not Ok")?;
         if r < 0 {
@@ -518,7 +518,8 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setfsgid_pos);
 
 fn smoke_abi_creds_setfsgid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: no error path; returns Ok(old fsgid) >= 0 always.
+        // NOT a divergence: `setfsgid` has no error path in Linux either —
+        // it returns Ok(old fsgid) >= 0 always.
         let r = call(Syscall::Setfsgid.raw(), a0(4242)).ok_or("setfsgid not Ok")?;
         if r < 0 {
             return Err("setfsgid(arbitrary) returned an errno");
