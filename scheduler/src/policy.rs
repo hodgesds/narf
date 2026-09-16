@@ -153,7 +153,7 @@ impl TaskMeta {
             budget: slot.spec.budget,
             account: slot.account,
             budget_state: slot.account.view(now, &slot.spec.budget),
-            runnable: slot.awake.flag.load(Ordering::Acquire),
+            runnable: slot.awake.executor_runnable(),
             affinity: slot.spec.affinity,
             addr_space: slot.addr_space.is_some(),
             vruntime: slot.vruntime,
@@ -364,7 +364,7 @@ impl<'a> RunQueue<'a> {
             class: slot.spec.class,
             priority: slot.spec.priority,
             eligibility: slot.account.view(now, &slot.spec.budget).eligibility,
-            runnable: slot.awake.flag.load(Ordering::Acquire),
+            runnable: slot.awake.executor_runnable(),
             addr_space: slot.addr_space.is_some(),
             vruntime: slot.vruntime,
         })
@@ -901,6 +901,19 @@ pub(crate) fn with_scheduler<R>(cpu: CpuId, f: impl FnOnce(Option<&dyn Scheduler
         .map(|entry| entry.instance.policy.as_ref()))
 }
 
+/// Direct task-to-task transfer is deliberately limited to the built-in
+/// policies whose ordering the core can validate without invoking a callback.
+/// External policies must observe every dispatch and therefore always return
+/// through the executor.
+pub(crate) fn direct_handoff_allowed(cpu: CpuId) -> bool {
+    with_scheduler(cpu, |scheduler| {
+        scheduler.is_none_or(|scheduler| {
+            scheduler.type_id() == TypeId::of::<ClassScheduler>()
+                || scheduler.type_id() == TypeId::of::<FifoScheduler>()
+        })
+    })
+}
+
 /// Non-blocking `with_scheduler`: run `f` against `cpu`'s policy slot only if
 /// the slot lock is uncontended, otherwise return `None` without spinning.
 ///
@@ -971,7 +984,7 @@ pub(crate) fn pick_next_slot(
         let urgent_pos = q.iter().rposition(|slot| {
             slot.id.raw() == urgent_id
                 && slot.spec.budget.period.is_none()
-                && slot.awake.flag.load(core::sync::atomic::Ordering::Acquire)
+                && slot.awake.executor_runnable()
         });
         let higher_class_awake = urgent_pos.is_some_and(|pos| {
             builtin_class
@@ -1051,7 +1064,7 @@ pub(crate) fn pick_next_slot(
     // has already made its slot awake and is counted by the scan below.
     crate::publish_runnable_peer(cpu.0 as usize, false);
     for (index, slot) in q.iter().enumerate() {
-        let awake = slot.awake.flag.load(core::sync::atomic::Ordering::Acquire);
+        let awake = slot.awake.executor_runnable();
         let tier = dispatch_tier(slot, awake);
         if tier != 0 {
             dispatchable_count += 1;

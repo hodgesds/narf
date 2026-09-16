@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "dedcf75a9d3e95cb4588f2e0d70b5a2a44f39a42e888346d68dfc31f323cf606"
+prompt_hash = "670b3a0ee69f4f0c60cd759cca1b5f2a373551335f76a807639914857a7a3296"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -967,3 +967,19 @@ argument = "The pre-scan shortcut detaches only an exact awake task whose Resour
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L62"
 argument = "The split urgent and generic next-buddy values remain scheduler-owned per-CPU scalar task identifiers with the same Release publication and AcqRel one-shot consumption. Admission and migration also OR the task's class into a scheduler-owned per-CPU bitmask before the slot becomes visible on that CPU. The mask is monotone outside hermetic test resets, so a missing higher-class bit is impossible once such a task can be selected; stale bits only force the validated slow path. A successful shortcut never clears the runnable-peer hint and raises it when queue entries remain, so a concurrent wake cannot be hidden. No task memory, capability object, saved protection state, address-space root, stack, or future body is exposed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The synchronous-wake direct handoff remains entirely inside the existing scheduler executor TCB. It consumes only a scheduler-owned exact-wake publication, run-queue state, and private stackful continuation. It adds no trusted subsystem, user-visible entry point, capability kind, mapping authority, DomainId, or externally selectable context-switch path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A direct target is claimed under its owning run-queue lock while its resident slot pins the KernelTask and supplies a cloned address-space owner; a per-CPU owner pins the off-queue root address space for exactly the handoff interval. Ordinary dispatch and stealing reject the claim until the root executor is executing again. Before the target's first instruction, the scheduler activates and strongly owns its hardware address-space root, publishes its task identity, retargets the kernel stack where required, restores TLS and the reported domain byte, enters through KernelContext so PKRS or SCTLR/GCR state is restored, and restores or arms only that task's FP/SIMD image. Every voluntary or timer-preempted handoff saves live FP/SIMD before clearing the current-task publication, and completion cannot expose the dead continuation. The return restores the root address-space owner, identity, domain attribution, and PMU attribution before switching to the root executor."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L62"
+argument = "The added per-CPU urgent WakeCell owner, root/target continuation pointers, active bit, and foreign-cycle counter are scheduler-owned execution metadata covered by the documented per-CPU scheduling-state exception. Raw pointers are backed by an explicit Arc or by an in-flight off-queue root whose executor frame pins it; the target back-pointer is cleared before RCU retirement. The metadata is never exposed to a task, policy, driver, or userspace and grants no capability, memory, domain, or mapping authority."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The fast path is bounded to one local stackful target: the target returns to the source's root executor continuation rather than the source stack, so task-stack chains cannot form. Only built-in Class/FIFO policy, default class, normal priority, unthrottled and uncapped tasks without donation are eligible. Remote, contended, first-run, mixed execution-kind, periodic, capped, donated, completed, or external-policy cases fall back to the ordinary exact-buddy and full core-validation path. Target runtime is charged to the target's virtual runtime and subtracted from the source poll charge; affinity, policy observability, budget eligibility, address-space ownership, FPU ownership, domain restoration, and task lifetime cannot be bypassed."

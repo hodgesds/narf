@@ -15,8 +15,9 @@ The executor is deliberately factored so that **mechanism** lives in the core
 - **Core owns** (a policy cannot and must not reimplement these): the per-CPU
   ready `VecDeque<TaskSlot>`, admission/park/wake transitions, work-stealing and
   migration, CPU hot-plug, time-slice/tick preemption at CPL3, budget throttling
-  and eligibility tiers, and the run-time *accounting* every policy needs (a
-  task's accumulated virtual runtime — see §4). Accounting is core-owned because
+  and eligibility tiers, the bounded one-hop synchronous-wake transfer, and the
+  run-time *accounting* every policy needs (a task's accumulated virtual runtime
+  — see §4). Accounting is core-owned because
   it is charged on the hottest path (once per dispatch) and every policy reads
   the same numbers; duplicating it per policy would add a virtual call to that
   path for no benefit.
@@ -60,6 +61,14 @@ class bitmask is a conservative guard only: admission and migration publish a
 class before its slot becomes visible, and bits remain sticky so a race cannot
 create a false negative. A stale higher-class bit only forces the validated
 path.
+
+Before returning through the executor, the core may directly enter that exact
+wakee only for the built-in class/FIFO policies and a local default-class,
+normal-priority stackful task with no period, budget cap, or donation. The core
+claims the resident slot under its home run-queue lock and charges the target's
+runtime back to its own virtual runtime. External and wrapper policies are
+never bypassed: their wakees return through `pick_next` so policy observation
+and ordering remain complete.
 
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative

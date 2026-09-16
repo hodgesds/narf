@@ -60,6 +60,19 @@ On a scheduler-timer trap:
 
 The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 
+An exact synchronous wake followed by an own-stack source park may take a
+bounded direct path instead of first resuming the executor. The core claims the
+awake target while its slot remains resident in the local ready queue, saves the
+source FP/SIMD and task-domain state, publishes and activates the target's task
+identity/address space, restores its kernel-stack target, TLS, saved domain
+state, and FP/SIMD ownership, then switches to the target continuation. The
+target's executor pointer is the source's root executor continuation, not the
+source stack. A target yield, completion, or tick preemption therefore restores
+the root identity/address space and switches to the executor in one hop. The
+claim is released only after the executor is executing again; the target's
+runtime is charged to its own virtual runtime and removed from the source's
+poll charge.
+
 ## 4. Tick decision
 
 The timer hook evaluates two independent boundaries:
@@ -142,6 +155,11 @@ rolling generation-ordered cutover.
   before migration and permits deferred restore only while the task-owned
   memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
+- Direct handoff is one hop: the claimed target is skipped by executor dispatch
+  and stealing, returns only to the root executor continuation, and restores
+  address-space ownership, TLS, domain state, and FP/SIMD ownership before its
+  first instruction. A decline leaves the exact wakee on the ordinary validated
+  selection path.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
 - Realtime class metadata is demoted on generic spawn paths. Only
@@ -169,8 +187,8 @@ code receives none of this state.
   `preempt_disable()` guard before changing their conservative opt-out.
 - Wire the public NMI accounting guard into each architecture's NMI/FIQ entry;
   hard-IRQ entry/exit is live on both architectures.
-- Reconcile direct time-slice donation with periodic runtime transfer. Current
-  period eligibility remains authoritative and donation cannot bypass it.
+- Period eligibility remains authoritative: periodic-budget and donated tasks
+  are excluded from the direct-handoff path, and donation cannot bypass it.
 - Add a real MTE-tag-aware allocator on aarch64; switch/vector mechanics
   preserve SCTLR/GCR today, while enforcement remains structural.
 
