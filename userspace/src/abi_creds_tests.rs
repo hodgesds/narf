@@ -139,6 +139,54 @@ fn smoke_abi_creds_getegid_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_getegid_neg);
 
+/// `current_ucred()` is on the SysV IPC and Unix-socket hot paths. Real user
+/// tasks resolve it through the scheduler-published `Task`; the ABI harness
+/// runs outside a user-task stack context, so validate the mirror consumed by
+/// that path directly. The scheduler separately pins that the opaque context
+/// follows the current task across switches. Credential changes must update
+/// the packed mirror atomically, and fork must seed a child before it can run.
+fn smoke_abi_creds_current_ucred_task_cache() -> TestResult {
+    with_setup(|| {
+        const UID: u64 = 1200;
+        const GID: u64 = 1300;
+        const CHILD_TID: u64 = 0xC4ED_0001;
+        const CHILD_PID: u64 = 0xC4ED_1001;
+
+        // Change the gid first: the subsequent uid drop clears the set-id
+        // capabilities, exactly as it does for a real process.
+        if call(Syscall::Setresgid.raw(), a2(GID, GID, GID)) != Some(0) {
+            return Err("setresgid did not seed the task credential cache");
+        }
+        if call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0) {
+            return Err("setresuid did not seed the task credential cache");
+        }
+
+        let parent = crate::task::__test_cached_identity(FAKE_TASK)
+            .ok_or("missing harness Task credential mirror")?;
+        if parent != (FAKE_TASK, UID as u32, GID as u32) {
+            return Err("credential writes did not update the task-local mirror");
+        }
+
+        crate::task::release_task(CHILD_TID);
+        let _child = crate::task::Task::new_registered(CHILD_TID, CHILD_PID);
+        crate::handlers::uidgid_fork(FAKE_TASK, CHILD_TID);
+        let child = crate::task::__test_cached_identity(CHILD_TID)
+            .ok_or("missing child Task credential mirror")?;
+        crate::task::release_task(CHILD_TID);
+        if child.0 != CHILD_PID {
+            return Err("forked child's task-local mirror returned the wrong pid");
+        }
+        if child.1 != UID as u32 {
+            return Err("fork did not seed the child's task-local effective uid");
+        }
+        if child.2 != GID as u32 {
+            return Err("fork did not seed the child's task-local effective gid");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_current_ucred_task_cache);
+
 /// Drop to an unprivileged uid so the `ns_capable_setid()` arms of the
 /// set*id family are actually reachable.
 ///

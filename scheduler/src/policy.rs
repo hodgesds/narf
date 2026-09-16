@@ -952,6 +952,45 @@ pub(crate) fn pick_next_slot(
     // External policies remain untrusted and still run their pick followed by
     // the core pass that enforces work conservation and budget eligibility.
     let builtin_class = scheduler.is_some_and(|s| s.type_id() == TypeId::of::<ClassScheduler>());
+    let builtin_fifo = scheduler.is_some_and(|s| s.type_id() == TypeId::of::<FifoScheduler>());
+    let urgent_id = crate::take_urgent_next(cpu.0);
+
+    // A successful synchronous handoff is already the core's first choice at
+    // the highest dispatch tier. Default tasks have no periodic budget, so an
+    // awake exact-id match can be proven top-tier without walking every parked
+    // slot first. Search from the back because a waiter that just parked was
+    // requeued there. ClassScheduler also checks the conservative per-CPU
+    // possible-class summary, so a higher class forces the full scan. Leave
+    // RUNNABLE_PEER conservative: a later full scan can refine its stale true
+    // without risking a false store racing another wake.
+    //
+    // External schedulers still receive their normal pick callback and use the
+    // mandatory validation scan below. Periodic-budget tasks also stay on that
+    // path so strict throttle/borrow eligibility remains authoritative.
+    if urgent_id != 0 && (builtin_class || builtin_fifo || scheduler.is_none()) {
+        let urgent_pos = q.iter().rposition(|slot| {
+            slot.id.raw() == urgent_id
+                && slot.spec.budget.period.is_none()
+                && slot.awake.flag.load(core::sync::atomic::Ordering::Acquire)
+        });
+        let higher_class_awake = urgent_pos.is_some_and(|pos| {
+            builtin_class
+                && crate::has_higher_possible_class(cpu.0 as usize, q[pos].spec.class.rank())
+        });
+        if let Some(pos) = urgent_pos.filter(|_| !higher_class_awake) {
+            let slot = q
+                .remove(pos)
+                .expect("urgent next-buddy position disappeared under queue lock");
+            if !q.is_empty() {
+                // Never clear this hint on the shortcut: another wake can race
+                // this pick, and even parked leftovers make a stale true safer
+                // than a false negative. The next full scan refines it.
+                crate::publish_runnable_peer(cpu.0 as usize, true);
+            }
+            return Some((TaskHandle::from_id(slot.id), slot));
+        }
+    }
+
     let requested = if builtin_class {
         None
     } else {
@@ -967,8 +1006,8 @@ pub(crate) fn pick_next_slot(
     // Keep the executor work-conserving without allowing policy to bypass a
     // strict throttle or run idle-borrow work ahead of regular eligibility.
     let mut now = None;
-    let mut dispatch_tier = |slot: &crate::TaskSlot| {
-        if !slot.awake.flag.load(core::sync::atomic::Ordering::Acquire) {
+    let mut dispatch_tier = |slot: &crate::TaskSlot, awake: bool| {
+        if !awake {
             return 0u8;
         }
         let eligibility = match slot.spec.budget.period {
@@ -996,7 +1035,11 @@ pub(crate) fn pick_next_slot(
     // Wake-next ("next buddy"): the id of the most recently woken task on this
     // CPU, read-and-cleared here so the boost is one-shot (Linux clears
     // `cfs_rq->next` on pick). 0 when the feature is off or nothing is queued.
-    let wake_next_id = crate::take_wake_next(cpu.0);
+    let wake_next_id = if urgent_id != 0 {
+        urgent_id
+    } else {
+        crate::take_wake_next(cpu.0)
+    };
     let mut best_tier = 0u8;
     let mut best_pos: Option<usize> = None;
     let mut requested_hit: Option<(usize, u8)> = None;
@@ -1008,7 +1051,8 @@ pub(crate) fn pick_next_slot(
     // has already made its slot awake and is counted by the scan below.
     crate::publish_runnable_peer(cpu.0 as usize, false);
     for (index, slot) in q.iter().enumerate() {
-        let tier = dispatch_tier(slot);
+        let awake = slot.awake.flag.load(core::sync::atomic::Ordering::Acquire);
+        let tier = dispatch_tier(slot, awake);
         if tier != 0 {
             dispatchable_count += 1;
         }
@@ -1089,8 +1133,14 @@ pub(crate) fn pick_next_slot(
     //      above so it is a single boost),
     //   2. the policy's requested pick,
     //   3. the earliest top-tier slot (the default FIFO order).
+    let wake_next_class_ok = |wake_pos: usize| {
+        !builtin_class
+            || class_pick.is_some_and(|(_, _, class, _, _)| q[wake_pos].spec.class == class)
+    };
     let pos = match wake_next_hit {
-        Some((wake_pos, wake_tier)) if wake_tier == best_tier => wake_pos,
+        Some((wake_pos, wake_tier)) if wake_tier == best_tier && wake_next_class_ok(wake_pos) => {
+            wake_pos
+        }
         _ => match requested_hit {
             Some((requested_pos, requested_tier)) if requested_tier == best_tier => requested_pos,
             _ => best_pos.expect("best_tier > 0 guarantees a top-tier position"),

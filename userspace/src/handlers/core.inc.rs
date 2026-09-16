@@ -11959,6 +11959,7 @@ pub fn uidgid_init() {
         *shard.uidgid.lock() = Some(BTreeMap::new());
         *shard.groups.lock() = Some(BTreeMap::new());
     }
+    crate::task::reset_effective_ids();
 }
 
 /// Reset the registry — test hook.
@@ -12026,23 +12027,31 @@ pub fn pty_open_fs_ids() -> (u32, u32) {
 /// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
-    let ids = read_uidgid(task);
+    let cached = crate::task::current_cached_identity(task);
+    let (pid, euid, egid) = cached.unwrap_or_else(|| {
+        let ids = read_uidgid(task);
+        (
+            task_to_pid_raw(task).unwrap_or(task),
+            ids.euid,
+            ids.egid,
+        )
+    });
     #[cfg(feature = "container")]
     let (uid, gid) = {
         let ns = crate::namespaces::current_user_ns(task);
         if ns.is_initial() {
-            (ids.euid, ids.egid)
+            (euid, egid)
         } else {
             (
-                ns.translate_uid_to_host(ids.euid),
-                ns.translate_gid_to_host(ids.egid),
+                ns.translate_uid_to_host(euid),
+                ns.translate_gid_to_host(egid),
             )
         }
     };
     #[cfg(not(feature = "container"))]
-    let (uid, gid) = (ids.euid, ids.egid);
+    let (uid, gid) = (euid, egid);
     crate::socket::Ucred {
-        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
+        pid: pid as u32,
         uid,
         gid,
     }
@@ -12516,12 +12525,17 @@ pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
-    let mut g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
+    let effective = {
+        let mut g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
+        let Some(m) = g.as_mut() else {
+            return false;
+        };
+        let entry = m.entry(task).or_default();
+        f(entry);
+        (entry.euid, entry.egid)
     };
-    let entry = m.entry(task).or_default();
-    f(entry);
+    // Do not nest the task registry lock under the credential shard lock.
+    crate::task::cache_effective_ids(task, effective.0, effective.1);
     true
 }
 

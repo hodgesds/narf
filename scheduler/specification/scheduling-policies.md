@@ -50,6 +50,16 @@ falls back to the first candidate in that tier (`pick_next_slot`,
 and need not re-check throttling itself beyond the `TaskMeta.budget_state`
 eligibility it is handed. Keep it a single O(n) scan over `queue.iter_meta()`;
 allocation, locking, or re-entering the scheduler from here is forbidden.
+The built-in class/FIFO path may select an exact, awake synchronous-handoff
+buddy before this scan only when the task has no periodic budget. Such a task
+is necessarily in the highest core eligibility tier; periodic-budget tasks and
+external policies still take the ordinary validated path. `ClassScheduler`
+also falls back when a higher-class task is awake, and the ordinary path applies
+the buddy only within the class selected by strict class ordering. A per-CPU
+class bitmask is a conservative guard only: admission and migration publish a
+class before its slot becomes visible, and bits remain sticky so a race cannot
+create a false negative. A stale higher-class bit only forces the validated
+path.
 
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative

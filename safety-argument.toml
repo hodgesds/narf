@@ -955,3 +955,15 @@ argument = "Cache-line isolation changes only the storage stride of scheduler-ow
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The x86_64 guarded-copy probe still publishes and clears the same per-CPU recovery descriptor with the same fences and fault-handler ownership checks. Giving each descriptor a full cache-line stride removes inter-CPU false sharing only; it does not widen a user range, bypass SMAP, alter a recovery RIP, or permit one CPU to consume another CPU's probe state."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The urgent-handoff selection change remains inside the existing scheduler executor TCB and consumes only the established task-id and awake-state hint under the owning run-queue lock. It adds no trusted subsystem, capability, mapping authority, domain transition, user pointer, or externally callable task-selection path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The pre-scan shortcut detaches only an exact awake task whose ResourceBudget has no period, which is therefore in the core's highest budget-eligibility tier. A miss, every periodic-budget task, and any awake higher-class task under ClassScheduler fall through to the full eligibility scan; the validated path honors a buddy only within the strict winning class, matching Linux's class-before-CFS-buddy order. Every external policy still receives its callback before core validation. Affinity, live-capability, address-space, saved-domain, and task-lifetime checks remain in the unchanged executor path before poll, and dedicated tests prove strict throttling, strict class order, and policy observability are not bypassed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L62"
+argument = "The split urgent and generic next-buddy values remain scheduler-owned per-CPU scalar task identifiers with the same Release publication and AcqRel one-shot consumption. Admission and migration also OR the task's class into a scheduler-owned per-CPU bitmask before the slot becomes visible on that CPU. The mask is monotone outside hermetic test resets, so a missing higher-class bit is impossible once such a task can be selected; stale bits only force the validated slow path. A successful shortcut never clears the runnable-peer hint and raises it when queue entries remain, so a concurrent wake cannot be hidden. No task memory, capability object, saved protection state, address-space root, stack, or future body is exposed."

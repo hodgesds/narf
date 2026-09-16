@@ -284,7 +284,18 @@ hook (`FifoScheduler`, `PriorityScheduler`, `ClassScheduler`, and
 callback and its `TaskMeta` snapshot. Any external/wrapper policy remains
 observable by default. `ClassScheduler` selection may be fused into the core's
 mandatory eligibility scan, but produces the same class/priority/deadline/FIFO
-ordering and remains subordinate to core budget validation.
+ordering and remains subordinate to core budget validation. The sole pre-scan
+selection is an exact synchronous-handoff hint for an awake task with no
+periodic budget: that state proves the highest eligibility tier without budget
+accounting, and wake-next already precedes class ordering within that tier.
+External policies and periodic-budget tasks always retain the full callback and
+validation scan. Under `ClassScheduler`, a monotone per-CPU mask of classes
+admitted or migrated there conservatively forces the full scan once a higher
+class could be present; a buddy is honored only within the winning class, as
+Linux applies CFS buddies only after core class selection. Stale class bits can
+only disable the shortcut. The fast path leaves the runnable-peer hint
+conservatively set until a later full scan, so it cannot erase a concurrent
+wake.
 
 Policy replacement is a first-class rolling operation ordered by an atomic
 generation ticket. `on_install` runs once before publication;

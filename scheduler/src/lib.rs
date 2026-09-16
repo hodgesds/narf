@@ -542,10 +542,13 @@ fn record_wake_next(cpu: u32, task: u64) {
     }
 }
 
-/// Read-and-clear `cpu`'s next-buddy hint (0 = none). `pick_next_slot` calls
-/// this once per pick; clearing on read makes the boost a one-shot so a buddy
-/// that turns out not to be top-tier does not stick.
-pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+/// Read-and-clear `cpu`'s urgent synchronous-handoff hint (0 = none).
+///
+/// Keep this separate from the opt-in generic wake-next slot: the built-in
+/// policies can validate and select this narrow hint before their mandatory
+/// full queue scan, while an external policy still consumes it through the
+/// ordinary core validation pass.
+pub(crate) fn take_urgent_next(cpu: u32) -> u64 {
     if (cpu as usize) >= WAKE_NEXT.len() {
         return 0;
     }
@@ -555,6 +558,16 @@ pub(crate) fn take_wake_next(cpu: u32) -> u64 {
     let urgent = URGENT_WAKE_NEXT[cpu as usize].0.load(Ordering::Acquire);
     if urgent != 0 {
         return URGENT_WAKE_NEXT[cpu as usize].0.swap(0, Ordering::AcqRel);
+    }
+    0
+}
+
+/// Read-and-clear `cpu`'s opt-in generic next-buddy hint (0 = none).
+/// `pick_next_slot` calls this once per pick; clearing on read makes the boost
+/// a one-shot so a buddy that turns out not to be top-tier does not stick.
+pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+    if (cpu as usize) >= WAKE_NEXT.len() {
+        return 0;
     }
     // Honored when EITHER the generic every-wake path or the narrow I/O-owner
     // path is enabled; both feed the same single-slot hint.
@@ -862,22 +875,56 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
     }
 }; narf_lib::percpu::MAX_CPUS];
 
-/// O(1) hint that the currently-dispatched task has a runnable peer on this
-/// CPU. The core refreshes it from the authoritative dispatch scan; wake and
-/// enqueue paths may only change it false->true. A stale true costs one
-/// harmless executor round, while a wake can never be hidden behind a stale
-/// false as long as every false->true runnable transition calls
-/// `note_runnable_peer`.
+/// O(1) hints for peer presence and strict-class shortcut safety. The core
+/// refreshes `peer` from the authoritative dispatch scan; wake and enqueue
+/// paths may only change it false->true. A stale true costs one harmless
+/// executor round, while a wake cannot be hidden behind a stale false as long
+/// as every false->true runnable transition calls `note_runnable_peer`.
+/// `class_mask` is deliberately monotone; see [`publish_possible_class`].
 #[repr(align(64))]
-struct PerCpuRunnablePeer(AtomicBool);
-static RUNNABLE_PEER: [PerCpuRunnablePeer; narf_lib::percpu::MAX_CPUS] =
-    [const { PerCpuRunnablePeer(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
+struct PerCpuRunnableState {
+    peer: AtomicBool,
+    class_mask: core::sync::atomic::AtomicU8,
+}
+static RUNNABLE_STATE: [PerCpuRunnableState; narf_lib::percpu::MAX_CPUS] = [const {
+    PerCpuRunnableState {
+        peer: AtomicBool::new(false),
+        class_mask: core::sync::atomic::AtomicU8::new(0),
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
 
 #[inline]
 pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
-    if cpu < RUNNABLE_PEER.len() {
-        RUNNABLE_PEER[cpu].0.store(present, Ordering::Release);
+    if cpu < RUNNABLE_STATE.len() {
+        RUNNABLE_STATE[cpu].peer.store(present, Ordering::Release);
     }
+}
+
+/// Record a class that can appear on this CPU. The mask is monotone outside
+/// hermetic test resets: stale high bits only disable the shortcut, while a
+/// missing high bit could violate strict class ordering. Admission/migration
+/// publishes before the slot becomes visible on the destination queue.
+#[inline]
+fn publish_possible_class(cpu: usize, rank: u8) {
+    if cpu < RUNNABLE_STATE.len() {
+        let bit = 1u8 << rank;
+        if RUNNABLE_STATE[cpu].class_mask.load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        RUNNABLE_STATE[cpu]
+            .class_mask
+            .fetch_or(bit, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn has_higher_possible_class(cpu: usize, rank: u8) -> bool {
+    if cpu >= RUNNABLE_STATE.len() {
+        return true;
+    }
+    let higher = u8::MAX << rank.saturating_add(1);
+    RUNNABLE_STATE[cpu].class_mask.load(Ordering::Acquire) & higher != 0
 }
 
 /// A task became runnable on `home`. Do not count a wake of the task already
@@ -885,11 +932,11 @@ pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
 #[inline]
 fn note_runnable_peer(home: u32, task: u64) {
     let cpu = home as usize;
-    if cpu >= RUNNABLE_PEER.len() {
+    if task == 0 || cpu >= RUNNABLE_STATE.len() {
         return;
     }
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != task {
-        RUNNABLE_PEER[cpu].0.store(true, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(true, Ordering::Release);
     }
 }
 
@@ -1708,7 +1755,8 @@ pub fn init() {
     }
     for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
-        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
     }
     // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
@@ -1738,7 +1786,8 @@ pub fn __reset_queues_for_test() {
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
-        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
     }
     // Clear any tasks left staged on the per-CPU wake inboxes so they don't
     // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
@@ -2306,6 +2355,16 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     // Record the slot's home CPU so a cross-core waker knows where to
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
+    let previous_home = slot.awake.cpu.load(Ordering::Relaxed) as usize;
+    if matches!(
+        reason,
+        policy::TaskEnqueueReason::Admitted | policy::TaskEnqueueReason::Migrated
+    ) || previous_home != cpu
+    {
+        // Publish before the slot becomes visible on this CPU. The monotone
+        // mask is only a strict-class fast-path guard, never dispatch authority.
+        publish_possible_class(cpu, slot.spec.class.rank());
+    }
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
     let awake = slot.awake.flag.load(Ordering::Acquire);
     if awake {
@@ -3628,7 +3687,9 @@ pub fn poll_one_round() -> usize {
                         notify_slot_reaped(slot.id);
                         continue;
                     }
-                    ChargeOutcome::Demote => slot.spec.class = SchedClass::Idle,
+                    ChargeOutcome::Demote => {
+                        slot.spec.class = SchedClass::Idle;
+                    }
                     ChargeOutcome::Throttle => {
                         slot.awake.flag.store(false, Ordering::Release);
                     }
@@ -4625,7 +4686,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
     debug_assert!(cpu < CURRENT_SCHED.len(), "CPU id out of scheduler range");
     let cpu = if cpu < CURRENT_SCHED.len() { cpu } else { 0 };
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
-        && RUNNABLE_PEER[cpu].0.load(Ordering::Acquire)
+        && RUNNABLE_STATE[cpu].peer.load(Ordering::Acquire)
     {
         return true;
     }

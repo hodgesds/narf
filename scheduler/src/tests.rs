@@ -3189,6 +3189,196 @@ fn smoke_scheduler_wake_next_buddy_runs_first() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_wake_next_buddy_runs_first);
 
+// A provider that dequeues one exact waiter publishes an always-live urgent
+// next-buddy, independent of the opt-in generic wake-next feature. The default
+// class policy must dispatch that exact awake, unbudgeted waiter first.
+fn smoke_scheduler_urgent_next_buddy_runs_first() -> TestResult {
+    use crate::{install_scheduler, spawn, ClassScheduler, SchedPolicy, TaskId};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    static ORDER: [AtomicUsize; 3] = [
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+        AtomicUsize::new(0),
+    ];
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    crate::__reset_queues_for_test();
+    crate::disable_wake_next();
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(ClassScheduler) failed");
+    }
+    NEXT.store(0, Ordering::Relaxed);
+    for slot in &ORDER {
+        slot.store(0, Ordering::Relaxed);
+    }
+
+    let mut ids = [TaskId(0); 3];
+    for (i, id_slot) in ids.iter_mut().enumerate() {
+        let tag = i + 1;
+        *id_slot = spawn(async move {
+            let pos = NEXT.fetch_add(1, Ordering::Relaxed);
+            if pos < ORDER.len() {
+                ORDER[pos].store(tag, Ordering::Relaxed);
+            }
+        });
+    }
+    crate::hint_urgent_next(ids[2].raw());
+    crate::run_until_empty();
+
+    if NEXT.load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("not all urgent-next test tasks ran");
+    }
+    if ORDER[0].load(Ordering::Relaxed) != 3 {
+        return TestResult::Fail("urgent next-buddy was not dispatched first");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_urgent_next_buddy_runs_first);
+
+// An urgent handoff is a core hint, not permission to bypass a pluggable
+// policy. External policies must still observe the queue and the core then
+// validates the requested and urgent candidates in the ordinary scan.
+fn smoke_scheduler_urgent_next_keeps_external_policy_observable() -> TestResult {
+    use crate::{
+        install_scheduler, spawn, ClassScheduler, CpuId, RunQueue, SchedPolicy, Scheduler,
+    };
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use narf_capabilities::{Cap, Grant};
+
+    #[derive(Copy, Clone, Debug)]
+    struct CountingPolicy;
+    static PICKS: AtomicUsize = AtomicUsize::new(0);
+
+    impl Scheduler for CountingPolicy {
+        fn name(&self) -> &'static str {
+            "counting-policy"
+        }
+
+        fn pick_next(&self, _cpu: CpuId, queue: &RunQueue<'_>) -> Option<crate::TaskHandle> {
+            PICKS.fetch_add(1, Ordering::Relaxed);
+            queue.front()
+        }
+    }
+
+    crate::__reset_queues_for_test();
+    crate::disable_wake_next();
+    PICKS.store(0, Ordering::Relaxed);
+    let cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if install_scheduler(&cap, CountingPolicy).is_err() {
+        return TestResult::Fail("install_scheduler(CountingPolicy) failed");
+    }
+
+    let _front = spawn(async {});
+    let urgent = spawn(async {});
+    crate::hint_urgent_next(urgent.raw());
+    crate::run_until_empty();
+    let _ = install_scheduler(&cap, ClassScheduler);
+
+    if PICKS.load(Ordering::Relaxed) == 0 {
+        return TestResult::Fail("urgent next-buddy bypassed an external policy callback");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_urgent_next_keeps_external_policy_observable
+);
+
+// A synchronous-handoff hint cannot bypass a strict periodic throttle. Charge
+// the target's account to exhaustion before selection, then verify that the
+// ordinary unbudgeted peer wins despite the exact urgent id.
+fn smoke_scheduler_urgent_next_respects_period_throttle() -> TestResult {
+    use crate::{spawn, spawn_with_spec, PeriodBudget, ResourceBudget, TaskSpec};
+
+    crate::__reset_queues_for_test();
+    crate::disable_wake_next();
+    let mut spec = TaskSpec::unthrottled();
+    spec.budget = ResourceBudget::unthrottled().with_period(PeriodBudget::strict(1, 1_000_000));
+    let urgent = spawn_with_spec(async {}, spec);
+    let peer = spawn(async {});
+
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let mut ready = crate::READY[cpu.0 as usize].lock();
+    let queue = match ready.as_mut() {
+        Some(queue) => queue,
+        None => return TestResult::Fail("ready queue was not initialised"),
+    };
+    let target = match queue.iter_mut().find(|slot| slot.id == urgent) {
+        Some(slot) => slot,
+        None => return TestResult::Fail("periodic urgent task was not queued"),
+    };
+    let now = narf_time::now_cycles();
+    let _ = target.account.prepare(now, &target.spec.budget);
+    let _ = target.account.charge_period(1, &target.spec.budget, false);
+
+    crate::hint_urgent_next(urgent.raw());
+    let class = crate::ClassScheduler;
+    let picked = crate::policy::pick_next_slot(Some(&class), cpu, queue);
+    drop(ready);
+    crate::__reset_queues_for_test();
+
+    match picked {
+        Some((handle, _)) if handle.task_id() == peer => TestResult::Pass,
+        Some(_) => TestResult::Fail("urgent next-buddy bypassed a strict period throttle"),
+        None => TestResult::Fail("eligible unbudgeted peer was not selected"),
+    }
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_urgent_next_respects_period_throttle
+);
+
+// Linux applies a fair-class next-buddy only after the core scheduler has
+// ruled out higher classes. The exact urgent hint must likewise never let an
+// ordinary task jump ahead of an eligible realtime task.
+fn smoke_scheduler_urgent_next_respects_strict_class_order() -> TestResult {
+    use crate::{spawn, ClassScheduler, CpuBudget, SchedPolicy, TaskSpec};
+    use narf_capabilities::{Cap, Grant, Spend};
+
+    crate::__reset_queues_for_test();
+    crate::disable_wake_next();
+    let policy_cap: Cap<SchedPolicy, Grant> = Cap::bootstrap();
+    if crate::install_scheduler(&policy_cap, ClassScheduler).is_err() {
+        return TestResult::Fail("install_scheduler(ClassScheduler) failed");
+    }
+    let budget_cap: Cap<CpuBudget, Spend> = Cap::bootstrap();
+    let deadline = narf_time::now_cycles().saturating_add(10_000_000);
+    let realtime = match crate::spawn_realtime(
+        async {},
+        TaskSpec::realtime_periodic(1, 1_000, deadline),
+        &budget_cap,
+    ) {
+        Ok(id) => id,
+        Err(_) => return TestResult::Fail("realtime task admission failed"),
+    };
+    let urgent = spawn(async {});
+    crate::hint_urgent_next(urgent.raw());
+
+    let cpu = crate::CpuId(narf_lib::percpu::current_cpu() as u32);
+    let mut ready = crate::READY[cpu.0 as usize].lock();
+    let queue = match ready.as_mut() {
+        Some(queue) => queue,
+        None => return TestResult::Fail("ready queue was not initialised"),
+    };
+    let class = ClassScheduler;
+    let picked = crate::policy::pick_next_slot(Some(&class), cpu, queue);
+    drop(ready);
+    crate::__reset_queues_for_test();
+
+    match picked {
+        Some((handle, _)) if handle.task_id() == realtime => TestResult::Pass,
+        Some(_) => TestResult::Fail("urgent default task bypassed the realtime class"),
+        None => TestResult::Fail("eligible realtime task was not selected"),
+    }
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_scheduler_urgent_next_respects_strict_class_order
+);
+
 fn smoke_scheduler_select_task_rq_prefers_idle_sibling() -> TestResult {
     use crate::affinity::CpuId;
     use crate::eevdf::EevdfScheduler;
