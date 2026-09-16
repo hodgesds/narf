@@ -2877,6 +2877,58 @@ fn alloc_mount_ns_id() -> u64 {
     f()
 }
 
+/// Hooks registering and retiring a namespace in the process-global
+/// namespace tree, which userspace owns for the same reason it owns the id
+/// counter: the tree spans every flavour, and half of them live above this
+/// crate.
+///
+/// A namespace minted before the hooks are installed — boot-time mount
+/// namespaces, in practice — is simply absent from the tree. That is the
+/// same window in which `alloc_mount_ns_id` answers 0, so such a namespace
+/// has no id to key on either; registering it would collapse every one of
+/// them onto the same key.
+static NS_TREE_ADD_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static NS_TREE_REMOVE_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the namespace-tree hooks (userspace `ns_tree_add`/`ns_tree_remove`).
+pub fn install_ns_tree_hooks(add: fn(u64, u32, u64), remove: fn(u64)) {
+    NS_TREE_ADD_HOOK.store(add as usize, core::sync::atomic::Ordering::Release);
+    NS_TREE_REMOVE_HOOK.store(remove as usize, core::sync::atomic::Ordering::Release);
+}
+
+/// `enum ns_type` bits for the two flavours this crate owns.
+pub const NS_TYPE_MNT: u32 = 1 << 17;
+pub const NS_TYPE_CGROUP: u32 = 1 << 25;
+
+pub(crate) fn ns_tree_add(id: u64, ns_type: u32, owner_user_ns: u64) {
+    if id == 0 {
+        return;
+    }
+    let v = NS_TREE_ADD_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return;
+    }
+    // SAFETY: v was stored by `install_ns_tree_hooks` as a
+    // `fn(u64, u32, u64)` pointer; non-zero confirms it was installed.
+    let f: fn(u64, u32, u64) = unsafe { core::mem::transmute::<usize, fn(u64, u32, u64)>(v) };
+    f(id, ns_type, owner_user_ns);
+}
+
+pub(crate) fn ns_tree_remove(id: u64) {
+    if id == 0 {
+        return;
+    }
+    let v = NS_TREE_REMOVE_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if v == 0 {
+        return;
+    }
+    // SAFETY: v was stored by `install_ns_tree_hooks` as a `fn(u64)`
+    // pointer; non-zero confirms it was installed.
+    let f: fn(u64) = unsafe { core::mem::transmute::<usize, fn(u64)>(v) };
+    f(id);
+}
+
 /// Hook answering "does the process on whose behalf we are running hold this
 /// capability?". Installed by userspace, which owns the task table and the
 /// capability sets; until then it answers **false** for everything.
@@ -2990,6 +3042,21 @@ pub fn drm_prime_export(card_index: u32, gem_handle: u32) -> Option<Arc<dyn File
 /// that cannot see when the last reference goes away.
 pub trait NsOwner: Send + Sync + core::fmt::Debug {
     fn as_any(&self) -> &dyn core::any::Any;
+
+    /// The owner's namespace id, for the namespace-tree entry of anything it
+    /// owns. Defaults to 0 — the tree's spelling for the initial user
+    /// namespace — so an owner that predates the tree needs no change.
+    fn ns_id(&self) -> u64 {
+        0
+    }
+}
+
+impl Drop for MountNamespace {
+    fn drop(&mut self) {
+        // Retire the tree entry: an entry outliving its namespace would
+        // answer a lookup with an id nothing can be reached through.
+        ns_tree_remove(self.id);
+    }
 }
 
 /// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
@@ -3023,8 +3090,10 @@ impl MountNamespace {
                 flags: core::sync::atomic::AtomicU64::new(m.flags()),
             })
             .collect();
+        let id = alloc_mount_ns_id();
+        ns_tree_add(id, NS_TYPE_MNT, owner.as_ref().map_or(0, |o| o.ns_id()));
         Arc::new(Self {
-            id: alloc_mount_ns_id(),
+            id,
             owner,
             inner: IrqSafeSpinLock::new(copied),
             mountinfo_generation: core::sync::atomic::AtomicU64::new(1),

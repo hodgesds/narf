@@ -9719,6 +9719,14 @@ pub fn wait_init() {
     // the same space as every other namespace flavour.
     #[cfg(feature = "container")]
     narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
+    // And the namespace tree, for the same reason: a MountNamespace or
+    // CgroupNamespace minted below this layer belongs in the SAME tree as
+    // every other flavour, or `listns` would report a partial system.
+    #[cfg(feature = "container")]
+    narf_filesystem::install_ns_tree_hooks(
+        crate::namespaces::ns_tree_add,
+        crate::namespaces::ns_tree_remove,
+    );
 }
 
 /// Exit-observer that removes an exiting *process* from its cgroup.

@@ -60,6 +60,168 @@ pub fn alloc_ns_id() -> NsId {
     NS_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+// ── The namespace tree ───────────────────────────────────────────
+//
+// Linux 6.17 added `kernel/nstree.c`: every namespace, of every flavour, is
+// registered in one structure keyed by its id, so a namespace can be found
+// or enumerated WITHOUT holding a task that happens to be in it. Before it,
+// the only way to reach a namespace was through something already using it
+// — which meant no way to ask "what namespaces exist" at all.
+//
+// NARF already had the hard half: `NsId` is drawn from one counter shared by
+// every flavour, so ids are globally unique and an ns-fd comparison is just
+// an id comparison. What was missing was the registry. This is it.
+//
+// A `BTreeMap` keyed by id is the whole data structure, and it is the right
+// one for the reason Linux uses an rbtree: enumeration has to be in id order
+// and has to resume from a cursor, because a caller with more namespaces
+// than buffer must page without restarting. `range((Excluded(cursor), ..))`
+// is that, exactly.
+
+/// `enum ns_type` (`include/uapi/linux/nsfs.h`) — the CLONE_NEW* bit that
+/// creates each flavour, reused as its type tag.
+///
+/// Reusing the clone flags is Linux's choice and worth keeping: a caller
+/// filtering `listns` by type writes the same constant it would pass to
+/// `unshare`, and there is no second numbering to keep in step.
+pub mod ns_type {
+    /// CLONE_NEWTIME. NARF has no time namespace; named so the mask is
+    /// complete and a filter naming it returns nothing rather than erroring.
+    pub const TIME: u32 = 1 << 7;
+    /// CLONE_NEWNS — the mount namespace, which predates the others.
+    pub const MNT: u32 = 1 << 17;
+    /// CLONE_NEWCGROUP.
+    pub const CGROUP: u32 = 1 << 25;
+    /// CLONE_NEWUTS.
+    pub const UTS: u32 = 1 << 26;
+    /// CLONE_NEWIPC.
+    pub const IPC: u32 = 1 << 27;
+    /// CLONE_NEWUSER.
+    pub const USER: u32 = 1 << 28;
+    /// CLONE_NEWPID.
+    pub const PID: u32 = 1 << 29;
+    /// CLONE_NEWNET.
+    pub const NET: u32 = 1 << 30;
+
+    /// `NS_ALL` — every flavour this ABI defines. A type filter outside it
+    /// is -EOPNOTSUPP rather than an empty result: "no such namespace type"
+    /// and "no namespaces of that type" are different answers, and a caller
+    /// probing for support needs to tell them apart.
+    pub const ALL: u32 = TIME | MNT | CGROUP | UTS | IPC | USER | PID | NET;
+}
+
+/// One namespace's entry in the tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NsTreeEntry {
+    /// The globally unique id, shared with `readlink /proc/<pid>/ns/<f>`.
+    pub id: NsId,
+    /// Which flavour, as a [`ns_type`] bit.
+    pub ns_type: u32,
+    /// The user namespace that owns this one — Linux's `ns->user_ns`, and
+    /// what `listns`'s `user_ns_id` filter selects on. 0 means the initial
+    /// user namespace, which is also what a namespace created before any
+    /// user namespace existed reports.
+    pub owner_user_ns: NsId,
+}
+
+static NS_TREE: IrqSafeSpinLock<Option<BTreeMap<NsId, NsTreeEntry>>> = IrqSafeSpinLock::new(None);
+
+/// Register a namespace. Called once, from the constructor of each flavour.
+///
+/// Registering with id 0 is ignored: `alloc_mount_ns_id` in `narf-filesystem`
+/// answers 0 until userspace installs the shared allocator, and a boot-time
+/// namespace minted before that has no id to key on. Letting it in would
+/// give every such namespace the same key and collapse them into one entry.
+pub fn ns_tree_add(id: NsId, ns_type: u32, owner_user_ns: NsId) {
+    if id == 0 {
+        return;
+    }
+    let mut g = NS_TREE.lock();
+    let m = g.get_or_insert_with(BTreeMap::new);
+    m.insert(
+        id,
+        NsTreeEntry {
+            id,
+            ns_type,
+            owner_user_ns,
+        },
+    );
+}
+
+/// Retire a namespace. Called from `Drop`, so the tree holds only namespaces
+/// that still exist — an entry outliving its namespace would answer a lookup
+/// with an id nothing can be reached through.
+pub fn ns_tree_remove(id: NsId) {
+    if id == 0 {
+        return;
+    }
+    let mut g = NS_TREE.lock();
+    if let Some(m) = g.as_mut() {
+        m.remove(&id);
+    }
+}
+
+/// Find one namespace by id.
+pub fn ns_tree_lookup(id: NsId) -> Option<NsTreeEntry> {
+    NS_TREE.lock().as_ref().and_then(|m| m.get(&id).copied())
+}
+
+/// Namespaces after `cursor`, in id order, optionally filtered.
+///
+/// `cursor` is EXCLUSIVE and is the id last returned, so paging is
+/// `list(0, ..)` then `list(last, ..)` — the shape `listns(2)` needs, and
+/// the reason the tree is ordered rather than a hash. A caller with more
+/// namespaces than buffer resumes instead of restarting, which is what makes
+/// the call safe against a tree that is changing underneath it.
+///
+/// `ns_type` of 0 means every flavour; `owner_user_ns` of `None` means every
+/// owner.
+pub fn ns_tree_list(
+    cursor: NsId,
+    ns_type: u32,
+    owner_user_ns: Option<NsId>,
+    max: usize,
+) -> Vec<NsId> {
+    let g = NS_TREE.lock();
+    let Some(m) = g.as_ref() else {
+        return Vec::new();
+    };
+    m.range((
+        core::ops::Bound::Excluded(cursor),
+        core::ops::Bound::Unbounded,
+    ))
+    .filter(|(_, e)| ns_type == 0 || e.ns_type & ns_type != 0)
+    .filter(|(_, e)| owner_user_ns.is_none_or(|o| e.owner_user_ns == o))
+    .take(max)
+    .map(|(&id, _)| id)
+    .collect()
+}
+
+/// Allocate an id and register it in one step.
+///
+/// Deliberately the only way a namespace gets an id: allocation and
+/// registration cannot drift apart if there is no way to do one without the
+/// other, and a flavour that allocated without registering would be invisible
+/// to `listns` in a way nothing would notice until someone went looking for
+/// it.
+fn alloc_registered(ns_type: u32, owner: Option<&Arc<UserNamespace>>) -> NsId {
+    let id = alloc_ns_id();
+    ns_tree_add(id, ns_type, owner.map_or(0, |u| u.id()));
+    id
+}
+
+/// How many namespaces the tree holds — diagnostics and tests.
+#[doc(hidden)]
+pub fn ns_tree_len() -> usize {
+    NS_TREE.lock().as_ref().map_or(0, |m| m.len())
+}
+
+/// Test hook — empty the tree.
+#[doc(hidden)]
+pub fn __test_ns_tree_reset() {
+    *NS_TREE.lock() = Some(BTreeMap::new());
+}
+
 fn initial_ns_id(slot: &AtomicU64) -> NsId {
     let current = slot.load(Ordering::Acquire);
     if current != 0 {
@@ -178,7 +340,7 @@ impl UtsNamespace {
     /// Seed a fresh namespace with the boot defaults.
     pub fn new_default() -> Arc<Self> {
         Arc::new(Self {
-            id: alloc_ns_id(),
+            id: alloc_registered(ns_type::UTS, None),
             owner: None,
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: String::from(DEFAULT_HOSTNAME),
@@ -293,7 +455,7 @@ impl NetNamespace {
             prefix_len: 8,
         };
         Arc::new(Self {
-            id: alloc_ns_id(),
+            id: alloc_registered(ns_type::NET, owner.as_ref()),
             owner,
             inner: IrqSafeSpinLock::new(NetInner {
                 ifaces: alloc::vec![lo],
@@ -332,6 +494,10 @@ impl NetNamespace {
 
 impl Drop for NetNamespace {
     fn drop(&mut self) {
+        // Retire the tree entry first: an entry outliving its
+        // namespace would answer a lookup with an id nothing can be
+        // reached through.
+        ns_tree_remove(self.id);
         narf_net::release_network_namespace(self.id);
     }
 }
@@ -383,6 +549,11 @@ impl IpcNamespace {
     }
 
     fn new_with_id(id: NsId, owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
+        // Registered HERE rather than at each caller: `new_in` mints a fresh
+        // id while the initial namespace reuses a cached one, and both must
+        // land in the tree. Re-registering the same id is an idempotent
+        // insert.
+        ns_tree_add(id, ns_type::IPC, owner.as_ref().map_or(0, |u| u.id()));
         Arc::new(Self {
             id,
             owner,
@@ -445,6 +616,10 @@ impl IpcNamespace {
 
 impl Drop for IpcNamespace {
     fn drop(&mut self) {
+        // Retire the tree entry first: an entry outliving its
+        // namespace would answer a lookup with an id nothing can be
+        // reached through.
+        ns_tree_remove(self.id);
         // Linux removes an IPC namespace's public ids when the final task/nsfd
         // reference disappears. Existing SysV SHM VMAs retain their backing
         // until their final detach; semaphore/message waiters wake with EIDRM.
@@ -788,14 +963,24 @@ impl narf_filesystem::NsOwner for UserNamespace {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+    fn ns_id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl UserNamespace {
     /// The initial (host/root) user namespace: identity map for the
     /// full id range, no parent. Created lazily and shared.
     pub fn new_initial() -> Arc<Self> {
+        // The initial user namespace owns itself, which is what Linux's
+        // `init_user_ns.ns.user_ns == &init_user_ns` says. Recorded as owner
+        // 0 rather than as its own id, because 0 is already the tree's
+        // spelling for "the initial user namespace" and a self-referential
+        // id would make an `owner == X` filter return the namespace itself.
+        let id = alloc_ns_id();
+        ns_tree_add(id, ns_type::USER, 0);
         Arc::new(Self {
-            id: alloc_ns_id(),
+            id,
             parent: None,
             owner_uid: 0,
             inner: IrqSafeSpinLock::new(UserInner {
@@ -821,8 +1006,11 @@ impl UserNamespace {
     /// translates to the overflow id, which is the Linux behaviour and
     /// is the safe default (an unconfigured ns has no host authority).
     pub fn new_child(parent: Arc<UserNamespace>, owner_uid: u32) -> Arc<Self> {
+        // A user namespace's owner is its PARENT (`user_ns->parent`), which
+        // is what makes the ownership chain walkable.
+        let id = alloc_registered(ns_type::USER, Some(&parent));
         Arc::new(Self {
-            id: alloc_ns_id(),
+            id,
             parent: Some(parent),
             owner_uid,
             inner: IrqSafeSpinLock::new(UserInner::default()),
@@ -1079,6 +1267,20 @@ impl HeldNs {
             HeldNs::Cgroup(n) => n.id(),
             HeldNs::User(n) => n.id(),
         }
+    }
+}
+
+impl Drop for UtsNamespace {
+    fn drop(&mut self) {
+        // Retire the tree entry: an entry outliving its namespace would
+        // answer a lookup with an id nothing can be reached through.
+        ns_tree_remove(self.id);
+    }
+}
+
+impl Drop for UserNamespace {
+    fn drop(&mut self) {
+        ns_tree_remove(self.id);
     }
 }
 

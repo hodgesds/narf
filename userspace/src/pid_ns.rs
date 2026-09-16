@@ -56,6 +56,14 @@ pub struct PidNamespace {
     parent: Option<Arc<PidNamespace>>,
 }
 
+impl Drop for PidNamespace {
+    fn drop(&mut self) {
+        // Retire the tree entry: an entry outliving its namespace would
+        // answer a lookup with an id nothing can be reached through.
+        crate::namespaces::ns_tree_remove(self.id);
+    }
+}
+
 impl PidNamespace {
     /// Build a fresh PID namespace. The first `bind_outer` call will
     /// allocate inner pid 1.
@@ -76,8 +84,14 @@ impl PidNamespace {
         parent: Option<Arc<Self>>,
         owner: Option<Arc<crate::namespaces::UserNamespace>>,
     ) -> Arc<Self> {
+        let id = crate::namespaces::alloc_ns_id();
+        crate::namespaces::ns_tree_add(
+            id,
+            crate::namespaces::ns_type::PID,
+            owner.as_ref().map_or(0, |u| u.id()),
+        );
         Arc::new(Self {
-            id: crate::namespaces::alloc_ns_id(),
+            id,
             watermark: AtomicU64::new(1),
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),

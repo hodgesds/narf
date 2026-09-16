@@ -2947,6 +2947,10 @@ pub fn namespace_fd_for_task(
                 // allocator here as well so the initial cgroup namespace can
                 // never be minted with the filesystem fallback identity 0.
                 narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
+                narf_filesystem::install_ns_tree_hooks(
+                    crate::namespaces::ns_tree_add,
+                    crate::namespaces::ns_tree_remove,
+                );
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 HeldNs::Cgroup(narf_filesystem::cgroupfs::cgroup_namespace_of(pid))
             }
