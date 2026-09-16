@@ -10000,12 +10000,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(Syscall::Listxattr, "listxattr", RawFnHandler(sys_listxattr));
     // Batch 13: xattr l*/f*/remove variants. NARF has no symlink-follow
     // distinction, so the l* variants alias the path handlers.
-    table.install_raw(Syscall::Lsetxattr, "lsetxattr", RawFnHandler(sys_setxattr));
-    table.install_raw(Syscall::Lgetxattr, "lgetxattr", RawFnHandler(sys_getxattr));
+    table.install_raw(Syscall::Lsetxattr, "lsetxattr", RawFnHandler(sys_lsetxattr));
+    table.install_raw(Syscall::Lgetxattr, "lgetxattr", RawFnHandler(sys_lgetxattr));
     table.install_raw(
         Syscall::Llistxattr,
         "llistxattr",
-        RawFnHandler(sys_listxattr),
+        RawFnHandler(sys_llistxattr),
     );
     table.install_raw(
         Syscall::Removexattr,
@@ -10015,7 +10015,7 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     table.install_raw(
         Syscall::Lremovexattr,
         "lremovexattr",
-        RawFnHandler(sys_removexattr),
+        RawFnHandler(sys_lremovexattr),
     );
     table.install_raw(Syscall::Fsetxattr, "fsetxattr", RawFnHandler(sys_fsetxattr));
     table.install_raw(Syscall::Fgetxattr, "fgetxattr", RawFnHandler(sys_fgetxattr));
@@ -10028,6 +10028,30 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         Syscall::Fremovexattr,
         "fremovexattr",
         RawFnHandler(sys_fremovexattr),
+    );
+    // Mount-table queries (Linux 6.8).
+    table.install_raw(Syscall::Statmount, "statmount", RawFnHandler(sys_statmount));
+    table.install_raw(Syscall::Listmount, "listmount", RawFnHandler(sys_listmount));
+    // The general form the twelve above are presets of (Linux 6.13).
+    table.install_raw(
+        Syscall::Setxattrat,
+        "setxattrat",
+        RawFnHandler(sys_setxattrat),
+    );
+    table.install_raw(
+        Syscall::Getxattrat,
+        "getxattrat",
+        RawFnHandler(sys_getxattrat),
+    );
+    table.install_raw(
+        Syscall::Listxattrat,
+        "listxattrat",
+        RawFnHandler(sys_listxattrat),
+    );
+    table.install_raw(
+        Syscall::Removexattrat,
+        "removexattrat",
+        RawFnHandler(sys_removexattrat),
     );
     // Batch 14: filesystem misc (legacy x86_64-only entries).
     table.install_raw(Syscall::Creat, "creat", RawFnHandler(sys_creat));
@@ -11203,6 +11227,10 @@ mod handler_sys_settimeofday;
 mod handler_sys_setuid;
 #[path = "sys_setxattr.rs"]
 mod handler_sys_setxattr;
+#[path = "sys_statmount.rs"]
+mod handler_sys_statmount;
+#[path = "sys_xattrat.rs"]
+mod handler_sys_xattrat;
 #[path = "sys_shmat.rs"]
 mod handler_sys_shmat;
 #[path = "sys_shmctl.rs"]
@@ -11489,7 +11517,7 @@ pub(crate) use {
     handler_sys_gettid::sys_gettid,
     handler_sys_gettimeofday::sys_gettimeofday,
     handler_sys_getuid::sys_getuid,
-    handler_sys_getxattr::sys_getxattr,
+    handler_sys_getxattr::{sys_getxattr, sys_lgetxattr},
     handler_sys_init_module::sys_init_module,
     handler_sys_ioctl::sys_ioctl,
     handler_sys_ioprio_get::sys_ioprio_get,
@@ -11499,7 +11527,7 @@ pub(crate) use {
     handler_sys_link::sys_link,
     handler_sys_linkat::sys_linkat,
     handler_sys_listdir::sys_listdir,
-    handler_sys_listxattr::sys_listxattr,
+    handler_sys_listxattr::{sys_listxattr, sys_llistxattr},
     handler_sys_lseek::sys_lseek,
     handler_sys_mbind::sys_mbind,
     handler_sys_membarrier::sys_membarrier,
@@ -11557,7 +11585,7 @@ pub(crate) use {
     handler_sys_readlinkat::sys_readlinkat,
     handler_sys_readv::sys_readv,
     handler_sys_reboot::sys_reboot,
-    handler_sys_removexattr::sys_removexattr,
+    handler_sys_removexattr::{sys_lremovexattr, sys_removexattr},
     handler_sys_rename::{rename_absolute, sys_rename},
     handler_sys_renameat::sys_renameat,
     handler_sys_renameat2::sys_renameat2,
@@ -11604,7 +11632,13 @@ pub(crate) use {
     handler_sys_setsid::sys_setsid,
     handler_sys_settimeofday::sys_settimeofday,
     handler_sys_setuid::sys_setuid,
-    handler_sys_setxattr::sys_setxattr,
+    handler_sys_setxattr::{sys_lsetxattr, sys_setxattr},
+    handler_sys_statmount::{sys_listmount, sys_statmount},
+    handler_sys_xattrat::{
+        sys_getxattrat, sys_listxattrat, sys_removexattrat, sys_setxattrat, xattr_get_at,
+        xattr_list_at, xattr_remove_at, xattr_set_at, AT_EMPTY_PATH_ARG, AT_FDCWD_ARG,
+        AT_SYMLINK_NOFOLLOW_ARG,
+    },
     handler_sys_shmem_create::sys_shmem_create,
     handler_sys_shmem_destroy::sys_shmem_destroy,
     handler_sys_shmem_map::sys_shmem_map,

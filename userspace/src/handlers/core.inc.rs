@@ -4844,6 +4844,82 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     }
 }
 
+/// `CAP_FS_SET` (`include/linux/capability.h`) — the capabilities that
+/// follow the FILESYSTEM uid rather than the effective one.
+///
+/// ```text
+/// # define CAP_FS_MASK (BIT_ULL(CAP_CHOWN) | BIT_ULL(CAP_MKNOD)
+///                     | BIT_ULL(CAP_DAC_OVERRIDE) | BIT_ULL(CAP_DAC_READ_SEARCH)
+///                     | BIT_ULL(CAP_FOWNER) | BIT_ULL(CAP_FSETID)
+///                     | BIT_ULL(CAP_MAC_OVERRIDE))
+/// # define CAP_FS_SET  ((kernel_cap_t) { CAP_FS_MASK | BIT_ULL(CAP_LINUX_IMMUTABLE) })
+/// ```
+/// `CAP_CHOWN` (0) and `CAP_MAC_OVERRIDE` (32) — named here because
+/// `CAP_FS_SET` is the only thing in NARF that needs them.
+const CAP_CHOWN: u32 = 0;
+const CAP_MAC_OVERRIDE: u32 = 32;
+
+const CAP_FS_SET: u64 = (1 << CAP_CHOWN)
+    | (1 << CAP_MKNOD)
+    | (1 << CAP_DAC_OVERRIDE)
+    | (1 << CAP_DAC_READ_SEARCH)
+    | (1 << CAP_FOWNER)
+    | (1 << CAP_FSETID)
+    | (1 << CAP_MAC_OVERRIDE)
+    | (1 << CAP_LINUX_IMMUTABLE);
+
+/// `security/commoncap.c::cap_task_fix_setuid`, the `LSM_SETID_FS` arm —
+/// the capability fixup that follows a `setfsuid` across root.
+///
+/// ```text
+/// if (uid_eq(old->fsuid, root_uid) && !uid_eq(new->fsuid, root_uid))
+///         new->cap_effective = cap_drop_fs_set(new->cap_effective);
+/// if (!uid_eq(old->fsuid, root_uid) && uid_eq(new->fsuid, root_uid))
+///         new->cap_effective = cap_raise_fs_set(new->cap_effective,
+///                                               new->cap_permitted);
+/// ```
+///
+/// Deliberately NOT the same transition [`cap_emulate_setxuid`] makes: that
+/// one empties the whole set when a task leaves root for good, while this
+/// moves only the FILE-related capabilities and is reversible, because
+/// `setfsuid` is meant to be used in pairs.
+///
+/// Without it the drop is half a drop. The idiom this exists for is a file
+/// server that holds CAP_SETUID and lowers fsuid to the requesting user for
+/// one operation — but CAP_DAC_OVERRIDE is consulted by the same checks
+/// fsuid is, so keeping it would let the server right through the very
+/// permission bits it lowered fsuid to be bound by.
+///
+/// Raising back is `cap_intersect(permitted, CAP_FS_SET)`, so returning to
+/// root restores only what the task was permitted to hold — a task that
+/// never had CAP_DAC_OVERRIDE does not acquire it by round-tripping fsuid.
+///
+/// LINUX-GAP: `SECURE_NO_SETUID_FIXUP` suppresses this in Linux; NARF does
+/// not model that bit, so the fixup always runs. Same gap, and for the same
+/// reason, as the one on `cap_emulate_setxuid`.
+/// Test hook — is `cap` in `task`'s EFFECTIVE set?
+///
+/// The fs-capability fixup is only observable through the effective set, and
+/// no syscall reports it directly (`capget` reports the whole word, but the
+/// point here is one bit moving with fsuid).
+#[doc(hidden)]
+pub fn __test_cap_effective(task: u64, cap: u32) -> bool {
+    cap_effective(task, cap)
+}
+
+fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
+    let mut caps = read_caps(task);
+    let before = caps.effective;
+    if old_fsuid == 0 && new_fsuid != 0 {
+        caps.effective &= !CAP_FS_SET;
+    } else if old_fsuid != 0 && new_fsuid == 0 {
+        caps.effective |= caps.permitted & CAP_FS_SET;
+    }
+    if caps.effective != before {
+        write_caps(task, caps);
+    }
+}
+
 /// `security/commoncap.c::handle_privileged_root` — the half of
 /// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
 /// actually privileged.
@@ -5312,13 +5388,6 @@ static XATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
 const XATTR_CREATE: u64 = 1;
 const XATTR_REPLACE: u64 = 2;
 
-/// Resolve a bare NUL-terminated user path pointer (no length arg) the
-/// same way the FS path syscalls do: copy the C string, then apply the
-/// chroot rewrite so the xattr key matches the file's canonical path.
-fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
-    copy_user_cstr(ptr, 4096).map(|s| apply_chroot(&s))
-}
-
 /// Resolve the fd argument of an `f*xattr` syscall to a side-table key.
 /// NARF has no fd→pathname cache yet, so `fd_path_of` returns a stable
 /// per-fd `anon_inode:[Type]` placeholder: `f*xattr` calls round-trip
@@ -5326,6 +5395,149 @@ fn xattr_user_path(ptr: u64) -> Option<alloc::string::String> {
 /// path-keyed `*xattr` family (a documented limitation).
 fn xattr_fd_key(fd: u32) -> Option<alloc::string::String> {
     fd_path_string_of(current_task_id(), fd)
+}
+
+/// `AT_*` bits the xattr `*at` syscalls accept.
+const XATTR_AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+const XATTR_AT_EMPTY_PATH: u32 = 0x1000;
+const XATTR_AT_FDCWD: i64 = -100;
+
+/// The `(dfd, pathname, at_flags)` prologue shared by all four xattr `*at`
+/// syscalls, and by the twelve legacy entry points that are presets of them.
+///
+/// `fs/xattr.c::path_setxattrat` and its three siblings all open the same
+/// way:
+///
+/// ```text
+/// if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0)
+///         return -EINVAL;
+/// if (!(at_flags & AT_SYMLINK_NOFOLLOW))
+///         lookup_flags = LOOKUP_FOLLOW;
+/// CLASS(filename_maybe_null, filename)(pathname, at_flags);
+/// if (!filename && dfd >= 0) { ... file_setxattr(fd_file(f), &ctx); }
+/// else { ... filename_setxattr(dfd, filename, lookup_flags, &ctx); }
+/// ```
+///
+/// `filename_maybe_null` is what makes a NULL pathname legal, and only with
+/// AT_EMPTY_PATH; the `dfd >= 0` guard is why `AT_FDCWD` with a NULL path
+/// still takes the path branch (and fails there) rather than silently
+/// operating on the cwd.
+///
+/// Returns the resolved absolute path (or the `f*xattr` fd key) together
+/// with the `follow_final` the caller must hand to the core.
+fn xattr_at_path(dfd: i64, path_ptr: u64, at_flags: u32) -> Result<(alloc::string::String, bool), i64> {
+    if at_flags & !(XATTR_AT_SYMLINK_NOFOLLOW | XATTR_AT_EMPTY_PATH) != 0 {
+        return Err(XE_INVAL);
+    }
+    let follow = at_flags & XATTR_AT_SYMLINK_NOFOLLOW == 0;
+    // A NULL pathname is `filename_maybe_null` returning NULL, which is only
+    // legal with AT_EMPTY_PATH; an empty STRING reaches the same arm because
+    // `getname_flags` maps "" + AT_EMPTY_PATH to it too.
+    let empty = if path_ptr == 0 {
+        if at_flags & XATTR_AT_EMPTY_PATH == 0 {
+            // `getname` on a NULL pointer is -EFAULT.
+            return Err(XE_FAULT);
+        }
+        true
+    } else {
+        let raw = copy_user_cstr(path_ptr, 4096).ok_or(XE_FAULT)?;
+        if raw.is_empty() {
+            if at_flags & XATTR_AT_EMPTY_PATH == 0 {
+                // `getname` rejects "" without AT_EMPTY_PATH: -ENOENT.
+                return Err(-2);
+            }
+            true
+        } else {
+            let task = current_task_id();
+            let anchored = apply_chroot(&resolve_at_path(task, dfd, &raw)?);
+            // The VFS-level symlink walk, exactly as `open` runs it:
+            //
+            //   resolve_vfs_symlink_path(&path_owned, flags & O_NOFOLLOW == 0)
+            //
+            // This is where LOOKUP_FOLLOW actually lives. It has the mount
+            // table, so it can follow an ABSOLUTE symlink target out of the
+            // filesystem the link sits on — which the in-filesystem resolver
+            // cannot, since it restarts such a target at its own mount root.
+            // Every absolute target (`/usr/bin/awk` -> `/etc/alternatives/awk`,
+            // and every `/lib` -> `/usr/lib` merge) depends on that.
+            //
+            // `unwrap_or` keeps a path the walk could not resolve: the xattr
+            // core reports the real errno for a missing name, and swallowing
+            // it here would turn every ENOENT into a resolution failure.
+            let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
+            return Ok((resolved, follow));
+        }
+    };
+    debug_assert!(empty);
+    // The fd branch. `dfd >= 0` is Linux's guard: AT_FDCWD here is not a
+    // descriptor, so it cannot name a file and falls through to the path
+    // branch, which has no path — -EBADF.
+    if dfd < 0 || dfd == XATTR_AT_FDCWD {
+        return Err(XE_BADF);
+    }
+    // Same side-table key the `f*xattr` family uses, so an AT_EMPTY_PATH
+    // call and an `f*xattr` call on the same descriptor address the same
+    // attributes. (Both are separate from the path-keyed family — see
+    // `xattr_fd_key`.)
+    xattr_fd_key(dfd as u32)
+        .map(|key| (key, follow))
+        .ok_or(XE_BADF)
+}
+
+/// `struct xattr_args` (`include/uapi/linux/xattr.h`), read with
+/// `copy_struct_from_user`'s extensible-struct rules.
+///
+/// ```text
+/// struct xattr_args { __aligned_u64 value; __u32 size; __u32 flags; };
+/// #define XATTR_ARGS_SIZE_VER0 16
+/// ```
+///
+/// `setxattrat`/`getxattrat` take this rather than a flat argument list so
+/// the struct can grow. The size handling is the part worth getting right,
+/// because it is what lets an OLD kernel refuse a NEW caller safely:
+///
+/// ```text
+/// if (unlikely(usize < XATTR_ARGS_SIZE_VER0)) return -EINVAL;
+/// if (usize > PAGE_SIZE)                      return -E2BIG;
+/// error = copy_struct_from_user(&args, sizeof(args), uargs, usize);
+/// ```
+///
+/// and `copy_struct_from_user` itself requires every byte PAST the struct
+/// this kernel knows to be zero, answering -E2BIG when it is not. That is
+/// the safety property: a caller who sets a field this kernel would ignore
+/// is told so instead of having it silently dropped.
+fn xattr_args_from_user(uargs: u64, usize_bytes: u64) -> Result<(u64, u32, u32), i64> {
+    const VER0: u64 = 16;
+    const PAGE: u64 = 4096;
+    if usize_bytes < VER0 {
+        return Err(XE_INVAL);
+    }
+    if usize_bytes > PAGE {
+        return Err(XE_2BIG);
+    }
+    let mut buf = [0u8; VER0 as usize];
+    // SAFETY: `copy_from_user` range-validates `uargs` and brackets the
+    // 16-byte read; the buffer is exactly VER0 bytes.
+    if unsafe { copy_from_user(&mut buf, uargs) }.is_err() {
+        return Err(XE_FAULT);
+    }
+    // `check_zeroed_user` over the tail this kernel does not know about.
+    if usize_bytes > VER0 {
+        let rest = (usize_bytes - VER0) as usize;
+        // SAFETY: the tail lies inside the caller-declared struct, which
+        // `copy_from_user_vec` range-validates before reading.
+        let tail = match unsafe { copy_from_user_vec(uargs + VER0, rest) } {
+            Ok(v) => v,
+            Err(_) => return Err(XE_FAULT),
+        };
+        if tail.iter().any(|&b| b != 0) {
+            return Err(XE_2BIG);
+        }
+    }
+    let value = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+    let size = u32::from_ne_bytes(buf[8..12].try_into().unwrap());
+    let flags = u32::from_ne_bytes(buf[12..16].try_into().unwrap());
+    Ok((value, size, flags))
 }
 
 // ── VFS-level xattr checks (fs/xattr.c) ──────────────────────────────
@@ -5419,6 +5631,7 @@ const XE_ACCES: i64 = -13;
 const XE_NOSPC: i64 = -28;
 const XE_DQUOT: i64 = -122;
 const XE_IO: i64 = -5;
+const XE_BADF: i64 = -9;
 
 /// Map an `FsError` from an xattr operation onto Linux's errno.
 ///
@@ -5598,6 +5811,18 @@ fn xattr_permission_check(
     }
 }
 
+/// Resolve the file an xattr operation names.
+///
+/// Deliberately NOT following the final symlink: by the time a path reaches
+/// here it has already been through `resolve_vfs_symlink_path`, which did
+/// the following (or did not) according to the caller's `at_flags`. Doing it
+/// again here would follow a link the `l` forms asked to keep.
+///
+/// That split is the same one `open` uses, and it is the one that matters
+/// for ABSOLUTE symlink targets: only the VFS-level walk can leave the
+/// filesystem the link lives on, because only it holds the mount table. The
+/// in-filesystem resolver restarts an absolute target at its own mount root,
+/// which is correct for what it can see and wrong for anything else.
 fn xattr_file(path: &str) -> Option<alloc::sync::Arc<dyn narf_filesystem::FileOps>> {
     let (root, rel) = narf_filesystem::registry().resolve_absolute(path, |fs, rel| {
         (fs.root(), alloc::string::String::from(rel))

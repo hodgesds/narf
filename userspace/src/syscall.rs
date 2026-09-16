@@ -1700,6 +1700,28 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `statmount(req, buf, bufsize, flags)` — query one mount without
+    /// parsing `/proc/self/mountinfo`.
+    /// Linux `statmount` (x86_64=457, aarch64=457).
+    Statmount,
+    /// `listmount(req, mnt_ids, nr_mnt_ids, flags)` — enumerate the mounts
+    /// reachable from one mount, with a cursor so a caller with more mounts
+    /// than buffer resumes rather than restarting.
+    /// Linux `listmount` (x86_64=458, aarch64=458).
+    Listmount,
+    /// `setxattrat(dfd, path, at_flags, name, xattr_args*, usize)` — the
+    /// general form of the twelve legacy xattr calls, which Linux 6.13 made
+    /// presets of it. Linux `setxattrat` (x86_64=463, aarch64=463).
+    Setxattrat,
+    /// `getxattrat(dfd, path, at_flags, name, xattr_args*, usize)`.
+    /// Linux `getxattrat` (x86_64=464, aarch64=464).
+    Getxattrat,
+    /// `listxattrat(dfd, path, at_flags, list, size)`.
+    /// Linux `listxattrat` (x86_64=465, aarch64=465).
+    Listxattrat,
+    /// `removexattrat(dfd, path, at_flags, name)`.
+    /// Linux `removexattrat` (x86_64=466, aarch64=466).
+    Removexattrat,
     /// `timer_getoverrun(timerid)` — how many expiries the signal most
     /// recently queued for this timer stood in for.
     ///
@@ -2515,6 +2537,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 195),
     (Syscall::Flistxattr, 196),
     (Syscall::Removexattr, 197),
+    (Syscall::Statmount, 457),
+    (Syscall::Listmount, 458),
+    (Syscall::Setxattrat, 463),
+    (Syscall::Getxattrat, 464),
+    (Syscall::Listxattrat, 465),
+    (Syscall::Removexattrat, 466),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
     (Syscall::Creat, 85),
@@ -2979,6 +3007,12 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 12),
     (Syscall::Flistxattr, 13),
     (Syscall::Removexattr, 14),
+    (Syscall::Statmount, 457),
+    (Syscall::Listmount, 458),
+    (Syscall::Setxattrat, 463),
+    (Syscall::Getxattrat, 464),
+    (Syscall::Listxattrat, 465),
+    (Syscall::Removexattrat, 466),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),

@@ -49,6 +49,31 @@ pub(crate) fn sys_setregid(ctx: &mut dyn TrapContext) {
     let rgid = a.arg0 as u32;
     let egid = a.arg1 as u32;
     let task = current_task_id();
+    // `make_kgid(ns, x)` + `gid_valid`: in a non-initial user-ns an
+    // unmapped id is INVALID_GID and the call is -EINVAL, per
+    // argument and before anything else:
+    //
+    //     if ((rgid != (gid_t) -1) && !gid_valid(krgid))
+    //             return -EINVAL;
+    //
+    // `setuid`/`setgid` carried this check and the re/res forms did not, so
+    // a task in a user namespace could give itself an id with no mapping —
+    // one that then gets compared against file owners from OUTSIDE the
+    // namespace. The host root-ns maps everything, so this is inert there.
+    #[cfg(feature = "container")]
+    {
+        let uns = crate::namespaces::current_user_ns(task);
+        if !uns.is_initial() {
+            if rgid != NOCHANGE && !uns.gid_is_mapped(rgid) {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+            if egid != NOCHANGE && !uns.gid_is_mapped(egid) {
+                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                return;
+            }
+        }
+    }
     let old = read_uidgid(task);
 
     if rgid != NOCHANGE && rgid != old.gid && rgid != old.egid && !capable_in_own_ns(CAP_SETGID) {

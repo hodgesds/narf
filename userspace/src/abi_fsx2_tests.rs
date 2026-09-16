@@ -2397,3 +2397,870 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_bind_still_succeeds_for_a_real_source
 );
+
+// ── the xattr `*at` family (Linux 6.13) ───────────────────────────────
+//
+// `fs/xattr.c` has four bodies — `path_setxattrat`, `path_getxattrat`,
+// `path_listxattrat`, `path_removexattrat` — and all sixteen entry points
+// are presets over them: plain (`AT_FDCWD, path, 0`), `l` (`AT_FDCWD, path,
+// AT_SYMLINK_NOFOLLOW`), `f` (`fd, NULL, AT_EMPTY_PATH`) and the `*at`
+// forms, which pass the caller's own three.
+
+/// A round trip through `setxattrat` and `getxattrat`.
+///
+/// The value and flags travel inside `struct xattr_args { __aligned_u64
+/// value; __u32 size; __u32 flags; }` rather than in registers, so this
+/// also pins the struct's layout: a get that read the fields at the wrong
+/// offsets would still "work" for a zero-length value.
+fn smoke_abi_fsx2_setxattrat_getxattrat_round_trip() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    with_memfs("/xat", "xat", &[("f", b"hi")], || {
+        let path = b"/xat/f\0";
+        let name = b"user.at\0";
+        let val = b"round-trip";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        // args.flags = 0 (neither XATTR_CREATE nor XATTR_REPLACE).
+        let set = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0, // at_flags
+            arg3: name.as_ptr() as u64,
+            arg4: args.as_ptr() as u64,
+            arg5: 16,
+        };
+        if call(Syscall::Setxattrat.raw(), set) != Some(0) {
+            return Err("setxattrat should store the attribute");
+        }
+        let mut out = [0u8; 32];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        let get = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: name.as_ptr() as u64,
+            arg4: gargs.as_ptr() as u64,
+            arg5: 16,
+        };
+        match call(Syscall::Getxattrat.raw(), get) {
+            Some(n) if n == val.len() as i64 => {}
+            _ => return Err("getxattrat should report the stored value's length"),
+        }
+        if &out[..val.len()] != val {
+            return Err("getxattrat returned a different value than setxattrat stored");
+        }
+        // The plain form is the same body with (AT_FDCWD, path, 0), so it
+        // must see the very same attribute.
+        let mut out2 = [0u8; 32];
+        let legacy = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: name.as_ptr() as u64,
+            arg2: out2.as_mut_ptr() as u64,
+            arg3: out2.len() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Getxattr.raw(), legacy) {
+            Some(n) if n == val.len() as i64 && &out2[..val.len()] == val => Ok(()),
+            _ => Err("getxattr and getxattrat disagree about the same attribute"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_setxattrat_getxattrat_round_trip
+);
+
+/// `listxattrat` and `removexattrat`, and that remove really removed it.
+fn smoke_abi_fsx2_listxattrat_removexattrat() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    with_memfs("/xat2", "xat2", &[("f", b"hi")], || {
+        let path = b"/xat2/f\0";
+        let name = b"user.gone\0";
+        let val = b"v";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        if call(
+            Syscall::Setxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: args.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) != Some(0)
+        {
+            return Err("setxattrat setup should succeed");
+        }
+        let mut list = [0u8; 128];
+        let listed = match call(
+            Syscall::Listxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: list.as_mut_ptr() as u64,
+                arg4: list.len() as u64,
+                ..Default::default()
+            },
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("listxattrat should report the attribute names"),
+        };
+        if !list[..listed].windows(9).any(|w| w == b"user.gone") {
+            return Err("listxattrat did not list the attribute that was set");
+        }
+        if call(
+            Syscall::Removexattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("removexattrat should remove the attribute");
+        }
+        // ENODATA, not 0: the name must actually be gone.
+        let mut out = [0u8; 8];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        match call(
+            Syscall::Getxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: gargs.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) {
+            Some(-61) => Ok(()), // -ENODATA
+            _ => Err("the attribute survived removexattrat"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattrat_removexattrat);
+
+/// The `struct xattr_args` size rules, which are what let an old kernel
+/// refuse a new caller safely.
+///
+/// ```text
+/// if (unlikely(usize < XATTR_ARGS_SIZE_VER0)) return -EINVAL;   /* 16 */
+/// if (usize > PAGE_SIZE)                      return -E2BIG;
+/// error = copy_struct_from_user(&args, sizeof(args), uargs, usize);
+/// ```
+///
+/// and `copy_struct_from_user` requires every byte past the struct this
+/// kernel knows to be zero, answering -E2BIG otherwise. That last rule is
+/// the safety property: a caller who sets a field this kernel would ignore
+/// is told so rather than having it silently dropped.
+fn smoke_abi_fsx2_xattrat_args_size_rules() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const E2BIG: i64 = -7;
+    with_memfs("/xat3", "xat3", &[("f", b"hi")], || {
+        let path = b"/xat3/f\0";
+        let name = b"user.k\0";
+        let val = b"v";
+        // A 24-byte struct: the 16 this kernel knows, plus 8 trailing.
+        let mut args = [0u8; 24];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        let args_ptr = args.as_ptr() as u64;
+        let mk = |usize_bytes: u64| SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: name.as_ptr() as u64,
+            arg4: args_ptr,
+            arg5: usize_bytes,
+        };
+        // Below VER0 — a struct too small to hold the fields it must.
+        if call(Syscall::Setxattrat.raw(), mk(15)) != Some(EINVAL) {
+            return Err("a usize below XATTR_ARGS_SIZE_VER0 must be -EINVAL");
+        }
+        // Past PAGE_SIZE.
+        if call(Syscall::Setxattrat.raw(), mk(4097)) != Some(E2BIG) {
+            return Err("a usize above PAGE_SIZE must be -E2BIG");
+        }
+        // 24 bytes with an all-zero tail: accepted, because the fields this
+        // kernel does not know are unset.
+        if call(Syscall::Setxattrat.raw(), mk(24)) != Some(0) {
+            return Err("a zeroed trailing region must be accepted");
+        }
+        // The same 24 bytes with something set in the tail: refused, rather
+        // than dropped.
+        args[16] = 1;
+        if call(Syscall::Setxattrat.raw(), mk(24)) != Some(E2BIG) {
+            return Err("a non-zero trailing region must be -E2BIG, not ignored");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattrat_args_size_rules);
+
+/// `at_flags` validation, and `getxattrat`'s extra rule that the struct's
+/// `flags` field must be zero.
+///
+/// `path_setxattrat` opens with
+/// `if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return
+/// -EINVAL;`, and `SYSCALL_DEFINE6(getxattrat)` adds `if (args.flags != 0)
+/// return -EINVAL;` — a get has no flags to carry, so a caller reusing a
+/// set call's struct is told instead of having the field ignored.
+fn smoke_abi_fsx2_xattrat_flag_validation() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const XATTR_CREATE: u32 = 1;
+    with_memfs("/xat4", "xat4", &[("f", b"hi")], || {
+        let path = b"/xat4/f\0";
+        let name = b"user.k\0";
+        let val = b"v";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        // An at_flag outside the two legal bits.
+        for bad in [0x200u64, 0x800, 0x1_0000] {
+            if call(
+                Syscall::Setxattrat.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: path.as_ptr() as u64,
+                    arg2: bad,
+                    arg3: name.as_ptr() as u64,
+                    arg4: args.as_ptr() as u64,
+                    arg5: 16,
+                },
+            ) != Some(EINVAL)
+            {
+                return Err("an at_flag outside AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH must be -EINVAL");
+            }
+        }
+        // getxattrat with args.flags set.
+        let mut out = [0u8; 8];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        gargs[12..16].copy_from_slice(&XATTR_CREATE.to_ne_bytes());
+        match call(
+            Syscall::Getxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: gargs.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("getxattrat with a non-zero args.flags must be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattrat_flag_validation);
+
+/// `setxattr` follows the final symlink; `lsetxattr` does not.
+///
+/// `path_setxattrat` derives the lookup from `at_flags`:
+///
+/// ```text
+/// if (!(at_flags & AT_SYMLINK_NOFOLLOW))
+///         lookup_flags = LOOKUP_FOLLOW;
+/// ```
+///
+/// so the plain form targets the file a link points at and the `l` form
+/// targets the link itself. NARF resolved with `resolve_async_nofollow`
+/// whatever the entry point, which made every form behave like the `l`
+/// one — the l-forms right by accident and the plain forms wrong, which is
+/// the direction that matters: `lsetxattr` exists BECAUSE the default is to
+/// follow, so a caller wanting the link had a spelling and a caller wanting
+/// the target did not.
+///
+/// The two attributes are read back through the opposite entry point from
+/// the one that wrote them, which is what distinguishes "both wrote
+/// somewhere" from "each wrote to its own inode".
+fn smoke_abi_fsx2_xattr_follows_symlink_unless_l_form() -> TestResult {
+    with_memfs("/xat5", "xat5", &[("target", b"hi")], || {
+        let target = b"/xat5/target\0";
+        let link = b"/xat5/link\0";
+        // An ABSOLUTE target, which is the ordinary shape in a real tree and
+        // the one that only the VFS-level walk can follow — the
+        // in-filesystem resolver restarts such a target at its own mount
+        // root. Getting this case right is why `xattr_at_path` runs
+        // `resolve_vfs_symlink_path` rather than leaving the follow to
+        // `resolve_async_ext`, which is the same split `open` uses.
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("symlink setup should succeed");
+        }
+        // `trusted.*`, not `user.*`: `xattr_permission` allows the user
+        // namespace only on regular files and directories, so `user.which`
+        // on the LINK would be -EPERM in Linux too and the case would be
+        // testing the namespace rule instead of the follow rule. The
+        // harness task is privileged, which is what `trusted.*` requires.
+        let name = b"trusted.which\0";
+        let set = |path: &[u8], val: &[u8], syscall: u32| {
+            call(
+                syscall,
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: val.as_ptr() as u64,
+                    arg3: val.len() as u64,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        // Through the link: the plain form must land on the TARGET.
+        if set(link, b"followed", Syscall::Setxattr.raw()) != Some(0) {
+            return Err("setxattr through a symlink should succeed");
+        }
+        // Through the link again, the l form: lands on the LINK.
+        if set(link, b"onlink", Syscall::Lsetxattr.raw()) != Some(0) {
+            return Err("lsetxattr on a symlink should succeed");
+        }
+        // Read the target directly. If the plain form had not followed, the
+        // two writes would have collided on the link and this would be
+        // ENODATA.
+        let mut out = [0u8; 32];
+        let get = |path: &[u8], buf: &mut [u8], syscall: u32| {
+            call(
+                syscall,
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: buf.as_mut_ptr() as u64,
+                    arg3: buf.len() as u64,
+                    ..Default::default()
+                },
+            )
+        };
+        match get(target, &mut out, Syscall::Getxattr.raw()) {
+            Some(n) if n == 8 && &out[..8] == b"followed" => {}
+            Some(-61) => return Err("setxattr through a symlink did not reach the target"),
+            _ => return Err("the target's attribute is not what setxattr wrote"),
+        }
+        // And the link kept its own, distinct value.
+        let mut out2 = [0u8; 32];
+        match get(link, &mut out2, Syscall::Lgetxattr.raw()) {
+            Some(n) if n == 6 && &out2[..6] == b"onlink" => {}
+            _ => return Err("the link's own attribute is not what lsetxattr wrote"),
+        }
+        // The plain get must follow too, seeing the target's value through
+        // the link rather than the link's own.
+        let mut out3 = [0u8; 32];
+        match get(link, &mut out3, Syscall::Getxattr.raw()) {
+            Some(n) if n == 8 && &out3[..8] == b"followed" => Ok(()),
+            _ => Err("getxattr through a symlink did not follow to the target"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_xattr_follows_symlink_unless_l_form
+);
+
+/// An ABSOLUTE symlink target resolves from the VFS root, not the mount root.
+///
+/// `fs/namei.c::nd_jump_root` — when `link_path_walk` reaches a symlink whose
+/// body starts with '/', the walk restarts at the process root and continues
+/// from there, which may leave the filesystem the link lives on entirely.
+/// Absolute targets are the common shape in a real tree (`/usr/bin/awk` ->
+/// `/etc/alternatives/awk`, and every `/lib` -> `/usr/lib` style merge).
+///
+/// NARF splits this in two: `resolve_vfs_symlink_path` does the walk at the
+/// syscall layer, where the mount table is reachable, and hands a fully
+/// resolved path to the per-filesystem resolver. Only the first half can
+/// leave the filesystem the link lives on; `resolve_async_ext` restarts an
+/// absolute target at its own mount root, which is right for what it can see
+/// and wrong for anything else.
+///
+/// This case drives `open(2)`, which has always run the VFS walk. It is here
+/// as the pin for that contract, because the xattr family did NOT run it and
+/// so got the mount-root answer — see
+/// `smoke_abi_fsx2_xattr_follows_symlink_unless_l_form`.
+fn smoke_abi_fsx2_absolute_symlink_target_resolves_from_vfs_root() -> TestResult {
+    with_memfs("/absl", "absl", &[("target", b"payload")], || {
+        let link = b"/absl/link\0";
+        let abs_target = b"/absl/target\0";
+        if call_symlink(abs_target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("symlink setup should succeed");
+        }
+        // Opening the link must reach the target's contents.
+        let fd = match call_open(link.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open through an absolute symlink target should succeed"),
+        };
+        let mut buf = [0u8; 16];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(7) if &buf[..7] == b"payload" => {}
+            _ => return Err("the absolute symlink did not resolve to its target's contents"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        // And a trailing component past the link: `/absl/link` -> `/absl`
+        // means `/absl/dirlink/target` must reach `/absl/target`.
+        let dirlink = b"/absl/dirlink\0";
+        let abs_dir = b"/absl\0";
+        if call_symlink(abs_dir.as_ptr() as u64, dirlink.as_ptr() as u64) != Some(0) {
+            return Err("directory symlink setup should succeed");
+        }
+        let through = b"/absl/dirlink/target\0";
+        let fd2 = match call_open(through.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open through an absolute directory symlink should succeed"),
+        };
+        let mut buf2 = [0u8; 16];
+        let got = call(
+            Syscall::Read.raw(),
+            a2(fd2, buf2.as_mut_ptr() as u64, buf2.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd2));
+        match got {
+            Some(7) if &buf2[..7] == b"payload" => Ok(()),
+            _ => Err("components after an absolute symlink were not applied to its target"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_absolute_symlink_target_resolves_from_vfs_root
+);
+
+// ── statmount(2) / listmount(2) ───────────────────────────────────────
+
+/// Field offsets in `struct statmount`, from `offsetof` on the real struct.
+///
+/// The ABI is the layout, and it is not countable by hand: `sb_flags`
+/// follows a `__u64` after two `__u32`s, and the `mnt_id_old` pair sits
+/// between two `__u64`s, so three fields land after padding. A wrong offset
+/// is not a compile error — it is a caller reading a mount id out of the
+/// middle of `mnt_attr` — so the test names them independently of the
+/// handler, and disagreeing with it is a failure rather than a coincidence.
+mod sm {
+    pub const SIZE: usize = 512;
+    pub const OFF_SIZE: usize = 0x00;
+    pub const OFF_MNT_OPTS: usize = 0x04;
+    pub const OFF_MASK: usize = 0x08;
+    pub const OFF_FS_TYPE: usize = 0x24;
+    pub const OFF_MNT_ID: usize = 0x28;
+    pub const OFF_MNT_PARENT_ID: usize = 0x30;
+    pub const OFF_MNT_ID_OLD: usize = 0x38;
+    pub const OFF_MNT_ATTR: usize = 0x40;
+    pub const OFF_MNT_ROOT: usize = 0x68;
+    pub const OFF_MNT_POINT: usize = 0x6c;
+    pub const OFF_SUPPORTED_MASK: usize = 0x90;
+}
+
+const STATMOUNT_SB_BASIC: u64 = 0x01;
+const STATMOUNT_MNT_BASIC: u64 = 0x02;
+const STATMOUNT_MNT_ROOT: u64 = 0x08;
+const STATMOUNT_MNT_POINT: u64 = 0x10;
+const STATMOUNT_FS_TYPE: u64 = 0x20;
+const STATMOUNT_MNT_OPTS: u64 = 0x80;
+const STATMOUNT_SUPPORTED_MASK: u64 = 0x1000;
+const MNT_UNIQUE_ID_OFFSET: u64 = 1 << 31;
+
+/// `struct mnt_id_req`: `{ u32 size; u32 mnt_fd; u64 mnt_id; u64 param; u64 mnt_ns_id; }`.
+fn mnt_id_req(size: u32, mnt_id: u64, param: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0..4].copy_from_slice(&size.to_ne_bytes());
+    b[8..16].copy_from_slice(&mnt_id.to_ne_bytes());
+    b[16..24].copy_from_slice(&param.to_ne_bytes());
+    b
+}
+
+fn rd_u32(b: &[u8], off: usize) -> u32 {
+    u32::from_ne_bytes(b[off..off + 4].try_into().unwrap())
+}
+fn rd_u64(b: &[u8], off: usize) -> u64 {
+    u64::from_ne_bytes(b[off..off + 8].try_into().unwrap())
+}
+
+/// A C string at `off` bytes into the string area (which starts at SIZE).
+fn sm_str(buf: &[u8], off: u32) -> &str {
+    let start = sm::SIZE + off as usize;
+    let end = buf[start..].iter().position(|&c| c == 0).unwrap_or(0) + start;
+    core::str::from_utf8(&buf[start..end]).unwrap_or("")
+}
+
+/// `listmount` enumerates the mounts under one mount, and `statmount`
+/// describes one of them.
+///
+/// The two are meant to be used together — list, then stat each id — so the
+/// case does exactly that rather than testing them apart.
+fn smoke_abi_fsx2_listmount_then_statmount() -> TestResult {
+    const LSMT_ROOT: u64 = u64::MAX;
+    with_memfs("/lsm", "lsm", &[("f", b"hi")], || {
+        let req = mnt_id_req(32, LSMT_ROOT, 0);
+        let mut ids = [0u64; 64];
+        let n = match call(
+            Syscall::Listmount.raw(),
+            a3(
+                req.as_ptr() as u64,
+                ids.as_mut_ptr() as u64,
+                ids.len() as u64,
+                0,
+            ),
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("listmount(LSMT_ROOT) should enumerate the mount table"),
+        };
+        // Every id must be in the unique space, which is what `statmount`
+        // will accept — `copy_mnt_id_req` rejects anything at or below the
+        // offset so a caller cannot pass a mountinfo id by mistake.
+        if ids[..n].iter().any(|&id| id <= MNT_UNIQUE_ID_OFFSET) {
+            return Err("listmount reported an id outside the unique id space");
+        }
+        // Find the mount this case created by statting each id.
+        let mask = STATMOUNT_SB_BASIC
+            | STATMOUNT_MNT_BASIC
+            | STATMOUNT_MNT_POINT
+            | STATMOUNT_FS_TYPE
+            | STATMOUNT_MNT_ROOT
+            | STATMOUNT_MNT_OPTS
+            | STATMOUNT_SUPPORTED_MASK;
+        let mut found = false;
+        for &id in &ids[..n] {
+            let sreq = mnt_id_req(32, id, mask);
+            let mut buf = [0u8; sm::SIZE + 512];
+            if call(
+                Syscall::Statmount.raw(),
+                a3(
+                    sreq.as_ptr() as u64,
+                    buf.as_mut_ptr() as u64,
+                    buf.len() as u64,
+                    0,
+                ),
+            ) != Some(0)
+            {
+                return Err("statmount on an id listmount reported should succeed");
+            }
+            // `mask` reports what was WRITTEN, which is the contract that
+            // lets a kernel answer partially instead of failing.
+            let got = rd_u64(&buf, sm::OFF_MASK);
+            if got & STATMOUNT_MNT_BASIC == 0 {
+                return Err("statmount did not report MNT_BASIC as written");
+            }
+            if rd_u64(&buf, sm::OFF_MNT_ID) != id {
+                return Err("statmount reported a different mnt_id than it was asked about");
+            }
+            // The old id is the mountinfo one — the unique id less the offset.
+            if u64::from(rd_u32(&buf, sm::OFF_MNT_ID_OLD)) != id - MNT_UNIQUE_ID_OFFSET {
+                return Err("mnt_id_old is not the mountinfo id behind mnt_id");
+            }
+            if rd_u32(&buf, sm::OFF_SIZE) as usize <= sm::SIZE {
+                return Err("statmount's size does not account for the string area");
+            }
+            if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_ROOT)) != "/" {
+                return Err("mnt_root should be the mount's root within its filesystem");
+            }
+            // The parent of a mount is another mount, so its id must also
+            // be in the unique space — a 0 here would mean the offset was
+            // never applied to the parent.
+            if rd_u64(&buf, sm::OFF_MNT_PARENT_ID) <= MNT_UNIQUE_ID_OFFSET {
+                return Err("mnt_parent_id is not in the unique id space");
+            }
+            if sm_str(&buf, rd_u32(&buf, sm::OFF_MNT_POINT)) == "/lsm" {
+                found = true;
+                if sm_str(&buf, rd_u32(&buf, sm::OFF_FS_TYPE)) != "lsm" {
+                    return Err("fs_type is not the filesystem's name");
+                }
+                // `mnt_opts` is the FILESYSTEM's own option string
+                // (`show_options`), which is the column a caller would
+                // otherwise have had to parse out of mountinfo. The two
+                // string fields must not alias: reading the same offset for
+                // both would pass a weaker check.
+                if rd_u32(&buf, sm::OFF_MNT_OPTS) == rd_u32(&buf, sm::OFF_MNT_POINT) {
+                    return Err("mnt_opts and mnt_point resolve to the same string");
+                }
+                if got & STATMOUNT_SB_BASIC == 0 {
+                    return Err("statmount did not report SB_BASIC as written");
+                }
+                // `mnt_attr` is the MOUNT_ATTR_* set. Asserted only for THIS
+                // mount, which the case created rw with no restrictions —
+                // the full boot has read-only mounts of its own, so a check
+                // over every listed mount would be asserting a property of
+                // the mount table rather than of the code.
+                const MOUNT_ATTR_RDONLY: u64 = 0x01;
+                const MOUNT_ATTR_NOSUID: u64 = 0x02;
+                const MOUNT_ATTR_NODEV: u64 = 0x04;
+                const MOUNT_ATTR_NOEXEC: u64 = 0x08;
+                let attr = rd_u64(&buf, sm::OFF_MNT_ATTR);
+                if attr
+                    & (MOUNT_ATTR_RDONLY | MOUNT_ATTR_NOSUID | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOEXEC)
+                    != 0
+                {
+                    return Err("mnt_attr reports restrictions this mount was not made with");
+                }
+                if got & STATMOUNT_SUPPORTED_MASK == 0
+                    || rd_u64(&buf, sm::OFF_SUPPORTED_MASK) & STATMOUNT_MNT_BASIC == 0
+                {
+                    return Err("supported_mask does not advertise a mask that works");
+                }
+            }
+        }
+        if !found {
+            return Err("listmount did not include the mount this case created");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_listmount_then_statmount);
+
+/// The returned `mask` says what was written, so an unsupported bit comes
+/// back CLEAR rather than failing the call.
+///
+/// That is Linux's own contract — filesystems vary in what they can supply —
+/// and it is what lets NARF answer honestly without faking a field. A caller
+/// learns the whole set at once from `supported_mask`.
+fn smoke_abi_fsx2_statmount_mask_reports_what_was_written() -> TestResult {
+    const STATMOUNT_PROPAGATE_FROM: u64 = 0x04;
+    const LSMT_ROOT: u64 = u64::MAX;
+    with_memfs("/lsm2", "lsm2", &[("f", b"hi")], || {
+        let req = mnt_id_req(32, LSMT_ROOT, 0);
+        let mut ids = [0u64; 8];
+        let n = match call(
+            Syscall::Listmount.raw(),
+            a3(req.as_ptr() as u64, ids.as_mut_ptr() as u64, 8, 0),
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("listmount setup should succeed"),
+        };
+        let _ = n;
+        // Ask for something NARF cannot supply alongside something it can.
+        let mask = STATMOUNT_MNT_BASIC | STATMOUNT_PROPAGATE_FROM | STATMOUNT_SUPPORTED_MASK;
+        let sreq = mnt_id_req(32, ids[0], mask);
+        let mut buf = [0u8; sm::SIZE];
+        if call(
+            Syscall::Statmount.raw(),
+            a3(
+                sreq.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+                0,
+            ),
+        ) != Some(0)
+        {
+            return Err("an unsupported mask bit must not fail the call");
+        }
+        let got = rd_u64(&buf, sm::OFF_MASK);
+        if got & STATMOUNT_MNT_BASIC == 0 {
+            return Err("the supported half of the mask was not written");
+        }
+        if got & STATMOUNT_PROPAGATE_FROM != 0 {
+            return Err("statmount claimed to have written a field it cannot supply");
+        }
+        if rd_u64(&buf, sm::OFF_SUPPORTED_MASK) & STATMOUNT_PROPAGATE_FROM != 0 {
+            return Err("supported_mask advertises a bit that is not in fact supported");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_statmount_mask_reports_what_was_written
+);
+
+/// `copy_mnt_id_req`'s version rules, shared by both syscalls.
+///
+/// ```text
+/// if (unlikely(usize > PAGE_SIZE))            return -E2BIG;
+/// if (unlikely(usize < MNT_ID_REQ_SIZE_VER0)) return -EINVAL;   /* 24 */
+/// ```
+///
+/// The ORDER matters and is easy to get backwards: an oversized `size`
+/// reports -E2BIG even though it is also not a version this kernel knows.
+/// And `mnt_id <= MNT_UNIQUE_ID_OFFSET` is -EINVAL, which is what stops a
+/// caller passing a `/proc/self/mountinfo` id and silently addressing a
+/// different mount than it meant.
+fn smoke_abi_fsx2_mnt_id_req_version_rules() -> TestResult {
+    const E2BIG: i64 = -7;
+    const LSMT_ROOT: u64 = u64::MAX;
+    with_memfs("/lsm3", "lsm3", &[("f", b"hi")], || {
+        let mut ids = [0u64; 8];
+        let mut list = |req: &[u8]| {
+            call(
+                Syscall::Listmount.raw(),
+                a3(req.as_ptr() as u64, ids.as_mut_ptr() as u64, 8, 0),
+            )
+        };
+        // Below VER0.
+        if list(&mnt_id_req(23, LSMT_ROOT, 0)) != Some(EINVAL) {
+            return Err("a size below MNT_ID_REQ_SIZE_VER0 must be -EINVAL");
+        }
+        // Past PAGE_SIZE — E2BIG, and decided first.
+        if list(&mnt_id_req(4097, LSMT_ROOT, 0)) != Some(E2BIG) {
+            return Err("a size above PAGE_SIZE must be -E2BIG");
+        }
+        // VER0 exactly: the older struct, without mnt_ns_id. Accepted.
+        match list(&mnt_id_req(24, LSMT_ROOT, 0)) {
+            Some(n) if n > 0 => {}
+            _ => return Err("MNT_ID_REQ_SIZE_VER0 must still be accepted"),
+        }
+        // A mountinfo-space id rather than a unique one.
+        if list(&mnt_id_req(32, 2, 0)) != Some(EINVAL) {
+            return Err("an id at or below MNT_UNIQUE_ID_OFFSET must be -EINVAL");
+        }
+        // An id in the right space that names nothing.
+        if list(&mnt_id_req(32, MNT_UNIQUE_ID_OFFSET + 99_999, 0)) != Some(-2) {
+            return Err("an unknown mount id must be -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_mnt_id_req_version_rules);
+
+/// `listmount`'s flag and count limits, and the cursor.
+///
+/// `req.param` is the last id already seen, so a caller with more mounts
+/// than buffer RESUMES rather than restarting — which is the whole reason
+/// the call is safe to use against a live mount table. Paging one id at a
+/// time must reach exactly the same set as one big call.
+fn smoke_abi_fsx2_listmount_flags_limits_and_cursor() -> TestResult {
+    const EOVERFLOW: i64 = -75;
+    const LISTMOUNT_REVERSE: u64 = 1;
+    const LSMT_ROOT: u64 = u64::MAX;
+    with_memfs("/lsm4", "lsm4", &[("f", b"hi")], || {
+        let req = mnt_id_req(32, LSMT_ROOT, 0);
+        let mut ids = [0u64; 64];
+        let call_list = |flags: u64, nr: u64, req: &[u8], out: &mut [u64]| {
+            call(
+                Syscall::Listmount.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, nr, flags),
+            )
+        };
+        // An unknown flag bit.
+        if call_list(0x2, 64, &req, &mut ids) != Some(EINVAL) {
+            return Err("an unknown listmount flag must be -EINVAL");
+        }
+        // Past the one-million cap.
+        if call_list(0, 1_000_001, &req, &mut ids) != Some(EOVERFLOW) {
+            return Err("nr_mnt_ids above the cap must be -EOVERFLOW");
+        }
+        // The whole list in one call.
+        let n = match call_list(0, 64, &req, &mut ids) {
+            Some(n) if n > 1 => n as usize,
+            _ => return Err("this case needs at least two mounts to page through"),
+        };
+        let all = ids[..n].to_vec();
+        // Now page it one at a time, carrying the cursor.
+        let mut paged = alloc::vec::Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let creq = mnt_id_req(32, LSMT_ROOT, cursor);
+            let mut one = [0u64; 1];
+            match call_list(0, 1, &creq, &mut one) {
+                Some(1) => {
+                    paged.push(one[0]);
+                    cursor = one[0];
+                }
+                Some(0) => break,
+                _ => return Err("paging with a cursor should keep returning ids"),
+            }
+            if paged.len() > n {
+                return Err("the cursor did not advance — paging would not terminate");
+            }
+        }
+        if paged != all {
+            return Err("paging with the cursor reached a different set than one call");
+        }
+        // Reverse yields the same set, opposite order.
+        let mut rids = [0u64; 64];
+        let rn = match call_list(LISTMOUNT_REVERSE, 64, &req, &mut rids) {
+            Some(c) if c as usize == n => n,
+            _ => return Err("reverse listmount should return the same count"),
+        };
+        let mut reversed = rids[..rn].to_vec();
+        reversed.reverse();
+        if reversed != all {
+            return Err("LISTMOUNT_REVERSE did not return the same set in reverse order");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_listmount_flags_limits_and_cursor
+);
+
+/// `statmount`'s flag validation and the string-area sizing.
+///
+/// `prepare_kstatmount` answers -EOVERFLOW for a request that asks for a
+/// string with no room past the fixed struct, BEFORE the mount is looked up:
+///
+/// ```text
+/// if (ks->mask & STATMOUNT_STRING_REQ) {
+///         if (bufsize == sizeof(ks->sm))
+///                 return -EOVERFLOW;
+/// ```
+///
+/// STATMOUNT_BY_FD is a legal flag this kernel refuses rather than one it
+/// does not know, and the two answers are deliberately different: -EINVAL
+/// means "no such flag", -EOPNOTSUPP means "that flag, not here".
+fn smoke_abi_fsx2_statmount_flags_and_overflow() -> TestResult {
+    const EOVERFLOW: i64 = -75;
+    const EOPNOTSUPP: i64 = -95;
+    const STATMOUNT_BY_FD: u64 = 1;
+    const LSMT_ROOT: u64 = u64::MAX;
+    with_memfs("/lsm5", "lsm5", &[("f", b"hi")], || {
+        let lreq = mnt_id_req(32, LSMT_ROOT, 0);
+        let mut ids = [0u64; 8];
+        if !matches!(
+            call(
+                Syscall::Listmount.raw(),
+                a3(lreq.as_ptr() as u64, ids.as_mut_ptr() as u64, 8, 0)
+            ),
+            Some(n) if n > 0
+        ) {
+            return Err("listmount setup should succeed");
+        }
+        let id = ids[0];
+        let mut buf = [0u8; sm::SIZE + 256];
+        let stat = |mask: u64, bufsize: u64, flags: u64, out: &mut [u8]| {
+            let req = mnt_id_req(32, id, mask);
+            call(
+                Syscall::Statmount.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, bufsize, flags),
+            )
+        };
+        // An unknown flag.
+        if stat(STATMOUNT_MNT_BASIC, sm::SIZE as u64, 0x2, &mut buf) != Some(EINVAL) {
+            return Err("an unknown statmount flag must be -EINVAL");
+        }
+        // A known flag this kernel cannot serve.
+        if stat(
+            STATMOUNT_MNT_BASIC,
+            sm::SIZE as u64,
+            STATMOUNT_BY_FD,
+            &mut buf,
+        ) != Some(EOPNOTSUPP)
+        {
+            return Err("STATMOUNT_BY_FD must be refused as unsupported, not as unknown");
+        }
+        // A string request with room for the struct only.
+        if stat(STATMOUNT_MNT_POINT, sm::SIZE as u64, 0, &mut buf) != Some(EOVERFLOW) {
+            return Err("a string request with no room past the struct must be -EOVERFLOW");
+        }
+        // The same request with room: succeeds, and the non-string half of
+        // the mask still works at exactly sizeof(statmount).
+        if stat(STATMOUNT_MNT_POINT, buf.len() as u64, 0, &mut buf) != Some(0) {
+            return Err("a string request with room should succeed");
+        }
+        if stat(STATMOUNT_MNT_BASIC, sm::SIZE as u64, 0, &mut buf) != Some(0) {
+            return Err("a non-string request at exactly sizeof(statmount) should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_statmount_flags_and_overflow);
