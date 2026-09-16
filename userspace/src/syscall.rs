@@ -1700,6 +1700,15 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `statmount(req, buf, bufsize, flags)` — query one mount without
+    /// parsing `/proc/self/mountinfo`.
+    /// Linux `statmount` (x86_64=457, aarch64=457).
+    Statmount,
+    /// `listmount(req, mnt_ids, nr_mnt_ids, flags)` — enumerate the mounts
+    /// reachable from one mount, with a cursor so a caller with more mounts
+    /// than buffer resumes rather than restarting.
+    /// Linux `listmount` (x86_64=458, aarch64=458).
+    Listmount,
     /// `setxattrat(dfd, path, at_flags, name, xattr_args*, usize)` — the
     /// general form of the twelve legacy xattr calls, which Linux 6.13 made
     /// presets of it. Linux `setxattrat` (x86_64=463, aarch64=463).
@@ -2528,6 +2537,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 195),
     (Syscall::Flistxattr, 196),
     (Syscall::Removexattr, 197),
+    (Syscall::Statmount, 457),
+    (Syscall::Listmount, 458),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),
@@ -2996,6 +3007,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 12),
     (Syscall::Flistxattr, 13),
     (Syscall::Removexattr, 14),
+    (Syscall::Statmount, 457),
+    (Syscall::Listmount, 458),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),

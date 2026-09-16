@@ -10026,6 +10026,9 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fremovexattr",
         RawFnHandler(sys_fremovexattr),
     );
+    // Mount-table queries (Linux 6.8).
+    table.install_raw(Syscall::Statmount, "statmount", RawFnHandler(sys_statmount));
+    table.install_raw(Syscall::Listmount, "listmount", RawFnHandler(sys_listmount));
     // The general form the twelve above are presets of (Linux 6.13).
     table.install_raw(
         Syscall::Setxattrat,
@@ -11221,6 +11224,8 @@ mod handler_sys_settimeofday;
 mod handler_sys_setuid;
 #[path = "sys_setxattr.rs"]
 mod handler_sys_setxattr;
+#[path = "sys_statmount.rs"]
+mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]
 mod handler_sys_xattrat;
 #[path = "sys_shmat.rs"]
@@ -11625,6 +11630,7 @@ pub(crate) use {
     handler_sys_settimeofday::sys_settimeofday,
     handler_sys_setuid::sys_setuid,
     handler_sys_setxattr::{sys_lsetxattr, sys_setxattr},
+    handler_sys_statmount::{sys_listmount, sys_statmount},
     handler_sys_xattrat::{
         sys_getxattrat, sys_listxattrat, sys_removexattrat, sys_setxattrat, xattr_get_at,
         xattr_list_at, xattr_remove_at, xattr_set_at, AT_EMPTY_PATH_ARG, AT_FDCWD_ARG,
