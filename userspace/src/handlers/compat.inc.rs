@@ -10241,6 +10241,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "io_cancel",
         RawFnHandler(aio::sys_io_cancel),
     );
+    table.install_raw(
+        Syscall::IoPgetevents,
+        "io_pgetevents",
+        RawFnHandler(aio::sys_io_pgetevents),
+    );
 
     // Auto-wire both delivery hooks so any kernel that uses
     // `install_core_syscalls` gets the async + sync signal paths
@@ -10790,6 +10795,122 @@ mod aio {
             count += 1;
         }
         ctx.set_return(SyscallReturn::ok(count as u64));
+    }
+
+    /// `fs/aio.c::SYSCALL_DEFINE6(io_pgetevents)` — x86_64 333, generic 292.
+    ///
+    /// ```text
+    /// if (timeout && unlikely(get_timespec64(&ts, timeout)))  return -EFAULT;
+    /// if (usig && copy_from_user(&ksig, usig, sizeof(ksig)))  return -EFAULT;
+    /// ret = set_user_sigmask(ksig.sigmask, ksig.sigsetsize);
+    /// if (ret) return ret;
+    /// ret = do_io_getevents(ctx_id, min_nr, nr, events, timeout ? &ts : NULL);
+    /// interrupted = signal_pending(current);
+    /// restore_saved_sigmask_unless(interrupted);
+    /// if (interrupted && !ret) ret = -ERESTARTNOHAND;
+    /// ```
+    ///
+    /// `io_getevents` with a signal mask applied for the duration, which is
+    /// the same shape `ppoll`/`pselect`/`epoll_pwait` have and exists for the
+    /// same reason: a caller that wants to be woken by a signal must unblock
+    /// it, and doing that around the call rather than inside it leaves a
+    /// window where the signal arrives and is lost.
+    ///
+    /// The first five arguments are `io_getevents`'s, in the same registers,
+    /// so the body is reached directly rather than through a reshaping
+    /// wrapper — only the sixth is new.
+    pub(super) fn sys_io_pgetevents(ctx: &mut dyn TrapContext) {
+        const AIO_SIGSET_LEN: usize = 16;
+        let args = *ctx.args();
+        let timeout = args.arg4;
+        let usig = args.arg5;
+
+        // `get_timespec64` runs FIRST, before the sigset is even read. NARF's
+        // `io_getevents` does not block — completions are synchronous, so
+        // events are already queued — but the fault this raises is observable
+        // whether or not the value is then used, and skipping the read would
+        // accept a pointer Linux rejects.
+        if timeout != 0 {
+            let mut ts = [0u8; 16];
+            // SAFETY: `timeout` is the user `struct __kernel_timespec`;
+            // copy_from_user range-validates it and brackets the read.
+            if unsafe { copy_from_user(&mut ts, timeout) }.is_err() {
+                ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+                return;
+            }
+        }
+
+        let mut old_mask = None;
+        if usig != 0 {
+            let mut buf = [0u8; AIO_SIGSET_LEN];
+            // SAFETY: `usig` is the user `struct __aio_sigset`
+            // `{ const sigset_t *sigmask; size_t sigsetsize; }`.
+            if unsafe { copy_from_user(&mut buf, usig) }.is_err() {
+                ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+                return;
+            }
+            let sigmask = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+            let sigsetsize = u64::from_ne_bytes(buf[8..16].try_into().unwrap());
+            // `set_user_sigmask` tests the POINTER before the size:
+            //
+            //     if (!umask) return 0;
+            //     if (sigsetsize != sizeof(sigset_t)) return -EINVAL;
+            //
+            // so a NULL sigmask with a nonsense size is accepted, and only a
+            // real mask has its size checked. Checking the size first — the
+            // obvious way — would reject a call Linux allows.
+            if sigmask != 0 {
+                if sigsetsize != 8 {
+                    ctx.set_return(SyscallReturn::ok(EINVAL as u64));
+                    return;
+                }
+                let mut mask_buf = [0u8; 8];
+                // SAFETY: `sigmask` is the user `sigset_t`, size checked to
+                // be 8 immediately above.
+                if unsafe { copy_from_user(&mut mask_buf, sigmask) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok(EFAULT as u64));
+                    return;
+                }
+                let mask = u64::from_ne_bytes(mask_buf);
+                let task = current_task_id();
+                old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
+            }
+        }
+
+        // Whether anything was available to reap, sampled BEFORE the call.
+        // `ERESTARTNOHAND` below is conditional on `!ret` — the number of
+        // events reaped — and `TrapContext` has no way to read a return that
+        // was just set, so this stands in for it: `io_getevents` returns a
+        // nonzero count exactly when the queue had something in it.
+        let tid = current_task_id();
+        let had_completions = with_task_ctxs(tid, |m| {
+            m.get(&args.arg0).is_some_and(|c| !c.completions.is_empty())
+        });
+
+        sys_io_getevents(ctx);
+
+        if let Some(old) = old_mask {
+            // `restore_saved_sigmask_unless(interrupted)`: Linux leaves the
+            // mask swapped when a signal is pending, so the handler runs
+            // under the caller's chosen mask and `sigreturn` puts the old one
+            // back. NARF has no saved-sigmask slot for that hand-off, so the
+            // mask is restored here either way — the thing it must not do is
+            // leave the caller permanently under a mask it asked for only for
+            // the duration of this call.
+            let interrupted = super::is_signal_pending(tid);
+            crate::handlers::set_signal_mask_for_task(tid, old);
+            // `if (interrupted && !ret) ret = -ERESTARTNOHAND;` — a signal
+            // arrived and nothing was reaped, so the call says EINTR rather
+            // than a bare 0, which a caller would read as "no completions
+            // yet" and loop on, never seeing the signal it unblocked to
+            // receive. Only when nothing was reaped: a call that DID return
+            // events must report them, or they are lost. NARF maps
+            // ERESTARTNOHAND to EINTR at the syscall boundary, as
+            // `sys_rt_sigsuspend` does.
+            if interrupted && !had_completions {
+                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // -EINTR
+            }
+        }
     }
 }
 

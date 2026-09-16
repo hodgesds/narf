@@ -1700,6 +1700,14 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `io_pgetevents(ctx, min_nr, nr, events, timeout, sigset)` —
+    /// `io_getevents` with a signal mask applied for the duration, so a
+    /// caller waiting on AIO completions can be woken by a signal without a
+    /// window where it arrives unblocked and is lost.
+    ///
+    /// The arch numbers do NOT match: x86_64 333, generic (aarch64) 292.
+    /// Linux `io_pgetevents`.
+    IoPgetevents,
     /// `quotactl_fd(fd, cmd, id, addr)` — `quotactl(2)`'s operations,
     /// naming the filesystem by an open descriptor instead of a device path.
     /// Linux `quotactl_fd` (x86_64=443, aarch64=443).
@@ -2546,6 +2554,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 195),
     (Syscall::Flistxattr, 196),
     (Syscall::Removexattr, 197),
+    (Syscall::IoPgetevents, 333),
     (Syscall::QuotactlFd, 443),
     (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
@@ -3018,6 +3027,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 12),
     (Syscall::Flistxattr, 13),
     (Syscall::Removexattr, 14),
+    (Syscall::IoPgetevents, 292),
     (Syscall::QuotactlFd, 443),
     (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
