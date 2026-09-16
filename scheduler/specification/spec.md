@@ -166,21 +166,26 @@ but syscall/driver critical regions have not completed the adoption audit;
 enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
 `note_urgent_wake_preempt` publishes the exact task selected by a synchronous
-wake. An own-stack source may consume that publication as a one-hop direct
+wake. An own-stack source may consume that publication as a bounded direct
 handoff only when both tasks are local stackful tasks using the same execution
 kind, the target is an awake default-class/normal-priority task with no period,
 budget cap, or donation, and the installed policy is the built-in class or FIFO
 policy. The target slot remains in its home queue under a core-owned atomic
-claim, so dispatch and stealing skip it until the root executor resumes. The
-target always returns to the source's root executor continuation, never to the
-source task stack, which bounds the transfer to one hop and prevents a chain of
-live task stacks. Before the first target instruction, the core publishes its
-task/address-space identity and restores its hardware root, kernel-stack target,
-TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD ownership,
-and PMU attribution. Switch-out saves the same state before the root identity is
-restored. A remote, contended, first-run, periodic, capped, donated, higher-class,
-or external-policy target declines to the ordinary exact-buddy/full-validation
-path. Generic every-wake preemption and wake-next remain opt-in.
+claim, so dispatch and stealing skip it until the final switch has completed.
+The target normally returns to the source's root executor continuation. If it
+urgently wakes that exact off-queue root, it may instead switch directly to the
+root's saved task continuation once; the root's next yield must reach the
+executor before any further direct handoff. The off-queue root is pinned by its
+in-flight executor poll, the exact `WakeCell` identity substitutes for a queue
+lookup, and a CPU-local whole-poll gate also covers nested scheduler pumps.
+Arbitrary target-to-third-task chains and repeated ping-pong are therefore
+forbidden. Before either task's first resumed instruction, the core publishes
+its task/address-space identity and restores its hardware root, kernel-stack
+target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
+ownership, and PMU attribution. Switch-out saves the same state first. A remote,
+contended, first-run, periodic, capped, donated, higher-class, or external-policy
+target declines to the ordinary exact-buddy/full-validation path. Generic
+every-wake preemption and wake-next remain opt-in.
 Syscall-frequency per-CPU wake, urgent-handoff, and runnable-peer cells occupy
 separate cache lines; independent CPUs never serialize their local scheduling
 hints through false sharing. This is a representation rule only: the same
@@ -295,7 +300,7 @@ ordering and remains subordinate to core budget validation. The sole pre-scan
 executor selection is an exact synchronous-handoff hint for an awake task with
 no periodic budget: that state proves the highest eligibility tier without
 budget accounting, and wake-next already precedes class ordering within that
-tier. Before returning through the executor, an eligible one-hop direct transfer
+tier. Before returning through the executor, an eligible bounded direct transfer
 may instead claim that same resident slot under its home queue lock; external
 policies, periodic/capped/donated targets, and non-default task classes always
 retain the full callback and validation scan. Under `ClassScheduler`, a
@@ -601,7 +606,9 @@ control callback.
   last incoming-context load and before the resumed continuation.
 - The synchronous-wake direct-transfer path restores the callee's saved
   architecture domain state and reported domain byte before its first
-  instruction, and captures both before returning to the root executor.
+  instruction, and captures both before returning to the exact root task or
+  its executor continuation. The exact-root return restores that root's state
+  before its first resumed instruction and cannot extend to a third task.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held
@@ -720,8 +727,10 @@ operation transfers bounded budget credit and moves an already queued donee
 to the head of its core-owned queue; it does not branch directly to the donee.
 This covers the present IPC-pair priority-inheritance case without multi-CPU
 coordinated dispatch. The synchronous-wake direct path is a single-CPU,
-one-target transfer that returns to the root executor and remains subject to the
-first-instruction domain-restore gate in §4; it does not coordinate a gang.
+one-target transfer that returns either to the exact root once or to the root
+executor, forces the next root yield through the executor, and remains subject
+to the first-instruction domain-restore gate in §4; it does not coordinate a
+gang.
 Other producer-consumer pairs express cache locality via affinity hints.
 
 Revisit if profiling shows specific pairs that lose >10% to

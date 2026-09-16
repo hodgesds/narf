@@ -67,11 +67,15 @@ source FP/SIMD and task-domain state, publishes and activates the target's task
 identity/address space, restores its kernel-stack target, TLS, saved domain
 state, and FP/SIMD ownership, then switches to the target continuation. The
 target's executor pointer is the source's root executor continuation, not the
-source stack. A target yield, completion, or tick preemption therefore restores
-the root identity/address space and switches to the executor in one hop. The
-claim is released only after the executor is executing again; the target's
-runtime is charged to its own virtual runtime and removed from the source's
-poll charge.
+source stack. A target yield, completion, or tick preemption normally restores
+the root identity/address space and switches to the executor. When the target
+urgently wakes that exact off-queue root, it may restore the same state and
+switch directly to the root's saved task continuation once. The root's next
+yield must reach the executor before another direct transfer; a CPU-local gate
+covers the entire in-flight poll, including nested scheduler pumps, so no third
+task stack or repeated ping-pong can extend the chain. The resident target claim
+is released only after the final switch completes. The target's runtime is
+charged to its own virtual runtime and removed from the source's poll charge.
 
 ## 4. Tick decision
 
@@ -155,10 +159,12 @@ rolling generation-ordered cutover.
   before migration and permits deferred restore only while the task-owned
   memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
-- Direct handoff is one hop: the claimed target is skipped by executor dispatch
-  and stealing, returns only to the root executor continuation, and restores
-  address-space ownership, TLS, domain state, and FP/SIMD ownership before its
-  first instruction. A decline leaves the exact wakee on the ordinary validated
+- Direct handoff is bounded to one claimed target and one optional exact-root
+  return: executor dispatch and stealing skip the target until the final switch
+  completes; arbitrary third-task transfers are refused; and the root's next
+  yield must pass through the executor. Address-space ownership, TLS, domain
+  state, and FP/SIMD ownership are restored before each resumed task's first
+  instruction. A decline leaves the exact wakee on the ordinary validated
   selection path.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.

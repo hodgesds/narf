@@ -270,6 +270,7 @@ pub fn __reset_user_own_stack_for_test() {
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
         DIRECT_HANDOFF_ACTIVE[cpu].store(false, Ordering::Release);
         DIRECT_HANDOFF_ROOT[cpu].store(core::ptr::null_mut(), Ordering::Release);
+        DIRECT_HANDOFF_RETURNED_ROOT[cpu].store(core::ptr::null_mut(), Ordering::Release);
         let _ = DIRECT_HANDOFF_ROOT_AS[cpu].lock().take();
         DIRECT_FOREIGN_CYCLES[cpu].store(0, Ordering::Release);
         let target = DIRECT_HANDOFF_TARGET[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
@@ -769,7 +770,15 @@ unsafe fn try_direct_handoff(
     source: *mut KernelTask,
     source_ctx: *mut KernelContext,
 ) -> bool {
-    if direct_handoff_active(cpu) {
+    // A root that already received a direct return may synchronously pump a
+    // nested stackful task before its own poll unwinds. Block the whole CPU-local
+    // nesting chain, not merely the matching root pointer, until that poll has
+    // reached its executor continuation.
+    if direct_handoff_active(cpu)
+        || !DIRECT_HANDOFF_RETURNED_ROOT[cpu]
+            .load(Ordering::Acquire)
+            .is_null()
+    {
         return false;
     }
     narf_lib::sync::without_interrupts(|| {
@@ -848,14 +857,26 @@ unsafe fn try_direct_handoff(
         guard_switch_into("direct_handoff:target.ctx", &target_ref.ctx);
         DIRECT_HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
         // SAFETY: source and target contexts are distinct, live save slots;
-        // the target returns to `root_exec`, not through this task's stack.
+        // the target returns either to `root_exec` or directly to this exact
+        // root continuation, never to a third task stack.
         unsafe { kernel_switch(source_ctx, &target_ref.ctx) };
+        // A direct target may have switched straight back to this source. Its
+        // resident-slot claim can be dropped only after that final switch has
+        // completed; the executor-return path performs the same operation from
+        // `poll_to_yield`, making this a no-op for the ordinary return.
+        // An ordinary return may later re-dispatch this source on another CPU;
+        // never use the captured old CPU to clean up a newer handoff there.
+        let resumed_cpu = this_cpu();
+        if DIRECT_HANDOFF_RETURNED_ROOT[resumed_cpu].load(Ordering::Acquire) == source {
+            complete_direct_return(resumed_cpu);
+        }
         true
     })
 }
 
 /// Restore the root task's software identity/address-space view immediately
-/// before the direct target switches to the root executor continuation.
+/// before the direct target switches to either the root task or its executor
+/// continuation.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted: bool) {
     if !DIRECT_HANDOFF_ACTIVE[cpu].swap(false, Ordering::AcqRel) {
@@ -903,11 +924,88 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     user_perf_switch(root_cell.task, true);
 }
 
-/// Drop the target claim only after the root executor is executing again. A
-/// remote thief can then select the resident slot without racing the target's
-/// final switch-out instruction window.
+/// Return an active direct target to the exact root task that urgently woke.
+///
+/// The root is pinned off-queue by its in-flight executor poll, so it cannot use
+/// the resident-slot claim path. The exact WakeCell comparison substitutes for
+/// that lookup. One such return is allowed per root poll; the root's next yield
+/// must visit the executor, bounding fairness latency and preventing repeated
+/// ping-pong from starving unrelated runnable work or RCU quiescent states.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn try_direct_return_to_root(
+    cpu: usize,
+    current: *mut KernelTask,
+    current_ctx: *mut KernelContext,
+) -> bool {
+    if !direct_handoff_active(cpu) {
+        return false;
+    }
+    narf_lib::sync::without_interrupts(|| {
+        let Some(cell) = crate::take_urgent_wake_cell(cpu) else {
+            return false;
+        };
+        let root = DIRECT_HANDOFF_ROOT[cpu].load(Ordering::Acquire);
+        if root.is_null() {
+            crate::hint_urgent_next(cell.task);
+            return false;
+        }
+        // SAFETY: an active handoff pins the off-queue root until either this
+        // return or the ordinary executor-return path completes.
+        let root_ref = unsafe { &*root };
+        let Some(root_cell) = task_wake_cell(root_ref) else {
+            crate::hint_urgent_next(cell.task);
+            return false;
+        };
+        if !Arc::ptr_eq(&cell, &root_cell) {
+            // A target other than the root still takes the bounded executor
+            // path. Preserve its scalar next-buddy hint for normal selection.
+            crate::hint_urgent_next(cell.task);
+            return false;
+        }
+        if !cell.flag.swap(false, Ordering::AcqRel) {
+            // A stale urgent publication must not make a parked root runnable.
+            return false;
+        }
+
+        let previous = DIRECT_HANDOFF_RETURNED_ROOT[cpu].swap(root, Ordering::AcqRel);
+        assert!(previous.is_null(), "direct root return escaped its poll");
+        // SAFETY: current is the live direct target, and the active handoff
+        // pins root/current plus both context save slots.
+        unsafe { finish_direct_handoff(cpu, current, false) };
+        // The direct target installed its own kernel-stack target and TLS.
+        // Restore both for the root before its continuation can reach userspace.
+        // SAFETY: root remains pinned by the in-flight executor poll.
+        unsafe { prepare_direct_arch_state(root_ref) };
+        // Restore eager FPSIMD state on aarch64, or arm x86 deferred restore,
+        // before the root executes its first resumed instruction.
+        user_fpu_restore_task(cpu, root_ref);
+        guard_switch_into("direct_handoff:root.ctx", &root_ref.ctx);
+        #[cfg(any(test, feature = "kernel-test"))]
+        DIRECT_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: current/root contexts are distinct live save slots. The
+        // switch resumes the root immediately after its source->target switch.
+        unsafe { kernel_switch(current_ctx, &root_ref.ctx) };
+        true
+    })
+}
+
+/// Drop the target claim only after the target's final switch has completed,
+/// either in the resumed exact root or in the root executor. A remote thief can
+/// then select the resident slot without racing that switch-out window.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn complete_direct_return(cpu: usize) {
+    // A direct target can synchronously pump and poll another stackful task.
+    // That inner poll also returns through `poll_to_yield`, but it is not the
+    // root executor continuation and must not release the outer target claim.
+    // `finish_direct_handoff` clears ACTIVE before either legitimate return.
+    if direct_handoff_active(cpu) {
+        return;
+    }
+    // The no-handoff executor path is overwhelmingly common. Avoid a locked
+    // RMW merely to rediscover an empty slot.
+    if DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire).is_null() {
+        return;
+    }
     let ptr = DIRECT_HANDOFF_TARGET[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
     if ptr.is_null() {
         return;
@@ -923,6 +1021,21 @@ fn complete_direct_return(cpu: usize) {
         unsafe { (&*task).completed.load(Ordering::Acquire) }
     };
     crate::release_direct_handoff_target(&cell, completed);
+}
+
+/// Clear the one-return fairness gate only after this root poll has actually
+/// reached its executor continuation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn complete_direct_root_poll(cpu: usize, root: *mut KernelTask) {
+    if DIRECT_HANDOFF_RETURNED_ROOT[cpu].load(Ordering::Acquire) != root {
+        return;
+    }
+    let _ = DIRECT_HANDOFF_RETURNED_ROOT[cpu].compare_exchange(
+        root,
+        core::ptr::null_mut(),
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 /// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
@@ -991,9 +1104,16 @@ static DIRECT_HANDOFF_ROOT_AS: [narf_lib::sync::IrqSafeSpinLock<
     [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
 static DIRECT_HANDOFF_TARGET: [AtomicPtr<crate::WakeCell>; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
+/// Root that already received the one permitted target->root return during its
+/// current executor poll. All sources must return through the executor
+/// before starting another direct handoff.
+static DIRECT_HANDOFF_RETURNED_ROOT: [AtomicPtr<KernelTask>; narf_lib::percpu::MAX_CPUS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
 static DIRECT_FOREIGN_CYCLES: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
     [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
 static DIRECT_HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "kernel-test"))]
+static DIRECT_RETURN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn direct_handoff_active(cpu: usize) -> bool {
@@ -1010,6 +1130,11 @@ pub(crate) fn take_direct_foreign_cycles() -> u64 {
 #[doc(hidden)]
 pub fn direct_handoff_count() -> u64 {
     DIRECT_HANDOFF_COUNT.load(Ordering::Acquire)
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+fn direct_return_count() -> u64 {
+    DIRECT_RETURN_COUNT.load(Ordering::Acquire)
 }
 
 /// Per-CPU save target for the FINAL `kernel_switch` of an exiting task
@@ -1630,7 +1755,9 @@ impl KernelTask {
         // SAFETY: both contexts and the task-owned stack remain live across
         // this switch; `exec_ctx` is this CPU's exclusive persistent slot.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
-        complete_direct_return(this_cpu());
+        let resumed_cpu = this_cpu();
+        complete_direct_return(resumed_cpu);
+        complete_direct_root_poll(resumed_cpu, self as *mut KernelTask);
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
         self.domain_byte
@@ -1752,7 +1879,9 @@ impl KernelTask {
         // SAFETY: both contexts and the task-owned stack remain live, and this
         // CPU exclusively owns the executor context for the switch round trip.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
-        complete_direct_return(this_cpu());
+        let resumed_cpu = this_cpu();
+        complete_direct_return(resumed_cpu);
+        complete_direct_root_poll(resumed_cpu, self as *mut KernelTask);
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
         self.domain_byte
@@ -1762,7 +1891,6 @@ impl KernelTask {
         user_perf_switch(perf_task, false);
         // SAFETY: same exclusive per-CPU slot as above.
         unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
-        let resumed_cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(saved_current, Ordering::Release);
         if !saved_current.is_null() {
             // SAFETY: same pinned outer-task invariant as the save above.
@@ -2682,11 +2810,18 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask) {
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: p is a valid non-null pointer to the active user task.
     let ctx = unsafe { &raw mut (*p).ctx };
-    // First try the one-hop exact-wakee transfer. On success this call resumes
-    // only when the ordinary executor later dispatches THIS source task.
+    // First try the bounded exact-wake transfer. An ordinary source may enter
+    // one resident target; that target may return directly only to its exact
+    // off-queue root. Every other case visits the executor.
     // SAFETY: p is the live current task and ctx its exclusive context save
     // slot; both remain pinned across the complete switch round trip.
-    let direct = unsafe { try_direct_handoff(cpu, p, ctx) };
+    let direct = if direct_handoff_active(cpu) {
+        // SAFETY: forwarded from this function's live-current-task contract.
+        unsafe { try_direct_return_to_root(cpu, p, ctx) }
+    } else {
+        // SAFETY: forwarded from this function's live-current-task contract.
+        unsafe { try_direct_handoff(cpu, p, ctx) }
+    };
     if !direct {
         if direct_handoff_active(cpu) {
             // We are the direct target returning to the root executor. Keep
@@ -6624,85 +6759,262 @@ pub mod tests {
     }
 
     /// A synchronous wake followed by a source park must enter the exact
-    /// resident wakee without first returning through the executor. The wakee
-    /// still returns to the root executor (one hop only), after which the
-    /// source is dispatched normally and resumes its saved continuation.
+    /// resident wakee without first returning through the executor. If that
+    /// wakee urgently wakes the off-queue root, it returns straight to the
+    /// root's saved continuation. The root is then forced through the executor
+    /// before another direct handoff, keeping the optimization bounded.
     fn smoke_direct_handoff_runs_exact_wakee() -> TestResult {
-        static TARGET_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
-            narf_lib::sync::IrqSafeSpinLock::new(None);
-        static PHASE: AtomicU32 = AtomicU32::new(0);
-        static FAILED: AtomicBool = AtomicBool::new(false);
+        #[cfg(target_arch = "x86_64")]
+        const ROOT_FPU: u64 = 0x524f_4f54_4650_5531;
+        #[cfg(target_arch = "x86_64")]
+        const TARGET_FPU: u64 = 0x5441_5247_4650_5531;
+        #[cfg(target_arch = "x86_64")]
+        const TARGET_FPU_AFTER: u64 = 0x5441_5247_4650_5532;
 
-        fn mark_current_direct_eligible() -> bool {
-            let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
-            if p.is_null() {
+        #[cfg(target_arch = "x86_64")]
+        #[repr(C, align(64))]
+        struct DirectFpuArea([u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+
+        #[cfg(target_arch = "x86_64")]
+        impl DirectFpuArea {
+            fn reset() -> Self {
+                let mut area = Self([0; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+                area.0[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+                area.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+                area
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_write(value: u64) {
+            // SAFETY: the caller materialized the current task's aligned image,
+            // which clears CR0.TS and gives this task the SIMD register file.
+            unsafe {
+                core::arch::asm!(
+                    "movq xmm0, {value}",
+                    value = in(reg) value,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_install(area: &mut DirectFpuArea, value: u64) -> bool {
+            set_current_user_fpu(area.0.as_mut_ptr());
+            arm_current_user_fpu();
+            if !materialize_current_user_fpu() {
                 return false;
             }
-            // SAFETY: CURRENT names the live task executing this test future.
-            let cell = unsafe { (&*p).wake_cell.lock().clone() };
-            let Some(cell) = cell else { return false };
-            cell.direct_eligible.store(true, Ordering::Release);
+            direct_fpu_write(value);
             true
         }
 
-        struct Target;
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_expect(expected: u64) -> bool {
+            if !materialize_current_user_fpu() {
+                return false;
+            }
+            let observed: u64;
+            // SAFETY: materialization above restored this task's image and
+            // cleared CR0.TS; reading XMM0 does not modify task state.
+            unsafe {
+                core::arch::asm!(
+                    "movq {observed}, xmm0",
+                    observed = out(reg) observed,
+                    options(nostack, preserves_flags),
+                );
+            }
+            observed == expected
+        }
+
+        static TARGET_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        static ROOT_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        static ROOT_TASK: AtomicU64 = AtomicU64::new(0);
+        static PHASE: AtomicU32 = AtomicU32::new(0);
+        static FAILURE: AtomicU32 = AtomicU32::new(0);
+
+        fn fail(code: u32) {
+            let _ = FAILURE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        }
+
+        fn current_direct_identity() -> Option<(u64, Waker)> {
+            let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+            if p.is_null() {
+                return None;
+            }
+            // SAFETY: CURRENT names the live task executing this test future.
+            let task = unsafe { &*p };
+            let cell = task.wake_cell.lock().clone()?;
+            cell.direct_eligible.store(true, Ordering::Release);
+            let waker = task.current_waker.lock().clone()?;
+            Some((cell.task, waker))
+        }
+
+        struct Target {
+            #[cfg(target_arch = "x86_64")]
+            fpu: Box<DirectFpuArea>,
+        }
         impl Future for Target {
             type Output = ();
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let _this = self.get_mut();
                 if PHASE.load(Ordering::Acquire) == 0 {
-                    if !mark_current_direct_eligible() {
-                        FAILED.store(true, Ordering::Release);
+                    if current_direct_identity().is_none() {
+                        fail(1);
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if !direct_fpu_install(&mut _this.fpu, TARGET_FPU) {
+                        fail(2);
                     }
                     *TARGET_WAKER.lock() = Some(cx.waker().clone());
                     PHASE.store(1, Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    // This synthetic kernel future published a user FPU image,
+                    // so model the real own-stack user's switch-out boundary
+                    // before returning Pending through task_body_rust.
+                    user_fpu_save();
                     return Poll::Pending;
                 }
                 if PHASE.load(Ordering::Acquire) != 2 {
-                    FAILED.store(true, Ordering::Release);
+                    fail(3);
                 }
+                // A nested stackful poll returns through the same completion
+                // hook while this target is active. It must leave the outer
+                // target claim intact for finish_direct_handoff.
+                let cpu = this_cpu();
+                let claimed = DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire);
+                complete_direct_return(cpu);
+                if claimed.is_null()
+                    || DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire) != claimed
+                {
+                    fail(4);
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if !direct_fpu_expect(TARGET_FPU) {
+                        fail(5);
+                    }
+                    direct_fpu_write(TARGET_FPU_AFTER);
+                }
+                let root_waker = ROOT_WAKER.lock().clone();
+                let root_task = ROOT_TASK.load(Ordering::Acquire);
+                let Some(root_waker) = root_waker else {
+                    fail(6);
+                    return Poll::Ready(());
+                };
                 PHASE.store(3, Ordering::Release);
+                crate::wake_urgent_task(&root_waker, root_task);
+                if !cooperative_yield() || PHASE.load(Ordering::Acquire) != 4 {
+                    fail(7);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_expect(TARGET_FPU_AFTER) {
+                    fail(8);
+                }
+                PHASE.store(5, Ordering::Release);
                 Poll::Ready(())
             }
         }
 
         crate::__reset_queues_for_test();
         PHASE.store(0, Ordering::Release);
-        FAILED.store(false, Ordering::Release);
+        FAILURE.store(0, Ordering::Release);
         *TARGET_WAKER.lock() = None;
-        let before = direct_handoff_count();
-        let target = crate::spawn_stackful(Target);
+        *ROOT_WAKER.lock() = None;
+        ROOT_TASK.store(0, Ordering::Release);
+        let handoffs_before = direct_handoff_count();
+        let returns_before = direct_return_count();
+        let target = crate::spawn_stackful(Target {
+            #[cfg(target_arch = "x86_64")]
+            fpu: Box::new(DirectFpuArea::reset()),
+        });
+        #[cfg(target_arch = "x86_64")]
+        let mut root_fpu = Box::new(DirectFpuArea::reset());
         crate::spawn_stackful(async move {
-            if !mark_current_direct_eligible() {
-                FAILED.store(true, Ordering::Release);
+            let Some((root_task, root_waker)) = current_direct_identity() else {
+                fail(9);
+                return;
+            };
+            #[cfg(target_arch = "x86_64")]
+            if !direct_fpu_install(&mut root_fpu, ROOT_FPU) {
+                fail(10);
                 return;
             }
+            ROOT_TASK.store(root_task, Ordering::Release);
+            *ROOT_WAKER.lock() = Some(root_waker);
             if PHASE.load(Ordering::Acquire) != 1 {
-                FAILED.store(true, Ordering::Release);
+                fail(11);
                 return;
             }
             let wake = TARGET_WAKER.lock().clone();
             let Some(wake) = wake else {
-                FAILED.store(true, Ordering::Release);
+                fail(12);
                 return;
             };
             PHASE.store(2, Ordering::Release);
             crate::wake_urgent_task(&wake, target.raw());
-            if !cooperative_yield() || PHASE.load(Ordering::Acquire) != 3 {
-                FAILED.store(true, Ordering::Release);
+            if !cooperative_yield() {
+                fail(13);
+            }
+            if PHASE.load(Ordering::Acquire) != 3 {
+                fail(14);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if !direct_fpu_expect(ROOT_FPU) {
+                fail(15);
+            }
+            let cpu = this_cpu();
+            let root = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+            if root.is_null() || DIRECT_HANDOFF_RETURNED_ROOT[cpu].load(Ordering::Acquire) != root {
+                fail(16);
             }
             PHASE.store(4, Ordering::Release);
         });
         crate::run_until_empty();
         *TARGET_WAKER.lock() = None;
+        *ROOT_WAKER.lock() = None;
 
-        if FAILED.load(Ordering::Acquire) || PHASE.load(Ordering::Acquire) != 4 {
+        match FAILURE.load(Ordering::Acquire) {
+            0 => {}
+            1 => return TestResult::Fail("direct target identity was not published"),
+            2 => return TestResult::Fail("direct target FPU image did not materialize"),
+            3 => return TestResult::Fail("direct target ran outside the requested phase"),
+            4 => return TestResult::Fail("nested completion released the direct target claim"),
+            5 => return TestResult::Fail("source-to-target transfer lost target FPU state"),
+            6 => return TestResult::Fail("direct target could not recover the root waker"),
+            7 => return TestResult::Fail("direct target did not resume after the root poll"),
+            8 => return TestResult::Fail("executor resume lost the target FPU state"),
+            9 => return TestResult::Fail("direct root identity was not published"),
+            10 => return TestResult::Fail("direct root FPU image did not materialize"),
+            11 => return TestResult::Fail("direct root ran before target initialization"),
+            12 => return TestResult::Fail("direct root could not recover the target waker"),
+            13 => return TestResult::Fail("direct root could not yield to the target"),
+            14 => {
+                return TestResult::Fail("target-to-root transfer did not resume the root directly")
+            }
+            15 => return TestResult::Fail("target-to-root transfer lost root FPU state"),
+            16 => return TestResult::Fail("direct-root fairness gate was not published"),
+            _ => return TestResult::Fail("unexpected direct-transfer smoke failure"),
+        }
+        if PHASE.load(Ordering::Acquire) != 5 {
             return TestResult::Fail("direct wakee/source ordering was not preserved");
         }
-        if direct_handoff_count() <= before {
+        if direct_handoff_count() <= handoffs_before {
             return TestResult::Fail("exact urgent wake did not use direct task transfer");
         }
-        TestResult::Pass
+        if direct_return_count() <= returns_before {
+            return TestResult::Fail("exact urgent root wake did not return task-to-task");
+        }
+        if DIRECT_HANDOFF_RETURNED_ROOT[this_cpu()]
+            .load(Ordering::Acquire)
+            .is_null()
+        {
+            return TestResult::Pass;
+        }
+        TestResult::Fail("direct-root fairness gate escaped its executor poll")
     }
 
     kernel_test_in!(
