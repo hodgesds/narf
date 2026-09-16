@@ -161,7 +161,13 @@ Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
 the userspace test-hook reset invokes it so distributed tests remain independent
 of link-order. Production builds neither compile nor call this reset.
 Their CPL0 syscall continuations remain run-to-completion except at explicit
-park/yield points. NARF now has a nestable CPU-local `preempt_disable()` guard,
+park/yield points. A scheduler tick that observes a slice, budget, or
+fair-quantum decision while such a continuation is running sets a sticky
+task-local reschedule request; the completed syscall consumes it immediately
+before returning to user mode, matching Linux's `TIF_NEED_RESCHED` shape
+without suspending an unaudited lock-bearing continuation. Any intervening
+voluntary switch clears the request because it already starts a fresh slice.
+NARF now has a nestable CPU-local `preempt_disable()` guard,
 but syscall/driver critical regions have not completed the adoption audit;
 enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.

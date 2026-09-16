@@ -22,7 +22,7 @@ frames, saved domain rights, executor contexts, or switch functions.
 | Stackless async task | `spawn`, `spawn_with_spec` | No; cooperative poll boundary only |
 | Stackful kernel thread | `spawn_stackful*` | x86_64 CPL0 / aarch64 EL1, unless `no_preempt` |
 | Own-stack user thread | `spawn_user` | x86_64 CPL3 / aarch64 EL0 |
-| User thread in syscall | `spawn_user` | No arbitrary CPL0/EL1 preemption yet |
+| User thread in syscall | `spawn_user` | No arbitrary CPL0/EL1 preemption; tick defers reschedule to syscall exit |
 | Hard IRQ/NMI | interrupt entry | Not schedulable work |
 | Deferred IRQ work | task with `WorkKind::SoftIrq` | According to its execution mode |
 
@@ -43,8 +43,10 @@ On a scheduler-timer trap:
 2. The architecture preemption hook validates that the frame lies inside the
    current task's stack and that the interrupted exception level is eligible.
 3. The hook checks the time slice and the core-published periodic-budget
-   boundaries.
-4. If a switch is required, it re-arms the task waker, records an involuntary
+   boundaries. If the tick interrupted a non-preemptible user syscall
+   continuation, it records the decision in that task's sticky reschedule bit
+   and returns; the completed syscall consumes the bit at exit-to-user.
+4. If an immediate switch is required, it re-arms the task waker, records an involuntary
    return for RCU, saves live user FPU/SIMD state when applicable, clears the
    per-CPU current pointer, and calls
    `kernel_switch(&mut task.ctx, executor_ctx)` directly from the trap handler
@@ -95,6 +97,14 @@ slice expired + competitor              -> switch
 slice expired + no competitor           -> resume same task
 otherwise                               -> resume same task
 ```
+
+For an own-stack user task interrupted in CPL0/EL1, `switch` in this table
+means publish a task-local deferred-reschedule request. Syscall exit normally
+tests only that bit; cycle-clock and run-queue work remains on the timer tick.
+The existing wake-preemption hints are separate: an urgent exact handoff needs
+only a runnable-peer probe, while an ordinary wake invokes the installed
+policy with elapsed runtime. Any voluntary block or yield clears a deferred
+request because that switch already begins a fresh slice.
 
 This avoids an executor/idle/task round trip when the current task is the only
 useful work. A wake makes an idle borrower preemptible at the next tick. The

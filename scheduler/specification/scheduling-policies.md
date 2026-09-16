@@ -127,8 +127,9 @@ steal can be renormalized in core (policy never writes slots).
 - **`BASE_SLICE`** is derived from `DEFAULT_SLICE_CYCLES` (not a new magic
   number) and is comparable to Linux's `sysctl_sched_base_slice` (700 µs). The
   tick/CPL3 slice preemption (`try_preempt_user`) and the `FAIR_QUANTUM_DIV`
-  fair-share floor remain the backstops; EEVDF only re-orders picks and supplies
-  the wake-preempt rule.
+  fair-share floor remain the backstops. A tick that lands in a user syscall
+  records either decision in that task's sticky reschedule bit for syscall
+  exit; EEVDF only re-orders picks and supplies the wake-preempt rule.
 
 Why this is correct where a flat "minimum run time before a wake may preempt"
 floor is not: the floor cannot tell a *starved sleeper that should preempt now*

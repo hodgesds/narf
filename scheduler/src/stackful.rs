@@ -1378,6 +1378,10 @@ pub struct KernelTask {
     /// `DEFAULT_SLICE_CYCLES`. Set via `with_slice_cycles` at
     /// spawn time for drivers that need bigger slices.
     slice_cycles: AtomicU64,
+    /// Sticky Linux-style reschedule request for an own-stack user task whose
+    /// timer tick landed in its non-preemptible syscall continuation. The tick
+    /// makes the scheduling decision; syscall exit only consumes this bit.
+    need_resched: AtomicBool,
     /// Opt-out: when true the trap-handler hook skips preempting
     /// this task. Use for drivers that hold hardware locks across
     /// an `.await`-free critical section.
@@ -1549,6 +1553,7 @@ impl KernelTask {
             completed: AtomicBool::new(false),
             tsc_started: AtomicU64::new(0),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
+            need_resched: AtomicBool::new(false),
             no_preempt: AtomicBool::new(false),
             user_preempt: AtomicBool::new(false),
             preempted: AtomicBool::new(false),
@@ -2292,6 +2297,50 @@ const fn cpl_zero(cs: u64) -> bool {
     (cs & 3) == 0
 }
 
+/// Decide whether a timer tick that cannot preempt a user task's kernel-mode
+/// continuation should leave a sticky reschedule request for syscall exit.
+/// `tick_required` carries the core slice/budget decision; `fair_sibling`
+/// carries the earlier fair-quantum starvation bound.
+#[inline]
+fn deferred_user_resched_decision(
+    started: u64,
+    slice: u64,
+    elapsed: u64,
+    tick_required: bool,
+    fair_sibling: bool,
+) -> bool {
+    started != 0 && (tick_required || (elapsed >= slice / FAIR_QUANTUM_DIV && fair_sibling))
+}
+
+/// Linux-style `TIF_NEED_RESCHED` publication for a tick that interrupted an
+/// own-stack user task in CPL0/EL1. Arbitrary kernel-mode preemption remains
+/// disabled; the completed syscall consumes the task-local request immediately
+/// before returning to user mode.
+#[inline]
+fn defer_user_resched_from_tick(task: &KernelTask, now: u64) {
+    if !task.user_preempt.load(Ordering::Acquire) || task.need_resched.load(Ordering::Acquire) {
+        return;
+    }
+    let started = task.tsc_started.load(Ordering::Acquire);
+    if started == 0 {
+        return;
+    }
+    let slice = task.slice_cycles.load(Ordering::Acquire);
+    let elapsed = now.saturating_sub(started);
+    let current = crate::current_task_id().raw();
+    let slice_expired = elapsed >= slice;
+    let tick_required = crate::tick_preemption_required(current, now, slice_expired);
+    // `tick_preemption_required` already probes runnable work for an expired
+    // ordinary slice. Probe separately only for the earlier fair quantum.
+    let fair_sibling = !tick_required
+        && !slice_expired
+        && elapsed >= slice / FAIR_QUANTUM_DIV
+        && crate::has_other_runnable_work(current);
+    if deferred_user_resched_decision(started, slice, elapsed, tick_required, fair_sibling) {
+        task.need_resched.store(true, Ordering::Release);
+    }
+}
+
 /// Inspect a trap frame at LAPIC timer entry; if a stackful task
 /// is currently CPU-bound and has used its slice, yield to the
 /// executor right here from inside the trap handler.
@@ -2355,6 +2404,11 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: Valid memory or trusted environment
     let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
     if no_preempt {
+        // A user task's syscall continuation is deliberately non-preemptible.
+        // Make the timer decision now and defer only the context switch, just
+        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop.
+        // SAFETY: task_ptr is the live current task established above.
+        defer_user_resched_from_tick(unsafe { &*task_ptr }, narf_time::now_cycles());
         return false;
     }
     // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
@@ -2542,12 +2596,17 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     // SAFETY: CURRENT names the task whose in-flight poll keeps its Box live.
     let task = unsafe { &*task_ptr };
     let from_user = (frame.spsr & 0xF) == 0;
+    let user_preempt = task.user_preempt.load(Ordering::Acquire);
+    let no_preempt = task.no_preempt.load(Ordering::Acquire);
     if !aarch64_preempt_mode_allowed(
         frame.spsr,
         USE_OWN_STACK.load(Ordering::Acquire),
-        task.user_preempt.load(Ordering::Acquire),
-        task.no_preempt.load(Ordering::Acquire),
+        user_preempt,
+        no_preempt,
     ) {
+        if !from_user && user_preempt && no_preempt {
+            defer_user_resched_from_tick(task, narf_time::now_cycles());
+        }
         return false;
     }
     let now = narf_time::now_cycles();
@@ -2874,6 +2933,11 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask) {
     // Slice ends here — fold it before the switch (the resume side
     // restamps tsc_started below).
     fold_current_slice(p);
+    // Any switch satisfies a deferred syscall-exit reschedule request. Clear
+    // it before handing control away so a blocking syscall does not inherit a
+    // stale request into the fresh slice in which it later resumes.
+    // SAFETY: p is the live current task required by this function's contract.
+    unsafe { (*p).need_resched.store(false, Ordering::Release) };
     // Reuse the task/cpu identity validated above. No migration is possible
     // until kernel_switch hands control to the executor.
     // SAFETY: `p` is the live current task required by this function's contract.
@@ -3155,49 +3219,18 @@ fn consume_syscall_exit_hint(hint: &AtomicBool) -> bool {
     hint.load(Ordering::Acquire) && hint.swap(false, Ordering::AcqRel)
 }
 
-/// Pure yield policy for [`maybe_resched_syscall_exit`], split out so it is
-/// unit-testable without a live executor. Yields (`true`) on an explicit
-/// back-pressure request, on full time-slice expiry, or once a fair quantum
-/// (`slice / FAIR_QUANTUM_DIV`) is spent AND a sibling task is
-/// runnable-and-waiting. `started == 0` (slice clock not yet stamped) never
-/// yields.
-///
-/// The `sibling_waiting` term is the cooperative-scheduler stand-in for "a
-/// lower-vtime task is runnable": a task sitting runnable in the queue while
-/// another has been running has, by construction, accrued less recent CPU, so
-/// ceding to it is the fair move. Without the early branch a syscall-dense
-/// spinner (a compositor looping `poll()` on an always-ready eventfd) holds the
-/// CPU for a full slice at a time and, on SMP=1, starves its own worker threads
-/// and the whole session — the busy-poll starvation the ReqGate cooperative
-/// yield (8c63bd43) fixed for the in-kernel spin, here for userspace.
+/// Pure final decision for [`maybe_resched_syscall_exit`]. Time-based slice,
+/// budget, and fair-quantum decisions arrive as the task-local
+/// `deferred_resched` bit set by the scheduler tick; wake terms are evaluated
+/// only after a wake publishes a hint. Keeping this final step pure pins that
+/// each independent reason is sufficient to cede.
 fn syscall_exit_yield_decision(
-    started: u64,
-    slice: u64,
-    elapsed: u64,
+    deferred_resched: bool,
     backpressure: bool,
-    sibling_waiting: bool,
     wake_preempt_sibling: bool,
     urgent_wake_sibling: bool,
 ) -> bool {
-    if backpressure {
-        return true;
-    }
-    if started == 0 {
-        return false;
-    }
-    if elapsed >= slice {
-        return true;
-    }
-    // Wake-preemption (Linux `wakeup_preempt`): a fresh wake made a peer
-    // runnable, so cede IMMEDIATELY — collapsing the `FAIR_QUANTUM_DIV` floor to
-    // zero. `wake_preempt_sibling` already carries the "a sibling is actually
-    // runnable" guard (computed by the caller like `sibling_waiting`), so a wake
-    // whose target already ran, or that raced a requeue, still runs the runner
-    // to its fair quantum rather than yielding to an empty queue.
-    if urgent_wake_sibling || wake_preempt_sibling {
-        return true;
-    }
-    elapsed >= slice / FAIR_QUANTUM_DIV && sibling_waiting
+    deferred_resched || backpressure || wake_preempt_sibling || urgent_wake_sibling
 }
 
 /// Linux `TIF_NEED_RESCHED`-at-syscall-exit analogue. The scheduler tick only
@@ -3205,18 +3238,18 @@ fn syscall_exit_yield_decision(
 /// *syscall-dense* task — one whose user-mode gaps between syscalls are far
 /// shorter than the syscall bodies — is essentially never sliced and starves
 /// every sibling on its CPU until it voluntarily blocks. Linux re-checks the
-/// spent time slice on the way out of every syscall; this restores that, and
-/// additionally yields EARLY (after a fair quantum, see
-/// [`syscall_exit_yield_decision`]) when a sibling is already runnable so a
-/// full-slice CPU hog cannot starve a waiting peer for the whole 10 ms.
+/// spent time slice on the way out of every syscall by checking the sticky
+/// `TIF_NEED_RESCHED` bit set by the tick. NARF follows that shape: a CPL0/EL1
+/// tick records the slice, budget, or fair-quantum decision in the current
+/// task, and this path consumes it before returning to user mode.
 ///
 /// Called at the tail of the `syscall`-instruction dispatch (a real user frame
 /// is returning to CPL=3). If this task's slice is spent it yields NOW — staying
 /// Ready by re-arming its slot waker first (same as `try_preempt_user`), so the
-/// executor re-polls it after servicing its siblings. Cheap when the slice is
-/// not yet spent (a few atomic loads + one TSC read); only the spent-slice case
-/// pays a context switch. No-op unless own-stack scheduling is live and a
-/// stackful task is current.
+/// executor re-polls it after servicing its siblings. The normally-clear path
+/// performs atomic loads only; it reads the cycle clock and consults EEVDF only
+/// after an actual ordinary-wake hint. No-op unless own-stack scheduling is
+/// live and a stackful task is current.
 ///
 /// # Safety
 /// Must be called at the tail of the `syscall` dispatch on the current task's
@@ -3233,6 +3266,9 @@ pub unsafe fn maybe_resched_syscall_exit() {
     if p.is_null() {
         return;
     }
+    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield
+    // keeps its Box alive across the user round-trip).
+    let deferred_resched = unsafe { consume_syscall_exit_hint(&(*p).need_resched) };
     // Both hints are cold in the ordinary syscall path.  Avoid an
     // unconditional RMW when they are clear: the per-CPU byte arrays share
     // cache lines, so `swap(false)` made independent CPUs contend on every
@@ -3250,47 +3286,38 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // remote wake or a wakee that already ran must not leak urgency into a
     // later unrelated syscall.
     let urgent_wake = consume_syscall_exit_hint(&URGENT_WAKE_PREEMPT.inner[cpu].value);
-    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
-    // its Box alive across the user round-trip); all reads are atomics.
+    // SAFETY: `p` is the live in-flight task established above.
     unsafe {
         // NOTE: deliberately NOT gated on `no_preempt`. User tasks keep CPL0
-        // timer preemption disabled, but this is precisely a cooperative yield —
-        // a SYNCHRONOUS slice check at syscall exit, about to return to CPL=3,
-        // outside any kernel critical section. Honouring `no_preempt` here is
-        // what left a syscall-dense task (stress-ng --sigrt's sigqueue loop)
-        // never yielding and starving its CPU's siblings.
-        let started = (*p).tsc_started.load(Ordering::Acquire);
-        let slice = (*p).slice_cycles.load(Ordering::Acquire);
-        let elapsed = narf_time::now_cycles().saturating_sub(started);
-        // The run-queue scan is the only "expensive" step, so run it lazily —
-        // only when a branch that needs it could actually fire: the fair-quantum
-        // branch (quantum spent, slice not up) OR a fresh wake-preemption request
-        // (slice not up). The cheap cases (back-pressure, full-slice, idle exit)
-        // decide without it, so a normal uncontended syscall exit still pays only
-        // the atomic loads + one TSC read above.
-        let current_id = crate::current_task_id().raw();
-        let quantum_spent = started != 0 && elapsed >= slice / FAIR_QUANTUM_DIV && elapsed < slice;
-        // Fair-share floor: cede after a fair quantum when a sibling is simply
-        // runnable (the cheap, policy-independent starvation bound).
-        let sibling_waiting =
-            !backpressure && quantum_spent && crate::has_other_runnable_work(current_id);
-        // Wake-preemption: a fresh wake made a peer runnable — ask the INSTALLED
-        // POLICY (EEVDF) whether the wakee is eligible to preempt the runner now.
-        // Only consulted inside the wake window (a wake is pending, slice not up),
-        // so the common no-wake syscall exit pays nothing here.
-        let wake_window =
-            (wake_preempt || urgent_wake) && !backpressure && started != 0 && elapsed < slice;
-        let urgent_wake_sibling =
-            wake_window && urgent_wake && crate::has_other_runnable_work(current_id);
-        let wake_preempt_sibling = !urgent_wake_sibling
-            && wake_window
-            && crate::wake_preempt_policy_check(current_id, elapsed);
+        // timer preemption disabled, but this is precisely a cooperative yield
+        // at the completed syscall boundary. The timer already made the slice,
+        // budget, and fair-quantum decision and published `need_resched`.
+        let mut urgent_wake_sibling = false;
+        let mut wake_preempt_sibling = false;
+        if !deferred_resched && !backpressure && (urgent_wake || wake_preempt) {
+            let started = (*p).tsc_started.load(Ordering::Acquire);
+            if started != 0 {
+                let current_id = crate::current_task_id().raw();
+                // An exact synchronous handoff only needs the runnable probe;
+                // avoid reading the cycle clock on this hottest wake path.
+                urgent_wake_sibling = urgent_wake && crate::has_other_runnable_work(current_id);
+                if !urgent_wake_sibling && wake_preempt {
+                    let slice = (*p).slice_cycles.load(Ordering::Acquire);
+                    let elapsed = narf_time::now_cycles().saturating_sub(started);
+                    // If the slice elapsed between ticks, a live peer is enough
+                    // to cede. Otherwise ask the installed policy whether the
+                    // freshly-woken task defeats RUN_TO_PARITY protection.
+                    wake_preempt_sibling = if elapsed >= slice {
+                        crate::has_other_runnable_work(current_id)
+                    } else {
+                        crate::wake_preempt_policy_check(current_id, elapsed)
+                    };
+                }
+            }
+        }
         if !syscall_exit_yield_decision(
-            started,
-            slice,
-            elapsed,
+            deferred_resched,
             backpressure,
-            sibling_waiting,
             wake_preempt_sibling,
             urgent_wake_sibling,
         ) {
@@ -3312,7 +3339,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
         // Yields via kernel_switch to the executor; returns here (with a fresh
         // tsc_started) when re-polled. Proven safe from syscall context — the
         // own-stack park paths (own_stack_park / wait4) switch out the same way.
-        yield_current_stackful();
+        yield_current_stackful_from(cpu, p);
     }
 }
 
@@ -4918,72 +4945,52 @@ pub mod tests {
         TestResult::Pass
     }
 
-    /// Fair-share syscall-exit yield policy (`syscall_exit_yield_decision`):
-    /// back-pressure and full-slice always yield; an EARLY yield requires BOTH a
-    /// spent fair quantum AND a waiting sibling; an unstamped slice clock
-    /// (`started == 0`) never yields. Regression pin for the SMP=1
-    /// compositor-poll-spin starvation — a syscall-dense CPU hog must cede to a
-    /// runnable peer after a fair quantum instead of holding the full slice.
+    /// Linux-style deferred syscall-exit policy: the timer publishes a sticky
+    /// task-local request after a core slice/budget decision or after the fair
+    /// quantum with a sibling. Syscall exit then treats that bit, backpressure,
+    /// and either wake-preemption result as independent reasons to cede.
     #[cfg(target_arch = "x86_64")]
     fn smoke_syscall_exit_fair_yield_policy() -> TestResult {
-        use super::{syscall_exit_yield_decision as decide, FAIR_QUANTUM_DIV};
+        use super::{
+            deferred_user_resched_decision as defer, syscall_exit_yield_decision as decide,
+            FAIR_QUANTUM_DIV,
+        };
         let slice = 40_000u64;
         let q = slice / FAIR_QUANTUM_DIV; // fair-quantum threshold
-                                          // Back-pressure always yields, even with the clock unstamped.
-        if !decide(0, slice, 0, true, false, false, false) {
-            return TestResult::Fail("back-pressure must yield regardless");
+
+        if defer(0, slice, slice, true, true) {
+            return TestResult::Fail("unstamped slice must not publish reschedule");
         }
-        // Unstamped slice clock never yields (absent back-pressure).
-        if decide(0, slice, slice * 2, false, true, false, false) {
-            return TestResult::Fail("started==0 must not yield");
+        if defer(1, slice, q - 1, false, true) {
+            return TestResult::Fail("below fair quantum must not publish reschedule");
         }
-        // Full slice spent always yields, even with no sibling waiting.
-        if !decide(1, slice, slice, false, false, false, false) {
-            return TestResult::Fail("full slice must yield");
+        if defer(1, slice, q, false, false) {
+            return TestResult::Fail("fair quantum without sibling must keep running");
         }
-        // Below the fair quantum: never yield, even with a sibling waiting.
-        if decide(1, slice, q - 1, false, true, false, false) {
-            return TestResult::Fail("below fair quantum must not yield");
+        if !defer(1, slice, q, false, true) {
+            return TestResult::Fail("fair quantum plus sibling must request reschedule");
         }
-        // At the fair quantum but no sibling: keep running to the full slice.
-        if decide(1, slice, q, false, false, false, false) {
-            return TestResult::Fail("fair quantum without a sibling must not yield");
+        if !defer(1, slice, 1, true, false) {
+            return TestResult::Fail("core tick decision must request reschedule");
         }
-        // At the fair quantum WITH a sibling waiting: yield early.
-        if !decide(1, slice, q, false, true, false, false) {
-            return TestResult::Fail("fair quantum + sibling must yield early");
+        if defer(1, slice, slice, false, false) {
+            return TestResult::Fail("expired slice without tick decision must keep running");
         }
-        // Wake-preemption: a fresh wake with a runnable sibling yields
-        // IMMEDIATELY — below the fair quantum, where the fair-share path alone
-        // would keep running. This is the futex wait/wake handoff collapse.
-        if !decide(1, slice, q - 1, false, false, true, false) {
-            return TestResult::Fail("wake-preempt + sibling must yield below fair quantum");
+
+        if !decide(false, true, false, false) {
+            return TestResult::Fail("backpressure must yield");
         }
-        // Even at elapsed 1 (just started): a wake with a runnable peer cedes.
-        if !decide(1, slice, 1, false, false, true, false) {
-            return TestResult::Fail("wake-preempt must yield right after slice start");
+        if !decide(true, false, false, false) {
+            return TestResult::Fail("deferred tick request must yield");
         }
-        // Wake-preempt WITHOUT a runnable sibling (caller ANDs in
-        // has_other_runnable_work, so the term arrives false): do NOT yield to an
-        // empty queue below the fair quantum.
-        if decide(1, slice, q - 1, false, false, false, false) {
-            return TestResult::Fail("wake-preempt without a sibling must not yield early");
+        if !decide(false, false, true, false) {
+            return TestResult::Fail("eligible wake-preempt must yield");
         }
-        // A wake-preempt request that arrives AFTER the full slice still yields
-        // (full-slice branch), and one with started==0 never does.
-        if !decide(1, slice, slice, false, false, true, false) {
-            return TestResult::Fail("full slice must yield even without wake-preempt");
+        if !decide(false, false, false, true) {
+            return TestResult::Fail("urgent wake handoff must yield");
         }
-        if decide(0, slice, 10, false, false, true, false) {
-            return TestResult::Fail("started==0 must not yield even on wake-preempt");
-        }
-        // An urgent synchronous handoff bypasses policy batching when a local
-        // peer is runnable, but remains subject to the same stamped-slice gate.
-        if !decide(1, slice, 1, false, false, false, true) {
-            return TestResult::Fail("urgent wake handoff must yield immediately");
-        }
-        if decide(0, slice, 1, false, false, false, true) {
-            return TestResult::Fail("unstamped urgent wake must not yield");
+        if decide(false, false, false, false) {
+            return TestResult::Fail("clear syscall-exit state must keep running");
         }
         TestResult::Pass
     }
