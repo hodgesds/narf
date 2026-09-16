@@ -491,10 +491,12 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setfsuid_pos);
 
 fn smoke_abi_creds_setfsuid_neg() -> TestResult {
     with_setup(|| {
-        // NOT a divergence: `setfsuid` never reports failure in Linux
-        // either — an unprivileged change silently no-ops and still returns
-        // the old fsuid. So even an "arbitrary" target yields Ok(old) >= 0,
-        // never an errno. This pins that no-error contract.
+        // `setfsuid` never reports failure in Linux either — the return is
+        // the previous fsuid whether the change happened or not. This pins
+        // that no-error contract; whether the change is REFUSED is
+        // `smoke_abi_creds_setfsuid_unprivileged_cannot_take_another_id`,
+        // because this shape of assertion cannot tell the two apart — which
+        // is exactly how the missing permission check survived.
         let r = call(Syscall::Setfsuid.raw(), a0(4242)).ok_or("setfsuid not Ok")?;
         if r < 0 {
             return Err("setfsuid(arbitrary) returned an errno");
@@ -528,6 +530,135 @@ fn smoke_abi_creds_setfsgid_neg() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_setfsgid_neg);
+
+/// An unprivileged task cannot take an fsuid it does not already hold.
+///
+/// `__sys_setfsuid` permits the change only when the target is one of the
+/// caller's OWN four uids, or it holds CAP_SETUID:
+///
+/// ```text
+/// if (uid_eq(kuid, old->uid)  || uid_eq(kuid, old->euid)  ||
+///     uid_eq(kuid, old->suid) || uid_eq(kuid, old->fsuid) ||
+///     ns_capable_setid(old->user_ns, CAP_SETUID))
+/// ```
+///
+/// NARF wrote the new fsuid unconditionally, which is a privilege
+/// escalation and not a conformance gap: `fsuid` is the identity every DAC
+/// decision is made against, so `setfsuid(0)` gave an unprivileged task
+/// root's file access and defeated the entire permission layer in one call.
+///
+/// Nothing caught it because the syscall CANNOT report failure — the return
+/// is the old fsuid either way — so the only way to test it is to make the
+/// call and then look at what fsuid actually became. That is what this case
+/// does, and it is why the neighbouring `_neg` case above cannot do it.
+fn smoke_abi_creds_setfsuid_unprivileged_cannot_take_another_id() -> TestResult {
+    with_setup(|| {
+        // Establish a known saved uid while privileged, then drop. After
+        // this the task holds uid == euid == suid == fsuid == 1000.
+        drop_to_unprivileged_uid()?;
+        // The refusal is silent, so read it back. `setfsuid(-1)` is the
+        // documented query form.
+        let probe = || call(Syscall::Setfsuid.raw(), a0(NOCHANGE));
+        if probe() != Some(1000) {
+            return Err("the privilege drop should have carried fsuid with it");
+        }
+        // Root — the id an escalation would want.
+        if call(Syscall::Setfsuid.raw(), a0(0)) != Some(1000) {
+            return Err("setfsuid must return the PREVIOUS fsuid");
+        }
+        if probe() != Some(1000) {
+            return Err("an unprivileged task took fsuid 0 — root file access");
+        }
+        // Any other id it does not hold.
+        let _ = call(Syscall::Setfsuid.raw(), a0(4242));
+        if probe() != Some(1000) {
+            return Err("an unprivileged task took an fsuid it does not hold");
+        }
+        // And the permitted move still works, or the check above would be
+        // satisfied by refusing everything: 1000 is the caller's own uid.
+        if call(Syscall::Setfsuid.raw(), a0(1000)) != Some(1000) {
+            return Err("setfsuid to an id the caller already holds must be allowed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_setfsuid_unprivileged_cannot_take_another_id
+);
+
+/// The gid twin: `setfsgid` is the group half of every DAC decision.
+fn smoke_abi_creds_setfsgid_unprivileged_cannot_take_another_id() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Setresgid.raw(), a2(100, 100, 100)) != Some(0) {
+            return Err("setresgid should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        let probe = || call(Syscall::Setfsgid.raw(), a0(NOCHANGE));
+        if probe() != Some(100) {
+            return Err("fsgid should be the gid established while privileged");
+        }
+        if call(Syscall::Setfsgid.raw(), a0(0)) != Some(100) {
+            return Err("setfsgid must return the PREVIOUS fsgid");
+        }
+        if probe() != Some(100) {
+            return Err("an unprivileged task took fsgid 0 — group-0 file access");
+        }
+        if call(Syscall::Setfsgid.raw(), a0(100)) != Some(100) {
+            return Err("setfsgid to the caller's own gid must be allowed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_setfsgid_unprivileged_cannot_take_another_id
+);
+
+/// A privileged caller may still lower fsuid and raise it back — the idiom
+/// `setfsuid` exists for — and the FS capabilities follow it.
+///
+/// `cap_task_fix_setuid`'s `LSM_SETID_FS` arm drops `CAP_FS_SET` from the
+/// effective set when fsuid leaves root and re-raises it (intersected with
+/// permitted) when it returns. Without that the drop is half a drop:
+/// CAP_DAC_OVERRIDE is consulted by the same checks fsuid is, so a server
+/// that lowered fsuid would walk straight through the permission bits it
+/// lowered fsuid to be bound by.
+fn smoke_abi_creds_setfsuid_round_trip_moves_fs_caps() -> TestResult {
+    const CAP_DAC_OVERRIDE: u32 = 1;
+    with_setup(|| {
+        // Privileged and at fsuid 0.
+        if call(Syscall::Setfsuid.raw(), a0(NOCHANGE)) != Some(0) {
+            return Err("the harness task should start at fsuid 0");
+        }
+        if !crate::handlers::__test_cap_effective(FAKE_TASK, CAP_DAC_OVERRIDE) {
+            return Err("the harness task should start holding CAP_DAC_OVERRIDE");
+        }
+        // Lower fsuid: permitted, because the task holds CAP_SETUID.
+        if call(Syscall::Setfsuid.raw(), a0(1000)) != Some(0) {
+            return Err("a privileged setfsuid should return the previous fsuid");
+        }
+        if call(Syscall::Setfsuid.raw(), a0(NOCHANGE)) != Some(1000) {
+            return Err("a privileged setfsuid should actually lower fsuid");
+        }
+        if crate::handlers::__test_cap_effective(FAKE_TASK, CAP_DAC_OVERRIDE) {
+            return Err("CAP_DAC_OVERRIDE survived fsuid leaving root");
+        }
+        // And back: the raise is intersected with permitted, so what the
+        // task was allowed to hold comes back.
+        if call(Syscall::Setfsuid.raw(), a0(0)) != Some(1000) {
+            return Err("raising fsuid back should return the previous fsuid");
+        }
+        if !crate::handlers::__test_cap_effective(FAKE_TASK, CAP_DAC_OVERRIDE) {
+            return Err("CAP_DAC_OVERRIDE did not come back with fsuid 0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_setfsuid_round_trip_moves_fs_caps
+);
 
 // ── getresuid ────────────────────────────────────────────────────────
 // Writes the (single) uid into up to three u32 out-pointers; Ok(0) on

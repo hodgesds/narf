@@ -4844,6 +4844,82 @@ fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
     }
 }
 
+/// `CAP_FS_SET` (`include/linux/capability.h`) — the capabilities that
+/// follow the FILESYSTEM uid rather than the effective one.
+///
+/// ```text
+/// # define CAP_FS_MASK (BIT_ULL(CAP_CHOWN) | BIT_ULL(CAP_MKNOD)
+///                     | BIT_ULL(CAP_DAC_OVERRIDE) | BIT_ULL(CAP_DAC_READ_SEARCH)
+///                     | BIT_ULL(CAP_FOWNER) | BIT_ULL(CAP_FSETID)
+///                     | BIT_ULL(CAP_MAC_OVERRIDE))
+/// # define CAP_FS_SET  ((kernel_cap_t) { CAP_FS_MASK | BIT_ULL(CAP_LINUX_IMMUTABLE) })
+/// ```
+/// `CAP_CHOWN` (0) and `CAP_MAC_OVERRIDE` (32) — named here because
+/// `CAP_FS_SET` is the only thing in NARF that needs them.
+const CAP_CHOWN: u32 = 0;
+const CAP_MAC_OVERRIDE: u32 = 32;
+
+const CAP_FS_SET: u64 = (1 << CAP_CHOWN)
+    | (1 << CAP_MKNOD)
+    | (1 << CAP_DAC_OVERRIDE)
+    | (1 << CAP_DAC_READ_SEARCH)
+    | (1 << CAP_FOWNER)
+    | (1 << CAP_FSETID)
+    | (1 << CAP_MAC_OVERRIDE)
+    | (1 << CAP_LINUX_IMMUTABLE);
+
+/// `security/commoncap.c::cap_task_fix_setuid`, the `LSM_SETID_FS` arm —
+/// the capability fixup that follows a `setfsuid` across root.
+///
+/// ```text
+/// if (uid_eq(old->fsuid, root_uid) && !uid_eq(new->fsuid, root_uid))
+///         new->cap_effective = cap_drop_fs_set(new->cap_effective);
+/// if (!uid_eq(old->fsuid, root_uid) && uid_eq(new->fsuid, root_uid))
+///         new->cap_effective = cap_raise_fs_set(new->cap_effective,
+///                                               new->cap_permitted);
+/// ```
+///
+/// Deliberately NOT the same transition [`cap_emulate_setxuid`] makes: that
+/// one empties the whole set when a task leaves root for good, while this
+/// moves only the FILE-related capabilities and is reversible, because
+/// `setfsuid` is meant to be used in pairs.
+///
+/// Without it the drop is half a drop. The idiom this exists for is a file
+/// server that holds CAP_SETUID and lowers fsuid to the requesting user for
+/// one operation — but CAP_DAC_OVERRIDE is consulted by the same checks
+/// fsuid is, so keeping it would let the server right through the very
+/// permission bits it lowered fsuid to be bound by.
+///
+/// Raising back is `cap_intersect(permitted, CAP_FS_SET)`, so returning to
+/// root restores only what the task was permitted to hold — a task that
+/// never had CAP_DAC_OVERRIDE does not acquire it by round-tripping fsuid.
+///
+/// LINUX-GAP: `SECURE_NO_SETUID_FIXUP` suppresses this in Linux; NARF does
+/// not model that bit, so the fixup always runs. Same gap, and for the same
+/// reason, as the one on `cap_emulate_setxuid`.
+/// Test hook — is `cap` in `task`'s EFFECTIVE set?
+///
+/// The fs-capability fixup is only observable through the effective set, and
+/// no syscall reports it directly (`capget` reports the whole word, but the
+/// point here is one bit moving with fsuid).
+#[doc(hidden)]
+pub fn __test_cap_effective(task: u64, cap: u32) -> bool {
+    cap_effective(task, cap)
+}
+
+fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
+    let mut caps = read_caps(task);
+    let before = caps.effective;
+    if old_fsuid == 0 && new_fsuid != 0 {
+        caps.effective &= !CAP_FS_SET;
+    } else if old_fsuid != 0 && new_fsuid == 0 {
+        caps.effective |= caps.permitted & CAP_FS_SET;
+    }
+    if caps.effective != before {
+        write_caps(task, caps);
+    }
+}
+
 /// `security/commoncap.c::handle_privileged_root` — the half of
 /// `cap_bprm_creds_from_file` that makes a set-user-ID-**root** binary
 /// actually privileged.
