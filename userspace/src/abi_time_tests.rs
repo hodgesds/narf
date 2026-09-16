@@ -1871,3 +1871,134 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_time_getres_serves_cpu_and_coarse_clocks
 );
+
+// ── timer_getoverrun(timerid) ─────────────────────────────────────────
+//
+// POSIX collapses a burst of missed expiries into ONE signal plus a count.
+// `timer_getoverrun(2)` is the only way to recover that count, so a handler
+// that must do work per expiry cannot be written without it. NARF tracked
+// the count all along — `posix_timer_pump` has always accumulated
+// `fires - 1` — and simply had no entry point to read it through, so the
+// number was computed and then discarded.
+
+/// The count reported is the one the delivered signal stood in for.
+///
+/// Driven through `__test_run_pump_at`, not by waiting: overrun accounting
+/// is `(now - next_fire) / interval`, so a case that armed a timer and slept
+/// would be asserting on however many intervals happened to elapse. The
+/// deadline is absolute and the pump instant is stated, which fixes the
+/// expected count by arithmetic.
+fn smoke_abi_time_timer_getoverrun_reports_delivered_count() -> TestResult {
+    const TIMER_ABSTIME: u64 = 1;
+    const NS: u64 = 1_000_000_000;
+    // Absolute deadline and interval, both in whole seconds so the
+    // itimerspec below carries no nanosecond remainder.
+    const DEADLINE_S: i64 = 1_000;
+    const INTERVAL_S: i64 = 10;
+    with_setup(|| {
+        let id = make_timer()?;
+        // itimerspec = { interval{10,0}, value{1000,0} }, TIMER_ABSTIME.
+        let new: [i64; 4] = [INTERVAL_S, 0, DEADLINE_S, 0];
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, TIMER_ABSTIME, new.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("arming the timer at an absolute deadline should succeed");
+        }
+        // Nothing has expired yet.
+        if call(Syscall::TimerGetoverrun.raw(), a0(id)) != Some(0) {
+            return Err("timer_getoverrun before any expiry must report 0");
+        }
+        // Two and a half intervals past the deadline: three expiries are due,
+        // and the one signal queued for them stands in for the other two.
+        let now =
+            (DEADLINE_S as u64) * NS + 2 * (INTERVAL_S as u64) * NS + (INTERVAL_S as u64) * NS / 2;
+        crate::posix_timer::__test_run_pump_at(now);
+        if call(Syscall::TimerGetoverrun.raw(), a0(id)) != Some(2) {
+            return Err("timer_getoverrun did not report the two expiries the signal stood for");
+        }
+        // Reading does not consume the count. The natural use is to read it
+        // inside the handler and again afterwards, and a self-clearing
+        // counter would make the second read lie.
+        if call(Syscall::TimerGetoverrun.raw(), a0(id)) != Some(2) {
+            return Err("timer_getoverrun reset the count when it was read");
+        }
+        // `common_timer_set` clears both halves, so re-arming starts over
+        // and a count from the previous arming cannot leak through.
+        if call(
+            Syscall::TimerSettime.raw(),
+            a3(id, TIMER_ABSTIME, new.as_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("re-arming the timer should succeed");
+        }
+        if call(Syscall::TimerGetoverrun.raw(), a0(id)) != Some(0) {
+            return Err("timer_settime did not clear the overrun count");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_getoverrun_reports_delivered_count
+);
+
+/// A timerid this task does not own is -EINVAL.
+///
+/// `scoped_timer_get_or_fail(timer_id)` expands to `return -EINVAL` when the
+/// lookup misses, so a deleted timer and a never-existing id answer the same
+/// way — not -ESRCH, and not -EBADF.
+fn smoke_abi_time_timer_getoverrun_unknown_id_is_einval() -> TestResult {
+    with_setup(|| {
+        // A timerid that named a real timer and no longer does.
+        let stale = stale_timer()?;
+        if call(Syscall::TimerGetoverrun.raw(), a0(stale)) != Some(EINVAL) {
+            return Err("timer_getoverrun on a deleted timer must be -EINVAL");
+        }
+        // And one that never named anything. Both a plausible id and one
+        // past the id space, since those take different arms.
+        for id in [0x4242u64, u64::from(u32::MAX)] {
+            if call(Syscall::TimerGetoverrun.raw(), a0(id)) != Some(EINVAL) {
+                return Err("timer_getoverrun on an unowned timerid must be -EINVAL");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_time_timer_getoverrun_unknown_id_is_einval
+);
+
+/// The syscall number is wired on both arches.
+///
+/// `timer_getoverrun` was absent from `LINUX_TABLE` entirely, which — since
+/// the dispatcher now answers -ENOSYS for a number it has no entry for —
+/// would leave this reachable only as "unsupported". x86_64 puts it at 225
+/// and the generic (arm64) table at 109, and the two are easy to transpose
+/// because the surrounding timer numbers are not in the same order.
+fn smoke_abi_time_timer_getoverrun_is_routed() -> TestResult {
+    with_setup(|| {
+        let raw = Syscall::TimerGetoverrun.raw();
+        #[cfg(target_arch = "x86_64")]
+        if raw != 225 {
+            return Err("timer_getoverrun is not at x86_64 number 225");
+        }
+        #[cfg(target_arch = "aarch64")]
+        if raw != 109 {
+            return Err("timer_getoverrun is not at the generic number 109");
+        }
+        // Routed, not answered by the not-implemented arm.
+        let id = make_timer()?;
+        let r = call_raw(raw, a0(id));
+        if r.status != SyscallReturn::OK {
+            return Err("timer_getoverrun did not reach a handler");
+        }
+        if r.value as i64 == -38 {
+            return Err("timer_getoverrun was answered by the -ENOSYS arm");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timer_getoverrun_is_routed);

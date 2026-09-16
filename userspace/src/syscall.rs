@@ -1700,6 +1700,14 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `timer_getoverrun(timerid)` — how many expiries the signal most
+    /// recently queued for this timer stood in for.
+    ///
+    /// POSIX collapses a burst of missed expiries into ONE signal plus a
+    /// count; this syscall is the only way to recover the count, so a
+    /// handler that must do work per expiry cannot be written without it.
+    /// Linux `timer_getoverrun` (x86_64=225, aarch64=109).
+    TimerGetoverrun,
     /// `timer_delete(timerid)` — destroy the timer.
     /// Linux `timer_delete` (x86_64=226, aarch64=111).
     TimerDelete,
@@ -2732,6 +2740,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::TimerCreate, 222),
     (Syscall::TimerSettime, 223),
     (Syscall::TimerGettime, 224),
+    (Syscall::TimerGetoverrun, 225),
     (Syscall::TimerDelete, 226),
     (Syscall::ClockNanosleep, 230),
     // tcgetattr/tcsetattr are libc-only on Linux (ioctl(TCGETS) backed);
@@ -3054,6 +3063,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     // Wave-73 POSIX timers + clock_nanosleep (linux-compat).
     (Syscall::TimerCreate, 107),
     (Syscall::TimerGettime, 108),
+    (Syscall::TimerGetoverrun, 109),
     (Syscall::TimerSettime, 110),
     (Syscall::TimerDelete, 111),
     (Syscall::ClockNanosleep, 115),
