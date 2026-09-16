@@ -82,6 +82,13 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `mm/mprotect.c::mprotect_fixup`: a sealed range refuses this outright. Sealing exists to
+    // guarantee that what is mapped at an address cannot be replaced, and
+    // mprotect is one of the operations that could replace it.
+    if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, len) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
     let base = VirtAddr::new(args.arg0);
     match mprotect_core(&as_ref, base, len, prot) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),

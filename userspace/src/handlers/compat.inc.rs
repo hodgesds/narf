@@ -10035,6 +10035,17 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(sys_quotactl_fd),
     );
     table.install_raw(Syscall::Cachestat, "cachestat", RawFnHandler(sys_cachestat));
+    table.install_raw(Syscall::Mseal, "mseal", RawFnHandler(sys_mseal));
+    table.install_raw(
+        Syscall::FileGetattr,
+        "file_getattr",
+        RawFnHandler(sys_file_getattr),
+    );
+    table.install_raw(
+        Syscall::FileSetattr,
+        "file_setattr",
+        RawFnHandler(sys_file_setattr),
+    );
     // Mount-table queries (Linux 6.8).
     table.install_raw(Syscall::Statmount, "statmount", RawFnHandler(sys_statmount));
     table.install_raw(Syscall::Listmount, "listmount", RawFnHandler(sys_listmount));
@@ -11356,6 +11367,10 @@ mod handler_sys_setuid;
 mod handler_sys_setxattr;
 #[path = "sys_cachestat.rs"]
 mod handler_sys_cachestat;
+#[path = "sys_file_attr.rs"]
+mod handler_sys_file_attr;
+#[path = "sys_mseal.rs"]
+mod handler_sys_mseal;
 #[path = "sys_statmount.rs"]
 mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]
@@ -11763,6 +11778,8 @@ pub(crate) use {
     handler_sys_setuid::sys_setuid,
     handler_sys_setxattr::{sys_lsetxattr, sys_setxattr},
     handler_sys_cachestat::sys_cachestat,
+    handler_sys_file_attr::{sys_file_getattr, sys_file_setattr},
+    handler_sys_mseal::{drop_address_space_seals, sys_mseal},
     handler_sys_statmount::{sys_listmount, sys_statmount},
     handler_sys_xattrat::{
         sys_getxattrat, sys_listxattrat, sys_removexattrat, sys_setxattrat, xattr_get_at,

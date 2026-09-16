@@ -395,3 +395,203 @@ kernel_test_in!(
 // memory crate by smoke_memory_perms_intersecting_reports_locked, which
 // covers the case this harness cannot: a range spanning an unlocked and
 // a locked VMA still reporting LOCKED.
+
+// ── mseal(2) ──────────────────────────────────────────────────────────
+//
+// Sealing makes a range permanently immune to the operations that could
+// replace what is mapped there. It is MONOTONIC — `unseal()` does not exist,
+// deliberately — which is why a case only ever has to prove that something
+// became refused, never that it became allowed again.
+
+static MSEAL_AS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::sync::Arc<narf_memory::AddressSpace>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn lookup_mseal_as() -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+    MSEAL_AS.lock().clone()
+}
+
+/// A real address space with one anonymous RW mapping, and the address of
+/// that mapping. `mseal` needs a range that is actually mapped — an
+/// unmapped one is -ENOMEM before anything is recorded.
+fn with_mseal_as(
+    body: impl FnOnce(u64, u64) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    const LEN: u64 = 0x4000; // four pages, so a sub-range is distinguishable
+                             // SAFETY: kernel tests run after paging is enabled; the new root stays
+                             // owned by MSEAL_AS for the whole sequence.
+    let as_ref = match unsafe { narf_memory::AddressSpace::new_for_user() } {
+        Ok(a) => alloc::sync::Arc::new(a),
+        Err(_) => return Err("failed to create an mseal test address space"),
+    };
+    *MSEAL_AS.lock() = Some(alloc::sync::Arc::clone(&as_ref));
+    crate::handlers::install_address_space_lookup(lookup_mseal_as);
+    let base = as_ref.reserve_mmap_va(LEN);
+    let result = if base == 0 {
+        Err("failed to reserve a test mapping")
+    } else {
+        // MAP_ANONYMOUS | MAP_PRIVATE, RW, at a fixed address.
+        let args = SyscallArgs {
+            arg0: base,
+            arg1: LEN,
+            arg2: 3,    // PROT_READ | PROT_WRITE
+            arg3: 0x32, // MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+            arg4: (-1i64) as u64,
+            arg5: 0,
+        };
+        match call(Syscall::Mmap.raw(), args) {
+            Some(v) if v as u64 == base => body(base, LEN),
+            _ => Err("failed to map the test range"),
+        }
+    };
+    crate::handlers::restore_address_space_lookup(None);
+    *MSEAL_AS.lock() = None;
+    result
+}
+
+/// A sealed range refuses every operation that could replace it.
+///
+/// The five are the ones `mm/mseal.c` lists: munmap, mremap, mprotect,
+/// pkey_mprotect and `mmap(MAP_FIXED)`. Each is checked AFTER sealing and
+/// each must be -EPERM — a seal that stops only some of them stops none of
+/// them, because any one is enough to put different contents at the address.
+fn smoke_abi_mem2_mseal_refuses_replacing_operations() -> TestResult {
+    with_setup(|| {
+        with_mseal_as(|base, len| {
+            // Before sealing, mprotect over the range works — so the refusals
+            // below are the seal and not some unrelated failure.
+            if call(Syscall::MProtect.raw(), a2(base, len, 1)) != Some(0) {
+                return Err("mprotect should work before the range is sealed");
+            }
+            if call(Syscall::Mseal.raw(), a2(base, len, 0)) != Some(0) {
+                return Err("mseal over a mapped range should succeed");
+            }
+            // "adding a seal on an already sealed memory is a no-action (no
+            // error)".
+            if call(Syscall::Mseal.raw(), a2(base, len, 0)) != Some(0) {
+                return Err("re-sealing an already sealed range must not be an error");
+            }
+            if call(Syscall::MProtect.raw(), a2(base, len, 1)) != Some(EPERM) {
+                return Err("mprotect over a sealed range must be -EPERM");
+            }
+            if call(Syscall::PkeyMprotect.raw(), a3(base, len, 1, 0)) != Some(EPERM) {
+                return Err("pkey_mprotect over a sealed range must be -EPERM");
+            }
+            if call(Syscall::Mremap.raw(), a3(base, len, len * 2, 0)) != Some(EPERM) {
+                return Err("mremap of a sealed range must be -EPERM");
+            }
+            // A destructive MAP_FIXED over the range.
+            let fixed = SyscallArgs {
+                arg0: base,
+                arg1: len,
+                arg2: 3,
+                arg3: 0x32, // MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+                arg4: (-1i64) as u64,
+                arg5: 0,
+            };
+            if call(Syscall::Mmap.raw(), fixed) != Some(EPERM) {
+                return Err("mmap(MAP_FIXED) over a sealed range must be -EPERM");
+            }
+            // munmap last — if it succeeded, everything above would be moot.
+            if call(Syscall::Munmap.raw(), a1(base, len)) != Some(EPERM) {
+                return Err("munmap of a sealed range must be -EPERM");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem2_mseal_refuses_replacing_operations
+);
+
+/// A sub-range seal protects only what it covers, and any OVERLAP is enough
+/// to refuse.
+///
+/// Overlap and not containment: unmapping a range that is half sealed would
+/// still leave a hole where the sealed half was, which is exactly what
+/// sealing exists to prevent.
+fn smoke_abi_mem2_mseal_partial_range() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    with_setup(|| {
+        with_mseal_as(|base, len| {
+            // Seal only the second page of four.
+            if call(Syscall::Mseal.raw(), a2(base + PAGE, PAGE, 0)) != Some(0) {
+                return Err("sealing a sub-range should succeed");
+            }
+            // The first page is untouched.
+            if call(Syscall::MProtect.raw(), a2(base, PAGE, 1)) != Some(0) {
+                return Err("a page outside the seal must still be mprotect-able");
+            }
+            // The fourth page too.
+            if call(Syscall::MProtect.raw(), a2(base + 3 * PAGE, PAGE, 1)) != Some(0) {
+                return Err("a later page outside the seal must still be mprotect-able");
+            }
+            // A range that merely OVERLAPS the sealed page is refused.
+            if call(Syscall::MProtect.raw(), a2(base, 2 * PAGE, 1)) != Some(EPERM) {
+                return Err("a range overlapping the seal must be -EPERM");
+            }
+            // And the whole mapping, which contains it.
+            if call(Syscall::Munmap.raw(), a1(base, len)) != Some(EPERM) {
+                return Err("unmapping a range containing the seal must be -EPERM");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_mseal_partial_range);
+
+/// `mseal`'s own argument rules.
+///
+/// ```text
+/// if (flags)                 return -EINVAL;   /* reserved */
+/// if (!PAGE_ALIGNED(start))  return -EINVAL;
+/// len = PAGE_ALIGN(len_in);
+/// if (len_in && !len)        return -EINVAL;   /* rounded up to zero */
+/// ```
+///
+/// and -ENOMEM for an address that is not mapped, or a gap inside the range
+/// — sealing half a range would leave the caller believing all of it is
+/// protected.
+fn smoke_abi_mem2_mseal_argument_rules() -> TestResult {
+    const PAGE: u64 = 0x1000;
+    with_setup(|| {
+        with_mseal_as(|base, len| {
+            // `flags` is reserved.
+            if call(Syscall::Mseal.raw(), a2(base, len, 1)) != Some(EINVAL) {
+                return Err("a nonzero mseal flag must be -EINVAL");
+            }
+            // Unaligned start.
+            if call(Syscall::Mseal.raw(), a2(base + 1, len, 0)) != Some(EINVAL) {
+                return Err("an unaligned start must be -EINVAL");
+            }
+            // A length that rounds up to zero.
+            if call(Syscall::Mseal.raw(), a2(base, u64::MAX, 0)) != Some(EINVAL) {
+                return Err("a length that rounds up to zero must be -EINVAL");
+            }
+            // Zero length is a no-op, not an error — and must not seal
+            // anything, or the mprotect below would fail.
+            if call(Syscall::Mseal.raw(), a2(base, 0, 0)) != Some(0) {
+                return Err("a zero length must be accepted as a no-op");
+            }
+            if call(Syscall::MProtect.raw(), a2(base, PAGE, 1)) != Some(0) {
+                return Err("a zero-length mseal sealed something");
+            }
+            // An unmapped address.
+            let unmapped = base + 0x1000_0000;
+            if call(Syscall::Mseal.raw(), a2(unmapped, PAGE, 0)) != Some(ENOMEM) {
+                return Err("sealing an unmapped address must be -ENOMEM");
+            }
+            // A range that starts inside the mapping and runs past its end
+            // is a gap, and must seal nothing.
+            if call(Syscall::Mseal.raw(), a2(base, len + PAGE, 0)) != Some(ENOMEM) {
+                return Err("a range spanning a gap must be -ENOMEM");
+            }
+            if call(Syscall::MProtect.raw(), a2(base, PAGE, 1)) != Some(0) {
+                return Err("a failed mseal sealed part of the range anyway");
+            }
+            Ok(())
+        })
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem2_mseal_argument_rules);

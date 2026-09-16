@@ -109,6 +109,13 @@ pub(crate) fn sys_munmap(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // `mm/vma.c::vms_gather_munmap_vmas`: `if (vma_is_sealed(vms->vma))`.
+    // Unmapping a sealed range is the operation sealing exists to prevent —
+    // it leaves a hole that can be filled with a different mapping.
+    if handler_sys_mseal::range_is_sealed(as_ref.identity(), base.as_u64(), len) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
 
     // Linux reaches SysV accounting only through `shm_vm_ops.close`. Inspect
     // the affected VMA range while holding the same per-mm transaction used by

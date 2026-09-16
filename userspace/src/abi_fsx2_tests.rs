@@ -3440,3 +3440,232 @@ fn smoke_abi_fsx2_cachestat_argument_order() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_cachestat_argument_order);
+
+// ── file_getattr(2) / file_setattr(2) ─────────────────────────────────
+//
+// The syscall form of the `FS_IOC_GETFLAGS`/`FS_IOC_SETFLAGS` ioctl pair,
+// added because an ioctl needs an already-open descriptor and these take a
+// path. They report the xfs-style `FS_XFLAG_*` word rather than the
+// `FS_*_FL` one the ioctl uses, so the two spellings must agree about the
+// same inode — which is the assertion that matters.
+
+const FILE_ATTR_SIZE: usize = 24;
+const FS_XFLAG_IMMUTABLE: u64 = 0x08;
+const FS_XFLAG_APPEND: u64 = 0x10;
+
+fn file_attr_buf(xflags: u64) -> [u8; FILE_ATTR_SIZE] {
+    let mut b = [0u8; FILE_ATTR_SIZE];
+    b[0..8].copy_from_slice(&xflags.to_ne_bytes());
+    b
+}
+
+/// Set through `file_setattr`, read back through both `file_getattr` and
+/// the `FS_IOC_GETFLAGS` ioctl.
+///
+/// The cross-check is the point: the syscall speaks `FS_XFLAG_*` and the
+/// ioctl speaks `FS_*_FL`, so a mis-mapped bit would round-trip cleanly
+/// through the syscall alone and still be wrong.
+fn smoke_abi_fsx2_file_setattr_getattr_round_trip() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    const FS_IMMUTABLE_FL: u32 = 0x10;
+    with_memfs("/fattr", "fattr", &[("f", b"hi")], || {
+        let path = c"/fattr/f";
+        // Set IMMUTABLE through the syscall.
+        let set = file_attr_buf(FS_XFLAG_IMMUTABLE);
+        let args = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: set.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), args) != Some(0) {
+            return Err("file_setattr(IMMUTABLE) should succeed");
+        }
+        // Read it back through the syscall.
+        let mut got = [0u8; FILE_ATTR_SIZE];
+        let gargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), gargs) != Some(0) {
+            return Err("file_getattr should succeed");
+        }
+        let xflags = u64::from_ne_bytes(got[0..8].try_into().unwrap());
+        if xflags & FS_XFLAG_IMMUTABLE == 0 {
+            return Err("file_getattr did not report the flag file_setattr set");
+        }
+        if xflags & FS_XFLAG_APPEND != 0 {
+            return Err("file_getattr reported a flag that was never set");
+        }
+        // And through the ioctl, which speaks the OTHER flag word. A
+        // mis-mapped bit would pass the syscall round trip and fail here.
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let mut fl = [0u8; 4];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd, FS_IOC_GETFLAGS, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_GETFLAGS should succeed");
+        }
+        if u32::from_ne_bytes(fl) & FS_IMMUTABLE_FL == 0 {
+            return Err("the ioctl and the syscall disagree about the same inode");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        // Clearing works too, so the set is not one-way.
+        let clear = file_attr_buf(0);
+        let cargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: clear.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), cargs) != Some(0) {
+            return Err("file_setattr clearing the flag should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_file_setattr_getattr_round_trip
+);
+
+/// The `usize` and `at_flags` rules.
+///
+/// ```text
+/// if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return -EINVAL;
+/// if (usize > PAGE_SIZE)                                       return -E2BIG;
+/// if (usize < FILE_ATTR_SIZE_VER0)                             return -EINVAL;
+/// ```
+///
+/// -E2BIG is decided BEFORE -EINVAL, so an oversized `usize` reports E2BIG
+/// even though it is also not a version this kernel knows. And an xflag
+/// outside `FS_XFLAGS_MASK` is -EINVAL, while the read-only flags inside it
+/// are silently STRIPPED rather than refused — two different answers for two
+/// kinds of unsettable bit.
+fn smoke_abi_fsx2_file_attr_size_and_flag_rules() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const E2BIG: i64 = -7;
+    const FS_XFLAG_HASATTR: u64 = 0x8000_0000; // in FS_XFLAG_RDONLY_MASK
+    with_memfs("/fattr2", "fattr2", &[("f", b"hi")], || {
+        let path = c"/fattr2/f";
+        let buf = file_attr_buf(0);
+        let mk = |usize_bytes: u64, at_flags: u64| SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: buf.as_ptr() as u64,
+            arg3: usize_bytes,
+            arg4: at_flags,
+            ..Default::default()
+        };
+        // Below VER0.
+        if call(Syscall::FileGetattr.raw(), mk(23, 0)) != Some(EINVAL) {
+            return Err("a usize below FILE_ATTR_SIZE_VER0 must be -EINVAL");
+        }
+        // Past PAGE_SIZE — E2BIG, and decided first.
+        if call(Syscall::FileGetattr.raw(), mk(4097, 0)) != Some(E2BIG) {
+            return Err("a usize above PAGE_SIZE must be -E2BIG");
+        }
+        // An at_flag outside the two legal bits.
+        if call(Syscall::FileGetattr.raw(), mk(FILE_ATTR_SIZE as u64, 0x200)) != Some(EINVAL) {
+            return Err("an at_flag outside AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH must be -EINVAL");
+        }
+        // An xflag outside FS_XFLAGS_MASK: -EINVAL.
+        let bogus = file_attr_buf(0x0004_0000);
+        let bargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: bogus.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), bargs) != Some(EINVAL) {
+            return Err("an xflag outside FS_XFLAGS_MASK must be -EINVAL");
+        }
+        // A read-only xflag INSIDE the mask: stripped, not refused.
+        let rdonly = file_attr_buf(FS_XFLAG_HASATTR);
+        let rargs = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: rdonly.as_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: 0,
+            ..Default::default()
+        };
+        if call(Syscall::FileSetattr.raw(), rargs) != Some(0) {
+            return Err("a read-only xflag must be stripped, not refused");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_attr_size_and_flag_rules);
+
+/// AT_EMPTY_PATH names the file behind the descriptor.
+///
+/// `if (!name && dfd >= 0) { filepath = fd_file(f)->f_path; }` — and
+/// AT_FDCWD is NOT a descriptor, so it falls through to the path branch,
+/// which has no path: -EBADF.
+fn smoke_abi_fsx2_file_getattr_empty_path() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    with_memfs("/fattr3", "fattr3", &[("f", b"hi")], || {
+        let path = c"/fattr3/f";
+        let fd = match call_open(path.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let mut got = [0u8; FILE_ATTR_SIZE];
+        let args = SyscallArgs {
+            arg0: fd,
+            arg1: 0, // NULL path
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), args) != Some(0) {
+            return Err("file_getattr(fd, NULL, AT_EMPTY_PATH) should succeed");
+        }
+        // A closed descriptor takes the same arm and is -EBADF.
+        let bad = SyscallArgs {
+            arg0: 4242,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), bad) != Some(EBADF) {
+            return Err("AT_EMPTY_PATH on a closed descriptor must be -EBADF");
+        }
+        // AT_FDCWD is not a descriptor, so it cannot name a file.
+        let cwd = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: 0,
+            arg2: got.as_mut_ptr() as u64,
+            arg3: FILE_ATTR_SIZE as u64,
+            arg4: AT_EMPTY_PATH,
+            ..Default::default()
+        };
+        if call(Syscall::FileGetattr.raw(), cwd) != Some(EBADF) {
+            return Err("AT_FDCWD with a NULL path must be -EBADF");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_file_getattr_empty_path);

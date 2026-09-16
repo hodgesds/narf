@@ -1717,6 +1717,20 @@ pub enum Syscall {
     /// can prove is unnecessary.
     /// Linux `cachestat` (x86_64=451, aarch64=451).
     Cachestat,
+    /// `mseal(start, len, flags)` — make a range permanently immune to the
+    /// operations that could replace what is mapped there (munmap, mremap,
+    /// mprotect, MAP_FIXED, destructive madvise). Monotonic: there is no
+    /// unseal, deliberately.
+    /// Linux `mseal` (x86_64=462, aarch64=462).
+    Mseal,
+    /// `file_getattr(dfd, path, file_attr*, usize, at_flags)` — the inode
+    /// attribute word (`FS_XFLAG_*`), by PATH rather than through an ioctl
+    /// on an already-open descriptor.
+    /// Linux `file_getattr` (x86_64=468, aarch64=468).
+    FileGetattr,
+    /// `file_setattr(dfd, path, file_attr*, usize, at_flags)`.
+    /// Linux `file_setattr` (x86_64=469, aarch64=469).
+    FileSetattr,
     /// `statmount(req, buf, bufsize, flags)` — query one mount without
     /// parsing `/proc/self/mountinfo`.
     /// Linux `statmount` (x86_64=457, aarch64=457).
@@ -2559,10 +2573,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
+    (Syscall::Mseal, 462),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),
     (Syscall::Removexattrat, 466),
+    (Syscall::FileGetattr, 468),
+    (Syscall::FileSetattr, 469),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
     (Syscall::Creat, 85),
@@ -3032,10 +3049,13 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
+    (Syscall::Mseal, 462),
     (Syscall::Setxattrat, 463),
     (Syscall::Getxattrat, 464),
     (Syscall::Listxattrat, 465),
     (Syscall::Removexattrat, 466),
+    (Syscall::FileGetattr, 468),
+    (Syscall::FileSetattr, 469),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),

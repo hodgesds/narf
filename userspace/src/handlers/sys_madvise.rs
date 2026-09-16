@@ -107,6 +107,35 @@ pub(crate) fn sys_madvise(ctx: &mut dyn TrapContext) {
         }
     };
 
+    // `mm/madvise.c::can_madvise_modify` — deliberately the NARROWEST of the
+    // seal checks:
+    //
+    //     if (!vma_is_sealed(vma))        return true;   /* not sealed */
+    //     if (!is_discard(behavior))      return true;   /* not destructive */
+    //     if (!vma_is_anonymous(vma))     return true;   /* file-backed is fine */
+    //     if (vma->vm_flags & VM_WRITE)   return true;   /* could write anyway */
+    //     return false;
+    //
+    // Only a DISCARD of a sealed anonymous mapping the caller cannot write
+    // is refused, because that is the one case where madvise is the only way
+    // to alter the contents — a discard is effectively a memset(0). A
+    // writable mapping can be overwritten directly, so refusing the discard
+    // would protect nothing, and file-backed pages come back from the file.
+    if matches!(advice, MADV_DONTNEED | MADV_FREE)
+        && handler_sys_mseal::range_is_sealed(as_ref.identity(), base.as_u64(), len)
+    {
+        let writable = as_ref
+            .perms_covering(base, len)
+            .is_some_and(|p| p.contains(narf_memory::RegionPerms::WRITE));
+        let file_backed = as_ref
+            .perms_covering(base, len)
+            .is_some_and(|p| p.contains(narf_memory::RegionPerms::FILE_DEMAND));
+        if !writable && !file_backed {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+    }
+
     match advice {
         MADV_DONTNEED | MADV_FREE => match as_ref.madvise_dontneed(base, len) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),

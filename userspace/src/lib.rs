@@ -129,6 +129,10 @@ pub use pipe::{pipe_pair, PipeRead, PipeWrite};
 /// translations belonging to an address space.
 pub fn drop_mapped_file_address_space(address_space_id: u64) {
     mapped_file::drop_address_space(address_space_id);
+    // `mseal` seals are keyed by the same identity. An entry that outlived
+    // its address space would seal whatever a later one happened to map at
+    // the same addresses.
+    handlers::drop_address_space_seals(address_space_id);
 }
 
 pub use elf::{parse as parse_elf, ElfError};
