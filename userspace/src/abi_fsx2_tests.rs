@@ -2397,3 +2397,442 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fsx2_bind_still_succeeds_for_a_real_source
 );
+
+// ── the xattr `*at` family (Linux 6.13) ───────────────────────────────
+//
+// `fs/xattr.c` has four bodies — `path_setxattrat`, `path_getxattrat`,
+// `path_listxattrat`, `path_removexattrat` — and all sixteen entry points
+// are presets over them: plain (`AT_FDCWD, path, 0`), `l` (`AT_FDCWD, path,
+// AT_SYMLINK_NOFOLLOW`), `f` (`fd, NULL, AT_EMPTY_PATH`) and the `*at`
+// forms, which pass the caller's own three.
+
+/// A round trip through `setxattrat` and `getxattrat`.
+///
+/// The value and flags travel inside `struct xattr_args { __aligned_u64
+/// value; __u32 size; __u32 flags; }` rather than in registers, so this
+/// also pins the struct's layout: a get that read the fields at the wrong
+/// offsets would still "work" for a zero-length value.
+fn smoke_abi_fsx2_setxattrat_getxattrat_round_trip() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    with_memfs("/xat", "xat", &[("f", b"hi")], || {
+        let path = b"/xat/f\0";
+        let name = b"user.at\0";
+        let val = b"round-trip";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        // args.flags = 0 (neither XATTR_CREATE nor XATTR_REPLACE).
+        let set = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0, // at_flags
+            arg3: name.as_ptr() as u64,
+            arg4: args.as_ptr() as u64,
+            arg5: 16,
+        };
+        if call(Syscall::Setxattrat.raw(), set) != Some(0) {
+            return Err("setxattrat should store the attribute");
+        }
+        let mut out = [0u8; 32];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        let get = SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: name.as_ptr() as u64,
+            arg4: gargs.as_ptr() as u64,
+            arg5: 16,
+        };
+        match call(Syscall::Getxattrat.raw(), get) {
+            Some(n) if n == val.len() as i64 => {}
+            _ => return Err("getxattrat should report the stored value's length"),
+        }
+        if &out[..val.len()] != val {
+            return Err("getxattrat returned a different value than setxattrat stored");
+        }
+        // The plain form is the same body with (AT_FDCWD, path, 0), so it
+        // must see the very same attribute.
+        let mut out2 = [0u8; 32];
+        let legacy = SyscallArgs {
+            arg0: path.as_ptr() as u64,
+            arg1: name.as_ptr() as u64,
+            arg2: out2.as_mut_ptr() as u64,
+            arg3: out2.len() as u64,
+            ..Default::default()
+        };
+        match call(Syscall::Getxattr.raw(), legacy) {
+            Some(n) if n == val.len() as i64 && &out2[..val.len()] == val => Ok(()),
+            _ => Err("getxattr and getxattrat disagree about the same attribute"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_setxattrat_getxattrat_round_trip
+);
+
+/// `listxattrat` and `removexattrat`, and that remove really removed it.
+fn smoke_abi_fsx2_listxattrat_removexattrat() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    with_memfs("/xat2", "xat2", &[("f", b"hi")], || {
+        let path = b"/xat2/f\0";
+        let name = b"user.gone\0";
+        let val = b"v";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        if call(
+            Syscall::Setxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: args.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) != Some(0)
+        {
+            return Err("setxattrat setup should succeed");
+        }
+        let mut list = [0u8; 128];
+        let listed = match call(
+            Syscall::Listxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: list.as_mut_ptr() as u64,
+                arg4: list.len() as u64,
+                ..Default::default()
+            },
+        ) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("listxattrat should report the attribute names"),
+        };
+        if !list[..listed].windows(9).any(|w| w == b"user.gone") {
+            return Err("listxattrat did not list the attribute that was set");
+        }
+        if call(
+            Syscall::Removexattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                ..Default::default()
+            },
+        ) != Some(0)
+        {
+            return Err("removexattrat should remove the attribute");
+        }
+        // ENODATA, not 0: the name must actually be gone.
+        let mut out = [0u8; 8];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        match call(
+            Syscall::Getxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: gargs.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) {
+            Some(-61) => Ok(()), // -ENODATA
+            _ => Err("the attribute survived removexattrat"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_listxattrat_removexattrat);
+
+/// The `struct xattr_args` size rules, which are what let an old kernel
+/// refuse a new caller safely.
+///
+/// ```text
+/// if (unlikely(usize < XATTR_ARGS_SIZE_VER0)) return -EINVAL;   /* 16 */
+/// if (usize > PAGE_SIZE)                      return -E2BIG;
+/// error = copy_struct_from_user(&args, sizeof(args), uargs, usize);
+/// ```
+///
+/// and `copy_struct_from_user` requires every byte past the struct this
+/// kernel knows to be zero, answering -E2BIG otherwise. That last rule is
+/// the safety property: a caller who sets a field this kernel would ignore
+/// is told so rather than having it silently dropped.
+fn smoke_abi_fsx2_xattrat_args_size_rules() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const E2BIG: i64 = -7;
+    with_memfs("/xat3", "xat3", &[("f", b"hi")], || {
+        let path = b"/xat3/f\0";
+        let name = b"user.k\0";
+        let val = b"v";
+        // A 24-byte struct: the 16 this kernel knows, plus 8 trailing.
+        let mut args = [0u8; 24];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        let args_ptr = args.as_ptr() as u64;
+        let mk = |usize_bytes: u64| SyscallArgs {
+            arg0: AT_FDCWD,
+            arg1: path.as_ptr() as u64,
+            arg2: 0,
+            arg3: name.as_ptr() as u64,
+            arg4: args_ptr,
+            arg5: usize_bytes,
+        };
+        // Below VER0 — a struct too small to hold the fields it must.
+        if call(Syscall::Setxattrat.raw(), mk(15)) != Some(EINVAL) {
+            return Err("a usize below XATTR_ARGS_SIZE_VER0 must be -EINVAL");
+        }
+        // Past PAGE_SIZE.
+        if call(Syscall::Setxattrat.raw(), mk(4097)) != Some(E2BIG) {
+            return Err("a usize above PAGE_SIZE must be -E2BIG");
+        }
+        // 24 bytes with an all-zero tail: accepted, because the fields this
+        // kernel does not know are unset.
+        if call(Syscall::Setxattrat.raw(), mk(24)) != Some(0) {
+            return Err("a zeroed trailing region must be accepted");
+        }
+        // The same 24 bytes with something set in the tail: refused, rather
+        // than dropped.
+        args[16] = 1;
+        if call(Syscall::Setxattrat.raw(), mk(24)) != Some(E2BIG) {
+            return Err("a non-zero trailing region must be -E2BIG, not ignored");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattrat_args_size_rules);
+
+/// `at_flags` validation, and `getxattrat`'s extra rule that the struct's
+/// `flags` field must be zero.
+///
+/// `path_setxattrat` opens with
+/// `if ((at_flags & ~(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH)) != 0) return
+/// -EINVAL;`, and `SYSCALL_DEFINE6(getxattrat)` adds `if (args.flags != 0)
+/// return -EINVAL;` — a get has no flags to carry, so a caller reusing a
+/// set call's struct is told instead of having the field ignored.
+fn smoke_abi_fsx2_xattrat_flag_validation() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const XATTR_CREATE: u32 = 1;
+    with_memfs("/xat4", "xat4", &[("f", b"hi")], || {
+        let path = b"/xat4/f\0";
+        let name = b"user.k\0";
+        let val = b"v";
+        let mut args = [0u8; 16];
+        args[0..8].copy_from_slice(&(val.as_ptr() as u64).to_ne_bytes());
+        args[8..12].copy_from_slice(&(val.len() as u32).to_ne_bytes());
+        // An at_flag outside the two legal bits.
+        for bad in [0x200u64, 0x800, 0x1_0000] {
+            if call(
+                Syscall::Setxattrat.raw(),
+                SyscallArgs {
+                    arg0: AT_FDCWD,
+                    arg1: path.as_ptr() as u64,
+                    arg2: bad,
+                    arg3: name.as_ptr() as u64,
+                    arg4: args.as_ptr() as u64,
+                    arg5: 16,
+                },
+            ) != Some(EINVAL)
+            {
+                return Err("an at_flag outside AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH must be -EINVAL");
+            }
+        }
+        // getxattrat with args.flags set.
+        let mut out = [0u8; 8];
+        let mut gargs = [0u8; 16];
+        gargs[0..8].copy_from_slice(&(out.as_mut_ptr() as u64).to_ne_bytes());
+        gargs[8..12].copy_from_slice(&(out.len() as u32).to_ne_bytes());
+        gargs[12..16].copy_from_slice(&XATTR_CREATE.to_ne_bytes());
+        match call(
+            Syscall::Getxattrat.raw(),
+            SyscallArgs {
+                arg0: AT_FDCWD,
+                arg1: path.as_ptr() as u64,
+                arg2: 0,
+                arg3: name.as_ptr() as u64,
+                arg4: gargs.as_ptr() as u64,
+                arg5: 16,
+            },
+        ) {
+            Some(v) if v == EINVAL => Ok(()),
+            _ => Err("getxattrat with a non-zero args.flags must be -EINVAL"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_xattrat_flag_validation);
+
+/// `setxattr` follows the final symlink; `lsetxattr` does not.
+///
+/// `path_setxattrat` derives the lookup from `at_flags`:
+///
+/// ```text
+/// if (!(at_flags & AT_SYMLINK_NOFOLLOW))
+///         lookup_flags = LOOKUP_FOLLOW;
+/// ```
+///
+/// so the plain form targets the file a link points at and the `l` form
+/// targets the link itself. NARF resolved with `resolve_async_nofollow`
+/// whatever the entry point, which made every form behave like the `l`
+/// one — the l-forms right by accident and the plain forms wrong, which is
+/// the direction that matters: `lsetxattr` exists BECAUSE the default is to
+/// follow, so a caller wanting the link had a spelling and a caller wanting
+/// the target did not.
+///
+/// The two attributes are read back through the opposite entry point from
+/// the one that wrote them, which is what distinguishes "both wrote
+/// somewhere" from "each wrote to its own inode".
+fn smoke_abi_fsx2_xattr_follows_symlink_unless_l_form() -> TestResult {
+    with_memfs("/xat5", "xat5", &[("target", b"hi")], || {
+        let target = b"/xat5/target\0";
+        let link = b"/xat5/link\0";
+        // An ABSOLUTE target, which is the ordinary shape in a real tree and
+        // the one that only the VFS-level walk can follow — the
+        // in-filesystem resolver restarts such a target at its own mount
+        // root. Getting this case right is why `xattr_at_path` runs
+        // `resolve_vfs_symlink_path` rather than leaving the follow to
+        // `resolve_async_ext`, which is the same split `open` uses.
+        if call_symlink(target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("symlink setup should succeed");
+        }
+        // `trusted.*`, not `user.*`: `xattr_permission` allows the user
+        // namespace only on regular files and directories, so `user.which`
+        // on the LINK would be -EPERM in Linux too and the case would be
+        // testing the namespace rule instead of the follow rule. The
+        // harness task is privileged, which is what `trusted.*` requires.
+        let name = b"trusted.which\0";
+        let set = |path: &[u8], val: &[u8], syscall: u32| {
+            call(
+                syscall,
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: val.as_ptr() as u64,
+                    arg3: val.len() as u64,
+                    arg4: 0,
+                    ..Default::default()
+                },
+            )
+        };
+        // Through the link: the plain form must land on the TARGET.
+        if set(link, b"followed", Syscall::Setxattr.raw()) != Some(0) {
+            return Err("setxattr through a symlink should succeed");
+        }
+        // Through the link again, the l form: lands on the LINK.
+        if set(link, b"onlink", Syscall::Lsetxattr.raw()) != Some(0) {
+            return Err("lsetxattr on a symlink should succeed");
+        }
+        // Read the target directly. If the plain form had not followed, the
+        // two writes would have collided on the link and this would be
+        // ENODATA.
+        let mut out = [0u8; 32];
+        let get = |path: &[u8], buf: &mut [u8], syscall: u32| {
+            call(
+                syscall,
+                SyscallArgs {
+                    arg0: path.as_ptr() as u64,
+                    arg1: name.as_ptr() as u64,
+                    arg2: buf.as_mut_ptr() as u64,
+                    arg3: buf.len() as u64,
+                    ..Default::default()
+                },
+            )
+        };
+        match get(target, &mut out, Syscall::Getxattr.raw()) {
+            Some(n) if n == 8 && &out[..8] == b"followed" => {}
+            Some(-61) => return Err("setxattr through a symlink did not reach the target"),
+            _ => return Err("the target's attribute is not what setxattr wrote"),
+        }
+        // And the link kept its own, distinct value.
+        let mut out2 = [0u8; 32];
+        match get(link, &mut out2, Syscall::Lgetxattr.raw()) {
+            Some(n) if n == 6 && &out2[..6] == b"onlink" => {}
+            _ => return Err("the link's own attribute is not what lsetxattr wrote"),
+        }
+        // The plain get must follow too, seeing the target's value through
+        // the link rather than the link's own.
+        let mut out3 = [0u8; 32];
+        match get(link, &mut out3, Syscall::Getxattr.raw()) {
+            Some(n) if n == 8 && &out3[..8] == b"followed" => Ok(()),
+            _ => Err("getxattr through a symlink did not follow to the target"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_xattr_follows_symlink_unless_l_form
+);
+
+/// An ABSOLUTE symlink target resolves from the VFS root, not the mount root.
+///
+/// `fs/namei.c::nd_jump_root` — when `link_path_walk` reaches a symlink whose
+/// body starts with '/', the walk restarts at the process root and continues
+/// from there, which may leave the filesystem the link lives on entirely.
+/// Absolute targets are the common shape in a real tree (`/usr/bin/awk` ->
+/// `/etc/alternatives/awk`, and every `/lib` -> `/usr/lib` style merge).
+///
+/// NARF splits this in two: `resolve_vfs_symlink_path` does the walk at the
+/// syscall layer, where the mount table is reachable, and hands a fully
+/// resolved path to the per-filesystem resolver. Only the first half can
+/// leave the filesystem the link lives on; `resolve_async_ext` restarts an
+/// absolute target at its own mount root, which is right for what it can see
+/// and wrong for anything else.
+///
+/// This case drives `open(2)`, which has always run the VFS walk. It is here
+/// as the pin for that contract, because the xattr family did NOT run it and
+/// so got the mount-root answer — see
+/// `smoke_abi_fsx2_xattr_follows_symlink_unless_l_form`.
+fn smoke_abi_fsx2_absolute_symlink_target_resolves_from_vfs_root() -> TestResult {
+    with_memfs("/absl", "absl", &[("target", b"payload")], || {
+        let link = b"/absl/link\0";
+        let abs_target = b"/absl/target\0";
+        if call_symlink(abs_target.as_ptr() as u64, link.as_ptr() as u64) != Some(0) {
+            return Err("symlink setup should succeed");
+        }
+        // Opening the link must reach the target's contents.
+        let fd = match call_open(link.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open through an absolute symlink target should succeed"),
+        };
+        let mut buf = [0u8; 16];
+        match call(
+            Syscall::Read.raw(),
+            a2(fd, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) {
+            Some(7) if &buf[..7] == b"payload" => {}
+            _ => return Err("the absolute symlink did not resolve to its target's contents"),
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        // And a trailing component past the link: `/absl/link` -> `/absl`
+        // means `/absl/dirlink/target` must reach `/absl/target`.
+        let dirlink = b"/absl/dirlink\0";
+        let abs_dir = b"/absl\0";
+        if call_symlink(abs_dir.as_ptr() as u64, dirlink.as_ptr() as u64) != Some(0) {
+            return Err("directory symlink setup should succeed");
+        }
+        let through = b"/absl/dirlink/target\0";
+        let fd2 = match call_open(through.as_ptr() as u64, 0) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open through an absolute directory symlink should succeed"),
+        };
+        let mut buf2 = [0u8; 16];
+        let got = call(
+            Syscall::Read.raw(),
+            a2(fd2, buf2.as_mut_ptr() as u64, buf2.len() as u64),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd2));
+        match got {
+            Some(7) if &buf2[..7] == b"payload" => Ok(()),
+            _ => Err("components after an absolute symlink were not applied to its target"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_absolute_symlink_target_resolves_from_vfs_root
+);

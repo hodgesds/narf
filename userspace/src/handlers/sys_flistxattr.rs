@@ -1,10 +1,11 @@
 #[allow(unused_imports)]
 use super::*;
 
-/// `flistxattr(fd, list, size)`.
+/// `flistxattr(fd, list, size)` — `path_listxtrat(fd, NULL, AT_EMPTY_PATH, ...)`.
+///
+/// The `f` forms are the AT_EMPTY_PATH preset: a NULL pathname sends
+/// `path_*xattrat` down its `fd_file(f)` branch, which is why an invalid
+/// descriptor is -EBADF there and not -ENOENT.
 pub(crate) fn sys_flistxattr(ctx: &mut dyn TrapContext) {
-    match xattr_fd_key(ctx.args().arg0 as u32) {
-        Some(p) => xattr_list_core(p, ctx),
-        None => ctx.set_return(SyscallReturn::ok((-9i64) as u64)), // EBADF
-    }
+    xattr_list_at(ctx.args().arg0 as i64, 0, AT_EMPTY_PATH_ARG, ctx);
 }
