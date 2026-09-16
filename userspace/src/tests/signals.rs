@@ -25,6 +25,18 @@ fn smoke_userspace_sigaction_records_handler() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::sigaction_init();
     __test_clear_global();
@@ -131,6 +143,18 @@ fn smoke_userspace_signal_delivery() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_sigaction_reset();
     crate::handlers::__test_signal_reset();
@@ -294,6 +318,18 @@ fn smoke_userspace_completed_syscall_not_restartable() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_sigaction_reset();
     crate::handlers::__test_signal_reset();
@@ -827,6 +863,18 @@ fn smoke_userspace_signal_delivery_lowest_first_multiple_pending() -> TestResult
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_sigaction_reset();
     crate::handlers::__test_signal_reset();
@@ -987,6 +1035,18 @@ fn smoke_userspace_synchronous_signal_delivery() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_sigaction_reset();
     crate::sigaction_init();
@@ -1109,6 +1169,18 @@ fn smoke_userspace_sync_signal_si_addr_from_payload() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     crate::handlers::__test_sigaction_reset();
     crate::sigaction_init();
@@ -1221,6 +1293,18 @@ fn smoke_userspace_fork_inherits_sigaction_handlers() -> TestResult {
         FAKE_TID.load(Ordering::Relaxed)
     }
     crate::install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
 
     // SAFETY: the test harness runs with paging enabled (its `# Safety`
     // precondition); `new_for_user` only allocates a fresh user root that
@@ -1324,6 +1408,18 @@ fn smoke_userspace_sigaltstack_install_and_query() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1430,6 +1526,18 @@ fn smoke_userspace_sigaltstack_rejects_too_small() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1484,6 +1592,18 @@ fn smoke_userspace_tkill_targets_specific_tid() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1534,6 +1654,18 @@ fn smoke_userspace_tgkill_routes_via_tid() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1593,6 +1725,18 @@ fn smoke_userspace_rt_sigpending_filters_by_mask() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1678,6 +1822,18 @@ fn smoke_userspace_rt_sigsuspend_replaces_mask() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1748,6 +1904,18 @@ fn smoke_userspace_rt_sigtimedwait_returns_pending_signal() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1825,6 +1993,18 @@ fn smoke_userspace_rt_sigtimedwait_no_pending_returns_minus_one() -> TestResult 
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1877,6 +2057,18 @@ fn smoke_userspace_rt_sigtimedwait_picks_lowest_match() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -1945,6 +2137,18 @@ fn smoke_userspace_rt_sigpending_zero_when_nothing_blocked() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2005,6 +2209,18 @@ fn smoke_userspace_sigaltstack_query_only_keeps_prior_install() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2078,6 +2294,18 @@ fn smoke_userspace_sigaction_flags_stored_and_recovered() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::sigaction_init();
     crate::handlers::signal_init();
     __test_clear_global();
@@ -2128,6 +2356,18 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::handlers::signal_init();
     __test_clear_global();
     let mut t = SyscallTable::new();
@@ -2238,6 +2478,18 @@ fn smoke_sys_kill_sigterm_marks_pending() -> TestResult {
     __test_signal_reset();
     signal_init();
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -2317,6 +2569,18 @@ fn smoke_sys_kill_sighup_sigint_sigabrt_round_trip() -> TestResult {
     __test_signal_reset();
     signal_init();
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -2645,6 +2909,18 @@ fn smoke_userspace_posix_timer_signal_delivery() -> TestResult {
     posix_timer::posix_timer_init();
     fd::__test_reset();
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -2757,6 +3033,18 @@ fn smoke_userspace_posix_timer_gettime_remaining() -> TestResult {
     posix_timer::posix_timer_init();
     fd::__test_reset();
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);
@@ -2874,6 +3162,18 @@ fn smoke_userspace_posix_timer_delete_cancels() -> TestResult {
     posix_timer::posix_timer_init();
     fd::__test_reset();
     install_task_id_lookup(task_lookup);
+    // `sys_kill` resolves its target through `pid_to_task_raw` and answers
+    // -ESRCH when that misses. It used to fall back to treating the argument
+    // as a raw TaskId — a fallback these cases relied on, since they pass
+    // `FAKE_TASK` (a TaskId) where a pid belongs. Production registers the
+    // mapping at every spawn site (boot init, fork, clone), so the fallback
+    // was dead there; registering it here is what makes the harness look
+    // like a real task rather than restoring a path nothing else needs.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     __test_clear_global();
     let mut t = SyscallTable::new();
     install_core_syscalls(&mut t);

@@ -16,6 +16,14 @@ fn smoke_userspace_default_delivery_auto_blocks_without_nodefer() -> TestResult 
         FAKE_TASK.load(Ordering::Relaxed)
     }
     install_task_id_lookup(task_lookup);
+    // See the note in `tests/signals.rs`: `sys_kill` no longer falls back to
+    // treating its target as a raw TaskId, so a harness task needs the same
+    // pid mapping and registry entry a real spawn gets.
+    crate::handlers::register_task_to_pid(task_lookup(), task_lookup());
+    crate::handlers::register_pid_task_mapping(task_lookup(), task_lookup());
+    if crate::task::task_get(task_lookup()).is_none() {
+        let _ = crate::task::Task::new_registered(task_lookup(), task_lookup());
+    }
     crate::sigaction_init();
     crate::handlers::signal_init();
     __test_clear_global();
