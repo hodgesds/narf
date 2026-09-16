@@ -183,8 +183,19 @@ type BoxedTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// caller's queue then attempts to steal one task from another CPU's
 /// queue. With single-CPU configurations only index 0 is exercised,
 /// matching pre-SMP behaviour byte-for-byte.
-const NEW_QUEUE: IrqSafeSpinLock<Option<VecDeque<TaskSlot>>> = IrqSafeSpinLock::new(None);
-static READY: [IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>; narf_lib::percpu::MAX_CPUS] =
+#[repr(align(64))]
+struct ReadyQueueCell(IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>);
+
+impl core::ops::Deref for ReadyQueueCell {
+    type Target = IrqSafeSpinLock<Option<VecDeque<TaskSlot>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+const NEW_QUEUE: ReadyQueueCell = ReadyQueueCell(IrqSafeSpinLock::new(None));
+static READY: [ReadyQueueCell; narf_lib::percpu::MAX_CPUS] =
     [NEW_QUEUE; narf_lib::percpu::MAX_CPUS];
 
 /// Monotonic task identifier. Minted at `spawn` time. `0` is reserved
@@ -398,8 +409,10 @@ static WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
 /// slot. They are narrower than the opt-in generic wake-next policy: a value is
 /// published only after a real waiter was removed from its wait queue and was
 /// observed runnable on this CPU.
-static URGENT_WAKE_NEXT: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+#[repr(align(64))]
+struct PerCpuTaskHint(AtomicU64);
+static URGENT_WAKE_NEXT: [PerCpuTaskHint; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuTaskHint(AtomicU64::new(0)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Narrow directed wake for I/O owners only (boot flag `io_next`). The generic
 /// `WAKE_NEXT` path names EVERY wake its CPU's next-buddy and was measured to
@@ -452,7 +465,18 @@ pub(crate) fn hint_urgent_next(task: u64) {
     }
     let cpu = narf_lib::percpu::current_cpu();
     if cpu < URGENT_WAKE_NEXT.len() {
-        URGENT_WAKE_NEXT[cpu].store(task, Ordering::Release);
+        URGENT_WAKE_NEXT[cpu].0.store(task, Ordering::Release);
+    }
+}
+
+/// Publish a synchronous-handoff next-buddy on the wakee's home run queue.
+/// The caller must have obtained `home` from that task's live [`WakeCell`].
+#[inline]
+fn hint_urgent_next_on(home: u32, task: u64) {
+    if task != 0 && (home as usize) < URGENT_WAKE_NEXT.len() {
+        URGENT_WAKE_NEXT[home as usize]
+            .0
+            .store(task, Ordering::Release);
     }
 }
 
@@ -528,9 +552,9 @@ pub(crate) fn take_wake_next(cpu: u32) -> u64 {
     // A successful synchronous wake is Linux's set-next-buddy case and is not
     // an experimental every-wake policy. Avoid an unconditional atomic RMW on
     // ordinary picks: the common empty slot costs one read only.
-    let urgent = URGENT_WAKE_NEXT[cpu as usize].load(Ordering::Acquire);
+    let urgent = URGENT_WAKE_NEXT[cpu as usize].0.load(Ordering::Acquire);
     if urgent != 0 {
-        return URGENT_WAKE_NEXT[cpu as usize].swap(0, Ordering::AcqRel);
+        return URGENT_WAKE_NEXT[cpu as usize].0.swap(0, Ordering::AcqRel);
     }
     // Honored when EITHER the generic every-wake path or the narrow I/O-owner
     // path is enabled; both feed the same single-slot hint.
@@ -571,16 +595,26 @@ pub fn user_task_smp_enabled() -> bool {
 /// same CPU as the task that issued it. Per-CPU is required once user
 /// tasks run on multiple CPUs concurrently; a single global would
 /// report the wrong task to a syscall on a different core.
-static CURRENT_TASK: [AtomicU64; narf_lib::percpu::MAX_CPUS] = {
-    #[allow(clippy::declare_interior_mutable_const)]
-    const ZERO: AtomicU64 = AtomicU64::new(0);
+#[repr(align(64))]
+struct CurrentTaskCell(AtomicU64);
+
+impl core::ops::Deref for CurrentTaskCell {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static CURRENT_TASK: [CurrentTaskCell; narf_lib::percpu::MAX_CPUS] = {
+    const ZERO: CurrentTaskCell = CurrentTaskCell(AtomicU64::new(0));
     [ZERO; narf_lib::percpu::MAX_CPUS]
 };
 
 /// This CPU's current-task cell.
 #[inline]
 fn current_task_slot() -> &'static AtomicU64 {
-    &CURRENT_TASK[narf_lib::percpu::current_cpu()]
+    &CURRENT_TASK[narf_lib::percpu::current_cpu()].0
 }
 
 pub(crate) fn cpu_running_task(cpu: CpuId) -> bool {
@@ -595,17 +629,26 @@ pub(crate) fn cpu_running_task(cpu: CpuId) -> bool {
 /// the run-queue (the slot has been popped and isn't visible to
 /// `address_space_of` during the poll body). Cleared on the way out.
 /// Per-CPU for the same reason as `CURRENT_TASK`.
-static ACTIVE_USER_AS: [narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>;
-    narf_lib::percpu::MAX_CPUS] = {
-    const EMPTY: narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> =
-        narf_lib::sync::IrqSafeSpinLock::new(None);
+#[repr(align(64))]
+struct ActiveUserAsCell(narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>);
+
+impl core::ops::Deref for ActiveUserAsCell {
+    type Target = narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static ACTIVE_USER_AS: [ActiveUserAsCell; narf_lib::percpu::MAX_CPUS] = {
+    const EMPTY: ActiveUserAsCell = ActiveUserAsCell(narf_lib::sync::IrqSafeSpinLock::new(None));
     [EMPTY; narf_lib::percpu::MAX_CPUS]
 };
 
 /// This CPU's active-user-AS cell.
 #[inline]
 fn active_user_as_slot() -> &'static narf_lib::sync::IrqSafeSpinLock<Option<Arc<AddressSpace>>> {
-    &ACTIVE_USER_AS[narf_lib::percpu::current_cpu()]
+    &ACTIVE_USER_AS[narf_lib::percpu::current_cpu()].0
 }
 
 /// Read the currently-polling task's id on this CPU. Returns
@@ -712,8 +755,19 @@ pub(crate) struct WakeCell {
 /// awake flag on its next round, no IPI needed). The wake side and the
 /// idle side fence around this (Dekker) so a wake racing a halt is never
 /// both un-IPI'd AND unobserved.
-static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+#[repr(align(64))]
+struct PerCpuHandoffFlag(AtomicBool);
+
+impl core::ops::Deref for PerCpuHandoffFlag {
+    type Target = AtomicBool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static CPU_HALTED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Per-CPU reschedule request (Linux `TIF_NEED_RESCHED`). A waker publishes
 /// this for the target CPU as a SECOND, AUTHORITATIVE Dekker channel paired
@@ -728,8 +782,8 @@ static CPU_HALTED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
 /// running CPU picks work up through the normal ready-queue awake scan and
 /// clears any stale request the next time it idles (one spurious poll, never a
 /// lost wake).
-static NEED_RESCHED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+static NEED_RESCHED: [PerCpuHandoffFlag; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuHandoffFlag(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Per-CPU virtual-time floor (EEVDF-lite; see
 /// `specification/scheduling-policies.md` §4): the maximum `vruntime` this CPU
@@ -814,13 +868,15 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
 /// harmless executor round, while a wake can never be hidden behind a stale
 /// false as long as every false->true runnable transition calls
 /// `note_runnable_peer`.
-static RUNNABLE_PEER: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+#[repr(align(64))]
+struct PerCpuRunnablePeer(AtomicBool);
+static RUNNABLE_PEER: [PerCpuRunnablePeer; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuRunnablePeer(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
 #[inline]
 pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
     if cpu < RUNNABLE_PEER.len() {
-        RUNNABLE_PEER[cpu].store(present, Ordering::Release);
+        RUNNABLE_PEER[cpu].0.store(present, Ordering::Release);
     }
 }
 
@@ -833,7 +889,7 @@ fn note_runnable_peer(home: u32, task: u64) {
         return;
     }
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != task {
-        RUNNABLE_PEER[cpu].store(true, Ordering::Release);
+        RUNNABLE_PEER[cpu].0.store(true, Ordering::Release);
     }
 }
 
@@ -1652,7 +1708,7 @@ pub fn init() {
     }
     for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
-        RUNNABLE_PEER[cpu].store(false, Ordering::Release);
+        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
     }
     // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
@@ -1682,7 +1738,7 @@ pub fn __reset_queues_for_test() {
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
-        RUNNABLE_PEER[cpu].store(false, Ordering::Release);
+        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
     }
     // Clear any tasks left staged on the per-CPU wake inboxes so they don't
     // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
@@ -3265,7 +3321,7 @@ unsafe fn wake_raw(data: *const ()) {
     wake_place_hint(home);
 }
 
-unsafe fn wake_by_ref_raw(data: *const ()) {
+unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
     let ptr = data as *const WakeCell;
     // SAFETY: caller still holds a live Waker (hence a live Arc), so
     // the WakeCell behind `data` is valid for the duration of this call.
@@ -3279,10 +3335,39 @@ unsafe fn wake_by_ref_raw(data: *const ()) {
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
     }
-    // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
-    record_wake_next(home, task);
+    if urgent_task == Some(task) {
+        // A provider dequeued this exact exclusive waiter. Unlike the generic
+        // opt-in wake-next policy, publish the one-shot hint unconditionally
+        // and on the wakee's home queue, where pick_next_slot will consume it.
+        hint_urgent_next_on(home, task);
+    } else {
+        // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
+        record_wake_next(home, task);
+    }
     resched_remote(home);
     wake_place_hint(home);
+}
+
+unsafe fn wake_by_ref_raw(data: *const ()) {
+    // SAFETY: the RawWaker vtable is invoked only with a live WakeCell Arc.
+    unsafe { wake_by_ref_impl(data, None) };
+}
+
+/// Wake one scheduler-owned exclusive waiter as a synchronous handoff.
+///
+/// Readiness providers already know the selected waiter's task id, but only
+/// the task waker knows which run queue currently owns it. Recognizing NARF's
+/// own vtable lets the wake publish a one-shot next-buddy on that home queue,
+/// matching Linux's synchronous pipe wake. Foreign/test wakers retain ordinary
+/// `wake_by_ref` behavior.
+pub fn wake_urgent_task(waker: &Waker, expected_task: u64) {
+    if expected_task != 0 && core::ptr::eq(waker.vtable(), &TASK_VTABLE) {
+        // SAFETY: vtable identity proves `data` is the live WakeCell pointer
+        // created by `make_waker`; borrowing the Waker keeps its Arc alive.
+        unsafe { wake_by_ref_impl(waker.data(), Some(expected_task)) };
+    } else {
+        waker.wake_by_ref();
+    }
 }
 
 /// Wake-time placement hint — NARF's analogue of Linux's `select_task_rq`.
@@ -4540,7 +4625,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
     debug_assert!(cpu < CURRENT_SCHED.len(), "CPU id out of scheduler range");
     let cpu = if cpu < CURRENT_SCHED.len() { cpu } else { 0 };
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
-        && RUNNABLE_PEER[cpu].load(Ordering::Acquire)
+        && RUNNABLE_PEER[cpu].0.load(Ordering::Acquire)
     {
         return true;
     }

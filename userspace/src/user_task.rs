@@ -111,6 +111,15 @@ pub struct UserTaskCtx {
     /// terminal status before sleeping, so migration and wake-before-register
     /// races do not require a polling deadline.
     pub sem_wait_pending: AtomicBool,
+    /// A retained SysV semaphore operation exists in the wait registry.
+    /// Unlike `sem_wait_pending`, this remains set after the scheduler observes
+    /// a ready completion and is cleared only when the rewound syscall removes
+    /// the record. It is therefore a safe fast-path guard for fresh semops.
+    pub sem_wait_record: AtomicBool,
+    /// Shard key for the retained semaphore record. Published before
+    /// `sem_wait_record` and consumed after its acquire load.
+    pub sem_wait_ipc_ns: AtomicU64,
+    pub sem_wait_id: AtomicU64,
     /// Set while a System V message send/receive is linked to its queue. The
     /// park loop installs one durable waker in that record and rechecks the
     /// queue-transition/terminal state under the message-state lock.
@@ -476,6 +485,9 @@ impl UserTaskCtx {
             net_io_wait: AtomicBool::new(false),
             durable_io_wait: AtomicBool::new(false),
             sem_wait_pending: AtomicBool::new(false),
+            sem_wait_record: AtomicBool::new(false),
+            sem_wait_ipc_ns: AtomicU64::new(0),
+            sem_wait_id: AtomicU64::new(0),
             msg_wait_pending: AtomicBool::new(false),
             epoll_park_gen: AtomicU64::new(0),
             signal_park_gen: AtomicU64::new(0),
@@ -1014,7 +1026,12 @@ fn park_should_block(
                 }
             }
             if uc.sem_wait_pending.load(Ordering::Acquire) {
-                match crate::sysvipc::register_sem_wait_waker(task_id, waker.clone()) {
+                match crate::sysvipc::register_sem_wait_waker_at(
+                    task_id,
+                    uc.sem_wait_ipc_ns.load(Ordering::Relaxed),
+                    uc.sem_wait_id.load(Ordering::Relaxed),
+                    waker.clone(),
+                ) {
                     crate::sysvipc::SemParkState::Pending => {}
                     crate::sysvipc::SemParkState::Ready => {
                         crate::handlers::drop_signal_waker(task_id);
@@ -2193,8 +2210,10 @@ impl core::future::Future for UserTaskFuture {
                     }
                 }
                 if this.task.uctx.sem_wait_pending.load(Ordering::Acquire) {
-                    match crate::sysvipc::register_sem_wait_waker(
+                    match crate::sysvipc::register_sem_wait_waker_at(
                         crate::handlers::current_task_id(),
+                        this.task.uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
+                        this.task.uctx.sem_wait_id.load(Ordering::Relaxed),
                         cx.waker().clone(),
                     ) {
                         crate::sysvipc::SemParkState::Pending => {}

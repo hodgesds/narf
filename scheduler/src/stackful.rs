@@ -120,6 +120,20 @@ const STACK_CANARY_WORDS: usize = 8;
 /// Recognisable in raw memory dumps ("SAFE STACK" flavored).
 const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 
+/// One cache-line-isolated CPU-local value. Scheduler context transitions
+/// update these slots at handoff frequency, so adjacent CPUs must not share a
+/// coherence line even when the contained atomic is only one machine word.
+#[repr(align(64))]
+struct CacheLineCell<T>(T);
+
+impl<T> core::ops::Deref for CacheLineCell<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Per-CPU currently-running stackful task. Set by
 /// `poll_to_yield` immediately before `kernel_switch`-in;
 /// cleared after the switch-back. The trap-handler hook reads
@@ -132,10 +146,11 @@ const STACK_CANARY: u64 = 0x5AFE_57AC_0F10_D511;
 /// single shared slot and try_preempt could observe the other
 /// CPU's task pointer — a real fault waiting to happen.
 struct PerCpuTaskPtr {
-    inner: [AtomicPtr<KernelTask>; narf_lib::percpu::MAX_CPUS],
+    inner: [CacheLineCell<AtomicPtr<KernelTask>>; narf_lib::percpu::MAX_CPUS],
 }
 static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
-    inner: [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const { CacheLineCell(AtomicPtr::new(core::ptr::null_mut())) };
+        narf_lib::percpu::MAX_CPUS],
 };
 
 /// Per-CPU flag: the most recent `poll_to_yield` on this CPU returned
@@ -155,10 +170,10 @@ static CURRENT_STACKFUL_TASK: PerCpuTaskPtr = PerCpuTaskPtr {
 /// an object the suspended task still points at. The executor therefore
 /// suppresses `report_quiescent` on a preemption return.
 struct PerCpuBool {
-    inner: [AtomicBool; narf_lib::percpu::MAX_CPUS],
+    inner: [CacheLineCell<AtomicBool>; narf_lib::percpu::MAX_CPUS],
 }
 static PREEMPTED_RETURN: PerCpuBool = PerCpuBool {
-    inner: [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const { CacheLineCell(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS],
 };
 
 /// Nestable CPU-local preemption depth. Interrupt masking remains the
@@ -261,11 +276,12 @@ static USER_PERF_SWITCH_HOOK: AtomicUsize = AtomicUsize::new(0);
 
 /// Mirrors CR0.TS for the scheduler-owned deferred user-FPU protocol. All
 /// transitions of that bit after own-stack user execution begins go through
-/// `arm_user_fpu_trap` or `handle_user_fpu_unavailable`, so the common
-/// already-armed switch avoids a serialising CR0 read/write pair.
+/// `arm_user_fpu_trap`, `materialize_current_user_fpu`, or
+/// `handle_user_fpu_unavailable`, so the common already-armed switch avoids a
+/// serialising CR0 read/write pair.
 #[cfg(target_arch = "x86_64")]
-static USER_FPU_TRAP_ARMED: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
+static USER_FPU_TRAP_ARMED: [CacheLineCell<AtomicBool>; narf_lib::percpu::MAX_CPUS] =
+    [const { CacheLineCell(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
@@ -282,14 +298,19 @@ fn arm_user_fpu_trap(cpu: usize) {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn disarm_user_fpu_trap_for_kernel() {
-    let cpu = this_cpu();
-    if USER_FPU_TRAP_ARMED[cpu].load(Ordering::Relaxed) {
-        // SAFETY: executor execution is CPL0. No user task runs concurrently
-        // on this CPU while the scheduler is entering/leaving its outer loop.
-        unsafe { narf_arch::x86_64::cr::clear_task_switched() };
-        USER_FPU_TRAP_ARMED[cpu].store(false, Ordering::Relaxed);
-    }
+fn clear_user_fpu_trap_for_kernel_on(cpu: usize) {
+    // Clear hardware unconditionally: this is also the repair boundary for an
+    // architecture-level CR0 writer that ran before scheduler tracking was
+    // installed. Every in-tree post-boot CLTS user must use the scheduler's
+    // materialization API, keeping the software mirror and CR0.TS synchronized.
+    // SAFETY: callers run at CPL0 with local interrupts disabled.
+    unsafe { narf_arch::x86_64::cr::clear_task_switched() };
+    USER_FPU_TRAP_ARMED[cpu].store(false, Ordering::Relaxed);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn clear_user_fpu_trap_for_kernel() {
+    narf_lib::sync::without_interrupts(|| clear_user_fpu_trap_for_kernel_on(this_cpu()));
 }
 
 /// Scope CR0.TS to one outer executor run. The kernel target is soft-float,
@@ -302,13 +323,13 @@ pub(crate) struct ExecutorFpuTrapGuard;
 #[cfg(target_arch = "x86_64")]
 impl Drop for ExecutorFpuTrapGuard {
     fn drop(&mut self) {
-        disarm_user_fpu_trap_for_kernel();
+        clear_user_fpu_trap_for_kernel();
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn executor_fpu_trap_guard() -> ExecutorFpuTrapGuard {
-    disarm_user_fpu_trap_for_kernel();
+    clear_user_fpu_trap_for_kernel();
     ExecutorFpuTrapGuard
 }
 
@@ -435,6 +456,61 @@ pub fn arm_current_user_fpu() {
     user_fpu_restore_task(cpu, unsafe { &*task });
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn materialize_user_fpu(cpu: usize, task: &KernelTask) -> bool {
+    let area = task.user_fpu.load(Ordering::Acquire);
+    if area.is_null() {
+        return false;
+    }
+
+    let live = task.user_fpu_live.load(Ordering::Acquire);
+    // Clearing TS is deliberately unconditional once an image exists. This is
+    // a cold trap/signal boundary and it also repairs a stale hardware bit
+    // before privileged FXSAVE/FXRSTOR. The task memory image is authoritative
+    // exactly while `live` is false.
+    USER_FPU_TRAP_ARMED[cpu].store(false, Ordering::Relaxed);
+    // SAFETY: the current task exclusively owns this CPU's user register file;
+    // `area` is its live, aligned FPU area and the caller is in CPL0 with
+    // ordinary interrupts masked by trap/syscall entry.
+    unsafe {
+        narf_arch::x86_64::cr::clear_task_switched();
+        if !live {
+            narf_arch::x86_64::xsave::fpu_restore(area);
+            task.user_fpu_live.store(true, Ordering::Release);
+        }
+    }
+    true
+}
+
+/// Make the current x86 user task's FP/SIMD image live in hardware.
+///
+/// Signal-frame construction and any other privileged observer of the user
+/// register file must call this before FXSAVE. If deferred restore is armed,
+/// this clears CR0.TS, restores the task-owned image, and marks it live so the
+/// next switch-out saves any handler changes. When no current own-stack user
+/// FPU image is published, it still clears CR0.TS and the scheduler mirror as
+/// one operation, then returns false. This is the only supported in-tree
+/// boundary for privileged code that needs the user FP/SIMD register file.
+#[cfg(target_arch = "x86_64")]
+pub fn materialize_current_user_fpu() -> bool {
+    narf_lib::sync::without_interrupts(|| {
+        let cpu = this_cpu();
+        let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        if task.is_null() {
+            clear_user_fpu_trap_for_kernel_on(cpu);
+            return false;
+        }
+        // SAFETY: CURRENT names the in-flight task and pins its owner future
+        // and aligned FPU area until this synchronous kernel boundary returns.
+        let materialized = materialize_user_fpu(cpu, unsafe { &*task });
+        if !materialized {
+            clear_user_fpu_trap_for_kernel_on(cpu);
+        }
+        materialized
+    })
+}
+
 /// Resolve a user-mode x86 `#NM` raised by the deferred-restore policy.
 /// Returns false when no own-stack user FPU image is published, in which case
 /// the frame must treat the exception as a genuine fault.
@@ -445,23 +521,12 @@ pub fn handle_user_fpu_unavailable() -> bool {
     if task.is_null() {
         return false;
     }
-    // SAFETY: CURRENT names the in-flight task and keeps its owner future (and
-    // therefore its aligned FPU area) alive until this trap returns.
-    let area = unsafe { (*task).user_fpu.load(Ordering::Acquire) };
-    if area.is_null() || !USER_FPU_TRAP_ARMED[cpu].load(Ordering::Relaxed) {
+    if !USER_FPU_TRAP_ARMED[cpu].load(Ordering::Relaxed) {
         return false;
     }
-    USER_FPU_TRAP_ARMED[cpu].store(false, Ordering::Relaxed);
-    // XRSTOR itself is subject to CR0.TS, so clear the bit first. Interrupt
-    // gates keep ordinary IRQs masked throughout this restore and no other
-    // task can run on this CPU until we return.
-    // SAFETY: #NM runs at CPL0; `area` satisfies the task FPU-area contract.
-    unsafe {
-        narf_arch::x86_64::cr::clear_task_switched();
-        narf_arch::x86_64::xsave::fpu_restore(area);
-        (*task).user_fpu_live.store(true, Ordering::Release);
-    }
-    true
+    // SAFETY: CURRENT names the in-flight task and keeps its owner future (and
+    // therefore its aligned FPU area) alive until this trap returns.
+    materialize_user_fpu(cpu, unsafe { &*task })
 }
 
 /// Publish an owner-defined context pointer on the CURRENT stackful task.
@@ -692,14 +757,15 @@ pub fn current_stackful_stack_top() -> u64 {
 /// `poll_to_yield` entry before the task runs, so no task relies on
 /// its contents persisting across the task's own suspension.
 struct PerCpuExecCtx {
-    inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
+    inner: [CacheLineCell<UnsafeCell<KernelContext>>; narf_lib::percpu::MAX_CPUS],
 }
 // SAFETY: each CPU accesses only `inner[its-own-cpu]`, non-re-entrantly
 // (no nested stackful polls), so there is never concurrent or aliasing
 // access to a single slot despite the shared-static `&`.
 unsafe impl Sync for PerCpuExecCtx {}
 static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
-    inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const { CacheLineCell(UnsafeCell::new(KernelContext::zeroed())) };
+        narf_lib::percpu::MAX_CPUS],
 };
 
 /// Per-CPU save target for the FINAL `kernel_switch` of an exiting task
@@ -711,14 +777,15 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
 /// `completed` is published. Nothing ever switches into this scratch —
 /// the continuation it captures is dead by construction.
 struct PerCpuScratchCtx {
-    inner: [UnsafeCell<KernelContext>; narf_lib::percpu::MAX_CPUS],
+    inner: [CacheLineCell<UnsafeCell<KernelContext>>; narf_lib::percpu::MAX_CPUS],
 }
 // SAFETY: each CPU writes only `inner[its-own-cpu]`, and only from
 // `exit_current_stackful` (one exiting task at a time per CPU); the slot
 // is write-only dead storage, never read or switched into.
 unsafe impl Sync for PerCpuScratchCtx {}
 static EXIT_SCRATCH_CTX: PerCpuScratchCtx = PerCpuScratchCtx {
-    inner: [const { UnsafeCell::new(KernelContext::zeroed()) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const { CacheLineCell(UnsafeCell::new(KernelContext::zeroed())) };
+        narf_lib::percpu::MAX_CPUS],
 };
 
 #[inline]
@@ -1195,6 +1262,14 @@ impl KernelTask {
             let cpu = this_cpu();
             CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire)
         };
+        if !saved_current.is_null() {
+            // A nested scheduler pump is running on an outer stackful task's
+            // kernel continuation. Save that task's live user FP/TLS state
+            // before the inner task can install or consume its own registers.
+            // SAFETY: `saved_current` is the synchronously executing outer
+            // task on this CPU and remains pinned across the nested poll.
+            user_fpu_save_task(this_cpu(), unsafe { &*saved_current });
+        }
         // SAFETY: ctx + exec_ctx both live for the duration of
         // this call; the task's stack was allocated by us and is
         // still alive; the trampoline_entry symbol is in this
@@ -1337,6 +1412,13 @@ impl KernelTask {
         {
             let cpu = this_cpu();
             CURRENT_STACKFUL_TASK.inner[cpu].store(saved_current, Ordering::Release);
+            if !saved_current.is_null() {
+                // Restore is deferred on x86 and eager on aarch64. Either way,
+                // re-establish the outer task's FP/TLS ownership before its
+                // kernel continuation resumes from this nested poll.
+                // SAFETY: same pinned outer-task invariant as the save above.
+                user_fpu_restore_task(cpu, unsafe { &*saved_current });
+            }
         }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
@@ -1391,6 +1473,11 @@ impl KernelTask {
             .store(narf_time::now_cycles(), Ordering::Release);
         let cpu = this_cpu();
         let saved_current = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+        if !saved_current.is_null() {
+            // SAFETY: `saved_current` is the synchronously executing outer
+            // task on this CPU and remains pinned across the nested poll.
+            user_fpu_save_task(cpu, unsafe { &*saved_current });
+        }
         if self.user_tls_valid.load(Ordering::Acquire) {
             let tls_base = self.user_fs_base.load(Ordering::Relaxed);
             // SAFETY: value was published after programming TPIDR_EL0 for this
@@ -1422,7 +1509,12 @@ impl KernelTask {
         user_perf_switch(perf_task, false);
         // SAFETY: same exclusive per-CPU slot as above.
         unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
-        CURRENT_STACKFUL_TASK.inner[cpu].store(saved_current, Ordering::Release);
+        let resumed_cpu = this_cpu();
+        CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(saved_current, Ordering::Release);
+        if !saved_current.is_null() {
+            // SAFETY: same pinned outer-task invariant as the save above.
+            user_fpu_restore_task(resumed_cpu, unsafe { &*saved_current });
+        }
         self.exec_ctx
             .store(core::ptr::null_mut(), Ordering::Release);
         PREEMPTED_RETURN.inner[cpu].store(
@@ -2402,11 +2494,23 @@ pub fn sched_yield_current() -> bool {
 /// A rare mis-attribution (the requesting task is preempted before its own
 /// syscall tail runs, so ANOTHER task's tail consumes the flag) costs one
 /// spurious-but-harmless yield.
+#[repr(align(64))]
+struct PerCpuBackpressureCell {
+    value: core::sync::atomic::AtomicBool,
+}
+
 struct PerCpuBackpressure {
-    inner: [core::sync::atomic::AtomicBool; narf_lib::percpu::MAX_CPUS],
+    // These flags are written and consumed at syscall frequency. Keep each CPU
+    // on its own cache line so independent producer/consumer pairs do not turn
+    // the hint into a cross-core coherence lock.
+    inner: [PerCpuBackpressureCell; narf_lib::percpu::MAX_CPUS],
 }
 static BACKPRESSURE_YIELD: PerCpuBackpressure = PerCpuBackpressure {
-    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const {
+        PerCpuBackpressureCell {
+            value: core::sync::atomic::AtomicBool::new(false),
+        }
+    }; narf_lib::percpu::MAX_CPUS],
 };
 
 /// Request a cooperative yield at the current task's next syscall exit
@@ -2424,7 +2528,9 @@ pub fn request_syscall_backpressure_yield() {
     {
         return;
     }
-    BACKPRESSURE_YIELD.inner[cpu].store(true, Ordering::Release);
+    BACKPRESSURE_YIELD.inner[cpu]
+        .value
+        .store(true, Ordering::Release);
 }
 
 /// Per-CPU one-shot wake-preemption request. Set by [`note_wake_preempt`] when a
@@ -2437,7 +2543,11 @@ pub fn request_syscall_backpressure_yield() {
 /// is the LOCAL "a peer just woke, cede to it" hint — the own-stack analogue of
 /// Linux setting `TIF_NEED_RESCHED` on the current rq inside `resched_curr`.
 static WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
-    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const {
+        PerCpuBackpressureCell {
+            value: core::sync::atomic::AtomicBool::new(false),
+        }
+    }; narf_lib::percpu::MAX_CPUS],
 };
 
 /// Per-CPU one-shot override for a wake that represents a synchronous handoff
@@ -2445,7 +2555,11 @@ static WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
 /// policy's batching window, but only when another task is actually runnable
 /// on this CPU at the syscall-exit check.
 static URGENT_WAKE_PREEMPT: PerCpuBackpressure = PerCpuBackpressure {
-    inner: [const { core::sync::atomic::AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS],
+    inner: [const {
+        PerCpuBackpressureCell {
+            value: core::sync::atomic::AtomicBool::new(false),
+        }
+    }; narf_lib::percpu::MAX_CPUS],
 };
 
 /// Ask the running task to cede at its next syscall exit because `woken` just
@@ -2469,7 +2583,7 @@ pub fn note_wake_preempt(woken: u64) {
     if crate::current_task_id().raw() == woken {
         return;
     }
-    WAKE_PREEMPT.inner[cpu].store(true, Ordering::Release);
+    WAKE_PREEMPT.inner[cpu].value.store(true, Ordering::Release);
 }
 
 /// Record an urgent synchronous handoff to `woken`.
@@ -2499,7 +2613,9 @@ pub fn note_urgent_wake_preempt(woken: u64) {
     if !crate::task_runnable_on_current_cpu(woken) {
         return;
     }
-    URGENT_WAKE_PREEMPT.inner[cpu].store(true, Ordering::Release);
+    URGENT_WAKE_PREEMPT.inner[cpu]
+        .value
+        .store(true, Ordering::Release);
     crate::hint_urgent_next(woken);
 }
 
@@ -2603,17 +2719,17 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // syscall even though no yield had been requested.  A request racing the
     // false load remains sticky for the next syscall exit, just as one racing
     // immediately after the old swap did.
-    let backpressure = consume_syscall_exit_hint(&BACKPRESSURE_YIELD.inner[cpu]);
+    let backpressure = consume_syscall_exit_hint(&BACKPRESSURE_YIELD.inner[cpu].value);
     // Wake-preemption request (gated `wake_preempt`; set by `note_wake_preempt`
     // when this task woke a peer). The eligibility-correct policy lives in the
     // EEVDF scheduler; this consume site only carries the request into the pure
     // decision fn. Sticky until an actual yield (cleared below) so a spinning
     // waker's request isn't dropped before the policy fires.
-    let wake_preempt = WAKE_PREEMPT.inner[cpu].load(Ordering::Acquire);
+    let wake_preempt = WAKE_PREEMPT.inner[cpu].value.load(Ordering::Acquire);
     // Urgent handoffs are one-shot. Consume the hint at this syscall exit; a
     // remote wake or a wakee that already ran must not leak urgency into a
     // later unrelated syscall.
-    let urgent_wake = consume_syscall_exit_hint(&URGENT_WAKE_PREEMPT.inner[cpu]);
+    let urgent_wake = consume_syscall_exit_hint(&URGENT_WAKE_PREEMPT.inner[cpu].value);
     // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
     // its Box alive across the user round-trip); all reads are atomics.
     unsafe {
@@ -2662,7 +2778,9 @@ pub unsafe fn maybe_resched_syscall_exit() {
         }
         // We are ceding: clear the sticky wake-preemption request so it doesn't
         // carry into the next slice / a different task on this CPU.
-        WAKE_PREEMPT.inner[cpu].store(false, Ordering::Release);
+        WAKE_PREEMPT.inner[cpu]
+            .value
+            .store(false, Ordering::Release);
         // Re-arm the slot waker so the executor keeps us Ready and re-polls us
         // after the siblings run (mirrors try_preempt_user's pre-yield re-arm).
         {
@@ -3755,15 +3873,16 @@ pub mod tests {
         TestResult::Pass
     }
 
-    /// The x86 user-FPU fast path must keep the task image authoritative while
-    /// CR0.TS is armed, restore it on the first simulated user `#NM`, and save
-    /// live SIMD state again before the task can migrate. This exercises the
-    /// same helpers as the real trap path without entering CPL3 from a smoke.
+    /// Signal capture and sigreturn must materialize a deferred x86 user-FPU
+    /// image before privileged FXSAVE/FXRSTOR. If a handler is preempted and
+    /// returns without touching SIMD, the restored interrupted image must
+    /// remain scheduler-owned and survive the next switch and user `#NM`.
     #[cfg(target_arch = "x86_64")]
     fn smoke_user_fpu_lazy_restore_round_trip() -> TestResult {
         use core::sync::atomic::AtomicU64;
 
         const SENTINEL: u64 = 0x4e41_5246_4650_5531;
+        const HANDLER: u64 = 0x4e41_5246_4841_4e44;
         static FAILURE: AtomicU32 = AtomicU32::new(0);
         static OBSERVED: AtomicU64 = AtomicU64::new(0);
 
@@ -3797,8 +3916,15 @@ pub mod tests {
                     FAILURE.store(1, Ordering::Release);
                     return Poll::Ready(());
                 }
-                if !handle_user_fpu_unavailable() {
+                if !materialize_current_user_fpu() {
                     FAILURE.store(2, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                // SAFETY: materialization cleared CR0.TS for this kernel
+                // smoke and restored the reset task image.
+                if unsafe { narf_arch::x86_64::cr::read_cr0() } & narf_arch::x86_64::cr::CR0_TS != 0
+                {
+                    FAILURE.store(5, Ordering::Release);
                     return Poll::Ready(());
                 }
                 // SAFETY: the handler above cleared CR0.TS and restored the
@@ -3810,6 +3936,36 @@ pub mod tests {
                         options(nostack, preserves_flags),
                     );
                 }
+                let mut signal_frame = TestFpuArea::reset();
+                // SAFETY: the materialization boundary left CR0.TS clear and
+                // `signal_frame` is a live, 64-byte-aligned FXSAVE target.
+                unsafe {
+                    core::arch::asm!(
+                        "fxsave64 [{area}]",
+                        area = in(reg) signal_frame.0.as_mut_ptr(),
+                        options(nostack, preserves_flags),
+                    );
+                }
+                let mut captured = [0u8; 8];
+                captured.copy_from_slice(&signal_frame.0[160..168]);
+                if u64::from_le_bytes(captured) != SENTINEL {
+                    FAILURE.store(6, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                // Model a handler clobber followed by preemption. The switch
+                // saves the handler image, marks the task image deferred, and
+                // arms TS. A handler that uses no SIMD after resume enters
+                // rt_sigreturn in exactly this state.
+                // SAFETY: materialization left CR0.TS clear; this smoke owns
+                // the current task register image and intentionally replaces
+                // XMM0 with the simulated handler value.
+                unsafe {
+                    core::arch::asm!(
+                        "movq xmm0, {value}",
+                        value = in(reg) HANDLER,
+                        options(nostack, preserves_flags),
+                    );
+                }
                 user_fpu_save();
                 // SAFETY: this kernel smoke executes at CPL0.
                 if unsafe { narf_arch::x86_64::cr::read_cr0() } & narf_arch::x86_64::cr::CR0_TS == 0
@@ -3817,13 +3973,30 @@ pub mod tests {
                     FAILURE.store(3, Ordering::Release);
                     return Poll::Ready(());
                 }
-                if !handle_user_fpu_unavailable() {
+                if !materialize_current_user_fpu() {
                     FAILURE.store(4, Ordering::Release);
                     return Poll::Ready(());
                 }
+                // Model rt_sigreturn replacing the materialized handler image
+                // with the interrupted image. Scheduler bookkeeping remains
+                // live because materialization preceded the FXRSTOR.
+                // SAFETY: `signal_frame` is the valid aligned FXSAVE image
+                // captured above, and materialization left CR0.TS clear.
+                unsafe {
+                    core::arch::asm!(
+                        "fxrstor64 [{area}]",
+                        area = in(reg) signal_frame.0.as_ptr(),
+                        options(nostack, preserves_flags),
+                    );
+                }
+                user_fpu_save();
+                if !handle_user_fpu_unavailable() {
+                    FAILURE.store(7, Ordering::Release);
+                    return Poll::Ready(());
+                }
                 let value: u64;
-                // SAFETY: the simulated #NM restored this task's saved image
-                // and left CR0.TS clear for the retried SIMD instruction.
+                // SAFETY: the simulated post-sigreturn switch and #NM restored
+                // this task's saved interrupted image and left CR0.TS clear.
                 unsafe {
                     core::arch::asm!(
                         "movq {value}, xmm0",
@@ -3839,7 +4012,7 @@ pub mod tests {
 
         FAILURE.store(0, Ordering::Release);
         OBSERVED.store(0, Ordering::Release);
-        disarm_user_fpu_trap_for_kernel();
+        clear_user_fpu_trap_for_kernel();
         let mut task = KernelTask::new(LazyFpu {
             area: Box::new(TestFpuArea::reset()),
         });
@@ -3847,7 +4020,7 @@ pub mod tests {
         let waker = KernelTask::no_op_waker();
         // SAFETY: task, stack, and executor context live for the round trip.
         let result = unsafe { task.poll_to_yield(&mut exec_ctx, &waker) };
-        disarm_user_fpu_trap_for_kernel();
+        clear_user_fpu_trap_for_kernel();
 
         if result != Poll::Ready(()) {
             return TestResult::Fail("lazy-FPU smoke did not complete");
@@ -3855,13 +4028,161 @@ pub mod tests {
         match FAILURE.load(Ordering::Acquire) {
             0 => {}
             1 => return TestResult::Fail("deferred FPU restore did not set CR0.TS"),
-            2 => return TestResult::Fail("first simulated user #NM was not handled"),
+            2 => return TestResult::Fail("signal capture did not materialize the task FPU image"),
             3 => return TestResult::Fail("FPU switch-out did not re-arm CR0.TS"),
-            4 => return TestResult::Fail("second simulated user #NM was not handled"),
+            4 => return TestResult::Fail("sigreturn did not materialize deferred handler state"),
+            5 => return TestResult::Fail("signal materialization left CR0.TS armed"),
+            6 => return TestResult::Fail("signal FXSAVE captured stale XMM state"),
+            7 => return TestResult::Fail("post-sigreturn simulated user #NM was not handled"),
             _ => return TestResult::Fail("unexpected lazy-FPU smoke failure"),
         }
         if OBSERVED.load(Ordering::Acquire) != SENTINEL {
             return TestResult::Fail("lazy FPU restore lost the task's XMM state");
+        }
+        TestResult::Pass
+    }
+
+    /// A synchronous scheduler pump may poll an inner stackful task while an
+    /// outer user task is stopped in a syscall. The nested switch must save
+    /// the outer live register file and re-arm its deferred restore before the
+    /// outer continuation returns to user mode.
+    #[cfg(target_arch = "x86_64")]
+    fn smoke_nested_stackful_poll_preserves_outer_fpu() -> TestResult {
+        use core::sync::atomic::AtomicU64;
+
+        const OUTER: u64 = 0x4e41_5246_4f55_5445;
+        const INNER: u64 = 0x4e41_5246_494e_4e52;
+        static FAILURE: AtomicU32 = AtomicU32::new(0);
+        static OBSERVED: AtomicU64 = AtomicU64::new(0);
+
+        #[repr(C, align(64))]
+        struct TestFpuArea([u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+
+        impl TestFpuArea {
+            fn reset() -> Self {
+                let mut area = Self([0; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+                area.0[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+                area.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+                area
+            }
+        }
+
+        struct InnerFpu {
+            area: Box<TestFpuArea>,
+        }
+
+        impl Future for InnerFpu {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                set_current_user_fpu(this.area.0.as_mut_ptr());
+                arm_current_user_fpu();
+                if !materialize_current_user_fpu() {
+                    FAILURE.store(1, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                // SAFETY: materialization cleared CR0.TS and made this inner
+                // task's register image live.
+                unsafe {
+                    core::arch::asm!(
+                        "movq xmm0, {value}",
+                        value = in(reg) INNER,
+                        options(nostack, preserves_flags),
+                    );
+                }
+                user_fpu_save();
+                Poll::Ready(())
+            }
+        }
+
+        struct OuterFpu {
+            area: Box<TestFpuArea>,
+        }
+
+        impl Future for OuterFpu {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+                let this = self.get_mut();
+                set_current_user_fpu(this.area.0.as_mut_ptr());
+                arm_current_user_fpu();
+                if !materialize_current_user_fpu() {
+                    FAILURE.store(2, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                // SAFETY: materialization cleared CR0.TS and made the outer
+                // task's register image live.
+                unsafe {
+                    core::arch::asm!(
+                        "movq xmm0, {value}",
+                        value = in(reg) OUTER,
+                        options(nostack, preserves_flags),
+                    );
+                }
+
+                let mut inner = KernelTask::new(InnerFpu {
+                    area: Box::new(TestFpuArea::reset()),
+                });
+                let mut nested_exec = KernelContext::default();
+                let waker = KernelTask::no_op_waker();
+                // SAFETY: the inner task and its executor context are owned by
+                // this outer poll and cannot be polled concurrently.
+                if unsafe { inner.poll_to_yield(&mut nested_exec, &waker) } != Poll::Ready(()) {
+                    FAILURE.store(3, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                if FAILURE.load(Ordering::Acquire) != 0 {
+                    return Poll::Ready(());
+                }
+
+                // Model the first outer user SIMD instruction after the
+                // syscall's nested scheduler pump returns.
+                if !handle_user_fpu_unavailable() {
+                    FAILURE.store(4, Ordering::Release);
+                    return Poll::Ready(());
+                }
+                let value: u64;
+                // SAFETY: the simulated #NM restored the outer task and left
+                // CR0.TS clear.
+                unsafe {
+                    core::arch::asm!(
+                        "movq {value}, xmm0",
+                        value = out(reg) value,
+                        options(nostack, preserves_flags),
+                    );
+                }
+                OBSERVED.store(value, Ordering::Release);
+                user_fpu_save();
+                Poll::Ready(())
+            }
+        }
+
+        FAILURE.store(0, Ordering::Release);
+        OBSERVED.store(0, Ordering::Release);
+        clear_user_fpu_trap_for_kernel();
+        let mut outer = KernelTask::new(OuterFpu {
+            area: Box::new(TestFpuArea::reset()),
+        });
+        let mut exec_ctx = KernelContext::default();
+        let waker = KernelTask::no_op_waker();
+        // SAFETY: the task and executor context are exclusively owned here.
+        let result = unsafe { outer.poll_to_yield(&mut exec_ctx, &waker) };
+        clear_user_fpu_trap_for_kernel();
+
+        if result != Poll::Ready(()) {
+            return TestResult::Fail("outer nested-FPU smoke did not complete");
+        }
+        match FAILURE.load(Ordering::Acquire) {
+            0 => {}
+            1 => return TestResult::Fail("inner FPU image did not materialize"),
+            2 => return TestResult::Fail("outer FPU image did not materialize"),
+            3 => return TestResult::Fail("inner stackful task did not complete"),
+            4 => return TestResult::Fail("outer deferred restore was not armed"),
+            _ => return TestResult::Fail("unexpected nested-FPU smoke failure"),
+        }
+        if OBSERVED.load(Ordering::Acquire) != OUTER {
+            return TestResult::Fail("nested stackful poll leaked the inner task's XMM state");
         }
         TestResult::Pass
     }
@@ -6083,6 +6404,11 @@ pub mod tests {
     );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!("scheduler/stackful", smoke_user_fpu_lazy_restore_round_trip);
+    #[cfg(target_arch = "x86_64")]
+    kernel_test_in!(
+        "scheduler/stackful",
+        smoke_nested_stackful_poll_preserves_outer_fpu
+    );
     #[cfg(target_arch = "x86_64")]
     kernel_test_in!(
         "scheduler/stackful",

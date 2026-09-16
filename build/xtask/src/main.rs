@@ -3512,6 +3512,9 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         ("alarmloop_smoke", "alarmloop-ok"),
         // (b) Timer-driven preemption: a CPU-bound child can't stall parent.
         ("preemptsched_smoke", "preemptsched-ok"),
+        // x87 + AVX state survives real user sched_yield switches, peer
+        // register use, and CPU migration under the own-stack scheduler.
+        ("fpu_preempt_smoke", "fpu-preempt-ok"),
         // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
         ("procfs2_smoke", "procfs2-ok"),
         // NUMA sysfs: node online range + per-node SLIT distance rows.

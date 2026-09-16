@@ -609,8 +609,19 @@ struct PublishedScheduler {
 /// One policy publication slot per CPU. Dispatch has no global lock or shared
 /// Arc-refcount write: it locks only its CPU-local slot and invokes the policy
 /// through the resident reference. Installation is a rare rolling update.
-static CPU_SCHEDULERS: [IrqSafeSpinLock<Option<PublishedScheduler>>; narf_lib::percpu::MAX_CPUS] =
-    [const { IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
+#[repr(align(64))]
+struct SchedulerCell(IrqSafeSpinLock<Option<PublishedScheduler>>);
+
+impl core::ops::Deref for SchedulerCell {
+    type Target = IrqSafeSpinLock<Option<PublishedScheduler>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+static CPU_SCHEDULERS: [SchedulerCell; narf_lib::percpu::MAX_CPUS] =
+    [const { SchedulerCell(IrqSafeSpinLock::new(None)) }; narf_lib::percpu::MAX_CPUS];
 
 /// Total order for concurrent rolling publications. This is an atomic ticket,
 /// not a dispatch lock; the newest issued generation wins each CPU slot.

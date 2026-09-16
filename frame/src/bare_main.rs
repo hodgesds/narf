@@ -5225,6 +5225,10 @@ fn boot_userspace_init() {
                     "preemptsched_smoke",
                     narf_verification::NARF_PREEMPTSCHED_SMOKE_ELF,
                 ),
+                (
+                    "fpu_preempt_smoke",
+                    narf_verification::NARF_FPU_PREEMPT_SMOKE_ELF,
+                ),
                 // procfs breadth: /proc/stat + fuller /proc/<pid>/status.
                 ("procfs2_smoke", narf_verification::NARF_PROCFS2_SMOKE_ELF),
                 // NUMA sysfs: /sys/devices/system/node/{online,nodeN/distance,meminfo}.

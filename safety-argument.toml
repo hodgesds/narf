@@ -931,3 +931,27 @@ argument = "The scheduler edit remains inside the existing executor TCB and chan
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "A published true hint is still consumed by the original Acquire/Release exchange and remains one-shot. A false Acquire load performs no write; a producer racing that load leaves true sticky for a later syscall exit, just as a producer racing immediately after the former exchange did. The optimization therefore cannot erase a yield request, and context switching, affinity validation, saved-domain restoration, and task security state are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The signal/FPU correction remains within the existing frame and scheduler executor TCB. It adds no trusted subsystem, authority, capability, mapping, domain transition, or task-selection path; it synchronizes an already owned per-task register image at the established signal-delivery boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Before frame reads or replaces user FP/SIMD hardware state, the scheduler now restores only the current own-stack task's aligned image while that task is synchronously published on the executing CPU, clears CR0.TS and its per-CPU mirror together, and marks the image live so every later switch-out saves it before migration. When no own-stack image is published the same boundary still clears hardware TS and the mirror together; all in-tree post-boot raw CLTS sites were removed, so no privileged fallback can silently invalidate the mirror. This includes rt_sigreturn after a handler was preempted with deferred state. A scheduler poll nested inside a syscall saves the synchronously pinned outer task before the inner switch and re-establishes the outer task's deferred/eager ownership before returning. No pointer or register state crosses a task or domain boundary."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Signal delivery and rt_sigreturn no longer clear CR0.TS independently of the scheduler's lazy-FPU ownership state. A deferred task image is made authoritative in hardware before FXSAVE or FXRSTOR, preventing stale registers belonging to another task from entering a user-visible signal frame and ensuring the restored interrupted image remains eligible for the next switch-out; legacy contexts retain their prior no-image fallback."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The pipe synchronous-wake change exposes only the task id already used to key an exclusive readiness waiter after that waiter's scheduler waker has fired. It feeds the id into the existing urgent-handoff hint, whose nonblocking run-queue probe and dispatch-time revalidation still enforce local placement, affinity, class, budget eligibility, saved-domain restoration, and task lifetime. Ordinary poll/epoll observers, terminal wake-all behavior, user-copy validation, signals, and Linux errno ordering are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Cache-line isolation changes only the storage stride of scheduler-owned per-CPU boolean and task-id hints. Each CPU publishes and consumes the same atomic value with the same Release/Acquire/AcqRel ordering and one-shot semantics; no value, pointer, authority, mapping, capability, domain transition, or task-selection rule is added or shared across CPUs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The x86_64 guarded-copy probe still publishes and clears the same per-CPU recovery descriptor with the same fences and fault-handler ownership checks. Giving each descriptor a full cache-line stride removes inter-CPU false sharing only; it does not widen a user range, bypass SMAP, alter a recovery RIP, or permit one CPU to consume another CPU's probe state."

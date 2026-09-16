@@ -368,6 +368,11 @@ pub mod xsave {
   discipline as other privileged state transitions. Callers may cache the
   scheduler-owned TS state only while execution is pinned to that CPU and must
   clear TS before XSAVE/XRSTOR or explicit kernel FP/SIMD use.
+- **Guarded-copy recovery slots are CPU-isolated.** Each x86_64 CPU's probe
+  descriptor occupies a complete cache line. Installing or clearing the
+  recovery RIP for a user copy therefore cannot contend with, partially share,
+  or perturb another CPU's fault-recovery publication; the existing
+  per-CPU-only access rule and compiler fences remain unchanged.
 - **Required features fail boot, optional features degrade.** Boot
   panics if any of these are absent: PKS (x86_64) or MTE (aarch64),
   invariant TSC / Generic Timer, x2APIC / GICv3. Optional features
