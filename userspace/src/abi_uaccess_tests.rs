@@ -453,15 +453,13 @@ kernel_test_in!("syscall_abi", smoke_abi_uaccess_kernel_src_neg);
 /// One ordinary syscall stands in for the ~180 `copy_to_user` sites that
 /// share the helper.
 ///
-/// LINUX-GAP: Linux `clock_gettime(2)` returns `-EFAULT` for an unwritable
-/// `struct timespec *`. NARF's handler turns the `copy_to_user` failure
-/// into `SyscallReturn::invalid_op()` — a non-`Ok` NARF status with no
-/// Linux errno at all — so a caller cannot tell EFAULT from EINVAL. That
-/// is a separate defect from the one this file is about; the assertion
-/// below is therefore "the call did not succeed", and
-/// `smoke_abi_uaccess_kernel_src_neg` carries the strict errno contract on
-/// a path that does map it (`write(2)` → `-EFAULT`). Tighten this to
-/// `EFAULT` when the handler is fixed.
+/// `clock_gettime(2)` returns `-EFAULT` for an unwritable `struct timespec
+/// *`, which is what Linux returns from `put_timespec64`.
+///
+/// This carried a LINUX-GAP saying the handler folded the `copy_to_user`
+/// failure into `SyscallReturn::invalid_op()`, leaving a caller unable to
+/// tell EFAULT from EINVAL — and it ended "tighten this to `EFAULT` when
+/// the handler is fixed". The handler maps it, so the assertion is tight.
 fn smoke_abi_uaccess_clock_gettime_kernel_dst_neg() -> TestResult {
     let kdst = match canary_arm() {
         Ok(a) => a,
@@ -472,10 +470,11 @@ fn smoke_abi_uaccess_clock_gettime_kernel_dst_neg() -> TestResult {
             Syscall::ClockGetTime.raw(),
             a1(0 /* CLOCK_REALTIME */, kdst),
         );
-        if r.status == SyscallReturn::OK && (r.value as i64) >= 0 {
-            return Err("clock_gettime(2) into a kernel-half timespec reported success");
+        match r.value as i64 {
+            v if v == EFAULT => Ok(()),
+            v if v >= 0 => Err("clock_gettime(2) into a kernel-half timespec reported success"),
+            _ => Err("clock_gettime(2) into a kernel-half timespec must be -EFAULT"),
         }
-        Ok(())
     });
     // The load-bearing half: whatever errno shape came back, no timespec
     // may have landed in kernel memory.

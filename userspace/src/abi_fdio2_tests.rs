@@ -8,7 +8,8 @@
 //! F_DUPFD / F_DUPFD_CLOEXEC fcntl commands, the dup2(fd, fd) no-op vs.
 //! bad-oldfd arms, and the close_range bad-flags / CLOSE_RANGE_CLOEXEC
 //! paths. Every test asserts the CURRENT NARF behavior (regression pin);
-//! Linux-ideal divergences carry a `// LINUX-GAP:` note.
+//! Every case here pins the Linux errno itself, so an assertion that only
+//! required "some failure" is a bug in the case, not a divergence to note.
 use crate::abi_test_support::*;
 
 // ── Local helpers (mirrors abi_fdio_tests.rs; kept private to this file) ──
@@ -73,7 +74,8 @@ fn smoke_abi_fdio2_pread64_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 4];
         // bad fd → -1 sentinel (Ok status, value -1).
-        // LINUX-GAP: Linux pread64(2) on a bad fd returns -EBADF.
+        // `pread64` resolves the fd through `fdget` before it looks at the
+        // offset or the buffer, so a closed descriptor is -EBADF.
         match call(
             Syscall::Pread64.raw(),
             a3(5151, buf.as_mut_ptr() as u64, 4, 0),
@@ -130,7 +132,7 @@ fn smoke_abi_fdio2_pwrite64_neg() -> TestResult {
     with_setup(|| {
         let data = *b"z";
         // bad fd → -1 sentinel.
-        // LINUX-GAP: Linux pwrite64(2) on a bad fd returns -EBADF.
+        // Same `fdget` as `pread64`: a closed descriptor is -EBADF.
         match call(
             Syscall::Pwrite64.raw(),
             a3(5252, data.as_ptr() as u64, 1, 0),
@@ -405,7 +407,8 @@ fn smoke_abi_fdio2_lseek_negative_neg() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"abcdef")], || {
         let fd = open_fd2(b"/abi/f\0")?;
         // A resulting offset < 0 (SEEK_SET to -1) → InvalidOp.
-        // LINUX-GAP: Linux lseek(2) to a negative offset returns -EINVAL.
+        // `fs/read_write.c::must_set_pos` rejects a resulting negative
+        // offset with -EINVAL.
         match call(Syscall::Lseek.raw(), a2(fd as u64, (-1i64) as u64, 0)) {
             Some(v) if v == EINVAL => Ok(()),
             _ => Err("expected -EINVAL"),
@@ -478,7 +481,8 @@ fn smoke_abi_fdio2_fcntl_dupfd_neg() -> TestResult {
     with_setup(|| {
         const F_DUPFD: u64 = 0;
         // F_DUPFD from a bad oldfd → InvalidOp.
-        // LINUX-GAP: Linux F_DUPFD on a bad fd returns -EBADF.
+        // `SYSCALL_DEFINE3(fcntl)` resolves the descriptor before it
+        // dispatches the command, so a closed one is -EBADF.
         match call(Syscall::Fcntl.raw(), a2(7654, F_DUPFD, 0)) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),
@@ -508,7 +512,8 @@ fn smoke_abi_fdio2_dup2_same_fd_neg() -> TestResult {
     with_setup(|| {
         // dup2(badfd, badfd): same-fd path verifies validity first → the
         // closed fd is invalid → InvalidOp.
-        // LINUX-GAP: Linux dup2(badfd, badfd) returns -EBADF.
+        // `dup2(x, x)` is the documented special case: it returns x
+        // unchanged when x is valid, and -EBADF when it is not.
         match call_dup2(3030, 3030) {
             Some(v) if v == EBADF => Ok(()),
             _ => Err("expected -EBADF"),

@@ -4,14 +4,24 @@ use crate::abi_test_support::*;
 // ─────────────────────────────────────────────────────────────────────
 // Notes on the harness reality these tests pin:
 //
-// * The credential / umask / hostname tables are *global* kernel statics
-//   that the ABI harness does NOT reset between tests, and whose
-//   initialised-ness depends on whether boot ran `uidgid_init()` /
-//   `umask_init()`. `read_uidgid()` always works (`unwrap_or_default()`
-//   ⇒ 0), so the get* family is deterministic. The set* family returns
-//   `0` when the table is initialised and `-1` (write-failed shape) when
-//   it is not — so set-tests accept either of those two Ok-status shapes
-//   rather than a single value.
+// * The credential tables ARE reset before every case: `with_setup` runs
+//   `init_per_task_state()`, which calls `uidgid_init()` (clearing every
+//   credential shard) and `caps_init()` (clearing CAP_TABLE). A case may
+//   therefore drop privilege and rely on the next one starting privileged
+//   again.
+//
+//   This note used to say the opposite — that the tables were globals the
+//   harness never reset, and that a set* call could legitimately answer
+//   either `0` or `-1` depending on whether boot had initialised them. That
+//   reading is what left the set* negative cases below accepting `0` or
+//   `-1` interchangeably, i.e. accepting both "the id was set" and
+//   "permission denied", so they passed whether or not the permission check
+//   existed. The `-1`-means-uninitialised shape is unreachable here.
+//
+// * A task with no CAP_TABLE entry reads back `Caps::boot()` — a full set —
+//   so the harness task starts PRIVILEGED. Reaching a
+//   `ns_capable_setid(CAP_SETUID)` arm therefore takes a real privilege
+//   drop first; see `drop_to_unprivileged_uid`.
 //
 // * `copy_to_user` / `copy_user_path` validate only canonicality + len,
 //   not page residency (see `validate_user_range` — kernel-test pointers
@@ -129,6 +139,33 @@ fn smoke_abi_creds_getegid_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_getegid_neg);
 
+/// Drop to an unprivileged uid so the `ns_capable_setid()` arms of the
+/// set*id family are actually reachable.
+///
+/// This is not a test backdoor: `setresuid` away from root runs
+/// `cap_emulate_setxuid` (`security/commoncap.c`), which clears the
+/// permitted and effective capability sets, so this is exactly how a real
+/// process drops privilege.
+///
+/// The self-check matters as much as the drop. The harness task starts with
+/// `Caps::boot()`, and if the drop did not actually remove CAP_SETUID then
+/// every assertion that follows would be satisfied by the *privileged*
+/// branch and prove nothing — which is the failure mode these cases had
+/// before.
+fn drop_to_unprivileged_uid() -> Result<(), &'static str> {
+    const UID: u64 = 1000;
+    if call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0) {
+        return Err("setresuid to an unprivileged uid should succeed while privileged");
+    }
+    if call(Syscall::SetUid.raw(), a0(4242)) != Some(EPERM) {
+        return Err("dropping to an unprivileged uid did not clear CAP_SETUID");
+    }
+    Ok(())
+}
+
+/// `(uid_t)-1` — "leave this id alone" in the set*re*id / set*res*id family.
+const NOCHANGE: u64 = u32::MAX as u64;
+
 // ── setuid ───────────────────────────────────────────────────────────
 // Without the `container` feature there is no user-ns gate, so the only
 // failure mode is "uid/gid table not initialised" ⇒ Ok(-1). With it
@@ -146,14 +183,27 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setuid_pos);
 
 fn smoke_abi_creds_setuid_neg() -> TestResult {
     with_setup(|| {
-        // A huge uid is still accepted by the no-container path (it's just
-        // stored); the value is truncated to u32. Pin the actual shape:
-        // Ok status, value 0 (stored) or -1 (table uninit). LINUX-GAP:
-        // Linux would EPERM an unprivileged setuid to an arbitrary id; the
-        // NARF no-container path is notionally-privileged and never EPERMs.
-        let r = call(Syscall::SetUid.raw(), a0(0xFFFF_FFFE)).ok_or("setuid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setuid(big) returned an unexpected value");
+        // `kernel/sys.c::__sys_setuid`: the privileged branch moves all the
+        // ids; otherwise the target must already be the real or saved uid,
+        // and anything else is -EPERM.
+        //
+        //   if (ns_capable_setid(old->user_ns, CAP_SETUID)) { ... }
+        //   else if (!uid_eq(kuid, old->uid) && !uid_eq(kuid, old->suid))
+        //           goto error;
+        //
+        // NARF implements that. This case did not test it: it called
+        // setuid(0xFFFFFFFE) as the privileged harness task and accepted
+        // `0` or `-1` — both "the id was set" and "permission denied" — so
+        // it passed whether or not the CAP_SETUID check existed.
+        drop_to_unprivileged_uid()?;
+        // uid == euid == suid == 1000 now, so 2000 is none of the three.
+        if call(Syscall::SetUid.raw(), a0(2000)) != Some(EPERM) {
+            return Err("unprivileged setuid to an unrelated uid must be -EPERM");
+        }
+        // The permitted move has to still work, or the assertion above would
+        // be satisfied by a check that simply denied everything.
+        if call(Syscall::SetUid.raw(), a0(1000)) != Some(0) {
+            return Err("unprivileged setuid to the real uid must succeed");
         }
         Ok(())
     })
@@ -174,11 +224,17 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setgid_pos);
 
 fn smoke_abi_creds_setgid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EPERMs an unprivileged setgid to an arbitrary
-        // gid; the NARF no-container path stores it and returns Ok.
-        let r = call(Syscall::SetGid.raw(), a0(0xFFFF_FFFE)).ok_or("setgid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setgid(big) returned an unexpected value");
+        // `__sys_setgid`: unprivileged is permitted only towards the real or
+        // saved gid. Establish both while still privileged, then drop.
+        if call(Syscall::Setresgid.raw(), a2(100, 100, 100)) != Some(0) {
+            return Err("setresgid should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        if call(Syscall::SetGid.raw(), a0(200)) != Some(EPERM) {
+            return Err("unprivileged setgid to an unrelated gid must be -EPERM");
+        }
+        if call(Syscall::SetGid.raw(), a0(100)) != Some(0) {
+            return Err("unprivileged setgid to the real gid must succeed");
         }
         Ok(())
     })
@@ -205,11 +261,18 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setreuid_pos);
 
 fn smoke_abi_creds_setreuid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EPERMs an unprivileged caller raising ruid to
-        // an unrelated id; the no-container path stores it ⇒ Ok(0)/Ok(-1).
-        let r = call(Syscall::Setreuid.raw(), a1(1234, 5678)).ok_or("setreuid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setreuid(1234,5678) unexpected value");
+        // `__sys_setreuid`: a real-uid change is permitted only towards the
+        // current real or effective uid.
+        //
+        //   if (!uid_eq(kruid, old->uid) && !uid_eq(kruid, old->euid) &&
+        //       !ns_capable_setid(old->user_ns, CAP_SETUID))
+        //           goto error;
+        drop_to_unprivileged_uid()?;
+        if call(Syscall::Setreuid.raw(), a1(5678, NOCHANGE)) != Some(EPERM) {
+            return Err("unprivileged setreuid raising the real uid must be -EPERM");
+        }
+        if call(Syscall::Setreuid.raw(), a1(1000, NOCHANGE)) != Some(0) {
+            return Err("unprivileged setreuid to the current real uid must succeed");
         }
         Ok(())
     })
@@ -234,10 +297,16 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setregid_pos);
 
 fn smoke_abi_creds_setregid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EPERMs an unprivileged gid raise; NARF stores it.
-        let r = call(Syscall::Setregid.raw(), a1(1234, 5678)).ok_or("setregid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setregid(1234,5678) unexpected value");
+        // `__sys_setregid`, the gid twin of the setreuid arm above.
+        if call(Syscall::Setresgid.raw(), a2(100, 100, 100)) != Some(0) {
+            return Err("setresgid should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        if call(Syscall::Setregid.raw(), a1(5678, NOCHANGE)) != Some(EPERM) {
+            return Err("unprivileged setregid raising the real gid must be -EPERM");
+        }
+        if call(Syscall::Setregid.raw(), a1(100, NOCHANGE)) != Some(0) {
+            return Err("unprivileged setregid to the current real gid must succeed");
         }
         Ok(())
     })
@@ -264,12 +333,16 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setresuid_pos);
 
 fn smoke_abi_creds_setresuid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux EPERMs an unprivileged caller setting arbitrary
-        // r/e/s uids; NARF collapses onto its single uid and ALWAYS
-        // returns Ok(0) (no EPERM path, write-failure swallowed).
-        let r = call(Syscall::Setresuid.raw(), a2(1000, 2000, 3000)).ok_or("setresuid not Ok")?;
-        if r != 0 {
-            return Err("setresuid(arbitrary) expected 0");
+        // `__sys_setresuid`: without CAP_SETUID, every requested id must
+        // already be one of the three the task holds.
+        drop_to_unprivileged_uid()?;
+        if call(Syscall::Setresuid.raw(), a2(3000, NOCHANGE, NOCHANGE)) != Some(EPERM) {
+            return Err("unprivileged setresuid to an unheld uid must be -EPERM");
+        }
+        // Re-stating an id already held is permitted, so the denial above is
+        // about the id being new rather than about the call being refused.
+        if call(Syscall::Setresuid.raw(), a2(1000, NOCHANGE, NOCHANGE)) != Some(0) {
+            return Err("unprivileged setresuid to an already-held uid must succeed");
         }
         Ok(())
     })
@@ -294,15 +367,113 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setresgid_pos);
 
 fn smoke_abi_creds_setresgid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: same as setresuid — NARF always returns Ok(0).
-        let r = call(Syscall::Setresgid.raw(), a2(1000, 2000, 3000)).ok_or("setresgid not Ok")?;
-        if r != 0 {
-            return Err("setresgid(arbitrary) expected 0");
+        // `__sys_setresgid`, the gid twin of the setresuid arm above.
+        if call(Syscall::Setresgid.raw(), a2(100, 100, 100)) != Some(0) {
+            return Err("setresgid should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        if call(Syscall::Setresgid.raw(), a2(3000, NOCHANGE, NOCHANGE)) != Some(EPERM) {
+            return Err("unprivileged setresgid to an unheld gid must be -EPERM");
+        }
+        if call(Syscall::Setresgid.raw(), a2(100, NOCHANGE, NOCHANGE)) != Some(0) {
+            return Err("unprivileged setresgid to an already-held gid must succeed");
         }
         Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_setresgid_neg);
+
+/// `setresgid` must write each of the three ids to its own field.
+///
+/// The handler used to pick egid if given and rgid otherwise, then write
+/// that single value to BOTH `gid` and `egid` — so `setresgid(100, 200, -1)`
+/// left the real gid at 200 — and it never wrote `sgid` at all. Without a
+/// saved gid a privileged caller cannot establish one to drop to and later
+/// restore, which is the whole point of the three-id form.
+///
+/// Run privileged, so what it pins is the assignment rather than the
+/// permission check `smoke_abi_creds_setresgid_neg` covers.
+fn smoke_abi_creds_setresgid_writes_each_field() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Setresgid.raw(), a2(100, 200, 300)) != Some(0) {
+            return Err("privileged setresgid(100, 200, 300) should succeed");
+        }
+        let mut rgid: u32 = 0;
+        let mut egid: u32 = 0;
+        let mut sgid: u32 = 0;
+        let r = call(
+            Syscall::Getresgid.raw(),
+            a2(
+                &mut rgid as *mut u32 as u64,
+                &mut egid as *mut u32 as u64,
+                &mut sgid as *mut u32 as u64,
+            ),
+        );
+        if r != Some(0) {
+            return Err("getresgid should succeed");
+        }
+        if rgid != 100 {
+            return Err("setresgid did not write the real gid to its own field");
+        }
+        if egid != 200 {
+            return Err("setresgid did not write the effective gid to its own field");
+        }
+        if sgid != 300 {
+            return Err("setresgid did not write the saved gid");
+        }
+        // `new->fsgid = new->egid;` — fsgid follows the effective gid, which
+        // is what makes this syscall a DAC decision and not just bookkeeping.
+        match call(Syscall::Setfsgid.raw(), a0(NOCHANGE)) {
+            Some(200) => Ok(()),
+            _ => Err("setresgid did not carry fsgid along with the effective gid"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_creds_setresgid_writes_each_field);
+
+/// The gid side of the set*id family must be guarded everywhere, not just in
+/// `setgid`.
+///
+/// `sys_setgid` has always checked CAP_SETGID. `setregid` and `setresgid`
+/// did not check anything, so the guard was reachable around: a task that
+/// had dropped to an unprivileged uid could still claim any group. This
+/// walks all three entry points from one unprivileged state so a future
+/// change cannot re-open one of them while the others stay shut.
+fn smoke_abi_creds_gid_raise_is_denied_by_every_entry_point() -> TestResult {
+    with_setup(|| {
+        if call(Syscall::Setresgid.raw(), a2(100, 100, 100)) != Some(0) {
+            return Err("setresgid should succeed while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+        // gid == egid == sgid == 100. Group 0 is the interesting target:
+        // fsgid follows egid, so taking it would hand the caller the group
+        // half of every DAC check over root-group files.
+        if call(Syscall::SetGid.raw(), a0(0)) != Some(EPERM) {
+            return Err("setgid to group 0 must be -EPERM for an unprivileged task");
+        }
+        if call(Syscall::Setregid.raw(), a1(0, NOCHANGE)) != Some(EPERM) {
+            return Err("setregid to group 0 must be -EPERM for an unprivileged task");
+        }
+        if call(Syscall::Setregid.raw(), a1(NOCHANGE, 0)) != Some(EPERM) {
+            return Err("setregid raising the effective gid to 0 must be -EPERM");
+        }
+        if call(Syscall::Setresgid.raw(), a2(0, NOCHANGE, NOCHANGE)) != Some(EPERM) {
+            return Err("setresgid to group 0 must be -EPERM for an unprivileged task");
+        }
+        if call(Syscall::Setresgid.raw(), a2(NOCHANGE, NOCHANGE, 0)) != Some(EPERM) {
+            return Err("setresgid raising the saved gid to 0 must be -EPERM");
+        }
+        // And the gid really did not move.
+        match call(Syscall::GetGid.raw(), a0(0)) {
+            Some(100) => Ok(()),
+            _ => Err("a denied gid change moved the real gid anyway"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_creds_gid_raise_is_denied_by_every_entry_point
+);
 
 // ── setfsuid ─────────────────────────────────────────────────────────
 // Returns the PREVIOUS fsuid; never an errno. `-1` queries only.
@@ -320,9 +491,9 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setfsuid_pos);
 
 fn smoke_abi_creds_setfsuid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: setfsuid never reports failure in Linux either — an
-        // unprivileged change just silently no-ops and still returns the
-        // old fsuid. So even an "arbitrary" target yields Ok(old) >= 0,
+        // NOT a divergence: `setfsuid` never reports failure in Linux
+        // either — an unprivileged change silently no-ops and still returns
+        // the old fsuid. So even an "arbitrary" target yields Ok(old) >= 0,
         // never an errno. This pins that no-error contract.
         let r = call(Syscall::Setfsuid.raw(), a0(4242)).ok_or("setfsuid not Ok")?;
         if r < 0 {
@@ -347,7 +518,8 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setfsgid_pos);
 
 fn smoke_abi_creds_setfsgid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: no error path; returns Ok(old fsgid) >= 0 always.
+        // NOT a divergence: `setfsgid` has no error path in Linux either —
+        // it returns Ok(old fsgid) >= 0 always.
         let r = call(Syscall::Setfsgid.raw(), a0(4242)).ok_or("setfsgid not Ok")?;
         if r < 0 {
             return Err("setfsgid(arbitrary) returned an errno");

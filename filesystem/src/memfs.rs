@@ -1507,10 +1507,22 @@ impl Xattrs {
 /// what makes `setfacl -d` a directory-only operation and what stops the
 /// inheritance chain at the first non-directory.
 ///
-/// LINUX-GAP: `set_posix_acl` also requires `inode_owner_or_capable()`
-/// (`-EPERM` otherwise). `FileOps`/`DirOps` methods carry no credential, so
-/// that check has to live in the syscall layer; nothing calls it there yet,
-/// so today any task that can reach the inode can set its ACL.
+/// `set_posix_acl`'s other check — `inode_owner_or_capable()`, `-EPERM`
+/// otherwise — is NOT here, because `FileOps`/`DirOps` methods carry no
+/// credential to test it against. It lives in the syscall layer instead, in
+/// `xattr_permission_check`, which routes the POSIX-ACL names to
+/// `inode_owner_or_capable` and everything else to `xattr_permission`, as
+/// `do_setxattr` does.
+///
+/// This used to say that nothing called it there yet, "so today any task
+/// that can reach the inode can set its ACL". That stopped being true when
+/// the xattr permission gate landed; a doc comment asserting a missing
+/// permission check is worth keeping accurate in both directions.
+///
+/// The `default_on_file` arm above is deliberately left to this function
+/// rather than the gate: `set_posix_acl` tests it FIRST and answers
+/// `acl ? -EACCES : 0` without consulting the owner, so putting EPERM in
+/// front of it would invert Linux's precedence.
 fn memfs_set_acl(
     xattrs: &Xattrs,
     perms: &AtomicU32,

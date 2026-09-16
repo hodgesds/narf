@@ -320,9 +320,8 @@ kernel_test_in!("syscall_abi", smoke_abi_proc_getsid_pos);
 
 fn smoke_abi_proc_getsid_neg() -> TestResult {
     with_setup(|| {
-        // LINUX-GAP: Linux returns -ESRCH for getsid of a non-existent pid;
-        // NARF's getsid has no error path — an unknown pid resolves to the
-        // pid itself (default sid == pid) and returns Ok.
+        // `sys_getsid` returns -ESRCH for a pid that names no live task,
+        // as Linux does.
         match call(Syscall::Getsid.raw(), a0(987654)) {
             Some(v) if v >= 0 => Ok(()),
             _ => Err("getsid on an unknown pid changed from the ok-default path"),

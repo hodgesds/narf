@@ -136,9 +136,30 @@ struct PosixTimer {
     next_fire_ns: u64,
     /// Re-arm interval in ns; 0 = one-shot.
     interval_ns: u64,
-    /// Expiries that fired since the last `timer_getoverrun` /
-    /// `timer_gettime` — visible to the test harness.
+    /// Extra expiries accumulated since the last signal was queued for this
+    /// timer — Linux's `k_itimer::it_overrun`.
+    ///
+    /// POSIX collapses a burst of missed expiries into ONE signal plus a
+    /// count, so this counts the ones the signal stands in for. Linux bases
+    /// it at `-1LL` and adds the full forward count; NARF adds `fires - 1`
+    /// from zero, which is the same number without the negative base.
     overrun: u32,
+    /// The overrun of the signal most recently queued for this timer —
+    /// Linux's `k_itimer::it_overrun_last`, and what `timer_getoverrun(2)`
+    /// reports.
+    ///
+    /// `posix_timer_queue_signal` latches one into the other:
+    ///
+    /// ```text
+    /// timr->it_overrun_last = timr->it_overrun;
+    /// timr->it_overrun = -1LL;
+    /// ```
+    ///
+    /// Without the latch a reader would see a count that keeps climbing
+    /// across deliveries, rather than "how many expiries did the signal I
+    /// just handled stand for" — which is the question the syscall answers,
+    /// and the only one a handler can act on.
+    overrun_last: u32,
 }
 
 #[derive(Debug, Default)]
@@ -521,6 +542,7 @@ pub fn sys_timer_create(ctx: &mut dyn TrapContext) {
                 next_fire_ns: 0,
                 interval_ns: 0,
                 overrun: 0,
+                overrun_last: 0,
             },
         );
         id
@@ -664,7 +686,11 @@ pub fn sys_timer_settime(ctx: &mut dyn TrapContext) {
         let prev_interval = entry.interval_ns;
         entry.next_fire_ns = next_fire;
         entry.interval_ns = interval_ns;
+        // `common_timer_set`: `timer->it_overrun_last = 0; timer->it_overrun
+        // = -1LL;` — re-arming clears both halves, so a getoverrun after a
+        // settime cannot report a count from the previous arming.
         entry.overrun = 0;
+        entry.overrun_last = 0;
         Some((prev_next, prev_interval))
     });
     let (prev_next, prev_interval) = match prev {
@@ -802,6 +828,48 @@ pub fn sys_timer_delete(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(0));
     } else {
         ctx.set_return(err(EINVAL));
+    }
+}
+
+/// `kernel/time/posix-timers.c::SYSCALL_DEFINE1(timer_getoverrun, timer_t)`.
+///
+/// ```text
+/// SYSCALL_DEFINE1(timer_getoverrun, timer_t, timer_id)
+/// {
+///         scoped_timer_get_or_fail(timer_id)
+///                 return timer_overrun_to_int(scoped_timer);
+/// }
+/// ```
+///
+/// `scoped_timer_get_or_fail` expands to `return -EINVAL` when the lookup
+/// misses, so an id this task does not own — including one already
+/// `timer_delete`d — is -EINVAL, and not -ESRCH or -EBADF.
+///
+/// POSIX collapses a burst of missed expiries into ONE signal plus a count.
+/// This syscall is the only way to recover that count, so a handler that has
+/// to do work per expiry cannot be written without it; NARF tracked the
+/// count all along and simply had no entry point to read it through.
+///
+/// `timer_overrun_to_int` saturates at `INT_MAX`. The clamp is kept explicit
+/// rather than left to the cast: a count above `i32::MAX` returned verbatim
+/// would arrive in userspace as a small negative number, i.e. as an errno.
+///
+/// Reading does not reset anything. The count is latched when the signal is
+/// queued (`posix_timer_queue_signal`) and cleared by `timer_settime`, so
+/// two reads between expiries agree — which matters because the natural use
+/// is to read it inside the handler and again afterwards.
+pub fn sys_timer_getoverrun(ctx: &mut dyn TrapContext) {
+    const INT_MAX: u32 = i32::MAX as u32;
+    let id = match timer_id_arg(ctx.args().arg0) {
+        Some(id) => id,
+        None => {
+            ctx.set_return(err(EINVAL));
+            return;
+        }
+    };
+    match getoverrun(current_task_id(), id) {
+        Some(n) => ctx.set_return(SyscallReturn::ok(u64::from(n.min(INT_MAX)))),
+        None => ctx.set_return(err(EINVAL)),
     }
 }
 
@@ -1394,7 +1462,17 @@ pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64>
 /// signals via the existing `raise_signal_pending` path. Re-arms
 /// periodic timers. Counts missed expiries into `overrun`.
 fn posix_timer_pump() {
-    let now = narf_scheduler::narf_time::monotonic_ns();
+    posix_timer_pump_at(narf_scheduler::narf_time::monotonic_ns());
+}
+
+/// The pump body, against a SUPPLIED instant.
+///
+/// Split out so a test can drive expiry deterministically instead of racing
+/// the real clock. Overrun accounting is arithmetic on `(now - next_fire) /
+/// interval`, so a case that arms a timer and then waits for wall time to
+/// pass would be asserting on however many intervals happened to elapse —
+/// exactly the kind of assertion that passes locally and fails under load.
+fn posix_timer_pump_at(now: u64) {
     // Collect (task, signum) pairs under the lock; deliver after
     // releasing it so we don't nest SIGNAL_PENDING under TIMERS.
     let mut deliveries: Vec<(u64, u32)> = Vec::new();
@@ -1419,6 +1497,15 @@ fn posix_timer_pump() {
                     if t.signum != 0 {
                         // Queue one signal — POSIX collapses missed
                         // expiries into a single signal + overrun count.
+                        //
+                        // `posix_timer_queue_signal` latches the accumulator
+                        // into `it_overrun_last` and restarts it, so the count
+                        // belongs to THIS signal. A SIGEV_NONE timer (signum
+                        // 0) queues nothing and keeps accumulating, which is
+                        // also what Linux does — there is no delivery to
+                        // attribute the count to.
+                        t.overrun_last = t.overrun;
+                        t.overrun = 0;
                         deliveries.push((t.target, t.signum));
                     }
                     if t.interval_ns == 0 {
@@ -1438,7 +1525,33 @@ fn posix_timer_pump() {
     }
 }
 
-/// Diagnostic for the smokes — peek the overrun counter.
+/// `timer_getoverrun(2)` — the overrun of the signal most recently queued
+/// for `id`, or `None` if the task holds no such timer (the caller maps that
+/// to -EINVAL).
+///
+/// `SYSCALL_DEFINE1(timer_getoverrun)` is `scoped_timer_get_or_fail(timer_id)
+/// return timer_overrun_to_int(scoped_timer);` — the lookup failure is
+/// -EINVAL, and the value is `it_overrun_last` saturated at INT_MAX:
+///
+/// ```text
+/// if (timr->it_overrun_last > (s64)INT_MAX) return INT_MAX;
+/// return (int)timr->it_overrun_last;
+/// ```
+///
+/// Reading does NOT reset the counter. It is latched at delivery and cleared
+/// by `timer_settime`, so two reads between expiries agree — a handler that
+/// reads it twice must see the same answer.
+pub fn getoverrun(task: u64, id: u32) -> Option<u32> {
+    with_table(|m| {
+        m.get(&task)
+            .and_then(|t| t.by_id.get(&id))
+            .map(|t| t.overrun_last)
+    })
+}
+
+/// Diagnostic for the smokes — peek the live overrun accumulator (Linux's
+/// `it_overrun`, not the latched `it_overrun_last` that `timer_getoverrun`
+/// reports).
 #[doc(hidden)]
 pub fn overrun_of(task: u64, id: u32) -> Option<u32> {
     with_table(|m| {
@@ -1463,6 +1576,16 @@ pub fn next_fire_of(task: u64, id: u32) -> Option<u64> {
 #[doc(hidden)]
 pub fn __test_run_pump() {
     posix_timer_pump();
+}
+
+/// Force the pump to run AT a given monotonic instant.
+///
+/// Lets an overrun case state the elapsed time rather than wait for it, so
+/// the expected count is fixed by arithmetic rather than by how long the
+/// case took to reach the assertion.
+#[doc(hidden)]
+pub fn __test_run_pump_at(now: u64) {
+    posix_timer_pump_at(now);
 }
 
 // ── ITIMER_REAL IRQ fast-path lifecycle smokes ──────────────────────

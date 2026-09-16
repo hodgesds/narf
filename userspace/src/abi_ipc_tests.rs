@@ -4226,8 +4226,9 @@ kernel_test_in!("syscall_abi", smoke_abi_ipc_shmem_create_neg);
 fn smoke_abi_ipc_shmem_map_neg() -> TestResult {
     with_setup(|| {
         // Unknown handle → pid_of(handle)=0 != FAKE_TASK → invalid_op.
-        // LINUX-GAP: not a Linux syscall (NARF-native); no errno wire
-        // value — failure is a non-Ok NARF status, not -EINVAL.
+        // Not a Linux syscall at all — `shmem_map` is NARF-native, so its
+        // ABI is the status word and failure is a non-Ok status, not an
+        // errno. Nothing here to compare against Linux.
         match call(Syscall::ShmemMap.raw(), a0(987654)) {
             None => Ok(()),
             Some(_) => Err("shmem_map of a foreign/unknown handle should be invalid_op (None)"),

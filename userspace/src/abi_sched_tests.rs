@@ -3,8 +3,9 @@
 //! Shares the harness in [`crate::abi_test_support`]; see that module for
 //! the rationale. Scheduler / rlimit / priority surface.
 //!
-//! Tests pin the implemented Linux-compatible wire behavior. Remaining
-//! cooperative-scheduler gaps are called out locally with LINUX-GAP comments.
+//! Tests pin the implemented Linux-compatible wire behavior. Where a
+//! cooperative-scheduler limit makes an arm unreachable, the case says so at
+//! the assertion rather than relying on a file-level note.
 
 use crate::abi_test_support::*;
 

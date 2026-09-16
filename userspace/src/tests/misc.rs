@@ -527,7 +527,7 @@ kernel_test_in!("userspace", smoke_userspace_chdir_getcwd_round_trip);
 fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
     // Install a global table with a live plain handler for
     // Syscall::Yield; kernel_syscall_entry_plain(104, …) routes
-    // to it. Unregistered numbers return invalid_op.
+    // to it. Unregistered numbers return -ENOSYS (InvalidOp status).
     use crate::{
         install_global, kernel_syscall_entry_plain, syscall::__test_clear_global, Syscall,
         SyscallArgs, SyscallReturn, SyscallTable,
@@ -561,26 +561,61 @@ fn smoke_userspace_syscall_dispatch_via_global() -> TestResult {
         return TestResult::Fail("handler did not observe args.arg0");
     }
 
-    // Unknown number → invalid_op.
+    // Unknown number → `not_implemented()`: -ENOSYS in the value register,
+    // `InvalidOp` still in the status word.
+    //
+    // This asserted plain `invalid_op()`, whose value is 0. The status half
+    // was right and is unchanged; the value half was the bug, because that is
+    // the register the Linux ABI returns, so every syscall this kernel does
+    // not implement reported success. Both halves are checked separately so a
+    // regression names which one moved.
     let r2 = kernel_syscall_entry_plain(999, &args);
-    if r2 != SyscallReturn::invalid_op() {
+    if r2.status != SyscallReturn::INVALID_OP {
         __test_clear_global();
-        return TestResult::Fail("unknown number did not surface invalid_op");
+        return TestResult::Fail("unknown number did not surface an InvalidOp status");
+    }
+    if r2.value == 0 {
+        __test_clear_global();
+        return TestResult::Fail("unknown syscall number reported success to userspace");
+    }
+    if r2.value as i64 != -38 {
+        __test_clear_global();
+        return TestResult::Fail("unknown number did not surface -ENOSYS");
     }
 
-    // Known number without a handler → invalid_op.
+    // Known number without a handler → the same `not_implemented()` answer
+    // as an unknown one. This table registered only `Yield`, so `Write` is a
+    // name the build knows with nothing installed behind it — which for a
+    // caller is indistinguishable from absent, and Linux says -ENOSYS for
+    // both (`sys_ni_syscall` serves every unwired entry in its table).
     let r3 = kernel_syscall_entry_plain(Syscall::Write.raw(), &args);
-    if r3 != SyscallReturn::invalid_op() {
+    if r3.status != SyscallReturn::INVALID_OP {
         __test_clear_global();
-        return TestResult::Fail("handler-less number did not surface invalid_op");
+        return TestResult::Fail("handler-less number did not surface an InvalidOp status");
+    }
+    if r3.value == 0 {
+        __test_clear_global();
+        return TestResult::Fail("handler-less syscall number reported success to userspace");
+    }
+    if r3.value as i64 != -38 {
+        __test_clear_global();
+        return TestResult::Fail("handler-less number did not surface -ENOSYS");
     }
 
-    // After __test_clear_global, every entry returns invalid_op —
-    // pre-boot / post-shutdown safety.
+    // After __test_clear_global there is no table at all — pre-boot /
+    // post-shutdown safety. Not the same condition as an absent number, but
+    // the answer to "can you run this syscall" is still no, and 0 is the one
+    // answer it must not be.
     __test_clear_global();
     let r4 = kernel_syscall_entry_plain(Syscall::Yield.raw(), &args);
-    if r4 != SyscallReturn::invalid_op() {
-        return TestResult::Fail("no global should surface invalid_op");
+    if r4.status != SyscallReturn::INVALID_OP {
+        return TestResult::Fail("no global should surface an InvalidOp status");
+    }
+    if r4.value == 0 {
+        return TestResult::Fail("a syscall with no table installed reported success");
+    }
+    if r4.value as i64 != -38 {
+        return TestResult::Fail("no global should surface -ENOSYS");
     }
     TestResult::Pass
 }

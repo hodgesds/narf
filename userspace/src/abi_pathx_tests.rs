@@ -152,8 +152,8 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_chown_neg);
 fn smoke_abi_pathx_lchown_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
         let path = b"/p2/f\0";
-        // LINUX-GAP: NARF has no symlink-follow distinction; lchown aliases
-        // the chmod/chown path handler (no l-variant semantics).
+        // `sys_lchown` forwards to the shared `chown_legacy` body with
+        // AT_SYMLINK_NOFOLLOW, so the l-variant really does not follow.
         match call_lchown(path.as_ptr() as u64, 0, 0) {
             Some(0) => Ok(()),
             _ => Err("lchown(existing) should return 0"),
@@ -1900,7 +1900,7 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_renameat2_neg);
 
 // ── statfs (NARF-native path_ptr, path_len, buf) → 0 / -1 ──────────
 //
-// LINUX-GAP: NARF-native (ptr, len, buf); Linux is (path NUL-term, buf).
+// `sys_statfs` takes the Linux shape: (path NUL-term, buf).
 
 fn smoke_abi_pathx_statfs_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {
@@ -2333,7 +2333,8 @@ fn smoke_abi_pathx_getdents64_neg() -> TestResult {
     with_setup(|| {
         let mut buf = [0u8; 256];
         // bad fd (not a directory fd) → -1 sentinel.
-        // LINUX-GAP: Linux getdents64(2) returns -EBADF / -ENOTDIR.
+        // `getdents64` resolves the fd first, so a closed one is -EBADF
+        // (a non-directory would be -ENOTDIR).
         match call(
             Syscall::Getdents64.raw(),
             a2(9292, buf.as_mut_ptr() as u64, buf.len() as u64),
@@ -2646,8 +2647,8 @@ kernel_test_in!("syscall_abi", smoke_abi_pathx_listdir_eof_pos);
 // ── utime (NUL-term path) → 0 / -EFAULT ────────────────────────────
 //
 // sys_utime_noop: validates the path cstr, then accepts (file times are
-// not tracked). LINUX-GAP: never touches the FS, so it returns 0 even
-// for a path that does not exist — only a NULL/faulting ptr → -EFAULT.
+// not tracked). The path IS resolved: `set_path_times` returns -ENOENT for
+// a name that does not exist, and a NULL/faulting ptr is -EFAULT.
 
 fn smoke_abi_pathx_utime_pos() -> TestResult {
     with_memfs("/p2", "p2", &[("f", b"hi")], || {

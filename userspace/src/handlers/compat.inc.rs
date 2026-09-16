@@ -9515,6 +9515,11 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
             RawFnHandler(crate::posix_timer::sys_timer_gettime),
         );
         table.install_raw(
+            Syscall::TimerGetoverrun,
+            "timer_getoverrun",
+            RawFnHandler(crate::posix_timer::sys_timer_getoverrun),
+        );
+        table.install_raw(
             Syscall::TimerDelete,
             "timer_delete",
             RawFnHandler(crate::posix_timer::sys_timer_delete),

@@ -218,8 +218,8 @@ fn smoke_abi_mem2_move_pages_bad_status_neg() -> TestResult {
             arg4: 0x0001_0000_0000_0000,
             arg5: 0,
         };
-        // LINUX-GAP: Linux move_pages writes per-page status / -EFAULT;
-        // NARF matches the -EFAULT shape here for an unwritable pointer.
+        // `move_pages` writes per-page status, so an unwritable status
+        // pointer is -EFAULT before any page is examined.
         match call(Syscall::MovePages.raw(), args) {
             Some(v) if v == EFAULT => Ok(()),
             Some(0) => Err("move_pages with a bad status ptr should not succeed"),

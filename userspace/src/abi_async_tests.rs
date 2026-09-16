@@ -26,10 +26,11 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_poll_pos);
 fn smoke_abi_async_poll_neg() -> TestResult {
     with_setup(|| {
         // poll(NULL, 1, 0): nfds>0 with a null array pointer → parse fails.
-        // LINUX-GAP: Linux returns -EFAULT here; NARF returns the -1 sentinel.
+        // `SYSCALL_DEFINE3(poll)` imports the pollfd array before anything
+        // else, so a NULL array with a non-zero count is -EFAULT.
         match call(Syscall::Poll.raw(), a2(0, 1, 0)) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("poll(NULL,1,0) must fail"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("poll(NULL,1,0) must be -EFAULT"),
         }
     })
 }
@@ -97,10 +98,10 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_ppoll_pos);
 fn smoke_abi_async_ppoll_neg() -> TestResult {
     with_setup(|| {
         // ppoll(NULL, 1, NULL, ..): null fds array with nfds>0 → fail.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
+        // Same import, same answer as `poll` above.
         match call(Syscall::Ppoll.raw(), a3(0, 1, 0, 0)) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("ppoll(NULL,1,NULL,..) must fail"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("ppoll(NULL,1,NULL,..) must be -EFAULT"),
         }
     })
 }
@@ -276,11 +277,12 @@ fn smoke_abi_async_epoll_ctl_neg() -> TestResult {
         let mut ev = [0u8; 12];
         ev[0..4].copy_from_slice(&(0x1u32).to_ne_bytes());
         // epoll_ctl on an epfd that was never created → fail.
-        // LINUX-GAP: Linux returns -EBADF; NARF returns the -1 sentinel.
+        // `do_epoll_ctl` resolves epfd through `fdget` first: a closed
+        // descriptor is -EBADF before the op or the event are looked at.
         let args = a3(999, EPOLL_CTL_ADD, 5, ev.as_ptr() as u64);
         match call(Syscall::EpollCtl.raw(), args) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("epoll_ctl on bad epfd must fail"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("epoll_ctl on a bad epfd must be -EBADF"),
         }
     })
 }
@@ -318,11 +320,12 @@ fn smoke_abi_async_epoll_wait_neg() -> TestResult {
             _ => return Err("epoll_create1 failed"),
         };
         // Null events pointer → fail.
-        // LINUX-GAP: Linux returns -EFAULT; NARF returns the -1 sentinel.
+        // `do_epoll_wait` checks the events buffer with `access_ok` before
+        // it waits, so a NULL buffer with maxevents > 0 is -EFAULT.
         let args = a3(epfd, 0, 1, 0);
         match call(Syscall::EpollWait.raw(), args) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("epoll_wait(NULL events) must fail"),
+            Some(v) if v == EFAULT => Ok(()),
+            _ => Err("epoll_wait(NULL events) must be -EFAULT"),
         }
     })
 }
@@ -359,13 +362,13 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait_pos);
 
 fn smoke_abi_async_epoll_pwait_neg() -> TestResult {
     with_setup(|| {
-        // Bad epfd (never created) with a valid events buffer → fail.
-        // LINUX-GAP: Linux returns -EBADF; NARF returns the -1 sentinel.
+        // Bad epfd (never created) with a valid events buffer.
+        // Same `fdget` on epfd as `epoll_ctl`.
         let mut evbuf = [0u8; 12];
         let args = a3(999, evbuf.as_mut_ptr() as u64, 1, 0);
         match call(Syscall::EpollPwait.raw(), args) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("epoll_pwait on bad epfd must fail"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("epoll_pwait on a bad epfd must be -EBADF"),
         }
     })
 }
@@ -469,8 +472,8 @@ kernel_test_in!("syscall_abi/async", smoke_abi_async_epoll_pwait2_timespec);
 
 fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
     with_setup(|| {
-        // Bad epfd (never created) with a valid events buffer → fail.
-        // LINUX-GAP: Linux returns -EBADF; NARF returns the -1 sentinel.
+        // Bad epfd (never created) with a valid events buffer.
+        // Same `fdget` on epfd as `epoll_pwait`.
         let mut evbuf = [0u8; 12];
         let args = SyscallArgs {
             arg0: 999,
@@ -481,8 +484,8 @@ fn smoke_abi_async_epoll_pwait2_neg() -> TestResult {
             arg5: 0,
         };
         match call(Syscall::EpollPwait2.raw(), args) {
-            Some(v) if v < 0 => Ok(()),
-            _ => Err("epoll_pwait2 on bad epfd must fail"),
+            Some(v) if v == EBADF => Ok(()),
+            _ => Err("epoll_pwait2 on a bad epfd must be -EBADF"),
         }
     })
 }
