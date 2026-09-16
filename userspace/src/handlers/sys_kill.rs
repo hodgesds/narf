@@ -41,21 +41,16 @@ pub(crate) fn sys_kill(ctx: &mut dyn TrapContext) {
             // Existence check FIRST so `kill(pid, 0)` (the POSIX
             // liveness probe) reports ESRCH for a vanished target and
             // queues NOTHING for a live one.
-            let target_tid = pid_to_task_raw(target).unwrap_or(target);
-            let exists = signal_target_exists(target_tid);
-            if !exists {
+            let Some(target_tid) = pid_to_task_raw(target) else {
+                ctx.set_return(esrch);
+                return;
+            };
+            if !signal_target_exists(target_tid) {
                 false
             } else if signum == 0 {
                 true
-            } else if pid_to_task_raw(target).is_some() {
-                kill_process(target, signum)
             } else {
-                // Raw-tid fallback (boot-init spawned tasks).
-                queue_sender_siginfo(target, signum);
-                signal_stopcont_interaction(target, signum);
-                raise_signal_pending(target, signum);
-                wake_signal(target);
-                true
+                kill_process(target, signum)
             }
         }
         0 => {

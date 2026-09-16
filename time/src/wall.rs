@@ -324,7 +324,11 @@ pub fn now_wall() -> WallInstant {
     let delta = SMEAR_DELTA_NS_REMAINING.load(Ordering::Acquire);
     let now = now_cycles();
 
-    let base_ns = monotonic_ns() as i128 + WALL_OFFSET_NS.load(Ordering::Acquire) as i128;
+    // Reuse the cycle sample that also decides the smear branch. Calling
+    // monotonic_ns() here would read the clock a second time, making one
+    // wall-clock observation internally span two instants and adding another
+    // RDTSCP to hot timestamp-maintenance paths such as semop.
+    let base_ns = cycles_to_ns(now) as i128 + WALL_OFFSET_NS.load(Ordering::Acquire) as i128;
 
     if end > now && delta != 0 {
         // Fold a fraction of the remaining delta proportional to how

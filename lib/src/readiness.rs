@@ -91,7 +91,7 @@ impl Inner {
 
     /// Linux wait-queue wake policy: notify every non-exclusive observer (poll
     /// and epoll) followed by at most one exclusive blocking-I/O waiter.
-    fn wake_waiters(&mut self, bits: u32) {
+    fn wake_waiters(&mut self, bits: u32, wake_exclusive: impl FnOnce(u64, &Waker)) -> Option<u64> {
         for waiter in self.waiters.values() {
             if !waiter.exclusive && waiter.interest & bits != 0 {
                 waiter.waker.wake_by_ref();
@@ -113,11 +113,12 @@ impl Inner {
                 continue;
             }
             if waiter.interest & bits != 0 {
-                waiter.waker.wake_by_ref();
-                return;
+                wake_exclusive(id, &waiter.waker);
+                return Some(id);
             }
             self.exclusive_order.push_back(id);
         }
+        None
     }
 
     /// Terminal-state wake policy: notify every waiter, including all
@@ -207,6 +208,32 @@ impl Readiness {
     /// without selecting two exclusive blockers for a single operation when
     /// that write also creates a rising edge.
     pub fn set_event(&self, add: u32, clear: u32, event: u32) {
+        let _ = self.set_event_with_exclusive_id(add, clear, event);
+    }
+
+    /// [`set_event`](Self::set_event), additionally returning the id of the
+    /// exclusive waiter selected by this event. The waker has already fired
+    /// before this returns. Providers with synchronous producer/consumer
+    /// semantics (notably Linux pipes' `WF_SYNC` wakeups) can feed that exact id
+    /// into a scheduler handoff hint without changing ordinary poll observers or
+    /// making the readiness primitive depend on a scheduler.
+    pub fn set_event_with_exclusive_id(&self, add: u32, clear: u32, event: u32) -> Option<u64> {
+        self.set_event_with_exclusive_wake(add, clear, event, |_, waker| waker.wake_by_ref())
+    }
+
+    /// [`set_event`](Self::set_event), allowing the provider to perform the
+    /// selected exclusive wake through a specialized scheduler path. The
+    /// callback runs at most once, under the readiness lock, and must wake the
+    /// supplied waker by reference. Non-exclusive observers retain the normal
+    /// wake path. This keeps provider-specific handoff policy out of the
+    /// readiness primitive while preserving the single selected waiter.
+    pub fn set_event_with_exclusive_wake(
+        &self,
+        add: u32,
+        clear: u32,
+        event: u32,
+        wake_exclusive: impl FnOnce(u64, &Waker),
+    ) -> Option<u64> {
         let mut g = self.inner.lock();
         let old = g.mask;
         let new = (old & !clear) | add;
@@ -214,7 +241,7 @@ impl Readiness {
         let rising = new & !old;
         let ready_event = event & new;
         if rising == 0 && ready_event == 0 {
-            return;
+            return None;
         }
         g.seq = g.seq.wrapping_add(1);
         // Wake satisfied waiters BY REFERENCE, UNDER the lock. This is the
@@ -230,7 +257,7 @@ impl Readiness {
         //   `Arc<WakeCell>`, the very IRQ-illegal dealloc we must avoid. An
         //   exclusive waiter is removed only from the u64 FIFO, leaving its
         //   waker stored until task-context re-arm/disarm.
-        g.wake_waiters(if rising != 0 { new } else { ready_event });
+        g.wake_waiters(if rising != 0 { new } else { ready_event }, wake_exclusive)
     }
 
     /// Publish a level transition and wake every matching waiter on a rising
@@ -343,7 +370,7 @@ impl Readiness {
         }
         let mut g = self.inner.lock();
         g.seq = g.seq.wrapping_add(1);
-        g.wake_waiters(bits);
+        let _ = g.wake_waiters(bits, |_, waker| waker.wake_by_ref());
     }
 
     /// Remove any waiter registered under `id`. Called when a wait ends for a
@@ -586,16 +613,50 @@ mod tests {
 
         // One operation both raises the level and carries an event. It must
         // not select one exclusive waiter for each representation.
-        r.set_event(IN, 0, IN);
+        assert_eq!(r.set_event_with_exclusive_id(IN, 0, IN), Some(1));
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(second.load(Ordering::SeqCst), 0);
         assert_eq!(observer.load(Ordering::SeqCst), 1);
 
         // A later same-level operation selects the next exclusive waiter.
-        r.set_event(IN, 0, IN);
+        assert_eq!(r.set_event_with_exclusive_id(IN, 0, IN), Some(2));
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(second.load(Ordering::SeqCst), 1);
         assert_eq!(observer.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn set_event_routes_selected_exclusive_waker_through_callback() {
+        let r = Readiness::new(0);
+        let exclusive = Arc::new(AtomicU32::new(0));
+        let observer = Arc::new(AtomicU32::new(0));
+
+        assert_eq!(
+            r.arm_exclusive(41, IN, &counting_waker(&exclusive)),
+            Poll::Pending
+        );
+        assert_eq!(r.arm(42, IN, &counting_waker(&observer)), Poll::Pending);
+
+        let mut callback_id = None;
+        let selected = r.set_event_with_exclusive_wake(IN, 0, IN, |id, waker| {
+            callback_id = Some(id);
+            waker.wake_by_ref();
+        });
+
+        assert_eq!(selected, Some(41));
+        assert_eq!(callback_id, Some(41));
+        assert_eq!(exclusive.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn set_event_reports_no_exclusive_id_for_observers_only() {
+        let r = Readiness::new(0);
+        let observer = Arc::new(AtomicU32::new(0));
+        assert_eq!(r.arm(30, IN, &counting_waker(&observer)), Poll::Pending);
+
+        assert_eq!(r.set_event_with_exclusive_id(IN, 0, IN), None);
+        assert_eq!(observer.load(Ordering::SeqCst), 1);
     }
 
     #[test]

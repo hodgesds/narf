@@ -147,6 +147,27 @@ fn smoke_abi_signal_kill_neg() -> TestResult {
         if r != Some(-3) {
             return Err("kill(nonexistent, SIGUSR1) should return -ESRCH");
         }
+
+        // A reaped PID can numerically collide with a live, unrelated
+        // scheduler TaskId. Linux resolves positive kill targets only in PID
+        // space; falling back to raw TaskId space here sent stress-ng's
+        // repeated receiver cleanup SIGKILL to its parent shell.
+        const REAPED_PID_COLLISION: u64 = 0xC5_10A1;
+        crate::task::release_task(REAPED_PID_COLLISION);
+        let _ = crate::task::Task::new_registered(REAPED_PID_COLLISION, REAPED_PID_COLLISION);
+        if call(Syscall::Kill.raw(), a1(REAPED_PID_COLLISION, 0)) != Some(ESRCH) {
+            crate::task::release_task(REAPED_PID_COLLISION);
+            return Err("kill(reaped-pid collision, 0) should return -ESRCH");
+        }
+        if call(Syscall::Kill.raw(), a1(REAPED_PID_COLLISION, 9)) != Some(ESRCH) {
+            crate::task::release_task(REAPED_PID_COLLISION);
+            return Err("kill(reaped-pid collision, SIGKILL) should return -ESRCH");
+        }
+        if crate::handlers::signal_pending_of(REAPED_PID_COLLISION) != 0 {
+            crate::task::release_task(REAPED_PID_COLLISION);
+            return Err("kill(reaped-pid collision) was misrouted to a raw TaskId");
+        }
+        crate::task::release_task(REAPED_PID_COLLISION);
         Ok(())
     })
 }

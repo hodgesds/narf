@@ -670,7 +670,27 @@ impl PipeShared {
             } else {
                 0
             };
-            self.readiness.set_event(add, clear, notify);
+            let selected = self.readiness.set_event_with_exclusive_wake(
+                add,
+                clear,
+                notify,
+                |task_id, waker| {
+                    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+                    narf_scheduler::wake_urgent_task(waker, task_id);
+                    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+                    waker.wake_by_ref();
+                },
+            );
+            // Linux uses `wake_up_interruptible_sync_poll` (WF_SYNC) for pipe
+            // reader/writer wakeups: the consumer should run promptly and
+            // generate/free the next token. The readiness cell has already made
+            // the exact exclusive blocker runnable; pass only that selected task
+            // into the scheduler's existing, revalidated next-buddy hint. Plain
+            // poll/epoll observers are non-exclusive and never take this path.
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            if let Some(task_id) = selected {
+                narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+            }
         }
     }
 }

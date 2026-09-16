@@ -409,7 +409,14 @@ interruptibly unless their blocking sembuf has `IPC_NOWAIT`; relative timed
 waits retain one absolute deadline across park/re-execution. Imported operation
 arrays and message payloads remain
 kernel-owned across that wait, so later user-memory mutation cannot alter an
-in-flight operation. Semaphore waiters are appended and evaluated in queue
+in-flight operation. A single-operation semaphore wait retains its six-byte
+`sembuf` inline, matching Linux's stack-resident common case without changing
+the imported snapshot. Repeated semid lookup uses a sequence-bearing,
+cache-line-isolated direct slot backed by the authoritative namespace table;
+removal invalidates that slot while holding the object lifetime lock. Wait
+records and completed-wake queues are partitioned by semaphore object into
+cache-line-isolated shards, while every waiter for one object remains under the
+same lock as its FIFO links. Semaphore waiters are appended and evaluated in queue
 order after each relevant mutation, but an older operation that remains
 unsatisfied is skipped as on Linux. Eligible operations commit their semvals,
 `SEM_UNDO`, `sempid`, timestamp, and terminal result while the semaphore-state
@@ -590,7 +597,11 @@ poll and persistent epoll observers still wake. This mirrors Linux's
 `wait_event_interruptible_exclusive` pipe queues and avoids a reader or writer
 thundering herd without changing readiness or errno semantics. Final endpoint
 closure uses the corresponding wake-all path so every blocked peer runs to
-observe EOF or `EPIPE`.
+observe EOF or `EPIPE`. A normal pipe event that selects an exclusive blocker
+passes that exact task to the scheduler's revalidated urgent-handoff hint,
+matching Linux's synchronous (`WF_SYNC`) pipe wakeup: ordinary poll/epoll
+observers do not request a handoff, and remote or ineligible targets fall back
+to normal scheduling.
 Readiness wakeups are being consolidated behind a single durable per-descriptor
 cell (`narf_lib::readiness::Readiness`): registering a waiter and checking the
 current readiness are fused under one lock, so a `poll`/`epoll` waiter can never

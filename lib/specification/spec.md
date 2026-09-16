@@ -192,6 +192,9 @@ impl Readiness {
     pub fn arm_persistent(&self, id: u64, interest: u32, waker: &Waker) -> u32;
     pub fn set(&self, add: u32, clear: u32);
     pub fn set_event(&self, add: u32, clear: u32, event: u32);
+    pub fn set_event_with_exclusive_id(
+        &self, add: u32, clear: u32, event: u32
+    ) -> Option<u64>;
     pub fn set_wake_all(&self, add: u32, clear: u32);
     pub fn notify(&self, bits: u32);
     pub fn disarm(&self, id: u64);
@@ -207,7 +210,12 @@ wait-queue exclusivity without permitting a waker drop or allocation in IRQ
 context. All arm variants check the current level under the same lock used by
 `set`, preserving the lost-wake-free contract. `set_event` folds a same-level
 provider notification into the state publication so one operation cannot
-select two exclusive waiters. `set_wake_all` is the terminal-state form: it
+select two exclusive waiters. `set_event_with_exclusive_id` performs the same
+atomic publication and additionally returns the selected exclusive waiter's id
+after its waker has fired, allowing a provider to request a scheduler handoff
+without coupling this primitive to the scheduler. It returns `None` when only
+ordinary observers fired or the event made no waiter eligible. `set_wake_all` is
+the terminal-state form: it
 wakes and logically dequeues all exclusive waiters without dropping their
 wakers.
 

@@ -3168,6 +3168,10 @@ fn smoke_abi_ipc_distinct_queues_do_not_share_content_lock() -> TestResult {
         if crate::sysvipc::__test_msg_queues_lock_independently(locked, active) != Some(true) {
             return Err("distinct message queues did not own independent content locks");
         }
+        if crate::sysvipc::__test_msg_queue_indexes_lock_independently(locked, active) != Some(true)
+        {
+            return Err("distinct message queues did not own independent lookup-index shards");
+        }
         if call(
             Syscall::Msgsnd.raw(),
             a3(active, msg.as_ptr() as u64, 1, IPC_NOWAIT),

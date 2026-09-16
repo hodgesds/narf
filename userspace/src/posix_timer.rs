@@ -11,7 +11,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::handlers::{current_task_id, raise_signal_pending};
@@ -158,6 +158,7 @@ static PUMP_REGISTERED: AtomicBool = AtomicBool::new(false);
 pub fn posix_timer_init() {
     *TIMERS.lock() = Some(BTreeMap::new());
     *ITIMERS.lock() = Some(BTreeMap::new());
+    NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
     if !PUMP_REGISTERED.swap(true, Ordering::AcqRel) {
         // Register a sleep-pump so timer expiries fire even while a
         // user task is parked in `sys_sleep` / `sys_clock_nanosleep`.
@@ -170,6 +171,7 @@ pub fn posix_timer_init() {
 pub fn __test_reset() {
     *TIMERS.lock() = Some(BTreeMap::new());
     *ITIMERS.lock() = Some(BTreeMap::new());
+    NEXT_ITIMER_REAL_DEADLINE_NS.store(NO_ITIMER_REAL_DEADLINE, Ordering::Release);
 }
 
 /// Exit-time disarm: drop the dying task's POSIX timers and interval
@@ -182,6 +184,7 @@ pub fn release_task_timers(task: u64) {
     }
     if let Some(m) = ITIMERS.lock().as_mut() {
         m.remove(&task);
+        refresh_itimer_real_deadline_locked(m);
     }
 }
 
@@ -947,13 +950,50 @@ struct Itimer {
 /// Per-task `[ITIMER_REAL, ITIMER_VIRTUAL, ITIMER_PROF]`.
 static ITIMERS: IrqSafeSpinLock<Option<BTreeMap<u64, [Itimer; 3]>>> = IrqSafeSpinLock::new(None);
 
+/// Earliest armed ITIMER_REAL deadline, or `u64::MAX` when none is armed.
+///
+/// Linux attaches ITIMER_REAL to an independent hrtimer, so expiry does not
+/// depend on a timer interrupt happening to return directly to user mode. NARF
+/// uses this cache to give syscall-exit the same guarantee without taking the
+/// global `ITIMERS` lock on every syscall. Writers publish it while holding
+/// `ITIMERS`; a stale deadline can only cause one extra slow-path scan, never a
+/// missed expiry.
+const NO_ITIMER_REAL_DEADLINE: u64 = u64::MAX;
+static NEXT_ITIMER_REAL_DEADLINE_NS: AtomicU64 = AtomicU64::new(NO_ITIMER_REAL_DEADLINE);
+
+fn refresh_itimer_real_deadline_locked(map: &BTreeMap<u64, [Itimer; 3]>) {
+    let next = map
+        .values()
+        .map(|slots| slots[ITIMER_REAL as usize].next_fire_ns)
+        .filter(|deadline| *deadline != 0)
+        .min()
+        .unwrap_or(NO_ITIMER_REAL_DEADLINE);
+    NEXT_ITIMER_REAL_DEADLINE_NS.store(next, Ordering::Release);
+}
+
 fn with_itimers<R>(f: impl FnOnce(&mut BTreeMap<u64, [Itimer; 3]>) -> R) -> R {
     // Lazily initialise — `posix_timer_init` is only called from the
     // in-kernel test harness, not the boot path, so the real-boot
     // arming syscalls must stand up the table themselves.
     let mut g = ITIMERS.lock();
     let m = g.get_or_insert_with(BTreeMap::new);
-    f(m)
+    let result = f(m);
+    refresh_itimer_real_deadline_locked(m);
+    result
+}
+
+/// Return the current time only when an ITIMER_REAL deadline may be due.
+///
+/// This is the syscall/timer-exit common-path gate: when no real timer is
+/// armed it costs one acquire load and avoids both a clock read and the global
+/// timer-table lock.
+pub fn itimer_real_due_now() -> Option<u64> {
+    let deadline = NEXT_ITIMER_REAL_DEADLINE_NS.load(Ordering::Acquire);
+    if deadline == NO_ITIMER_REAL_DEADLINE {
+        return None;
+    }
+    let now = narf_scheduler::narf_time::monotonic_ns();
+    (now >= deadline).then_some(now)
 }
 
 /// Ensure the `sleep_pumps` callback that fires interval timers is
@@ -1292,6 +1332,7 @@ fn itimer_pump_collect(now: u64, deliveries: &mut Vec<(u64, u32)>) {
                 .saturating_add(slot.interval_ns.saturating_mul(fires));
         }
     }
+    refresh_itimer_real_deadline_locked(map);
 }
 
 /// IRQ-context fast path for ITIMER_REAL — the half that makes a
@@ -1331,6 +1372,7 @@ pub fn itimer_real_check_due_irq(task: u64, now: u64) -> bool {
             .next_fire_ns
             .saturating_add(slot.interval_ns.saturating_mul(fires));
     }
+    refresh_itimer_real_deadline_locked(map);
     true
 }
 
@@ -1387,6 +1429,9 @@ pub fn itimer_real_take_one_due_irq(now: u64, after: Option<u64>) -> Option<u64>
         }
         return Some(*task);
     }
+    // The caller has exhausted the due-task walk. Publish the next future
+    // deadline (or the disarmed sentinel) before its next fast-path probe.
+    refresh_itimer_real_deadline_locked(map);
     None
 }
 

@@ -111,6 +111,12 @@ shared type directly; it does not define or cast a mirror layout.
   restore only the currently published own-stack task image and returns to
   retry the faulting instruction. Vector 7 from CPL0, or without a matching
   published task/image, remains on the fatal exception path.
+- **x86 signal-frame FP capture and restore materialize scheduler-owned lazy
+  state before FXSAVE/FXRSTOR.** Frame asks the scheduler to restore a deferred
+  current-task image, clear CR0.TS, and mark the register file live before
+  reading or replacing it. Frame must not independently clear TS for an
+  own-stack task because that would make the scheduler skip the next save and
+  could expose another task's register image.
 - **NMI / double-fault / machine-check paths have their own IST-backed
   trap frames** and perform the same save/restore independently. They
   must not assume GS / TPIDR_EL1 is valid.

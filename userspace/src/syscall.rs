@@ -3665,6 +3665,12 @@ pub fn kernel_syscall_entry_plain_with_state(
     // point and restart there). A completed syscall's return value stands,
     // exactly as Linux preserves it across a handler.
     if !user_state.is_null() {
+        // Linux drives ITIMER_REAL from an independent hrtimer. Check the
+        // cached earliest deadline before every kernel→user transition so a
+        // syscall-dense task cannot indefinitely defer SIGALRM merely because
+        // timer IRQs keep landing at CPL=0. The no-timer common path is one
+        // atomic load; the locked all-task scan runs only after a deadline.
+        crate::handlers::timer_tick_raise_due_signals();
         crate::default_signal_delivery(&mut ctx, crate::handlers::SYSCALL_NUM_NONE);
         // TIF_NEED_RESCHED-at-syscall-exit: the tick only preempts at CPL=3, so
         // a syscall-dense task (e.g. stress-ng --sigrt's tight sigqueue loop)
@@ -4072,11 +4078,11 @@ mod sigframe {
             #[cfg(target_arch = "x86_64")]
             let fx = {
                 let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
+                let _ = narf_scheduler::stackful::materialize_current_user_fpu();
                 // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is 64-byte aligned
                 // and owned by this frame build.
                 unsafe {
                     core::arch::asm!(
-                        "clts",
                         "fxsave64 [{0}]",
                         in(reg) fx.0.as_mut_ptr(),
                         options(nostack, preserves_flags)
@@ -4201,12 +4207,12 @@ mod sigframe {
             let mut mxcsr = u32::from_ne_bytes([fx.0[24], fx.0[25], fx.0[26], fx.0[27]]);
             mxcsr &= 0xffff;
             fx.0[24..28].copy_from_slice(&mxcsr.to_ne_bytes());
+            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
             // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is 64-byte aligned and
             // holds a sanitized FXSAVE image.
             unsafe {
                 core::arch::asm!(
-                    "clts",
-                        "fxrstor64 [{0}]",
+                    "fxrstor64 [{0}]",
                     in(reg) fx.0.as_ptr(),
                     options(nostack, preserves_flags)
                 );

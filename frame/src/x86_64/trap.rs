@@ -2195,16 +2195,17 @@ impl<'a> TrapContext for X86TrapContext<'a> {
                 uc_sigmask: 0,
             };
 
-            // The interrupted task's FPU registers are live in hardware
-            // (kernel code is built without SSE); capture them for the frame.
-            // `clts` first: a task that has not yet touched the FPU may still
-            // have CR0.TS armed, and a CPL=0 FXSAVE would #NM.
+            // Materialize a deferred task image before capturing it. Merely
+            // executing CLTS here would desynchronise the scheduler's CR0.TS
+            // mirror and could save another task's registers into this frame.
+            // For a legacy/non-own-stack context with no published image, the
+            // same API still clears TS and its scheduler mirror together.
+            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
             let mut fx = FxSaveArea([0; FXSAVE_BYTES]);
             // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` is a 64-byte-aligned
             // buffer owned by this frame build.
             unsafe {
                 core::arch::asm!(
-                    "clts",
                     "fxsave64 [{0}]",
                     in(reg) fx.0.as_mut_ptr(),
                     options(nostack, preserves_flags)
@@ -2567,11 +2568,17 @@ unsafe fn perform_sigreturn(ctx: &mut X86TrapContext<'_>, sc_vaddr: u64, is_rt: 
             let mut mxcsr = u32::from_ne_bytes([fx.0[24], fx.0[25], fx.0[26], fx.0[27]]);
             mxcsr &= 0xffff;
             fx.0[24..28].copy_from_slice(&mxcsr.to_ne_bytes());
+            // A handler can be preempted after delivery and resume without
+            // touching SIMD before entering rt_sigreturn. In that case the
+            // task image is deferred and CR0.TS is armed here. Materialize it
+            // before FXRSTOR so the scheduler keeps hardware ownership live
+            // after the interrupted image replaces the handler image.
+            let _ = narf_scheduler::stackful::materialize_current_user_fpu();
             // SAFETY: CPL=0 with CR4.OSFXSR set; `fx` holds a sanitized
-            // 64-byte-aligned FXSAVE image. `clts` first — see delivery.
+            // 64-byte-aligned FXSAVE image. The materialization call also
+            // clears TS for a legacy context without a scheduler image.
             unsafe {
                 core::arch::asm!(
-                    "clts",
                     "fxrstor64 [{0}]",
                     in(reg) fx.0.as_ptr(),
                     options(nostack, preserves_flags)
@@ -3131,13 +3138,13 @@ fn smoke_x86_64_rt_fpstate_saved_and_restored() -> TestResult {
     let mut frame = smoke_signal_trap_frame(0xDEAD_F00D, interrupted_rsp);
 
     // Plant a recognizable pattern in XMM6 — the "interrupted user
-    // context" FPU state the frame must round-trip. `clts` first: TS
-    // may be armed and a CPL=0 SSE touch would #NM.
+    // context" FPU state the frame must round-trip. Clear scheduler-owned TS
+    // state first so this test cannot leave the software mirror stale.
     const XMM6_PATTERN: u64 = 0x5EED_F00D_CAFE_D00D;
+    let _ = narf_scheduler::stackful::materialize_current_user_fpu();
     // SAFETY: CPL=0 with CR4.OSFXSR set; touches only XMM6.
     unsafe {
         core::arch::asm!(
-            "clts",
             "movq xmm6, {0}",
             in(reg) XMM6_PATTERN,
             options(nostack, preserves_flags)

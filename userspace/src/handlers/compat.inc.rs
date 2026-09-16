@@ -5847,16 +5847,17 @@ pub fn deliver_signal_to_pgrp(pgrp: u64, signum: u32) -> bool {
 /// stop) and the syscall is interrupted with EINTR. Returns `Some(neg
 /// errno)` when the caller should abort the syscall with that value, or
 /// `None` to proceed with the I/O. The fd's tty identity / fg pgrp / TOSTOP
-/// are read in one short fd-table borrow; signal delivery happens after it
-/// is released (no fd-table reentrancy).
-fn tty_background_access(task: u64, fd: u32, is_write: bool) -> Option<i64> {
-    let (tty_id, fg, tostop) = crate::fd::with_table(task, |t| {
-        t.get(fd).and_then(|e| {
-            e.ops
-                .tty_id()
-                .map(|id| (id, e.ops.tty_fg_pgrp().unwrap_or(0), e.ops.tty_tostop()))
-        })
-    })??;
+/// are read from the same open-file snapshot the caller already resolved;
+/// signal delivery therefore happens without fd-table reentrancy or a
+/// close-and-reuse race against a second numeric-fd lookup.
+fn tty_background_access(
+    task: u64,
+    ops: &dyn narf_filesystem::FileOps,
+    is_write: bool,
+) -> Option<i64> {
+    let tty_id = ops.tty_id()?;
+    let fg = ops.tty_fg_pgrp().unwrap_or(0);
+    let tostop = ops.tty_tostop();
 
     if fg == 0 {
         return None; // no job control configured on this tty
@@ -5945,7 +5946,9 @@ pub fn raise_signal_pending_irq(task: u64, signum: u32) -> bool {
 /// delivered by `signal_delivery_hook` on the same trap's return to user.
 pub fn timer_tick_raise_due_signals() {
     {
-        let now = narf_scheduler::narf_time::monotonic_ns();
+        let Some(now) = crate::posix_timer::itimer_real_due_now() else {
+            return;
+        };
         // Scan EVERY armed ITIMER_REAL slot, not just the interrupted task's.
         // The owner of a `setitimer(ITIMER_REAL)` is frequently PARKED (e.g.
         // blocked in waitpid while CPU-bound children spin) — so it's never

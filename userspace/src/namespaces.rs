@@ -468,7 +468,25 @@ type IpcTable = BTreeMap<u64, Arc<IpcNamespace>>;
 
 static UTS_BY_TASK: IrqSafeSpinLock<Option<UtsTable>> = IrqSafeSpinLock::new(None);
 static NET_BY_TASK: IrqSafeSpinLock<Option<NetTable>> = IrqSafeSpinLock::new(None);
-static IPC_BY_TASK: IrqSafeSpinLock<Option<IpcTable>> = IrqSafeSpinLock::new(None);
+const IPC_TASK_SHARDS: usize = 32;
+
+#[repr(align(64))]
+struct IpcTaskShard {
+    namespaces: IrqSafeSpinLock<Option<IpcTable>>,
+}
+
+impl IpcTaskShard {
+    const fn new() -> Self {
+        Self {
+            namespaces: IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+/// Task-to-IPC-namespace overrides are read by every SysV IPC operation.
+/// Sharding keeps unrelated tasks from bouncing one global lock cache line.
+static IPC_BY_TASK: [IpcTaskShard; IPC_TASK_SHARDS] =
+    [const { IpcTaskShard::new() }; IPC_TASK_SHARDS];
 
 // Global / default namespaces. Tasks without a per-task override
 // read/write these.
@@ -508,11 +526,17 @@ fn ensure_net_table() {
     }
 }
 
-fn ensure_ipc_table() {
-    let mut g = IPC_BY_TASK.lock();
+#[inline]
+fn ipc_task_shard(task: u64) -> &'static IpcTaskShard {
+    &IPC_BY_TASK[task as usize & (IPC_TASK_SHARDS - 1)]
+}
+
+fn install_ipc_ns(task: u64, ns: Arc<IpcNamespace>) {
+    let mut g = ipc_task_shard(task).namespaces.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
     }
+    g.as_mut().expect("just inserted").insert(task, ns);
 }
 
 /// Look up the calling task's UTS namespace. Returns the global
@@ -559,8 +583,18 @@ pub fn current_net_ns(task: u64) -> Option<Arc<NetNamespace>> {
 /// Look up the calling task's IPC namespace. `None` means "share
 /// the global SysV keyspace" — today that path is itself a stub.
 pub fn current_ipc_ns(task: u64) -> Option<Arc<IpcNamespace>> {
-    let g = IPC_BY_TASK.lock();
+    let g = ipc_task_shard(task).namespaces.lock();
     g.as_ref().and_then(|m| m.get(&task).cloned())
+}
+
+/// Return only the stable IPC namespace identity needed by SysV IPC tables.
+/// Tasks without an explicit override can use the initial id directly and do
+/// not need to materialise or clone the global namespace object.
+pub(crate) fn current_ipc_namespace_id(task: u64) -> NsId {
+    let g = ipc_task_shard(task).namespaces.lock();
+    g.as_ref()
+        .and_then(|map| map.get(&task))
+        .map_or_else(|| initial_ns_id(&INITIAL_IPC_NS_ID), |ns| ns.id())
 }
 
 /// Return the namespace every task actually sees. An absent per-task override
@@ -600,11 +634,7 @@ pub fn unshare_ipc(task: u64) {
         task,
     );
     let fresh = IpcNamespace::new_in(user_ns_of(task));
-    ensure_ipc_table();
-    let mut g = IPC_BY_TASK.lock();
-    if let Some(map) = g.as_mut() {
-        map.insert(task, fresh);
-    }
+    install_ipc_ns(task, fresh);
 }
 
 // ── setns(2) — join an existing namespace by Arc ─────────────────
@@ -630,11 +660,7 @@ pub fn setns_net(task: u64, ns: Arc<NetNamespace>) {
 }
 
 pub fn setns_ipc(task: u64, ns: Arc<IpcNamespace>) {
-    ensure_ipc_table();
-    let mut g = IPC_BY_TASK.lock();
-    if let Some(map) = g.as_mut() {
-        map.insert(task, ns);
-    }
+    install_ipc_ns(task, ns);
 }
 
 fn setns_initial_net(task: u64) {
@@ -644,7 +670,7 @@ fn setns_initial_net(task: u64) {
 }
 
 fn setns_initial_ipc(task: u64) {
-    if let Some(map) = IPC_BY_TASK.lock().as_mut() {
+    if let Some(map) = ipc_task_shard(task).namespaces.lock().as_mut() {
         map.remove(&task);
     }
 }
@@ -658,7 +684,7 @@ pub fn release_task(task: u64) {
     if let Some(map) = NET_BY_TASK.lock().as_mut() {
         map.remove(&task);
     }
-    if let Some(map) = IPC_BY_TASK.lock().as_mut() {
+    if let Some(map) = ipc_task_shard(task).namespaces.lock().as_mut() {
         map.remove(&task);
     }
     if let Some(map) = USER_BY_TASK.lock().as_mut() {
@@ -1188,7 +1214,9 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
 pub fn __test_reset_all() {
     *UTS_BY_TASK.lock() = None;
     *NET_BY_TASK.lock() = None;
-    *IPC_BY_TASK.lock() = None;
+    for shard in &IPC_BY_TASK {
+        *shard.namespaces.lock() = None;
+    }
     *USER_BY_TASK.lock() = None;
     *GLOBAL_UTS.lock() = None;
     *GLOBAL_IPC.lock() = None;

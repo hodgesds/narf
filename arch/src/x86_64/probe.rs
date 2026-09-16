@@ -20,12 +20,15 @@ use narf_lib::percpu::MAX_CPUS;
 /// consumed by that CPU's trap handler). Using `[const { … }; N]`
 /// because `AtomicU*` isn't `Copy`, so `PerCpu<AtomicU*>` can't
 /// repeat-initialise.
+#[repr(C, align(64))]
 #[derive(Debug)]
 struct ProbeCell {
     recovery: AtomicU64,
     caught: AtomicU32,
     error: AtomicU64,
 }
+
+const _: () = assert!(core::mem::size_of::<ProbeCell>() == 64);
 
 impl ProbeCell {
     const NEW: Self = Self {

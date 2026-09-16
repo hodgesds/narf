@@ -109,7 +109,7 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    if let Some(ret) = tty_background_access(task, fd_num, false) {
+    if let Some(ret) = tty_background_access(task, endpoint.ops.as_ref(), false) {
         ctx.set_return(SyscallReturn::ok(ret as u64));
         return;
     }
@@ -133,7 +133,9 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
         }
         return;
     }
-    note_console_reader(task);
+    if endpoint.ops.tty_id() == Some(narf_filesystem::TTY_ID_CONSOLE) {
+        note_console_reader(task);
+    }
 
     let _position_guard = if endpoint.ops.is_stream() {
         None

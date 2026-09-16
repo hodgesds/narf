@@ -73,6 +73,8 @@ pub fn current_user_context() -> *mut ();
 #[cfg(target_arch = "x86_64")]
 pub fn stackful::arm_current_user_fpu();
 #[cfg(target_arch = "x86_64")]
+pub fn stackful::materialize_current_user_fpu() -> bool;
+#[cfg(target_arch = "x86_64")]
 pub fn stackful::handle_user_fpu_unavailable() -> bool;
 pub fn note_forward_progress();          // bounded completion heartbeat
 pub fn forward_progress_count() -> u64;  // fatal-watchdog snapshot
@@ -146,7 +148,15 @@ syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
 On x86_64, switch-out saves an FP/SIMD image only after the task has consumed
 the register file, then arms CR0.TS; the first user FP/SIMD instruction after
 resume raises `#NM`, restores that task's image, and retries. A task is always
-saved before it can migrate. AArch64 keeps the eager FPSIMD save/restore path.
+saved before it can migrate. A privileged consumer that must observe or replace
+user FP/SIMD state (notably signal-frame construction and sigreturn) first calls
+`materialize_current_user_fpu`; this restores a deferred task image, clears TS,
+and marks the registers live before capture or replacement. With no published
+image it still clears hardware TS and the scheduler mirror together. No
+post-boot in-tree privileged consumer may execute a raw `clts`. A nested
+scheduler pump saves the outer current task before polling an inner stackful
+task and re-establishes the outer task's ownership before its kernel
+continuation resumes. AArch64 keeps the eager FPSIMD save/restore path.
 Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
 the userspace test-hook reset invokes it so distributed tests remain independent
 of link-order. Production builds neither compile nor call this reset.
@@ -164,6 +174,10 @@ dedicated one-shot preferred-next slot. A remote, contended, or ineligible
 target declines the optimization. The executor revalidates the preference
 during selection, so the hint cannot bypass affinity, class, or budget
 eligibility. Generic every-wake preemption remains opt-in.
+Syscall-frequency per-CPU wake, urgent-handoff, and runnable-peer cells occupy
+separate cache lines; independent CPUs never serialize their local scheduling
+hints through false sharing. This is a representation rule only: the same
+release publication and acquire/exchange consumption remain authoritative.
 The progress counter advances when bounded synchronous waits complete, so a
 long syscall with continuing I/O is not misclassified as a scheduler stall.
 Forward-progress and remote-reschedule telemetry is cache-line-isolated per CPU
@@ -528,9 +542,14 @@ control callback.
   conservative fallbacks.
 - On x86_64, a task's FP/SIMD memory image is authoritative whenever CR0.TS is
   armed. The user `#NM` path clears TS, restores only the currently published
-  own-stack task image, and marks the register image live. Every path that can
-  switch or migrate that task saves a live image and re-arms TS first. A
-  kernel-mode `#NM` is never attributed to a user task.
+  own-stack task image, and marks the register image live. Signal-frame capture
+  performs that same materialization before reading hardware registers; it may
+  not clear TS independently of the scheduler mirror, including when no task
+  image is published. Every path that can switch or migrate that task,
+  including a scheduler poll nested inside its syscall, saves a live image and
+  re-arms TS first. The nested return restores the outer task's ownership
+  before resuming its continuation. A kernel-mode `#NM` is never attributed to
+  a user task.
 - A task is never scheduled on a CPU outside its `Affinity.allowed`
   set. Work-stealing and runtime requeue both respect this as a hard
   constraint; a mask change takes effect at the next cooperative poll
@@ -741,7 +760,7 @@ coherent domain-rights state from the first instruction.
 Task waking and IRQ integration follows
 `interrupts/spec` §8 (`wait_for_irq`'s waker contract).
 
-`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 3`.
+`SCHEDULER_ABI_MAJOR = 1`, `SCHEDULER_ABI_MINOR = 4`.
 
 ## 10. Open implementation gates
 
