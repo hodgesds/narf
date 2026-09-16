@@ -4086,13 +4086,20 @@ unsafe fn read_active_address_space_root() -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn restore_active_address_space_root(root: u64, cpu: usize) {
+unsafe fn restore_active_address_space_root(root: u64, _cpu: usize) {
+    // Preserve the incoming nonzero PCID just as Linux's switch_mm_irqs_off()
+    // does when its generation is current. Process-residency bits remain set:
+    // with NOFLUSH they describe conservative TLB history, not only the
+    // context executing at this instant.
+    // A nonzero process tag is allocated only after the all-online-CPU PCIDE
+    // gate closes, so the tag itself is the hot-path capability proof.
+    let value = if root & 0xFFF != 0 {
+        root | (1u64 << 63)
+    } else {
+        root
+    };
     // SAFETY: `root` is the complete CR3 value captured on this CPU.
-    unsafe { narf_arch::x86_64::cr::write_cr3(root) };
-    // A plain restore flushes PCID 0. Clear residency only after it, so a
-    // concurrent shared-MM mutation cannot omit this CPU while stale user
-    // translations remain usable.
-    narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
+    unsafe { narf_arch::x86_64::cr::write_cr3(value) };
 }
 
 #[cfg(target_arch = "aarch64")]

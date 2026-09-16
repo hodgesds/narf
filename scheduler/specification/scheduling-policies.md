@@ -15,8 +15,9 @@ The executor is deliberately factored so that **mechanism** lives in the core
 - **Core owns** (a policy cannot and must not reimplement these): the per-CPU
   ready `VecDeque<TaskSlot>`, admission/park/wake transitions, work-stealing and
   migration, CPU hot-plug, time-slice/tick preemption at CPL3, budget throttling
-  and eligibility tiers, the bounded synchronous-wake target plus optional
-  exact-root return, and the run-time *accounting* every policy needs (a task's
+  and eligibility tiers, the bounded synchronous-wake batch (one fixed root,
+  one target at a time, at most eight exact-root returns), and the run-time
+  *accounting* every policy needs (a task's
   accumulated virtual runtime
   — see §4). Accounting is core-owned because
   it is charged on the hottest path (once per dispatch) and every policy reads

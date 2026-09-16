@@ -352,9 +352,11 @@ pub struct StackGrowthLimits {
 }
 
 impl AddressSpace {
-    /// Allocate an architecture user root. On aarch64 this also reserves one
-    /// lifetime-scoped process ASID when the hardware pool has capacity.
+    /// Allocate an architecture user root and reserve one lifetime process
+    /// PCID/ASID when the architecture pool and boot capability gate permit.
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
+    /// Lifetime process PCID/ASID, or zero for the flushing fallback.
+    pub fn translation_tag(&self) -> u16;
     /// Stable, never-reused identity of this address-space incarnation.
     /// Const-created empty address spaces allocate it lazily on first use.
     pub fn identity(&self) -> u64;
@@ -1080,9 +1082,8 @@ x86_64 is rejected at runtime.
   and invalidation behavior.
 - Final-owner address-space teardown relies on the scheduler active-mm's strong
   `Arc` ownership: reaching `Drop` proves no CPU can still execute or repopulate
-  the root. x86_64's different-root/restore switch has already flushed the
-  process-wide PCID 0; aarch64 retires a nonzero lifetime ASID before any
-  backing becomes reusable, while ASID-0 switches flush locally. Teardown may
+  the root. Both architectures retire a nonzero lifetime process tag before
+  any backing becomes reusable; tag-0 switches flush locally. Teardown may
   therefore detach the complete private tree without clearing every base-page
   leaf first. The unlocked reclaim walk reports only actually-present 4 KiB
   leaves; teardown resolves each reported VA through authoritative Region
@@ -1205,6 +1206,16 @@ x86_64 is rejected at runtime.
 ## 5. Architecture notes
 
 ### x86_64
+- Process roots use lifetime PCIDs 17..=4095; tags 1..=16 remain reserved for
+  domain roots and tag 0 is the flushing fallback. Boot enables CR4.PCIDE on
+  every CPU independently of the PKS/PCID domain backend and issues nonzero
+  process tags only after every online CPU proves PCIDE+INVPCID. Activation
+  publishes conservative tag residency before loading `root|pcid|NOFLUSH`.
+  Scheduler restore and own-stack resume preserve a current nonzero tag;
+  mapping mutation invalidates every CPU in that tag's residency history, and
+  final-owner teardown completes a tag-wide shootdown before allocator reuse.
+  A CPU rejoining after the gate closes flushes all local contexts before it is
+  marked online, covering shootdowns that occurred while it was offline.
 - Paging: 4-level (possibly 5-level where CPUID says so).
 - PKS: `MSR_IA32_PKRS` is the per-CPU rights mask; updated on domain
   enter/exit. Page-table PK field (bits 59..62 of PTE) stores the key.

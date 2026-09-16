@@ -717,28 +717,25 @@ mod tests {
     // A user store that lands right as the migration invalidates the page must
     // survive the move: the leaf teardown + cross-CPU flush has to PRECEDE the
     // copy (Linux `try_to_migrate` → copy → `remove_migration_ptes`). The test
-    // wraps the single-page shootdown hook: when the migration invalidates the
-    // page, the hook plays the last racing writer and stores a marker into the
-    // OLD frame. A copy taken after the flush carries the marker; a copy taken
-    // before it (the torn-write bug that corrupted the KDE greeter's heap under
-    // SMP) does not.
-    #[cfg(target_arch = "x86_64")]
+    // observes completion of the tagged shootdown: at that rendezvous boundary
+    // the observer plays the last racing writer and stores a marker into the OLD
+    // frame. A copy taken after the flush carries the marker; a copy taken before
+    // it (the torn-write bug that corrupted the KDE greeter's heap under SMP)
+    // does not.
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     static RACE_VA: u64 = 0x0000_0080_00A0_0000;
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     static RACE_OLD_PHYS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     static RACE_HOOK_CALLS: core::sync::atomic::AtomicUsize =
         core::sync::atomic::AtomicUsize::new(0);
-    #[cfg(target_arch = "x86_64")]
-    static RACE_INNER_HOOK: core::sync::atomic::AtomicUsize =
-        core::sync::atomic::AtomicUsize::new(0);
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     const RACE_MARKER: u32 = 0xA5A5_5A5A;
 
-    #[cfg(target_arch = "x86_64")]
-    fn racing_writer_hook(va: u64) {
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
+    fn racing_writer_hook(req: crate::tlb_shootdown::ShootdownRequest) {
         use core::sync::atomic::Ordering;
-        if va == RACE_VA {
+        if req.addr == Some(RACE_VA) {
             let old = RACE_OLD_PHYS.load(Ordering::Acquire);
             if old != 0 {
                 // SAFETY: `old` is the test's live, identity-mapped source frame.
@@ -746,18 +743,11 @@ mod tests {
                 RACE_HOOK_CALLS.fetch_add(1, Ordering::AcqRel);
             }
         }
-        let inner = RACE_INNER_HOOK.load(Ordering::Acquire);
-        if inner != 0 {
-            // SAFETY: stored from `paging::shootdown_hook()` as `fn(u64) as usize`.
-            let f: crate::x86_64::paging::TlbShootdownHook = unsafe { core::mem::transmute(inner) };
-            f(va);
-        }
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     fn smoke_migrate_frame_flushes_before_copy() -> TestResult {
         use super::migrate_frame;
-        use crate::x86_64::paging::{clear_shootdown_hook, set_shootdown_hook, shootdown_hook};
         use crate::{Region, RegionPerms, VirtAddr};
         use core::sync::atomic::Ordering;
 
@@ -796,11 +786,10 @@ mod tests {
         *TEST_AS.lock() = Some(aspace.clone());
         register_address_space_resolver(&SINGLE_AS_RESOLVER);
 
-        let prev = shootdown_hook();
-        RACE_INNER_HOOK.store(prev.map_or(0, |h| h as usize), Ordering::Release);
+        let previous_hook =
+            crate::tlb_shootdown::replace_completion_hook_for_test(Some(racing_writer_hook));
         RACE_HOOK_CALLS.store(0, Ordering::Release);
         RACE_OLD_PHYS.store(p.raw(), Ordering::Release);
-        set_shootdown_hook(racing_writer_hook);
 
         let result = (|| {
             let new_p = match migrate_frame(p) {
@@ -831,17 +820,13 @@ mod tests {
         })();
 
         RACE_OLD_PHYS.store(0, Ordering::Release);
-        match prev {
-            Some(h) => set_shootdown_hook(h),
-            None => clear_shootdown_hook(),
-        }
-        RACE_INNER_HOOK.store(0, Ordering::Release);
+        crate::tlb_shootdown::replace_completion_hook_for_test(previous_hook);
         *TEST_AS.lock() = None;
         __reset_resolver_for_test();
         crate::rmap::__reset_for_test();
         result
     }
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", any(test, feature = "kernel-test")))]
     kernel_test_in!("memory/migrate", smoke_migrate_frame_flushes_before_copy);
 
     // A resolver backed by several test-owned address spaces, so a fork-shared

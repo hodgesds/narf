@@ -70,11 +70,11 @@ target's executor pointer is the source's root executor continuation, not the
 source stack. A target yield, completion, or tick preemption normally restores
 the root identity/address space and switches to the executor. When the target
 urgently wakes that exact off-queue root, it may restore the same state and
-switch directly to the root's saved task continuation once. The root's next
-yield must reach the executor before another direct transfer; a CPU-local gate
-covers the entire in-flight poll, including nested scheduler pumps, so no third
-task stack or repeated ping-pong can extend the chain. The resident target claim
-is released only after the final switch completes. The target's runtime is
+switch directly to the root's saved task continuation. That fixed root may
+start another exact transfer, up to eight target-to-root returns; the next
+yield must reach the executor. A CPU-local gate rejects nested sources and
+third-task chains. The resident target claim is released only after the final
+switch completes. The target's runtime is
 charged to its own virtual runtime and removed from the source's poll charge.
 
 ## 4. Tick decision
@@ -159,10 +159,11 @@ rolling generation-ordered cutover.
   before migration and permits deferred restore only while the task-owned
   memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
-- Direct handoff is bounded to one claimed target and one optional exact-root
-  return: executor dispatch and stealing skip the target until the final switch
-  completes; arbitrary third-task transfers are refused; and the root's next
-  yield must pass through the executor. Address-space ownership, TLS, domain
+- Direct handoff is bounded to one claimed target at a time and eight returns
+  to one fixed exact root: executor dispatch and stealing skip the target until
+  each switch completes; nested sources and arbitrary third-task transfers are
+  refused; and the root's next yield after the eighth return must pass through
+  the executor. Address-space ownership, TLS, domain
   state, and FP/SIMD ownership are restored before each resumed task's first
   instruction. A decline leaves the exact wakee on the ordinary validated
   selection path.

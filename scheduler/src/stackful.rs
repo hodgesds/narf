@@ -268,12 +268,16 @@ pub fn user_own_stack_enabled() -> bool {
 pub fn __reset_user_own_stack_for_test() {
     USE_OWN_STACK.store(false, Ordering::Release);
     for cpu in 0..narf_lib::percpu::MAX_CPUS {
-        DIRECT_HANDOFF_ACTIVE[cpu].store(false, Ordering::Release);
-        DIRECT_HANDOFF_ROOT[cpu].store(core::ptr::null_mut(), Ordering::Release);
-        DIRECT_HANDOFF_RETURNED_ROOT[cpu].store(core::ptr::null_mut(), Ordering::Release);
-        let _ = DIRECT_HANDOFF_ROOT_AS[cpu].lock().take();
-        DIRECT_FOREIGN_CYCLES[cpu].store(0, Ordering::Release);
-        let target = DIRECT_HANDOFF_TARGET[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let direct = &DIRECT_HANDOFF[cpu];
+        direct.active.store(false, Ordering::Release);
+        direct.root.store(core::ptr::null_mut(), Ordering::Release);
+        direct
+            .returned_root
+            .store(core::ptr::null_mut(), Ordering::Release);
+        direct.returns.store(0, Ordering::Release);
+        let _ = direct.root_as.lock().take();
+        direct.foreign_cycles.store(0, Ordering::Release);
+        let target = direct.target.swap(core::ptr::null_mut(), Ordering::AcqRel);
         if !target.is_null() {
             // SAFETY: the direct-target slot owns one Arc strong reference.
             let cell = unsafe { Arc::from_raw(target) };
@@ -761,24 +765,32 @@ unsafe fn prepare_direct_arch_state(task: &KernelTask) {
     }
 }
 
-/// Try one bounded task-to-task transfer. The target stays resident in READY
-/// under `direct_claimed`; it returns to the root executor context, never to a
-/// second task, so Rust/kernel stacks cannot form an unbounded handoff chain.
+#[inline]
+fn direct_handoff_gate_open(cpu: usize, source: *mut KernelTask) -> bool {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.active.load(Ordering::Acquire) {
+        return false;
+    }
+    let returned_root = direct_state.returned_root.load(Ordering::Acquire);
+    returned_root.is_null()
+        || (returned_root == source
+            && direct_state.returns.load(Ordering::Acquire) < MAX_DIRECT_ROOT_RETURNS)
+}
+
+/// Try one transfer inside a bounded task-to-task batch. The target stays
+/// resident in READY under `direct_claimed`; only the fixed root may start the
+/// next transfer, and the batch must cross the executor after eight returns.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn try_direct_handoff(
     cpu: usize,
     source: *mut KernelTask,
     source_ctx: *mut KernelContext,
 ) -> bool {
-    // A root that already received a direct return may synchronously pump a
-    // nested stackful task before its own poll unwinds. Block the whole CPU-local
-    // nesting chain, not merely the matching root pointer, until that poll has
-    // reached its executor continuation.
-    if direct_handoff_active(cpu)
-        || !DIRECT_HANDOFF_RETURNED_ROOT[cpu]
-            .load(Ordering::Acquire)
-            .is_null()
-    {
+    // A root may continue its bounded batch after a direct return. A nested
+    // stackful pump has a different source pointer and must pass through the
+    // executor; the same is true after the fixed return budget is exhausted.
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if !direct_handoff_gate_open(cpu, source) {
         return false;
     }
     narf_lib::sync::without_interrupts(|| {
@@ -841,12 +853,12 @@ unsafe fn try_direct_handoff(
         target_ref
             .tsc_started
             .store(narf_time::now_cycles(), Ordering::Release);
-        *DIRECT_HANDOFF_ROOT_AS[cpu].lock() = root_as;
-        DIRECT_HANDOFF_ROOT[cpu].store(source, Ordering::Release);
+        *direct_state.root_as.lock() = root_as;
+        direct_state.root.store(source, Ordering::Release);
         let target_raw = Arc::into_raw(target.cell.clone()).cast_mut();
-        let old = DIRECT_HANDOFF_TARGET[cpu].swap(target_raw, Ordering::AcqRel);
+        let old = direct_state.target.swap(target_raw, Ordering::AcqRel);
         debug_assert!(old.is_null(), "nested direct target publication");
-        DIRECT_HANDOFF_ACTIVE[cpu].store(true, Ordering::Release);
+        direct_state.active.store(true, Ordering::Release);
 
         user_perf_switch(source_cell.task, false);
         user_perf_switch(target.id, true);
@@ -855,6 +867,7 @@ unsafe fn try_direct_handoff(
         unsafe { prepare_direct_arch_state(target_ref) };
         user_fpu_restore_task(cpu, target_ref);
         guard_switch_into("direct_handoff:target.ctx", &target_ref.ctx);
+        #[cfg(any(test, feature = "kernel-test"))]
         DIRECT_HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
         // SAFETY: source and target contexts are distinct, live save slots;
         // the target returns either to `root_exec` or directly to this exact
@@ -867,7 +880,11 @@ unsafe fn try_direct_handoff(
         // An ordinary return may later re-dispatch this source on another CPU;
         // never use the captured old CPU to clean up a newer handoff there.
         let resumed_cpu = this_cpu();
-        if DIRECT_HANDOFF_RETURNED_ROOT[resumed_cpu].load(Ordering::Acquire) == source {
+        if DIRECT_HANDOFF[resumed_cpu]
+            .returned_root
+            .load(Ordering::Acquire)
+            == source
+        {
             complete_direct_return(resumed_cpu);
         }
         true
@@ -879,10 +896,13 @@ unsafe fn try_direct_handoff(
 /// continuation.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted: bool) {
-    if !DIRECT_HANDOFF_ACTIVE[cpu].swap(false, Ordering::AcqRel) {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if !direct_state.active.swap(false, Ordering::AcqRel) {
         return;
     }
-    let root = DIRECT_HANDOFF_ROOT[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
+    let root = direct_state
+        .root
+        .swap(core::ptr::null_mut(), Ordering::AcqRel);
     assert!(!root.is_null(), "direct handoff lost root continuation");
     // SAFETY: active handoff publication pins both root and current tasks.
     let current_ref = unsafe { &*current };
@@ -891,7 +911,7 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     let root_ref = unsafe { &*root };
     let now = narf_time::now_cycles();
     let ran = now.saturating_sub(current_ref.tsc_started.load(Ordering::Acquire));
-    let target = DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire);
+    let target = direct_state.target.load(Ordering::Acquire);
     assert!(!target.is_null(), "direct handoff lost target wake cell");
     // SAFETY: the per-CPU target slot owns a strong Arc reference until the
     // root executor completes the return.
@@ -900,7 +920,9 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
             .direct_runtime_cycles
             .fetch_add(ran, Ordering::Relaxed)
     };
-    DIRECT_FOREIGN_CYCLES[cpu].fetch_add(ran, Ordering::Relaxed);
+    direct_state
+        .foreign_cycles
+        .fetch_add(ran, Ordering::Relaxed);
     // SAFETY: current is the uniquely running direct target.
     current_ref
         .domain_byte
@@ -915,7 +937,7 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     }
 
     let root_cell = task_wake_cell(root_ref).expect("direct root lost wake cell");
-    let root_as = DIRECT_HANDOFF_ROOT_AS[cpu].lock().take();
+    let root_as = direct_state.root_as.lock().take();
     crate::activate_direct_task(root_cell.task, root_as)
         .expect("direct handoff could not restore root address space");
     narf_arch::set_current_domain_byte(root_ref.domain_byte.load(Ordering::Relaxed));
@@ -928,9 +950,9 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
 ///
 /// The root is pinned off-queue by its in-flight executor poll, so it cannot use
 /// the resident-slot claim path. The exact WakeCell comparison substitutes for
-/// that lookup. One such return is allowed per root poll; the root's next yield
-/// must visit the executor, bounding fairness latency and preventing repeated
-/// ping-pong from starving unrelated runnable work or RCU quiescent states.
+/// that lookup. At most eight such returns are allowed per root poll; the next
+/// yield must visit the executor, bounding fairness latency and preventing an
+/// exact-wake ping-pong from starving unrelated work or RCU quiescent states.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn try_direct_return_to_root(
     cpu: usize,
@@ -941,10 +963,11 @@ unsafe fn try_direct_return_to_root(
         return false;
     }
     narf_lib::sync::without_interrupts(|| {
+        let direct_state = &DIRECT_HANDOFF[cpu];
         let Some(cell) = crate::take_urgent_wake_cell(cpu) else {
             return false;
         };
-        let root = DIRECT_HANDOFF_ROOT[cpu].load(Ordering::Acquire);
+        let root = direct_state.root.load(Ordering::Acquire);
         if root.is_null() {
             crate::hint_urgent_next(cell.task);
             return false;
@@ -967,8 +990,14 @@ unsafe fn try_direct_return_to_root(
             return false;
         }
 
-        let previous = DIRECT_HANDOFF_RETURNED_ROOT[cpu].swap(root, Ordering::AcqRel);
-        assert!(previous.is_null(), "direct root return escaped its poll");
+        let previous = direct_state.returned_root.load(Ordering::Acquire);
+        if previous.is_null() {
+            direct_state.returned_root.store(root, Ordering::Release);
+        } else {
+            assert_eq!(previous, root, "direct return changed chain root");
+        }
+        let returns = direct_state.returns.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(returns <= MAX_DIRECT_ROOT_RETURNS);
         // SAFETY: current is the live direct target, and the active handoff
         // pins root/current plus both context save slots.
         unsafe { finish_direct_handoff(cpu, current, false) };
@@ -1003,10 +1032,13 @@ fn complete_direct_return(cpu: usize) {
     }
     // The no-handoff executor path is overwhelmingly common. Avoid a locked
     // RMW merely to rediscover an empty slot.
-    if DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire).is_null() {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.target.load(Ordering::Acquire).is_null() {
         return;
     }
-    let ptr = DIRECT_HANDOFF_TARGET[cpu].swap(core::ptr::null_mut(), Ordering::AcqRel);
+    let ptr = direct_state
+        .target
+        .swap(core::ptr::null_mut(), Ordering::AcqRel);
     if ptr.is_null() {
         return;
     }
@@ -1023,19 +1055,26 @@ fn complete_direct_return(cpu: usize) {
     crate::release_direct_handoff_target(&cell, completed);
 }
 
-/// Clear the one-return fairness gate only after this root poll has actually
+/// Clear the bounded-batch fairness gate only after this root poll has actually
 /// reached its executor continuation.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn complete_direct_root_poll(cpu: usize, root: *mut KernelTask) {
-    if DIRECT_HANDOFF_RETURNED_ROOT[cpu].load(Ordering::Acquire) != root {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.returned_root.load(Ordering::Acquire) != root {
         return;
     }
-    let _ = DIRECT_HANDOFF_RETURNED_ROOT[cpu].compare_exchange(
-        root,
-        core::ptr::null_mut(),
-        Ordering::AcqRel,
-        Ordering::Acquire,
-    );
+    if direct_state
+        .returned_root
+        .compare_exchange(
+            root,
+            core::ptr::null_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        direct_state.returns.store(0, Ordering::Release);
+    }
 }
 
 /// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
@@ -1091,44 +1130,71 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
         narf_lib::percpu::MAX_CPUS],
 };
 
-/// One-hop direct handoff state. A root task may switch straight into one
-/// exact urgent wakee; that wakee still returns to the root's executor
-/// continuation, preventing unbounded task-stack chains.
-static DIRECT_HANDOFF_ACTIVE: [AtomicBool; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicBool::new(false) }; narf_lib::percpu::MAX_CPUS];
-static DIRECT_HANDOFF_ROOT: [AtomicPtr<KernelTask>; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
-static DIRECT_HANDOFF_ROOT_AS: [narf_lib::sync::IrqSafeSpinLock<
-    Option<Arc<narf_memory::AddressSpace>>,
->; narf_lib::percpu::MAX_CPUS] =
-    [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; narf_lib::percpu::MAX_CPUS];
-static DIRECT_HANDOFF_TARGET: [AtomicPtr<crate::WakeCell>; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
-/// Root that already received the one permitted target->root return during its
-/// current executor poll. All sources must return through the executor
-/// before starting another direct handoff.
-static DIRECT_HANDOFF_RETURNED_ROOT: [AtomicPtr<KernelTask>; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; narf_lib::percpu::MAX_CPUS];
-static DIRECT_FOREIGN_CYCLES: [AtomicU64; narf_lib::percpu::MAX_CPUS] =
-    [const { AtomicU64::new(0) }; narf_lib::percpu::MAX_CPUS];
+/// Bounded direct-handoff state. A fixed root may alternate with one exact
+/// urgent wakee at a time, but no target may extend the task-stack chain and
+/// the ninth root yield must cross the executor.
+const MAX_DIRECT_ROOT_RETURNS: u32 = 8;
+
+/// Cache-line-isolated state for one CPU's bounded direct-transfer chain.
+/// Every field is written only by that CPU while a chain is active; keeping
+/// them together prevents independent semaphore pairs from bouncing shared
+/// array cache lines.
+#[repr(C, align(64))]
+struct DirectHandoffState {
+    active: AtomicBool,
+    _active_pad: [u8; 7],
+    root: AtomicPtr<KernelTask>,
+    root_as: narf_lib::sync::IrqSafeSpinLock<Option<Arc<narf_memory::AddressSpace>>>,
+    target: AtomicPtr<crate::WakeCell>,
+    returned_root: AtomicPtr<KernelTask>,
+    foreign_cycles: AtomicU64,
+    returns: AtomicU32,
+    _pad: [u8; 4],
+}
+
+impl DirectHandoffState {
+    const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            _active_pad: [0; 7],
+            root: AtomicPtr::new(core::ptr::null_mut()),
+            root_as: narf_lib::sync::IrqSafeSpinLock::new(None),
+            target: AtomicPtr::new(core::ptr::null_mut()),
+            returned_root: AtomicPtr::new(core::ptr::null_mut()),
+            foreign_cycles: AtomicU64::new(0),
+            returns: AtomicU32::new(0),
+            _pad: [0; 4],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<DirectHandoffState>() == 64);
+
+static DIRECT_HANDOFF: [DirectHandoffState; narf_lib::percpu::MAX_CPUS] =
+    [const { DirectHandoffState::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[cfg(any(test, feature = "kernel-test"))]
 static DIRECT_HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg(any(test, feature = "kernel-test"))]
 static DIRECT_RETURN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
 fn direct_handoff_active(cpu: usize) -> bool {
-    DIRECT_HANDOFF_ACTIVE[cpu].load(Ordering::Acquire)
+    DIRECT_HANDOFF[cpu].active.load(Ordering::Acquire)
 }
 
 /// Cycles included in the root adapter's wall interval but executed by its
 /// direct wakee. The executor subtracts these before charging root vruntime.
 #[inline]
 pub(crate) fn take_direct_foreign_cycles() -> u64 {
-    DIRECT_FOREIGN_CYCLES[this_cpu()].swap(0, Ordering::AcqRel)
+    DIRECT_HANDOFF[this_cpu()]
+        .foreign_cycles
+        .swap(0, Ordering::AcqRel)
 }
 
 #[doc(hidden)]
-pub fn direct_handoff_count() -> u64 {
+#[cfg(any(test, feature = "kernel-test"))]
+fn direct_handoff_count() -> u64 {
     DIRECT_HANDOFF_COUNT.load(Ordering::Acquire)
 }
 
@@ -1699,12 +1765,17 @@ impl KernelTask {
                     // `address_space.activate()` of this task's live AS;
                     // reloading it restores that mapping (kernel half is
                     // global in every AS).
+                    // Nonzero process tags exist only after the global PCIDE
+                    // gate closes; avoid even a cached CR4 probe here.
+                    let value = if cr3 & 0xFFF != 0 {
+                        cr3 | (1u64 << 63)
+                    } else {
+                        cr3
+                    };
+                    // SAFETY: `cr3` was captured from this live task's prior
+                    // activation; nonzero low bits imply the global PCIDE gate.
                     unsafe {
-                        core::arch::asm!(
-                            "mov cr3, {v}",
-                            v = in(reg) cr3,
-                            options(nostack, preserves_flags),
-                        );
+                        narf_arch::x86_64::cr::write_cr3(value);
                     }
                 }
             }
@@ -6885,10 +6956,10 @@ pub mod tests {
                 // hook while this target is active. It must leave the outer
                 // target claim intact for finish_direct_handoff.
                 let cpu = this_cpu();
-                let claimed = DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire);
+                let claimed = DIRECT_HANDOFF[cpu].target.load(Ordering::Acquire);
                 complete_direct_return(cpu);
                 if claimed.is_null()
-                    || DIRECT_HANDOFF_TARGET[cpu].load(Ordering::Acquire) != claimed
+                    || DIRECT_HANDOFF[cpu].target.load(Ordering::Acquire) != claimed
                 {
                     fail(4);
                 }
@@ -6968,9 +7039,25 @@ pub mod tests {
             }
             let cpu = this_cpu();
             let root = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-            if root.is_null() || DIRECT_HANDOFF_RETURNED_ROOT[cpu].load(Ordering::Acquire) != root {
+            if root.is_null() || DIRECT_HANDOFF[cpu].returned_root.load(Ordering::Acquire) != root {
                 fail(16);
             }
+            let returns = DIRECT_HANDOFF[cpu].returns.load(Ordering::Acquire);
+            if returns != 1 {
+                fail(17);
+            }
+            if !direct_handoff_gate_open(cpu, root) {
+                fail(18);
+            }
+            DIRECT_HANDOFF[cpu]
+                .returns
+                .store(MAX_DIRECT_ROOT_RETURNS, Ordering::Release);
+            if direct_handoff_gate_open(cpu, root) {
+                fail(19);
+            }
+            DIRECT_HANDOFF[cpu]
+                .returns
+                .store(returns, Ordering::Release);
             PHASE.store(4, Ordering::Release);
         });
         crate::run_until_empty();
@@ -6997,6 +7084,9 @@ pub mod tests {
             }
             15 => return TestResult::Fail("target-to-root transfer lost root FPU state"),
             16 => return TestResult::Fail("direct-root fairness gate was not published"),
+            17 => return TestResult::Fail("direct-root return count was not advanced once"),
+            18 => return TestResult::Fail("direct-root batch closed before its bound"),
+            19 => return TestResult::Fail("direct-root batch remained open at its bound"),
             _ => return TestResult::Fail("unexpected direct-transfer smoke failure"),
         }
         if PHASE.load(Ordering::Acquire) != 5 {
@@ -7008,13 +7098,13 @@ pub mod tests {
         if direct_return_count() <= returns_before {
             return TestResult::Fail("exact urgent root wake did not return task-to-task");
         }
-        if DIRECT_HANDOFF_RETURNED_ROOT[this_cpu()]
-            .load(Ordering::Acquire)
-            .is_null()
+        let direct = &DIRECT_HANDOFF[this_cpu()];
+        if !direct.returned_root.load(Ordering::Acquire).is_null()
+            || direct.returns.load(Ordering::Acquire) != 0
         {
-            return TestResult::Pass;
+            return TestResult::Fail("direct-root fairness gate escaped its executor poll");
         }
-        TestResult::Fail("direct-root fairness gate escaped its executor poll")
+        TestResult::Pass
     }
 
     kernel_test_in!(

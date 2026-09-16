@@ -900,7 +900,11 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
     // holds once the kernel test harness is running at EL1/long mode.
     // SAFETY: Valid memory or trusted environment
     let user_as = unsafe { AddressSpace::new_for_user() }.expect("alloc user AS");
-    let user_cr3 = user_as.root.as_u64();
+    let user_tag = user_as.translation_tag();
+    // Allocation returns a nonzero tag only when every online CPU passed the
+    // global PCIDE+INVPCID gate, matching AddressSpace::activate().
+    let hardware_tag = user_tag as u64;
+    let user_cr3 = user_as.root.as_u64() | hardware_tag;
     if user_cr3 == kernel_cr3 {
         return TestResult::Fail("new user AS shares root with kernel AS");
     }
@@ -908,11 +912,11 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
 
     let _tid = spawn_user(
         crate::alloc_task_id(),
-        async {
+        async move {
             let cpu = narf_lib::percpu::current_cpu() as u32;
             POLL_CPU.store(cpu, Ordering::Relaxed);
             RESIDENCY_SEEN_DURING_POLL.store(
-                tlb_shootdown::active_as_bitmap(cpu) & 1 != 0,
+                tlb_shootdown::active_as_bitmap(cpu) & (1u64 << (user_tag & 63)) != 0,
                 Ordering::Relaxed,
             );
         },
@@ -931,14 +935,14 @@ fn smoke_scheduler_user_task_poll_restores_kernel_cr3() -> TestResult {
         return TestResult::Fail("CR3 ended in unexpected value after run_until_empty");
     }
     if !RESIDENCY_SEEN_DURING_POLL.load(Ordering::Relaxed) {
-        return TestResult::Fail("PCID-0 residency was absent during user poll");
+        return TestResult::Fail("process-PCID residency was absent during user poll");
     }
     let poll_cpu = POLL_CPU.load(Ordering::Relaxed);
     if poll_cpu == u32::MAX {
         return TestResult::Fail("user poll did not record its CPU");
     }
-    if tlb_shootdown::active_as_bitmap(poll_cpu) & 1 != 0 {
-        return TestResult::Fail("PCID-0 residency survived kernel CR3 restore");
+    if tlb_shootdown::active_as_bitmap(poll_cpu) & (1u64 << (user_tag & 63)) == 0 {
+        return TestResult::Fail("process-PCID history was cleared on kernel CR3 restore");
     }
     TestResult::Pass
 }

@@ -2185,40 +2185,49 @@ fn smoke_asid_rollover_bumps_generation() -> TestResult {
 }
 kernel_test_in!("memory/asid_alloc", smoke_asid_rollover_bumps_generation);
 
-#[cfg(target_arch = "aarch64")]
-fn smoke_process_asids_are_unique_and_retired_before_reuse() -> TestResult {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn smoke_process_contexts_are_unique_and_retired_before_reuse() -> TestResult {
     use crate::asid_alloc::{
-        allocate_process_asid, process_asid_live_for_test, release_process_asid, N_DOMAINS,
-        TAG_RESERVED,
+        allocate_process_context, process_context_live_for_test, release_process_context,
+        N_DOMAINS, TAG_RESERVED,
     };
 
-    let first = allocate_process_asid();
-    let second = allocate_process_asid();
-    if first.tag == TAG_RESERVED || second.tag == TAG_RESERVED {
-        return TestResult::Fail("process allocator unexpectedly exhausted ASIDs");
-    }
-    if first.tag <= N_DOMAINS as u16 || second.tag <= N_DOMAINS as u16 {
-        return TestResult::Fail("process ASID overlaps the domain-tag partition");
-    }
-    if first.tag == second.tag {
-        return TestResult::Fail("live process address spaces received the same ASID");
-    }
-    if !process_asid_live_for_test(first.tag) || !process_asid_live_for_test(second.tag) {
-        return TestResult::Fail("allocated process ASID was not marked live");
+    #[cfg(target_arch = "x86_64")]
+    if !narf_arch::x86_64::pcid::process_pcid_ready() {
+        return if allocate_process_context().tag == TAG_RESERVED {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("process PCID issued before every CPU was capable")
+        };
     }
 
-    release_process_asid(first);
-    if process_asid_live_for_test(first.tag) {
-        release_process_asid(second);
-        return TestResult::Fail("retired process ASID remained live");
+    let first = allocate_process_context();
+    let second = allocate_process_context();
+    if first.tag == TAG_RESERVED || second.tag == TAG_RESERVED {
+        return TestResult::Fail("process allocator unexpectedly exhausted context tags");
     }
-    release_process_asid(second);
+    if first.tag <= N_DOMAINS as u16 || second.tag <= N_DOMAINS as u16 {
+        return TestResult::Fail("process tag overlaps the domain-tag partition");
+    }
+    if first.tag == second.tag {
+        return TestResult::Fail("live process address spaces received the same tag");
+    }
+    if !process_context_live_for_test(first.tag) || !process_context_live_for_test(second.tag) {
+        return TestResult::Fail("allocated process tag was not marked live");
+    }
+
+    release_process_context(first);
+    if process_context_live_for_test(first.tag) {
+        release_process_context(second);
+        return TestResult::Fail("retired process tag remained live");
+    }
+    release_process_context(second);
     TestResult::Pass
 }
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!(
     "memory/asid_alloc",
-    smoke_process_asids_are_unique_and_retired_before_reuse
+    smoke_process_contexts_are_unique_and_retired_before_reuse
 );
 
 fn smoke_per_domain_root_register_lookup() -> TestResult {

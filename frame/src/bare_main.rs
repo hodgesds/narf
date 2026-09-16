@@ -461,8 +461,8 @@ fn parse_stop_at(args: &narf_boot::KernelCmdline) -> narf_init::Stage {
     last
 }
 
-/// PCID domain-enforcer setup: enable CR4.PCIDE, snapshot the kernel
-/// bootstrap PML4, and allocate + register one private PML4 (with its
+/// PCID domain-enforcer setup: snapshot the kernel bootstrap PML4 and
+/// allocate + register one private PML4 (with its
 /// per-domain PDPT) for each of the 16 domains.
 ///
 /// This MUST run AFTER the MMU handoff (`init_mmu` installs the final
@@ -477,11 +477,7 @@ fn parse_stop_at(args: &narf_boot::KernelCmdline) -> narf_init::Stage {
 /// i.e. KVM / real silicon — TCG CI never enables it).
 #[cfg(target_arch = "x86_64")]
 fn setup_pcid_domains() {
-    // SAFETY: PCID is a baseline long-mode feature; the post-handoff CR3
-    // has PCID==0 (init_mmu wrote a clean CR3), as enable_pcide requires.
-    unsafe {
-        narf_arch::x86_64::pcid::enable_pcide();
-    }
+    // The caller has already attempted to enable PCIDE for process contexts.
     // `enable_pcide` declines on a CPU whose CPUID does not advertise PCID,
     // and without CR4.PCIDE `pcid::enter_domain` returns an inert guard: every
     // crossing it is supposed to confine runs on the kernel's own CR3. Naming
@@ -1721,6 +1717,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                     }
                 }
 
+                // Enable process PCIDs independently of the selected domain
+                // enforcer. The post-handoff CR3 is PCID 0, as required when
+                // setting CR4.PCIDE; unsupported CPUs retain the flushing path.
+                // SAFETY: enable_pcide performs its own CPUID gate.
+                unsafe { narf_arch::x86_64::pcid::enable_pcide() };
+
                 // Per-domain PCID PML4s — deferred here, AFTER the MMU
                 // handoff (CR3 is now the final kernel PML4) and the buddy
                 // populate, so the clones snapshot the right PML4 from a live
@@ -2418,6 +2420,23 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                         }
                     }
                 }
+                // Issue nonzero process PCIDs only when every online CPU can
+                // both install them and retire an inactive tag with INVPCID.
+                // This gate closes before any user AddressSpace is created.
+                let online_mask = narf_lib::smp::online_bitmap();
+                let online = online_mask.count_ones() as u64;
+                narf_arch::x86_64::pcid::finalize_process_pcid(online_mask);
+                let capable = narf_arch::x86_64::pcid::process_pcid_cpu_count();
+                let _ = writeln!(
+                    console::Writer,
+                    "  process-pcid: {} ({}/{online} CPU(s) PCIDE+INVPCID)",
+                    if narf_arch::x86_64::pcid::process_pcid_ready() {
+                        "enabled"
+                    } else {
+                        "disabled — flushing fallback"
+                    },
+                    capable,
+                );
             }
             #[cfg(target_arch = "aarch64")]
             {

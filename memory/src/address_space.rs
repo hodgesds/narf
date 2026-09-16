@@ -1483,10 +1483,10 @@ pub struct AddressSpace {
     /// for binding opaque mapping receipts to this exact address space.
     /// Const-created empty spaces allocate it lazily on first observation.
     address_space_id: core::sync::atomic::AtomicU64,
-    /// Lifetime-scoped aarch64 process ASID. Tag 0 is the safe fallback and
-    /// selects the flushing TTBR0 switch path.
-    #[cfg(target_arch = "aarch64")]
-    asid: crate::asid_alloc::DomainTag,
+    /// Lifetime-scoped process PCID/ASID. Tag 0 is the safe fallback and
+    /// selects the flushing context-switch path.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    context_tag: crate::asid_alloc::DomainTag,
     regions: IrqSafeSpinLock<RegionTable>,
     huge_regions: IrqSafeSpinLock<Vec<HugeRegion>>,
     /// Per-address-space VMA write transaction. Linux serializes mmap, mlock,
@@ -1514,17 +1514,12 @@ pub struct AddressSpace {
     /// addition to growth above `start_brk`. The ELF loader publishes that
     /// immutable span before the new task becomes runnable; fork inherits it.
     program_data_bytes: core::sync::atomic::AtomicU64,
-    /// Set once this AS is shared by a `CLONE_VM` clone (a thread) —
-    /// from then on it can be RESIDENT ON MULTIPLE CPUS at once, so PTE
-    /// mutations must broadcast cross-CPU TLB shootdowns. While false
-    /// (a single-threaded process — the common case) the AS is active
-    /// on at most ONE CPU: the one its task is currently running on.
-    /// Every residency change reloads CR3 with a plain (flushing)
-    /// `mov cr3` (`activate()` / `poll_to_yield`'s resume path), so no
-    /// OTHER CPU can hold a live user-half TLB entry for it — remote
-    /// shootdowns are pure waste there, and their ack-wait spins were
-    /// measured to serialise the whole machine under fork/COW-heavy
-    /// load (stress-ng --sigrt) whenever one vCPU was slow to ack.
+    /// Set once this AS is shared by a `CLONE_VM` clone (a thread). This still
+    /// governs operations that require concurrent owners to be absent (for
+    /// example OOM reaping), but it does not gate x86 TLB invalidation: a
+    /// lifetime PCID retains translations on CPUs where even a single-threaded
+    /// process ran previously, so mutations target the conservative residency
+    /// history for this address space.
     vm_shared: core::sync::atomic::AtomicBool,
     /// Resident base pages temporarily made inaccessible by automatic NUMA
     /// balancing. The next access is a NUMA hint fault, not demand paging.
@@ -1583,8 +1578,8 @@ impl AddressSpace {
         Self {
             root: PhysAddr::new(0),
             address_space_id: core::sync::atomic::AtomicU64::new(0),
-            #[cfg(target_arch = "aarch64")]
-            asid: crate::asid_alloc::DomainTag::RESERVED,
+            #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+            context_tag: crate::asid_alloc::DomainTag::RESERVED,
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
@@ -1738,19 +1733,31 @@ impl AddressSpace {
     }
 
     /// Mark this AS as shared by a `CLONE_VM` clone (thread creation).
-    /// One-way: once multi-resident, PTE mutations broadcast cross-CPU
-    /// shootdowns forever (threads may exit, but a racing stale-TLB
-    /// window on the CPU a thread JUST ran on isn't worth tracking).
+    /// One-way: once multi-resident, lifecycle operations must continue to
+    /// account for possible concurrent owners even after threads exit.
     pub fn mark_vm_shared(&self) {
         self.vm_shared
             .store(true, core::sync::atomic::Ordering::Release);
     }
 
-    /// Whether PTE mutations on this AS must broadcast cross-CPU TLB
-    /// shootdowns (see `vm_shared` field docs).
+    /// Whether this AS has ever had concurrent `CLONE_VM` owners.
     #[inline]
     pub fn is_vm_shared(&self) -> bool {
         self.vm_shared.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Lifetime PCID/ASID allocated to this address space, or zero on the
+    /// flushing fallback. The tag remains owned until final `Drop` retires it.
+    #[inline]
+    pub fn translation_tag(&self) -> u16 {
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        {
+            self.context_tag.tag
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            0
+        }
     }
 
     /// Run one compound VMA mutation while excluding CLONE_VM peers.
@@ -2385,6 +2392,7 @@ impl AddressSpace {
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
+            context_tag: crate::asid_alloc::allocate_process_context(),
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
@@ -2412,7 +2420,7 @@ impl AddressSpace {
         Ok(Self {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
-            asid: crate::asid_alloc::allocate_process_asid(),
+            context_tag: crate::asid_alloc::allocate_process_context(),
             regions: IrqSafeSpinLock::new(RegionTable::new()),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
@@ -3663,7 +3671,18 @@ impl AddressSpace {
                 crate::hugepage::HugeSize::G1 => crate::x86_64::paging::unmap_1gb(self.root, va),
             }
         };
-        result.map_err(|_| AddressSpaceError::Unmapped)
+        let phys = result.map_err(|_| AddressSpaceError::Unmapped)?;
+        // The generic paging helper can only invalidate the current hardware
+        // context plus the legacy PCID-0 hook. A process lifetime PCID may be
+        // cached on a different CPU (or be inactive on this one), so retire the
+        // complete huge-leaf range under this address space's actual tag before
+        // any caller can reuse its backing or install stricter permissions.
+        let pages = match size {
+            crate::hugepage::HugeSize::M2 => crate::hugepage::HUGEPAGE_2M_BYTES >> 12,
+            crate::hugepage::HugeSize::G1 => crate::hugepage::HUGEPAGE_1G_BYTES >> 12,
+        };
+        self.flush_range_all_cpus(va, pages);
+        Ok(phys)
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -6195,8 +6214,8 @@ impl AddressSpace {
         }
         drop(regions);
         // ONE cross-CPU invalidation covering the punched window, BEFORE any
-        // frame is freed for reuse (same mmu_gather shape + vm_shared gating
-        // as the live `unmap_region` path). This also replaces the previous PER-PAGE
+        // frame is freed for reuse (same mmu_gather shape as the live
+        // `unmap_region` path). This also replaces the previous PER-PAGE
         // broadcast+ack-wait (`unmap_4kb`) a CLONE_VM AS paid here — an IPI
         // round-trip per punched page under MAP_FIXED churn.
         if punched_pages > 0 {
@@ -6218,28 +6237,29 @@ impl AddressSpace {
     }
 
     /// One batched cross-CPU TLB invalidation for `pages` pages starting at
-    /// `base`, issued only when this AS can be TLB-resident on another CPU
-    /// (CLONE_VM-shared — see the `vm_shared` field docs). Ranged broadcast
-    /// for small spans; one full non-global flush past the ceiling (mirrors
-    /// Linux's tlb_single_page_flush_ceiling). Callers MUST have already
-    /// torn down / rewritten the covered leaf PTEs, and must call this
-    /// BEFORE freeing any of the covered frames for reuse.
+    /// `base`. A lifetime PCID can remain cached on CPUs this AS previously
+    /// ran on even when it is single-threaded, so the conservative residency
+    /// history is always targeted. Ranged invalidation covers small spans; a
+    /// tag-wide invalidation is used past the ceiling (mirroring Linux's
+    /// `tlb_single_page_flush_ceiling`). Callers MUST have already torn down /
+    /// rewritten the covered leaves and must call this before frame reuse.
     fn flush_region_broadcast(&self, base: VirtAddr, pages: u64) {
         #[cfg(target_arch = "x86_64")]
         {
             const FULL_FLUSH_PAGE_CEILING: u64 = 512;
-            if pages == 0 || !self.is_vm_shared() {
+            if pages == 0 {
                 return;
             }
             if pages > FULL_FLUSH_PAGE_CEILING {
-                // SAFETY: CPL=0; the page-table helper already completed the
-                // current CPU's local invalidation phase.
-                unsafe { crate::x86_64::paging::flush_user_tlb_local() };
-                crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+                    self.translation_tag(),
+                ));
             } else {
-                crate::tlb_shootdown::shootdown_remote(
-                    crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
-                );
+                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
+                    self.translation_tag(),
+                    base.as_u64(),
+                    pages,
+                ));
             }
         }
         // aarch64: `unmap_4kb`'s TLBI already covers the shareability
@@ -6250,34 +6270,26 @@ impl AddressSpace {
         }
     }
 
-    /// Cross-CPU invalidation of `pages` pages at `base` that is NOT gated on
-    /// `vm_shared`. `flush_region_broadcast`'s gate assumes the caller is a
-    /// thread of this AS (so a single-threaded AS can only be resident on the
-    /// calling CPU); page migration runs from a foreign task (compaction,
-    /// `migrate_pages(2)`), where the owner may be resident on any CPU. The
-    /// caller has already completed the local invalidation.
+    /// Cross-CPU invalidation used by foreign mutation (compaction and
+    /// `migrate_pages(2)`). Like `flush_region_broadcast`, it applies a local
+    /// tagged invalidation as well because the edited root need not be current
+    /// on the writer CPU.
+    #[cfg(target_arch = "x86_64")]
     fn flush_range_all_cpus(&self, base: VirtAddr, pages: u64) {
-        #[cfg(target_arch = "x86_64")]
-        {
-            const FULL_FLUSH_PAGE_CEILING: u64 = 512;
-            if pages == 0 {
-                return;
-            }
-            if pages > FULL_FLUSH_PAGE_CEILING {
-                // SAFETY: CPL=0; the page-table helper already completed the
-                // current CPU's local invalidation phase.
-                unsafe { crate::x86_64::paging::flush_user_tlb_local() };
-                crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
-            } else {
-                crate::tlb_shootdown::shootdown_remote(
-                    crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
-                );
-            }
+        const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        if pages == 0 {
+            return;
         }
-        // aarch64: the unmap's TLBI already covers the shareability domain.
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let _ = (base, pages);
+        if pages > FULL_FLUSH_PAGE_CEILING {
+            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+                self.translation_tag(),
+            ));
+        } else {
+            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
+                self.translation_tag(),
+                base.as_u64(),
+                pages,
+            ));
         }
     }
 
@@ -6355,19 +6367,18 @@ impl AddressSpace {
             return ReapOutcome::Nothing;
         }
 
-        // ONE forced full user-TLB shootdown across ALL CPUs. Unlike the
-        // vm_shared-gated `flush_region_broadcast`, the reaper runs cross-task
-        // and cannot assume the doomed AS is resident only on the local CPU;
-        // for a formerly-`vm_shared` victim this flushes any stale entry left on
-        // a CPU a now-dead thread last ran on. No CPU can be spinning on this
-        // region lock (we hold it via try_lock; no live thread can contend it —
-        // `!vm_shared`, or `sole_owner` proves all siblings exited), so the
-        // ack-wait cannot deadlock.
+        // ONE tag-wide shootdown across every CPU in this AS's conservative
+        // residency history. The reaper runs cross-task and the lifetime PCID
+        // can remain cached on a CPU where even a single-threaded victim ran
+        // previously. No CPU can be spinning on this region lock (we hold it
+        // via try_lock; no live thread can contend it — `!vm_shared`, or
+        // `sole_owner` proves all siblings exited), so the ack-wait cannot
+        // deadlock.
         #[cfg(target_arch = "x86_64")]
         {
-            // SAFETY: CPL=0; the local invalidation phase completed above.
-            unsafe { crate::x86_64::paging::flush_user_tlb_local() };
-            crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+                self.translation_tag(),
+            ));
         }
 
         // Pass 2: free the backing frames (allocation-free) and zero the
@@ -7296,28 +7307,32 @@ impl AddressSpace {
         // SAFETY: the transition table above pins metadata ownership. The
         // callback clears it before the swap primitive invalidates/frees.
         let result = unsafe {
-            crate::swap::swap_out_batch_owned(&bare_victims, |resolved| {
-                let mut table = self.regions.lock();
-                for (victim, phys) in resolved {
-                    let va = victim.virt.as_u64();
-                    assert_eq!(
-                        table.swap_pages.get(&va),
-                        Some(&SwapPageState::Evicting(*phys)),
-                        "swap ownership transition changed before PTE commit"
-                    );
-                    {
-                        let region = table
-                            .containing_backing_mut(va)
-                            .expect("swap victim region disappeared during transaction");
-                        let index = ((va - region.base.as_u64()) >> 12) as usize;
-                        assert_eq!(region.phys[index], *phys);
-                        region.phys[index] = PhysAddr::new(0);
+            crate::swap::swap_out_batch_owned(
+                &bare_victims,
+                Some(self.translation_tag()),
+                |resolved| {
+                    let mut table = self.regions.lock();
+                    for (victim, phys) in resolved {
+                        let va = victim.virt.as_u64();
+                        assert_eq!(
+                            table.swap_pages.get(&va),
+                            Some(&SwapPageState::Evicting(*phys)),
+                            "swap ownership transition changed before PTE commit"
+                        );
+                        {
+                            let region = table
+                                .containing_backing_mut(va)
+                                .expect("swap victim region disappeared during transaction");
+                            let index = ((va - region.base.as_u64()) >> 12) as usize;
+                            assert_eq!(region.phys[index], *phys);
+                            region.phys[index] = PhysAddr::new(0);
+                        }
+                        // Evicted to swap → no longer resident here; drop its rmap.
+                        crate::rmap::remove(*phys, self.root, VirtAddr::new(va));
+                        table.swap_pages.insert(va, SwapPageState::Swapped);
                     }
-                    // Evicted to swap → no longer resident here; drop its rmap.
-                    crate::rmap::remove(*phys, self.root, VirtAddr::new(va));
-                    table.swap_pages.insert(va, SwapPageState::Swapped);
-                }
-            })
+                },
+            )
         };
 
         // Remove reservations for an aborted transaction or for a backed page
@@ -9041,8 +9056,8 @@ impl AddressSpace {
         }
         #[cfg(target_arch = "x86_64")]
         crate::swap::swap_discard_batch(&discarded_swap);
-        // ONE cross-CPU invalidation over the advised span BEFORE any
-        // frame is freed for reuse (no-op unless CLONE_VM-shared).
+        // ONE tagged cross-CPU invalidation over the advised span BEFORE any
+        // frame is freed for reuse.
         if !to_release.is_empty() {
             self.flush_region_broadcast(base, (hi - lo) >> 12);
         }
@@ -9067,29 +9082,25 @@ impl AddressSpace {
     /// call; we only re-target the same phys.
     #[cfg(target_arch = "x86_64")]
     unsafe fn rewrite_perms_pages(&self, regions: &[Region], cow_readonly: bool) {
-        use crate::x86_64::paging::{
-            flush_user_tlb_local, rewrite_4kb_scatter_range, unmap_4kb_local_range, PtFlags,
-        };
+        use crate::x86_64::paging::{rewrite_4kb_scatter_range, unmap_4kb_local_range, PtFlags};
         if self.root.as_u64() == 0 {
             return;
         }
         // Batched-shootdown shape (Linux `flush_tlb_mm_range`): every
-        // leaf-PTE rewrite below invalidates LOCALLY only; the cross-CPU
-        // invalidation is either ONE ranged broadcast per region (small
+        // leaf-PTE rewrite below is followed by a tagged invalidation, either
+        // ONE ranged request per region (small
         // batches — mprotect) or ONE full non-global flush for the whole
         // call (large batches — fork's whole-AS COW WRITE-strip via
         // `rematerialize`). The previous per-page `unmap_4kb` broadcast +
         // ack-wait cost thousands of IPI round-trips per fork of a large
         // process (~0.5 s each, unbounded when an AP acked slowly) — the
         // stress-ng --sigrt fork-phase crawl.
-        // Only a CLONE_VM-shared AS can be resident on another CPU (see
-        // the `vm_shared` field docs); for a single-threaded process the
-        // per-page LOCAL invalidations below already cover the only CPU
-        // that can hold its entries — skip the cross-CPU broadcast.
+        // A lifetime PCID can remain cached on any CPU where this AS ran,
+        // including a single-threaded process's previous CPU. Target the
+        // conservative residency history for every rewritten leaf.
         const FULL_FLUSH_PAGE_CEILING: u64 = 512;
-        let broadcast = self.is_vm_shared();
         let total_pages: u64 = regions.iter().map(|r| (r.len + 0xFFF) >> 12).sum();
-        let use_full_flush = broadcast && total_pages > FULL_FLUSH_PAGE_CEILING;
+        let use_full_flush = total_pages > FULL_FLUSH_PAGE_CEILING;
         for r in regions {
             // Fork rematerialize (`cow_readonly`) only re-marks the COW regions
             // clone_for_fork touched; every other region's perms are unchanged,
@@ -9139,21 +9150,18 @@ impl AddressSpace {
                 };
             }
             let region_pages = (r.len + 0xFFF) >> 12;
-            if broadcast && !use_full_flush && region_pages > 0 {
-                crate::tlb_shootdown::shootdown_remote(
-                    crate::tlb_shootdown::ShootdownRequest::for_range(
-                        0,
-                        r.base.as_u64(),
-                        region_pages,
-                    ),
-                );
+            if !use_full_flush && region_pages > 0 {
+                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
+                    self.translation_tag(),
+                    r.base.as_u64(),
+                    region_pages,
+                ));
             }
         }
         if use_full_flush {
-            // SAFETY: CPL=0; user PTEs are never GLOBAL, so a local
-            // non-global flush covers the current CPU before remote dispatch.
-            unsafe { flush_user_tlb_local() };
-            crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+                self.translation_tag(),
+            ));
         }
     }
 
@@ -9255,8 +9263,6 @@ impl AddressSpace {
         #[cfg(target_arch = "x86_64")]
         const FULL_FLUSH_PAGE_CEILING: u64 = 512;
         #[cfg(target_arch = "x86_64")]
-        let broadcast = self.is_vm_shared();
-        #[cfg(target_arch = "x86_64")]
         let mut changed_pages = 0u64;
         #[cfg(target_arch = "x86_64")]
         let mut protect_run = |base: VirtAddr, pages: u64| {
@@ -9274,10 +9280,12 @@ impl AddressSpace {
             changed_pages += changed;
             // Per-run remote invalidation up to the ceiling; past it, the
             // single full flush after the walk covers every restricted leaf.
-            if broadcast && changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
-                crate::tlb_shootdown::shootdown_remote(
-                    crate::tlb_shootdown::ShootdownRequest::for_range(0, base.as_u64(), pages),
-                );
+            if changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
+                crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
+                    self.translation_tag(),
+                    base.as_u64(),
+                    pages,
+                ));
             }
             Ok::<(), AddressSpaceError>(())
         };
@@ -9355,8 +9363,10 @@ impl AddressSpace {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if broadcast && changed_pages > FULL_FLUSH_PAGE_CEILING {
-            crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+        if changed_pages > FULL_FLUSH_PAGE_CEILING {
+            crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+                self.translation_tag(),
+            ));
         }
         Ok(())
     }
@@ -10317,8 +10327,8 @@ impl AddressSpace {
     /// `Err(())` (mapping restored to `old_phys`) otherwise.
     ///
     /// The relocation core of [`Self::relocate_page`]. It does NOT touch
-    /// `Region.phys`, the reverse map, the cross-CPU TLB broadcast, or free
-    /// either frame — the caller owns that bookkeeping under the region lock.
+    /// `Region.phys`, the reverse map, or free either frame; it does complete
+    /// the cross-CPU invalidation before copying.
     /// `perms` is copied out of the region so no borrow is held across the call.
     /// Shared by `relocate_page_inner` (compaction) and `migrate_page_to_node`
     /// (NUMA migration / hint faults).
@@ -10358,8 +10368,11 @@ impl AddressSpace {
         unsafe {
             #[cfg(target_arch = "x86_64")]
             {
-                // Local invalidation + residency-filtered cross-CPU shootdown.
-                let _ = crate::x86_64::paging::unmap_4kb(self.root, page_va);
+                // Remove under the root lock, then invalidate this logical
+                // address space's lifetime PCID on every resident CPU before
+                // copying from the old frame.
+                let _ = crate::x86_64::paging::unmap_4kb_local(self.root, page_va);
+                self.flush_range_all_cpus(page_va, 1);
             }
             #[cfg(target_arch = "aarch64")]
             {
@@ -10774,7 +10787,6 @@ impl AddressSpace {
             crate::hugepage::free_hugepage(new);
             return Some(Err(AddressSpaceError::Unmapped));
         }
-        self.flush_range_all_cpus(leaf_va, bytes >> 12);
         // SAFETY: both huge frames are live, distinct, naturally aligned
         // direct-map ranges of the same size; the region lock prevents a
         // concurrent unmap from returning the source frame to the pool, and
@@ -11034,7 +11046,7 @@ impl AddressSpace {
     ///   mutation of the same region.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn remap_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-        use crate::x86_64::paging::{map_4kb, unmap_4kb, MapError, PtFlags};
+        use crate::x86_64::paging::{map_4kb, MapError, PtFlags};
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
         }
@@ -11059,21 +11071,13 @@ impl AddressSpace {
             flags |= PtFlags::NO_EXEC;
         }
 
-        // COW-break hot path (one call per first-write #PF): only a
-        // CLONE_VM-shared AS can hold this page's stale entry on another
-        // CPU (see `vm_shared` docs) — a single-threaded process needs
-        // the LOCAL invalidation only. The per-page broadcast + ack-wait
-        // here was a storm-scale serializer under fork-heavy load.
+        // COW-break hot path (one call per first-write #PF). Lifetime PCIDs
+        // retain entries on prior CPUs even for a single-threaded process, so
+        // remove locally and retire this AS's tagged translation everywhere.
         // SAFETY: root is a valid PML4; the page we're touching
         // sits inside `region` per the lookup above.
         // SAFETY: Valid memory or trusted environment
-        let _ = unsafe {
-            if self.is_vm_shared() {
-                unmap_4kb(self.root, page_va)
-            } else {
-                crate::x86_64::paging::unmap_4kb_local(self.root, page_va)
-            }
-        };
+        let _ = unsafe { crate::x86_64::paging::unmap_4kb_local(self.root, page_va) };
         // SAFETY: `self.root` is this AS's live PML4 (same root just
         // passed to `unmap_4kb`); `page_va` is the page-aligned VA of a
         // page that belongs to `region` (the lookup above resolved it),
@@ -11081,11 +11085,12 @@ impl AddressSpace {
         // for that page. `flags` mirror the region's perms, so the new
         // PTE re-installs exactly the mapping we just tore down.
         // SAFETY: Valid memory or trusted environment
-        match unsafe { map_4kb(self.root, page_va, phys, flags) } {
-            Ok(()) => Ok(()),
-            Err(MapError::AlreadyMapped) => Ok(()),
+        let result = match unsafe { map_4kb(self.root, page_va, phys, flags) } {
+            Ok(()) | Err(MapError::AlreadyMapped) => Ok(()),
             Err(_) => Err(AddressSpaceError::NotImplemented),
-        }
+        };
+        self.flush_region_broadcast(page_va, 1);
+        result
     }
 
     /// aarch64 sibling of the x86_64 `remap_page`. Same contract:
@@ -11197,11 +11202,10 @@ impl AddressSpace {
             .cloned()
     }
 
-    /// Make this address-space the active one. On x86_64 issues a
-    /// `MOV CR3` with the right `compiler_fence` discipline; on
-    /// aarch64 installs the `(root, ASID)` TTBR0 context with the architected
-    /// DSB + MSR + ISB sequence. Nonzero lifetime-scoped ASIDs retain cached
-    /// translations; the ASID-0 exhaustion fallback flushes on root changes.
+    /// Make this address-space the active one. On x86_64, a nonzero lifetime
+    /// PCID uses CR3.NOFLUSH; on aarch64 the lifetime ASID is encoded in TTBR0.
+    /// Tag-0 exhaustion and unsupported-hardware fallbacks flush on root
+    /// changes.
     ///
     /// # Safety invariants (x86_64)
     /// - `self.root` must have been constructed via `new_for_user`,
@@ -11219,16 +11223,20 @@ impl AddressSpace {
     ///   tree-wide migration of phys-as-virt accessors —
     ///   so callers in the Stage-4 scheduler / fork path don't
     ///   need to re-establish them.
+    #[inline]
     pub fn activate(&self) -> Result<(), AddressSpaceError> {
         if self.root.as_u64() == 0 {
             return Err(AddressSpaceError::OutOfRange);
         }
         #[cfg(target_arch = "x86_64")]
         {
-            // Publish PCID-0 residency before loading the root. A concurrent
-            // shared-AS invalidation therefore either targets this CPU or
-            // completes before MOV CR3 observes the edited page tables.
-            crate::tlb_shootdown::set_active_as(narf_lib::percpu::current_cpu() as u32, 0);
+            // Publish logical-AS residency before loading the root. This uses
+            // the allocated tag even on a CPU taking the PCID-0 fallback, so a
+            // mixed-feature sibling remains a target of this AS's shootdowns.
+            crate::tlb_shootdown::set_active_as(
+                narf_lib::percpu::current_cpu() as u32,
+                self.context_tag.tag,
+            );
             // SAFETY: `new_for_user` (the only safe path to a
             // non-zero `root`) populated the kernel-half entries
             // from the current PML4, so the next instruction fetch
@@ -11237,9 +11245,19 @@ impl AddressSpace {
             // contract — the executor disables IRQs through the
             // existing `IrqSafeSpinLock` on the ready queue.
             // SAFETY: Valid memory or trusted environment
-            unsafe {
-                crate::x86_64::paging::write_cr3(self.root);
-            }
+            // Allocation returns a nonzero tag only after the post-SMP gate
+            // proved PCIDE+INVPCID on every online CPU. The tag therefore is
+            // the hot-path proof; do not execute CPUID on every switch.
+            let tagged = self.context_tag.tag != crate::asid_alloc::TAG_RESERVED;
+            let value = self.root.as_u64()
+                | if tagged {
+                    self.context_tag.tag as u64 | (1u64 << 63)
+                } else {
+                    0
+                };
+            // SAFETY: the live, aligned root contains the shared kernel half;
+            // a nonzero low tag is issued only after PCIDE is globally ready.
+            unsafe { narf_arch::x86_64::cr::write_cr3(value) };
             Ok(())
         }
         #[cfg(target_arch = "aarch64")]
@@ -11272,7 +11290,7 @@ impl AddressSpace {
             // TTBR1 carries the executing kernel across this low-half switch.
             // SAFETY: Valid memory or trusted environment
             unsafe {
-                crate::aarch64::paging::write_ttbr0_el1_asid(self.root, self.asid.tag);
+                crate::aarch64::paging::write_ttbr0_el1_asid(self.root, self.context_tag.tag);
             }
             Ok(())
         }
@@ -11306,21 +11324,19 @@ impl Drop for AddressSpace {
     /// absent child leaf first: no CPU can walk the root.
     ///
     /// Safety: the scheduler's active-mm handoff strongly owns every installed
-    /// root. Reaching Drop therefore proves every CPU has switched away. x86
-    /// uses PCID 0 for process roots and every different-root/restore MOV CR3
-    /// has NOFLUSH clear, so that switch already retired the old translations.
-    /// aarch64 explicitly invalidates this root's lifetime ASID below before
-    /// releasing any backing; ASID-0 switches already perform a full local
-    /// invalidation. Kernel-half PML4 entries on x86_64 are never reclaimed.
+    /// root. Reaching Drop therefore proves every CPU has switched away. A
+    /// nonzero lifetime PCID/ASID is invalidated below before backing or the
+    /// allocator slot can be reused; tag-0 switches flush on root changes.
+    /// Kernel-half PML4 entries on x86_64 are never reclaimed.
     fn drop(&mut self) {
-        // Nonzero aarch64 ASIDs preserve translations across TTBR0 switches.
+        // Nonzero process tags preserve translations across context switches.
         // Last-Arc ownership proves the root is inactive; retire the complete
         // lifetime tag BEFORE any data or table frame can be reused. Releasing
         // the allocator bit here also prevents a second call at the end.
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
-            crate::asid_alloc::release_process_asid(self.asid);
-            self.asid = crate::asid_alloc::DomainTag::RESERVED;
+            crate::asid_alloc::release_process_context(self.context_tag);
+            self.context_tag = crate::asid_alloc::DomainTag::RESERVED;
         }
         {
             // Serialize externally owned aliases only through authoritative

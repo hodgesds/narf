@@ -3,13 +3,13 @@
 //! Spec: `memory/specification/asid-pcid-isolation.md` §2.
 //!
 //! Generation-tagged mapping from `DomainId` to a hardware tag, plus
-//! lifetime-scoped process ASIDs on aarch64. Domain and process partitions are
+//! lifetime-scoped process context tags. Domain and process partitions are
 //! disjoint; a process tag is not reusable until a system-wide tag
 //! invalidation completes.
 
 #![allow(dead_code)]
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 use core::sync::atomic::AtomicU16;
 use core::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
@@ -84,37 +84,39 @@ static GENERATION: AtomicU64 = AtomicU64::new(1);
 /// Values: 0 = uninitialized, 1 = initialization in progress, 2 = ready.
 static INIT_STATE: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 static NEXT_TAG: AtomicU16 = AtomicU16::new(1);
 
 // Domain roots permanently occupy tags 1..=16. Process address spaces use the
 // remainder of the architectural namespace, so the two root classes can never
 // cache different translations under the same live tag.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const PROCESS_CONTEXT_FIRST: u16 = N_DOMAINS as u16 + 1;
+#[cfg(target_arch = "x86_64")]
+const PROCESS_CONTEXT_BITMAP_WORDS: usize = 64; // complete 12-bit PCID namespace
 #[cfg(target_arch = "aarch64")]
-const PROCESS_ASID_FIRST: u16 = N_DOMAINS as u16 + 1;
-#[cfg(target_arch = "aarch64")]
-const ASID_BITMAP_WORDS: usize = 1024; // complete 16-bit ASID namespace
+const PROCESS_CONTEXT_BITMAP_WORDS: usize = 1024; // complete 16-bit ASID namespace
 
-#[cfg(target_arch = "aarch64")]
-struct ProcessAsidState {
-    used: [u64; ASID_BITMAP_WORDS],
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+struct ProcessContextState {
+    used: [u64; PROCESS_CONTEXT_BITMAP_WORDS],
     cursor: u16,
 }
 
-#[cfg(target_arch = "aarch64")]
-impl ProcessAsidState {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+impl ProcessContextState {
     const fn new() -> Self {
         Self {
-            used: [0; ASID_BITMAP_WORDS],
-            cursor: PROCESS_ASID_FIRST,
+            used: [0; PROCESS_CONTEXT_BITMAP_WORDS],
+            cursor: PROCESS_CONTEXT_FIRST,
         }
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-static PROCESS_ASIDS: IrqSafeSpinLock<ProcessAsidState> =
-    IrqSafeSpinLock::new(ProcessAsidState::new());
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+static PROCESS_CONTEXTS: IrqSafeSpinLock<ProcessContextState> =
+    IrqSafeSpinLock::new(ProcessContextState::new());
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 static PROCESS_CONTEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Initialise the allocator once, before any tagged address space is created.
@@ -137,7 +139,7 @@ pub fn allocator_init() {
 
 fn reset_domain_state() {
     GENERATION.store(1, Ordering::Release);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     NEXT_TAG.store(1, Ordering::Release);
     let mut t = TAGS.lock();
     for slot in t.iter_mut() {
@@ -150,9 +152,9 @@ fn reset_domain_state() {
 
 fn reset_all_state() {
     reset_domain_state();
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
-        *PROCESS_ASIDS.lock() = ProcessAsidState::new();
+        *PROCESS_CONTEXTS.lock() = ProcessContextState::new();
         PROCESS_CONTEXT_GENERATION.store(1, Ordering::Release);
     }
 }
@@ -196,11 +198,11 @@ pub fn alloc(domain: DomainId) -> DomainTag {
             return cur;
         }
     }
-    // aarch64 domain tags are stable and permanently disjoint from process
-    // ASIDs. Other architectures retain the existing generation allocator.
-    #[cfg(target_arch = "aarch64")]
+    // x86_64/aarch64 domain tags are stable and permanently disjoint from
+    // process context tags. Other architectures retain the generation allocator.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     let tag = idx as u16 + 1;
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let tag = {
         let max = arch_max_tag();
         let mut tag = NEXT_TAG.fetch_add(1, Ordering::AcqRel);
@@ -256,7 +258,7 @@ pub fn asid_for(domain: DomainId) -> u16 {
 /// is reachable from this scope).
 pub fn rollover_now() {
     GENERATION.fetch_add(1, Ordering::AcqRel);
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     NEXT_TAG.store(1, Ordering::Release);
     let mut g = TAGS.lock();
     for slot in g.iter_mut() {
@@ -267,25 +269,29 @@ pub fn rollover_now() {
     }
 }
 
-/// Allocate one lifetime-scoped ASID for a process address space.
+/// Allocate one lifetime-scoped PCID/ASID for a process address space.
 ///
 /// Tags 1..=16 are permanently reserved for domain roots. A process tag is
-/// removed from the bitmap only after [`release_process_asid`] has invalidated
-/// it across the inner-shareable domain. Exhaustion returns ASID 0, whose
-/// caller must use the flushing switch path.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn allocate_process_asid() -> DomainTag {
+/// removed from the bitmap only after [`release_process_context`] has invalidated
+/// it across every CPU that may retain the context. Exhaustion returns tag 0,
+/// whose caller must use the architecture's flushing switch path.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn allocate_process_context() -> DomainTag {
     allocator_init();
-    let max = arch_max_tag();
-    if max < PROCESS_ASID_FIRST {
+    #[cfg(target_arch = "x86_64")]
+    if !narf_arch::x86_64::pcid::process_pcid_ready() {
         return DomainTag::RESERVED;
     }
-    let mut state = PROCESS_ASIDS.lock();
-    let candidates = max as usize - PROCESS_ASID_FIRST as usize + 1;
+    let max = arch_max_tag();
+    if max < PROCESS_CONTEXT_FIRST {
+        return DomainTag::RESERVED;
+    }
+    let mut state = PROCESS_CONTEXTS.lock();
+    let candidates = max as usize - PROCESS_CONTEXT_FIRST as usize + 1;
     for _ in 0..candidates {
         let tag = state.cursor;
         state.cursor = if tag == max {
-            PROCESS_ASID_FIRST
+            PROCESS_CONTEXT_FIRST
         } else {
             tag + 1
         };
@@ -301,32 +307,37 @@ pub(crate) fn allocate_process_asid() -> DomainTag {
     DomainTag::RESERVED
 }
 
-/// Retire a process ASID and make it available for safe reuse.
+/// Retire a process PCID/ASID and make it available for safe reuse.
 ///
 /// The caller must prove that no CPU can still execute the owning address
 /// space. `AddressSpace::drop` provides that proof through last-`Arc`
 /// ownership. Invalidation happens before the bitmap bit is cleared, so an
 /// allocator cannot reissue the tag while stale translations remain.
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn release_process_asid(context: DomainTag) {
-    if context.tag < PROCESS_ASID_FIRST || context.tag > arch_max_tag() {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn release_process_context(context: DomainTag) {
+    if context.tag < PROCESS_CONTEXT_FIRST || context.tag > arch_max_tag() {
         return;
     }
-    // SAFETY: the tag was allocated from the architectural ASID range and the
-    // last AddressSpace owner guarantees it can no longer be repopulated.
-    unsafe { narf_arch::aarch64::sysreg::tlbi_asid_inner_shareable(context.tag) };
-    let mut state = PROCESS_ASIDS.lock();
+    #[cfg(target_arch = "x86_64")]
+    crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(context.tag));
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: the tag was allocated from the architectural ASID range and
+        // the last AddressSpace owner guarantees it can no longer be repopulated.
+        unsafe { narf_arch::aarch64::sysreg::tlbi_asid_inner_shareable(context.tag) };
+    }
+    let mut state = PROCESS_CONTEXTS.lock();
     let word = context.tag as usize / 64;
     let bit = 1u64 << (context.tag as usize % 64);
     state.used[word] &= !bit;
 }
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn process_asid_live_for_test(tag: u16) -> bool {
-    if tag < PROCESS_ASID_FIRST || tag > arch_max_tag() {
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn process_context_live_for_test(tag: u16) -> bool {
+    if tag < PROCESS_CONTEXT_FIRST || tag > arch_max_tag() {
         return false;
     }
-    let state = PROCESS_ASIDS.lock();
+    let state = PROCESS_CONTEXTS.lock();
     state.used[tag as usize / 64] & (1u64 << (tag as usize % 64)) != 0
 }
 
@@ -339,6 +350,12 @@ pub fn invalidate_tag(domain: DomainId) {
         return;
     }
     let mut g = TAGS.lock();
+    #[cfg(target_arch = "x86_64")]
+    if g[idx].tag != TAG_RESERVED {
+        crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
+            g[idx].tag,
+        ));
+    }
     #[cfg(target_arch = "aarch64")]
     if g[idx].tag != TAG_RESERVED {
         // SAFETY: the tag came from the architectural domain-tag partition.

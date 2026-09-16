@@ -11,9 +11,9 @@ This spec covers four primitives:
   * **Per-domain page-table root** — each NARF driver domain owns
     a private user-half PML4 (x86_64) or TTBR0 root (aarch64) so
     address-space changes don't leak across domains.
-  * **ASID / PCID allocator** — generation-tagged domain mappings plus
-    lifetime-scoped aarch64 process ASIDs. Process tags are invalidated before
-    reuse; exhaustion safely falls back to flushing ASID 0 switches.
+  * **ASID / PCID allocator** — stable domain mappings plus lifetime-scoped
+    process PCIDs/ASIDs. Process tags are invalidated before reuse; exhaustion
+    or an incomplete x86 CPU feature set safely falls back to tag-0 flushing.
   * **Selective TLB invalidation** — `INVPCID` on x86_64 + `TLBI
     ASIDE1IS` on aarch64 to invalidate the entries for one tag
     without flushing the whole TLB.
@@ -84,23 +84,30 @@ destination tag stay live.
 
 | arch    | width | reserved   | usable                          |
 |---------|-------|------------|---------------------------------|
-| x86_64  | 12 bits | 0 (reserved as "no-PCID" sentinel) | 1..4095 |
+| x86_64  | 12 bits | 0 (flushing fallback), 1..16 (domain roots) | 17..4095 for process roots |
 | aarch64 | 8 / 16 bits (per `ID_AA64MMFR0_EL1.ASIDBits`) | 0 (flushing fallback), 1..16 (domain roots) | 17..(2^N - 1) for process roots |
 
 ### 2.2 Allocation policy
 
-Domain roots retain the generation-tagged public allocator. x86_64 hands out
-PCIDs from its 12-bit namespace and rolls the generation when that counter
-exhausts. aarch64 assigns its 16 domain roots stable tags 1..=16, keeping them
-disjoint from process roots.
+Both architectures assign the 16 domain roots stable tags 1..=16, matching the
+x86 domain-enforcer encoding and keeping domain tags disjoint from processes.
 
-Each aarch64 `AddressSpace::new_for_user` reserves one tag from 17 through the
-maximum encoded by `ID_AA64MMFR0_EL1.ASIDBits`. The tag remains bound
-to that root for the complete `AddressSpace` lifetime. Last-owner teardown
-issues `TLBI ASIDE1IS` and its completion barriers before clearing the allocator
-bit, so no concurrent allocation can reissue a tag while stale translations
-remain. If every process tag is live, allocation returns tag 0; activation of
-tag 0 performs a local full EL1 invalidation whenever its root changes.
+Each `AddressSpace::new_for_user` reserves one lifetime tag from 17 through the
+architectural maximum (4095 on x86_64; the maximum encoded by
+`ID_AA64MMFR0_EL1.ASIDBits` on aarch64). On x86_64, boot enables CR4.PCIDE on
+the BSP and every AP independently of the domain backend, then enables process
+PCIDs only if every online CPU also advertises INVPCID. This all-CPU gate makes
+a nonzero process PCID uniformly installable and retireable; otherwise every
+new address space receives tag 0 and uses the prior flushing path. A CPU that
+rejoins after the gate closes invalidates every local PCID context before it
+publishes itself online; a CPU lacking either feature fails before publication.
+
+The tag remains bound to its root for the complete `AddressSpace` lifetime.
+Last-owner teardown issues a synchronous tag-wide invalidation before clearing
+the allocator bit (`INVPCID` plus targeted IPI rendezvous on x86_64, `TLBI
+ASIDE1IS` on aarch64), so no concurrent allocation can reissue a tag while
+stale translations remain. Pool exhaustion returns tag 0. A tag-0 root switch
+does not use NOFLUSH and therefore retires the previous tag-0 context.
 
 `allocator_init` is one-shot in production and allocation lazily invokes it, so
 a later explicit call cannot reset live tag ownership. The kernel-test reset
@@ -111,7 +118,7 @@ ownership so test ordering cannot reissue a still-live process tag.
 
 ```rust
 pub fn allocator_init();
-pub fn pcid_for(domain: DomainId) -> u16;     // x86_64 (1..4095)
+pub fn pcid_for(domain: DomainId) -> u16;     // x86_64 (1..=16)
 pub fn asid_for(domain: DomainId) -> u16;     // aarch64 (1..N)
 pub fn current_generation() -> u64;
 pub fn invalidate_tag(domain: DomainId);      // arch-dispatched
@@ -209,9 +216,12 @@ pub fn shootdown_count() -> u64;     // per-CPU counter
 
 `shootdown` applies the invalidation locally and then dispatches its remote
 half. `shootdown_remote` is for page-table helpers that already completed the
-local half. A tracked tag publishes CPU residency before its context-register
-load and clears residency only after a local invalidation; an untracked bucket
-always retains bootstrap-safe all-peer dispatch. x86 idle CPUs atomically
+local half. A tracked lifetime tag publishes CPU residency before its
+context-register load. Its bit is conservative history and remains set across
+NOFLUSH context switches; tag retirement invalidates every CPU in that history
+before reuse. Hash collisions and stale set bits can only add an IPI, never
+omit one. An untracked bucket always retains bootstrap-safe all-peer dispatch.
+x86 idle CPUs atomically
 acquire full-flush debt instead of receiving an IPI, and `mark_busy` clears the
 idle state and discharges that debt before the scheduler can load another task
 root. The sender publishes debt and rechecks the idle mask, while the waking
@@ -223,9 +233,9 @@ The pre-load residency publication is a sequentially consistent read-modify-
 write. Remote dispatch executes a sequentially consistent fence after the
 caller has completed its page-table writes and before it samples residency.
 This forbids the store-buffer outcome where the loading CPU and invalidating
-CPU each miss the other's publication. Batched unmap, permission rewrite, and
-swap-out use the remote-only surface only after completing their local
-invalidation, and never release an unmapped frame before remote completion.
+CPU each miss the other's publication. Address-space mutation and swap-out use
+the tag-aware local-plus-remote surface because the edited root may be inactive
+on the writer CPU; frame ownership is never released before completion.
 
 On aarch64, tag/VA and tag-wide requests use Inner Shareable TLBI operations;
 the architecture already propagates them across the shareability domain, so
@@ -238,7 +248,7 @@ uses the interrupt bridge because that instruction is not shareable-scoped.
 |------------------------------------|--------------------------------|
 | `pcid_alloc_per_domain_unique`     | distinct domains get distinct PCIDs |
 | `asid_alloc_per_domain_unique`     | aarch64 mirror                 |
-| `process_asids_are_unique_and_retired_before_reuse` | live process tags are disjoint; retirement clears ownership only after TLBI |
+| `process_contexts_are_unique_and_retired_before_reuse` | live process tags are disjoint; retirement clears ownership only after tag-wide invalidation; x86 fallback issues no tag before the all-CPU gate |
 | `pcid_rollover_bumps_generation`   | rollover_now() bumps generation + invalidates |
 | `invpcid_single_compiles`          | INVPCID type-1 wrapper assembles cleanly |
 | `tlbi_aside1is_compiles`           | aarch64 ASIDE1IS wrapper assembles cleanly |

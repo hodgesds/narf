@@ -174,12 +174,13 @@ policy. The target slot remains in its home queue under a core-owned atomic
 claim, so dispatch and stealing skip it until the final switch has completed.
 The target normally returns to the source's root executor continuation. If it
 urgently wakes that exact off-queue root, it may instead switch directly to the
-root's saved task continuation once; the root's next yield must reach the
-executor before any further direct handoff. The off-queue root is pinned by its
+root's saved task continuation. That same fixed root may begin another exact
+handoff, but the batch is capped at eight target-to-root returns; its next
+yield then must reach the executor. The off-queue root is pinned by its
 in-flight executor poll, the exact `WakeCell` identity substitutes for a queue
-lookup, and a CPU-local whole-poll gate also covers nested scheduler pumps.
-Arbitrary target-to-third-task chains and repeated ping-pong are therefore
-forbidden. Before either task's first resumed instruction, the core publishes
+lookup, and a CPU-local whole-poll gate refuses nested sources and arbitrary
+target-to-third-task chains. Before either task's first resumed instruction,
+the core publishes
 its task/address-space identity and restores its hardware root, kernel-stack
 target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
 ownership, and PMU attribution. Switch-out saves the same state first. A remote,
@@ -542,17 +543,20 @@ control callback.
   an `Arc` to every root while hardware can reference it, skips the register
   write for an exact same-MM successor, and switches directly to a different
   user MM. A kernel task or end-of-round maintenance boundary restores the
-  incoming root before proceeding. On aarch64 lifetime-scoped ASIDs make user
-  switches non-flushing; an ASID is not reused until the memory subsystem
-  completes a system-wide tag invalidation. A poll-time address-space
+  incoming root before proceeding. Lifetime-scoped x86 PCIDs and aarch64 ASIDs
+  make nonzero-tag user switches non-flushing; a tag is not reused until the
+  memory subsystem completes a system-wide invalidation. A poll-time address-space
   replacement is reconciled before either root owner is dropped and forces a
   restore rather than carrying stale same-MM identity into the next dispatch.
-- On x86_64 the executor publishes process-PCID-0 residency before a user root
-  is loaded using the memory subsystem's sequentially consistent publication
-  primitive, and clears it only after the plain kernel-root CR3 restore has
-  invalidated PCID 0 locally. A CPU entering either scheduler halt path marks
-  itself TLB-idle; after wake it clears that state and completes any deferred
-  full non-global flush before another task root or domain context can load.
+- On x86_64 the executor publishes the address space's lifetime process PCID
+  before loading `root|pcid|NOFLUSH`. Kernel-root restore and own-stack resume
+  preserve nonzero tags. Residency is conservative history and remains set
+  until tag retirement, so mapping invalidation reaches CPUs that previously
+  ran even a single-threaded process. If the all-CPU PCIDE+INVPCID boot gate or
+  tag allocation fails, PCID 0 retains the plain flushing behavior. A CPU
+  entering either scheduler halt path marks itself TLB-idle; after wake it
+  clears that state and completes any deferred full non-global flush before
+  another task root or domain context can load.
   The idle/debt publication handshake guarantees a racing shootdown is handled
   either by its ordinary IPI acknowledgement or by this pre-dispatch flush.
 - `donate_to` does not bypass capability checks; caller must hold a
@@ -607,8 +611,10 @@ control callback.
 - The synchronous-wake direct-transfer path restores the callee's saved
   architecture domain state and reported domain byte before its first
   instruction, and captures both before returning to the exact root task or
-  its executor continuation. The exact-root return restores that root's state
-  before its first resumed instruction and cannot extend to a third task.
+  its executor continuation. Every exact-root return restores that root's
+  state before its first resumed instruction; only that fixed root may start
+  another transfer and the eighth return forces the next yield through the
+  executor, so the batch cannot extend to a third task or run unbounded.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held

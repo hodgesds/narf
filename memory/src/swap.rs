@@ -982,7 +982,7 @@ pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>
     // SAFETY: forwarded from the public primitive's ownership contract. The
     // no-op publisher is correct only because that contract requires the
     // caller to have detached ownership metadata itself.
-    unsafe { swap_out_batch_owned(victims, |_| {}) }
+    unsafe { swap_out_batch_owned(victims, None, |_| {}) }
 }
 
 /// Ownership-integrated implementation used by `AddressSpace` reclaim.
@@ -991,6 +991,7 @@ pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn swap_out_batch_owned(
     victims: &[SwapVictim],
+    context_tag: Option<u16>,
     publish: impl FnOnce(&[(SwapVictim, PhysAddr)]),
 ) -> Result<usize, SwapError> {
     use crate::paging::translate;
@@ -1100,12 +1101,14 @@ pub(crate) unsafe fn swap_out_batch_owned(
     publish(&resolved);
 
     // ONE local + residency-filtered peer invalidation for the entire batch,
-    // before any old frame can return to the allocator. All process roots use
-    // flushing PCID 0 and publish exact scheduler residency for that tag.
-    // SAFETY: every present leaf in the batch was replaced above; user PTEs
-    // are non-global, so the local non-global flush retires every victim.
-    unsafe { crate::paging::flush_user_tlb_local() };
-    crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+    // before any old frame can return to the allocator. AddressSpace-owned
+    // callers supply its lifetime PCID; the raw compatibility entry point has
+    // no root→tag ownership proof and therefore takes the safe all-context
+    // fallback.
+    crate::tlb_shootdown::shootdown(context_tag.map_or_else(
+        crate::tlb_shootdown::ShootdownRequest::full,
+        crate::tlb_shootdown::ShootdownRequest::for_tag,
+    ));
 
     // ── 6. Only after the batch flush, free all evicted frames. ──
     for (_, phys) in &resolved {
