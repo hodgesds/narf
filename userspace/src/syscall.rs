@@ -1700,6 +1700,15 @@ pub enum Syscall {
     /// arg0 = timerid, arg1 = `itimerspec*` out.
     /// Linux `timer_gettime` (x86_64=224, aarch64=108).
     TimerGettime,
+    /// `quotactl_fd(fd, cmd, id, addr)` — `quotactl(2)`'s operations,
+    /// naming the filesystem by an open descriptor instead of a device path.
+    /// Linux `quotactl_fd` (x86_64=443, aarch64=443).
+    QuotactlFd,
+    /// `cachestat(fd, cachestat_range*, cachestat*, flags)` — how much of a
+    /// file range is in the page cache, so a caller can skip a readahead it
+    /// can prove is unnecessary.
+    /// Linux `cachestat` (x86_64=451, aarch64=451).
+    Cachestat,
     /// `statmount(req, buf, bufsize, flags)` — query one mount without
     /// parsing `/proc/self/mountinfo`.
     /// Linux `statmount` (x86_64=457, aarch64=457).
@@ -2537,6 +2546,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 195),
     (Syscall::Flistxattr, 196),
     (Syscall::Removexattr, 197),
+    (Syscall::QuotactlFd, 443),
+    (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
     (Syscall::Setxattrat, 463),
@@ -3007,6 +3018,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Llistxattr, 12),
     (Syscall::Flistxattr, 13),
     (Syscall::Removexattr, 14),
+    (Syscall::QuotactlFd, 443),
+    (Syscall::Cachestat, 451),
     (Syscall::Statmount, 457),
     (Syscall::Listmount, 458),
     (Syscall::Setxattrat, 463),

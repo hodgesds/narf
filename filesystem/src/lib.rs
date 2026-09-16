@@ -976,6 +976,21 @@ pub trait FileOps: Send + Sync {
     /// The inode's `FS_*_FL` flag word — `chattr`'s bits, read by
     /// `FS_IOC_GETFLAGS`.
     ///
+    /// `cachestat(2)` — page-cache residency for pages `first..=last`
+    /// (indices, not bytes) of this file.
+    ///
+    /// `None` means this filesystem keeps no page cache of its own, which
+    /// the caller reports as all-zero. That is not a fabricated answer: a
+    /// file the kernel does not cache genuinely has no cached pages, and a
+    /// caller deciding whether to readahead should readahead.
+    ///
+    /// A filesystem that DOES cache must answer exactly, because the whole
+    /// point of the syscall is to let userspace skip work it can prove is
+    /// unnecessary — an over-report makes it skip a read it needed.
+    fn cachestat_range(&self, _first: u64, _last: u64) -> Option<CacheStat> {
+        None
+    }
+
     /// Only [`FS_IMMUTABLE_FL`] and [`FS_APPEND_FL`] carry meaning here;
     /// both are enforced by the VFS rather than by the filesystem, which
     /// is why they live on the inode and are read from the syscall layer.
@@ -2530,6 +2545,27 @@ impl fmt::Debug for Mount {
 /// in different columns: `mount options` is this ATTACHMENT's `MNT_*` set
 /// (`rw`/`ro` plus `nosuid`/`nodev`/`noexec`), while `super options` is
 /// the filesystem's own `show_options` string, already `,`-prefixed.
+/// `struct cachestat` (`include/uapi/linux/mman.h`) — what `cachestat(2)`
+/// reports for a range of a file.
+///
+/// ```text
+/// struct cachestat {
+///         __u64 nr_cache;             /* in the page cache */
+///         __u64 nr_dirty;
+///         __u64 nr_writeback;
+///         __u64 nr_evicted;           /* evicted since the range was last read */
+///         __u64 nr_recently_evicted;  /* ...and evicted recently */
+/// };
+/// ```
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CacheStat {
+    pub nr_cache: u64,
+    pub nr_dirty: u64,
+    pub nr_writeback: u64,
+    pub nr_evicted: u64,
+    pub nr_recently_evicted: u64,
+}
+
 pub type MountInfoRow = (u64, u64, String, String, String, String);
 
 fn mountinfo_rows(mounts: &[Mount]) -> Vec<MountInfoRow> {

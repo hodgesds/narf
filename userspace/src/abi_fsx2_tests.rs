@@ -3264,3 +3264,179 @@ fn smoke_abi_fsx2_statmount_flags_and_overflow() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fsx2_statmount_flags_and_overflow);
+
+// ── cachestat(2) ──────────────────────────────────────────────────────
+
+/// `cachestat` reports the pages of a range that are actually resident.
+///
+/// For tmpfs this is exact rather than estimated — `FileData::pages` IS the
+/// page cache for the inode, so a present key is a resident page and an
+/// absent one is a hole. The value of the syscall is entirely in that
+/// exactness: a caller uses it to skip a read it can prove is unnecessary,
+/// so an over-report makes it skip a read it needed.
+fn smoke_abi_fsx2_cachestat_counts_resident_pages() -> TestResult {
+    // A three-page file, so the count is a number and not just "nonzero".
+    const PAGE: u64 = 4096;
+    with_memfs("/cst", "cst", &[("f", b"seed")], || {
+        // O_RDWR (2): `can_do_cachestat` accepts a writable descriptor, and
+        // the case writes through it anyway.
+        let fd = match call_open(c"/cst/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let page = [b'x'; PAGE as usize];
+        for i in 0..3u64 {
+            if call(
+                Syscall::Pwrite64.raw(),
+                a3(fd, page.as_ptr() as u64, PAGE, i * PAGE),
+            ) != Some(PAGE as i64)
+            {
+                return Err("seeding three pages should succeed");
+            }
+        }
+        let stat = |off: u64, len: u64| -> Option<[u64; 5]> {
+            let range = [off, len];
+            let mut out = [0u64; 5];
+            match call(
+                Syscall::Cachestat.raw(),
+                a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+            ) {
+                Some(0) => Some(out),
+                _ => None,
+            }
+        };
+        // len == 0 means "to the end", so the whole file: three pages.
+        let all = stat(0, 0).ok_or("cachestat over the whole file should succeed")?;
+        if all[0] != 3 {
+            return Err("cachestat did not count every resident page of the file");
+        }
+        // tmpfs pages have nowhere to be written back to, so Linux marks
+        // them dirty; reporting 0 would say they could be dropped cheaply,
+        // which is the one thing never true of them.
+        if all[1] != 3 {
+            return Err("tmpfs pages must report as dirty — they have no backing store");
+        }
+        // Nothing is under writeback, and nothing is ever evicted: NARF has
+        // no reclaim and no swap, so these are honest zeroes.
+        if all[2] != 0 || all[3] != 0 || all[4] != 0 {
+            return Err("writeback/evicted must be zero without reclaim or swap");
+        }
+        // A one-page window really is one page, so the range arithmetic is
+        // being applied rather than the whole file being counted every time.
+        let one = stat(0, PAGE).ok_or("a one-page range should succeed")?;
+        if one[0] != 1 {
+            return Err("cachestat ignored the range and counted the whole file");
+        }
+        // An unaligned range that spans a page boundary covers both pages:
+        // `first = off >> PAGE_SHIFT`, `last = (off + len - 1) >> PAGE_SHIFT`.
+        let two = stat(PAGE - 1, 2).ok_or("a boundary-spanning range should succeed")?;
+        if two[0] != 2 {
+            return Err("cachestat mis-rounded a range that spans a page boundary");
+        }
+        // Entirely past EOF: no pages, and not an error.
+        let past = stat(64 * PAGE, PAGE).ok_or("a range past EOF should still succeed")?;
+        if past[0] != 0 {
+            return Err("cachestat found pages past the end of the file");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fsx2_cachestat_counts_resident_pages
+);
+
+/// A hole really reads as a hole.
+///
+/// Written sparsely so the count is strictly less than the range: this is
+/// what separates "counts pages" from "reports the range size".
+fn smoke_abi_fsx2_cachestat_sees_holes() -> TestResult {
+    const PAGE: u64 = 4096;
+    with_memfs("/cst2", "cst2", &[("f", b"")], || {
+        let fd = match call_open(c"/cst2/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let byte = [b'z'; 1];
+        // Pages 0 and 4 only — pages 1..3 are holes.
+        for i in [0u64, 4] {
+            if call(
+                Syscall::Pwrite64.raw(),
+                a3(fd, byte.as_ptr() as u64, 1, i * PAGE),
+            ) != Some(1)
+            {
+                return Err("sparse seeding should succeed");
+            }
+        }
+        let range = [0u64, 5 * PAGE];
+        let mut out = [0u64; 5];
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+        ) != Some(0)
+        {
+            return Err("cachestat over a sparse file should succeed");
+        }
+        if out[0] != 2 {
+            return Err("cachestat counted holes as resident pages");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_cachestat_sees_holes);
+
+/// The argument checks, in Linux's order — which is not the order the
+/// arguments appear in.
+///
+/// `SYSCALL_DEFINE4(cachestat)` tests the descriptor, then copies the range,
+/// then the file type, then permission, and only THEN `flags`. A caller
+/// passing both a bad pointer and a bad flag therefore gets -EFAULT, and
+/// checking `flags` first — the obvious way to write it — would answer
+/// -EINVAL instead.
+fn smoke_abi_fsx2_cachestat_argument_order() -> TestResult {
+    // Canonical and in the user half, so `access_ok` passes and the copy is
+    // what faults — the same address the other cases in this file use.
+    const BAD_PTR: u64 = 0x0001_0000_0000_0000;
+    with_memfs("/cst3", "cst3", &[("f", b"hi")], || {
+        let fd = match call_open(c"/cst3/f".as_ptr() as u64, 2) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open should succeed"),
+        };
+        let range = [0u64, 0];
+        let mut out = [0u64; 5];
+        // A closed descriptor, before anything else is looked at.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(4242, range.as_ptr() as u64, out.as_mut_ptr() as u64, 0),
+        ) != Some(EBADF)
+        {
+            return Err("cachestat on a closed descriptor must be -EBADF");
+        }
+        // An unreadable range pointer.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, BAD_PTR, out.as_mut_ptr() as u64, 0),
+        ) != Some(EFAULT)
+        {
+            return Err("an unreadable cachestat_range must be -EFAULT");
+        }
+        // A nonzero flag.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, range.as_ptr() as u64, out.as_mut_ptr() as u64, 1),
+        ) != Some(EINVAL)
+        {
+            return Err("a nonzero cachestat flag must be -EINVAL");
+        }
+        // Both wrong: the range copy runs first, so -EFAULT wins.
+        if call(
+            Syscall::Cachestat.raw(),
+            a3(fd, BAD_PTR, out.as_mut_ptr() as u64, 1),
+        ) != Some(EFAULT)
+        {
+            return Err("cachestat checked flags before copying the range");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_cachestat_argument_order);

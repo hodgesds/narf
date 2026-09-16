@@ -10029,6 +10029,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         "fremovexattr",
         RawFnHandler(sys_fremovexattr),
     );
+    table.install_raw(
+        Syscall::QuotactlFd,
+        "quotactl_fd",
+        RawFnHandler(sys_quotactl_fd),
+    );
+    table.install_raw(Syscall::Cachestat, "cachestat", RawFnHandler(sys_cachestat));
     // Mount-table queries (Linux 6.8).
     table.install_raw(Syscall::Statmount, "statmount", RawFnHandler(sys_statmount));
     table.install_raw(Syscall::Listmount, "listmount", RawFnHandler(sys_listmount));
@@ -11227,6 +11233,8 @@ mod handler_sys_settimeofday;
 mod handler_sys_setuid;
 #[path = "sys_setxattr.rs"]
 mod handler_sys_setxattr;
+#[path = "sys_cachestat.rs"]
+mod handler_sys_cachestat;
 #[path = "sys_statmount.rs"]
 mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]
@@ -11578,7 +11586,7 @@ pub(crate) use {
     handler_sys_pwrite64::sys_pwrite64,
     handler_sys_pwritev::sys_pwritev,
     handler_sys_pwritev2::sys_pwritev2,
-    handler_sys_quotactl::sys_quotactl,
+    handler_sys_quotactl::{sys_quotactl, sys_quotactl_fd},
     handler_sys_read::sys_read,
     handler_sys_readahead::sys_readahead,
     handler_sys_readlink::sys_readlink,
@@ -11633,6 +11641,7 @@ pub(crate) use {
     handler_sys_settimeofday::sys_settimeofday,
     handler_sys_setuid::sys_setuid,
     handler_sys_setxattr::{sys_lsetxattr, sys_setxattr},
+    handler_sys_cachestat::sys_cachestat,
     handler_sys_statmount::{sys_listmount, sys_statmount},
     handler_sys_xattrat::{
         sys_getxattrat, sys_listxattrat, sys_removexattrat, sys_setxattrat, xattr_get_at,
