@@ -187,30 +187,6 @@ fn smoke_abi_creds_current_ucred_task_cache() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_creds_current_ucred_task_cache);
 
-/// Drop to an unprivileged uid so the `ns_capable_setid()` arms of the
-/// set*id family are actually reachable.
-///
-/// This is not a test backdoor: `setresuid` away from root runs
-/// `cap_emulate_setxuid` (`security/commoncap.c`), which clears the
-/// permitted and effective capability sets, so this is exactly how a real
-/// process drops privilege.
-///
-/// The self-check matters as much as the drop. The harness task starts with
-/// `Caps::boot()`, and if the drop did not actually remove CAP_SETUID then
-/// every assertion that follows would be satisfied by the *privileged*
-/// branch and prove nothing — which is the failure mode these cases had
-/// before.
-fn drop_to_unprivileged_uid() -> Result<(), &'static str> {
-    const UID: u64 = 1000;
-    if call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0) {
-        return Err("setresuid to an unprivileged uid should succeed while privileged");
-    }
-    if call(Syscall::SetUid.raw(), a0(4242)) != Some(EPERM) {
-        return Err("dropping to an unprivileged uid did not clear CAP_SETUID");
-    }
-    Ok(())
-}
-
 /// `(uid_t)-1` — "leave this id alone" in the set*re*id / set*res*id family.
 const NOCHANGE: u64 = u32::MAX as u64;
 

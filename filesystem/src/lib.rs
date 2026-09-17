@@ -3065,6 +3065,17 @@ pub fn drm_prime_export(card_index: u32, gem_handle: u32) -> Option<Arc<dyn File
 /// reference.
 pub trait NsObject: Send + Sync + core::fmt::Debug {
     fn as_any(&self) -> &dyn core::any::Any;
+
+    /// Recover the OWNING handle, not just a borrow.
+    ///
+    /// `as_any` is enough to ask what a namespace is; it is not enough to
+    /// keep one alive. An ns-fd minted from a tree lookup has to hold the
+    /// object, so the caller needs `Arc<ConcreteNs>` back out of
+    /// `Arc<dyn NsObject>` — which needs an `Arc<dyn Any>` to downcast
+    /// from, and `Arc::downcast` cannot manufacture one from `&dyn Any`.
+    fn into_any_arc(
+        self: alloc::sync::Arc<Self>,
+    ) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync>;
     /// This namespace's globally unique id.
     fn ns_id(&self) -> u64;
     /// The `enum ns_type` bit for this flavour.
@@ -3084,6 +3095,11 @@ pub trait NsOwner: Send + Sync + core::fmt::Debug {
 
 impl NsObject for MountNamespace {
     fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn into_any_arc(
+        self: alloc::sync::Arc<Self>,
+    ) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync> {
         self
     }
     fn ns_id(&self) -> u64 {

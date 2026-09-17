@@ -16,6 +16,44 @@ pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     }
     let hbytes = u32::from_ne_bytes(hdr[0..4].try_into().unwrap()) as usize;
     let htype = i32::from_ne_bytes(hdr[4..8].try_into().unwrap());
+    // An nsfs handle resolves through the namespace tree, not the VFS:
+    // `nsfs_fh_to_dentry` looks the id up, cross-checks the type and inode
+    // against what it found, and applies the same visibility rule
+    // `/proc/<pid>/ns/` does — otherwise a handle would be a way around it.
+    #[cfg(feature = "container")]
+    if htype == super::handler_nsfs::FILEID_NSFS {
+        const EMFILE: i64 = -24;
+        let n = core::cmp::max(hbytes, super::handler_nsfs::NSFS_FILE_HANDLE_SIZE);
+        // SAFETY: copy_from_user_vec validates the f_handle range.
+        let fid = match unsafe { copy_from_user_vec(a.arg1 + 8, n) } {
+            Ok(b) => b,
+            Err(_) => {
+                ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                return;
+            }
+        };
+        let task = current_task_id();
+        match super::handler_nsfs::decode_handle(task, &fid) {
+            Ok(held) => {
+                let ops: Arc<dyn narf_filesystem::FileOps> = crate::namespaces::NsFd::new(held);
+                let f = fd::install(
+                    task,
+                    fd::FdEntry {
+                        ops,
+                        offset: 0,
+                        flags: crate::fd::FD_CLOEXEC,
+                        status_flags: 0,
+                    },
+                );
+                match f {
+                    Some(f) => ctx.set_return(SyscallReturn::ok(u64::from(f))),
+                    None => ctx.set_return(SyscallReturn::ok(EMFILE as u64)),
+                }
+            }
+            Err(e) => ctx.set_return(SyscallReturn::ok(e as u64)),
+        }
+        return;
+    }
     if htype != NARF_HANDLE_TYPE {
         ctx.set_return(SyscallReturn::ok((-ESTALE) as u64));
         return;

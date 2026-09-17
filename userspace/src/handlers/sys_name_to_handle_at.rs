@@ -33,6 +33,62 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
         }
         let task = current_task_id();
         let dirfd = a.arg0 as u32;
+        // An ns-fd encodes to an nsfs handle, not to the generic inode one.
+        // `nsfs_encode_fh` carries id, type AND inode: the id alone would
+        // locate the namespace, and the other two are what let the decoder
+        // notice that a handle kept across a reboot now names a different
+        // one. A generic 8-byte inode handle would round-trip to a path,
+        // which a namespace does not have.
+        #[cfg(feature = "container")]
+        {
+            let held = fd::with_table(task, |t| {
+                t.get(dirfd).and_then(|e| {
+                    e.ops
+                        .as_any()
+                        .and_then(|x| x.downcast_ref::<crate::namespaces::NsFd>())
+                        .map(|nsfd| nsfd.held().clone())
+                })
+            })
+            .flatten();
+            if let Some(held) = held {
+                use super::handler_nsfs::{encode_handle, FILEID_NSFS, NSFS_FILE_HANDLE_SIZE};
+                let mut cap = [0u8; 4];
+                // SAFETY: copy_from_user validates the 4-byte read.
+                if unsafe { copy_from_user(&mut cap, a.arg2) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                    return;
+                }
+                let need = NSFS_FILE_HANDLE_SIZE as u32;
+                if u32::from_ne_bytes(cap) < need {
+                    // `*max_len = NSFS_FID_SIZE_U32_LATEST; return
+                    // FILEID_INVALID;` — report the size and fail, so the
+                    // caller retries with a big enough buffer.
+                    // SAFETY: copy_to_user validates the 4-byte destination.
+                    let _ = unsafe { copy_to_user(a.arg2, &need.to_ne_bytes()) };
+                    ctx.set_return(SyscallReturn::ok((-EOVERFLOW) as u64));
+                    return;
+                }
+                let mut hdr = [0u8; 8];
+                hdr[0..4].copy_from_slice(&need.to_ne_bytes());
+                hdr[4..8].copy_from_slice(&FILEID_NSFS.to_ne_bytes());
+                // SAFETY: copy_to_user validates the 8-byte header.
+                let h1 = unsafe { copy_to_user(a.arg2, &hdr) };
+                // SAFETY: copy_to_user validates the 16-byte body.
+                let h2 = unsafe { copy_to_user(a.arg2 + 8, &encode_handle(&held)) };
+                if h1.is_err() || h2.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+                    return;
+                }
+                if a.arg3 != 0 {
+                    // nsfs is its own mount; NARF has no id for it, and
+                    // Linux's is not stable across boots either.
+                    // SAFETY: copy_to_user validates the 4-byte destination.
+                    let _ = unsafe { copy_to_user(a.arg3, &0i32.to_ne_bytes()) };
+                }
+                ctx.set_return(SyscallReturn::ok(0));
+                return;
+            }
+        }
         let id: Option<u64> = fd::with_table(task, |t| t.get(dirfd).map(|e| e.ops.ino()))
             .flatten()
             .filter(|&i| i != 0)

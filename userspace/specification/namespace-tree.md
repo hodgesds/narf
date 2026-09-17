@@ -68,10 +68,10 @@ These are UAPI, not implementation detail: `is_ns_init_id(ns)` is
 `ns->ns_id <= NS_LAST_INIT_ID` (`ns_common.h:23`) and gates refcount
 behaviour, and userspace can hard-code them.
 
-**NARF: NOT satisfied.** `init_namespaces()` allocates initial ids from
-`NS_ID_COUNTER` (which starts at 1), so the values it produces depend on
-boot ordering and collide with the UAPI constants only by accident. Must
-become fixed constants with the dynamic counter starting at 9.
+**NARF: satisfied** — it was not. `init_namespaces()` allocated initial ids
+from `NS_ID_COUNTER`, which started at 1, so the values depended on boot
+ordering and collided with the UAPI constants only by accident. Now a
+reserved block, with the dynamic counter starting at 9.
 
 ### R3 — Initial namespaces have fixed inode numbers
 
@@ -80,7 +80,16 @@ plus the kernel-internal `MNT_NS_ANON_INO = 0xEFFFFFF7`. `is_ns_init_inum`
 range-checks against these, and `__ns_common_init` uses the *inum* (not the
 id) to decide whether a namespace starts life active.
 
-**NARF:** not applicable until nsfs exists (§9). Deferred, not dropped.
+**NARF: satisfied.** `namespaces::init_ns_ino` plus `ns_inum(id)`, which
+derives rather than stores: dynamic inums are offset into the
+`PROC_DYNAMIC_FIRST` (`0xF0000000`) range that `proc_alloc_inum` allocates
+from, and NARF's ids are already dense and monotonic above the reserved
+block, so the offset is unique for the same reason Linux's ida is — without
+a second allocator to keep in step with the first.
+
+Needed by R29: `nsfs_encode_fh` puts the inum in the handle, so a handle
+could not be faithful without one. `NsFd::stat` reports it as `st_ino`,
+which is what `ns_match` compares.
 
 ### R4 — `ns_type` values are the `CLONE_NEW*` bits
 
@@ -278,8 +287,11 @@ the sorted RCU list forward or backward within one type tree, returning
 `ERR_PTR(-ENOENT)` at either end. This is what backs
 `NS_MNT_GET_NEXT` / `NS_MNT_GET_PREV`.
 
-**NARF: NOT satisfied** — no traversal API. `BTreeMap` range queries in both
-directions supply the primitive; the API is missing.
+**NARF: satisfied.** `ns_tree_adjoined(from, ns_type, previous)`. Linux
+walks a per-type list so "next" is implicitly "next of this flavour"; NARF
+has one map, so the flavour is a filter over a `BTreeMap` range in either
+direction. Dead entries are skipped inside, which composes with
+`get_sequential_mnt_ns`'s own permission loop rather than duplicating it.
 
 ---
 
@@ -357,10 +369,19 @@ success. That is how a paging loop terminates; returning 0 would be
 indistinguishable from "nothing is visible to you" and the caller would
 spin.
 
-Note the lookup that decides ENOENT applies the *type* constraint only in
-single-type global mode, and **no** type constraint in owner mode or
-unified mode. A cursor past the last matching element, with higher-id
-elements of other types present, therefore returns `0`, not `-ENOENT`.
+The lookup applies only what the SELECTED tree carries — the type in
+single-type global mode, the owner in owner mode, nothing in unified mode —
+never the caller's full mask and never the visibility check. The two halves
+pull opposite ways:
+
+- One type bit walks that flavour's tree, so exhausting that flavour IS the
+  end of the list, even with higher-id namespaces of other flavours present.
+- Zero bits, or two or more, walk the unified tree, so the same situation is
+  an empty success.
+
+Deciding it over the fully-filtered candidate set gets the second wrong;
+always consulting the unified tree gets the first wrong, and a paging loop
+never terminates.
 
 ### R22 — Per-element visibility
 
@@ -413,20 +434,17 @@ The count of ids written. `put_user` failure mid-loop → `-EFAULT`
 (ids already written stay written). The loop stops when `nr_ns_ids`
 is exhausted or the list ends.
 
-**NARF status for §8:** `sys_listns` implements R18, R19, R21 (partly),
-R22, R23, R25. Gaps: R20's `hweight32 == 1` rule is not implemented (any
-type mask is treated as a filter, which is behaviourally identical except
-for R21's ENOENT interaction); R21's ENOENT is decided over the
-type-and-owner-filtered candidate set rather than the unfiltered tree, so a
-cursor past the last element of a *filtered* enumeration returns `-ENOENT`
-where Linux returns `0`; R14's incremental locking is absent.
+**NARF status for §8:** satisfied, except R14's incremental locking, which
+is D5. R20's `hweight32 == 1` selection and R21's cursor rule are both
+`ns_tree_first_at`, which applies only the selected tree's constraint.
 
 ---
 
 ## 9. nsfs — ioctls and file handles
 
-NARF has no nsfs. These requirements are recorded so the tree is not
-designed in a way that forecloses them.
+NARF has no nsfs *filesystem*, but an ns-fd is a real object
+(`namespaces::NsFd`), which is all these need: the ioctls answer on the fd
+and the handle encodes the namespace, neither of which requires a mount.
 
 ### R26 — Simple ioctls (`ns_ioctl`, `fs/nsfs.c`)
 
@@ -443,6 +461,10 @@ designed in a way that forecloses them.
 An unrecognised command returns `-ENOIOCTLCMD`, which the VFS translates to
 `-ENOTTY`. An unrecognised *extensible* command returns `-ENOTTY` directly.
 
+**NARF: satisfied.** `handlers/nsfs.rs`, dispatched from `sys_ioctl`
+because four of these mint a new fd and the fd table belongs to that layer
+— the same reason `TIOCGPTPEER` is handled there.
+
 ### R27 — Extensible ioctls
 
 `NS_MNT_GET_INFO` / `NS_MNT_GET_NEXT` / `NS_MNT_GET_PREV` carry a size in
@@ -453,12 +475,23 @@ non-MNT namespace or a NULL `uinfo` (INFO only).
 
 `struct mnt_ns_info { __u32 size; __u32 nr_mounts; __u64 mnt_ns_id; }`.
 
+**NARF: satisfied.** Every ioctl number and struct layout was computed
+against `<linux/ioctl.h>` with `offsetof`, not assembled by hand.
+
 ### R28 — Traversal is privileged
 
 `may_use_nsfs_ioctl` (`fs/nsfs.c`) returns `may_see_all_namespaces()`
 for `NS_MNT_GET_NEXT` and `NS_MNT_GET_PREV`, and `true` for everything
 else. Failure is **`-EPERM`**, checked before the namespace is even fetched
 from the inode.
+
+On top of that, `get_sequential_mnt_ns` SKIPS each namespace the caller
+lacks `CAP_SYS_ADMIN` in rather than refusing, so an enumerating caller
+walks what it may see and ends at `-ENOENT` instead of stopping dead at the
+first it may not. The gate is about the system; the per-namespace check is
+about each namespace.
+
+**NARF: satisfied**, including the skip loop.
 
 ### R29 — nsfs file handles
 
@@ -483,6 +516,13 @@ from the inode.
 This is the requirement that makes the id space meaningful across
 `name_to_handle_at` / `open_by_handle_at`, and it is why R1's
 "equal ids are identical namespaces" must hold.
+
+**NARF: satisfied.** `name_to_handle_at(fd, "", .., AT_EMPTY_PATH)` on an
+ns-fd emits a `FILEID_NSFS` handle; `open_by_handle_at` resolves it through
+the tree with every cross-check above. The type and inode checks are what
+matter: ids are unique within a boot but minted afresh on the next, so a
+persisted handle would otherwise resolve silently to an unrelated
+namespace.
 
 ---
 
@@ -640,9 +680,11 @@ never held across a read, and the only thing published under it is a map of
    a silent leak in the collector first: its per-CPU queue is now intrusive
    (`rcu_head` model) rather than a 64-slot array that discarded on
    overflow. Negative-controlled both ways.
-5. **R17** — ordered next/previous traversal API. The primitive exists in
-   `BTreeMap::range`; the API does not.
-6. **R20/R21** — `hweight32 == 1` tree selection and the unfiltered-cursor
-   ENOENT rule. Two small, precisely-specified divergences in `sys_listns`.
-7. **R26–R29** — nsfs: ioctls and file handles. Largest item; needs an
-   ns-fd type first.
+5. ~~**R17** — ordered next/previous traversal API.~~ **Done.**
+6. ~~**R20/R21** — `hweight32 == 1` tree selection and the cursor ENOENT
+   rule.~~ **Done.**
+7. ~~**R26–R29** — nsfs: ioctls and file handles.~~ **Done**, which also
+   closed R3 (a handle carries the inode, so there had to be one).
+
+Every requirement in this document is now either satisfied or a recorded
+deviation in §12.

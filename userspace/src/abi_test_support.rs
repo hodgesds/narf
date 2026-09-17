@@ -268,6 +268,33 @@ pub fn wired(s: Syscall) -> bool {
 }
 
 // ── Arg builders (the rest default to 0) ──
+/// Drop the harness task to an unprivileged uid so the `ns_capable*()` arms
+/// of the syscalls under test are actually reachable.
+///
+/// Not a test backdoor: `setresuid` away from root runs
+/// `cap_emulate_setxuid` (`security/commoncap.c`), which clears the
+/// permitted and effective capability sets, so this is exactly how a real
+/// process drops privilege.
+///
+/// Lives here rather than in one test file because more than one needs it,
+/// and a second copy would be a second thing to keep correct.
+///
+/// The self-check matters as much as the drop. The harness task starts with
+/// `Caps::boot()`, and if the drop did not actually remove CAP_SETUID then
+/// every assertion that follows would be satisfied by the *privileged*
+/// branch and prove nothing — which is the failure mode these cases had
+/// before.
+pub fn drop_to_unprivileged_uid() -> Result<(), &'static str> {
+    const UID: u64 = 1000;
+    if call(Syscall::Setresuid.raw(), a2(UID, UID, UID)) != Some(0) {
+        return Err("setresuid to an unprivileged uid should succeed while privileged");
+    }
+    if call(Syscall::SetUid.raw(), a0(4242)) != Some(EPERM) {
+        return Err("dropping to an unprivileged uid did not clear CAP_SETUID");
+    }
+    Ok(())
+}
+
 pub fn a0(arg0: u64) -> SyscallArgs {
     SyscallArgs {
         arg0,

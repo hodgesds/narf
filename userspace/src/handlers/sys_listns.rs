@@ -143,17 +143,50 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
         }
     };
 
-    let candidates = crate::namespaces::ns_tree_entries_from(cursor, req_ns_type, owner_filter);
+    // `do_listns`: `if (hweight32(kls->ns_type) == 1) ns_type = kls->ns_type;
+    // else ns_type = 0;` — EXACTLY ONE type bit selects that flavour's tree;
+    // zero bits, or two or more, fall back to the unified tree with the mask
+    // applied per element by `ns_requested`.
+    //
+    // NARF has one map, so this changes no result directly — the per-element
+    // filter below is the same either way. It matters because the CURSOR
+    // lookup walks the selected tree, and which tree that is decides whether
+    // a cursor past the end is -ENOENT or an empty success.
+    let tree_type = if req_ns_type.count_ones() == 1 {
+        req_ns_type
+    } else {
+        0
+    };
 
-    // `if (kls->last_ns_id) { first = lookup_ns_id_at(last + 1, ...); if
-    // (!first) return -ENOENT; }` — a cursor with nothing after it is
-    // -ENOENT, NOT an empty success. That is how a paging caller learns it
-    // has reached the end; returning 0 would be indistinguishable from "no
-    // namespaces are visible to you right now" and a loop would spin.
-    if cursor != 0 && candidates.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
-        return;
+    // `if (kls->last_ns_id) { first = lookup_*_at(last + 1, ...); if (!first)
+    // return -ENOENT; }` — a cursor with nothing after it is -ENOENT, NOT an
+    // empty success. That is how a paging caller learns it has reached the
+    // end; returning 0 would be indistinguishable from "no namespaces are
+    // visible to you right now" and a loop would spin.
+    //
+    // The lookup applies only what the SELECTED TREE carries, which is the
+    // part that is easy to get wrong: the owner tree is walked without a
+    // type constraint (`lookup_ns_owner_at` takes none), the unified tree
+    // without any constraint, and only single-type global mode constrains by
+    // type. Deciding this over the fully-filtered candidate set instead
+    // reports -ENOENT whenever a cursor passes the last element of a
+    // FILTERED enumeration — even though the tree still holds higher ids, so
+    // Linux returns 0 there. `saturating_add` because a caller may page from
+    // u64::MAX; Linux wraps, but wrapping to 0 would restart the enumeration.
+    if cursor != 0 {
+        let at = cursor.saturating_add(1);
+        let first = if owner_filter.is_some() {
+            crate::namespaces::ns_tree_first_at(at, 0, owner_filter)
+        } else {
+            crate::namespaces::ns_tree_first_at(at, tree_type, None)
+        };
+        if first.is_none() {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
+        }
     }
+
+    let candidates = crate::namespaces::ns_tree_entries_from(cursor, req_ns_type, owner_filter);
 
     // `may_list_ns`: a namespace the caller is IN is always listable;
     // anything else needs `may_see_all_namespaces()`, which is the initial
@@ -182,22 +215,6 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
         }
     }
     ctx.set_return(SyscallReturn::ok(ids.len() as u64));
-}
-
-/// `kernel/nscommon.c::may_see_all_namespaces`.
-///
-/// ```text
-/// return (task_active_pid_ns(current) == &init_pid_ns) &&
-///        ns_capable_noaudit(init_pid_ns.user_ns, CAP_SYS_ADMIN);
-/// ```
-///
-/// Both halves matter: CAP_SYS_ADMIN inside a pid namespace is authority
-/// over that namespace, not over the system, so a container root must not be
-/// able to enumerate its host's namespaces.
-#[cfg(feature = "container")]
-fn may_see_all_namespaces(task: u64) -> bool {
-    let in_initial_pid_ns = crate::pid_ns::ns_of(task).is_none();
-    in_initial_pid_ns && capable(CAP_SYS_ADMIN)
 }
 
 /// The ids of every namespace the caller is currently in.

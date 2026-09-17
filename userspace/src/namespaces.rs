@@ -87,6 +87,59 @@ pub fn alloc_ns_id() -> NsId {
     NS_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+/// `enum init_ns_ino` (`include/uapi/linux/nsfs.h:47`) — the nsfs inode
+/// number of each flavour's INITIAL namespace.
+///
+/// Reserved just as the ids are (see [`init_ns_id`]), but a separate space:
+/// Linux's `__ns_common_init` decides "is this namespace permanently
+/// active" from the INUM (`is_ns_init_inum`) and `__ns_ref_put` decides the
+/// same thing from the ID (`is_ns_init_id`), so the two blocks have to line
+/// up flavour-for-flavour while being numerically unrelated.
+pub mod init_ns_ino {
+    pub const IPC: u32 = 0xEFFF_FFFF;
+    pub const UTS: u32 = 0xEFFF_FFFE;
+    pub const USER: u32 = 0xEFFF_FFFD;
+    pub const PID: u32 = 0xEFFF_FFFC;
+    pub const CGROUP: u32 = 0xEFFF_FFFB;
+    pub const TIME: u32 = 0xEFFF_FFFA;
+    pub const NET: u32 = 0xEFFF_FFF9;
+    pub const MNT: u32 = 0xEFFF_FFF8;
+}
+
+/// `PROC_DYNAMIC_FIRST` (`fs/proc/generic.c:195`) — the floor
+/// `proc_alloc_inum` allocates dynamic procfs/nsfs inodes from, which is
+/// what keeps them clear of the reserved block above.
+const PROC_DYNAMIC_FIRST: u32 = 0xF000_0000;
+
+/// The nsfs inode number of the namespace with id `id`.
+///
+/// Derived rather than stored. Linux hands out dynamic inums from an ida,
+/// so an inum is only ever "some unique number above the floor"; NARF's ids
+/// are already dense and monotonic from `init_ns_id::LAST + 1`, so offsetting
+/// them into the dynamic range is unique for the same reason the ida is,
+/// with no second allocator to keep in step with the first.
+///
+/// The wrap at 2^28 namespaces-per-boot matches the ida's own ceiling
+/// (`UINT_MAX - PROC_DYNAMIC_FIRST`), where Linux would start failing to
+/// allocate; nothing reaches it, and an inum is identity for a LIVE
+/// namespace, never a key into anything.
+pub fn ns_inum(id: NsId) -> u32 {
+    match id {
+        init_ns_id::IPC => init_ns_ino::IPC,
+        init_ns_id::UTS => init_ns_ino::UTS,
+        init_ns_id::USER => init_ns_ino::USER,
+        init_ns_id::PID => init_ns_ino::PID,
+        init_ns_id::CGROUP => init_ns_ino::CGROUP,
+        init_ns_id::TIME => init_ns_ino::TIME,
+        init_ns_id::NET => init_ns_ino::NET,
+        init_ns_id::MNT => init_ns_ino::MNT,
+        _ => {
+            let span = u64::from(u32::MAX - PROC_DYNAMIC_FIRST);
+            PROC_DYNAMIC_FIRST + ((id - init_ns_id::LAST) % span) as u32
+        }
+    }
+}
+
 /// `is_ns_init_id` (`include/linux/ns_common.h:23`) — an initial namespace
 /// is identified by its id falling in the reserved block, nothing else.
 /// Id 0 is never assigned and is the ABI's spelling for "unset".
@@ -458,6 +511,74 @@ pub fn ns_tree_entries_from(
     })
 }
 
+/// `__ns_tree_adjoined_rcu` (`kernel/nstree.c:365`) — the next, or previous,
+/// namespace of the SAME flavour in id order.
+///
+/// ```text
+/// if (previous) list = list_bidir_prev_rcu(&ns->ns_tree_node.ns_list_entry);
+/// else          list = list_next_rcu(&ns->ns_tree_node.ns_list_entry);
+/// if (list_is_head(list, &ns_tree->ns_list_head)) return ERR_PTR(-ENOENT);
+/// ```
+///
+/// Linux walks a per-type list, so "next" is implicitly "next of this
+/// flavour"; NARF has one map, so the flavour is a filter. Same answer.
+///
+/// `from` need not itself be in the tree — a caller stepping away from a
+/// namespace that has just been retired still gets the next live one,
+/// which is what keeps a traversal from dead-ending on a race.
+///
+/// Dead entries are skipped. Linux leaves that to the caller
+/// (`get_sequential_mnt_ns` loops on `ns_ref_get` failing), but an entry
+/// whose object is gone is useless to every caller here — it cannot be
+/// upgraded — so skipping it inside composes with the caller's own
+/// permission loop rather than duplicating it.
+pub fn ns_tree_adjoined(from: NsId, ns_type: u32, previous: bool) -> Option<NsTreeEntry> {
+    use core::ops::Bound;
+    read_tree(|m| {
+        let m = m?;
+        let matches = |e: &&NsTreeEntry| {
+            (ns_type == 0 || e.ns_type & ns_type != 0) && e.object.strong_count() > 0
+        };
+        if previous {
+            m.range((Bound::Unbounded, Bound::Excluded(from)))
+                .rev()
+                .map(|(_, e)| e)
+                .find(matches)
+                .cloned()
+        } else {
+            m.range((Bound::Excluded(from), Bound::Unbounded))
+                .map(|(_, e)| e)
+                .find(matches)
+                .cloned()
+        }
+    })
+}
+
+/// `lookup_ns_id_at` / `lookup_ns_owner_at` (`kernel/nstree.c:624`, `:462`)
+/// — the smallest id `>= at` that the SELECTED TREE holds.
+///
+/// Deliberately narrower than [`ns_tree_entries_from`]: it applies only the
+/// constraint the tree being walked carries — a single type for
+/// single-type global mode, an owner for owner mode, and NOTHING for the
+/// unified tree — never the caller's full type mask and never the
+/// visibility check. `listns` decides its cursor ENOENT on exactly this,
+/// so the two must not be conflated: a cursor past the last element of a
+/// FILTERED enumeration is an empty success, not an end-of-list error.
+///
+/// Both Linux functions end in `ns_get_unless_inactive`, hence the
+/// liveness filter here.
+pub fn ns_tree_first_at(at: NsId, ns_type: u32, owner_user_ns: Option<NsId>) -> Option<NsId> {
+    read_tree(|m| {
+        m?.range(at..)
+            .find(|(_, e)| {
+                (ns_type == 0 || e.ns_type & ns_type != 0)
+                    && owner_user_ns.is_none_or(|o| e.owner_user_ns == o)
+                    && e.object.strong_count() > 0
+            })
+            .map(|(&id, _)| id)
+    })
+}
+
 /// How many namespaces the tree holds — diagnostics and tests.
 #[doc(hidden)]
 pub fn ns_tree_len() -> usize {
@@ -478,6 +599,9 @@ macro_rules! impl_ns_object {
     ($ty:ty, $kind:expr) => {
         impl narf_filesystem::NsObject for $ty {
             fn as_any(&self) -> &dyn core::any::Any {
+                self
+            }
+            fn into_any_arc(self: Arc<Self>) -> Arc<dyn core::any::Any + Send + Sync> {
                 self
             }
             fn ns_id(&self) -> u64 {
@@ -573,6 +697,13 @@ impl NsFlavour {
     /// The `CLONE_NEW*` bit a `setns(fd, nstype)` would pass to select
     /// this flavour. `0` means "any nstype is accepted" (Linux allows
     /// `setns(fd, 0)` to join every namespace the fd names).
+    /// `ns_common.ns_type` — the `CLONE_NEW*` bit as `enum ns_type` spells
+    /// it. Same value as [`Self::clone_flag`], in the width the nsfs ABI
+    /// and the tree both use.
+    pub fn ns_type(self) -> u32 {
+        self.clone_flag() as u32
+    }
+
     pub fn clone_flag(self) -> u64 {
         match self {
             NsFlavour::Uts => CLONE_NEWUTS,
@@ -1642,11 +1773,13 @@ impl narf_filesystem::FileOps for NsFd {
         Box::pin(async move { Err(narf_filesystem::FsError::ReadOnly) })
     }
     fn stat(&self) -> narf_filesystem::Stat {
-        // Report the ns id in `size` so `st_ino` (synthesised from
-        // size in the stat syscall) carries the namespace identity —
-        // two fds naming the same ns then stat() equal.
+        // Report the nsfs INODE number in `size` so `st_ino` (synthesised
+        // from size in the stat syscall) carries the namespace identity —
+        // two fds naming the same ns then stat() equal. The id would do as
+        // well for that, but `st_ino` is what `ns_match` and the nsfs file
+        // handle compare, so it should be the number Linux puts there.
         narf_filesystem::Stat {
-            size: self.held.id(),
+            size: u64::from(crate::namespaces::ns_inum(self.held.id())),
             blocks: 0,
             mode: narf_filesystem::Mode {
                 file_type: narf_filesystem::FileType::Special,
@@ -1658,6 +1791,103 @@ impl narf_filesystem::FileOps for NsFd {
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
     }
+}
+
+/// Recover the owning `Arc<UserNamespace>` for a user-namespace id.
+///
+/// `None` for an id that names nothing, or names something of another
+/// flavour — the same "resolve before you trust it" rule `listns`'s owner
+/// filter follows.
+pub fn user_ns_by_id(id: NsId) -> Option<Arc<UserNamespace>> {
+    let live = ns_tree_lookup_object(id)?;
+    if live.ns_type != ns_type::USER {
+        return None;
+    }
+    live.object.into_any_arc().downcast::<UserNamespace>().ok()
+}
+
+/// `ns->ops->owner(ns)` — the user namespace a namespace belongs to.
+///
+/// `None` only for the initial user namespace, whose owner is its own
+/// absent parent; Linux says the same thing with `userns_owner`'s
+/// `to_user_ns(ns)->parent` and reports it as -EPERM at the one caller that
+/// asks (`ns_get_owner`). Every other flavour falls back to the initial
+/// user namespace, which is what `owner_user_ns()` already spells.
+pub fn owner_user_ns_of(held: &HeldNs) -> Option<Arc<UserNamespace>> {
+    match held {
+        HeldNs::Uts(n) => Some(n.owner_user_ns()),
+        HeldNs::Net(n) => Some(n.owner_user_ns()),
+        HeldNs::Ipc(n) => Some(n.owner_user_ns()),
+        HeldNs::Pid(n) => Some(n.owner_user_ns()),
+        HeldNs::Mnt(n) => Some(owner_by_ns_id(n.owner().map(|o| o.ns_id()))),
+        #[cfg(feature = "cgroup")]
+        HeldNs::Cgroup(n) => Some(owner_by_ns_id(n.owner().map(|o| o.ns_id()))),
+        HeldNs::User(n) => n.parent().cloned(),
+    }
+}
+
+/// The filesystem-side namespaces record their owner as an id (the crate
+/// sits below `UserNamespace` and cannot name the type), so resolving one
+/// goes through the tree. An absent or unresolvable owner is the initial
+/// user namespace — the tree's `0` already means exactly that.
+fn owner_by_ns_id(id: Option<NsId>) -> Arc<UserNamespace> {
+    id.filter(|&i| i != 0)
+        .and_then(user_ns_by_id)
+        .unwrap_or_else(global_user)
+}
+
+/// Rebuild a [`HeldNs`] from a live tree object.
+///
+/// The tree stores one uniform handle; an ns-fd needs the concrete
+/// namespace, and needs to OWN it. `None` for a flavour this kernel does
+/// not model, which is `nsfs_fh_to_dentry`'s `-EOPNOTSUPP` arm.
+pub fn held_from_ns_object(
+    object: &Arc<dyn narf_filesystem::NsObject>,
+    ns_type: u32,
+) -> Option<HeldNs> {
+    let any = object.clone().into_any_arc();
+    match ns_type {
+        t if t == ns_type::UTS => any.downcast::<UtsNamespace>().ok().map(HeldNs::Uts),
+        t if t == ns_type::NET => any.downcast::<NetNamespace>().ok().map(HeldNs::Net),
+        t if t == ns_type::IPC => any.downcast::<IpcNamespace>().ok().map(HeldNs::Ipc),
+        t if t == ns_type::USER => any.downcast::<UserNamespace>().ok().map(HeldNs::User),
+        t if t == ns_type::PID => any
+            .downcast::<crate::pid_ns::PidNamespace>()
+            .ok()
+            .map(HeldNs::Pid),
+        t if t == ns_type::MNT => any
+            .downcast::<narf_filesystem::MountNamespace>()
+            .ok()
+            .map(HeldNs::Mnt),
+        #[cfg(feature = "cgroup")]
+        t if t == ns_type::CGROUP => any
+            .downcast::<narf_filesystem::cgroupfs::CgroupNamespace>()
+            .ok()
+            .map(HeldNs::Cgroup),
+        _ => None,
+    }
+}
+
+/// `is_current_namespace` (`fs/nsfs.c:479`) — is `task` IN this namespace?
+///
+/// Linux dispatches on the flavour to `current_in_namespace(ns)`, which is
+/// a pointer comparison against the matching slot of `current->nsproxy`
+/// (with `task_active_pid_ns` for PID and `current_user_ns()` for USER).
+/// Ids are globally unique, so comparing them says the same thing.
+pub fn task_is_in_namespace(task: u64, held: &HeldNs) -> bool {
+    let mine = match held.flavour() {
+        NsFlavour::Uts => current_uts_ns(task).id(),
+        NsFlavour::Net => current_net_ns(task).map_or(init_ns_id::NET, |n| n.id()),
+        NsFlavour::Ipc => current_ipc_ns(task).map_or(init_ns_id::IPC, |n| n.id()),
+        NsFlavour::Pid => crate::pid_ns::ns_of(task).map_or(init_ns_id::PID, |n| n.id()),
+        NsFlavour::User => current_user_ns(task).id(),
+        NsFlavour::Mnt | NsFlavour::Cgroup => {
+            // Both live in `narf-filesystem` and are bridged by the
+            // handlers layer, which owns the per-task tables for them.
+            return crate::handlers::task_is_in_fs_namespace(task, held);
+        }
+    };
+    mine == held.id()
 }
 
 /// Mint an ns-fd for `task`'s current namespace of `flavour`. Returns
