@@ -996,6 +996,70 @@ fn smoke_abi_pathx_openat2_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_neg);
 
+/// Regression: `openat2` with a real dirfd + a RELATIVE path under
+/// `RESOLVE_IN_ROOT` must resolve ONCE, rooted at the dirfd — not double-root
+/// it. `sys_openat` already joins the relative path onto the dirfd (`/p2/f`);
+/// the in-root prefix then re-prepended the dirfd path, yielding `/p2/p2/f` →
+/// spurious ENOENT. That double-prefix failed systemd's ProtectKernelTunables
+/// (`openat2(dirfd=mount-rootfs, "proc/sys/kernel/domainname",
+/// RESOLVE_IN_ROOT)`) and with it every sandboxed daemon — dbus-broker,
+/// logind, udevd, userdbd all `EXIT_NAMESPACE` — so the KDE greeter never got
+/// a system bus. Linux resolves such a path once, rooted at the dirfd.
+fn smoke_abi_pathx_openat2_in_root_dirfd_relative() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const RESOLVE_IN_ROOT: u64 = 0x10;
+        let dir = b"/p2\0";
+        let dfd = match call_open(dir.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p2, O_PATH) as dirfd failed"),
+        };
+        // struct open_how { u64 flags=O_RDONLY(0); u64 mode=0; u64 resolve; }
+        let mut how = [0u8; 24];
+        how[16..24].copy_from_slice(&RESOLVE_IN_ROOT.to_ne_bytes());
+        let leaf = b"f\0";
+        match call(
+            Syscall::Openat2.raw(),
+            a3(dfd, leaf.as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) {
+            Some(fd) if fd >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                Ok(())
+            }
+            _ => Err(
+                "openat2(dirfd, relative, RESOLVE_IN_ROOT) must resolve rooted at the dirfd, not double-root to ENOENT",
+            ),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_in_root_dirfd_relative);
+
+/// Guard: the double-prefix fix must not weaken scoping. A lexically-escaping
+/// `..` under `RESOLVE_BENEATH` is still -EXDEV.
+fn smoke_abi_pathx_openat2_beneath_escape_is_exdev() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const RESOLVE_BENEATH: u64 = 0x08;
+        const EXDEV: i64 = -18;
+        let dir = b"/p2\0";
+        let dfd = match call_open(dir.as_ptr() as u64, O_PATH) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("open(/p2, O_PATH) as dirfd failed"),
+        };
+        let mut how = [0u8; 24];
+        how[16..24].copy_from_slice(&RESOLVE_BENEATH.to_ne_bytes());
+        let leaf = b"../p2/f\0";
+        match call(
+            Syscall::Openat2.raw(),
+            a3(dfd, leaf.as_ptr() as u64, how.as_ptr() as u64, 24),
+        ) {
+            Some(v) if v == EXDEV => Ok(()),
+            _ => Err("openat2(RESOLVE_BENEATH) with an escaping .. was not -EXDEV"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_beneath_escape_is_exdev);
+
 // ── readlinkat (dirfd, NUL-term path, buf, buflen) → len / -1 ──────
 //
 // Resolves a symlink and copies its target into buf, returning the byte

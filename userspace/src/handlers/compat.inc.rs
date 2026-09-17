@@ -573,8 +573,25 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
     let path_owned;
     let path = if scope.as_ref().is_some_and(|s| s.in_root) && path.starts_with('/') {
         let root = &scope.as_ref().expect("checked").root;
-        path_owned = normalize_abs(&alloc::format!("{root}/{path}"));
-        path_owned.as_str()
+        // `openat2` reaches here with the path ALREADY joined onto the dirfd
+        // by `sys_openat` (a relative openat2 path is resolved below the
+        // directory it names), and `path`, `root`, and the resolver all speak
+        // the same post-chroot view. So a relative input arrives already
+        // rooted at `root`; prefixing `root` a SECOND time would double it
+        // (`…/mount-rootfs/…/mount-rootfs/…`) and spuriously ENOENT — the
+        // regression that failed every sandboxed daemon's ProtectKernelTunables
+        // (`openat2(dirfd=mount-rootfs, "proc/sys/kernel/domainname",
+        // RESOLVE_IN_ROOT)`), taking down dbus-broker/logind/udevd/userdbd.
+        // Linux resolves such a path exactly once, rooted at the dirfd. Only a
+        // genuinely-absolute input that is NOT already under the root still
+        // needs the in-root prefix; `..`/symlink escapes are caught by the
+        // within-root check in `finish` below regardless.
+        if path_is_within(path, root) {
+            path
+        } else {
+            path_owned = normalize_abs(&alloc::format!("{root}/{path}"));
+            path_owned.as_str()
+        }
     } else {
         path
     };
