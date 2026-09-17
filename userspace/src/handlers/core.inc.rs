@@ -1120,6 +1120,17 @@ fn open_impl(
             return;
         }
     }
+    // Linux's `FD_ADD(flags, do_file_open(...))` reserves the lowest-free fd
+    // before evaluating path lookup or O_CREAT. Apart from preserving exact
+    // EMFILE precedence, that ordering is transactional: descriptor exhaustion
+    // must not create an inode which the caller never received an fd for.
+    let reservation = match fd::reserve(current_task_id()) {
+        Some(reservation) => reservation,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            return;
+        }
+    };
     // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR), O_PATH identity, and
     // the settable status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
     // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
@@ -1197,7 +1208,7 @@ fn open_impl(
         let proc_prefix = apply_chroot("/proc");
         if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
             let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
-            let new_fd = fd::install(task, crate::fd::FdEntry {
+            let new_fd = reservation.install(crate::fd::FdEntry {
                     ops,
                     offset: 0,
                     flags: 0,
@@ -1241,7 +1252,7 @@ fn open_impl(
                         return;
                     }
                 };
-                let new_fd = fd::install(task, crate::fd::FdEntry {
+                let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
                         flags: 0,
@@ -1292,7 +1303,7 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
                     return;
                 }
-                let new_fd = fd::install(task, crate::fd::FdEntry {
+                let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: lops,
                         offset: 0,
                         flags: 0,
@@ -1367,7 +1378,7 @@ fn open_impl(
         .unwrap_or(false);
     if fast_create.is_none() && (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
-            let new_fd = fd::install(task, crate::fd::FdEntry {
+            let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
                     flags: 0,
@@ -1779,11 +1790,12 @@ fn open_impl(
             access_mode,
             nonblock,
             path,
+            reservation,
         );
         return;
     }
 
-    let new_fd = match fd::install(task, crate::fd::FdEntry {
+    let new_fd = match reservation.install(crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
@@ -1841,6 +1853,7 @@ fn open_fifo(
     access_mode: u64,
     nonblock: bool,
     _path: &str,
+    reservation: fd::FdReservation,
 ) {
     let task = current_task_id();
     let can_read = access_mode == 0 || access_mode == 2; // O_RDONLY | O_RDWR
@@ -1868,7 +1881,7 @@ fn open_fifo(
         can_write,
     )) as Arc<dyn narf_filesystem::FileOps>;
     let status_flags = access_mode as u32 | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-    let new_fd = match fd::install(task, crate::fd::FdEntry {
+    let new_fd = match reservation.install(crate::fd::FdEntry {
             ops: handle,
             offset: 0,
             flags: 0,

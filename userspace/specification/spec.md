@@ -561,7 +561,9 @@ truncated output still reports the full address length.
 normalization; an empty path never aliases the current directory. Linux path
 and descriptor failures return their specific errno rather than a bare `-1`:
 in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
-errors, while `newfstatat(2)` distinguishes `EFAULT`, `ENOENT`, `EBADF`,
+errors. Descriptor allocation precedes path lookup and creation, so `EMFILE`
+publishes neither a file descriptor nor an `O_CREAT` inode. `newfstatat(2)`
+distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 `ENOTDIR`, and invalid flag `EINVAL`.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and

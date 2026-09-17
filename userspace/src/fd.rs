@@ -368,6 +368,29 @@ impl FdTable {
         Some(out)
     }
 
+    /// Reserve one lowest-free descriptor without publishing a file.
+    ///
+    /// This is Linux's `get_unused_fd_flags()` half of `FD_ADD`: path lookup
+    /// and `O_CREAT` run only after the descriptor number is secured, so an
+    /// `EMFILE` failure cannot leave a newly-created inode behind.
+    fn reserve_fd(&mut self) -> Option<u32> {
+        let candidate = self.next_free_from(0)? as u32;
+        self.reserved.insert(candidate);
+        self.grow_max_fds_for(candidate as usize);
+        self.next_fd = self.next_fd.saturating_add(1);
+        self.advance_next_fd();
+        Some(candidate)
+    }
+
+    fn install_reserved(&mut self, fd: u32, entry: FdEntry) -> bool {
+        if !self.reserved.contains(&fd) || self.slots.get(fd as usize).is_some_and(Option::is_some)
+        {
+            return false;
+        }
+        self.set(fd, entry);
+        true
+    }
+
     pub(crate) fn install_reserved_batch(&mut self, entries: Vec<(u32, FdEntry)>) -> bool {
         if entries.iter().any(|(fd, _)| {
             !self.reserved.contains(fd) || self.slots.get(*fd as usize).is_some_and(Option::is_some)
@@ -768,6 +791,50 @@ pub fn with_table_alloc<R>(task_id: u64, op: impl FnOnce(&mut FdTable) -> R) -> 
 /// have to reach through [`with_table`] and flatten two layers of `Option`.
 pub fn install(task_id: u64, entry: FdEntry) -> Option<u32> {
     with_table_alloc(task_id, |t| t.open(entry)).flatten()
+}
+
+/// An unpublished descriptor number reserved for one in-flight open.
+///
+/// Dropping the guard rolls the reservation back. Committing publishes the
+/// supplied file at that exact number, preserving Linux's lowest-free rule
+/// even when `CLONE_FILES` siblings allocate concurrently during path I/O.
+#[must_use = "dropping an fd reservation releases it without publishing a file"]
+pub(crate) struct FdReservation {
+    task_id: u64,
+    fd: u32,
+    active: bool,
+}
+
+impl FdReservation {
+    pub(crate) fn install(mut self, entry: FdEntry) -> Option<u32> {
+        let installed = with_table(self.task_id, |table| table.install_reserved(self.fd, entry))
+            .unwrap_or(false);
+        if installed {
+            self.active = false;
+            Some(self.fd)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for FdReservation {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = with_table(self.task_id, |table| table.release_reserved(&[self.fd]));
+        }
+    }
+}
+
+/// Reserve the descriptor number for an `open(2)`-shaped transaction.
+/// `None` is `EMFILE`; no path lookup or filesystem mutation should run.
+pub(crate) fn reserve(task_id: u64) -> Option<FdReservation> {
+    let fd = with_table_alloc(task_id, FdTable::reserve_fd).flatten()?;
+    Some(FdReservation {
+        task_id,
+        fd,
+        active: true,
+    })
 }
 
 /// Install two descriptors that must both exist, or neither.
