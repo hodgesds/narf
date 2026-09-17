@@ -1340,6 +1340,85 @@ kernel_test_in!(
     smoke_abi_ipc_sem_queue_timeout_and_undo_handoff
 );
 
+#[cfg(feature = "kernel-test")]
+fn smoke_abi_ipc_sem_otime_linux_updates() -> TestResult {
+    fn sem_otime(id: u64) -> Result<i64, &'static str> {
+        #[cfg(target_arch = "x86_64")]
+        const SIZE: usize = 104;
+        #[cfg(target_arch = "aarch64")]
+        const SIZE: usize = 88;
+        const OTIME: usize = 48;
+
+        let mut stat = [0u8; SIZE];
+        if call(
+            Syscall::Semctl.raw(),
+            a3(id, 0, IPC_STAT, stat.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("semctl IPC_STAT failed while reading sem_otime");
+        }
+        Ok(i64::from_ne_bytes(
+            stat[OTIME..OTIME + 8].try_into().unwrap(),
+        ))
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        if sem_otime(id)? != 0 {
+            return Err("new semaphore set must have zero sem_otime");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 0)) != Some(0) || sem_otime(id)? != 0 {
+            return Err("SETVAL without a completed waiter must not advance sem_otime");
+        }
+
+        const OWNER: u64 = FAKE_TASK + 38;
+        let mut zero_undo = [0u8; 6];
+        zero_undo[4..6].copy_from_slice(&SEM_UNDO.to_le_bytes());
+        set_task(OWNER);
+        let owner_pid = u64::from(crate::handlers::current_ucred().pid);
+        if call(Syscall::Semop.raw(), a2(id, zero_undo.as_ptr() as u64, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("zero SEM_UNDO setup operation failed");
+        }
+        set_task(FAKE_TASK);
+        if !crate::sysvipc::__test_set_sem_otime(id, 0) {
+            return Err("failed to reset sem_otime test fixture");
+        }
+        crate::sysvipc::sem_undo_process_exit(owner_pid, OWNER);
+        if sem_otime(id)? == 0 {
+            return Err("process exit with an all-zero SEM_UNDO row must advance sem_otime");
+        }
+
+        if !crate::sysvipc::__test_set_sem_otime(id, 0) {
+            return Err("failed to reset sem_otime before waiter test");
+        }
+        const WAITER: u64 = FAKE_TASK + 39;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        set_task(WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("semaphore decrement did not queue for sem_otime test");
+        }
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) || sem_otime(id)? == 0 {
+            return Err("SETVAL completing a waiter must advance sem_otime");
+        }
+        set_task(WAITER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("sem_otime test waiter did not consume cached success");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+#[cfg(feature = "kernel-test")]
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_otime_linux_updates
+);
+
 fn smoke_abi_ipc_sem_exit_undo_is_set_atomic() -> TestResult {
     with_setup(|| {
         let id = make_semset(2)?;

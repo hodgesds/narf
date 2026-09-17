@@ -288,6 +288,8 @@ type SemWaitBlocker = (usize, bool); // (sem_num, waits-for-zero)
 type SemOpFailure = (i64, bool, Option<SemWaitBlocker>); // (errno, terminal, blocker)
 /// (nsops, timeout, linked, terminal result)
 type SemStagedSnapshot = (usize, Option<(i64, i64)>, bool, Option<i64>);
+/// (task id, installed waker, successful semaphore handoff)
+type SemWake = (u64, Waker, bool);
 
 struct SemWait {
     task: u64,
@@ -619,6 +621,30 @@ fn unlink_sem_wake(state: &mut SemWaitState, index: usize) {
     state.waits[index].wake_next = None;
 }
 
+fn take_sem_wake(state: &mut SemWaitState) -> Option<SemWake> {
+    let task = state.wake_head?;
+    let index =
+        sem_wait_index(&state.waits, task).expect("queued SysV semaphore waker disappeared");
+    let successful_handoff = state.waits[index].result == Some(0);
+    unlink_sem_wake(state, index);
+    Some((
+        task,
+        state.waits[index]
+            .waker
+            .take()
+            .expect("queued SysV semaphore wait lost its waker"),
+        successful_handoff,
+    ))
+}
+
+fn dispatch_sem_wake((task, waker, successful_handoff): SemWake) {
+    if successful_handoff {
+        narf_scheduler::wake_urgent_task(&waker, task);
+    } else {
+        waker.wake();
+    }
+}
+
 fn sem_undo_index(undos: &SemUndoTable, owner: u64) -> Result<usize, usize> {
     undos.binary_search_by_key(&owner, |undo| undo.owner)
 }
@@ -662,6 +688,15 @@ pub(crate) fn __test_sem_set_count() -> usize {
             .unwrap_or_default()
             .set_count
     })
+}
+
+#[cfg(feature = "kernel-test")]
+pub(crate) fn __test_set_sem_otime(id: u64, otime: i64) -> bool {
+    let Some(set_ref) = lookup_sem_set((current_ipc_namespace_id(), id)) else {
+        return false;
+    };
+    set_ref.lock().otime = otime;
+    true
 }
 
 /// Prove distinct semaphore arrays have independently acquirable mutation
@@ -1841,7 +1876,12 @@ pub(crate) fn sem_undo_process_exit(pid: u64, _tid: u64) {
             }
         }
         if changed && set.pending_head.is_some() {
-            with_sem_wait_state(object, |state| scan_sem_waiters(&mut set, state));
+            let _ = with_sem_wait_state(object, |state| scan_sem_waiters(&mut set, state));
+        }
+        if undo.is_some() {
+            // Linux passes otime=1 to do_smart_update() for every process-exit
+            // undo row, including an all-zero vector with no queued waiter.
+            set.otime = now_seconds();
         }
         drop(set);
         drop(undo);
@@ -1957,7 +1997,6 @@ fn perform_sem_ops(
         let (num, _, _) = parse_sem_op(sops, i);
         set.pids[num] = pid;
     }
-    set.otime = now_seconds();
     Ok(())
 }
 
@@ -1972,6 +2011,8 @@ fn perform_semop_locked(
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
+    first_wake: &mut Option<SemWake>,
+    more_wakes: &mut bool,
 ) -> Result<(), SemOpFailure> {
     let needs_write = (0..nsops).any(|i| parse_sem_op(sops, i).1 != 0);
     let request = if needs_write { 0o2 } else { 0o4 };
@@ -1997,8 +2038,21 @@ fn perform_semop_locked(
         return Err((EACCES, true, None));
     }
     let result = perform_sem_ops(set, sops, nsops, pid, undo_owner);
-    if result.is_ok() && set.pending_head.is_some() {
-        with_sem_wait_state(object, |state| scan_sem_waiters(set, state));
+    if result.is_ok() {
+        if set.pending_head.is_some() {
+            let (wake, more) = with_sem_wait_state(object, |state| {
+                let _ = scan_sem_waiters(set, state);
+                let wake = take_sem_wake(state);
+                (wake, state.wake_head.is_some())
+            });
+            *first_wake = wake;
+            *more_wakes = more;
+        }
+        // Linux's do_smart_update() timestamps the complete atomic update
+        // once, after it has consumed every newly-satisfiable waiter.  A
+        // waiter completed by this operation is part of the same update, not
+        // a second clock observation.
+        set.otime = now_seconds();
     }
     result
 }
@@ -2081,24 +2135,9 @@ fn queue_new_sem_wait_locked(
 
 fn drain_sem_wakes(object: IpcObjectKey) {
     loop {
-        let wake = with_sem_wait_state(object, |state| {
-            let task = state.wake_head?;
-            let index = sem_wait_index(&state.waits, task)
-                .expect("queued SysV semaphore waker disappeared");
-            let successful_handoff = state.waits[index].result == Some(0);
-            unlink_sem_wake(state, index);
-            Some((
-                task,
-                state.waits[index]
-                    .waker
-                    .take()
-                    .expect("queued SysV semaphore wait lost its waker"),
-                successful_handoff,
-            ))
-        });
+        let wake = with_sem_wait_state(object, take_sem_wake);
         match wake {
-            Some((task, waker, true)) => narf_scheduler::wake_urgent_task(&waker, task),
-            Some((_, waker, false)) => waker.wake(),
+            Some(wake) => dispatch_sem_wake(wake),
             None => break,
         }
     }
@@ -2107,7 +2146,8 @@ fn drain_sem_wakes(object: IpcObjectKey) {
 /// Complete every currently eligible waiter before exposing the mutation.
 /// The queue is scanned in insertion order, but an unsatisfied entry is
 /// skipped, matching Linux rather than imposing head-of-line blocking.
-fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) {
+fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) -> bool {
+    let mut completed = false;
     loop {
         let pass_tail = set.pending_tail;
         let mut altered = false;
@@ -2134,6 +2174,7 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) {
             let result = perform_sem_ops(set, wait.sops.as_slice(), nsops, pid, undo_owner);
             match result {
                 Ok(()) => {
+                    completed = true;
                     if let Some(blocker) = old_blocker {
                         adjust_wait_count(set, blocker, false);
                     }
@@ -2186,6 +2227,7 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) {
             break;
         }
     }
+    completed
 }
 
 fn complete_sem_set_waits(
@@ -2889,7 +2931,8 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     let has_undo = (0..nsops).any(|i| parse_sem_op(buf, i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
     let set_ref = lookup_sem_set(object);
-    let mut scanned_waiters = false;
+    let mut first_wake = None;
+    let mut more_wakes = false;
     enum SemopStart {
         Complete(Result<(), SemOpFailure>),
         Queued,
@@ -2904,7 +2947,6 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 // Linux find_alloc_undo() creates one dense per-set adjustment array
                 // before EFBIG and permission validation.  Do the same, including for
                 // a zero operation carrying SEM_UNDO, so ENOMEM has Linux precedence.
-                let had_pending = set.pending_head.is_some();
                 let result = if let Some(owner) = undo_owner {
                     if let Err(errno) = ensure_sem_undo_set(&mut set, owner) {
                         Err((errno, true, None))
@@ -2919,6 +2961,8 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                             caller_uid,
                             caller_gid,
                             &caller_groups,
+                            &mut first_wake,
+                            &mut more_wakes,
                         )
                     }
                 } else {
@@ -2932,6 +2976,8 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                         caller_uid,
                         caller_gid,
                         &caller_groups,
+                        &mut first_wake,
+                        &mut more_wakes,
                     )
                 };
                 match result {
@@ -2945,10 +2991,7 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                             Err(errno) => SemopStart::Complete(Err((errno, true, None))),
                         },
                     },
-                    result => {
-                        scanned_waiters = had_pending && result.is_ok();
-                        SemopStart::Complete(result)
-                    }
+                    result => SemopStart::Complete(result),
                 }
             }
         }
@@ -2981,7 +3024,10 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
             return;
         }
     };
-    if scanned_waiters {
+    if let Some(wake) = first_wake {
+        dispatch_sem_wake(wake);
+    }
+    if more_wakes {
         drain_sem_wakes(object);
     }
     match result {
@@ -3260,8 +3306,12 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                 for undo in &mut set.undos {
                     undo.adjustments[semnum] = 0;
                 }
-                if set.pending_head.is_some() {
-                    with_sem_wait_state(object, |state| scan_sem_waiters(set, state));
+                if set.pending_head.is_some()
+                    && with_sem_wait_state(object, |state| scan_sem_waiters(set, state))
+                {
+                    // SETVAL changes sem_ctime. sem_otime changes only if the
+                    // new value lets a queued operation complete.
+                    set.otime = now_seconds();
                 }
                 Ok(())
             });
@@ -3382,8 +3432,12 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                     for undo in &mut set.undos {
                         undo.adjustments.fill(0);
                     }
-                    if set.pending_head.is_some() {
-                        with_sem_wait_state(object, |state| scan_sem_waiters(&mut set, state));
+                    if set.pending_head.is_some()
+                        && with_sem_wait_state(object, |state| scan_sem_waiters(&mut set, state))
+                    {
+                        // As in Linux do_smart_update(..., otime=0), SETALL
+                        // advances sem_otime only for a completed waiter.
+                        set.otime = now_seconds();
                     }
                     Ok(())
                 }
