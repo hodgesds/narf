@@ -46,7 +46,7 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
 pub fn wake_signal(task_id: u64) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
-    crate::user_task::with_user_task_ctx(task_id, |uctx| {
+    let sem_wait = crate::user_task::with_user_task_ctx(task_id, |uctx| {
         // Clear the park deadline so the woken task re-executes its syscall (and
         // re-checks the signal) NOW instead of sleeping to the ~1-tick wheel
         // backstop. Two cases, mirroring the io-waiter wake `wake_one`:
@@ -62,6 +62,12 @@ pub fn wake_signal(task_id: u64) {
         if deadline == u64::MAX || uctx.sigwait_set.load(Ordering::Acquire) != 0 {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
+        uctx.sem_wait_pending.load(Ordering::Acquire).then(|| {
+            (
+                uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
+                uctx.sem_wait_id.load(Ordering::Relaxed),
+            )
+        })
     });
     let waker = {
         let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
@@ -69,6 +75,9 @@ pub fn wake_signal(task_id: u64) {
     };
     if let Some(w) = waker {
         w.wake();
+    }
+    if let Some(Some((ipc_ns, id))) = sem_wait {
+        crate::sysvipc::wake_sem_waiter_for_signal(task_id, ipc_ns, id);
     }
 }
 

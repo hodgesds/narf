@@ -1078,6 +1078,74 @@ kernel_test_in!(
     smoke_abi_ipc_sem_queue_handoff_order_and_waker_dedupe
 );
 
+/// Infinite semop waits use their queue-local waker for both semaphore and
+/// signal readiness.  A signal wake must borrow that registration rather than
+/// consume it: a semaphore completion racing immediately afterward still has
+/// to publish and wake the successful terminal result.
+fn smoke_abi_ipc_sem_signal_wake_preserves_completion() -> TestResult {
+    use alloc::task::Wake;
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    struct CountWake(AtomicU32);
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    with_setup(|| {
+        let id = make_semset(1)?;
+        const WAITER: u64 = FAKE_TASK + 23;
+        let mut decrement = [0u8; 6];
+        decrement[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+
+        set_task(WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, decrement.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("semaphore signal-wake waiter did not queue");
+        }
+        let wakes = Arc::new(CountWake(AtomicU32::new(0)));
+        if crate::sysvipc::register_sem_wait_waker(
+            WAITER,
+            core::task::Waker::from(Arc::clone(&wakes)),
+        ) != crate::sysvipc::SemParkState::Pending
+        {
+            set_task(FAKE_TASK);
+            return Err("semaphore signal-wake waiter rejected waker registration");
+        }
+
+        let ipc_ns = crate::sysvipc::current_ipc_namespace_id();
+        crate::sysvipc::wake_sem_waiter_for_signal(WAITER, ipc_ns, id);
+        if wakes.0.load(Ordering::Relaxed) != 1 {
+            set_task(FAKE_TASK);
+            return Err("signal path did not wake the durable semaphore waiter");
+        }
+
+        set_task(FAKE_TASK);
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("SETVAL failed after semaphore signal wake");
+        }
+        if wakes.0.load(Ordering::Relaxed) != 2 {
+            return Err("signal wake consumed the semaphore completion waker");
+        }
+        set_task(WAITER);
+        if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+            set_task(FAKE_TASK);
+            return Err("signal/completion race lost the successful semop result");
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_signal_wake_preserves_completion
+);
+
 /// A single value transition can complete several semaphore operations.  The
 /// allocation-free wake queue must preserve the set's handoff order rather
 /// than the task-id order used by the global registration index.

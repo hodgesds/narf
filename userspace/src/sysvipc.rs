@@ -126,12 +126,12 @@ impl IpcIdTable {
 }
 
 #[cfg(feature = "container")]
-fn current_ipc_namespace_id() -> u64 {
+pub(crate) fn current_ipc_namespace_id() -> u64 {
     crate::namespaces::current_ipc_namespace_id(crate::handlers::current_task_id())
 }
 
 #[cfg(not(feature = "container"))]
-fn current_ipc_namespace_id() -> u64 {
+pub(crate) fn current_ipc_namespace_id() -> u64 {
     0
 }
 
@@ -2447,6 +2447,21 @@ pub(crate) fn register_sem_wait_waker_at(
     drop(replaced);
     drop(incoming);
     park_state
+}
+
+/// Wake an infinite semaphore wait through its durable queue-local waker.
+/// Signal delivery uses this instead of duplicating the same scheduler waker
+/// in the generic signal registry.  Cloning under the wait-state lock closes
+/// the completion race; the actual wake remains outside the IRQ-safe lock.
+pub(crate) fn wake_sem_waiter_for_signal(task: u64, ipc_ns: u64, id: u64) {
+    let waker = with_sem_wait_state((ipc_ns, id), |state| {
+        sem_wait_index(&state.waits, task)
+            .ok()
+            .and_then(|index| state.waits[index].waker.as_ref().cloned())
+    });
+    if let Some(waker) = waker {
+        waker.wake();
+    }
 }
 
 /// Test/cleanup fallback when no live UserTaskCtx supplies the semid shard.

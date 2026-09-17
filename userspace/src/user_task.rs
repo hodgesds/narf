@@ -930,21 +930,19 @@ fn park_should_block(
             return false;
         }
         uc.sigwait_reserve.store(0, Ordering::Release);
-        crate::handlers::register_signal_waker(task_id, waker.clone());
-        if crate::handlers::is_signal_pending(task_id) {
-            crate::handlers::drop_signal_waker(task_id);
-            uc.sleep_deadline_ns.store(0, Ordering::Release);
-            return false;
-        }
-        return match crate::sysvipc::register_sem_wait_waker_at(
+        let park_state = crate::sysvipc::register_sem_wait_waker_at(
             task_id,
             uc.sem_wait_ipc_ns.load(Ordering::Relaxed),
             uc.sem_wait_id.load(Ordering::Relaxed),
             waker.clone(),
-        ) {
+        );
+        if crate::handlers::is_signal_pending(task_id) {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            return false;
+        }
+        return match park_state {
             crate::sysvipc::SemParkState::Pending => true,
             crate::sysvipc::SemParkState::Ready | crate::sysvipc::SemParkState::NotWaiting => {
-                crate::handlers::drop_signal_waker(task_id);
                 uc.sem_wait_pending.store(false, Ordering::Release);
                 uc.sleep_deadline_ns.store(0, Ordering::Release);
                 false
