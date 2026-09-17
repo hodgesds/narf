@@ -905,13 +905,22 @@ pub(crate) fn with_scheduler<R>(cpu: CpuId, f: impl FnOnce(Option<&dyn Scheduler
 /// policies whose ordering the core can validate without invoking a callback.
 /// External policies must observe every dispatch and therefore always return
 /// through the executor.
-pub(crate) fn direct_handoff_allowed(cpu: CpuId) -> bool {
-    with_scheduler(cpu, |scheduler| {
-        scheduler.is_none_or(|scheduler| {
-            scheduler.type_id() == TypeId::of::<ClassScheduler>()
-                || scheduler.type_id() == TypeId::of::<FifoScheduler>()
-        })
+pub(crate) fn policy_allows_direct_handoff(scheduler: Option<&dyn Scheduler>) -> bool {
+    scheduler.is_none_or(|scheduler| {
+        scheduler.type_id() == TypeId::of::<ClassScheduler>()
+            || scheduler.type_id() == TypeId::of::<FifoScheduler>()
     })
+}
+
+pub(crate) fn direct_handoff_allowed(cpu: CpuId) -> bool {
+    with_scheduler(cpu, policy_allows_direct_handoff)
+}
+
+/// Best-effort direct-handoff policy check for a remote CPU. Contention must
+/// decline rather than spin because callers can be in another CPU's syscall
+/// wake path with interrupts disabled by an unrelated provider lock.
+pub(crate) fn try_direct_handoff_allowed(cpu: CpuId) -> bool {
+    try_with_scheduler(cpu, policy_allows_direct_handoff).unwrap_or(false)
 }
 
 /// Non-blocking `with_scheduler`: run `f` against `cpu`'s policy slot only if

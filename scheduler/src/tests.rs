@@ -7,6 +7,28 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_scheduler_steal_leaves_runnable_on_victim() -> TestResult {
+    if crate::victim_has_stealable_surplus(false, 0)
+        || crate::victim_has_stealable_surplus(false, 1)
+        || crate::victim_has_stealable_surplus(true, 0)
+    {
+        return TestResult::Fail("idle steal could empty the victim's runnable work");
+    }
+    if !crate::victim_has_stealable_surplus(false, 2)
+        || !crate::victim_has_stealable_surplus(true, 1)
+    {
+        return TestResult::Fail("idle steal rejected runnable surplus");
+    }
+    if crate::task_is_migration_hot(0, 10_000, 500)
+        || crate::task_is_migration_hot(9_000, 10_000, 500)
+        || !crate::task_is_migration_hot(9_750, 10_000, 500)
+    {
+        return TestResult::Fail("idle steal cache-hot window was misclassified");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_steal_leaves_runnable_on_victim);
+
 fn smoke_scheduler_parked_idle_leaves_rcu_census() -> TestResult {
     let cpu = narf_lib::percpu::current_cpu();
     if cpu >= 64 {

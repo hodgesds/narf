@@ -1033,5 +1033,29 @@ ref = "security-model/specification/spec.md#L75"
 argument = "Final address-space teardown now retires stable swap PTEs and backend slots through fixed stack batches instead of allocating vectors proportional to the number of swapped pages. Last-Arc ownership and the existing shared-mapping transaction still exclude concurrent VMA mutation; each batch validates and clears its leaves under the root page-table lock, removes the matching authoritative swap records, and retires backend slots before page-table frames can be reused. The change removes an allocation dependency while preserving swap-slot ownership, cgroup uncharge, translation invalidation, and teardown-before-frame-reuse ordering."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The idle-steal floor and cache-hot window remain entirely inside the existing scheduler executor TCB and change only whether an idle CPU may migrate a queued task. They add no trusted subsystem, authority, capability, domain, user entry point, or context-switch destination."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A refused steal leaves the task in its existing owner queue with its WakeCell home, address-space owner, saved domain state, kernel stack, TLS, and FP/SIMD image untouched. The cache-hot timestamp carries no ownership or authority. An admitted steal continues through the existing dequeue, policy notification, enqueue_on re-home, and architecture restore paths; the change cannot bypass capability or domain enforcement."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The victim READY lock serializes the dispatchable-slot count with queued selection and migration; an acquire snapshot of CURRENT_TASK contributes the executing task that Linux includes in rq->nr_running but NARF temporarily removes from READY. Requiring the observed sum to exceed one prevents idle siblings from draining a freshly-woken singleton. A release/acquire last-run timestamp additionally declines cache-hot candidates for Linux's 500 us migration-cost window, including direct handoffs whose slots remain resident. Races can only conservatively retain a task or migrate genuine observed surplus; affinity, budget eligibility, policy allow_steal checks, queue-event ordering, and hot-plug ownership remain unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Remote urgent transfer extends an existing scheduler-executor mechanism without adding a trusted subsystem, public authority, capability, domain, syscall, or arbitrary context-switch destination. Only the exact WakeCell selected by a successful exclusive provider wake can enter the path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The remote target is already switched out with its FPU/SIMD, TLS, kernel-stack continuation, address-space owner, and domain state saved. Its old policy and READY locks authenticate the exact Arc-backed WakeCell, validate affinity/class/priority/budget/donation state, publish the non-dispatchable claim, and emit the migrated dequeue before enqueue_on re-homes the owned slot. The unchanged direct activation then retains both address-space Arcs and restores architecture, domain, FPU/SIMD, TLS, stack, PMU, and task identity before the target's first instruction."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Remote policy or queue contention declines without blocking while provider locks may be held. A declined pre-claim attempt republishes and kicks the WakeCell's authoritative home; an abort after claim re-arms the consumed wake before fallback. The target is never simultaneously dispatchable on two queues, remains within Affinity.allowed, and external policy, period, cap, donation, class, first-run, and execution-kind exclusions remain fail-closed."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The zram encoder scratch buffer and chunked handle index remain private to the backend and are accessed only while the existing ZramInner lock is held. The codec copies exactly its returned byte count into a separately fallible payload allocation before publishing a handle; scratch is reused only after that copy and is never referenced by a live slot. Zpool slot metadata and zram handles grow in fallible page-sized chunks, preserving the same stable u32 handle and swap-slot index while eliminating large contiguous directory reallocations. Chunk, scratch, payload, or batch-bookkeeping allocation failure returns BackendFull through the existing all-or-nothing rollback before any PTE publication, leaving region ownership, swap accounting, and frames unchanged. Successful page-out retains the existing backend-before-PTE, metadata-before-invalidation, and invalidation-before-buddy-return ordering."

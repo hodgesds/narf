@@ -466,8 +466,9 @@ pub fn hint_io_next(task: u64) {
 
 /// Name the target of an urgent synchronous handoff as this CPU's one-shot
 /// next-buddy. Unlike the opt-in generic wake-next experiment, only a wake path
-/// that dequeued a real waiter may use it. A remote target simply fails to
-/// match the local queue and the normal policy chooses instead.
+/// that dequeued a real waiter may use it. This scalar-only helper retains the
+/// local fallback behavior; direct remote transfer requires the owning
+/// `WakeCell` published by `hint_urgent_next_on`.
 pub(crate) fn hint_urgent_next(task: u64) {
     if task == 0 {
         return;
@@ -504,6 +505,14 @@ fn hint_urgent_next_on(home: u32, task: u64, cell: *const WakeCell) {
             }
         }
     }
+}
+
+#[inline]
+pub(crate) fn urgent_wake_targets_cpu(cpu: usize, task: u64) -> bool {
+    task != 0
+        && URGENT_WAKE_NEXT
+            .get(cpu)
+            .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
 }
 
 /// Consume the exact synchronous-wake cell on `cpu`. Used first by a running
@@ -818,6 +827,10 @@ pub(crate) struct WakeCell {
     /// Runtime accumulated while this resident slot ran through a direct
     /// handoff; drained into vruntime on its next ordinary dispatch.
     direct_runtime_cycles: AtomicU64,
+    /// Most recent cycle at which this task returned from execution. Idle
+    /// balancing uses it as Linux's `se.exec_start`-shaped cache-hot signal;
+    /// zero means the task has never run and remains freely placeable.
+    last_run_cycles: AtomicU64,
 }
 
 impl WakeCell {
@@ -834,17 +847,30 @@ pub(crate) struct DirectHandoffTarget {
     pub addr_space: Option<Arc<AddressSpace>>,
 }
 
-/// Claim one exact urgent wakee while its slot remains resident in READY.
-/// Holding the home queue lock makes the false->true claim atomic with respect
-/// to local dispatch and stealing; the executor treats a claimed slot as not
-/// runnable until the target switches back to the root executor continuation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn direct_handoff_slot_eligible(slot: &TaskSlot, destination: CpuId) -> bool {
+    slot.awake.executor_runnable()
+        && slot.spec.affinity.allowed.contains(destination)
+        && slot.spec.class == SchedClass::Default
+        && slot.spec.priority == Priority::NORMAL
+        && slot.spec.budget == ResourceBudget::unthrottled()
+        && slot.spec.budget_cap.is_none()
+        && slot.donation.is_none()
+}
+
+/// Claim one exact urgent wakee for direct execution on `cpu`.
+///
+/// A local target remains resident in its queue. A remote target is removed
+/// under its home policy/queue locks, claimed before those locks are released,
+/// and re-enqueued on the source CPU while non-dispatchable. That keeps queue
+/// ownership and policy lifecycle explicit while preventing either executor or
+/// an idle thief from racing the cross-CPU handoff.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn claim_direct_handoff_target(
     cpu: usize,
-    cell: Arc<WakeCell>,
+    cell: &Arc<WakeCell>,
 ) -> Option<DirectHandoffTarget> {
     if cpu >= READY.len()
-        || cell.cpu.load(Ordering::Acquire) as usize != cpu
         || !cell.direct_eligible.load(Ordering::Acquire)
         || cell.direct_claimed.load(Ordering::Acquire)
         || !policy::direct_handoff_allowed(CpuId(cpu as u32))
@@ -852,33 +878,81 @@ pub(crate) fn claim_direct_handoff_target(
         return None;
     }
 
-    let mut ready = READY[cpu].lock();
-    let queue = ready.as_mut()?;
-    let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, &cell))?;
-    if !slot.awake.executor_runnable()
-        || slot.spec.class != SchedClass::Default
-        || slot.spec.priority != Priority::NORMAL
-        || slot.spec.budget != ResourceBudget::unthrottled()
-        || slot.spec.budget_cap.is_some()
-        || slot.donation.is_some()
-    {
+    let home = cell.cpu.load(Ordering::Acquire) as usize;
+    if home >= READY.len() {
         return None;
     }
-    let task = cell.stackful.load(Ordering::Acquire);
-    if task.is_null() {
-        return None;
+
+    if home == cpu {
+        let mut ready = READY[cpu].lock();
+        let queue = ready.as_mut()?;
+        let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell))?;
+        if !direct_handoff_slot_eligible(slot, CpuId(cpu as u32)) {
+            return None;
+        }
+        let task = cell.stackful.load(Ordering::Acquire);
+        if task.is_null() {
+            return None;
+        }
+        // The home queue lock excludes every executor removal/steal of this
+        // slot. Publish the claim before consuming the wake bit so all later
+        // scans skip it even if another wake races the direct continuation.
+        cell.direct_claimed.store(true, Ordering::Release);
+        cell.flag.store(false, Ordering::Release);
+        publish_current_sched(cpu, slot);
+        return Some(DirectHandoffTarget {
+            task,
+            id: cell.task,
+            cell: cell.clone(),
+            addr_space: slot.addr_space.clone(),
+        });
     }
-    // The home queue lock excludes every executor removal/steal of this slot.
-    // Publish the claim before consuming the wake bit so all later scans skip
-    // the resident slot even if another wake races the direct continuation.
-    cell.direct_claimed.store(true, Ordering::Release);
-    cell.flag.store(false, Ordering::Release);
-    publish_current_sched(cpu, slot);
-    let addr_space = slot.addr_space.clone();
+
+    let home_id = CpuId(home as u32);
+    let destination = CpuId(cpu as u32);
+    let moved = policy::try_with_scheduler(home_id, |scheduler| {
+        if !policy::policy_allows_direct_handoff(scheduler) {
+            return None;
+        }
+        let mut ready = READY[home].try_lock()?;
+        let queue = ready.as_mut()?;
+        let pos = queue
+            .iter()
+            .position(|slot| Arc::ptr_eq(&slot.awake, cell))?;
+        let slot = &queue[pos];
+        if !direct_handoff_slot_eligible(slot, destination) {
+            return None;
+        }
+        let task = cell.stackful.load(Ordering::Acquire);
+        if task.is_null() {
+            return None;
+        }
+        cell.direct_claimed.store(true, Ordering::Release);
+        cell.flag.store(false, Ordering::Release);
+        publish_current_sched(cpu, slot);
+        let addr_space = slot.addr_space.clone();
+        let slot = queue
+            .remove(pos)
+            .expect("remote direct-handoff position disappeared under queue lock");
+        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
+            scheduler.on_task_queue_event(
+                home_id,
+                policy::TaskQueueEvent::Dequeued {
+                    task: policy::TaskMeta::from_slot(&slot),
+                    reason: policy::TaskDequeueReason::Migrated,
+                },
+            );
+        }
+        Some((slot, task, addr_space))
+    })
+    .flatten()?;
+
+    let (slot, task, addr_space) = moved;
+    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
     Some(DirectHandoffTarget {
         task,
         id: cell.task,
-        cell,
+        cell: cell.clone(),
         addr_space,
     })
 }
@@ -889,6 +963,14 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
         cell.flag.store(true, Ordering::Release);
     }
     cell.direct_claimed.store(false, Ordering::Release);
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn fallback_urgent_wake(cell: &Arc<WakeCell>) {
+    let home = cell.cpu.load(Ordering::Acquire);
+    hint_urgent_next_on(home, cell.task, Arc::as_ptr(cell));
+    resched_remote(home);
+    wake_place_hint(home);
 }
 
 /// Publish a direct target's identity/address space before its continuation is
@@ -930,6 +1012,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         direct_eligible: AtomicBool::new(direct_eligible),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
+        last_run_cycles: AtomicU64::new(0),
     })
 }
 
@@ -3572,17 +3655,37 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
     }
+    let mut defer_home_kick = false;
     if urgent_task == Some(task) {
         // A provider dequeued this exact exclusive waiter. Unlike the generic
-        // opt-in wake-next policy, publish the one-shot hint unconditionally
-        // and on the wakee's home queue, where pick_next_slot will consume it.
-        hint_urgent_next_on(home, task, ptr);
+        // opt-in wake-next policy, publish the one-shot hint unconditionally.
+        // A direct-eligible stackful source may consume a remote target itself:
+        // publish on that source CPU and let the syscall-exit/park boundary
+        // migrate the exact claimed slot before switching. Otherwise retain the
+        // ordinary home-queue hint and wake.
+        let source_cpu = narf_lib::percpu::current_cpu();
+        let direct_source = source_cpu < URGENT_WAKE_NEXT.len()
+            && source_cpu as u32 != home
+            && policy::try_direct_handoff_allowed(CpuId(source_cpu as u32))
+            && stackful::current_stackful_waker()
+                .and_then(|waker| scheduler_wake_cell(&waker))
+                .is_some_and(|source| {
+                    source.task != task && source.direct_eligible.load(Ordering::Acquire)
+                });
+        if direct_source {
+            hint_urgent_next_on(source_cpu as u32, task, ptr);
+            defer_home_kick = true;
+        } else {
+            hint_urgent_next_on(home, task, ptr);
+        }
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
     }
-    resched_remote(home);
-    wake_place_hint(home);
+    if !defer_home_kick {
+        resched_remote(home);
+        wake_place_hint(home);
+    }
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -3841,7 +3944,11 @@ pub fn poll_one_round() -> usize {
         current_task_slot().store(outer_task, Ordering::Release);
         *active_user_as_slot().lock() = outer_as;
         let interrupt_elapsed = accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
-        let elapsed = Instant::now()
+        let end = Instant::now();
+        slot.awake
+            .last_run_cycles
+            .store(end.as_cycles(), Ordering::Release);
+        let elapsed = end
             .cycles_since(start)
             .saturating_sub(interrupt_elapsed)
             .saturating_sub(stackful::take_direct_foreign_cycles());
@@ -4344,7 +4451,11 @@ pub fn run_until_empty() {
             }
             let interrupt_elapsed =
                 accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
-            let elapsed = Instant::now()
+            let end = Instant::now();
+            slot.awake
+                .last_run_cycles
+                .store(end.as_cycles(), Ordering::Release);
+            let elapsed = end
                 .cycles_since(start)
                 .saturating_sub(interrupt_elapsed)
                 .saturating_sub(stackful::take_direct_foreign_cycles());
@@ -5156,6 +5267,22 @@ fn try_steal_one(cpu: usize) -> bool {
     false
 }
 
+/// Whether an idle thief may take one dispatchable slot without emptying the
+/// victim of runnable work. Linux's idle load balancer applies the same floor
+/// through `rq->nr_running <= 1`; NARF's queued count excludes the task
+/// currently executing, so that task must be included explicitly.
+#[inline]
+fn victim_has_stealable_surplus(victim_running: bool, dispatchable: usize) -> bool {
+    dispatchable + usize::from(victim_running) > 1
+}
+
+const MIGRATION_COST_NS: u64 = 500_000;
+
+#[inline]
+fn task_is_migration_hot(last_run: u64, now: u64, migration_cost: u64) -> bool {
+    last_run != 0 && now.saturating_sub(last_run) < migration_cost
+}
+
 /// Inner helper: try to move one strategy-permitted slot from
 /// `victim`'s queue onto `cpu`'s queue. Returns `true` on success.
 /// The `strategy` reference is the snapshot-out Arc from
@@ -5188,15 +5315,32 @@ fn try_steal_from(victim: usize, cpu: usize, strategy: &dyn crate::steal::StealS
         };
         // Linear scan for the first slot the strategy permits. The
         // default impl respects `affinity.allowed`; custom impls may
-        // refuse on class/priority/id.
+        // refuse on class/priority/id. Keep one runnable task on the victim:
+        // otherwise every idle sibling can race the owner for a freshly-woken
+        // singleton and migrate a synchronous endpoint on every handoff.
+        // `CURRENT_TASK` accounts for the running slot that Linux includes in
+        // `rq->nr_running` but NARF removes from READY while it is executing.
         let now = narf_time::now_cycles();
-        let pos = q.iter().position(|s| {
-            if !slot_is_dispatchable(s, now) {
-                return false;
+        let migration_cost = narf_time::ns_to_cycles(MIGRATION_COST_NS);
+        let victim_running = cpu_running_task(victim_id);
+        let mut dispatchable = 0usize;
+        let mut pos = None;
+        for (index, slot) in q.iter().enumerate() {
+            if !slot_is_dispatchable(slot, now) {
+                continue;
             }
-            let meta = crate::policy::TaskMeta::from_slot(s);
-            strategy.allow_steal(thief, &meta)
-        });
+            dispatchable += 1;
+            let last_run = slot.awake.last_run_cycles.load(Ordering::Acquire);
+            if pos.is_none() && !task_is_migration_hot(last_run, now, migration_cost) {
+                let meta = crate::policy::TaskMeta::from_slot(slot);
+                if strategy.allow_steal(thief, &meta) {
+                    pos = Some(index);
+                }
+            }
+        }
+        if !victim_has_stealable_surplus(victim_running, dispatchable) {
+            return None;
+        }
         match pos {
             Some(p) => {
                 let slot = q.remove(p);
@@ -5709,6 +5853,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         direct_eligible: AtomicBool::new(false),
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
+        last_run_cycles: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);
