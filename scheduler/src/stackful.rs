@@ -786,7 +786,7 @@ fn direct_handoff_gate_open(cpu: usize, source: *mut KernelTask) -> bool {
 
 /// Try one transfer inside a bounded task-to-task batch. The target stays
 /// resident in READY under `direct_claimed`; only the fixed root may start the
-/// next transfer, and the batch must cross the executor after eight returns.
+/// next transfer, and the batch must cross the executor after 64 returns.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 unsafe fn try_direct_handoff(
     cpu: usize,
@@ -960,7 +960,7 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
 ///
 /// The root is pinned off-queue by its in-flight executor poll, so it cannot use
 /// the resident-slot claim path. The exact WakeCell comparison substitutes for
-/// that lookup. At most eight such returns are allowed per root poll; the next
+/// that lookup. At most 64 such returns are allowed per root poll; the next
 /// yield must visit the executor, bounding fairness latency and preventing an
 /// exact-wake ping-pong from starving unrelated work or RCU quiescent states.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -1142,8 +1142,8 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
 
 /// Bounded direct-handoff state. A fixed root may alternate with one exact
 /// urgent wakee at a time, but no target may extend the task-stack chain and
-/// the ninth root yield must cross the executor.
-const MAX_DIRECT_ROOT_RETURNS: u32 = 8;
+/// the 65th root yield must cross the executor.
+const MAX_DIRECT_ROOT_RETURNS: u32 = 64;
 
 /// Cache-line-isolated state for one CPU's bounded direct-transfer chain.
 /// Every field is written only by that CPU while a chain is active; keeping

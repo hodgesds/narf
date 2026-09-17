@@ -1007,3 +1007,15 @@ argument = "The CPU-local ACTIVE_USER_AS lock retains the outgoing Arc while the
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "A false narf_lib perf master gate proves that no registered perf event requires switch attribution because first-event publication enables that same gate. A true or conservatively stale gate still calls the existing userspace hook, whose live-event refcount remains authoritative; active-event accounting, PMU programming, rollback, and task identity are unchanged. The shortcut neither exposes scheduling metadata nor alters which task runs."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Increasing the existing direct-return batch bound changes only how often an authenticated fixed-root/exact-wakee pair re-enters the executor. It adds no trusted subsystem, authority, capability, mapping, domain transition, or task-selection destination."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Every transfer within the larger finite batch retains the existing address-space ownership exchange, kernel-stack and TLS retarget, domain-state restore, FPU/SIMD save-restore, PMU attribution, and exact WakeCell authentication before either task resumes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The chain remains limited to one fixed off-queue root and one locally claimed exact wakee at a time; no target-to-third-task edge is admitted. The 65th root yield must cross the executor, preserving a finite transfer-count bound for fairness and RCU quiescence."

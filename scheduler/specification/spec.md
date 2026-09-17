@@ -181,8 +181,10 @@ claim, so dispatch and stealing skip it until the final switch has completed.
 The target normally returns to the source's root executor continuation. If it
 urgently wakes that exact off-queue root, it may instead switch directly to the
 root's saved task continuation. That same fixed root may begin another exact
-handoff, but the batch is capped at eight target-to-root returns; its next
-yield then must reach the executor. The off-queue root is pinned by its
+handoff, but the batch is capped at 64 target-to-root returns; its next yield
+then must reach the executor. This amortizes executor re-entry while retaining
+a finite fairness and RCU-quiescence progress bound. The off-queue root is
+pinned by its
 in-flight executor poll, the exact `WakeCell` identity substitutes for a queue
 lookup, and a CPU-local whole-poll gate refuses nested sources and arbitrary
 target-to-third-task chains. Before either task's first resumed instruction,
