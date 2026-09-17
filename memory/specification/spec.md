@@ -1214,6 +1214,11 @@ x86_64 is rejected at runtime.
   Scheduler restore and own-stack resume preserve a current nonzero tag;
   mapping mutation invalidates every CPU in that tag's residency history, and
   final-owner teardown completes a tag-wide shootdown before allocator reuse.
+  Tag 0 reloads CR3 without NOFLUSH on every address-space switch, so an
+  ordinary mutation of a single-threaded address space needs only its local
+  invalidation; a `CLONE_VM`-shared tag-0 address space still broadcasts because
+  it may execute concurrently on another CPU. Foreign mutation and forced
+  reaping retain unconditional cross-CPU invalidation.
   A CPU rejoining after the gate closes flushes all local contexts before it is
   marked online, covering shootdowns that occurred while it was offline.
 - Paging: 4-level (possibly 5-level where CPUID says so).

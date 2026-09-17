@@ -1526,6 +1526,12 @@ pub struct AddressSpace {
     numa_hints: IrqSafeSpinLock<NumaHints>,
 }
 
+#[cfg(target_arch = "x86_64")]
+#[inline]
+const fn ordinary_mutation_needs_remote_tlb(tag: u16, vm_shared: bool) -> bool {
+    tag != crate::asid_alloc::TAG_RESERVED || vm_shared
+}
+
 impl AddressSpace {
     /// Default base for the per-AS mmap cursor. Matches the prior
     /// global MMAP_CURSOR so existing user binaries continue to see
@@ -1744,6 +1750,20 @@ impl AddressSpace {
     #[inline]
     pub fn is_vm_shared(&self) -> bool {
         self.vm_shared.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether an ordinary mutation by this address space can leave a stale
+    /// translation on another x86 CPU.
+    ///
+    /// A nonzero lifetime PCID may remain cached on every CPU in its residency
+    /// history. Tag 0 is different: every task switch reloads CR3 without
+    /// NOFLUSH, so a single-threaded address space can retain translations only
+    /// on the CPU performing the mutation. A CLONE_VM address space can still
+    /// execute concurrently and therefore always needs the remote half.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    fn needs_remote_tlb_invalidation(&self) -> bool {
+        ordinary_mutation_needs_remote_tlb(self.translation_tag(), self.is_vm_shared())
     }
 
     /// Lifetime PCID/ASID allocated to this address space, or zero on the
@@ -6238,16 +6258,18 @@ impl AddressSpace {
 
     /// One batched cross-CPU TLB invalidation for `pages` pages starting at
     /// `base`. A lifetime PCID can remain cached on CPUs this AS previously
-    /// ran on even when it is single-threaded, so the conservative residency
-    /// history is always targeted. Ranged invalidation covers small spans; a
-    /// tag-wide invalidation is used past the ceiling (mirroring Linux's
-    /// `tlb_single_page_flush_ceiling`). Callers MUST have already torn down /
-    /// rewritten the covered leaves and must call this before frame reuse.
+    /// ran on even when it is single-threaded, so nonzero tags target the
+    /// conservative residency history. Tag 0 reloads CR3 on switches and only
+    /// needs the remote half for a CLONE_VM-shared address space. Ranged
+    /// invalidation covers small spans; a tag-wide invalidation is used past
+    /// the ceiling (mirroring Linux's `tlb_single_page_flush_ceiling`). Callers
+    /// MUST have already torn down / rewritten the covered leaves and must call
+    /// this before frame reuse.
     fn flush_region_broadcast(&self, base: VirtAddr, pages: u64) {
         #[cfg(target_arch = "x86_64")]
         {
             const FULL_FLUSH_PAGE_CEILING: u64 = 512;
-            if pages == 0 {
+            if pages == 0 || !self.needs_remote_tlb_invalidation() {
                 return;
             }
             if pages > FULL_FLUSH_PAGE_CEILING {
@@ -9095,12 +9117,13 @@ impl AddressSpace {
         // ack-wait cost thousands of IPI round-trips per fork of a large
         // process (~0.5 s each, unbounded when an AP acked slowly) — the
         // stress-ng --sigrt fork-phase crawl.
-        // A lifetime PCID can remain cached on any CPU where this AS ran,
-        // including a single-threaded process's previous CPU. Target the
-        // conservative residency history for every rewritten leaf.
+        // A nonzero lifetime PCID can remain cached on any CPU where this AS
+        // ran. Tag 0 flushes on context switch and needs remote invalidation
+        // only while CLONE_VM permits concurrent execution.
         const FULL_FLUSH_PAGE_CEILING: u64 = 512;
+        let broadcast = self.needs_remote_tlb_invalidation();
         let total_pages: u64 = regions.iter().map(|r| (r.len + 0xFFF) >> 12).sum();
-        let use_full_flush = total_pages > FULL_FLUSH_PAGE_CEILING;
+        let use_full_flush = broadcast && total_pages > FULL_FLUSH_PAGE_CEILING;
         for r in regions {
             // Fork rematerialize (`cow_readonly`) only re-marks the COW regions
             // clone_for_fork touched; every other region's perms are unchanged,
@@ -9150,7 +9173,7 @@ impl AddressSpace {
                 };
             }
             let region_pages = (r.len + 0xFFF) >> 12;
-            if !use_full_flush && region_pages > 0 {
+            if broadcast && !use_full_flush && region_pages > 0 {
                 crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
                     self.translation_tag(),
                     r.base.as_u64(),
@@ -9263,6 +9286,8 @@ impl AddressSpace {
         #[cfg(target_arch = "x86_64")]
         const FULL_FLUSH_PAGE_CEILING: u64 = 512;
         #[cfg(target_arch = "x86_64")]
+        let broadcast = self.needs_remote_tlb_invalidation();
+        #[cfg(target_arch = "x86_64")]
         let mut changed_pages = 0u64;
         #[cfg(target_arch = "x86_64")]
         let mut protect_run = |base: VirtAddr, pages: u64| {
@@ -9280,7 +9305,7 @@ impl AddressSpace {
             changed_pages += changed;
             // Per-run remote invalidation up to the ceiling; past it, the
             // single full flush after the walk covers every restricted leaf.
-            if changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
+            if broadcast && changed != 0 && changed_pages <= FULL_FLUSH_PAGE_CEILING {
                 crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_range(
                     self.translation_tag(),
                     base.as_u64(),
@@ -9363,7 +9388,7 @@ impl AddressSpace {
         }
 
         #[cfg(target_arch = "x86_64")]
-        if changed_pages > FULL_FLUSH_PAGE_CEILING {
+        if broadcast && changed_pages > FULL_FLUSH_PAGE_CEILING {
             crate::tlb_shootdown::shootdown(crate::tlb_shootdown::ShootdownRequest::for_tag(
                 self.translation_tag(),
             ));
@@ -12310,3 +12335,22 @@ fn smoke_memory_file_demand_refusal_is_a_segv() -> TestResult {
     }
 }
 kernel_test_in!("memory", smoke_memory_file_demand_refusal_is_a_segv);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_tag0_remote_tlb_gate_matches_switch_contract() -> TestResult {
+    if ordinary_mutation_needs_remote_tlb(crate::asid_alloc::TAG_RESERVED, false) {
+        return TestResult::Fail("single-owner tag 0 requested a remote invalidation");
+    }
+    if !ordinary_mutation_needs_remote_tlb(crate::asid_alloc::TAG_RESERVED, true) {
+        return TestResult::Fail("CLONE_VM tag 0 skipped its remote invalidation");
+    }
+    if !ordinary_mutation_needs_remote_tlb(17, false) {
+        return TestResult::Fail("lifetime PCID skipped its residency-history invalidation");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory/tlb_shootdown",
+    smoke_memory_tag0_remote_tlb_gate_matches_switch_contract
+);
