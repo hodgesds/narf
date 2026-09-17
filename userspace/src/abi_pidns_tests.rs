@@ -1109,3 +1109,606 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_pidns_getpriority_resolves_in_caller_pid_ns
 );
+
+// ── the namespace tree ────────────────────────────────────────────────
+//
+// Linux 6.17's `kernel/nstree.c` registers every namespace, of every
+// flavour, in one structure keyed by id — so a namespace can be found or
+// enumerated WITHOUT holding a task that happens to be in it. Before it, the
+// only way to reach a namespace was through something already using it,
+// which meant there was no way to ask what namespaces exist at all.
+
+/// A namespace appears in the tree when created and is gone when dropped.
+///
+/// The drop half is the one that matters: an entry outliving its namespace
+/// would answer a lookup with an id nothing can be reached through, and
+/// since ids are never reused, it would accumulate forever.
+fn smoke_abi_nstree_tracks_lifetime() -> TestResult {
+    use crate::namespaces::{ns_tree_lookup, ns_type, UtsNamespace};
+    with_setup(|| {
+        let before = crate::namespaces::ns_tree_len();
+        let id = {
+            let ns = UtsNamespace::new_default();
+            let id = ns.id();
+            let entry = ns_tree_lookup(id).ok_or("a fresh namespace should be in the tree")?;
+            if entry.ns_type != ns_type::UTS {
+                return Err("the tree recorded the wrong flavour");
+            }
+            if entry.id != id {
+                return Err("the tree recorded the wrong id");
+            }
+            if crate::namespaces::ns_tree_len() != before + 1 {
+                return Err("creating a namespace did not grow the tree by one");
+            }
+            id
+        };
+        // The Arc is gone, so the entry must be too.
+        if ns_tree_lookup(id).is_some() {
+            return Err("a dropped namespace is still in the tree");
+        }
+        if crate::namespaces::ns_tree_len() != before {
+            return Err("dropping a namespace did not shrink the tree");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_tracks_lifetime);
+
+/// Every flavour lands in ONE tree.
+///
+/// That is the whole point of a unified tree rather than a per-type list:
+/// ids are drawn from a single counter, so a lookup needs no type argument,
+/// and `listns` with no filter must see all of them.
+fn smoke_abi_nstree_spans_every_flavour() -> TestResult {
+    use crate::namespaces::{ns_tree_lookup, ns_type, IpcNamespace, NetNamespace, UtsNamespace};
+    with_setup(|| {
+        let uts = UtsNamespace::new_default();
+        let net = NetNamespace::new_with_loopback();
+        let ipc = IpcNamespace::new();
+        let pid = crate::pid_ns::PidNamespace::new();
+        for (id, want, what) in [
+            (uts.id(), ns_type::UTS, "uts"),
+            (net.id(), ns_type::NET, "net"),
+            (ipc.id(), ns_type::IPC, "ipc"),
+            (pid.id(), ns_type::PID, "pid"),
+        ] {
+            let entry = ns_tree_lookup(id).ok_or("a flavour is missing from the tree")?;
+            if entry.ns_type != want {
+                let _ = what;
+                return Err("a flavour was recorded with the wrong type bit");
+            }
+        }
+        // Ids come from one counter, so no two flavours can collide.
+        let ids = [uts.id(), net.id(), ipc.id(), pid.id()];
+        for (i, a) in ids.iter().enumerate() {
+            if ids[i + 1..].contains(a) {
+                return Err("two namespaces of different flavours share an id");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_spans_every_flavour);
+
+/// Enumeration is ordered and resumes from a cursor.
+///
+/// The cursor is what `listns(2)` needs: a caller with more namespaces than
+/// buffer resumes instead of restarting, which is what makes the call safe
+/// against a tree that is changing underneath it. Paging one at a time must
+/// reach exactly the same set as one call.
+fn smoke_abi_nstree_enumeration_pages() -> TestResult {
+    use crate::namespaces::{ns_tree_list, ns_type, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let a = UtsNamespace::new_default();
+        let b = UtsNamespace::new_default();
+        let c = UtsNamespace::new_default();
+        let all = ns_tree_list(0, 0, None, 64);
+        if all.len() != 3 {
+            return Err("the tree did not list every namespace");
+        }
+        // Ascending id order — the counter is monotonic, so creation order.
+        if all != [a.id(), b.id(), c.id()] {
+            return Err("enumeration is not in id order");
+        }
+        // Page one at a time, carrying the cursor.
+        let mut paged = alloc::vec::Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let one = ns_tree_list(cursor, 0, None, 1);
+            match one.first() {
+                Some(&id) => {
+                    paged.push(id);
+                    cursor = id;
+                }
+                None => break,
+            }
+            if paged.len() > 3 {
+                return Err("the cursor did not advance — paging would not terminate");
+            }
+        }
+        if paged != all {
+            return Err("paging with the cursor reached a different set than one call");
+        }
+        // A type filter selects, and a flavour with no instances is empty
+        // rather than an error.
+        if ns_tree_list(0, ns_type::UTS, None, 64).len() != 3 {
+            return Err("the UTS filter did not select the UTS namespaces");
+        }
+        if !ns_tree_list(0, ns_type::NET, None, 64).is_empty() {
+            return Err("the NET filter selected namespaces of another flavour");
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_enumeration_pages);
+
+/// The owning user namespace is recorded, and filters on it.
+///
+/// `listns`'s `user_ns_id` selects the namespaces one user namespace owns,
+/// which is how a container runtime asks "what did this sandbox create".
+fn smoke_abi_nstree_owner_filter() -> TestResult {
+    use crate::namespaces::{ns_tree_list, ns_tree_lookup, IpcNamespace, UserNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let parent = UserNamespace::new_initial();
+        let child = UserNamespace::new_child(parent.clone(), 0);
+        // An IPC namespace owned by the child user namespace.
+        let owned = IpcNamespace::new_in(Some(child.clone()));
+        let entry = ns_tree_lookup(owned.id()).ok_or("the owned namespace is missing")?;
+        if entry.owner_user_ns != child.id() {
+            return Err("the tree recorded the wrong owning user namespace");
+        }
+        // One owned by nobody in particular — the initial user namespace.
+        let unowned = IpcNamespace::new();
+        let unowned_entry =
+            ns_tree_lookup(unowned.id()).ok_or("the unowned namespace is missing")?;
+        if unowned_entry.owner_user_ns != 0 {
+            return Err("a namespace with no explicit owner should record 0");
+        }
+        // The filter selects only what the child owns.
+        let mine = ns_tree_list(0, 0, Some(child.id()), 64);
+        if mine != [owned.id()] {
+            return Err("the owner filter did not select exactly the owned namespace");
+        }
+        // And the child user namespace itself is owned by its PARENT, which
+        // is what makes the ownership chain walkable.
+        let child_entry = ns_tree_lookup(child.id()).ok_or("the child user ns is missing")?;
+        if child_entry.owner_user_ns != parent.id() {
+            return Err("a user namespace should be owned by its parent");
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_owner_filter);
+
+/// The two flavours that live BELOW this crate reach the same tree.
+///
+/// `MountNamespace` and `CgroupNamespace` are in `narf-filesystem`, which
+/// sits under userspace and cannot call up — they register through a hook
+/// installed at init. A tree missing them would report a partial system,
+/// and nothing else would notice, because every other flavour is right.
+fn smoke_abi_nstree_includes_cross_crate_flavours() -> TestResult {
+    use crate::namespaces::{ns_tree_lookup, ns_type};
+    with_setup(|| {
+        let mnt = narf_filesystem::MountNamespace::snapshot_global_owned_by(None);
+        let entry = ns_tree_lookup(mnt.id())
+            .ok_or("a mount namespace minted below this crate is missing from the tree")?;
+        if entry.ns_type != ns_type::MNT {
+            return Err("the mount namespace was recorded with the wrong type bit");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_nstree_includes_cross_crate_flavours
+);
+
+// ── listns(2) ─────────────────────────────────────────────────────────
+
+/// `struct ns_id_req { u32 size, spare; u64 ns_id; u32 ns_type, spare2; u64 user_ns_id; }`.
+fn ns_id_req(size: u32, cursor: u64, ns_type: u32, user_ns_id: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0..4].copy_from_slice(&size.to_ne_bytes());
+    b[8..16].copy_from_slice(&cursor.to_ne_bytes());
+    b[16..20].copy_from_slice(&ns_type.to_ne_bytes());
+    b[24..32].copy_from_slice(&user_ns_id.to_ne_bytes());
+    b
+}
+
+/// `listns` enumerates the tree, filters by type, and pages with a cursor.
+///
+/// Paging is the load-bearing part: `req.ns_id` is the last id already seen,
+/// so a caller with more namespaces than buffer resumes instead of
+/// restarting. One id at a time must reach the same set as one call.
+fn smoke_abi_listns_enumerates_and_pages() -> TestResult {
+    use crate::namespaces::{ns_type, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let a = UtsNamespace::new_default();
+        let b = UtsNamespace::new_default();
+        let c = UtsNamespace::new_default();
+        let mut out = [0u64; 16];
+        let list = |cursor: u64, ty: u32, nr: u64, out: &mut [u64; 16]| {
+            let req = ns_id_req(32, cursor, ty, 0);
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, nr, 0),
+            )
+        };
+        let n = match list(0, 0, 16, &mut out) {
+            Some(n) if n >= 3 => n as usize,
+            _ => return Err("listns should enumerate the namespaces in the tree"),
+        };
+        let all = out[..n].to_vec();
+        for id in [a.id(), b.id(), c.id()] {
+            if !all.contains(&id) {
+                return Err("listns omitted a namespace that is in the tree");
+            }
+        }
+        // Ascending id order — what makes the cursor work at all.
+        if all.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("listns did not return ids in ascending order");
+        }
+        // Page one at a time. Bounded by a generous constant rather than by
+        // `n`, so a cursor that fails to advance is caught as a runaway
+        // rather than by an equality that a one-off tree growth would break.
+        let mut paged = alloc::vec::Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let mut one = [0u64; 16];
+            match list(cursor, 0, 1, &mut one) {
+                Some(1) => {
+                    if one[0] <= cursor {
+                        return Err("the cursor did not advance — paging would not terminate");
+                    }
+                    paged.push(one[0]);
+                    cursor = one[0];
+                }
+                // A cursor with nothing after it is -ENOENT, not an empty
+                // success: that is how a paging caller learns it is done.
+                Some(-2) => break,
+                Some(0) => return Err("listns ended with 0 rather than -ENOENT"),
+                _ => return Err("paging with a cursor should keep returning ids"),
+            }
+            if paged.len() > 256 {
+                return Err("paging did not terminate");
+            }
+        }
+        if paged != all {
+            return Err("paging with the cursor reached a different set than one call");
+        }
+        // Listing must not CREATE a namespace. It used to: the first
+        // `capable()` inside the handler materialised the lazily-built
+        // initial user namespace, which then joined the tree, so the first
+        // call grew it by one. The initial namespaces are registered at boot
+        // now — as Linux registers `init_user_ns` and friends — and this is
+        // the assertion that keeps it that way.
+        let before = crate::namespaces::ns_tree_len();
+        let _ = list(0, 0, 16, &mut out);
+        if crate::namespaces::ns_tree_len() != before {
+            return Err("listns created a namespace while enumerating");
+        }
+        // A type filter selects.
+        let mut uts_out = [0u64; 16];
+        let uts_n = match list(0, ns_type::UTS, 16, &mut uts_out) {
+            Some(n) if n >= 3 => n as usize,
+            _ => return Err("the UTS filter should select the UTS namespaces"),
+        };
+        if uts_out[..uts_n].iter().any(|id| !all.contains(id)) {
+            return Err("the type filter returned something outside the tree");
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_enumerates_and_pages);
+
+/// `listns`'s argument rules.
+///
+/// The one that is easy to get wrong is the type filter: a bit outside
+/// `NS_ALL` is -EOPNOTSUPP and NOT -EINVAL, and not an empty result either.
+/// "No such namespace type" and "no namespaces of that type" are different
+/// answers, and a caller probing for a flavour this kernel does not know
+/// needs to tell them apart.
+fn smoke_abi_listns_argument_rules() -> TestResult {
+    use crate::namespaces::ns_type;
+    with_setup(|| {
+        const E2BIG: i64 = -7;
+        const EOPNOTSUPP: i64 = -95;
+        const EOVERFLOW: i64 = -75;
+        let mut out = [0u64; 8];
+        let mut call_with = |req: &[u8], nr: u64, flags: u64| {
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, nr, flags),
+            )
+        };
+        // An unknown flag.
+        let ok = ns_id_req(32, 0, 0, 0);
+        if call_with(&ok, 8, 1) != Some(EINVAL) {
+            return Err("an unknown listns flag must be -EINVAL");
+        }
+        // Past the one-million cap.
+        if call_with(&ok, 1_000_001, 0) != Some(EOVERFLOW) {
+            return Err("nr_ns_ids above the cap must be -EOVERFLOW");
+        }
+        // Below VER0, and past PAGE_SIZE — E2BIG decided first.
+        let small = ns_id_req(31, 0, 0, 0);
+        if call_with(&small, 8, 0) != Some(EINVAL) {
+            return Err("a size below NS_ID_REQ_SIZE_VER0 must be -EINVAL");
+        }
+        let huge = ns_id_req(4097, 0, 0, 0);
+        if call_with(&huge, 8, 0) != Some(E2BIG) {
+            return Err("a size above PAGE_SIZE must be -E2BIG");
+        }
+        // A reserved field the caller set.
+        let mut spare = ns_id_req(32, 0, 0, 0);
+        spare[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        if call_with(&spare, 8, 0) != Some(EINVAL) {
+            return Err("a nonzero spare must be -EINVAL");
+        }
+        // A type bit outside NS_ALL.
+        let bad_type = ns_id_req(32, 0, 1 << 3, 0);
+        if call_with(&bad_type, 8, 0) != Some(EOPNOTSUPP) {
+            return Err("a type outside NS_ALL must be -EOPNOTSUPP, not -EINVAL");
+        }
+        // A type bit INSIDE NS_ALL with no instances is an empty success,
+        // not an error — the other half of that distinction.
+        crate::namespaces::__test_ns_tree_reset();
+        let time_ns = ns_id_req(32, 0, ns_type::TIME, 0);
+        if call_with(&time_ns, 8, 0) != Some(0) {
+            return Err("a known type with no instances must be an empty success");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_argument_rules);
+
+/// The `user_ns_id` filter, including `LISTNS_CURRENT_USER`.
+///
+/// This is how a container runtime asks "what did this sandbox create".
+fn smoke_abi_listns_owner_filter() -> TestResult {
+    use crate::namespaces::{IpcNamespace, UserNamespace};
+    const LISTNS_CURRENT_USER: u64 = u64::MAX;
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let parent = UserNamespace::new_initial();
+        let child = UserNamespace::new_child(parent.clone(), 0);
+        let owned = IpcNamespace::new_in(Some(child.clone()));
+        let _other = IpcNamespace::new();
+
+        let mut out = [0u64; 16];
+        let req = ns_id_req(32, 0, 0, child.id());
+        let n = match call(
+            Syscall::Listns.raw(),
+            a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) {
+            Some(n) if n >= 0 => n as usize,
+            _ => return Err("listns with an owner filter should succeed"),
+        };
+        if out[..n] != [owned.id()] {
+            return Err("the owner filter did not select exactly the owned namespace");
+        }
+        // An owner id that names nothing is -EINVAL, NOT an empty result.
+        // `do_listns_userns` resolves the id to a user namespace first:
+        // `if (!ns) return -EINVAL;`. The two answers mean different things
+        // — "the user namespace you asked about is gone" versus "it exists
+        // and owns nothing" — and a supervisor polling a sandbox it created
+        // needs to tell them apart.
+        let gone = ns_id_req(32, 0, 0, 0x7FFF_FFFF_FFFF);
+        if call(
+            Syscall::Listns.raw(),
+            a3(gone.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("an owner id that names no namespace must be -EINVAL");
+        }
+        // And an id that names a namespace of the WRONG flavour: the lookup
+        // is `lookup_ns_id(id, CLONE_NEWUSER)`, so an IPC id is not a valid
+        // owner either.
+        let wrong = ns_id_req(32, 0, 0, owned.id());
+        if call(
+            Syscall::Listns.raw(),
+            a3(wrong.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("an owner id naming a non-user namespace must be -EINVAL");
+        }
+        // LISTNS_CURRENT_USER resolves to the caller's own user namespace,
+        // so it must not be treated as the literal id u64::MAX.
+        let cur = ns_id_req(32, 0, 0, LISTNS_CURRENT_USER);
+        match call(
+            Syscall::Listns.raw(),
+            a3(cur.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("LISTNS_CURRENT_USER should resolve, not be used literally"),
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_owner_filter);
+
+// ── Reserved initial-namespace ids ───────────────────────────────
+//
+// `enum init_ns_id` (`include/uapi/linux/nsfs.h:71`) fixes the id of each
+// flavour's INITIAL namespace, and `is_ns_init_id()` is spelled
+// `ns->ns_id <= NS_LAST_INIT_ID` — so the values must be exactly those and
+// exactly contiguous. See `userspace/specification/namespace-tree.md` R2.
+
+/// The initial namespace of every flavour carries its reserved UAPI id.
+///
+/// These were previously drawn from the shared counter, which made an
+/// initial namespace's id depend on boot ordering and match the UAPI
+/// constants only by coincidence. The negative half is what makes this a
+/// real check: a *non*-initial namespace must never land in the reserved
+/// block, or `is_ns_init_id` would call it initial and the refcount rules
+/// that hang off that predicate would apply to the wrong object.
+fn smoke_abi_ns_initial_ids_are_reserved() -> TestResult {
+    use crate::namespaces::{init_ns_id, is_init_ns_id, ns_tree_lookup, ns_type};
+    with_setup(|| {
+        crate::namespaces::init_namespaces();
+        for (id, want, what) in [
+            (init_ns_id::IPC, ns_type::IPC, "ipc"),
+            (init_ns_id::UTS, ns_type::UTS, "uts"),
+            (init_ns_id::USER, ns_type::USER, "user"),
+            (init_ns_id::PID, ns_type::PID, "pid"),
+            (init_ns_id::NET, ns_type::NET, "net"),
+            (init_ns_id::MNT, ns_type::MNT, "mnt"),
+        ] {
+            let entry = ns_tree_lookup(id)
+                .ok_or("an initial namespace is missing from the tree at its reserved id")?;
+            if entry.ns_type != want {
+                let _ = what;
+                return Err("a reserved id is held by the wrong flavour");
+            }
+            if !is_init_ns_id(id) {
+                return Err("a reserved id did not read as an initial-namespace id");
+            }
+        }
+        // The UAPI block is 1..=8 and NOTHING else may fall in it.
+        if is_init_ns_id(0) || is_init_ns_id(init_ns_id::LAST + 1) {
+            return Err("the reserved id range does not match NS_LAST_INIT_ID");
+        }
+        // Negative control: a freshly minted namespace must land ABOVE the
+        // block. Without the counter starting at NS_LAST_INIT_ID + 1 this is
+        // the assertion that fails.
+        let fresh = crate::namespaces::UtsNamespace::new_default();
+        if is_init_ns_id(fresh.id()) {
+            return Err("a newly created namespace was minted inside the reserved id block");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ns_initial_ids_are_reserved);
+
+/// `narf-filesystem` spells the reserved MNT id itself, because the
+/// reserved block lives in the crate ABOVE it. The two must agree.
+///
+/// Without this, a rename or a renumber on one side would silently give the
+/// initial mount namespace two different identities depending on which
+/// crate you asked.
+fn smoke_abi_ns_init_ids_agree_across_crates() -> TestResult {
+    if narf_filesystem::NS_INIT_ID_MNT != crate::namespaces::init_ns_id::MNT {
+        return TestResult::Fail("narf-filesystem's NS_INIT_ID_MNT disagrees with init_ns_id::MNT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_ns_init_ids_agree_across_crates);
+
+/// The initial mount namespace IS the global registry, not a snapshot.
+///
+/// A snapshot would fork the table at boot: a later `mount(2)` through the
+/// registry would be invisible through the namespace object, and the two
+/// would drift apart with nothing reporting it. A private namespace must
+/// still diverge — that is the negative control, and it is what says this
+/// test is measuring sharing rather than measuring nothing.
+fn smoke_abi_initial_mount_ns_shares_the_registry() -> TestResult {
+    with_setup(|| {
+        let init = narf_filesystem::initial_mount_ns();
+        let private = narf_filesystem::MountNamespace::snapshot_global();
+        let before_init = init.list().len();
+        let before_private = private.list().len();
+
+        // Mount through the REGISTRY, not through either namespace object —
+        // that is the path the initial namespace has to observe.
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("nstree-probe"));
+        let handle = match narf_filesystem::registry().mount_arc(&auth, "/abi-nstree-probe", fs) {
+            Ok(h) => h,
+            Err(_) => return Err("could not mount the probe filesystem in the registry"),
+        };
+
+        let grew_init = init.list().len() > before_init;
+        let grew_private = private.list().len() > before_private;
+        let _ = narf_filesystem::registry().unmount(&handle, "/abi-nstree-probe");
+
+        if !grew_init {
+            return Err("a mount through the registry was invisible to the initial namespace");
+        }
+        if grew_private {
+            return Err("a mount through the registry leaked into a private namespace");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_initial_mount_ns_shares_the_registry
+);
+
+/// Namespace churn retires trees, and every retired tree is reclaimed.
+///
+/// Each add and remove publishes a fresh map and retires the previous one,
+/// so a few hundred namespaces retire a few hundred trees — well past the
+/// 64-entry ceiling the collector's per-CPU queue used to have, when an
+/// over-capacity enqueue was silently discarded. The leak itself is fixed
+/// in `narf-rcu` and pinned there by
+/// `smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all`; this asserts
+/// the tree is a well-behaved consumer of the fixed collector — the queue
+/// drains to empty, and the tree is still correct after churning through it.
+fn smoke_abi_nstree_churn_reclaims_retired_trees() -> TestResult {
+    use crate::namespaces::UtsNamespace;
+    with_setup(|| {
+        const N: usize = 256;
+        narf_rcu::report_quiescent();
+        for _ in 0..N {
+            let ns = UtsNamespace::new_default();
+            if crate::namespaces::ns_tree_lookup(ns.id()).is_none() {
+                return Err("a namespace created during churn was not in the tree");
+            }
+        }
+        // Every one of those maps must be reclaimABLE, not discarded.
+        if narf_rcu::qsbr::overflow_count_this_cpu() != 0 {
+            return Err("the collector discarded a retired tree");
+        }
+        narf_rcu::sync();
+        if narf_rcu::qsbr::deferred_len_this_cpu() != 0 {
+            return Err("retired trees were still queued after a grace period");
+        }
+        // And the tree itself survived the churn: those namespaces are gone
+        // (each `Arc` dropped at its iteration's end), so what remains must
+        // still be a whole map and not a half-published intermediate.
+        crate::namespaces::init_namespaces();
+        if crate::namespaces::ns_tree_lookup(crate::namespaces::init_ns_id::USER).is_none() {
+            return Err("the tree lost an initial namespace across the churn");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_churn_reclaims_retired_trees);
+
+/// A reader holding a tree snapshot survives a concurrent removal.
+///
+/// This is the property the copy-on-write cell exists for: `ns_tree_entries_from`
+/// hands back owned entries taken under a pin, and a namespace dropped
+/// afterwards cannot invalidate them. Under the old spinlock the same
+/// sequence was safe only because no caller held a borrow across a drop —
+/// a rule maintained by hand at every call site.
+fn smoke_abi_nstree_snapshot_survives_removal() -> TestResult {
+    use crate::namespaces::UtsNamespace;
+    with_setup(|| {
+        let ns = UtsNamespace::new_default();
+        let id = ns.id();
+        let snapshot = crate::namespaces::ns_tree_entries_from(0, 0, None);
+        if !snapshot.iter().any(|e| e.id == id) {
+            return Err("the snapshot did not contain the namespace that was live when taken");
+        }
+        drop(ns);
+        // The snapshot is owned, so it still names the id; the TREE must not.
+        if !snapshot.iter().any(|e| e.id == id) {
+            return Err("a snapshot taken before the drop lost its entry");
+        }
+        if crate::namespaces::ns_tree_lookup(id).is_some() {
+            return Err("a dropped namespace is still reachable through the tree");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_snapshot_survives_removal);

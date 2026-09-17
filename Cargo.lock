@@ -2215,6 +2215,7 @@ dependencies = [
  "narf-modules",
  "narf-net",
  "narf-power",
+ "narf-rcu",
  "narf-scheduler",
  "narf-time",
  "narf-tracing",

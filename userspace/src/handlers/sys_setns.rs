@@ -117,12 +117,15 @@ pub(crate) fn sys_setns(ctx: &mut dyn TrapContext) {
             // namespaces module. The `ns->ns_type != flags` EINVAL is already
             // decided above, for every flavour at once.
             if let crate::namespaces::HeldNs::Mnt(mnt) = &held {
-                install_mount_namespace(caller, mnt.clone());
-                ctx.set_return(SyscallReturn::ok(0));
-                return;
-            }
-            if let crate::namespaces::HeldNs::MntGlobal(_) = &held {
-                install_initial_mount_namespace(caller);
+                // Rejoining the INITIAL mount namespace drops the per-task
+                // override rather than installing it — the initial namespace
+                // borrows the global registry, and a task that never left it
+                // has no entry at all.
+                if mnt.id() == narf_filesystem::NS_INIT_ID_MNT {
+                    install_initial_mount_namespace(caller);
+                } else {
+                    install_mount_namespace(caller, mnt.clone());
+                }
                 ctx.set_return(SyscallReturn::ok(0));
                 return;
             }

@@ -4613,10 +4613,6 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
             Some(user_ns) => task_ns_capable(caller, user_ns, CAP_SYS_ADMIN),
             None => task_capable(caller, CAP_SYS_ADMIN),
         },
-        HeldNs::NetGlobal(_)
-        | HeldNs::IpcGlobal(_)
-        | HeldNs::PidGlobal(_)
-        | HeldNs::MntGlobal(_) => task_capable(caller, CAP_SYS_ADMIN),
     };
 
     if let HeldNs::User(ns) = held {
@@ -4639,7 +4635,7 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
 
     let extra = match held {
         // `!ns_capable(user_ns, CAP_SYS_CHROOT)` — mount only.
-        HeldNs::Mnt(_) | HeldNs::MntGlobal(_) => {
+        HeldNs::Mnt(_) => {
             task_capable_in_own_ns(caller, CAP_SYS_CHROOT)
         }
         _ => true,
@@ -4649,8 +4645,13 @@ pub(crate) fn setns_install_check(caller: u64, held: &crate::namespaces::HeldNs)
         // may select only its active PID namespace or a descendant for future
         // children. Joining a parent/sibling would let descendants escape.
         let pid_relation_ok = match held {
+            // `None` is "the initial namespace" to
+            // `may_setns_for_children`, which is how it spells the root of
+            // the pid hierarchy — so the initial object maps to `None`.
+            HeldNs::Pid(ns) if ns.id() == crate::namespaces::init_ns_id::PID => {
+                crate::pid_ns::may_setns_for_children(caller, None)
+            }
             HeldNs::Pid(ns) => crate::pid_ns::may_setns_for_children(caller, Some(ns)),
-            HeldNs::PidGlobal(_) => crate::pid_ns::may_setns_for_children(caller, None),
             _ => true,
         };
         if !pid_relation_ok {
@@ -9719,6 +9720,19 @@ pub fn wait_init() {
     // the same space as every other namespace flavour.
     #[cfg(feature = "container")]
     narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
+    // And the namespace tree, for the same reason: a MountNamespace or
+    // CgroupNamespace minted below this layer belongs in the SAME tree as
+    // every other flavour, or `listns` would report a partial system.
+    #[cfg(feature = "container")]
+    narf_filesystem::install_ns_tree_hooks(
+        crate::namespaces::ns_tree_add,
+        crate::namespaces::ns_tree_remove,
+    );
+    // Then the initial namespaces themselves, as Linux registers
+    // `init_user_ns` and friends at boot. AFTER the hooks, or a namespace
+    // materialised here would never reach the tree.
+    #[cfg(feature = "container")]
+    crate::namespaces::init_namespaces();
 }
 
 /// Exit-observer that removes an exiting *process* from its cgroup.

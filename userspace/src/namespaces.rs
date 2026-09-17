@@ -28,7 +28,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -50,26 +50,497 @@ use narf_lib::sync::IrqSafeSpinLock;
 /// monotonic counter so ids never collide across flavours.
 pub type NsId = u64;
 
-static NS_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
-static INITIAL_NET_NS_ID: AtomicU64 = AtomicU64::new(0);
-static INITIAL_IPC_NS_ID: AtomicU64 = AtomicU64::new(0);
-static INITIAL_PID_NS_ID: AtomicU64 = AtomicU64::new(0);
+/// `enum init_ns_id` (`include/uapi/linux/nsfs.h:71`) — the INITIAL
+/// namespace of each flavour has a FIXED id, and those ids are UAPI, not
+/// an implementation detail. `is_ns_init_id()` is spelled
+/// `ns->ns_id <= NS_LAST_INIT_ID` (`include/linux/ns_common.h:23`), so the
+/// values have to be exactly these and exactly contiguous — a caller may
+/// hard-code them, and the kernel itself derives "is this an initial
+/// namespace" from nothing but the numeric range.
+///
+/// These were previously allocated lazily from the shared counter, which
+/// made an initial namespace's id depend on boot ordering and match the
+/// UAPI constants only by coincidence.
+pub mod init_ns_id {
+    use super::NsId;
+
+    pub const IPC: NsId = 1;
+    pub const UTS: NsId = 2;
+    pub const USER: NsId = 3;
+    pub const PID: NsId = 4;
+    pub const CGROUP: NsId = 5;
+    pub const TIME: NsId = 6;
+    pub const NET: NsId = 7;
+    pub const MNT: NsId = 8;
+
+    /// `NS_LAST_INIT_ID`. The dynamic counter starts one past this.
+    pub const LAST: NsId = MNT;
+}
+
+/// `atomic64_t namespace_cookie = ATOMIC64_INIT(NS_LAST_INIT_ID + 1)`
+/// (`kernel/nstree.c:382`) — dynamic ids begin above the reserved initial
+/// block so the two can never collide.
+static NS_ID_COUNTER: AtomicU64 = AtomicU64::new(init_ns_id::LAST + 1);
 
 /// Allocate a fresh, never-reused namespace id.
 pub fn alloc_ns_id() -> NsId {
     NS_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-fn initial_ns_id(slot: &AtomicU64) -> NsId {
-    let current = slot.load(Ordering::Acquire);
-    if current != 0 {
-        return current;
+/// `is_ns_init_id` (`include/linux/ns_common.h:23`) — an initial namespace
+/// is identified by its id falling in the reserved block, nothing else.
+/// Id 0 is never assigned and is the ABI's spelling for "unset".
+pub fn is_init_ns_id(id: NsId) -> bool {
+    id != 0 && id <= init_ns_id::LAST
+}
+
+// ── The namespace tree ───────────────────────────────────────────
+//
+// Linux 6.17 added `kernel/nstree.c`: every namespace, of every flavour, is
+// registered in one structure keyed by its id, so a namespace can be found
+// or enumerated WITHOUT holding a task that happens to be in it. Before it,
+// the only way to reach a namespace was through something already using it
+// — which meant no way to ask "what namespaces exist" at all.
+//
+// NARF already had the hard half: `NsId` is drawn from one counter shared by
+// every flavour, so ids are globally unique and an ns-fd comparison is just
+// an id comparison. What was missing was the registry. This is it.
+//
+// A `BTreeMap` keyed by id is the whole data structure, and it is the right
+// one for the reason Linux uses an rbtree: enumeration has to be in id order
+// and has to resume from a cursor, because a caller with more namespaces
+// than buffer must page without restarting. `range((Excluded(cursor), ..))`
+// is that, exactly.
+
+/// `enum ns_type` (`include/uapi/linux/nsfs.h`) — the CLONE_NEW* bit that
+/// creates each flavour, reused as its type tag.
+///
+/// Reusing the clone flags is Linux's choice and worth keeping: a caller
+/// filtering `listns` by type writes the same constant it would pass to
+/// `unshare`, and there is no second numbering to keep in step.
+pub mod ns_type {
+    /// CLONE_NEWTIME. NARF has no time namespace; named so the mask is
+    /// complete and a filter naming it returns nothing rather than erroring.
+    pub const TIME: u32 = 1 << 7;
+    /// CLONE_NEWNS — the mount namespace, which predates the others.
+    pub const MNT: u32 = 1 << 17;
+    /// CLONE_NEWCGROUP.
+    pub const CGROUP: u32 = 1 << 25;
+    /// CLONE_NEWUTS.
+    pub const UTS: u32 = 1 << 26;
+    /// CLONE_NEWIPC.
+    pub const IPC: u32 = 1 << 27;
+    /// CLONE_NEWUSER.
+    pub const USER: u32 = 1 << 28;
+    /// CLONE_NEWPID.
+    pub const PID: u32 = 1 << 29;
+    /// CLONE_NEWNET.
+    pub const NET: u32 = 1 << 30;
+
+    /// `NS_ALL` — every flavour this ABI defines. A type filter outside it
+    /// is -EOPNOTSUPP rather than an empty result: "no such namespace type"
+    /// and "no namespaces of that type" are different answers, and a caller
+    /// probing for support needs to tell them apart.
+    pub const ALL: u32 = TIME | MNT | CGROUP | UTS | IPC | USER | PID | NET;
+}
+
+/// One namespace's entry in the tree.
+#[derive(Debug, Clone)]
+pub struct NsTreeEntry {
+    /// The globally unique id, shared with `readlink /proc/<pid>/ns/<f>`.
+    pub id: NsId,
+    /// Which flavour, as a [`ns_type`] bit.
+    pub ns_type: u32,
+    /// The user namespace that owns this one — Linux's `ns->user_ns`, and
+    /// what `listns`'s `user_ns_id` filter selects on. 0 means the initial
+    /// user namespace, which is also what a namespace created before any
+    /// user namespace existed reports.
+    pub owner_user_ns: NsId,
+    /// A WEAK handle to the namespace itself, so a lookup can return the
+    /// object and not merely the fact that an id exists — which is what
+    /// `setns`-by-id and the `NS_GET_*` ioctls need.
+    ///
+    /// Weak and not strong, for two reasons that both matter:
+    ///
+    ///   * A strong reference would keep every namespace alive forever, so
+    ///     `Drop` would never run, so the entry would never be removed. The
+    ///     tree would grow monotonically and `listns` would report
+    ///     namespaces nothing can reach — a cycle, not a cache.
+    ///   * `Drop` calls [`ns_tree_remove`], which takes this same lock, and
+    ///     `IrqSafeSpinLock` is NOT reentrant. Holding strong references
+    ///     means any code path that drops the last one while the tree is
+    ///     locked self-deadlocks. Weak handles make that unrepresentable:
+    ///     upgrading under the lock cannot drop anything, and the upgraded
+    ///     `Arc` is released by the caller after the guard is gone.
+    ///
+    /// Linux solves the same problem with RCU and a deferred `ns_put`. NARF
+    /// has no RCU; this is the discipline that stands in for it, and it is
+    /// the same rule `mapped_file::drop_address_space` already follows for
+    /// its own side table.
+    pub object: Weak<dyn narf_filesystem::NsObject>,
+}
+
+/// A namespace entry whose object is still alive.
+#[derive(Debug, Clone)]
+pub struct NsTreeLive {
+    pub id: NsId,
+    pub ns_type: u32,
+    pub owner_user_ns: NsId,
+    pub object: Arc<dyn narf_filesystem::NsObject>,
+}
+
+type NsTreeMap = BTreeMap<NsId, NsTreeEntry>;
+
+/// The tree, published through RCU.
+///
+/// Linux splits this as seqlock-write / RCU-read (`kernel/nstree.c:11`):
+/// `write_seqlock` for add/remove, and every ordinary read lock-free under
+/// `rcu_read_lock()` via `rb_find_rcu` / `list_entry_rcu`. `narf-rcu` gives
+/// the same split with a copy-on-write cell — readers `pin()` and `load()`,
+/// writers publish a whole new map and defer-drop the old one
+/// (`userspace/specification/namespace-tree.md` R31).
+///
+/// The read side taking NO lock is the point. Under a spinlock, dropping
+/// the last `Arc` to a namespace while the tree is locked re-enters
+/// `ns_tree_remove` on a non-reentrant lock and self-deadlocks; that made
+/// "never drop a namespace under the tree lock" a rule every call site had
+/// to remember. A lock-free read side removes the hazard by construction
+/// rather than by discipline (R32).
+static NS_TREE: narf_rcu::Atomic<NsTreeMap> = narf_rcu::Atomic::null();
+
+/// Writer mutual exclusion. Readers never take it.
+///
+/// `Atomic::store` is a swap, so two concurrent read-modify-publish writers
+/// would lose one of the updates. This is the seqlock's write side and
+/// nothing more — it is never held across a read.
+static NS_TREE_WRITE: IrqSafeSpinLock<()> = IrqSafeSpinLock::new(());
+
+/// Read the tree lock-free. The pin is released when this returns, so the
+/// closure must not stash the borrow.
+fn read_tree<R>(f: impl FnOnce(Option<&NsTreeMap>) -> R) -> R {
+    let g = narf_rcu::pin();
+    let snapshot = NS_TREE.load(&g);
+    f(snapshot.as_ref())
+}
+
+/// Copy-on-write publish: clone the map, apply `f`, publish the result.
+///
+/// No grace period is driven here. Retirement hands the displaced map to
+/// `narf-rcu`'s per-CPU reclamation list, which is intrusive and
+/// unbounded, and the executor drains it at its poll boundaries
+/// (`report_quiescent` / `advance_epoch_if_pending`) like every other RCU
+/// consumer. An earlier version called `narf_rcu::sync()` on every
+/// mutation to keep the then-fixed 64-slot bucket from silently
+/// discarding entries; that bucket is gone, and a consumer working around
+/// its collector is exactly the kind of local patch that outlives the
+/// problem it was for.
+fn mutate_tree(f: impl FnOnce(&mut NsTreeMap)) {
+    let _w = NS_TREE_WRITE.lock();
+    let g = narf_rcu::pin();
+    let mut next = NS_TREE.load(&g).as_ref().cloned().unwrap_or_default();
+    f(&mut next);
+    // Publishing retires the old map. It holds only `Weak` handles, so
+    // nothing in it can run a namespace destructor and re-enter here.
+    NS_TREE.store(narf_rcu::Owned::new(next), &g);
+}
+
+/// Register a namespace. Called once, from the constructor of each flavour.
+///
+/// Registering with id 0 is ignored: `alloc_mount_ns_id` in `narf-filesystem`
+/// answers 0 until userspace installs the shared allocator, and a boot-time
+/// namespace minted before that has no id to key on. Letting it in would
+/// give every such namespace the same key and collapse them into one entry.
+///
+/// Re-registering an id is an idempotent insert, which is what lets
+/// [`init_namespaces`] restore the initial namespaces rather than only
+/// create them.
+pub fn ns_tree_add(
+    id: NsId,
+    ns_type: u32,
+    owner_user_ns: NsId,
+    object: Weak<dyn narf_filesystem::NsObject>,
+) {
+    if id == 0 {
+        return;
     }
-    let fresh = alloc_ns_id();
-    match slot.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => fresh,
-        Err(existing) => existing,
+    mutate_tree(|m| {
+        m.insert(
+            id,
+            NsTreeEntry {
+                id,
+                ns_type,
+                owner_user_ns,
+                object,
+            },
+        );
+    });
+}
+
+/// Retire a namespace. Called from `Drop`, so the tree holds only namespaces
+/// that still exist — an entry outliving its namespace would answer a lookup
+/// with an id nothing can be reached through.
+///
+/// An INITIAL namespace is never retired. Linux says the same thing through
+/// `__ns_ref_put` (`include/linux/ns_common.h:71`), which short-circuits on
+/// `is_ns_init_id(ns)` and asserts the count was 1: an initial namespace is
+/// permanently active and never leaves the tree
+/// (`userspace/specification/namespace-tree.md` R10).
+///
+/// It also closes a footgun the reserved-id block would otherwise open. A
+/// reserved id names a SLOT, not an object, and the test hooks can replace
+/// the object in a slot; if the displaced object's `Drop` ran after its
+/// replacement registered, it would erase the live entry and the flavour
+/// would vanish from the tree with nothing reporting it.
+pub fn ns_tree_remove(id: NsId) {
+    if id == 0 || is_init_ns_id(id) {
+        return;
     }
+    mutate_tree(|m| {
+        m.remove(&id);
+    });
+}
+
+/// Find one namespace by id.
+///
+/// An entry whose object is already gone reads as ABSENT, matching
+/// `ns_get_unless_inactive` (R11): every Linux tree read path funnels
+/// through it, and a namespace found in the tree but no longer reachable is
+/// skipped rather than reported.
+pub fn ns_tree_lookup(id: NsId) -> Option<NsTreeEntry> {
+    read_tree(|m| m?.get(&id).filter(|e| e.object.strong_count() > 0).cloned())
+}
+
+/// Find one namespace by id AND recover the object behind it.
+///
+/// `None` also covers an entry whose object has already been dropped but
+/// whose `Drop` has not yet reached [`ns_tree_remove`]. Reporting that as
+/// absent is correct: the namespace is gone, and the window is exactly the
+/// one Linux closes with `ns_get_unless_inactive`.
+///
+/// The upgrade happens under the lock — safe, because upgrading a `Weak`
+/// only ever INCREMENTS a refcount — and the resulting `Arc` is handed back
+/// to the caller, who drops it with the guard long released.
+pub fn ns_tree_lookup_object(id: NsId) -> Option<NsTreeLive> {
+    read_tree(|m| {
+        let e = m?.get(&id)?;
+        let object = e.object.upgrade()?;
+        Some(NsTreeLive {
+            id: e.id,
+            ns_type: e.ns_type,
+            owner_user_ns: e.owner_user_ns,
+            object,
+        })
+    })
+}
+
+/// Namespaces after `cursor`, in id order, optionally filtered.
+///
+/// `cursor` is EXCLUSIVE and is the id last returned, so paging is
+/// `list(0, ..)` then `list(last, ..)` — the shape `listns(2)` needs, and
+/// the reason the tree is ordered rather than a hash. A caller with more
+/// namespaces than buffer resumes instead of restarting, which is what makes
+/// the call safe against a tree that is changing underneath it.
+///
+/// `ns_type` of 0 means every flavour; `owner_user_ns` of `None` means every
+/// owner.
+pub fn ns_tree_list(
+    cursor: NsId,
+    ns_type: u32,
+    owner_user_ns: Option<NsId>,
+    max: usize,
+) -> Vec<NsId> {
+    read_tree(|m| {
+        let Some(m) = m else {
+            return Vec::new();
+        };
+        m.range((
+            core::ops::Bound::Excluded(cursor),
+            core::ops::Bound::Unbounded,
+        ))
+        .filter(|(_, e)| ns_type == 0 || e.ns_type & ns_type != 0)
+        .filter(|(_, e)| owner_user_ns.is_none_or(|o| e.owner_user_ns == o))
+        // R11 again: an id nothing can be reached through must not be listed.
+        .filter(|(_, e)| e.object.strong_count() > 0)
+        .take(max)
+        .map(|(&id, _)| id)
+        .collect()
+    })
+}
+
+/// Register the INITIAL namespaces, as Linux registers `init_user_ns`,
+/// `init_pid_ns` and the rest at boot.
+///
+/// Without this the tree would be complete only once something had touched
+/// each flavour — so `listns` could grow the tree with its own first call,
+/// and an initial namespace nobody had used yet would be absent rather than
+/// present-and-idle. The initial namespaces conceptually exist from boot;
+/// the tree should say so.
+///
+/// Called from `wait_init`, immediately after the cross-crate hooks are
+/// installed — the order matters, because a namespace materialised before
+/// the hooks would not reach the tree at all.
+///
+/// Idempotent: re-registering an id is an insert on the same key, and the
+/// `global_*` accessors return the existing object once it exists.
+pub fn init_namespaces() {
+    // Registration is stated HERE rather than left to each constructor.
+    // The constructors memoise (`OnceLock` / a `static` slot), so a second
+    // call hands back the existing object without re-registering — which
+    // means after `__test_ns_tree_reset` the initial namespaces could never
+    // come back. `ns_tree_add` is an idempotent insert keyed by id, so
+    // re-stating them costs nothing and makes this function restore the
+    // tree rather than merely populate it once.
+    register_ns(&global_uts(), ns_type::UTS, 0);
+    register_ns(&global_ipc(), ns_type::IPC, 0);
+    register_ns(&global_user(), ns_type::USER, 0);
+    // NET and PID materialise real initial objects, which register
+    // themselves. Each is a `&'static Arc` that is never dropped — correct
+    // rather than a leak, and the reason Linux's `init_*_ns` are static.
+    register_ns(initial_net_ns(), ns_type::NET, 0);
+    crate::pid_ns::register_initial();
+    // MNT's initial namespace lives in `narf-filesystem` (it borrows the
+    // global mount registry rather than snapshotting it), but it registers
+    // through the same hooks.
+    narf_filesystem::register_initial_mount_ns();
+}
+
+/// Allocate an id and register it in one step.
+///
+/// Deliberately the only way a namespace gets an id: allocation and
+/// registration cannot drift apart if there is no way to do one without the
+/// other, and a flavour that allocated without registering would be invisible
+/// to `listns` in a way nothing would notice until someone went looking for
+/// it.
+fn register_ns<T>(ns: &Arc<T>, ns_type: u32, owner_user_ns: NsId)
+where
+    T: narf_filesystem::NsObject + 'static,
+{
+    ns_tree_add(
+        ns_type_id_of(ns),
+        ns_type,
+        owner_user_ns,
+        Arc::downgrade(ns) as Weak<dyn narf_filesystem::NsObject>,
+    );
+}
+
+fn ns_type_id_of<T: narf_filesystem::NsObject>(ns: &Arc<T>) -> NsId {
+    narf_filesystem::NsObject::ns_id(&**ns)
+}
+
+/// Every namespace after `cursor` matching the filters, as entries.
+///
+/// Unbounded on purpose: `listns` must apply a per-entry PERMISSION check
+/// before it counts towards the caller's buffer, so truncating here would
+/// return short whenever an invisible namespace fell inside the window. The
+/// tree holds only live namespaces, which is a small number.
+pub fn ns_tree_entries_from(
+    cursor: NsId,
+    ns_type: u32,
+    owner_user_ns: Option<NsId>,
+) -> Vec<NsTreeEntry> {
+    read_tree(|m| {
+        let Some(m) = m else {
+            return Vec::new();
+        };
+        m.range((
+            core::ops::Bound::Excluded(cursor),
+            core::ops::Bound::Unbounded,
+        ))
+        .filter(|(_, e)| ns_type == 0 || e.ns_type & ns_type != 0)
+        .filter(|(_, e)| owner_user_ns.is_none_or(|o| e.owner_user_ns == o))
+        // A stale entry — object dropped, `Drop` not yet through
+        // `ns_tree_remove` — is skipped rather than listed. `listns` must
+        // not name a namespace nothing can reach; this is the window Linux
+        // closes with `ns_get_unless_inactive`.
+        .filter(|(_, e)| e.object.strong_count() > 0)
+        .map(|(_, e)| e.clone())
+        .collect()
+    })
+}
+
+/// How many namespaces the tree holds — diagnostics and tests.
+#[doc(hidden)]
+pub fn ns_tree_len() -> usize {
+    read_tree(|m| m.map_or(0, |m| m.len()))
+}
+
+// ── `NsObject` for the userspace-owned namespace flavours ────────
+//
+// The tree stores `Weak<dyn NsObject>` rather than metadata alone, so a
+// lookup can hand back the LIVE object and a namespace whose last owner is
+// gone stops being listed. Linux gets the same property from
+// `ns_get_unless_inactive` (`include/linux/ns_common.h:136`) under RCU:
+// an entry found in the tree whose active count already hit zero is
+// skipped, never reported. `Weak::upgrade` failing is the direct analogue.
+//
+// See `userspace/specification/namespace-tree.md` R6, R11.
+macro_rules! impl_ns_object {
+    ($ty:ty, $kind:expr) => {
+        impl narf_filesystem::NsObject for $ty {
+            fn as_any(&self) -> &dyn core::any::Any {
+                self
+            }
+            fn ns_id(&self) -> u64 {
+                self.id
+            }
+            fn ns_type(&self) -> u32 {
+                $kind
+            }
+        }
+    };
+}
+
+impl_ns_object!(UtsNamespace, ns_type::UTS);
+impl_ns_object!(NetNamespace, ns_type::NET);
+impl_ns_object!(IpcNamespace, ns_type::IPC);
+impl_ns_object!(UserNamespace, ns_type::USER);
+
+/// Test hook — empty the tree.
+#[doc(hidden)]
+pub fn __test_ns_tree_reset() {
+    mutate_tree(|m| m.clear());
+}
+
+/// The reserved id of the initial PID namespace, for `pid_ns` to build its
+/// singleton with. Stable across calls, like every other initial id.
+pub fn initial_pid_ns_id() -> NsId {
+    init_ns_id::PID
+}
+
+/// The reserved id of the initial NET namespace.
+pub fn initial_net_ns_id() -> NsId {
+    init_ns_id::NET
+}
+
+/// `init_net` — the initial network namespace object.
+///
+/// A real namespace rather than a bare reserved id: a tree entry whose
+/// `Weak` cannot be upgraded is indistinguishable from a stale one, so
+/// every flavour NARF implements needs an object behind its initial entry
+/// (`userspace/specification/namespace-tree.md` R30). Created on first use
+/// and never dropped, like every initial namespace.
+static INITIAL_NET_NS: narf_lib::sync::OnceLock<Arc<NetNamespace>> =
+    narf_lib::sync::OnceLock::new();
+
+/// The initial network namespace. See [`INITIAL_NET_NS`].
+pub fn initial_net_ns() -> &'static Arc<NetNamespace> {
+    INITIAL_NET_NS.get_or_init(|| {
+        let lo = NetIfaceStub {
+            name: String::from("lo"),
+            mac: [0u8; 6],
+            ipv4: [127, 0, 0, 1],
+            prefix_len: 8,
+        };
+        let ns = Arc::new(NetNamespace {
+            id: init_ns_id::NET,
+            owner: None,
+            inner: IrqSafeSpinLock::new(NetInner {
+                ifaces: alloc::vec![lo],
+            }),
+        });
+        register_ns(&ns, ns_type::NET, 0);
+        ns
+    })
 }
 
 /// Linux ns-flavour tags used to render `readlink` text and to tag the
@@ -177,14 +648,24 @@ struct UtsInner {
 impl UtsNamespace {
     /// Seed a fresh namespace with the boot defaults.
     pub fn new_default() -> Arc<Self> {
-        Arc::new(Self {
-            id: alloc_ns_id(),
+        Self::new_with_id(alloc_ns_id())
+    }
+
+    /// [`Self::new_default`] with an explicit id, so `global_uts` can claim
+    /// the reserved `init_uts_ns` id while every other caller mints a fresh
+    /// one. Only the INITIAL namespace of a flavour may use a reserved id
+    /// (`userspace/specification/namespace-tree.md` R2).
+    fn new_with_id(id: NsId) -> Arc<Self> {
+        let ns = Arc::new(Self {
+            id,
             owner: None,
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: String::from(DEFAULT_HOSTNAME),
                 domainname: String::from("(none)"),
             }),
-        })
+        });
+        register_ns(&ns, ns_type::UTS, 0);
+        ns
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -208,14 +689,17 @@ impl UtsNamespace {
     /// the owner, per `create_uts_ns`'s `ns->user_ns = get_user_ns(user_ns)`.
     pub fn clone_from_in(other: &Self, owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
         let g = other.inner.lock();
-        Arc::new(Self {
+        let owner_id = owner.as_ref().map_or(0, |u| u.id());
+        let ns = Arc::new(Self {
             id: alloc_ns_id(),
             owner,
             inner: IrqSafeSpinLock::new(UtsInner {
                 hostname: g.hostname.clone(),
                 domainname: g.domainname.clone(),
             }),
-        })
+        });
+        register_ns(&ns, ns_type::UTS, owner_id);
+        ns
     }
 
     pub fn hostname(&self) -> String {
@@ -292,13 +776,16 @@ impl NetNamespace {
             ipv4: [127, 0, 0, 1],
             prefix_len: 8,
         };
-        Arc::new(Self {
+        let owner_id = owner.as_ref().map_or(0, |u| u.id());
+        let ns = Arc::new(Self {
             id: alloc_ns_id(),
             owner,
             inner: IrqSafeSpinLock::new(NetInner {
                 ifaces: alloc::vec![lo],
             }),
-        })
+        });
+        register_ns(&ns, ns_type::NET, owner_id);
+        ns
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -332,6 +819,10 @@ impl NetNamespace {
 
 impl Drop for NetNamespace {
     fn drop(&mut self) {
+        // Retire the tree entry first: an entry outliving its
+        // namespace would answer a lookup with an id nothing can be
+        // reached through.
+        ns_tree_remove(self.id);
         narf_net::release_network_namespace(self.id);
     }
 }
@@ -383,14 +874,22 @@ impl IpcNamespace {
     }
 
     fn new_with_id(id: NsId, owner: Option<Arc<UserNamespace>>) -> Arc<Self> {
-        Arc::new(Self {
+        // Registered HERE rather than at each caller: `new_in` mints a fresh
+        // id while the initial namespace reuses a cached one, and both must
+        // land in the tree. Re-registering the same id is an idempotent
+        // insert. Registration follows `Arc::new` because the tree stores a
+        // weak handle and there is nothing to downgrade before then.
+        let owner_id = owner.as_ref().map_or(0, |u| u.id());
+        let ns = Arc::new(Self {
             id,
             owner,
             next_shm_id: AtomicU32::new(1),
             next_sem_id: AtomicU32::new(1),
             next_msg_id: AtomicU32::new(1),
             inner: IrqSafeSpinLock::new(IpcInner::default()),
-        })
+        });
+        register_ns(&ns, ns_type::IPC, owner_id);
+        ns
     }
 
     /// Stable namespace id (nsfs inode in Linux).
@@ -445,6 +944,10 @@ impl IpcNamespace {
 
 impl Drop for IpcNamespace {
     fn drop(&mut self) {
+        // Retire the tree entry first: an entry outliving its
+        // namespace would answer a lookup with an id nothing can be
+        // reached through.
+        ns_tree_remove(self.id);
         // Linux removes an IPC namespace's public ids when the final task/nsfd
         // reference disappears. Existing SysV SHM VMAs retain their backing
         // until their final detach; semaphore/message waiters wake with EIDRM.
@@ -496,7 +999,7 @@ static GLOBAL_IPC: IrqSafeSpinLock<Option<Arc<IpcNamespace>>> = IrqSafeSpinLock:
 fn global_uts() -> Arc<UtsNamespace> {
     let mut g = GLOBAL_UTS.lock();
     if g.is_none() {
-        *g = Some(UtsNamespace::new_default());
+        *g = Some(UtsNamespace::new_with_id(init_ns_id::UTS));
     }
     g.as_ref().expect("just inserted").clone()
 }
@@ -504,10 +1007,7 @@ fn global_uts() -> Arc<UtsNamespace> {
 fn global_ipc() -> Arc<IpcNamespace> {
     let mut g = GLOBAL_IPC.lock();
     if g.is_none() {
-        *g = Some(IpcNamespace::new_with_id(
-            initial_ns_id(&INITIAL_IPC_NS_ID),
-            None,
-        ));
+        *g = Some(IpcNamespace::new_with_id(init_ns_id::IPC, None));
     }
     g.as_ref().expect("just inserted").clone()
 }
@@ -594,7 +1094,7 @@ pub(crate) fn current_ipc_namespace_id(task: u64) -> NsId {
     let g = ipc_task_shard(task).namespaces.lock();
     g.as_ref()
         .and_then(|map| map.get(&task))
-        .map_or_else(|| initial_ns_id(&INITIAL_IPC_NS_ID), |ns| ns.id())
+        .map_or_else(|| init_ns_id::IPC, |ns| ns.id())
 }
 
 /// Return the namespace every task actually sees. An absent per-task override
@@ -788,14 +1288,29 @@ impl narf_filesystem::NsOwner for UserNamespace {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+    fn ns_id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl UserNamespace {
     /// The initial (host/root) user namespace: identity map for the
     /// full id range, no parent. Created lazily and shared.
     pub fn new_initial() -> Arc<Self> {
-        Arc::new(Self {
-            id: alloc_ns_id(),
+        Self::new_initial_with_id(alloc_ns_id())
+    }
+
+    /// [`Self::new_initial`] with an explicit id, so `global_user` can claim
+    /// the reserved `init_user_ns` id while tests that want a host-like
+    /// namespace mint a fresh one. See R2.
+    fn new_initial_with_id(id: NsId) -> Arc<Self> {
+        // The initial user namespace owns itself, which is what Linux's
+        // `init_user_ns.ns.user_ns == &init_user_ns` says. Recorded as owner
+        // 0 rather than as its own id, because 0 is already the tree's
+        // spelling for "the initial user namespace" and a self-referential
+        // id would make an `owner == X` filter return the namespace itself.
+        let ns = Arc::new(Self {
+            id,
             parent: None,
             owner_uid: 0,
             inner: IrqSafeSpinLock::new(UserInner {
@@ -812,7 +1327,9 @@ impl UserNamespace {
                 uid_map_written: true,
                 gid_map_written: true,
             }),
-        })
+        });
+        register_ns(&ns, ns_type::USER, 0);
+        ns
     }
 
     /// `unshare(CLONE_NEWUSER)` — a fresh user namespace owned by
@@ -821,12 +1338,17 @@ impl UserNamespace {
     /// translates to the overflow id, which is the Linux behaviour and
     /// is the safe default (an unconfigured ns has no host authority).
     pub fn new_child(parent: Arc<UserNamespace>, owner_uid: u32) -> Arc<Self> {
-        Arc::new(Self {
+        // A user namespace's owner is its PARENT (`user_ns->parent`), which
+        // is what makes the ownership chain walkable.
+        let parent_id = parent.id();
+        let ns = Arc::new(Self {
             id: alloc_ns_id(),
             parent: Some(parent),
             owner_uid,
             inner: IrqSafeSpinLock::new(UserInner::default()),
-        })
+        });
+        register_ns(&ns, ns_type::USER, parent_id);
+        ns
     }
 
     pub fn id(&self) -> NsId {
@@ -967,7 +1489,7 @@ static GLOBAL_USER: IrqSafeSpinLock<Option<Arc<UserNamespace>>> = IrqSafeSpinLoc
 pub(crate) fn global_user() -> Arc<UserNamespace> {
     let mut g = GLOBAL_USER.lock();
     if g.is_none() {
-        *g = Some(UserNamespace::new_initial());
+        *g = Some(UserNamespace::new_initial_with_id(init_ns_id::USER));
     }
     g.as_ref().expect("just inserted").clone()
 }
@@ -1033,15 +1555,9 @@ pub fn setns_user(task: u64, ns: Arc<UserNamespace>) {
 pub enum HeldNs {
     Uts(Arc<UtsNamespace>),
     Net(Arc<NetNamespace>),
-    NetGlobal(NsId),
     Ipc(Arc<IpcNamespace>),
-    IpcGlobal(NsId),
     Pid(Arc<crate::pid_ns::PidNamespace>),
-    PidGlobal(NsId),
     Mnt(Arc<narf_filesystem::MountNamespace>),
-    /// The shared initial mount namespace is backed directly by the global
-    /// mount registry, so it has identity but no snapshot `MountNamespace`.
-    MntGlobal(NsId),
     #[cfg(feature = "cgroup")]
     Cgroup(Arc<narf_filesystem::cgroupfs::CgroupNamespace>),
     User(Arc<UserNamespace>),
@@ -1052,13 +1568,9 @@ impl HeldNs {
         match self {
             HeldNs::Uts(_) => NsFlavour::Uts,
             HeldNs::Net(_) => NsFlavour::Net,
-            HeldNs::NetGlobal(_) => NsFlavour::Net,
             HeldNs::Ipc(_) => NsFlavour::Ipc,
-            HeldNs::IpcGlobal(_) => NsFlavour::Ipc,
             HeldNs::Pid(_) => NsFlavour::Pid,
-            HeldNs::PidGlobal(_) => NsFlavour::Pid,
             HeldNs::Mnt(_) => NsFlavour::Mnt,
-            HeldNs::MntGlobal(_) => NsFlavour::Mnt,
             #[cfg(feature = "cgroup")]
             HeldNs::Cgroup(_) => NsFlavour::Cgroup,
             HeldNs::User(_) => NsFlavour::User,
@@ -1068,17 +1580,27 @@ impl HeldNs {
         match self {
             HeldNs::Uts(n) => n.id(),
             HeldNs::Net(n) => n.id(),
-            HeldNs::NetGlobal(id) => *id,
             HeldNs::Ipc(n) => n.id(),
-            HeldNs::IpcGlobal(id) => *id,
             HeldNs::Pid(n) => n.id(),
-            HeldNs::PidGlobal(id) => *id,
             HeldNs::Mnt(n) => n.id(),
-            HeldNs::MntGlobal(id) => *id,
             #[cfg(feature = "cgroup")]
             HeldNs::Cgroup(n) => n.id(),
             HeldNs::User(n) => n.id(),
         }
+    }
+}
+
+impl Drop for UtsNamespace {
+    fn drop(&mut self) {
+        // Retire the tree entry: an entry outliving its namespace would
+        // answer a lookup with an id nothing can be reached through.
+        ns_tree_remove(self.id);
+    }
+}
+
+impl Drop for UserNamespace {
+    fn drop(&mut self) {
+        ns_tree_remove(self.id);
     }
 }
 
@@ -1145,15 +1667,17 @@ impl narf_filesystem::FileOps for NsFd {
 pub fn ns_fd_for(task: u64, flavour: NsFlavour) -> Option<Arc<NsFd>> {
     let held = match flavour {
         NsFlavour::Uts => HeldNs::Uts(current_uts_ns(task)),
-        NsFlavour::Net => current_net_ns(task)
-            .map(HeldNs::Net)
-            .unwrap_or_else(|| HeldNs::NetGlobal(initial_ns_id(&INITIAL_NET_NS_ID))),
-        NsFlavour::Ipc => current_ipc_ns(task)
-            .map(HeldNs::Ipc)
-            .unwrap_or_else(|| HeldNs::IpcGlobal(initial_ns_id(&INITIAL_IPC_NS_ID))),
-        NsFlavour::Pid => crate::pid_ns::ns_of(task)
-            .map(HeldNs::Pid)
-            .unwrap_or_else(|| HeldNs::PidGlobal(initial_ns_id(&INITIAL_PID_NS_ID))),
+        // A task that has not unshared IS in the initial namespace, so the
+        // fd names that object — not a bare id. Every flavour's initial
+        // namespace is a real object now, which is what lets the four
+        // `*Global(NsId)` variants go away.
+        NsFlavour::Net => {
+            HeldNs::Net(current_net_ns(task).unwrap_or_else(|| initial_net_ns().clone()))
+        }
+        NsFlavour::Ipc => HeldNs::Ipc(current_ipc_ns(task).unwrap_or_else(global_ipc)),
+        NsFlavour::Pid => HeldNs::Pid(
+            crate::pid_ns::ns_of(task).unwrap_or_else(|| crate::pid_ns::initial_pid_ns().clone()),
+        ),
         NsFlavour::User => HeldNs::User(current_user_ns(task)),
         // Mount and cgroup namespace ownership spans the handlers/filesystem
         // layers; the handlers' namespace_fd_for_task bridge mints those.
@@ -1173,33 +1697,42 @@ pub fn install_held_ns(caller: u64, outer_pid: u64, held: &HeldNs, nstype: u64) 
     }
     match held {
         HeldNs::Uts(n) => setns_uts(caller, n.clone()),
-        HeldNs::Net(n) => setns_net(caller, n.clone()),
-        HeldNs::NetGlobal(_) => setns_initial_net(caller),
+        // Joining the INITIAL namespace of a flavour means dropping the
+        // per-task override, not installing one: NARF spells "in the initial
+        // namespace" as "no entry in the per-task table", so installing the
+        // initial object would leave a task that is in the initial namespace
+        // disagreeing with a task that never left it.
+        HeldNs::Net(n) => {
+            if n.id() == init_ns_id::NET {
+                setns_initial_net(caller);
+            } else {
+                setns_net(caller, n.clone());
+            }
+        }
         HeldNs::Ipc(n) => {
             crate::sysvipc::sem_undo_process_exit(
                 crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
                 caller,
             );
-            setns_ipc(caller, n.clone());
-        }
-        HeldNs::IpcGlobal(_) => {
-            crate::sysvipc::sem_undo_process_exit(
-                crate::handlers::task_to_pid_raw(caller).unwrap_or(caller),
-                caller,
-            );
-            setns_initial_ipc(caller);
+            if n.id() == init_ns_id::IPC {
+                setns_initial_ipc(caller);
+            } else {
+                setns_ipc(caller, n.clone());
+            }
         }
         HeldNs::User(n) => setns_user(caller, n.clone()),
         HeldNs::Pid(n) => {
-            let _ = crate::pid_ns::attach_to_ns(caller, outer_pid, n.clone());
+            if n.id() == init_ns_id::PID {
+                crate::pid_ns::clear_ns(caller);
+            } else {
+                let _ = crate::pid_ns::attach_to_ns(caller, outer_pid, n.clone());
+            }
         }
-        HeldNs::PidGlobal(_) => crate::pid_ns::clear_ns(caller),
         HeldNs::Mnt(_) => {
             // Mount-ns install lives in the handlers layer
             // (install_mount_namespace); the caller handles it.
             return false;
         }
-        HeldNs::MntGlobal(_) => return false,
         #[cfg(feature = "cgroup")]
         HeldNs::Cgroup(n) => {
             narf_filesystem::cgroupfs::install_cgroup_namespace(outer_pid, n.clone());

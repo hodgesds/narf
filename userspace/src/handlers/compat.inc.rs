@@ -2908,24 +2908,6 @@ pub fn mount_namespace_of(task: u64) -> Option<alloc::sync::Arc<narf_filesystem:
     g.as_ref().and_then(|m| m.get(&task).cloned())
 }
 
-/// Stable nsfs identity for the shared initial mount namespace. Unlike a
-/// private `MountNamespace`, this namespace is backed directly by the global
-/// registry and therefore has no snapshot object to hold.
-#[cfg(feature = "container")]
-fn initial_mount_namespace_id() -> u64 {
-    use core::sync::atomic::{AtomicU64, Ordering};
-    static ID: AtomicU64 = AtomicU64::new(0);
-    let current = ID.load(Ordering::Acquire);
-    if current != 0 {
-        return current;
-    }
-    let fresh = crate::namespaces::alloc_ns_id();
-    match ID.compare_exchange(0, fresh, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => fresh,
-        Err(existing) => existing,
-    }
-}
-
 /// Mint the real namespace fd named by `/proc/<pid>/ns/<flavour>` or the
 /// equivalent pidfd ioctl. Mount and cgroup namespaces are bridged here
 /// because their backing objects live outside `userspace::namespaces`.
@@ -2936,9 +2918,9 @@ pub fn namespace_fd_for_task(
 ) -> Option<alloc::sync::Arc<crate::namespaces::NsFd>> {
     use crate::namespaces::{HeldNs, NsFd, NsFlavour};
     let held = match flavour {
-        NsFlavour::Mnt => mount_namespace_of(task)
-            .map(HeldNs::Mnt)
-            .unwrap_or_else(|| HeldNs::MntGlobal(initial_mount_namespace_id())),
+        NsFlavour::Mnt => HeldNs::Mnt(
+            mount_namespace_of(task).unwrap_or_else(narf_filesystem::initial_mount_ns),
+        ),
         NsFlavour::Cgroup => {
             #[cfg(feature = "cgroup")]
             {
@@ -2947,6 +2929,10 @@ pub fn namespace_fd_for_task(
                 // allocator here as well so the initial cgroup namespace can
                 // never be minted with the filesystem fallback identity 0.
                 narf_filesystem::install_ns_id_alloc_hook(crate::namespaces::alloc_ns_id);
+                narf_filesystem::install_ns_tree_hooks(
+                    crate::namespaces::ns_tree_add,
+                    crate::namespaces::ns_tree_remove,
+                );
                 let pid = task_to_pid_raw(task).unwrap_or(task);
                 HeldNs::Cgroup(narf_filesystem::cgroupfs::cgroup_namespace_of(pid))
             }
@@ -2960,7 +2946,8 @@ pub fn namespace_fd_for_task(
     Some(NsFd::new(held))
 }
 
-/// Rejoin the shared initial mount namespace represented by `MntGlobal`.
+/// Rejoin the initial mount namespace: drop the per-task override, so
+/// the task reads the global registry again.
 #[cfg(feature = "container")]
 pub fn install_initial_mount_namespace(task: u64) {
     remove_mount_namespace(task);
@@ -10036,6 +10023,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Cachestat, "cachestat", RawFnHandler(sys_cachestat));
     table.install_raw(Syscall::Mseal, "mseal", RawFnHandler(sys_mseal));
+    #[cfg(feature = "container")]
+    table.install_raw(
+        Syscall::Listns,
+        "listns",
+        RawFnHandler(handler_sys_listns::sys_listns),
+    );
     table.install_raw(
         Syscall::FileGetattr,
         "file_getattr",
@@ -11371,6 +11364,9 @@ mod handler_sys_cachestat;
 mod handler_sys_file_attr;
 #[path = "sys_mseal.rs"]
 mod handler_sys_mseal;
+#[cfg(feature = "container")]
+#[path = "sys_listns.rs"]
+mod handler_sys_listns;
 #[path = "sys_statmount.rs"]
 mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]

@@ -131,6 +131,116 @@ fn smoke_rcu_retire_box_advance_epoch_reclaims() -> TestResult {
 }
 kernel_test_in!("rcu", smoke_rcu_retire_box_advance_epoch_reclaims);
 
+/// Retiring far more objects than the old fixed bucket held must reclaim
+/// EVERY one of them.
+///
+/// The per-CPU queue used to be a 64-slot array whose 65th entry hit
+/// `bucket.overflow += 1` and dropped the pointer on the floor — a silent
+/// leak with no destructor, no diagnostic anything read, and no upper
+/// bound on how much it lost. Any copy-on-write consumer retires once per
+/// publish, so this was reachable from ordinary use, not just from abuse.
+///
+/// The queue is intrusive now: the list node lives inside each managed
+/// allocation, so enqueue is a splice that cannot fail. This pins that —
+/// under the old code the count would stop at 64.
+fn smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all() -> TestResult {
+    use alloc::boxed::Box;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    // 4x the old `DEFER_BUCKET_CAP`, so a regression cannot pass by
+    // widening the array a little.
+    const N: usize = 256;
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    struct Canary;
+    impl Drop for Canary {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    crate::report_quiescent();
+    for _ in 0..N {
+        crate::retire_box(Box::new(Canary));
+    }
+    // Nothing may be reclaimed yet — the grace period needs a later epoch.
+    if DROPS.load(Ordering::Relaxed) != 0 {
+        return TestResult::Fail("a retired object was reclaimed before its grace period");
+    }
+    if crate::qsbr::deferred_len_this_cpu() != N {
+        return TestResult::Fail("the queue did not accept every retired object");
+    }
+    crate::sync();
+    let dropped = DROPS.load(Ordering::Relaxed);
+    if dropped != N {
+        // Distinguish the leak from a partial drain, so a failure says
+        // which one it is rather than just "wrong number".
+        if dropped == 64 {
+            return TestResult::Fail("queue capped at 64 — the fixed-bucket leak is back");
+        }
+        return TestResult::Fail("sync() did not reclaim every retired object");
+    }
+    if crate::qsbr::deferred_len_this_cpu() != 0 {
+        return TestResult::Fail("the queue still holds reclaimed nodes");
+    }
+    if crate::qsbr::overflow_count_this_cpu() != 0 {
+        return TestResult::Fail("the intrusive queue reported a discarded enqueue");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all);
+
+/// A reader pinned before a publish keeps seeing the OLD value, and the
+/// displaced value is reclaimed only after the reader releases.
+///
+/// This is the property the retirement header must not disturb: the
+/// writer stamps `next`/`epoch` into the node it just unlinked while a
+/// reader may still be dereferencing that node's value. Header and value
+/// are separate fields of one `#[repr(C)]` allocation precisely so the
+/// two cannot collide.
+fn smoke_rcu_reader_sees_old_value_across_publish() -> TestResult {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static DROPS: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug)]
+    struct Payload(u64);
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            DROPS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    DROPS.store(0, Ordering::Relaxed);
+    crate::report_quiescent();
+    let cell = crate::Atomic::new(Payload(1));
+    {
+        let g = crate::pin();
+        let old = cell.load(&g);
+        if old.as_ref().map(|p| p.0) != Some(1) {
+            return TestResult::Fail("load did not see the published value");
+        }
+        cell.store(crate::Owned::new(Payload(2)), &g);
+        // The pin is still live: the displaced payload must be intact and
+        // still readable through the snapshot taken before the store.
+        if old.as_ref().map(|p| p.0) != Some(1) {
+            return TestResult::Fail("a pinned reader lost its value across a publish");
+        }
+        if DROPS.load(Ordering::Relaxed) != 0 {
+            return TestResult::Fail("the displaced value was reclaimed under a live reader");
+        }
+    }
+    crate::sync();
+    if DROPS.load(Ordering::Relaxed) != 1 {
+        return TestResult::Fail("the displaced value was not reclaimed after the reader left");
+    }
+    drop(cell);
+    if DROPS.load(Ordering::Relaxed) != 2 {
+        return TestResult::Fail("dropping the cell did not reclaim the live value");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_reader_sees_old_value_across_publish);
+
 // ── epoch ──────────────────────────────────────────────────────────
 
 fn smoke_rcu_epoch_pin_cycle() -> TestResult {
