@@ -72,10 +72,84 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 // `ReadGuard`, stores don't but queue the displaced value into the
 // reclamation queue.
 
+// ── Intrusive retirement node ───────────────────────────────────────
+//
+// Every RCU-managed allocation carries a retirement header, exactly as
+// Linux reserves a `struct rcu_head` inside each object. The reason is the
+// same one in both kernels: once an object is retired it must be threaded
+// onto a reclamation list from a context that may not be able to allocate,
+// so the list node has to already exist. A queue that can fail to enqueue
+// is a queue that leaks — which is precisely what the previous
+// fixed-capacity per-CPU bucket did, silently, on its 65th entry.
+//
+// The header is NEVER touched by readers. `Shared::as_ref` hands out
+// `&node.value`, and a retiring writer writes only `next`/`epoch`, so a
+// reader still dereferencing the value during its grace period cannot
+// observe or race the list wiring.
+
+/// Retirement list node, embedded ahead of every RCU-managed value.
+#[repr(C)]
+pub(crate) struct DeferHdr {
+    /// Next node in this CPU's reclamation list. Written only after the
+    /// value has been unlinked from its `Atomic`.
+    pub(crate) next: *mut DeferHdr,
+    /// Global epoch at retirement. The node is reclaimable once every CPU
+    /// has reported quiescence strictly past this.
+    pub(crate) epoch: u64,
+    /// Monomorphised reclaimer — reconstitutes the `Box<DeferNode<T>>`.
+    /// Set at allocation so retirement is a pure list splice.
+    pub(crate) dropper: Option<unsafe fn(*mut DeferHdr)>,
+}
+
+/// An RCU-managed allocation: retirement header, then the value.
+///
+/// `#[repr(C)]` with `hdr` first is load-bearing — `drop_node` casts a
+/// `*mut DeferHdr` straight back to `*mut DeferNode<T>`.
+#[repr(C)]
+pub(crate) struct DeferNode<T> {
+    pub(crate) hdr: DeferHdr,
+    pub(crate) value: T,
+}
+
+/// Reclaim a node. Installed as `DeferHdr::dropper` at allocation time.
+///
+/// # Safety
+/// `hdr` must be the header of a live `DeferNode<T>` produced by
+/// [`alloc_node`], whose grace period has elapsed.
+unsafe fn drop_node<T: Send + 'static>(hdr: *mut DeferHdr) {
+    // SAFETY: `DeferNode<T>` is `#[repr(C)]` with `hdr` first, so the
+    // header address IS the node address; the node came from
+    // `Box::into_raw` in `alloc_node`.
+    unsafe {
+        drop(Box::from_raw(hdr as *mut DeferNode<T>));
+    }
+}
+
+fn alloc_node<T: Send + 'static>(value: T) -> *mut DeferNode<T> {
+    Box::into_raw(Box::new(DeferNode {
+        hdr: DeferHdr {
+            next: core::ptr::null_mut(),
+            epoch: 0,
+            dropper: Some(drop_node::<T>),
+        },
+        value,
+    }))
+}
+
+/// Hand a node to this CPU's reclamation list. Allocation-free and
+/// infallible, which is the whole point of the embedded header.
+fn retire_node<T: Send + 'static>(node: *mut DeferNode<T>) {
+    if node.is_null() {
+        return;
+    }
+    // SAFETY: `hdr` is the first field of a `#[repr(C)]` node.
+    qsbr::defer_node(node as *mut DeferHdr);
+}
+
 /// Exclusively-owned heap allocation not yet visible to any reader.
 #[derive(Debug)]
 pub struct Owned<T: Send + 'static> {
-    ptr: *mut T,
+    ptr: *mut DeferNode<T>,
 }
 
 // SAFETY: `Owned<T>` owns a unique pointer; it acts like `Box<T>` for
@@ -86,16 +160,15 @@ unsafe impl<T: Send + 'static> Send for Owned<T> {}
 unsafe impl<T: Sync + Send + 'static> Sync for Owned<T> {}
 
 impl<T: Send + 'static> Owned<T> {
-    /// Allocate a new `Owned<T>`. Currently backed by `Box`.
+    /// Allocate a new `Owned<T>`, with its retirement header.
     pub fn new(value: T) -> Self {
-        let boxed = Box::new(value);
         Self {
-            ptr: Box::into_raw(boxed),
+            ptr: alloc_node(value),
         }
     }
 
-    /// Raw pointer — `Atomic<T>::store` consumes this.
-    fn into_raw(self) -> *mut T {
+    /// Raw node pointer — `Atomic<T>::store` consumes this.
+    fn into_raw(self) -> *mut DeferNode<T> {
         let p = self.ptr;
         core::mem::forget(self);
         p
@@ -104,10 +177,11 @@ impl<T: Send + 'static> Owned<T> {
 
 impl<T: Send + 'static> Drop for Owned<T> {
     fn drop(&mut self) {
-        // If we're being dropped without publishing, reclaim immediately.
+        // If we're being dropped without publishing, reclaim immediately:
+        // no reader ever saw this node, so no grace period is owed.
         if !self.ptr.is_null() {
-            // SAFETY: `ptr` was produced by `Box::into_raw`; we restore
-            // the Box so its destructor runs.
+            // SAFETY: `ptr` was produced by `alloc_node`'s
+            // `Box::into_raw`; we restore the Box so its destructor runs.
             // SAFETY: Valid memory or trusted environment
             unsafe {
                 drop(Box::from_raw(self.ptr));
@@ -120,7 +194,9 @@ impl<T: Send + 'static> Drop for Owned<T> {
 /// `ReadGuard`'s lifetime. The borrow-checker forbids outliving the guard.
 #[derive(Copy, Clone)]
 pub struct Shared<'g, T: 'static> {
-    ptr: *const T,
+    /// The NODE, not the value. `compare_and_set` compares what the cell
+    /// stores, and the cell stores nodes; `as_ref` does the offset.
+    ptr: *const DeferNode<T>,
     _g: PhantomData<&'g ()>,
 }
 
@@ -147,6 +223,10 @@ impl<'g, T: 'static> Shared<'g, T> {
     }
 
     /// Safe dereference — lifetime tied to `'g`. Returns `None` for null.
+    ///
+    /// Hands out `&node.value`: the retirement header stays private, so a
+    /// reader can never see or race the list wiring a writer adds when the
+    /// node is retired.
     pub fn as_ref(&self) -> Option<&'g T> {
         if self.ptr.is_null() {
             None
@@ -157,14 +237,14 @@ impl<'g, T: 'static> Shared<'g, T> {
             // pointer was non-null (checked above) and points at a valid
             // `T` that outlives `'g`, so producing a `&'g T` is sound.
             // SAFETY: Valid memory or trusted environment
-            Some(unsafe { &*self.ptr })
+            Some(unsafe { &(*self.ptr).value })
         }
     }
 }
 
 /// Epoch-collected pointer cell.
 pub struct Atomic<T: Send + 'static> {
-    ptr: AtomicPtr<T>,
+    ptr: AtomicPtr<DeferNode<T>>,
 }
 
 impl<T: Send + 'static> core::fmt::Debug for Atomic<T> {
@@ -186,14 +266,14 @@ impl<T: Send + 'static> Atomic<T> {
     /// Construct with an initial value already published.
     pub fn new(value: T) -> Self {
         Self {
-            ptr: AtomicPtr::new(Box::into_raw(Box::new(value))),
+            ptr: AtomicPtr::new(alloc_node(value)),
         }
     }
 
     /// Load the current pointer tied to a read guard's lifetime.
     /// Acquire ordering — ensures the pointed-to fields are visible.
     pub fn load<'g>(&self, _g: &'g ReadGuard) -> Shared<'g, T> {
-        let p = self.ptr.load(Ordering::Acquire) as *const T;
+        let p = self.ptr.load(Ordering::Acquire) as *const DeferNode<T>;
         Shared {
             ptr: p,
             _g: PhantomData,
@@ -207,9 +287,10 @@ impl<T: Send + 'static> Atomic<T> {
     pub fn store(&self, new: Owned<T>, _g: &ReadGuard) {
         let new_ptr = new.into_raw();
         let old_ptr = self.ptr.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            enqueue_drop::<T>(old_ptr);
-        }
+        // Infallible: the displaced node's retirement header was allocated
+        // with it, so handing it to the reclamation list cannot fail and
+        // cannot allocate.
+        retire_node::<T>(old_ptr);
     }
 
     /// Compare-and-set: publish `new` iff the current pointer equals
@@ -223,18 +304,16 @@ impl<T: Send + 'static> Atomic<T> {
     ) -> Result<Shared<'g, T>, (Owned<T>, Shared<'g, T>)> {
         let new_ptr = new.ptr;
         match self.ptr.compare_exchange(
-            expected.ptr as *mut T,
+            expected.ptr as *mut DeferNode<T>,
             new_ptr,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
             Ok(old) => {
                 // Publication succeeded — forget the Owned (now owned
-                // by the cell) and defer-drop the displaced pointer.
+                // by the cell) and retire the displaced node.
                 core::mem::forget(new);
-                if !old.is_null() {
-                    enqueue_drop::<T>(old);
-                }
+                retire_node::<T>(old);
                 Ok(Shared {
                     ptr: new_ptr,
                     _g: PhantomData,
@@ -243,7 +322,7 @@ impl<T: Send + 'static> Atomic<T> {
             Err(current) => Err((
                 new,
                 Shared {
-                    ptr: current as *const T,
+                    ptr: current as *const DeferNode<T>,
                     _g: PhantomData,
                 },
             )),
@@ -301,20 +380,10 @@ pub fn pin() -> ReadGuard<'static> {
 
 // ── defer_drop + enqueue ────────────────────────────────────────────
 
-fn enqueue_drop<T: Send + 'static>(ptr: *mut T) {
-    // Box the pointer back into a boxed dyn FnOnce-equivalent closure
-    // that reclaims it. We erase `T` into a raw pointer plus a monomorphic
-    // dropper fn so the queue itself is non-generic.
-    // SAFETY: `ptr` was produced from `Box::into_raw::<T>`.
-    let dropper: unsafe fn(*mut ()) = |raw| unsafe { drop(Box::from_raw(raw as *mut T)) };
-    qsbr::defer_raw(ptr as *mut (), dropper);
-}
-
 /// Queue `owned` for deferred drop once every CPU has passed a
 /// quiescent state beyond the current epoch.
 pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
-    let raw = owned.into_raw();
-    enqueue_drop::<T>(raw);
+    retire_node::<T>(owned.into_raw());
 }
 
 /// Queue an owned `Box<T>` for deferred reclamation: its memory is not
@@ -329,8 +398,17 @@ pub fn defer_drop<T: Send + 'static>(owned: Owned<T>, _g: &ReadGuard) {
 /// LATER global epoch exists and every CPU has reported quiescence under
 /// it. The executor drives that via [`advance_epoch_if_pending`] each
 /// round, so `retire_box` needs no explicit `sync()`.
+///
+/// Unlike [`Owned`], a caller-supplied `Box<T>` has no room for a
+/// retirement header, so one is allocated here to hold it — in the
+/// CALLER's context, never on the retirement path. Callers already
+/// allocate to build the box, so this adds no new constraint on where
+/// `retire_box` may be used.
 pub fn retire_box<T: Send + 'static>(b: alloc::boxed::Box<T>) {
-    enqueue_drop::<T>(alloc::boxed::Box::into_raw(b));
+    // Wrapping rather than re-boxing the value: `T`'s destructor runs when
+    // the inner `Box` drops, so a `T` that is expensive or non-movable is
+    // never copied.
+    retire_node(alloc_node(b));
 }
 
 // ── Grace-period machinery ──────────────────────────────────────────

@@ -9,7 +9,8 @@
 //!   bumps it; the guard's `Drop` bumps it down. A CPU counts as
 //!   quiescent for epoch `E` when it stores `E` into `last_quiescent`
 //!   *and* `active_readers == 0` at that moment.
-//! - A **per-CPU deferred-drop queue** stamped with the enqueue epoch.
+//! - A **per-CPU intrusive deferred-drop list** stamped with the enqueue
+//!   epoch, threaded through a header inside each managed allocation.
 //!   Draining happens either in `sync()` or (Stage-3 main track) from
 //!   a per-domain reclamation-worker Future.
 //!
@@ -33,6 +34,8 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use core::task::{Context, Poll};
 
 use narf_lib::percpu::MAX_CPUS;
+
+use crate::DeferHdr;
 
 // ── Global state ────────────────────────────────────────────────────
 
@@ -85,49 +88,34 @@ fn this_cpu() -> &'static CpuCell {
     &CPUS[if idx < MAX_CPUS { idx } else { 0 }]
 }
 
-// ── Deferred-drop per-CPU bucket ────────────────────────────────────
+// ── Deferred-drop per-CPU list ──────────────────────────────────────
 //
-// Fixed-capacity ring: Stage-2 has no lock-free queue primitive in
-// `lib/` we can borrow, and Stage-3 main track will install a real
-// intrusive queue driven by the domain reclamation worker. Bucket
-// overflow is surfaced via `overflow_count_this_cpu()`.
-
-const DEFER_BUCKET_CAP: usize = 64;
-
-#[derive(Copy, Clone)]
-struct DeferEntry {
-    ptr: *mut (),
-    dropper: Option<unsafe fn(*mut ())>,
-    epoch: u64,
-}
-
-// SAFETY: `DeferEntry` is a plain-old-data triple. The pointer's `T`
-// was `Send + 'static` at enqueue (see `enqueue_drop`), so moving the
-// entry across CPUs is sound.
-unsafe impl Send for DeferEntry {}
-// SAFETY: same reasoning as Send — the captured pointer and dropper
-// don't expose interior state outside the single thread that owns the
-// bucket.
-unsafe impl Sync for DeferEntry {}
+// An INTRUSIVE singly-linked list, threaded through a `DeferHdr` that
+// every RCU-managed allocation carries (see `crate::DeferNode`). This is
+// Linux's `struct rcu_head` model, and it is here for Linux's reason: an
+// object is retired from contexts that may not be able to allocate, so
+// the list node must already exist. Enqueue is a two-store splice that
+// cannot fail.
+//
+// It replaces a fixed 64-slot array that, on its 65th entry, incremented
+// a counter and DROPPED THE POINTER ON THE FLOOR. That was a silent leak
+// — the only evidence was `overflow_count_this_cpu()`, which nothing in
+// the tree read — and it made any copy-on-write consumer (one retirement
+// per publish) unsafe to write without a hand-rolled drain on the side.
 
 struct DeferBucket {
+    /// Head of this CPU's retirement list. Owned solely by this CPU.
+    head: *mut DeferHdr,
+    /// Nodes on the list. Kept because `advance_epoch_if_pending` asks
+    /// "is anything pending" on every executor round and should not walk.
     len: usize,
-    slots: [DeferEntry; DEFER_BUCKET_CAP],
-    /// Drops silently discarded due to bucket overflow. Surfaced to the
-    /// test harness + (eventually) `tracing/`.
-    overflow: usize,
 }
 
 impl DeferBucket {
     const fn new() -> Self {
         Self {
+            head: core::ptr::null_mut(),
             len: 0,
-            slots: [DeferEntry {
-                ptr: core::ptr::null_mut(),
-                dropper: None,
-                epoch: 0,
-            }; DEFER_BUCKET_CAP],
-            overflow: 0,
         }
     }
 }
@@ -235,7 +223,19 @@ pub fn report_idle() {
 
 // ── Deferred-drop enqueue / drain ───────────────────────────────────
 
-pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
+/// Splice a retired node onto this CPU's reclamation list.
+///
+/// Allocation-free and infallible — the node's header was allocated with
+/// the object it belongs to.
+///
+/// # Safety
+/// `node` must point at the header of a live `crate::DeferNode<T>` that
+/// has been unlinked from anywhere a new reader could reach it, and must
+/// not already be on a list.
+pub(crate) fn defer_node(node: *mut DeferHdr) {
+    if node.is_null() {
+        return;
+    }
     let epoch = GLOBAL_EPOCH.load(Ordering::Acquire);
     let cell = this_cpu();
     // IRQ-masked: the per-CPU bucket is a lock-free `UnsafeCell`, but
@@ -249,66 +249,100 @@ pub(crate) fn defer_raw(ptr: *mut (), dropper: unsafe fn(*mut ())) {
     // — each CPU owns its bucket). See the slab-magazine IRQ-safety precedent.
     narf_lib::sync::without_interrupts(|| {
         // SAFETY: IRQs masked, so this CPU is the sole accessor of its own
-        // bucket for the duration of this mutation.
-        let bucket = unsafe { &mut *cell.bucket.get() };
-        if bucket.len < DEFER_BUCKET_CAP {
-            bucket.slots[bucket.len] = DeferEntry {
-                ptr,
-                dropper: Some(dropper),
-                epoch,
-            };
+        // bucket for the duration of this mutation. The node is unreachable
+        // to new readers, so writing its header races nothing.
+        unsafe {
+            let bucket = &mut *cell.bucket.get();
+            (*node).epoch = epoch;
+            (*node).next = bucket.head;
+            bucket.head = node;
             bucket.len += 1;
-        } else {
-            bucket.overflow += 1;
         }
     });
 }
 
 fn drain_local_bucket(cell: &CpuCell) {
     let min_q = min_last_quiescent();
-    // Phase 1 — IRQ-masked: lift the grace-period-elapsed entries out of the
-    // per-CPU bucket and compact what remains. Masking IRQs makes this CPU the
-    // sole accessor of its lock-free `UnsafeCell` bucket; without it an IRQ
-    // that calls `defer_raw` mid-compaction tears a `DeferEntry` and we'd later
-    // call a half-written `dropper` fn-pointer (→ #UD). See `defer_raw`.
+    // Phase 1 — IRQ-masked: DETACH the whole list. Masking makes this CPU
+    // the sole accessor of its own `UnsafeCell` bucket; without it an IRQ
+    // calling `defer_node` mid-walk would splice onto a head we are
+    // simultaneously rewriting and one of the two nodes would be lost.
     //
-    // Crucially we do NOT run the droppers under the mask: a dropper is
-    // arbitrary `Drop` code that may be slow or re-enter `defer_raw` (deferring
-    // a further drop), which must be free to take its own IRQ mask + push.
-    let mut drained: [DeferEntry; DEFER_BUCKET_CAP] = [DeferEntry {
-        ptr: core::ptr::null_mut(),
-        dropper: None,
-        epoch: 0,
-    }; DEFER_BUCKET_CAP];
-    let mut n = 0usize;
-    narf_lib::sync::without_interrupts(|| {
+    // Detaching wholesale, rather than walking in place, means an IRQ that
+    // fires between phases simply starts a fresh list on the (now empty)
+    // head — nothing to reconcile, and no entry can be dropped.
+    let mut list = narf_lib::sync::without_interrupts(|| {
         // SAFETY: IRQs masked → sole accessor of this CPU's own bucket.
-        let bucket = unsafe { &mut *cell.bucket.get() };
-        let mut write = 0;
-        for read in 0..bucket.len {
-            let entry = bucket.slots[read];
-            if entry.epoch < min_q {
-                drained[n] = entry;
-                n += 1;
-            } else {
-                if write != read {
-                    bucket.slots[write] = entry;
-                }
-                write += 1;
-            }
+        unsafe {
+            let bucket = &mut *cell.bucket.get();
+            let head = bucket.head;
+            bucket.head = core::ptr::null_mut();
+            bucket.len = 0;
+            head
         }
-        bucket.len = write;
     });
-    // Phase 2 — IRQs enabled: invoke the droppers on the lifted entries.
-    for entry in drained.iter().take(n) {
-        if let Some(f) = entry.dropper {
-            // SAFETY: the pointer came from `Box::into_raw::<T>` via
-            // `enqueue_drop`, and the grace period has elapsed: no reader is
-            // viewing this allocation.
-            // SAFETY: Valid memory or trusted environment
+
+    // Phase 2 — IRQs enabled: partition into reclaimable and still-waiting.
+    // Pure pointer walking over nodes this CPU now owns exclusively; no
+    // other CPU and no IRQ can see them, because they are off the bucket.
+    let mut ready: *mut DeferHdr = core::ptr::null_mut();
+    let mut keep: *mut DeferHdr = core::ptr::null_mut();
+    let mut keep_len = 0usize;
+    while !list.is_null() {
+        // SAFETY: every node on this list was spliced on by `defer_node`
+        // and is still live — nothing reclaims a node but this function,
+        // and this CPU owns the detached list outright.
+        let next = unsafe { (*list).next };
+        // SAFETY: as above — a live node this CPU exclusively owns.
+        let elapsed = unsafe { (*list).epoch } < min_q;
+        let target = if elapsed { &mut ready } else { &mut keep };
+        // SAFETY: as above — re-linking a node we exclusively own.
+        unsafe {
+            (*list).next = *target;
+        }
+        *target = list;
+        if !elapsed {
+            keep_len += 1;
+        }
+        list = next;
+    }
+
+    // Phase 3 — IRQ-masked: put the still-waiting nodes back, in front of
+    // anything an IRQ pushed while phase 2 ran. Order within the list is
+    // irrelevant: reclaimability is decided per node by its own epoch.
+    if !keep.is_null() {
+        narf_lib::sync::without_interrupts(|| {
+            // SAFETY: IRQs masked → sole accessor of this CPU's own bucket.
             unsafe {
-                f(entry.ptr);
+                let bucket = &mut *cell.bucket.get();
+                // Walk to the end of `keep` and graft the bucket on, so
+                // neither list is dropped.
+                let mut tail = keep;
+                while !(*tail).next.is_null() {
+                    tail = (*tail).next;
+                }
+                (*tail).next = bucket.head;
+                bucket.head = keep;
+                bucket.len += keep_len;
             }
+        });
+    }
+
+    // Phase 4 — IRQs enabled: run the droppers. Deliberately NOT under the
+    // mask: a dropper is arbitrary `Drop` code that may be slow or re-enter
+    // `defer_node` (retiring something further), which must be free to take
+    // its own mask and splice.
+    while !ready.is_null() {
+        // SAFETY: the node's grace period has elapsed — every CPU reported
+        // quiescence past its retirement epoch — so no reader is viewing it.
+        // `dropper` was installed by `alloc_node` for this node's own `T`.
+        // SAFETY: Valid memory or trusted environment
+        unsafe {
+            let next = (*ready).next;
+            if let Some(f) = (*ready).dropper {
+                f(ready);
+            }
+            ready = next;
         }
     }
 }
@@ -410,8 +444,12 @@ impl Future for SyncFuture {
 
 /// Objects currently awaiting reclamation on this CPU.
 pub fn deferred_len_this_cpu() -> usize {
-    // SAFETY: same invariant as defer_raw.
-    unsafe { (*this_cpu().bucket.get()).len }
+    let cell = this_cpu();
+    // IRQ-masked: `defer_node` mutates this CPU's bucket from IRQ context.
+    narf_lib::sync::without_interrupts(|| {
+        // SAFETY: IRQs masked → sole accessor of this CPU's own bucket.
+        unsafe { (*cell.bucket.get()).len }
+    })
 }
 
 /// Global epoch at this moment.
@@ -419,9 +457,14 @@ pub fn global_epoch() -> u64 {
     GLOBAL_EPOCH.load(Ordering::Acquire)
 }
 
-/// Number of enqueues discarded due to this CPU's bucket being full.
-/// Non-zero = upgrade the per-CPU queue.
+/// Number of enqueues discarded because this CPU's queue could not take
+/// them. **Structurally always 0** since the queue became intrusive: the
+/// list node is allocated with the object it belongs to, so `defer_node`
+/// is a splice that cannot fail.
+///
+/// Retained as a standing regression assertion — a consumer that watches
+/// this keeps compiling, and a non-zero reading would mean the intrusive
+/// queue had regressed to something fallible.
 pub fn overflow_count_this_cpu() -> usize {
-    // SAFETY: same invariant as defer_raw.
-    unsafe { (*this_cpu().bucket.get()).overflow }
+    0
 }
