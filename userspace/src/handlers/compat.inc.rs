@@ -10040,6 +10040,12 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
     );
     table.install_raw(Syscall::Cachestat, "cachestat", RawFnHandler(sys_cachestat));
     table.install_raw(Syscall::Mseal, "mseal", RawFnHandler(sys_mseal));
+    #[cfg(feature = "container")]
+    table.install_raw(
+        Syscall::Listns,
+        "listns",
+        RawFnHandler(handler_sys_listns::sys_listns),
+    );
     table.install_raw(
         Syscall::FileGetattr,
         "file_getattr",
@@ -11375,6 +11381,9 @@ mod handler_sys_cachestat;
 mod handler_sys_file_attr;
 #[path = "sys_mseal.rs"]
 mod handler_sys_mseal;
+#[cfg(feature = "container")]
+#[path = "sys_listns.rs"]
+mod handler_sys_listns;
 #[path = "sys_statmount.rs"]
 mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]

@@ -132,6 +132,15 @@ static NS_TREE: IrqSafeSpinLock<Option<BTreeMap<NsId, NsTreeEntry>>> = IrqSafeSp
 /// answers 0 until userspace installs the shared allocator, and a boot-time
 /// namespace minted before that has no id to key on. Letting it in would
 /// give every such namespace the same key and collapse them into one entry.
+///
+/// LINUX-GAP: Linux registers `init_user_ns`, `init_pid_ns` and the rest at
+/// BOOT, so its tree is complete from the first moment it can be read. NARF
+/// materialises its initial namespaces lazily — `current_user_ns` mints the
+/// initial user namespace on first use — so the tree gains them the first
+/// time anything touches them, which for `listns` means its own first call
+/// can grow the tree by one. Every id is still correct and still unique; what
+/// differs is that an initial namespace nothing has touched yet is absent
+/// rather than present-and-idle.
 pub fn ns_tree_add(id: NsId, ns_type: u32, owner_user_ns: NsId) {
     if id == 0 {
         return;
@@ -197,6 +206,38 @@ pub fn ns_tree_list(
     .collect()
 }
 
+/// Register the INITIAL namespaces, as Linux registers `init_user_ns`,
+/// `init_pid_ns` and the rest at boot.
+///
+/// Without this the tree would be complete only once something had touched
+/// each flavour — so `listns` could grow the tree with its own first call,
+/// and an initial namespace nobody had used yet would be absent rather than
+/// present-and-idle. The initial namespaces conceptually exist from boot;
+/// the tree should say so.
+///
+/// Called from `wait_init`, immediately after the cross-crate hooks are
+/// installed — the order matters, because a namespace materialised before
+/// the hooks would not reach the tree at all.
+///
+/// Idempotent: re-registering an id is an insert on the same key, and the
+/// `global_*` accessors return the existing object once it exists.
+pub fn init_namespaces() {
+    // The flavours with a real global object. Each constructor registers
+    // itself, so touching the accessor is the registration.
+    let _ = global_uts();
+    let _ = global_ipc();
+    let _ = global_user();
+    // NET and PID have no global OBJECT: a task with no per-task namespace
+    // IS in the initial one, which NARF spells as a reserved id rather than
+    // an `Arc`. Register those ids directly.
+    //
+    // They have no `Drop` to retire them, and that is correct rather than a
+    // leak — an initial namespace never goes away, which is exactly why
+    // Linux's `init_*_ns` are static.
+    ns_tree_add(initial_ns_id(&INITIAL_NET_NS_ID), ns_type::NET, 0);
+    ns_tree_add(initial_ns_id(&INITIAL_PID_NS_ID), ns_type::PID, 0);
+}
+
 /// Allocate an id and register it in one step.
 ///
 /// Deliberately the only way a namespace gets an id: allocation and
@@ -208,6 +249,31 @@ fn alloc_registered(ns_type: u32, owner: Option<&Arc<UserNamespace>>) -> NsId {
     let id = alloc_ns_id();
     ns_tree_add(id, ns_type, owner.map_or(0, |u| u.id()));
     id
+}
+
+/// Every namespace after `cursor` matching the filters, as entries.
+///
+/// Unbounded on purpose: `listns` must apply a per-entry PERMISSION check
+/// before it counts towards the caller's buffer, so truncating here would
+/// return short whenever an invisible namespace fell inside the window. The
+/// tree holds only live namespaces, which is a small number.
+pub fn ns_tree_entries_from(
+    cursor: NsId,
+    ns_type: u32,
+    owner_user_ns: Option<NsId>,
+) -> Vec<NsTreeEntry> {
+    let g = NS_TREE.lock();
+    let Some(m) = g.as_ref() else {
+        return Vec::new();
+    };
+    m.range((
+        core::ops::Bound::Excluded(cursor),
+        core::ops::Bound::Unbounded,
+    ))
+    .filter(|(_, e)| ns_type == 0 || e.ns_type & ns_type != 0)
+    .filter(|(_, e)| owner_user_ns.is_none_or(|o| e.owner_user_ns == o))
+    .map(|(_, e)| *e)
+    .collect()
 }
 
 /// How many namespaces the tree holds — diagnostics and tests.

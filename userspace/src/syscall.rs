@@ -1717,6 +1717,13 @@ pub enum Syscall {
     /// can prove is unnecessary.
     /// Linux `cachestat` (x86_64=451, aarch64=451).
     Cachestat,
+    /// `listns(req, ns_ids, nr_ns_ids, flags)` — enumerate the namespaces
+    /// that exist, which before the namespace tree was not answerable at
+    /// all: a namespace could only be reached through something already
+    /// using it. `req.ns_id` is a cursor, so a caller pages rather than
+    /// restarting.
+    /// Linux `listns` (x86_64=470, aarch64=470).
+    Listns,
     /// `mseal(start, len, flags)` — make a range permanently immune to the
     /// operations that could replace what is mapped there (munmap, mremap,
     /// mprotect, MAP_FIXED, destructive madvise). Monotonic: there is no
@@ -2580,6 +2587,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Removexattrat, 466),
     (Syscall::FileGetattr, 468),
     (Syscall::FileSetattr, 469),
+    (Syscall::Listns, 470),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
     (Syscall::Creat, 85),
@@ -3056,6 +3064,7 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::Removexattrat, 466),
     (Syscall::FileGetattr, 468),
     (Syscall::FileSetattr, 469),
+    (Syscall::Listns, 470),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),

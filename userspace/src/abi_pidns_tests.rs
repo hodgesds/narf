@@ -1306,3 +1306,205 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_nstree_includes_cross_crate_flavours
 );
+
+// ── listns(2) ─────────────────────────────────────────────────────────
+
+/// `struct ns_id_req { u32 size, spare; u64 ns_id; u32 ns_type, spare2; u64 user_ns_id; }`.
+fn ns_id_req(size: u32, cursor: u64, ns_type: u32, user_ns_id: u64) -> [u8; 32] {
+    let mut b = [0u8; 32];
+    b[0..4].copy_from_slice(&size.to_ne_bytes());
+    b[8..16].copy_from_slice(&cursor.to_ne_bytes());
+    b[16..20].copy_from_slice(&ns_type.to_ne_bytes());
+    b[24..32].copy_from_slice(&user_ns_id.to_ne_bytes());
+    b
+}
+
+/// `listns` enumerates the tree, filters by type, and pages with a cursor.
+///
+/// Paging is the load-bearing part: `req.ns_id` is the last id already seen,
+/// so a caller with more namespaces than buffer resumes instead of
+/// restarting. One id at a time must reach the same set as one call.
+fn smoke_abi_listns_enumerates_and_pages() -> TestResult {
+    use crate::namespaces::{ns_type, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let a = UtsNamespace::new_default();
+        let b = UtsNamespace::new_default();
+        let c = UtsNamespace::new_default();
+        let mut out = [0u64; 16];
+        let list = |cursor: u64, ty: u32, nr: u64, out: &mut [u64; 16]| {
+            let req = ns_id_req(32, cursor, ty, 0);
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, nr, 0),
+            )
+        };
+        let n = match list(0, 0, 16, &mut out) {
+            Some(n) if n >= 3 => n as usize,
+            _ => return Err("listns should enumerate the namespaces in the tree"),
+        };
+        let all = out[..n].to_vec();
+        for id in [a.id(), b.id(), c.id()] {
+            if !all.contains(&id) {
+                return Err("listns omitted a namespace that is in the tree");
+            }
+        }
+        // Ascending id order — what makes the cursor work at all.
+        if all.windows(2).any(|w| w[0] >= w[1]) {
+            return Err("listns did not return ids in ascending order");
+        }
+        // Page one at a time. Bounded by a generous constant rather than by
+        // `n`, so a cursor that fails to advance is caught as a runaway
+        // rather than by an equality that a one-off tree growth would break.
+        let mut paged = alloc::vec::Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let mut one = [0u64; 16];
+            match list(cursor, 0, 1, &mut one) {
+                Some(1) => {
+                    if one[0] <= cursor {
+                        return Err("the cursor did not advance — paging would not terminate");
+                    }
+                    paged.push(one[0]);
+                    cursor = one[0];
+                }
+                // A cursor with nothing after it is -ENOENT, not an empty
+                // success: that is how a paging caller learns it is done.
+                Some(-2) => break,
+                Some(0) => return Err("listns ended with 0 rather than -ENOENT"),
+                _ => return Err("paging with a cursor should keep returning ids"),
+            }
+            if paged.len() > 256 {
+                return Err("paging did not terminate");
+            }
+        }
+        if paged != all {
+            return Err("paging with the cursor reached a different set than one call");
+        }
+        // Listing must not CREATE a namespace. It used to: the first
+        // `capable()` inside the handler materialised the lazily-built
+        // initial user namespace, which then joined the tree, so the first
+        // call grew it by one. The initial namespaces are registered at boot
+        // now — as Linux registers `init_user_ns` and friends — and this is
+        // the assertion that keeps it that way.
+        let before = crate::namespaces::ns_tree_len();
+        let _ = list(0, 0, 16, &mut out);
+        if crate::namespaces::ns_tree_len() != before {
+            return Err("listns created a namespace while enumerating");
+        }
+        // A type filter selects.
+        let mut uts_out = [0u64; 16];
+        let uts_n = match list(0, ns_type::UTS, 16, &mut uts_out) {
+            Some(n) if n >= 3 => n as usize,
+            _ => return Err("the UTS filter should select the UTS namespaces"),
+        };
+        if uts_out[..uts_n].iter().any(|id| !all.contains(id)) {
+            return Err("the type filter returned something outside the tree");
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_enumerates_and_pages);
+
+/// `listns`'s argument rules.
+///
+/// The one that is easy to get wrong is the type filter: a bit outside
+/// `NS_ALL` is -EOPNOTSUPP and NOT -EINVAL, and not an empty result either.
+/// "No such namespace type" and "no namespaces of that type" are different
+/// answers, and a caller probing for a flavour this kernel does not know
+/// needs to tell them apart.
+fn smoke_abi_listns_argument_rules() -> TestResult {
+    use crate::namespaces::ns_type;
+    with_setup(|| {
+        const E2BIG: i64 = -7;
+        const EOPNOTSUPP: i64 = -95;
+        const EOVERFLOW: i64 = -75;
+        let mut out = [0u64; 8];
+        let mut call_with = |req: &[u8], nr: u64, flags: u64| {
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, nr, flags),
+            )
+        };
+        // An unknown flag.
+        let ok = ns_id_req(32, 0, 0, 0);
+        if call_with(&ok, 8, 1) != Some(EINVAL) {
+            return Err("an unknown listns flag must be -EINVAL");
+        }
+        // Past the one-million cap.
+        if call_with(&ok, 1_000_001, 0) != Some(EOVERFLOW) {
+            return Err("nr_ns_ids above the cap must be -EOVERFLOW");
+        }
+        // Below VER0, and past PAGE_SIZE — E2BIG decided first.
+        let small = ns_id_req(31, 0, 0, 0);
+        if call_with(&small, 8, 0) != Some(EINVAL) {
+            return Err("a size below NS_ID_REQ_SIZE_VER0 must be -EINVAL");
+        }
+        let huge = ns_id_req(4097, 0, 0, 0);
+        if call_with(&huge, 8, 0) != Some(E2BIG) {
+            return Err("a size above PAGE_SIZE must be -E2BIG");
+        }
+        // A reserved field the caller set.
+        let mut spare = ns_id_req(32, 0, 0, 0);
+        spare[4..8].copy_from_slice(&1u32.to_ne_bytes());
+        if call_with(&spare, 8, 0) != Some(EINVAL) {
+            return Err("a nonzero spare must be -EINVAL");
+        }
+        // A type bit outside NS_ALL.
+        let bad_type = ns_id_req(32, 0, 1 << 3, 0);
+        if call_with(&bad_type, 8, 0) != Some(EOPNOTSUPP) {
+            return Err("a type outside NS_ALL must be -EOPNOTSUPP, not -EINVAL");
+        }
+        // A type bit INSIDE NS_ALL with no instances is an empty success,
+        // not an error — the other half of that distinction.
+        crate::namespaces::__test_ns_tree_reset();
+        let time_ns = ns_id_req(32, 0, ns_type::TIME, 0);
+        if call_with(&time_ns, 8, 0) != Some(0) {
+            return Err("a known type with no instances must be an empty success");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_argument_rules);
+
+/// The `user_ns_id` filter, including `LISTNS_CURRENT_USER`.
+///
+/// This is how a container runtime asks "what did this sandbox create".
+fn smoke_abi_listns_owner_filter() -> TestResult {
+    use crate::namespaces::{IpcNamespace, UserNamespace};
+    const LISTNS_CURRENT_USER: u64 = u64::MAX;
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let parent = UserNamespace::new_initial();
+        let child = UserNamespace::new_child(parent.clone(), 0);
+        let owned = IpcNamespace::new_in(Some(child.clone()));
+        let _other = IpcNamespace::new();
+
+        let mut out = [0u64; 16];
+        let req = ns_id_req(32, 0, 0, child.id());
+        let n = match call(
+            Syscall::Listns.raw(),
+            a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) {
+            Some(n) if n >= 0 => n as usize,
+            _ => return Err("listns with an owner filter should succeed"),
+        };
+        if out[..n] != [owned.id()] {
+            return Err("the owner filter did not select exactly the owned namespace");
+        }
+        // LISTNS_CURRENT_USER resolves to the caller's own user namespace,
+        // so it must not be treated as the literal id u64::MAX.
+        let cur = ns_id_req(32, 0, 0, LISTNS_CURRENT_USER);
+        match call(
+            Syscall::Listns.raw(),
+            a3(cur.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) {
+            Some(n) if n >= 0 => {}
+            _ => return Err("LISTNS_CURRENT_USER should resolve, not be used literally"),
+        }
+        crate::namespaces::__test_ns_tree_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_listns_owner_filter);

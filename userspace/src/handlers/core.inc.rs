@@ -9727,6 +9727,11 @@ pub fn wait_init() {
         crate::namespaces::ns_tree_add,
         crate::namespaces::ns_tree_remove,
     );
+    // Then the initial namespaces themselves, as Linux registers
+    // `init_user_ns` and friends at boot. AFTER the hooks, or a namespace
+    // materialised here would never reach the tree.
+    #[cfg(feature = "container")]
+    crate::namespaces::init_namespaces();
 }
 
 /// Exit-observer that removes an exiting *process* from its cgroup.
