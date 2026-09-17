@@ -640,6 +640,8 @@ fn take_sem_wake(state: &mut SemWaitState) -> Option<SemWake> {
 fn dispatch_sem_wake((task, waker, successful_handoff): SemWake) {
     if successful_handoff {
         narf_scheduler::wake_urgent_task(&waker, task);
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        narf_scheduler::stackful::note_urgent_wake_preempt(task);
     } else {
         waker.wake();
     }

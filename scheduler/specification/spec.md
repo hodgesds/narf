@@ -173,11 +173,14 @@ enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
 `note_urgent_wake_preempt` publishes the exact task selected by a synchronous
 wake. An own-stack source may consume that publication as a bounded direct
-handoff only when both tasks are local stackful tasks using the same execution
-kind, the target is an awake default-class/normal-priority task with no period,
-budget cap, or donation, and the installed policy is the built-in class or FIFO
-policy. The target slot remains in its home queue under a core-owned atomic
-claim, so dispatch and stealing skip it until the final switch has completed.
+handoff when both tasks are stackful tasks using the same execution kind, the
+target is an awake default-class/normal-priority task with no period, budget
+cap, or donation, and the installed source and target policies are the built-in
+class or FIFO policy. A local target remains in its home queue under a
+core-owned atomic claim. A remote target is claimed and removed under a
+nonblocking home-policy/home-queue transaction, then re-enqueued within its
+allowed mask on the source CPU while still claimed. In both cases dispatch and
+stealing skip it until the final switch has completed.
 The target normally returns to the source's root executor continuation. If it
 urgently wakes that exact off-queue root, it may instead switch directly to the
 root's saved task continuation. That same fixed root may begin another exact
@@ -191,9 +194,10 @@ target-to-third-task chains. Before either task's first resumed instruction,
 the core publishes
 its task/address-space identity and restores its hardware root, kernel-stack
 target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
-ownership, and PMU attribution. Switch-out saves the same state first. A remote,
-contended, first-run, periodic, capped, donated, higher-class, or external-policy
-target declines to the ordinary exact-buddy/full-validation path. Generic
+ownership, and PMU attribution. Switch-out saves the same state first. A
+contended, first-run, affinity-excluded, periodic, capped, donated,
+higher-class, or external-policy target declines to the ordinary
+exact-buddy/full-validation path and re-kicks its authoritative home. Generic
 every-wake preemption and wake-next remain opt-in. The direct path exchanges
 the target's strong address-space owner into the CPU-local active slot under
 its IRQ-safe lock after activation succeeds. The displaced source owner is
@@ -418,7 +422,11 @@ pub struct TaskSpec {
 - **Hints, not guarantees.** The executor honours `Affinity.preferred`
   for initial placement when possible; a completed poll remains on its
   current CPU while that CPU is allowed. Work-stealing may move a task
-  within `allowed` under load.
+  within `allowed` under load. Idle balancing does not detach a victim's
+  final runnable task: the currently executing task and dispatchable queued
+  slots together must exceed one before a thief may take a queued slot. A task
+  that ran within the 500 us migration-cost window is cache-hot and is not an
+  idle-steal candidate; explicit affinity and CPU-lifecycle moves are exempt.
 - Runtime affinity updates are published in a task-identity registry so
   a currently-polled slot cannot miss them. A parked slot whose queue is
   excluded is moved immediately; a running cooperative continuation is
@@ -628,8 +636,12 @@ control callback.
   instruction, and captures both before returning to the exact root task or
   its executor continuation. Every exact-root return restores that root's
   state before its first resumed instruction; only that fixed root may start
-  another transfer and the eighth return forces the next yield through the
+  another transfer and the 64th return forces the next yield through the
   executor, so the batch cannot extend to a third task or run unbounded.
+  A remotely queued target is first claimed under its old queue lock and moved
+  through the normal migrated dequeue/enqueue lifecycle; affinity and policy
+  checks precede that move, and a contended or rejected claim leaves the task
+  on and wakes its prior authoritative home.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held

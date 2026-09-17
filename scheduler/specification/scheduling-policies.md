@@ -16,7 +16,7 @@ The executor is deliberately factored so that **mechanism** lives in the core
   ready `VecDeque<TaskSlot>`, admission/park/wake transitions, work-stealing and
   migration, CPU hot-plug, time-slice/tick preemption at CPL3, budget throttling
   and eligibility tiers, the bounded synchronous-wake batch (one fixed root,
-  one target at a time, at most eight exact-root returns), and the run-time
+  one target at a time, at most 64 exact-root returns), and the run-time
   *accounting* every policy needs (a task's
   accumulated virtual runtime
   — see §4). Accounting is core-owned because
@@ -65,12 +65,16 @@ create a false negative. A stale higher-class bit only forces the validated
 path.
 
 Before returning through the executor, the core may directly enter that exact
-wakee only for the built-in class/FIFO policies and a local default-class,
-normal-priority stackful task with no period, budget cap, or donation. The core
-claims the resident slot under its home run-queue lock and charges the target's
-runtime back to its own virtual runtime. External and wrapper policies are
-never bypassed: their wakees return through `pick_next` so policy observation
-and ordering remain complete.
+wakee only for the built-in class/FIFO policies and a default-class,
+normal-priority stackful task with no period, budget cap, or donation. A local
+target remains resident under a home-run-queue claim. A remote target is
+claimed and removed through a nonblocking home-policy/home-queue transaction,
+then enqueued on the source CPU as a claimed, non-dispatchable migration before
+the switch. Affinity and both CPUs' policy eligibility are checked first;
+contention or rejection falls back to the target's authoritative home. Target
+runtime is charged back to its own virtual runtime. External and wrapper
+policies are never bypassed: their wakees return through `pick_next` so policy
+observation and ordering remain complete.
 
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative

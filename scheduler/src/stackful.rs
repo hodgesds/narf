@@ -804,22 +804,21 @@ unsafe fn try_direct_handoff(
         let Some(cell) = crate::take_urgent_wake_cell(cpu) else {
             return false;
         };
-        let urgent_id = cell.task;
-        let republish = |task| crate::hint_urgent_next(task);
+        let fallback = |cell: &Arc<crate::WakeCell>| crate::fallback_urgent_wake(cell);
         // SAFETY: caller supplies the live current stackful task.
         let source_ref = unsafe { &*source };
         let Some(source_cell) = task_wake_cell(source_ref) else {
-            republish(cell.task);
+            fallback(&cell);
             return false;
         };
         if !source_cell.direct_eligible.load(Ordering::Acquire) {
-            republish(cell.task);
+            fallback(&cell);
             return false;
         }
-        let Some(mut target) = crate::claim_direct_handoff_target(cpu, cell) else {
-            // The scalar id preserves ordinary exact-buddy selection after a
-            // direct claim declines (policy, budget, migration, or first run).
-            republish(urgent_id);
+        let Some(mut target) = crate::claim_direct_handoff_target(cpu, &cell) else {
+            // Restore the ordinary home wake after a remote/direct claim
+            // declines (policy, budget, queue contention, or first run).
+            fallback(&cell);
             return false;
         };
         // SAFETY: the run-queue claim keeps this non-null stackful target
@@ -833,22 +832,22 @@ unsafe fn try_direct_handoff(
                 != target_ref.user_context.load(Ordering::Acquire).is_null()
             || target_ref.completed.load(Ordering::Acquire)
         {
-            crate::release_direct_handoff_target(&target.cell, false);
-            republish(target.id);
+            crate::release_direct_handoff_target(&target.cell, true);
+            fallback(&target.cell);
             return false;
         }
 
         let root_exec = source_ref.exec_ctx.load(Ordering::Acquire);
         if root_exec.is_null() {
-            crate::release_direct_handoff_target(&target.cell, false);
-            republish(target.id);
+            crate::release_direct_handoff_target(&target.cell, true);
+            fallback(&target.cell);
             return false;
         }
         let root_as = match crate::activate_direct_task(target.id, target.addr_space.take()) {
             Ok(root_as) => root_as,
             Err(()) => {
-                crate::release_direct_handoff_target(&target.cell, false);
-                republish(target.id);
+                crate::release_direct_handoff_target(&target.cell, true);
+                fallback(&target.cell);
                 return false;
             }
         };
@@ -929,6 +928,11 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
             .direct_runtime_cycles
             .fetch_add(ran, Ordering::Relaxed)
     };
+    // The target just executed even though its slot stayed resident in READY;
+    // publish the same cache-hot timestamp an ordinary poll return records.
+    // SAFETY: `target` is the strong Arc-backed WakeCell published for the
+    // active direct target and remains owned until completion of this return.
+    unsafe { (*target).last_run_cycles.store(now, Ordering::Release) };
     direct_state
         .foreign_cycles
         .fetch_add(ran, Ordering::Relaxed);
@@ -946,6 +950,7 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
     }
 
     let root_cell = task_wake_cell(root_ref).expect("direct root lost wake cell");
+    root_cell.last_run_cycles.store(now, Ordering::Release);
     let root_as = direct_state.root_as.lock().take();
     let displaced = crate::activate_direct_task(root_cell.task, root_as)
         .expect("direct handoff could not restore root address space");
@@ -979,20 +984,22 @@ unsafe fn try_direct_return_to_root(
         };
         let root = direct_state.root.load(Ordering::Acquire);
         if root.is_null() {
-            crate::hint_urgent_next(cell.task);
+            crate::fallback_urgent_wake(&cell);
             return false;
         }
         // SAFETY: an active handoff pins the off-queue root until either this
         // return or the ordinary executor-return path completes.
         let root_ref = unsafe { &*root };
         let Some(root_cell) = task_wake_cell(root_ref) else {
-            crate::hint_urgent_next(cell.task);
+            crate::fallback_urgent_wake(&cell);
             return false;
         };
         if !Arc::ptr_eq(&cell, &root_cell) {
             // A target other than the root still takes the bounded executor
-            // path. Preserve its scalar next-buddy hint for normal selection.
-            crate::hint_urgent_next(cell.task);
+            // path. Restore its exact hint and kick its authoritative home;
+            // the original wake may have deferred that kick for a possible
+            // cross-CPU claim on this CPU.
+            crate::fallback_urgent_wake(&cell);
             return false;
         }
         if !cell.flag.swap(false, Ordering::AcqRel) {
@@ -3187,8 +3194,8 @@ pub fn note_wake_preempt(woken: u64) {
 /// protecting the syscall-dense waker for the normal RUN_TO_PARITY batching
 /// window only adds handoff latency. Unlike generic wake-preemption, this
 /// narrow path is always live: it ignores self-wakes and yields only if the
-/// exact dequeued waiter is runnable locally. Remote wakes therefore do not
-/// idle the caller's CPU.
+/// exact dequeued waiter is runnable locally or has been published as this
+/// CPU's remote direct-transfer candidate.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn note_urgent_wake_preempt(woken: u64) {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
@@ -3204,7 +3211,7 @@ pub fn note_urgent_wake_preempt(woken: u64) {
     if crate::current_task_id().raw() == woken {
         return;
     }
-    if !crate::task_runnable_on_current_cpu(woken) {
+    if !crate::task_runnable_on_current_cpu(woken) && !crate::urgent_wake_targets_cpu(cpu, woken) {
         return;
     }
     URGENT_WAKE_PREEMPT.inner[cpu]

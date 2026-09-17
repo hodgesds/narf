@@ -64,8 +64,10 @@ The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 
 An exact synchronous wake followed by an own-stack source park may take a
 bounded direct path instead of first resuming the executor. The core claims the
-awake target while its slot remains resident in the local ready queue, saves the
-source FP/SIMD and task-domain state, publishes and activates the target's task
+awake target under its home ready-queue lock. A local slot remains resident; a
+remote slot is removed and migrated onto the source CPU while still claimed
+and non-dispatchable. The core then saves the source FP/SIMD and task-domain
+state, publishes and activates the target's task
 identity/address space, restores its kernel-stack target, TLS, saved domain
 state, and FP/SIMD ownership, then switches to the target continuation. The
 CPU-local active-address-space slot is held across activation and atomically
@@ -77,7 +79,7 @@ source stack. A target yield, completion, or tick preemption normally restores
 the root identity/address space and switches to the executor. When the target
 urgently wakes that exact off-queue root, it may restore the same state and
 switch directly to the root's saved task continuation. That fixed root may
-start another exact transfer, up to eight target-to-root returns; the next
+start another exact transfer, up to 64 target-to-root returns; the next
 yield must reach the executor. A CPU-local gate rejects nested sources and
 third-task chains. The resident target claim is released only after the final
 switch completes. The target's runtime is
@@ -173,11 +175,14 @@ rolling generation-ordered cutover.
   before migration and permits deferred restore only while the task-owned
   memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
-- Direct handoff is bounded to one claimed target at a time and eight returns
+- Direct handoff is bounded to one claimed target at a time and 64 returns
   to one fixed exact root: executor dispatch and stealing skip the target until
-  each switch completes; nested sources and arbitrary third-task transfers are
-  refused; and the root's next yield after the eighth return must pass through
-  the executor. Address-space ownership, TLS, domain
+  each switch completes; a remote target is claimed under its prior policy and
+  queue locks, checked against destination affinity, then rehomed through the
+  migrated dequeue/enqueue lifecycle while still non-dispatchable. Contention
+  and rejection leave or wake it on the authoritative home. Nested sources and
+  arbitrary third-task transfers are refused; the root's next yield after the
+  64th return must pass through the executor. Address-space ownership, TLS, domain
   state, and FP/SIMD ownership are restored before each resumed task's first
   instruction. A decline leaves the exact wakee on the ordinary validated
   selection path.
