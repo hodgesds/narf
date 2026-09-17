@@ -22,7 +22,7 @@ frames, saved domain rights, executor contexts, or switch functions.
 | Stackless async task | `spawn`, `spawn_with_spec` | No; cooperative poll boundary only |
 | Stackful kernel thread | `spawn_stackful*` | x86_64 CPL0 / aarch64 EL1, unless `no_preempt` |
 | Own-stack user thread | `spawn_user` | x86_64 CPL3 / aarch64 EL0 |
-| User thread in syscall | `spawn_user` | No arbitrary CPL0/EL1 preemption yet |
+| User thread in syscall | `spawn_user` | No arbitrary CPL0/EL1 preemption; tick defers reschedule to syscall exit |
 | Hard IRQ/NMI | interrupt entry | Not schedulable work |
 | Deferred IRQ work | task with `WorkKind::SoftIrq` | According to its execution mode |
 
@@ -43,8 +43,10 @@ On a scheduler-timer trap:
 2. The architecture preemption hook validates that the frame lies inside the
    current task's stack and that the interrupted exception level is eligible.
 3. The hook checks the time slice and the core-published periodic-budget
-   boundaries.
-4. If a switch is required, it re-arms the task waker, records an involuntary
+   boundaries. If the tick interrupted a non-preemptible user syscall
+   continuation, it records the decision in that task's sticky reschedule bit
+   and returns; the completed syscall consumes the bit at exit-to-user.
+4. If an immediate switch is required, it re-arms the task waker, records an involuntary
    return for RCU, saves live user FPU/SIMD state when applicable, clears the
    per-CPU current pointer, and calls
    `kernel_switch(&mut task.ctx, executor_ctx)` directly from the trap handler
@@ -59,6 +61,27 @@ On a scheduler-timer trap:
    retries without advancing the user instruction pointer.
 
 The retired `preempt_yield_stub`/IRET-rewrite design is not used.
+
+An exact synchronous wake followed by an own-stack source park may take a
+bounded direct path instead of first resuming the executor. The core claims the
+awake target while its slot remains resident in the local ready queue, saves the
+source FP/SIMD and task-domain state, publishes and activates the target's task
+identity/address space, restores its kernel-stack target, TLS, saved domain
+state, and FP/SIMD ownership, then switches to the target continuation. The
+CPU-local active-address-space slot is held across activation and atomically
+exchanged only after success; the displaced source Arc becomes the handoff's
+root owner and is moved back on return. Thus neither transition exposes an
+ownerless live root or needs a second active-slot lock acquisition. The
+target's executor pointer is the source's root executor continuation, not the
+source stack. A target yield, completion, or tick preemption normally restores
+the root identity/address space and switches to the executor. When the target
+urgently wakes that exact off-queue root, it may restore the same state and
+switch directly to the root's saved task continuation. That fixed root may
+start another exact transfer, up to eight target-to-root returns; the next
+yield must reach the executor. A CPU-local gate rejects nested sources and
+third-task chains. The resident target claim is released only after the final
+switch completes. The target's runtime is
+charged to its own virtual runtime and removed from the source's poll charge.
 
 ## 4. Tick decision
 
@@ -78,6 +101,14 @@ slice expired + competitor              -> switch
 slice expired + no competitor           -> resume same task
 otherwise                               -> resume same task
 ```
+
+For an own-stack user task interrupted in CPL0/EL1, `switch` in this table
+means publish a task-local deferred-reschedule request. Syscall exit normally
+tests only that bit; cycle-clock and run-queue work remains on the timer tick.
+The existing wake-preemption hints are separate: an urgent exact handoff needs
+only a runnable-peer probe, while an ordinary wake invokes the installed
+policy with elapsed runtime. Any voluntary block or yield clears a deferred
+request because that switch already begins a fresh slice.
 
 This avoids an executor/idle/task round trip when the current task is the only
 useful work. A wake makes an idle borrower preemptible at the next tick. The
@@ -142,6 +173,14 @@ rolling generation-ordered cutover.
   before migration and permits deferred restore only while the task-owned
   memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
+- Direct handoff is bounded to one claimed target at a time and eight returns
+  to one fixed exact root: executor dispatch and stealing skip the target until
+  each switch completes; nested sources and arbitrary third-task transfers are
+  refused; and the root's next yield after the eighth return must pass through
+  the executor. Address-space ownership, TLS, domain
+  state, and FP/SIMD ownership are restored before each resumed task's first
+  instruction. A decline leaves the exact wakee on the ordinary validated
+  selection path.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
 - Realtime class metadata is demoted on generic spawn paths. Only
@@ -169,8 +208,8 @@ code receives none of this state.
   `preempt_disable()` guard before changing their conservative opt-out.
 - Wire the public NMI accounting guard into each architecture's NMI/FIQ entry;
   hard-IRQ entry/exit is live on both architectures.
-- Reconcile direct time-slice donation with periodic runtime transfer. Current
-  period eligibility remains authoritative and donation cannot bypass it.
+- Period eligibility remains authoritative: periodic-budget and donated tasks
+  are excluded from the direct-handoff path, and donation cannot bypass it.
 - Add a real MTE-tag-aware allocator on aarch64; switch/vector mechanics
   preserve SCTLR/GCR today, while enforcement remains structural.
 

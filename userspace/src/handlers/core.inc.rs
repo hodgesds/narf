@@ -46,7 +46,7 @@ pub fn register_signal_waker(task_id: u64, waker: core::task::Waker) {
 pub fn wake_signal(task_id: u64) {
     // Deref the ctx UNDER the registry lock (see `with_user_task_ctx`) so a
     // concurrent task-exit + box-drop on another CPU can't free it mid-deref.
-    crate::user_task::with_user_task_ctx(task_id, |uctx| {
+    let sem_wait = crate::user_task::with_user_task_ctx(task_id, |uctx| {
         // Clear the park deadline so the woken task re-executes its syscall (and
         // re-checks the signal) NOW instead of sleeping to the ~1-tick wheel
         // backstop. Two cases, mirroring the io-waiter wake `wake_one`:
@@ -62,6 +62,12 @@ pub fn wake_signal(task_id: u64) {
         if deadline == u64::MAX || uctx.sigwait_set.load(Ordering::Acquire) != 0 {
             uctx.sleep_deadline_ns.store(0, Ordering::Release);
         }
+        uctx.sem_wait_pending.load(Ordering::Acquire).then(|| {
+            (
+                uctx.sem_wait_ipc_ns.load(Ordering::Relaxed),
+                uctx.sem_wait_id.load(Ordering::Relaxed),
+            )
+        })
     });
     let waker = {
         let mut g = SIGNAL_WAKERS[signal_waker_shard(task_id)].values.lock();
@@ -69,6 +75,9 @@ pub fn wake_signal(task_id: u64) {
     };
     if let Some(w) = waker {
         w.wake();
+    }
+    if let Some(Some((ipc_ns, id))) = sem_wait {
+        crate::sysvipc::wake_sem_waiter_for_signal(task_id, ipc_ns, id);
     }
 }
 
@@ -1111,6 +1120,17 @@ fn open_impl(
             return;
         }
     }
+    // Linux's `FD_ADD(flags, do_file_open(...))` reserves the lowest-free fd
+    // before evaluating path lookup or O_CREAT. Apart from preserving exact
+    // EMFILE precedence, that ordering is transactional: descriptor exhaustion
+    // must not create an inode which the caller never received an fd for.
+    let reservation = match fd::reserve(current_task_id()) {
+        Some(reservation) => reservation,
+        None => {
+            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            return;
+        }
+    };
     // Record the access mode (O_RDONLY/O_WRONLY/O_RDWR), O_PATH identity, and
     // the settable status flags (O_NONBLOCK | O_APPEND | O_DIRECT) on the fd, so
     // `fcntl(F_GETFL)` reports both. glibc's `fdopen(fd, "w")` reads the
@@ -1188,7 +1208,7 @@ fn open_impl(
         let proc_prefix = apply_chroot("/proc");
         if let Some(nsfd) = proc_namespace_fd_from_path(task, path, &proc_prefix) {
             let ops: Arc<dyn narf_filesystem::FileOps> = nsfd;
-            let new_fd = fd::install(task, crate::fd::FdEntry {
+            let new_fd = reservation.install(crate::fd::FdEntry {
                     ops,
                     offset: 0,
                     flags: 0,
@@ -1232,7 +1252,7 @@ fn open_impl(
                         return;
                     }
                 };
-                let new_fd = fd::install(task, crate::fd::FdEntry {
+                let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,
                         flags: 0,
@@ -1283,7 +1303,7 @@ fn open_impl(
                     ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
                     return;
                 }
-                let new_fd = fd::install(task, crate::fd::FdEntry {
+                let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: lops,
                         offset: 0,
                         flags: 0,
@@ -1358,7 +1378,7 @@ fn open_impl(
         .unwrap_or(false);
     if fast_create.is_none() && (ops.is_none() || resolved_is_dir) && mnt_len == 0 {
         if let Some(dirops) = resolve_dir_absolute(path) {
-            let new_fd = fd::install(task, crate::fd::FdEntry {
+            let new_fd = reservation.install(crate::fd::FdEntry {
                     ops: alloc::sync::Arc::new(DirFdFile { dir: dirops }),
                     offset: 0,
                     flags: 0,
@@ -1770,11 +1790,12 @@ fn open_impl(
             access_mode,
             nonblock,
             path,
+            reservation,
         );
         return;
     }
 
-    let new_fd = match fd::install(task, crate::fd::FdEntry {
+    let new_fd = match reservation.install(crate::fd::FdEntry {
             ops,
             offset: 0,
             flags: 0,
@@ -1832,6 +1853,7 @@ fn open_fifo(
     access_mode: u64,
     nonblock: bool,
     _path: &str,
+    reservation: fd::FdReservation,
 ) {
     let task = current_task_id();
     let can_read = access_mode == 0 || access_mode == 2; // O_RDONLY | O_RDWR
@@ -1859,7 +1881,7 @@ fn open_fifo(
         can_write,
     )) as Arc<dyn narf_filesystem::FileOps>;
     let status_flags = access_mode as u32 | if nonblock { crate::fd::O_NONBLOCK } else { 0 };
-    let new_fd = match fd::install(task, crate::fd::FdEntry {
+    let new_fd = match reservation.install(crate::fd::FdEntry {
             ops: handle,
             offset: 0,
             flags: 0,
@@ -11959,6 +11981,7 @@ pub fn uidgid_init() {
         *shard.uidgid.lock() = Some(BTreeMap::new());
         *shard.groups.lock() = Some(BTreeMap::new());
     }
+    crate::task::reset_effective_ids();
 }
 
 /// Reset the registry — test hook.
@@ -12026,23 +12049,31 @@ pub fn pty_open_fs_ids() -> (u32, u32) {
 /// creation so `SO_PEERCRED` / `SCM_CREDENTIALS` report a real identity.
 pub fn current_ucred() -> crate::socket::Ucred {
     let task = current_task_id();
-    let ids = read_uidgid(task);
+    let cached = crate::task::current_cached_identity(task);
+    let (pid, euid, egid) = cached.unwrap_or_else(|| {
+        let ids = read_uidgid(task);
+        (
+            task_to_pid_raw(task).unwrap_or(task),
+            ids.euid,
+            ids.egid,
+        )
+    });
     #[cfg(feature = "container")]
     let (uid, gid) = {
         let ns = crate::namespaces::current_user_ns(task);
         if ns.is_initial() {
-            (ids.euid, ids.egid)
+            (euid, egid)
         } else {
             (
-                ns.translate_uid_to_host(ids.euid),
-                ns.translate_gid_to_host(ids.egid),
+                ns.translate_uid_to_host(euid),
+                ns.translate_gid_to_host(egid),
             )
         }
     };
     #[cfg(not(feature = "container"))]
-    let (uid, gid) = (ids.euid, ids.egid);
+    let (uid, gid) = (euid, egid);
     crate::socket::Ucred {
-        pid: task_to_pid_raw(task).unwrap_or(task) as u32,
+        pid: pid as u32,
         uid,
         gid,
     }
@@ -12516,12 +12547,17 @@ pub(crate) fn write_groups(task: u64, groups: alloc::vec::Vec<u32>) -> bool {
 }
 
 fn write_uidgid<F: FnOnce(&mut UidGid)>(task: u64, f: F) -> bool {
-    let mut g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
-    let Some(m) = g.as_mut() else {
-        return false;
+    let effective = {
+        let mut g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
+        let Some(m) = g.as_mut() else {
+            return false;
+        };
+        let entry = m.entry(task).or_default();
+        f(entry);
+        (entry.euid, entry.egid)
     };
-    let entry = m.entry(task).or_default();
-    f(entry);
+    // Do not nest the task registry lock under the credential shard lock.
+    crate::task::cache_effective_ids(task, effective.0, effective.1);
     true
 }
 

@@ -43,7 +43,7 @@ pub enum MmuError {
 impl From<FrameAllocError> for MmuError {
     fn from(e: FrameAllocError) -> Self {
         match e {
-            FrameAllocError::Exhausted | FrameAllocError::ReservePressure => {
+            FrameAllocError::Exhausted | FrameAllocError::ReservePressure(_) => {
                 MmuError::FramesExhausted
             }
             FrameAllocError::Uninitialised => MmuError::AllocatorUninitialised,

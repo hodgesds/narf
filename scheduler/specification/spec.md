@@ -161,19 +161,47 @@ Kernel-test builds expose a hidden reset for the process-wide own-stack latch;
 the userspace test-hook reset invokes it so distributed tests remain independent
 of link-order. Production builds neither compile nor call this reset.
 Their CPL0 syscall continuations remain run-to-completion except at explicit
-park/yield points. NARF now has a nestable CPU-local `preempt_disable()` guard,
+park/yield points. A scheduler tick that observes a slice, budget, or
+fair-quantum decision while such a continuation is running sets a sticky
+task-local reschedule request; the completed syscall consumes it immediately
+before returning to user mode, matching Linux's `TIF_NEED_RESCHED` shape
+without suspending an unaudited lock-bearing continuation. Any intervening
+voluntary switch clears the request because it already starts a fresh slice.
+NARF now has a nestable CPU-local `preempt_disable()` guard,
 but syscall/driver critical regions have not completed the adoption audit;
 enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
-`note_urgent_wake_preempt` is a scheduling hint, not a direct switch. It is
-always available to synchronous wake paths while own-stack scheduling is live,
-but filters self-wakes and uses a nonblocking run-queue probe after a real waiter
-was dequeued. It bypasses the policy batching window only when the exact woken
-task is already dispatchable on the local CPU and names that waiter in a
-dedicated one-shot preferred-next slot. A remote, contended, or ineligible
-target declines the optimization. The executor revalidates the preference
-during selection, so the hint cannot bypass affinity, class, or budget
-eligibility. Generic every-wake preemption remains opt-in.
+`note_urgent_wake_preempt` publishes the exact task selected by a synchronous
+wake. An own-stack source may consume that publication as a bounded direct
+handoff only when both tasks are local stackful tasks using the same execution
+kind, the target is an awake default-class/normal-priority task with no period,
+budget cap, or donation, and the installed policy is the built-in class or FIFO
+policy. The target slot remains in its home queue under a core-owned atomic
+claim, so dispatch and stealing skip it until the final switch has completed.
+The target normally returns to the source's root executor continuation. If it
+urgently wakes that exact off-queue root, it may instead switch directly to the
+root's saved task continuation. That same fixed root may begin another exact
+handoff, but the batch is capped at 64 target-to-root returns; its next yield
+then must reach the executor. This amortizes executor re-entry while retaining
+a finite fairness and RCU-quiescence progress bound. The off-queue root is
+pinned by its
+in-flight executor poll, the exact `WakeCell` identity substitutes for a queue
+lookup, and a CPU-local whole-poll gate refuses nested sources and arbitrary
+target-to-third-task chains. Before either task's first resumed instruction,
+the core publishes
+its task/address-space identity and restores its hardware root, kernel-stack
+target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
+ownership, and PMU attribution. Switch-out saves the same state first. A remote,
+contended, first-run, periodic, capped, donated, higher-class, or external-policy
+target declines to the ordinary exact-buddy/full-validation path. Generic
+every-wake preemption and wake-next remain opt-in. The direct path exchanges
+the target's strong address-space owner into the CPU-local active slot under
+its IRQ-safe lock after activation succeeds. The displaced source owner is
+carried by the handoff and moved back on return, so both hardware-root
+transitions retain the outgoing page tables without extra Arc clones or an
+observable ownerless interval. When the global perf gate is off, switch
+attribution stops before the cross-crate callback; an enabled gate still
+reaches the perf registry's authoritative live-event check.
 Syscall-frequency per-CPU wake, urgent-handoff, and runnable-peer cells occupy
 separate cache lines; independent CPUs never serialize their local scheduling
 hints through false sharing. This is a representation rule only: the same
@@ -284,7 +312,21 @@ hook (`FifoScheduler`, `PriorityScheduler`, `ClassScheduler`, and
 callback and its `TaskMeta` snapshot. Any external/wrapper policy remains
 observable by default. `ClassScheduler` selection may be fused into the core's
 mandatory eligibility scan, but produces the same class/priority/deadline/FIFO
-ordering and remains subordinate to core budget validation.
+ordering and remains subordinate to core budget validation. The sole pre-scan
+executor selection is an exact synchronous-handoff hint for an awake task with
+no periodic budget: that state proves the highest eligibility tier without
+budget accounting, and wake-next already precedes class ordering within that
+tier. Before returning through the executor, an eligible bounded direct transfer
+may instead claim that same resident slot under its home queue lock; external
+policies, periodic/capped/donated targets, and non-default task classes always
+retain the full callback and validation scan. Under `ClassScheduler`, a
+monotone per-CPU mask of classes
+admitted or migrated there conservatively forces the full scan once a higher
+class could be present; a buddy is honored only within the winning class, as
+Linux applies CFS buddies only after core class selection. Stale class bits can
+only disable the shortcut. The fast path leaves the runnable-peer hint
+conservatively set until a later full scan, so it cannot erase a concurrent
+wake.
 
 Policy replacement is a first-class rolling operation ordered by an atomic
 generation ticket. `on_install` runs once before publication;
@@ -516,17 +558,20 @@ control callback.
   an `Arc` to every root while hardware can reference it, skips the register
   write for an exact same-MM successor, and switches directly to a different
   user MM. A kernel task or end-of-round maintenance boundary restores the
-  incoming root before proceeding. On aarch64 lifetime-scoped ASIDs make user
-  switches non-flushing; an ASID is not reused until the memory subsystem
-  completes a system-wide tag invalidation. A poll-time address-space
+  incoming root before proceeding. Lifetime-scoped x86 PCIDs and aarch64 ASIDs
+  make nonzero-tag user switches non-flushing; a tag is not reused until the
+  memory subsystem completes a system-wide invalidation. A poll-time address-space
   replacement is reconciled before either root owner is dropped and forces a
   restore rather than carrying stale same-MM identity into the next dispatch.
-- On x86_64 the executor publishes process-PCID-0 residency before a user root
-  is loaded using the memory subsystem's sequentially consistent publication
-  primitive, and clears it only after the plain kernel-root CR3 restore has
-  invalidated PCID 0 locally. A CPU entering either scheduler halt path marks
-  itself TLB-idle; after wake it clears that state and completes any deferred
-  full non-global flush before another task root or domain context can load.
+- On x86_64 the executor publishes the address space's lifetime process PCID
+  before loading `root|pcid|NOFLUSH`. Kernel-root restore and own-stack resume
+  preserve nonzero tags. Residency is conservative history and remains set
+  until tag retirement, so mapping invalidation reaches CPUs that previously
+  ran even a single-threaded process. If the all-CPU PCIDE+INVPCID boot gate or
+  tag allocation fails, PCID 0 retains the plain flushing behavior. A CPU
+  entering either scheduler halt path marks itself TLB-idle; after wake it
+  clears that state and completes any deferred full non-global flush before
+  another task root or domain context can load.
   The idle/debt publication handshake guarantees a racing shootdown is handled
   either by its ordinary IPI acknowledgement or by this pre-dispatch flush.
 - `donate_to` does not bypass capability checks; caller must hold a
@@ -578,10 +623,15 @@ control callback.
   the same boundary without exposing register details to scheduler policy:
   entry neutralises before Rust/outgoing stores, and restore occurs after the
   last incoming-context load and before the resumed continuation.
-- A future true direct-transfer primitive must restore the callee's domain
-  state before its first instruction. Today's `donate_to` only moves budget
-  credit and queue position; it does not branch directly to the donee and must
-  not be described as satisfying this future invariant.
+- The synchronous-wake direct-transfer path restores the callee's saved
+  architecture domain state and reported domain byte before its first
+  instruction, and captures both before returning to the exact root task or
+  its executor continuation. Every exact-root return restores that root's
+  state before its first resumed instruction; only that fixed root may start
+  another transfer and the eighth return forces the next yield through the
+  executor, so the batch cannot extend to a third task or run unbounded.
+  `donate_to` remains a separate capability-checked budget and queue operation;
+  it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held
   (except sleepable-RCU guards).** The executor's `report_quiescent`
   hook relies on poll-boundary release; holding a non-sleepable guard
@@ -634,10 +684,10 @@ SMT-aware placement, deadline-ish realtime class.
 ### 8.1 Wake-overhead cap (resolved)
 
 **Decision:** **2 µs** (≈ 6000 cycles at 3 GHz) is the budget
-for a wake-and-poll round trip in the executor. Above this,
-hot paths bypass the executor with direct context transfer
-(`donate_to`, mirroring seL4's IPC fast path) or with
-Narf-Ring polling on the consumer side.
+for a wake-and-poll round trip in the executor. Synchronous exclusive wakes may
+use the bounded direct-handoff path above; other hot paths use Narf-Ring polling
+on the consumer side. `donate_to` changes budget credit and queue position and
+is not itself a context transfer.
 
 The 2 µs cap is profile-tracked; `tracing/` emits
 `scheduler.wake_latency` histograms and a CI gate fails if
@@ -697,9 +747,12 @@ Scheduler policy:
 operation transfers bounded budget credit and moves an already queued donee
 to the head of its core-owned queue; it does not branch directly to the donee.
 This covers the present IPC-pair priority-inheritance case without multi-CPU
-coordinated dispatch. A future true direct-transfer fast path remains subject
-to the first-instruction domain-restore gate in §4. Producer-consumer pairs
-that benefit from cache locality express it via affinity hints, not gang.
+coordinated dispatch. The synchronous-wake direct path is a single-CPU,
+one-target transfer that returns either to the exact root once or to the root
+executor, forces the next root yield through the executor, and remains subject
+to the first-instruction domain-restore gate in §4; it does not coordinate a
+gang.
+Other producer-consumer pairs express cache locality via affinity hints.
 
 Revisit if profiling shows specific pairs that lose >10% to
 inter-CPU cache misses.

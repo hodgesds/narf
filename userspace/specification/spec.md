@@ -78,8 +78,9 @@ pages or one backing descriptor per untouched virtual page unless
 `MAP_POPULATE` requests a best-effort prefault. The VMA's materialized backing
 prefix grows through each faulted page, and its omitted tail retains normal
 demand-zero semantics. `MAP_NONBLOCK` suppresses prefaulting without changing
-VMA publication. No-hint private-anonymous placement uses the first suitable
-gap from the locked live topology; caller hints remain advisory. Anonymous
+VMA publication. No-hint private-anonymous placement first validates the
+address-space high-water candidate and falls back to the locked live-topology
+search when necessary; caller hints remain advisory. Anonymous
 `MAP_SHARED` mappings eagerly allocate zeroed frames whose unnamed ownership is
 tracked by cache-line-isolated, per-page reference shards. A creator reference
 keeps each page live until VMA publication or rollback completes; VMA and fork
@@ -561,7 +562,9 @@ truncated output still reports the full address length.
 normalization; an empty path never aliases the current directory. Linux path
 and descriptor failures return their specific errno rather than a bare `-1`:
 in particular `openat(2)` reports `EFAULT`, `EMFILE`, and mapped filesystem
-errors, while `newfstatat(2)` distinguishes `EFAULT`, `ENOENT`, `EBADF`,
+errors. Descriptor allocation precedes path lookup and creation, so `EMFILE`
+publishes neither a file descriptor nor an `O_CREAT` inode. `newfstatat(2)`
+distinguishes `EFAULT`, `ENOENT`, `EBADF`,
 `ENOTDIR`, and invalid flag `EINVAL`.
 The chmod/chown syscall families resolve relative `*at` paths through a real
 directory fd, reject invalid flags and dirfd shapes with Linux errnos, and

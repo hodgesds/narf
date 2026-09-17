@@ -47,12 +47,15 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use core::cell::UnsafeCell;
 use core::future::Future;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
 use core::task::{Context, Poll, Waker};
 
 #[cfg(target_arch = "aarch64")]
@@ -264,6 +267,23 @@ pub fn user_own_stack_enabled() -> bool {
 #[doc(hidden)]
 pub fn __reset_user_own_stack_for_test() {
     USE_OWN_STACK.store(false, Ordering::Release);
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        let direct = &DIRECT_HANDOFF[cpu];
+        direct.active.store(false, Ordering::Release);
+        direct.root.store(core::ptr::null_mut(), Ordering::Release);
+        direct
+            .returned_root
+            .store(core::ptr::null_mut(), Ordering::Release);
+        direct.returns.store(0, Ordering::Release);
+        let _ = direct.root_as.lock().take();
+        direct.foreign_cycles.store(0, Ordering::Release);
+        let target = direct.target.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !target.is_null() {
+            // SAFETY: the direct-target slot owns one Arc strong reference.
+            let cell = unsafe { Arc::from_raw(target) };
+            crate::release_direct_handoff_target(&cell, false);
+        }
+    }
 }
 
 // Hooks for saving/restoring the CURRENT user task's FPU (x87/SSE) across a
@@ -353,6 +373,13 @@ pub fn set_user_perf_switch_hook(hook: fn(u64, bool)) {
 
 #[inline]
 fn user_perf_switch(task: u64, running: bool) {
+    // The userspace perf registry owns this global fast gate and toggles it on
+    // the same 0<->1 live-event transitions that make the switch hook useful.
+    // Keep ordinary task switches to one predictable load/branch rather than
+    // paying an indirect cross-crate call merely to repeat the same empty test.
+    if !narf_lib::perf::enabled() {
+        return;
+    }
     let hook = USER_PERF_SWITCH_HOOK.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `set_user_perf_switch_hook` writes this slot.
@@ -715,6 +742,351 @@ fn user_fpu_restore() {
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn user_fpu_restore() {}
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn task_wake_cell(task: &KernelTask) -> Option<Arc<crate::WakeCell>> {
+    task.wake_cell.lock().clone()
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn prepare_direct_arch_state(task: &KernelTask) {
+    let top = ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64;
+    crate::retarget_kernel_stack(top);
+    if task.user_tls_valid.load(Ordering::Acquire) {
+        // SAFETY: the task published this canonical user TLS base while its
+        // address space was active.
+        unsafe {
+            narf_arch::x86_64::user_mode::set_user_fs_base(
+                task.user_fs_base.load(Ordering::Relaxed),
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn prepare_direct_arch_state(task: &KernelTask) {
+    if task.user_tls_valid.load(Ordering::Acquire) {
+        // SAFETY: the task published this TPIDR_EL0 value while current.
+        unsafe {
+            narf_arch::aarch64::set_user_tls_base(task.user_fs_base.load(Ordering::Relaxed));
+        }
+    }
+}
+
+#[inline]
+fn direct_handoff_gate_open(cpu: usize, source: *mut KernelTask) -> bool {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.active.load(Ordering::Acquire) {
+        return false;
+    }
+    let returned_root = direct_state.returned_root.load(Ordering::Acquire);
+    returned_root.is_null()
+        || (returned_root == source
+            && direct_state.returns.load(Ordering::Acquire) < MAX_DIRECT_ROOT_RETURNS)
+}
+
+/// Try one transfer inside a bounded task-to-task batch. The target stays
+/// resident in READY under `direct_claimed`; only the fixed root may start the
+/// next transfer, and the batch must cross the executor after 64 returns.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn try_direct_handoff(
+    cpu: usize,
+    source: *mut KernelTask,
+    source_ctx: *mut KernelContext,
+) -> bool {
+    // A root may continue its bounded batch after a direct return. A nested
+    // stackful pump has a different source pointer and must pass through the
+    // executor; the same is true after the fixed return budget is exhausted.
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if !direct_handoff_gate_open(cpu, source) {
+        return false;
+    }
+    narf_lib::sync::without_interrupts(|| {
+        let Some(cell) = crate::take_urgent_wake_cell(cpu) else {
+            return false;
+        };
+        let urgent_id = cell.task;
+        let republish = |task| crate::hint_urgent_next(task);
+        // SAFETY: caller supplies the live current stackful task.
+        let source_ref = unsafe { &*source };
+        let Some(source_cell) = task_wake_cell(source_ref) else {
+            republish(cell.task);
+            return false;
+        };
+        if !source_cell.direct_eligible.load(Ordering::Acquire) {
+            republish(cell.task);
+            return false;
+        }
+        let Some(mut target) = crate::claim_direct_handoff_target(cpu, cell) else {
+            // The scalar id preserves ordinary exact-buddy selection after a
+            // direct claim declines (policy, budget, migration, or first run).
+            republish(urgent_id);
+            return false;
+        };
+        // SAFETY: the run-queue claim keeps this non-null stackful target
+        // allocation alive and excludes executor dispatch until release.
+        let target_ref = unsafe { &*target.task };
+        if target.task == source
+            // Kernel-only roots may hand to kernel-only targets; user roots
+            // may hand to user targets. Mixing the two would require exposing
+            // the executor's incoming hardware root to this path.
+            || source_ref.user_context.load(Ordering::Acquire).is_null()
+                != target_ref.user_context.load(Ordering::Acquire).is_null()
+            || target_ref.completed.load(Ordering::Acquire)
+        {
+            crate::release_direct_handoff_target(&target.cell, false);
+            republish(target.id);
+            return false;
+        }
+
+        let root_exec = source_ref.exec_ctx.load(Ordering::Acquire);
+        if root_exec.is_null() {
+            crate::release_direct_handoff_target(&target.cell, false);
+            republish(target.id);
+            return false;
+        }
+        let root_as = match crate::activate_direct_task(target.id, target.addr_space.take()) {
+            Ok(root_as) => root_as,
+            Err(()) => {
+                crate::release_direct_handoff_target(&target.cell, false);
+                republish(target.id);
+                return false;
+            }
+        };
+
+        // SAFETY: source is the uniquely running task whose continuation this
+        // switch saves; no executor can access its off-queue slot concurrently.
+        source_ref
+            .domain_byte
+            .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
+        target_ref.exec_ctx.store(root_exec, Ordering::Release);
+        target_ref
+            .tsc_started
+            .store(narf_time::now_cycles(), Ordering::Release);
+        *direct_state.root_as.lock() = root_as;
+        direct_state.root.store(source, Ordering::Release);
+        let target_raw = Arc::into_raw(target.cell.clone()).cast_mut();
+        let old = direct_state.target.swap(target_raw, Ordering::AcqRel);
+        debug_assert!(old.is_null(), "nested direct target publication");
+        direct_state.active.store(true, Ordering::Release);
+
+        user_perf_switch(source_cell.task, false);
+        user_perf_switch(target.id, true);
+        narf_arch::set_current_domain_byte(target_ref.domain_byte.load(Ordering::Relaxed));
+        // SAFETY: target AS/TLS/stack state was validated and published above.
+        unsafe { prepare_direct_arch_state(target_ref) };
+        user_fpu_restore_task(cpu, target_ref);
+        guard_switch_into("direct_handoff:target.ctx", &target_ref.ctx);
+        #[cfg(any(test, feature = "kernel-test"))]
+        DIRECT_HANDOFF_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: source and target contexts are distinct, live save slots;
+        // the target returns either to `root_exec` or directly to this exact
+        // root continuation, never to a third task stack.
+        unsafe { kernel_switch(source_ctx, &target_ref.ctx) };
+        // A direct target may have switched straight back to this source. Its
+        // resident-slot claim can be dropped only after that final switch has
+        // completed; the executor-return path performs the same operation from
+        // `poll_to_yield`, making this a no-op for the ordinary return.
+        // An ordinary return may later re-dispatch this source on another CPU;
+        // never use the captured old CPU to clean up a newer handoff there.
+        let resumed_cpu = this_cpu();
+        if DIRECT_HANDOFF[resumed_cpu]
+            .returned_root
+            .load(Ordering::Acquire)
+            == source
+        {
+            complete_direct_return(resumed_cpu);
+        }
+        true
+    })
+}
+
+/// Restore the root task's software identity/address-space view immediately
+/// before the direct target switches to either the root task or its executor
+/// continuation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted: bool) {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if !direct_state.active.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let root = direct_state
+        .root
+        .swap(core::ptr::null_mut(), Ordering::AcqRel);
+    assert!(!root.is_null(), "direct handoff lost root continuation");
+    // SAFETY: active handoff publication pins both root and current tasks.
+    let current_ref = unsafe { &*current };
+    // SAFETY: DIRECT_HANDOFF_ROOT holds the off-queue root whose executor
+    // continuation cannot drop it before this target switches back.
+    let root_ref = unsafe { &*root };
+    let now = narf_time::now_cycles();
+    let ran = now.saturating_sub(current_ref.tsc_started.load(Ordering::Acquire));
+    let target = direct_state.target.load(Ordering::Acquire);
+    assert!(!target.is_null(), "direct handoff lost target wake cell");
+    // SAFETY: the per-CPU target slot owns a strong Arc reference until the
+    // root executor completes the return.
+    unsafe {
+        (*target)
+            .direct_runtime_cycles
+            .fetch_add(ran, Ordering::Relaxed)
+    };
+    direct_state
+        .foreign_cycles
+        .fetch_add(ran, Ordering::Relaxed);
+    // SAFETY: current is the uniquely running direct target.
+    current_ref
+        .domain_byte
+        .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
+    if preempted {
+        current_ref.preempted.store(false, Ordering::Release);
+        root_ref.preempted.store(true, Ordering::Release);
+    }
+    if current_ref.completed.load(Ordering::Acquire) {
+        // SAFETY: same owned target-cell reference established above.
+        unsafe { (*target).flag.store(true, Ordering::Release) };
+    }
+
+    let root_cell = task_wake_cell(root_ref).expect("direct root lost wake cell");
+    let root_as = direct_state.root_as.lock().take();
+    let displaced = crate::activate_direct_task(root_cell.task, root_as)
+        .expect("direct handoff could not restore root address space");
+    drop(displaced);
+    narf_arch::set_current_domain_byte(root_ref.domain_byte.load(Ordering::Relaxed));
+    // SAFETY: same owned target-cell reference established above.
+    user_perf_switch(unsafe { (*target).task }, false);
+    user_perf_switch(root_cell.task, true);
+}
+
+/// Return an active direct target to the exact root task that urgently woke.
+///
+/// The root is pinned off-queue by its in-flight executor poll, so it cannot use
+/// the resident-slot claim path. The exact WakeCell comparison substitutes for
+/// that lookup. At most 64 such returns are allowed per root poll; the next
+/// yield must visit the executor, bounding fairness latency and preventing an
+/// exact-wake ping-pong from starving unrelated work or RCU quiescent states.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+unsafe fn try_direct_return_to_root(
+    cpu: usize,
+    current: *mut KernelTask,
+    current_ctx: *mut KernelContext,
+) -> bool {
+    if !direct_handoff_active(cpu) {
+        return false;
+    }
+    narf_lib::sync::without_interrupts(|| {
+        let direct_state = &DIRECT_HANDOFF[cpu];
+        let Some(cell) = crate::take_urgent_wake_cell(cpu) else {
+            return false;
+        };
+        let root = direct_state.root.load(Ordering::Acquire);
+        if root.is_null() {
+            crate::hint_urgent_next(cell.task);
+            return false;
+        }
+        // SAFETY: an active handoff pins the off-queue root until either this
+        // return or the ordinary executor-return path completes.
+        let root_ref = unsafe { &*root };
+        let Some(root_cell) = task_wake_cell(root_ref) else {
+            crate::hint_urgent_next(cell.task);
+            return false;
+        };
+        if !Arc::ptr_eq(&cell, &root_cell) {
+            // A target other than the root still takes the bounded executor
+            // path. Preserve its scalar next-buddy hint for normal selection.
+            crate::hint_urgent_next(cell.task);
+            return false;
+        }
+        if !cell.flag.swap(false, Ordering::AcqRel) {
+            // A stale urgent publication must not make a parked root runnable.
+            return false;
+        }
+
+        let previous = direct_state.returned_root.load(Ordering::Acquire);
+        if previous.is_null() {
+            direct_state.returned_root.store(root, Ordering::Release);
+        } else {
+            assert_eq!(previous, root, "direct return changed chain root");
+        }
+        let returns = direct_state.returns.fetch_add(1, Ordering::AcqRel) + 1;
+        assert!(returns <= MAX_DIRECT_ROOT_RETURNS);
+        // SAFETY: current is the live direct target, and the active handoff
+        // pins root/current plus both context save slots.
+        unsafe { finish_direct_handoff(cpu, current, false) };
+        // The direct target installed its own kernel-stack target and TLS.
+        // Restore both for the root before its continuation can reach userspace.
+        // SAFETY: root remains pinned by the in-flight executor poll.
+        unsafe { prepare_direct_arch_state(root_ref) };
+        // Restore eager FPSIMD state on aarch64, or arm x86 deferred restore,
+        // before the root executes its first resumed instruction.
+        user_fpu_restore_task(cpu, root_ref);
+        guard_switch_into("direct_handoff:root.ctx", &root_ref.ctx);
+        #[cfg(any(test, feature = "kernel-test"))]
+        DIRECT_RETURN_COUNT.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: current/root contexts are distinct live save slots. The
+        // switch resumes the root immediately after its source->target switch.
+        unsafe { kernel_switch(current_ctx, &root_ref.ctx) };
+        true
+    })
+}
+
+/// Drop the target claim only after the target's final switch has completed,
+/// either in the resumed exact root or in the root executor. A remote thief can
+/// then select the resident slot without racing that switch-out window.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn complete_direct_return(cpu: usize) {
+    // A direct target can synchronously pump and poll another stackful task.
+    // That inner poll also returns through `poll_to_yield`, but it is not the
+    // root executor continuation and must not release the outer target claim.
+    // `finish_direct_handoff` clears ACTIVE before either legitimate return.
+    if direct_handoff_active(cpu) {
+        return;
+    }
+    // The no-handoff executor path is overwhelmingly common. Avoid a locked
+    // RMW merely to rediscover an empty slot.
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.target.load(Ordering::Acquire).is_null() {
+        return;
+    }
+    let ptr = direct_state
+        .target
+        .swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if ptr.is_null() {
+        return;
+    }
+    // SAFETY: the slot owned exactly one strong reference.
+    let cell = unsafe { Arc::from_raw(ptr) };
+    let task = cell.stackful.load(Ordering::Acquire);
+    let completed = if task.is_null() {
+        false
+    } else {
+        // SAFETY: the cell's stackful pointer remains live until adapter drop;
+        // the direct claim is still held at this point.
+        unsafe { (&*task).completed.load(Ordering::Acquire) }
+    };
+    crate::release_direct_handoff_target(&cell, completed);
+}
+
+/// Clear the bounded-batch fairness gate only after this root poll has actually
+/// reached its executor continuation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn complete_direct_root_poll(cpu: usize, root: *mut KernelTask) {
+    let direct_state = &DIRECT_HANDOFF[cpu];
+    if direct_state.returned_root.load(Ordering::Acquire) != root {
+        return;
+    }
+    if direct_state
+        .returned_root
+        .compare_exchange(
+            root,
+            core::ptr::null_mut(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        direct_state.returns.store(0, Ordering::Release);
+    }
+}
+
 /// Top (16-byte-aligned) of the CURRENT stackful task's kernel stack on this
 /// CPU, or 0 if none. The own-stack user entry resets RSP/SP_EL1 to this before
 /// returning to userspace so the kernel exception stack is empty while it runs.
@@ -767,6 +1139,79 @@ static EXEC_CTX: PerCpuExecCtx = PerCpuExecCtx {
     inner: [const { CacheLineCell(UnsafeCell::new(KernelContext::zeroed())) };
         narf_lib::percpu::MAX_CPUS],
 };
+
+/// Bounded direct-handoff state. A fixed root may alternate with one exact
+/// urgent wakee at a time, but no target may extend the task-stack chain and
+/// the 65th root yield must cross the executor.
+const MAX_DIRECT_ROOT_RETURNS: u32 = 64;
+
+/// Cache-line-isolated state for one CPU's bounded direct-transfer chain.
+/// Every field is written only by that CPU while a chain is active; keeping
+/// them together prevents independent semaphore pairs from bouncing shared
+/// array cache lines.
+#[repr(C, align(64))]
+struct DirectHandoffState {
+    active: AtomicBool,
+    _active_pad: [u8; 7],
+    root: AtomicPtr<KernelTask>,
+    root_as: narf_lib::sync::IrqSafeSpinLock<Option<Arc<narf_memory::AddressSpace>>>,
+    target: AtomicPtr<crate::WakeCell>,
+    returned_root: AtomicPtr<KernelTask>,
+    foreign_cycles: AtomicU64,
+    returns: AtomicU32,
+    _pad: [u8; 4],
+}
+
+impl DirectHandoffState {
+    const fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            _active_pad: [0; 7],
+            root: AtomicPtr::new(core::ptr::null_mut()),
+            root_as: narf_lib::sync::IrqSafeSpinLock::new(None),
+            target: AtomicPtr::new(core::ptr::null_mut()),
+            returned_root: AtomicPtr::new(core::ptr::null_mut()),
+            foreign_cycles: AtomicU64::new(0),
+            returns: AtomicU32::new(0),
+            _pad: [0; 4],
+        }
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<DirectHandoffState>() == 64);
+
+static DIRECT_HANDOFF: [DirectHandoffState; narf_lib::percpu::MAX_CPUS] =
+    [const { DirectHandoffState::new() }; narf_lib::percpu::MAX_CPUS];
+
+#[cfg(any(test, feature = "kernel-test"))]
+static DIRECT_HANDOFF_COUNT: AtomicU64 = AtomicU64::new(0);
+#[cfg(any(test, feature = "kernel-test"))]
+static DIRECT_RETURN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn direct_handoff_active(cpu: usize) -> bool {
+    DIRECT_HANDOFF[cpu].active.load(Ordering::Acquire)
+}
+
+/// Cycles included in the root adapter's wall interval but executed by its
+/// direct wakee. The executor subtracts these before charging root vruntime.
+#[inline]
+pub(crate) fn take_direct_foreign_cycles() -> u64 {
+    DIRECT_HANDOFF[this_cpu()]
+        .foreign_cycles
+        .swap(0, Ordering::AcqRel)
+}
+
+#[doc(hidden)]
+#[cfg(any(test, feature = "kernel-test"))]
+fn direct_handoff_count() -> u64 {
+    DIRECT_HANDOFF_COUNT.load(Ordering::Acquire)
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+fn direct_return_count() -> u64 {
+    DIRECT_RETURN_COUNT.load(Ordering::Acquire)
+}
 
 /// Per-CPU save target for the FINAL `kernel_switch` of an exiting task
 /// (`exit_current_stackful`). The exit's abandoned continuation must be
@@ -921,7 +1366,7 @@ pub struct KernelTask {
     /// that domain for whatever runs next — which picks the wrong
     /// `domain_heap` window and misfires `block::encrypted`'s assertion,
     /// silently in both cases.
-    domain_byte: u8,
+    domain_byte: AtomicU8,
     /// Pointer to the executor's `KernelContext`. The executor
     /// stores its own ctx address here before switching in; the
     /// task reads it back to know where to switch when yielding.
@@ -943,6 +1388,10 @@ pub struct KernelTask {
     /// `DEFAULT_SLICE_CYCLES`. Set via `with_slice_cycles` at
     /// spawn time for drivers that need bigger slices.
     slice_cycles: AtomicU64,
+    /// Sticky Linux-style reschedule request for an own-stack user task whose
+    /// timer tick landed in its non-preemptible syscall continuation. The tick
+    /// makes the scheduling decision; syscall exit only consumes this bit.
+    need_resched: AtomicBool,
     /// Opt-out: when true the trap-handler hook skips preempting
     /// this task. Use for drivers that hold hardware locks across
     /// an `.await`-free critical section.
@@ -1031,6 +1480,10 @@ pub struct KernelTask {
     /// legitimately be zero, and skipping that restore leaks another task's
     /// thread pointer across a direct context-switch resume.
     user_tls_valid: AtomicBool,
+    /// Owning scheduler wake cell. Its raw `stackful` back-pointer is cleared
+    /// synchronously before this task is retired, while this Arc keeps the
+    /// cell and direct address-space owner alive across a handoff.
+    wake_cell: narf_lib::sync::IrqSafeSpinLock<Option<Arc<crate::WakeCell>>>,
 }
 
 // SAFETY: A `KernelTask` runs on one CPU at a time (the executor switches
@@ -1100,7 +1553,7 @@ impl KernelTask {
             future: Box::pin(future),
             stack,
             // A fresh task has no scope open, so it reports FRAME.
-            domain_byte: narf_lib::id::DomainId::FRAME.raw(),
+            domain_byte: AtomicU8::new(narf_lib::id::DomainId::FRAME.raw()),
             // `KernelContext::default()` is a real register struct on x86_64
             // and a unit struct elsewhere; the allow covers the unit-struct
             // arches where clippy would otherwise flag the constructor.
@@ -1110,6 +1563,7 @@ impl KernelTask {
             completed: AtomicBool::new(false),
             tsc_started: AtomicU64::new(0),
             slice_cycles: AtomicU64::new(DEFAULT_SLICE_CYCLES),
+            need_resched: AtomicBool::new(false),
             no_preempt: AtomicBool::new(false),
             user_preempt: AtomicBool::new(false),
             preempted: AtomicBool::new(false),
@@ -1123,6 +1577,7 @@ impl KernelTask {
             user_cr3: AtomicU64::new(0),
             user_fs_base: AtomicU64::new(0),
             user_tls_valid: AtomicBool::new(false),
+            wake_cell: narf_lib::sync::IrqSafeSpinLock::new(None),
         });
 
         // Stack top = highest byte addr + 1, then mask down to
@@ -1325,12 +1780,17 @@ impl KernelTask {
                     // `address_space.activate()` of this task's live AS;
                     // reloading it restores that mapping (kernel half is
                     // global in every AS).
+                    // Nonzero process tags exist only after the global PCIDE
+                    // gate closes; avoid even a cached CR4 probe here.
+                    let value = if cr3 & 0xFFF != 0 {
+                        cr3 | (1u64 << 63)
+                    } else {
+                        cr3
+                    };
+                    // SAFETY: `cr3` was captured from this live task's prior
+                    // activation; nonzero low bits imply the global PCIDE gate.
                     unsafe {
-                        core::arch::asm!(
-                            "mov cr3, {v}",
-                            v = in(reg) cr3,
-                            options(nostack, preserves_flags),
-                        );
+                        narf_arch::x86_64::cr::write_cr3(value);
                     }
                 }
             }
@@ -1377,13 +1837,17 @@ impl KernelTask {
         // switch and re-captured after, so a task preempted inside a scope
         // does not leave `current_domain()` answering with its domain for
         // whoever runs next.
-        narf_arch::set_current_domain_byte(self.domain_byte);
+        narf_arch::set_current_domain_byte(self.domain_byte.load(Ordering::Relaxed));
         // SAFETY: both contexts and the task-owned stack remain live across
         // this switch; `exec_ctx` is this CPU's exclusive persistent slot.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        let resumed_cpu = this_cpu();
+        complete_direct_return(resumed_cpu);
+        complete_direct_root_poll(resumed_cpu, self as *mut KernelTask);
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
-        self.domain_byte = narf_arch::current_domain_byte();
+        self.domain_byte
+            .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
         narf_arch::set_current_domain_byte(narf_lib::id::DomainId::FRAME.raw());
         // ── We are resumed here when the task yields back ──
         // Stack-overflow tripwire: catch a task whose kernel stack
@@ -1497,19 +1961,22 @@ impl KernelTask {
         // switch and re-captured after, so a task preempted inside a scope
         // does not leave `current_domain()` answering with its domain for
         // whoever runs next.
-        narf_arch::set_current_domain_byte(self.domain_byte);
+        narf_arch::set_current_domain_byte(self.domain_byte.load(Ordering::Relaxed));
         // SAFETY: both contexts and the task-owned stack remain live, and this
         // CPU exclusively owns the executor context for the switch round trip.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
+        let resumed_cpu = this_cpu();
+        complete_direct_return(resumed_cpu);
+        complete_direct_root_poll(resumed_cpu, self as *mut KernelTask);
         // Both a voluntary yield and an involuntary preemption resume here,
         // so one capture covers both: the CPU still holds the task's byte.
-        self.domain_byte = narf_arch::current_domain_byte();
+        self.domain_byte
+            .store(narf_arch::current_domain_byte(), Ordering::Relaxed);
         narf_arch::set_current_domain_byte(narf_lib::id::DomainId::FRAME.raw());
         self.check_stack_canary();
         user_perf_switch(perf_task, false);
         // SAFETY: same exclusive per-CPU slot as above.
         unsafe { core::ptr::write(exec_ctx as *mut KernelContext, previous) };
-        let resumed_cpu = this_cpu();
         CURRENT_STACKFUL_TASK.inner[resumed_cpu].store(saved_current, Ordering::Release);
         if !saved_current.is_null() {
             // SAFETY: same pinned outer-task invariant as the save above.
@@ -1569,6 +2036,25 @@ impl KernelTask {
 }
 
 impl KernelTask {
+    fn bind_wake_cell(&self, cell: Arc<crate::WakeCell>) {
+        let me = self as *const KernelTask as *mut KernelTask;
+        cell.stackful.store(me, Ordering::Release);
+        *self.wake_cell.lock() = Some(cell);
+    }
+
+    fn unbind_wake_cell(&self) {
+        let me = self as *const KernelTask as *mut KernelTask;
+        if let Some(cell) = self.wake_cell.lock().as_ref() {
+            let _ = cell.stackful.compare_exchange(
+                me,
+                core::ptr::null_mut(),
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            );
+            cell.direct_claimed.store(false, Ordering::Release);
+        }
+    }
+
     /// Move the waker for one active inner-future poll into task-owned storage.
     ///
     /// The returned pointer remains valid until that poll returns normally or
@@ -1622,6 +2108,7 @@ impl Drop for KernelTask {
     /// RCU, so by the time this runs the slots are already clear; re-clear
     /// here in case a `KernelTask` is ever freed by some other path.
     fn drop(&mut self) {
+        self.unbind_wake_cell();
         self.drop_active_poll_waker();
         self.clear_current_slots();
     }
@@ -1773,8 +2260,18 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
         // is alive in its `poll_to_yield`).
         // SAFETY: exec_ctx non-null (checked above).
         guard_switch_into("try_preempt:exec_ctx", unsafe { &*exec_ctx });
-        // SAFETY: Valid memory or trusted environment
-        unsafe { kernel_switch(&mut task.ctx, exec_ctx) };
+        if direct_handoff_active(this_cpu()) {
+            let cpu = this_cpu();
+            narf_lib::sync::without_interrupts(|| {
+                // SAFETY: task_ptr is the live direct target.
+                unsafe { finish_direct_handoff(cpu, task_ptr, false) };
+                // SAFETY: task + root executor contexts remain live.
+                unsafe { kernel_switch(&mut task.ctx, exec_ctx) };
+            });
+        } else {
+            // SAFETY: Valid memory or trusted environment
+            unsafe { kernel_switch(&mut task.ctx, exec_ctx) };
+        }
         // ── We resume here when the executor switches us back ──
         if task.completed.load(Ordering::Acquire) {
             // Defensive: the executor should have dropped us
@@ -1808,6 +2305,50 @@ extern "C" fn task_body_rust(task: *mut KernelTask) -> ! {
 #[inline]
 const fn cpl_zero(cs: u64) -> bool {
     (cs & 3) == 0
+}
+
+/// Decide whether a timer tick that cannot preempt a user task's kernel-mode
+/// continuation should leave a sticky reschedule request for syscall exit.
+/// `tick_required` carries the core slice/budget decision; `fair_sibling`
+/// carries the earlier fair-quantum starvation bound.
+#[inline]
+fn deferred_user_resched_decision(
+    started: u64,
+    slice: u64,
+    elapsed: u64,
+    tick_required: bool,
+    fair_sibling: bool,
+) -> bool {
+    started != 0 && (tick_required || (elapsed >= slice / FAIR_QUANTUM_DIV && fair_sibling))
+}
+
+/// Linux-style `TIF_NEED_RESCHED` publication for a tick that interrupted an
+/// own-stack user task in CPL0/EL1. Arbitrary kernel-mode preemption remains
+/// disabled; the completed syscall consumes the task-local request immediately
+/// before returning to user mode.
+#[inline]
+fn defer_user_resched_from_tick(task: &KernelTask, now: u64) {
+    if !task.user_preempt.load(Ordering::Acquire) || task.need_resched.load(Ordering::Acquire) {
+        return;
+    }
+    let started = task.tsc_started.load(Ordering::Acquire);
+    if started == 0 {
+        return;
+    }
+    let slice = task.slice_cycles.load(Ordering::Acquire);
+    let elapsed = now.saturating_sub(started);
+    let current = crate::current_task_id().raw();
+    let slice_expired = elapsed >= slice;
+    let tick_required = crate::tick_preemption_required(current, now, slice_expired);
+    // `tick_preemption_required` already probes runnable work for an expired
+    // ordinary slice. Probe separately only for the earlier fair quantum.
+    let fair_sibling = !tick_required
+        && !slice_expired
+        && elapsed >= slice / FAIR_QUANTUM_DIV
+        && crate::has_other_runnable_work(current);
+    if deferred_user_resched_decision(started, slice, elapsed, tick_required, fair_sibling) {
+        task.need_resched.store(true, Ordering::Release);
+    }
 }
 
 /// Inspect a trap frame at LAPIC timer entry; if a stackful task
@@ -1873,6 +2414,11 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // SAFETY: Valid memory or trusted environment
     let no_preempt = unsafe { (*task_ptr).no_preempt.load(Ordering::Acquire) };
     if no_preempt {
+        // A user task's syscall continuation is deliberately non-preemptible.
+        // Make the timer decision now and defer only the context switch, just
+        // as Linux sets TIF_NEED_RESCHED for its exit-to-user loop.
+        // SAFETY: task_ptr is the live current task established above.
+        defer_user_resched_from_tick(unsafe { &*task_ptr }, narf_time::now_cycles());
         return false;
     }
     // SAFETY: `task_ptr` was loaded from CURRENT_STACKFUL_TASK above and is
@@ -1975,6 +2521,10 @@ pub unsafe fn try_preempt(frame: &mut TrapFrame) -> bool {
     // `ctx` field does not dereference beyond the live allocation.
     // SAFETY: Valid memory or trusted environment
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
+    if direct_handoff_active(cpu) {
+        // SAFETY: timer entry already masks interrupts and task_ptr is current.
+        unsafe { finish_direct_handoff(cpu, task_ptr, true) };
+    }
     // SAFETY: `task_ctx_ptr` points at this task's `KernelContext` (save slot)
     // and `exec_ctx` is the non-null executor context published by the
     // in-progress poll_to_yield; kernel_switch saves the current callee-saved
@@ -2056,12 +2606,17 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     // SAFETY: CURRENT names the task whose in-flight poll keeps its Box live.
     let task = unsafe { &*task_ptr };
     let from_user = (frame.spsr & 0xF) == 0;
+    let user_preempt = task.user_preempt.load(Ordering::Acquire);
+    let no_preempt = task.no_preempt.load(Ordering::Acquire);
     if !aarch64_preempt_mode_allowed(
         frame.spsr,
         USE_OWN_STACK.load(Ordering::Acquire),
-        task.user_preempt.load(Ordering::Acquire),
-        task.no_preempt.load(Ordering::Acquire),
+        user_preempt,
+        no_preempt,
     ) {
+        if !from_user && user_preempt && no_preempt {
+            defer_user_resched_from_tick(task, narf_time::now_cycles());
+        }
         return false;
     }
     let now = narf_time::now_cycles();
@@ -2103,6 +2658,10 @@ pub unsafe fn try_preempt_aarch64(frame: &Aarch64TrapFrame) -> bool {
     // SAFETY: CURRENT_STACKFUL_TASK names the task whose in-flight
     // poll_to_yield call exclusively owns this context save slot.
     let task_ctx = unsafe { &raw mut (*task_ptr).ctx };
+    if direct_handoff_active(cpu) {
+        // SAFETY: exception entry masks interrupts and task_ptr is current.
+        unsafe { finish_direct_handoff(cpu, task_ptr, true) };
+    }
     // SAFETY: exec_ctx was published by the in-flight poll_to_yield call and
     // stays live until this trap continuation switches back into the task.
     guard_switch_into("try_preempt_aarch64:exec_ctx", unsafe { &*exec_ctx });
@@ -2224,6 +2783,10 @@ pub unsafe fn try_preempt_user(frame: &mut TrapFrame) -> bool {
     // SAFETY: `task.ctx` is the save slot, `exec_ctx` the live executor ctx;
     // kernel_switch saves the trap-handler continuation and resumes the executor.
     let task_ctx_ptr = unsafe { &raw mut (*task_ptr).ctx };
+    if direct_handoff_active(cpu) {
+        // SAFETY: timer entry masks interrupts and task_ptr is current.
+        unsafe { finish_direct_handoff(cpu, task_ptr, true) };
+    }
     // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx.
     guard_switch_into("preempt_yield:exec_ctx", unsafe { &*exec_ctx });
     // SAFETY: `task_ctx_ptr` is the save slot, `exec_ctx` the live executor ctx;
@@ -2380,6 +2943,11 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask) {
     // Slice ends here — fold it before the switch (the resume side
     // restamps tsc_started below).
     fold_current_slice(p);
+    // Any switch satisfies a deferred syscall-exit reschedule request. Clear
+    // it before handing control away so a blocking syscall does not inherit a
+    // stale request into the fresh slice in which it later resumes.
+    // SAFETY: p is the live current task required by this function's contract.
+    unsafe { (*p).need_resched.store(false, Ordering::Release) };
     // Reuse the task/cpu identity validated above. No migration is possible
     // until kernel_switch hands control to the executor.
     // SAFETY: `p` is the live current task required by this function's contract.
@@ -2387,13 +2955,39 @@ unsafe fn yield_current_stackful_from(cpu: usize, p: *mut KernelTask) {
     CURRENT_STACKFUL_TASK.inner[cpu].store(core::ptr::null_mut(), Ordering::Release);
     // SAFETY: p is a valid non-null pointer to the active user task.
     let ctx = unsafe { &raw mut (*p).ctx };
-    // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
-    // resumes the executor, returning here when it switches us back in.
-    // SAFETY: exec_ctx non-null (checked above); the executor populated it.
-    guard_switch_into("yield_current_stackful:exec_ctx", unsafe { &*exec_ctx });
-    // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation and
-    // resumes the executor, returning here when it switches us back in.
-    unsafe { kernel_switch(ctx, exec_ctx) };
+    // First try the bounded exact-wake transfer. An ordinary source may enter
+    // one resident target; that target may return directly only to its exact
+    // off-queue root. Every other case visits the executor.
+    // SAFETY: p is the live current task and ctx its exclusive context save
+    // slot; both remain pinned across the complete switch round trip.
+    let direct = if direct_handoff_active(cpu) {
+        // SAFETY: forwarded from this function's live-current-task contract.
+        unsafe { try_direct_return_to_root(cpu, p, ctx) }
+    } else {
+        // SAFETY: forwarded from this function's live-current-task contract.
+        unsafe { try_direct_handoff(cpu, p, ctx) }
+    };
+    if !direct {
+        if direct_handoff_active(cpu) {
+            // We are the direct target returning to the root executor. Keep
+            // IRQs masked across identity/root restoration and the final
+            // switch so no trap can observe a mixed task/AS publication.
+            narf_lib::sync::without_interrupts(|| {
+                // SAFETY: p is the live direct target on this CPU.
+                unsafe { finish_direct_handoff(cpu, p, false) };
+                // SAFETY: exec_ctx non-null (checked above); root published it.
+                guard_switch_into("yield_current_stackful:exec_ctx", unsafe { &*exec_ctx });
+                // SAFETY: ctx + exec_ctx are distinct live contexts.
+                unsafe { kernel_switch(ctx, exec_ctx) };
+            });
+        } else {
+            // SAFETY: exec_ctx non-null (checked above); the executor populated it.
+            guard_switch_into("yield_current_stackful:exec_ctx", unsafe { &*exec_ctx });
+            // SAFETY: ctx + exec_ctx live; kernel_switch saves our continuation
+            // and resumes the executor, returning here when re-dispatched.
+            unsafe { kernel_switch(ctx, exec_ctx) };
+        }
+    }
     // ── Resumed ──
     let cpu = this_cpu();
     // SAFETY: still our live task.
@@ -2635,49 +3229,18 @@ fn consume_syscall_exit_hint(hint: &AtomicBool) -> bool {
     hint.load(Ordering::Acquire) && hint.swap(false, Ordering::AcqRel)
 }
 
-/// Pure yield policy for [`maybe_resched_syscall_exit`], split out so it is
-/// unit-testable without a live executor. Yields (`true`) on an explicit
-/// back-pressure request, on full time-slice expiry, or once a fair quantum
-/// (`slice / FAIR_QUANTUM_DIV`) is spent AND a sibling task is
-/// runnable-and-waiting. `started == 0` (slice clock not yet stamped) never
-/// yields.
-///
-/// The `sibling_waiting` term is the cooperative-scheduler stand-in for "a
-/// lower-vtime task is runnable": a task sitting runnable in the queue while
-/// another has been running has, by construction, accrued less recent CPU, so
-/// ceding to it is the fair move. Without the early branch a syscall-dense
-/// spinner (a compositor looping `poll()` on an always-ready eventfd) holds the
-/// CPU for a full slice at a time and, on SMP=1, starves its own worker threads
-/// and the whole session — the busy-poll starvation the ReqGate cooperative
-/// yield (8c63bd43) fixed for the in-kernel spin, here for userspace.
+/// Pure final decision for [`maybe_resched_syscall_exit`]. Time-based slice,
+/// budget, and fair-quantum decisions arrive as the task-local
+/// `deferred_resched` bit set by the scheduler tick; wake terms are evaluated
+/// only after a wake publishes a hint. Keeping this final step pure pins that
+/// each independent reason is sufficient to cede.
 fn syscall_exit_yield_decision(
-    started: u64,
-    slice: u64,
-    elapsed: u64,
+    deferred_resched: bool,
     backpressure: bool,
-    sibling_waiting: bool,
     wake_preempt_sibling: bool,
     urgent_wake_sibling: bool,
 ) -> bool {
-    if backpressure {
-        return true;
-    }
-    if started == 0 {
-        return false;
-    }
-    if elapsed >= slice {
-        return true;
-    }
-    // Wake-preemption (Linux `wakeup_preempt`): a fresh wake made a peer
-    // runnable, so cede IMMEDIATELY — collapsing the `FAIR_QUANTUM_DIV` floor to
-    // zero. `wake_preempt_sibling` already carries the "a sibling is actually
-    // runnable" guard (computed by the caller like `sibling_waiting`), so a wake
-    // whose target already ran, or that raced a requeue, still runs the runner
-    // to its fair quantum rather than yielding to an empty queue.
-    if urgent_wake_sibling || wake_preempt_sibling {
-        return true;
-    }
-    elapsed >= slice / FAIR_QUANTUM_DIV && sibling_waiting
+    deferred_resched || backpressure || wake_preempt_sibling || urgent_wake_sibling
 }
 
 /// Linux `TIF_NEED_RESCHED`-at-syscall-exit analogue. The scheduler tick only
@@ -2685,18 +3248,18 @@ fn syscall_exit_yield_decision(
 /// *syscall-dense* task — one whose user-mode gaps between syscalls are far
 /// shorter than the syscall bodies — is essentially never sliced and starves
 /// every sibling on its CPU until it voluntarily blocks. Linux re-checks the
-/// spent time slice on the way out of every syscall; this restores that, and
-/// additionally yields EARLY (after a fair quantum, see
-/// [`syscall_exit_yield_decision`]) when a sibling is already runnable so a
-/// full-slice CPU hog cannot starve a waiting peer for the whole 10 ms.
+/// spent time slice on the way out of every syscall by checking the sticky
+/// `TIF_NEED_RESCHED` bit set by the tick. NARF follows that shape: a CPL0/EL1
+/// tick records the slice, budget, or fair-quantum decision in the current
+/// task, and this path consumes it before returning to user mode.
 ///
 /// Called at the tail of the `syscall`-instruction dispatch (a real user frame
 /// is returning to CPL=3). If this task's slice is spent it yields NOW — staying
 /// Ready by re-arming its slot waker first (same as `try_preempt_user`), so the
-/// executor re-polls it after servicing its siblings. Cheap when the slice is
-/// not yet spent (a few atomic loads + one TSC read); only the spent-slice case
-/// pays a context switch. No-op unless own-stack scheduling is live and a
-/// stackful task is current.
+/// executor re-polls it after servicing its siblings. The normally-clear path
+/// performs atomic loads only; it reads the cycle clock and consults EEVDF only
+/// after an actual ordinary-wake hint. No-op unless own-stack scheduling is
+/// live and a stackful task is current.
 ///
 /// # Safety
 /// Must be called at the tail of the `syscall` dispatch on the current task's
@@ -2713,6 +3276,9 @@ pub unsafe fn maybe_resched_syscall_exit() {
     if p.is_null() {
         return;
     }
+    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield
+    // keeps its Box alive across the user round-trip).
+    let deferred_resched = unsafe { consume_syscall_exit_hint(&(*p).need_resched) };
     // Both hints are cold in the ordinary syscall path.  Avoid an
     // unconditional RMW when they are clear: the per-CPU byte arrays share
     // cache lines, so `swap(false)` made independent CPUs contend on every
@@ -2730,47 +3296,38 @@ pub unsafe fn maybe_resched_syscall_exit() {
     // remote wake or a wakee that already ran must not leak urgency into a
     // later unrelated syscall.
     let urgent_wake = consume_syscall_exit_hint(&URGENT_WAKE_PREEMPT.inner[cpu].value);
-    // SAFETY: `p` is the in-flight stackful task on this CPU (poll_to_yield keeps
-    // its Box alive across the user round-trip); all reads are atomics.
+    // SAFETY: `p` is the live in-flight task established above.
     unsafe {
         // NOTE: deliberately NOT gated on `no_preempt`. User tasks keep CPL0
-        // timer preemption disabled, but this is precisely a cooperative yield —
-        // a SYNCHRONOUS slice check at syscall exit, about to return to CPL=3,
-        // outside any kernel critical section. Honouring `no_preempt` here is
-        // what left a syscall-dense task (stress-ng --sigrt's sigqueue loop)
-        // never yielding and starving its CPU's siblings.
-        let started = (*p).tsc_started.load(Ordering::Acquire);
-        let slice = (*p).slice_cycles.load(Ordering::Acquire);
-        let elapsed = narf_time::now_cycles().saturating_sub(started);
-        // The run-queue scan is the only "expensive" step, so run it lazily —
-        // only when a branch that needs it could actually fire: the fair-quantum
-        // branch (quantum spent, slice not up) OR a fresh wake-preemption request
-        // (slice not up). The cheap cases (back-pressure, full-slice, idle exit)
-        // decide without it, so a normal uncontended syscall exit still pays only
-        // the atomic loads + one TSC read above.
-        let current_id = crate::current_task_id().raw();
-        let quantum_spent = started != 0 && elapsed >= slice / FAIR_QUANTUM_DIV && elapsed < slice;
-        // Fair-share floor: cede after a fair quantum when a sibling is simply
-        // runnable (the cheap, policy-independent starvation bound).
-        let sibling_waiting =
-            !backpressure && quantum_spent && crate::has_other_runnable_work(current_id);
-        // Wake-preemption: a fresh wake made a peer runnable — ask the INSTALLED
-        // POLICY (EEVDF) whether the wakee is eligible to preempt the runner now.
-        // Only consulted inside the wake window (a wake is pending, slice not up),
-        // so the common no-wake syscall exit pays nothing here.
-        let wake_window =
-            (wake_preempt || urgent_wake) && !backpressure && started != 0 && elapsed < slice;
-        let urgent_wake_sibling =
-            wake_window && urgent_wake && crate::has_other_runnable_work(current_id);
-        let wake_preempt_sibling = !urgent_wake_sibling
-            && wake_window
-            && crate::wake_preempt_policy_check(current_id, elapsed);
+        // timer preemption disabled, but this is precisely a cooperative yield
+        // at the completed syscall boundary. The timer already made the slice,
+        // budget, and fair-quantum decision and published `need_resched`.
+        let mut urgent_wake_sibling = false;
+        let mut wake_preempt_sibling = false;
+        if !deferred_resched && !backpressure && (urgent_wake || wake_preempt) {
+            let started = (*p).tsc_started.load(Ordering::Acquire);
+            if started != 0 {
+                let current_id = crate::current_task_id().raw();
+                // An exact synchronous handoff only needs the runnable probe;
+                // avoid reading the cycle clock on this hottest wake path.
+                urgent_wake_sibling = urgent_wake && crate::has_other_runnable_work(current_id);
+                if !urgent_wake_sibling && wake_preempt {
+                    let slice = (*p).slice_cycles.load(Ordering::Acquire);
+                    let elapsed = narf_time::now_cycles().saturating_sub(started);
+                    // If the slice elapsed between ticks, a live peer is enough
+                    // to cede. Otherwise ask the installed policy whether the
+                    // freshly-woken task defeats RUN_TO_PARITY protection.
+                    wake_preempt_sibling = if elapsed >= slice {
+                        crate::has_other_runnable_work(current_id)
+                    } else {
+                        crate::wake_preempt_policy_check(current_id, elapsed)
+                    };
+                }
+            }
+        }
         if !syscall_exit_yield_decision(
-            started,
-            slice,
-            elapsed,
+            deferred_resched,
             backpressure,
-            sibling_waiting,
             wake_preempt_sibling,
             urgent_wake_sibling,
         ) {
@@ -2792,7 +3349,7 @@ pub unsafe fn maybe_resched_syscall_exit() {
         // Yields via kernel_switch to the executor; returns here (with a fresh
         // tsc_started) when re-polled. Proven safe from syscall context — the
         // own-stack park paths (own_stack_park / wait4) switch out the same way.
-        yield_current_stackful();
+        yield_current_stackful_from(cpu, p);
     }
 }
 
@@ -2851,9 +3408,20 @@ pub unsafe fn exit_current_stackful() -> ! {
                 // `completed`, and the box must never be a save target once
                 // `completed` is published (see EXIT_SCRATCH_CTX).
                 let scratch = EXIT_SCRATCH_CTX.inner[cpu].get();
-                // SAFETY: exec_ctx non-null (checked); executor populated it.
-                guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
-                kernel_switch(scratch, exec_ctx);
+                if direct_handoff_active(cpu) {
+                    narf_lib::sync::without_interrupts(|| {
+                        // SAFETY: p is the completed live direct target.
+                        finish_direct_handoff(cpu, p, false);
+                        // SAFETY: exec_ctx non-null; root executor populated it.
+                        guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
+                        // SAFETY: scratch is write-only and exec_ctx is live.
+                        kernel_switch(scratch, exec_ctx);
+                    });
+                } else {
+                    // SAFETY: exec_ctx non-null (checked); executor populated it.
+                    guard_switch_into("exit_current_stackful:exec_ctx", &*exec_ctx);
+                    kernel_switch(scratch, exec_ctx);
+                }
             }
             // A completed task must never be switched back into.
             panic!(
@@ -2928,6 +3496,7 @@ impl Drop for StackfulAdapter {
         // SAFETY: `inner` is live here and never touched after this take
         // (the field's own drop glue is a no-op under `ManuallyDrop`).
         let task = unsafe { core::mem::ManuallyDrop::take(&mut self.inner) };
+        task.unbind_wake_cell();
         task.clear_current_slots();
         narf_rcu::retire_box(task);
     }
@@ -3010,6 +3579,14 @@ impl Future for StackfulAdapter {
             // `self` is upheld.
             // SAFETY: Valid memory or trusted environment
             let this = unsafe { self.get_unchecked_mut() };
+            // End the lock guard's temporary scope before `bind_wake_cell`
+            // takes the same lock.
+            let needs_wake_cell = this.inner.wake_cell.lock().is_none();
+            if needs_wake_cell {
+                if let Some(cell) = crate::scheduler_wake_cell(cx.waker()) {
+                    this.inner.bind_wake_cell(cell);
+                }
+            }
             // Use this CPU's PERSISTENT resume-context slot, not a
             // stack local. The task stashes this pointer in its
             // `exec_ctx` and switches back to it on yield/preempt; a
@@ -4378,72 +4955,52 @@ pub mod tests {
         TestResult::Pass
     }
 
-    /// Fair-share syscall-exit yield policy (`syscall_exit_yield_decision`):
-    /// back-pressure and full-slice always yield; an EARLY yield requires BOTH a
-    /// spent fair quantum AND a waiting sibling; an unstamped slice clock
-    /// (`started == 0`) never yields. Regression pin for the SMP=1
-    /// compositor-poll-spin starvation — a syscall-dense CPU hog must cede to a
-    /// runnable peer after a fair quantum instead of holding the full slice.
+    /// Linux-style deferred syscall-exit policy: the timer publishes a sticky
+    /// task-local request after a core slice/budget decision or after the fair
+    /// quantum with a sibling. Syscall exit then treats that bit, backpressure,
+    /// and either wake-preemption result as independent reasons to cede.
     #[cfg(target_arch = "x86_64")]
     fn smoke_syscall_exit_fair_yield_policy() -> TestResult {
-        use super::{syscall_exit_yield_decision as decide, FAIR_QUANTUM_DIV};
+        use super::{
+            deferred_user_resched_decision as defer, syscall_exit_yield_decision as decide,
+            FAIR_QUANTUM_DIV,
+        };
         let slice = 40_000u64;
         let q = slice / FAIR_QUANTUM_DIV; // fair-quantum threshold
-                                          // Back-pressure always yields, even with the clock unstamped.
-        if !decide(0, slice, 0, true, false, false, false) {
-            return TestResult::Fail("back-pressure must yield regardless");
+
+        if defer(0, slice, slice, true, true) {
+            return TestResult::Fail("unstamped slice must not publish reschedule");
         }
-        // Unstamped slice clock never yields (absent back-pressure).
-        if decide(0, slice, slice * 2, false, true, false, false) {
-            return TestResult::Fail("started==0 must not yield");
+        if defer(1, slice, q - 1, false, true) {
+            return TestResult::Fail("below fair quantum must not publish reschedule");
         }
-        // Full slice spent always yields, even with no sibling waiting.
-        if !decide(1, slice, slice, false, false, false, false) {
-            return TestResult::Fail("full slice must yield");
+        if defer(1, slice, q, false, false) {
+            return TestResult::Fail("fair quantum without sibling must keep running");
         }
-        // Below the fair quantum: never yield, even with a sibling waiting.
-        if decide(1, slice, q - 1, false, true, false, false) {
-            return TestResult::Fail("below fair quantum must not yield");
+        if !defer(1, slice, q, false, true) {
+            return TestResult::Fail("fair quantum plus sibling must request reschedule");
         }
-        // At the fair quantum but no sibling: keep running to the full slice.
-        if decide(1, slice, q, false, false, false, false) {
-            return TestResult::Fail("fair quantum without a sibling must not yield");
+        if !defer(1, slice, 1, true, false) {
+            return TestResult::Fail("core tick decision must request reschedule");
         }
-        // At the fair quantum WITH a sibling waiting: yield early.
-        if !decide(1, slice, q, false, true, false, false) {
-            return TestResult::Fail("fair quantum + sibling must yield early");
+        if defer(1, slice, slice, false, false) {
+            return TestResult::Fail("expired slice without tick decision must keep running");
         }
-        // Wake-preemption: a fresh wake with a runnable sibling yields
-        // IMMEDIATELY — below the fair quantum, where the fair-share path alone
-        // would keep running. This is the futex wait/wake handoff collapse.
-        if !decide(1, slice, q - 1, false, false, true, false) {
-            return TestResult::Fail("wake-preempt + sibling must yield below fair quantum");
+
+        if !decide(false, true, false, false) {
+            return TestResult::Fail("backpressure must yield");
         }
-        // Even at elapsed 1 (just started): a wake with a runnable peer cedes.
-        if !decide(1, slice, 1, false, false, true, false) {
-            return TestResult::Fail("wake-preempt must yield right after slice start");
+        if !decide(true, false, false, false) {
+            return TestResult::Fail("deferred tick request must yield");
         }
-        // Wake-preempt WITHOUT a runnable sibling (caller ANDs in
-        // has_other_runnable_work, so the term arrives false): do NOT yield to an
-        // empty queue below the fair quantum.
-        if decide(1, slice, q - 1, false, false, false, false) {
-            return TestResult::Fail("wake-preempt without a sibling must not yield early");
+        if !decide(false, false, true, false) {
+            return TestResult::Fail("eligible wake-preempt must yield");
         }
-        // A wake-preempt request that arrives AFTER the full slice still yields
-        // (full-slice branch), and one with started==0 never does.
-        if !decide(1, slice, slice, false, false, true, false) {
-            return TestResult::Fail("full slice must yield even without wake-preempt");
+        if !decide(false, false, false, true) {
+            return TestResult::Fail("urgent wake handoff must yield");
         }
-        if decide(0, slice, 10, false, false, true, false) {
-            return TestResult::Fail("started==0 must not yield even on wake-preempt");
-        }
-        // An urgent synchronous handoff bypasses policy batching when a local
-        // peer is runnable, but remains subject to the same stamped-slice gate.
-        if !decide(1, slice, 1, false, false, false, true) {
-            return TestResult::Fail("urgent wake handoff must yield immediately");
-        }
-        if decide(0, slice, 1, false, false, false, true) {
-            return TestResult::Fail("unstamped urgent wake must not yield");
+        if decide(false, false, false, false) {
+            return TestResult::Fail("clear syscall-exit state must keep running");
         }
         TestResult::Pass
     }
@@ -6289,10 +6846,342 @@ pub mod tests {
         TestResult::Pass
     }
 
+    /// A synchronous wake followed by a source park must enter the exact
+    /// resident wakee without first returning through the executor. If that
+    /// wakee urgently wakes the off-queue root, it returns straight to the
+    /// root's saved continuation. The root is then forced through the executor
+    /// before another direct handoff, keeping the optimization bounded.
+    fn smoke_direct_handoff_runs_exact_wakee() -> TestResult {
+        #[cfg(target_arch = "x86_64")]
+        const ROOT_FPU: u64 = 0x524f_4f54_4650_5531;
+        #[cfg(target_arch = "x86_64")]
+        const TARGET_FPU: u64 = 0x5441_5247_4650_5531;
+        #[cfg(target_arch = "x86_64")]
+        const TARGET_FPU_AFTER: u64 = 0x5441_5247_4650_5532;
+
+        #[cfg(target_arch = "x86_64")]
+        #[repr(C, align(64))]
+        struct DirectFpuArea([u8; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+
+        #[cfg(target_arch = "x86_64")]
+        impl DirectFpuArea {
+            fn reset() -> Self {
+                let mut area = Self([0; narf_arch::x86_64::xsave::FPU_AREA_SIZE]);
+                area.0[0..2].copy_from_slice(&0x037fu16.to_le_bytes());
+                area.0[24..28].copy_from_slice(&0x1f80u32.to_le_bytes());
+                area
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_write(value: u64) {
+            // SAFETY: the caller materialized the current task's aligned image,
+            // which clears CR0.TS and gives this task the SIMD register file.
+            unsafe {
+                core::arch::asm!(
+                    "movq xmm0, {value}",
+                    value = in(reg) value,
+                    options(nostack, preserves_flags),
+                );
+            }
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_install(area: &mut DirectFpuArea, value: u64) -> bool {
+            set_current_user_fpu(area.0.as_mut_ptr());
+            arm_current_user_fpu();
+            if !materialize_current_user_fpu() {
+                return false;
+            }
+            direct_fpu_write(value);
+            true
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        fn direct_fpu_expect(expected: u64) -> bool {
+            if !materialize_current_user_fpu() {
+                return false;
+            }
+            let observed: u64;
+            // SAFETY: materialization above restored this task's image and
+            // cleared CR0.TS; reading XMM0 does not modify task state.
+            unsafe {
+                core::arch::asm!(
+                    "movq {observed}, xmm0",
+                    observed = out(reg) observed,
+                    options(nostack, preserves_flags),
+                );
+            }
+            observed == expected
+        }
+
+        static TARGET_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        static ROOT_WAKER: narf_lib::sync::IrqSafeSpinLock<Option<Waker>> =
+            narf_lib::sync::IrqSafeSpinLock::new(None);
+        static ROOT_TASK: AtomicU64 = AtomicU64::new(0);
+        static PHASE: AtomicU32 = AtomicU32::new(0);
+        static FAILURE: AtomicU32 = AtomicU32::new(0);
+
+        fn fail(code: u32) {
+            let _ = FAILURE.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
+        }
+
+        fn current_direct_identity() -> Option<(u64, Waker)> {
+            let p = CURRENT_STACKFUL_TASK.inner[this_cpu()].load(Ordering::Acquire);
+            if p.is_null() {
+                return None;
+            }
+            // SAFETY: CURRENT names the live task executing this test future.
+            let task = unsafe { &*p };
+            let cell = task.wake_cell.lock().clone()?;
+            cell.direct_eligible.store(true, Ordering::Release);
+            let waker = task.current_waker.lock().clone()?;
+            Some((cell.task, waker))
+        }
+
+        struct Target {
+            addr_space: Arc<narf_memory::AddressSpace>,
+            #[cfg(target_arch = "x86_64")]
+            fpu: Box<DirectFpuArea>,
+        }
+        impl Future for Target {
+            type Output = ();
+
+            fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                let _this = self.get_mut();
+                if PHASE.load(Ordering::Acquire) == 0 {
+                    if current_direct_identity().is_none() {
+                        fail(1);
+                    }
+                    if !crate::current_address_space()
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &_this.addr_space))
+                    {
+                        fail(20);
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    if !direct_fpu_install(&mut _this.fpu, TARGET_FPU) {
+                        fail(2);
+                    }
+                    *TARGET_WAKER.lock() = Some(cx.waker().clone());
+                    PHASE.store(1, Ordering::Release);
+                    #[cfg(target_arch = "x86_64")]
+                    // This synthetic kernel future published a user FPU image,
+                    // so model the real own-stack user's switch-out boundary
+                    // before returning Pending through task_body_rust.
+                    user_fpu_save();
+                    return Poll::Pending;
+                }
+                if PHASE.load(Ordering::Acquire) != 2 {
+                    fail(3);
+                }
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &_this.addr_space))
+                {
+                    fail(21);
+                }
+                // A nested stackful poll returns through the same completion
+                // hook while this target is active. It must leave the outer
+                // target claim intact for finish_direct_handoff.
+                let cpu = this_cpu();
+                let claimed = DIRECT_HANDOFF[cpu].target.load(Ordering::Acquire);
+                complete_direct_return(cpu);
+                if claimed.is_null()
+                    || DIRECT_HANDOFF[cpu].target.load(Ordering::Acquire) != claimed
+                {
+                    fail(4);
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if !direct_fpu_expect(TARGET_FPU) {
+                        fail(5);
+                    }
+                    direct_fpu_write(TARGET_FPU_AFTER);
+                }
+                let root_waker = ROOT_WAKER.lock().clone();
+                let root_task = ROOT_TASK.load(Ordering::Acquire);
+                let Some(root_waker) = root_waker else {
+                    fail(6);
+                    return Poll::Ready(());
+                };
+                PHASE.store(3, Ordering::Release);
+                crate::wake_urgent_task(&root_waker, root_task);
+                if !cooperative_yield() || PHASE.load(Ordering::Acquire) != 4 {
+                    fail(7);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_expect(TARGET_FPU_AFTER) {
+                    fail(8);
+                }
+                PHASE.store(5, Ordering::Release);
+                Poll::Ready(())
+            }
+        }
+
+        crate::__reset_queues_for_test();
+        PHASE.store(0, Ordering::Release);
+        FAILURE.store(0, Ordering::Release);
+        *TARGET_WAKER.lock() = None;
+        *ROOT_WAKER.lock() = None;
+        ROOT_TASK.store(0, Ordering::Release);
+        let handoffs_before = direct_handoff_count();
+        let returns_before = direct_return_count();
+        // SAFETY: paging is live in the distributed kernel-test environment.
+        let target_as = Arc::new(
+            unsafe { narf_memory::AddressSpace::new_for_user() }.expect("alloc direct target AS"),
+        );
+        // SAFETY: as above; this root must remain distinct from the target.
+        let root_as = Arc::new(
+            unsafe { narf_memory::AddressSpace::new_for_user() }.expect("alloc direct root AS"),
+        );
+        let target = crate::spawn_user(
+            crate::alloc_task_id(),
+            Target {
+                addr_space: Arc::clone(&target_as),
+                #[cfg(target_arch = "x86_64")]
+                fpu: Box::new(DirectFpuArea::reset()),
+            },
+            crate::TaskSpec::unthrottled(),
+            Arc::clone(&target_as),
+        );
+        #[cfg(target_arch = "x86_64")]
+        let mut root_fpu = Box::new(DirectFpuArea::reset());
+        let root_expected = Arc::clone(&root_as);
+        crate::spawn_user(
+            crate::alloc_task_id(),
+            async move {
+                let Some((root_task, root_waker)) = current_direct_identity() else {
+                    fail(9);
+                    return;
+                };
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &root_expected))
+                {
+                    fail(22);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_install(&mut root_fpu, ROOT_FPU) {
+                    fail(10);
+                    return;
+                }
+                ROOT_TASK.store(root_task, Ordering::Release);
+                *ROOT_WAKER.lock() = Some(root_waker);
+                if PHASE.load(Ordering::Acquire) != 1 {
+                    fail(11);
+                    return;
+                }
+                let wake = TARGET_WAKER.lock().clone();
+                let Some(wake) = wake else {
+                    fail(12);
+                    return;
+                };
+                PHASE.store(2, Ordering::Release);
+                crate::wake_urgent_task(&wake, target.raw());
+                if !cooperative_yield() {
+                    fail(13);
+                }
+                if PHASE.load(Ordering::Acquire) != 3 {
+                    fail(14);
+                }
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &root_expected))
+                {
+                    fail(23);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_expect(ROOT_FPU) {
+                    fail(15);
+                }
+                let cpu = this_cpu();
+                let root = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+                if root.is_null()
+                    || DIRECT_HANDOFF[cpu].returned_root.load(Ordering::Acquire) != root
+                {
+                    fail(16);
+                }
+                let returns = DIRECT_HANDOFF[cpu].returns.load(Ordering::Acquire);
+                if returns != 1 {
+                    fail(17);
+                }
+                if !direct_handoff_gate_open(cpu, root) {
+                    fail(18);
+                }
+                DIRECT_HANDOFF[cpu]
+                    .returns
+                    .store(MAX_DIRECT_ROOT_RETURNS, Ordering::Release);
+                if direct_handoff_gate_open(cpu, root) {
+                    fail(19);
+                }
+                DIRECT_HANDOFF[cpu]
+                    .returns
+                    .store(returns, Ordering::Release);
+                PHASE.store(4, Ordering::Release);
+            },
+            crate::TaskSpec::unthrottled(),
+            Arc::clone(&root_as),
+        );
+        crate::run_until_empty();
+        *TARGET_WAKER.lock() = None;
+        *ROOT_WAKER.lock() = None;
+
+        match FAILURE.load(Ordering::Acquire) {
+            0 => {}
+            1 => return TestResult::Fail("direct target identity was not published"),
+            2 => return TestResult::Fail("direct target FPU image did not materialize"),
+            3 => return TestResult::Fail("direct target ran outside the requested phase"),
+            4 => return TestResult::Fail("nested completion released the direct target claim"),
+            5 => return TestResult::Fail("source-to-target transfer lost target FPU state"),
+            6 => return TestResult::Fail("direct target could not recover the root waker"),
+            7 => return TestResult::Fail("direct target did not resume after the root poll"),
+            8 => return TestResult::Fail("executor resume lost the target FPU state"),
+            9 => return TestResult::Fail("direct root identity was not published"),
+            10 => return TestResult::Fail("direct root FPU image did not materialize"),
+            11 => return TestResult::Fail("direct root ran before target initialization"),
+            12 => return TestResult::Fail("direct root could not recover the target waker"),
+            13 => return TestResult::Fail("direct root could not yield to the target"),
+            14 => {
+                return TestResult::Fail("target-to-root transfer did not resume the root directly")
+            }
+            15 => return TestResult::Fail("target-to-root transfer lost root FPU state"),
+            16 => return TestResult::Fail("direct-root fairness gate was not published"),
+            17 => return TestResult::Fail("direct-root return count was not advanced once"),
+            18 => return TestResult::Fail("direct-root batch closed before its bound"),
+            19 => return TestResult::Fail("direct-root batch remained open at its bound"),
+            20 => {
+                return TestResult::Fail("target executor poll published the wrong address space")
+            }
+            21 => return TestResult::Fail("source-to-target transfer lost target address space"),
+            22 => return TestResult::Fail("root executor poll published the wrong address space"),
+            23 => return TestResult::Fail("target-to-root transfer lost root address space"),
+            _ => return TestResult::Fail("unexpected direct-transfer smoke failure"),
+        }
+        if PHASE.load(Ordering::Acquire) != 5 {
+            return TestResult::Fail("direct wakee/source ordering was not preserved");
+        }
+        if direct_handoff_count() <= handoffs_before {
+            return TestResult::Fail("exact urgent wake did not use direct task transfer");
+        }
+        if direct_return_count() <= returns_before {
+            return TestResult::Fail("exact urgent root wake did not return task-to-task");
+        }
+        let direct = &DIRECT_HANDOFF[this_cpu()];
+        if !direct.returned_root.load(Ordering::Acquire).is_null()
+            || direct.returns.load(Ordering::Acquire) != 0
+        {
+            return TestResult::Fail("direct-root fairness gate escaped its executor poll");
+        }
+        TestResult::Pass
+    }
+
     kernel_test_in!(
         "scheduler/stackful",
         smoke_preempt_disable_nests_and_unwinds
     );
+    kernel_test_in!("scheduler/stackful", smoke_direct_handoff_runs_exact_wakee);
 
     /// The reported domain follows a task across a yield, and does not follow
     /// the CPU.

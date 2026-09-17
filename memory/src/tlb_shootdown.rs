@@ -21,8 +21,9 @@
 //!   which PCIDs / ASIDs it currently has resident in its TLB. The
 //!   scheduler publishes `set_active_as(pcid)` before it loads a task's
 //!   CR3 (Intel SDM Vol 3 §4.10.4.3, "Software may assume that a TLB
-//!   entry's tag matches the current PCID"). On context-out, it first
-//!   invalidates that tag locally and only then calls `clear_active_as`.
+//!   entry's tag matches the current PCID"). Lifetime process tags retain
+//!   this conservative history across context-out; their teardown invalidates
+//!   every published CPU before allocator reuse.
 //! * **IPI mask construction** -- `shootdown(req)` builds the IPI target
 //!   set by intersecting the online-CPU bitmap with the set of CPUs that
 //!   have the affected PCID resident. CPUs that have never loaded the
@@ -47,8 +48,7 @@
 //! on the same bucket force an IPI to a CPU that doesn't hold the
 //! exact tag) but no false negatives. Today's NARF allocates <= 16
 //! PCIDs (one per domain, see `arch/x86_64/pcid.rs`) so collisions are
-//! impossible in practice; the encoding scales cleanly when the PCID
-//! allocator grows.
+//! expected for process PCIDs; the resulting false positives remain safe.
 //!
 //! ## Hard cutover (no fallback flag)
 //!
@@ -239,8 +239,7 @@ pub fn set_active_as(cpu: u32, pcid: u16) {
 
 /// Announce that `cpu` can no longer retain anything tagged with `pcid`.
 /// The caller must first complete a local invalidation for the bucket. For
-/// x86 process PCID 0, the scheduler's plain kernel-CR3 restore supplies that
-/// invalidation. Tags sharing a hash bucket must not use this operation until
+/// Tags sharing a hash bucket must not use this operation until
 /// every colliding resident has also been invalidated.
 pub fn clear_active_as(cpu: u32, pcid: u16) {
     let i = (cpu as usize).min(MAX_CPUS - 1);
@@ -417,6 +416,43 @@ pub fn shootdown(req: ShootdownRequest) {
         .fetch_add(1, Ordering::Relaxed);
 
     dispatch_remote(req, req);
+    #[cfg(any(test, feature = "kernel-test"))]
+    notify_completion_for_test(req);
+}
+
+/// Test-only observer invoked after both halves of a synchronous shootdown.
+/// It lets ordering tests model the last store completed by a remote CPU at
+/// the rendezvous boundary without routing through the obsolete PCID-0 paging
+/// hook.
+#[cfg(any(test, feature = "kernel-test"))]
+pub type ShootdownCompletionHook = fn(ShootdownRequest);
+
+#[cfg(any(test, feature = "kernel-test"))]
+static COMPLETION_HOOK_FOR_TEST: AtomicUsize = AtomicUsize::new(0);
+
+/// Replace the test-only completion observer and return the prior value.
+#[doc(hidden)]
+#[cfg(any(test, feature = "kernel-test"))]
+pub fn replace_completion_hook_for_test(
+    hook: Option<ShootdownCompletionHook>,
+) -> Option<ShootdownCompletionHook> {
+    let previous = COMPLETION_HOOK_FOR_TEST.swap(hook.map_or(0, |f| f as usize), Ordering::AcqRel);
+    if previous == 0 {
+        None
+    } else {
+        // SAFETY: only `ShootdownCompletionHook` values are stored above.
+        Some(unsafe { core::mem::transmute::<usize, ShootdownCompletionHook>(previous) })
+    }
+}
+
+#[cfg(any(test, feature = "kernel-test"))]
+fn notify_completion_for_test(req: ShootdownRequest) {
+    let hook = COMPLETION_HOOK_FOR_TEST.load(Ordering::Acquire);
+    if hook != 0 {
+        // SAFETY: only `ShootdownCompletionHook` values are stored above.
+        let hook: ShootdownCompletionHook = unsafe { core::mem::transmute(hook) };
+        hook(req);
+    }
 }
 
 /// Complete only the remote half of an invalidation whose caller already
@@ -429,8 +465,8 @@ pub fn shootdown_remote(req: ShootdownRequest) {
 }
 
 /// Remotely flush every non-global entry, but target only CPUs that may hold
-/// `residency_tag`. Used by x86 process roots, which all run under flushing
-/// PCID 0 and publish exact active residency around scheduler polls.
+/// `residency_tag`. Retained for callers whose local phase deliberately uses a
+/// broader non-global flush while remote selection still knows one logical tag.
 pub fn shootdown_remote_full_for_tag(residency_tag: u16) {
     local_stats()
         .shootdown_count
@@ -680,7 +716,7 @@ fn smoke_tlb_shootdown_tracked_empty_and_idle_defer() -> TestResult {
         return TestResult::Fail("unrelated tracking suppressed bootstrap broadcast");
     }
 
-    // Once PCID 0 is tracked, clearing its only resident makes an empty mask
+    // Once tag 0 is tracked, clearing its only resident makes an empty mask
     // authoritative rather than falling back to all peers.
     if filter_residency_targets(ShootdownRequest::for_va(0, 0x4000), peer, tracked, 0) & peer != 0 {
         return TestResult::Fail("tracked empty bucket fell back to broadcast");
@@ -805,8 +841,9 @@ fn smoke_tlb_shootdown_local_only_count_advances() -> TestResult {
     // The IPI-reduction headline: when no peer CPU holds an
     // affected mapping, every shootdown collapses to a local INVPCID and
     // shows up as a +1 in local_only_count. Bucket 63 is unused by production
-    // (process roots publish PCID 0); marking it tracked is monotonic and safe
-    // because any future load must publish residency before its context load.
+    // Marking it tracked is monotonic and safe because any future load must
+    // publish residency before its context load. A production PCID may share
+    // the bucket, in which case this diagnostic correctly skips.
     const TEST_TAG: u16 = 63;
     let bucket = 1u64 << pcid_bucket(TEST_TAG);
     TRACKED_BUCKETS.fetch_or(bucket, Ordering::Release);

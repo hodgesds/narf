@@ -15,8 +15,11 @@ The executor is deliberately factored so that **mechanism** lives in the core
 - **Core owns** (a policy cannot and must not reimplement these): the per-CPU
   ready `VecDeque<TaskSlot>`, admission/park/wake transitions, work-stealing and
   migration, CPU hot-plug, time-slice/tick preemption at CPL3, budget throttling
-  and eligibility tiers, and the run-time *accounting* every policy needs (a
-  task's accumulated virtual runtime — see §4). Accounting is core-owned because
+  and eligibility tiers, the bounded synchronous-wake batch (one fixed root,
+  one target at a time, at most eight exact-root returns), and the run-time
+  *accounting* every policy needs (a task's
+  accumulated virtual runtime
+  — see §4). Accounting is core-owned because
   it is charged on the hottest path (once per dispatch) and every policy reads
   the same numbers; duplicating it per policy would add a virtual call to that
   path for no benefit.
@@ -50,6 +53,24 @@ falls back to the first candidate in that tier (`pick_next_slot`,
 and need not re-check throttling itself beyond the `TaskMeta.budget_state`
 eligibility it is handed. Keep it a single O(n) scan over `queue.iter_meta()`;
 allocation, locking, or re-entering the scheduler from here is forbidden.
+The built-in class/FIFO path may select an exact, awake synchronous-handoff
+buddy before this scan only when the task has no periodic budget. Such a task
+is necessarily in the highest core eligibility tier; periodic-budget tasks and
+external policies still take the ordinary validated path. `ClassScheduler`
+also falls back when a higher-class task is awake, and the ordinary path applies
+the buddy only within the class selected by strict class ordering. A per-CPU
+class bitmask is a conservative guard only: admission and migration publish a
+class before its slot becomes visible, and bits remain sticky so a race cannot
+create a false negative. A stale higher-class bit only forces the validated
+path.
+
+Before returning through the executor, the core may directly enter that exact
+wakee only for the built-in class/FIFO policies and a local default-class,
+normal-priority stackful task with no period, budget cap, or donation. The core
+claims the resident slot under its home run-queue lock and charges the target's
+runtime back to its own virtual runtime. External and wrapper policies are
+never bypassed: their wakees return through `pick_next` so policy observation
+and ordering remain complete.
 
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative
@@ -106,8 +127,9 @@ steal can be renormalized in core (policy never writes slots).
 - **`BASE_SLICE`** is derived from `DEFAULT_SLICE_CYCLES` (not a new magic
   number) and is comparable to Linux's `sysctl_sched_base_slice` (700 µs). The
   tick/CPL3 slice preemption (`try_preempt_user`) and the `FAIR_QUANTUM_DIV`
-  fair-share floor remain the backstops; EEVDF only re-orders picks and supplies
-  the wake-preempt rule.
+  fair-share floor remain the backstops. A tick that lands in a user syscall
+  records either decision in that task's sticky reschedule bit for syscall
+  exit; EEVDF only re-orders picks and supplies the wake-preempt rule.
 
 Why this is correct where a flat "minimum run time before a wake may preempt"
 floor is not: the floor cannot tell a *starved sleeper that should preempt now*

@@ -64,6 +64,34 @@ const NUM_DOMAINS: usize = 16;
 /// link against the trait.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// CPUs capable of the complete process-PCID contract: CR4.PCIDE is enabled
+/// and INVPCID can retire an inactive context before tag reuse.
+static PROCESS_PCID_CAPABLE: AtomicU64 = AtomicU64::new(0);
+
+/// Global process-PCID gate, finalized only after SMP bring-up proves every
+/// online CPU can install and retire a nonzero process tag.
+static PROCESS_PCID_READY: AtomicBool = AtomicBool::new(false);
+
+/// Finalize per-process PCID support after the online CPU set is stable.
+pub fn finalize_process_pcid(online_cpu_mask: u64) {
+    let capable = PROCESS_PCID_CAPABLE.load(Ordering::Acquire);
+    PROCESS_PCID_READY.store(
+        online_cpu_mask != 0 && capable & online_cpu_mask == online_cpu_mask,
+        Ordering::Release,
+    );
+}
+
+/// Whether every online CPU can safely participate in process-PCID reuse.
+#[inline]
+pub fn process_pcid_ready() -> bool {
+    PROCESS_PCID_READY.load(Ordering::Acquire)
+}
+
+/// Number of CPUs that enabled PCIDE and advertise INVPCID.
+pub fn process_pcid_cpu_count() -> u64 {
+    PROCESS_PCID_CAPABLE.load(Ordering::Acquire).count_ones() as u64
+}
+
 /// Bootstrap PML4 physical address (PML4_MASK bits only). Set by
 /// `init`. Used as the fallback when a domain has no registered PML4.
 // Read by the trap-entry assembly to enter the neutral FRAME address space
@@ -144,6 +172,10 @@ impl fmt::Display for DomainRights {
 /// bit, exposed since Zen). Caller must have ensured the current CR3
 /// has PCID = 0 in its low 12 bits.
 pub unsafe fn enable_pcide() {
+    // A CPU joining after process tags became live may retain translations
+    // from an earlier online epoch. It must flush every context before it is
+    // published online again; an incapable CPU must fail before publication.
+    let process_pcids_active = process_pcid_ready();
     // CPUID.01H:ECX.PCID[bit 17] reports support. Skip the
     // CR4.PCIDE write entirely on a CPU that doesn't advertise
     // PCID — setting the bit would #GP. All Zen / modern Intel
@@ -163,6 +195,10 @@ pub unsafe fn enable_pcide() {
         // while APs see it clear, so the machine boots reporting the PCID
         // enforcer while every AP silently enforces nothing.
         mark_pcide_missing();
+        assert!(
+            !process_pcids_active,
+            "cannot online a CPU without PCID after process PCIDs are active"
+        );
         return;
     }
 
@@ -180,6 +216,23 @@ pub unsafe fn enable_pcide() {
         cr::write_cr3(cr3 & !0xFFFu64);
         let cr4 = cr::read_cr4();
         cr::write_cr4(cr4 | cr::CR4_PCIDE);
+    }
+    if invpcid_supported() {
+        if process_pcids_active {
+            // SAFETY: CR4.PCIDE is enabled above and CPUID advertised INVPCID.
+            // Type 2 also retires global entries, which is conservative for a
+            // CPU rejoining after it may have missed offline shootdowns.
+            unsafe { invpcid_all_with_globals() };
+        }
+        let cpu = crate::current_cpu_id().raw() as usize;
+        if cpu < 64 {
+            PROCESS_PCID_CAPABLE.fetch_or(1u64 << cpu, Ordering::AcqRel);
+        }
+    } else {
+        assert!(
+            !process_pcids_active,
+            "cannot online a CPU without INVPCID after process PCIDs are active"
+        );
     }
 }
 

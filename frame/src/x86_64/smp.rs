@@ -335,12 +335,11 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //
     //     For the PKS path the same logic applies: AP CR4.PKS must
     //     mirror BSP. We enable both per the BSP's effective backend.
-    if narf_arch::effective_backend() == narf_arch::DomainBackend::Pcid {
-        // SAFETY: PCID is a baseline x86_64 feature; CR3 has PCID = 0.
-        unsafe {
-            narf_arch::x86_64::pcid::enable_pcide();
-        }
-    } else if narf_arch::effective_backend() == narf_arch::DomainBackend::Pks {
+    // Process address spaces use PCIDs independently of the domain enforcer.
+    // AP trampoline CR3 has PCID 0; unsupported/masked vCPUs safely decline.
+    unsafe { narf_arch::x86_64::pcid::enable_pcide() };
+
+    if narf_arch::effective_backend() == narf_arch::DomainBackend::Pks {
         // Mirror CR4.PKS on this AP. CPUID gating already happened on
         // the BSP — if PKS is selected we know the silicon supports it.
         // SAFETY: BSP confirmed PKS support via CPUID.

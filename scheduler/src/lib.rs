@@ -163,7 +163,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use core::future::Future;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 use core::sync::atomic::AtomicU32;
@@ -249,7 +249,7 @@ pub fn cpu_demand(cpu: CpuId) -> CpuDemand {
     };
     let now = narf_time::now_cycles();
     for slot in queue {
-        if !slot.awake.flag.load(Ordering::Acquire) {
+        if !slot.awake.executor_runnable() {
             continue;
         }
         let view = slot.account.view(now, &slot.spec.budget);
@@ -414,6 +414,15 @@ struct PerCpuTaskHint(AtomicU64);
 static URGENT_WAKE_NEXT: [PerCpuTaskHint; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuTaskHint(AtomicU64::new(0)) }; narf_lib::percpu::MAX_CPUS];
 
+/// Owning reference for the exact synchronous wake target. The raw pointer is
+/// one `Arc<WakeCell>` strong reference; consumers reconstruct and own it.
+/// Keeping the cell, rather than only its task id, lets a running stackful task
+/// claim the wakee without a global task lookup while preserving lifetime.
+#[repr(align(64))]
+struct PerCpuUrgentWake(AtomicPtr<WakeCell>);
+static URGENT_WAKE_CELL: [PerCpuUrgentWake; narf_lib::percpu::MAX_CPUS] =
+    [const { PerCpuUrgentWake(AtomicPtr::new(core::ptr::null_mut())) }; narf_lib::percpu::MAX_CPUS];
+
 /// Narrow directed wake for I/O owners only (boot flag `io_next`). The generic
 /// `WAKE_NEXT` path names EVERY wake its CPU's next-buddy and was measured to
 /// thrash this cooperative executor (redis throughput halved, #235). This
@@ -472,12 +481,44 @@ pub(crate) fn hint_urgent_next(task: u64) {
 /// Publish a synchronous-handoff next-buddy on the wakee's home run queue.
 /// The caller must have obtained `home` from that task's live [`WakeCell`].
 #[inline]
-fn hint_urgent_next_on(home: u32, task: u64) {
+fn hint_urgent_next_on(home: u32, task: u64, cell: *const WakeCell) {
     if task != 0 && (home as usize) < URGENT_WAKE_NEXT.len() {
         URGENT_WAKE_NEXT[home as usize]
             .0
             .store(task, Ordering::Release);
+        let direct = !cell.is_null()
+            // SAFETY: the raw-waker caller holds a live Arc for `cell`.
+            && unsafe { (*cell).direct_eligible.load(Ordering::Acquire) };
+        if direct {
+            // SAFETY: the raw-waker caller holds a live Arc for `cell`.
+            // Increment before publication; the atomic slot owns that new
+            // reference until replacement or one-shot consumption.
+            unsafe { Arc::increment_strong_count(cell) };
+            let old = URGENT_WAKE_CELL[home as usize]
+                .0
+                .swap(cell.cast_mut(), Ordering::AcqRel);
+            if !old.is_null() {
+                // SAFETY: every non-null pointer in the slot is exactly one
+                // `Arc::into_raw`-equivalent strong reference.
+                unsafe { drop(Arc::from_raw(old)) };
+            }
+        }
     }
+}
+
+/// Consume the exact synchronous-wake cell on `cpu`. Used first by a running
+/// stackful task attempting a direct handoff; if that path declines, it
+/// republishes the scalar id for the ordinary executor next-buddy path.
+pub(crate) fn take_urgent_wake_cell(cpu: usize) -> Option<Arc<WakeCell>> {
+    let slot = URGENT_WAKE_CELL.get(cpu)?;
+    let ptr = slot.0.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    if ptr.is_null() {
+        return None;
+    }
+    URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
+    // SAFETY: the atomic slot owned one strong reference, transferred here by
+    // the successful swap-to-null above.
+    Some(unsafe { Arc::from_raw(ptr) })
 }
 
 /// Wake-preemption (boot flag `wake_preempt`, debugfs `sched/wake_preempt`).
@@ -542,19 +583,35 @@ fn record_wake_next(cpu: u32, task: u64) {
     }
 }
 
-/// Read-and-clear `cpu`'s next-buddy hint (0 = none). `pick_next_slot` calls
-/// this once per pick; clearing on read makes the boost a one-shot so a buddy
-/// that turns out not to be top-tier does not stick.
-pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+/// Read-and-clear `cpu`'s urgent synchronous-handoff hint (0 = none).
+///
+/// Keep this separate from the opt-in generic wake-next slot: the built-in
+/// policies can validate and select this narrow hint before their mandatory
+/// full queue scan, while an external policy still consumes it through the
+/// ordinary core validation pass.
+pub(crate) fn take_urgent_next(cpu: u32) -> u64 {
     if (cpu as usize) >= WAKE_NEXT.len() {
         return 0;
     }
     // A successful synchronous wake is Linux's set-next-buddy case and is not
     // an experimental every-wake policy. Avoid an unconditional atomic RMW on
     // ordinary picks: the common empty slot costs one read only.
+    if let Some(cell) = take_urgent_wake_cell(cpu as usize) {
+        return cell.task;
+    }
     let urgent = URGENT_WAKE_NEXT[cpu as usize].0.load(Ordering::Acquire);
     if urgent != 0 {
         return URGENT_WAKE_NEXT[cpu as usize].0.swap(0, Ordering::AcqRel);
+    }
+    0
+}
+
+/// Read-and-clear `cpu`'s opt-in generic next-buddy hint (0 = none).
+/// `pick_next_slot` calls this once per pick; clearing on read makes the boost
+/// a one-shot so a buddy that turns out not to be top-tier does not stick.
+pub(crate) fn take_wake_next(cpu: u32) -> u64 {
+    if (cpu as usize) >= WAKE_NEXT.len() {
+        return 0;
     }
     // Honored when EITHER the generic every-wake path or the narrow I/O-owner
     // path is enabled; both feed the same single-slot hint.
@@ -748,6 +805,132 @@ pub(crate) struct WakeCell {
     /// Zero when never externally woken. Off-path unless `wake_race` is set.
     wake_cyc: AtomicU64,
     wake_halt_gen: AtomicU64,
+    /// Stable stackful continuation, published after slot construction and
+    /// cleared synchronously before the adapter is retired through RCU.
+    stackful: AtomicPtr<stackful::KernelTask>,
+    /// This task satisfies the deliberately narrow direct-handoff contract:
+    /// built-in default class, no capability/budget gate, and stackful state.
+    direct_eligible: AtomicBool,
+    /// Excludes executor dispatch/work stealing while another task is directly
+    /// running this continuation. Protected by the home run-queue lock when it
+    /// transitions false->true; cleared before control returns to the executor.
+    direct_claimed: AtomicBool,
+    /// Runtime accumulated while this resident slot ran through a direct
+    /// handoff; drained into vruntime on its next ordinary dispatch.
+    direct_runtime_cycles: AtomicU64,
+}
+
+impl WakeCell {
+    #[inline]
+    fn executor_runnable(&self) -> bool {
+        self.flag.load(Ordering::Acquire) && !self.direct_claimed.load(Ordering::Acquire)
+    }
+}
+
+pub(crate) struct DirectHandoffTarget {
+    pub task: *mut stackful::KernelTask,
+    pub id: u64,
+    pub cell: Arc<WakeCell>,
+    pub addr_space: Option<Arc<AddressSpace>>,
+}
+
+/// Claim one exact urgent wakee while its slot remains resident in READY.
+/// Holding the home queue lock makes the false->true claim atomic with respect
+/// to local dispatch and stealing; the executor treats a claimed slot as not
+/// runnable until the target switches back to the root executor continuation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn claim_direct_handoff_target(
+    cpu: usize,
+    cell: Arc<WakeCell>,
+) -> Option<DirectHandoffTarget> {
+    if cpu >= READY.len()
+        || cell.cpu.load(Ordering::Acquire) as usize != cpu
+        || !cell.direct_eligible.load(Ordering::Acquire)
+        || cell.direct_claimed.load(Ordering::Acquire)
+        || !policy::direct_handoff_allowed(CpuId(cpu as u32))
+    {
+        return None;
+    }
+
+    let mut ready = READY[cpu].lock();
+    let queue = ready.as_mut()?;
+    let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, &cell))?;
+    if !slot.awake.executor_runnable()
+        || slot.spec.class != SchedClass::Default
+        || slot.spec.priority != Priority::NORMAL
+        || slot.spec.budget != ResourceBudget::unthrottled()
+        || slot.spec.budget_cap.is_some()
+        || slot.donation.is_some()
+    {
+        return None;
+    }
+    let task = cell.stackful.load(Ordering::Acquire);
+    if task.is_null() {
+        return None;
+    }
+    // The home queue lock excludes every executor removal/steal of this slot.
+    // Publish the claim before consuming the wake bit so all later scans skip
+    // the resident slot even if another wake races the direct continuation.
+    cell.direct_claimed.store(true, Ordering::Release);
+    cell.flag.store(false, Ordering::Release);
+    publish_current_sched(cpu, slot);
+    let addr_space = slot.addr_space.clone();
+    Some(DirectHandoffTarget {
+        task,
+        id: cell.task,
+        cell,
+        addr_space,
+    })
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
+    if completed {
+        cell.flag.store(true, Ordering::Release);
+    }
+    cell.direct_claimed.store(false, Ordering::Release);
+}
+
+/// Publish a direct target's identity/address space before its continuation is
+/// entered, returning ownership of the displaced active address space. The
+/// active slot stays locked and the old Arc stays locally owned across the
+/// hardware transition, so no live page-table root can be freed or observed
+/// half-published.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn activate_direct_task(
+    id: u64,
+    next: Option<Arc<AddressSpace>>,
+) -> Result<Option<Arc<AddressSpace>>, ()> {
+    let mut active = active_user_as_slot().lock();
+    let same = match (active.as_ref(), next.as_ref()) {
+        (Some(active), Some(next)) => Arc::ptr_eq(active, next),
+        (None, None) => true,
+        _ => false,
+    };
+    if !same {
+        let Some(ref next_as) = next else {
+            return Err(());
+        };
+        next_as.activate().map_err(|_| ())?;
+    }
+    let previous = core::mem::replace(&mut *active, next);
+    drop(active);
+    current_task_slot().store(id, Ordering::Release);
+    Ok(previous)
+}
+
+fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
+    Arc::new(WakeCell {
+        flag: AtomicBool::new(true),
+        cpu: AtomicU32::new(cpu),
+        task: id.raw(),
+        wake_cyc: AtomicU64::new(0),
+        wake_halt_gen: AtomicU64::new(0),
+        stackful: AtomicPtr::new(core::ptr::null_mut()),
+        direct_eligible: AtomicBool::new(direct_eligible),
+        direct_claimed: AtomicBool::new(false),
+        direct_runtime_cycles: AtomicU64::new(0),
+    })
 }
 
 /// Per-CPU "about to halt / halted" flag, used to gate the reschedule
@@ -862,22 +1045,56 @@ static CURRENT_SCHED: [CurrentSched; narf_lib::percpu::MAX_CPUS] = [const {
     }
 }; narf_lib::percpu::MAX_CPUS];
 
-/// O(1) hint that the currently-dispatched task has a runnable peer on this
-/// CPU. The core refreshes it from the authoritative dispatch scan; wake and
-/// enqueue paths may only change it false->true. A stale true costs one
-/// harmless executor round, while a wake can never be hidden behind a stale
-/// false as long as every false->true runnable transition calls
-/// `note_runnable_peer`.
+/// O(1) hints for peer presence and strict-class shortcut safety. The core
+/// refreshes `peer` from the authoritative dispatch scan; wake and enqueue
+/// paths may only change it false->true. A stale true costs one harmless
+/// executor round, while a wake cannot be hidden behind a stale false as long
+/// as every false->true runnable transition calls `note_runnable_peer`.
+/// `class_mask` is deliberately monotone; see [`publish_possible_class`].
 #[repr(align(64))]
-struct PerCpuRunnablePeer(AtomicBool);
-static RUNNABLE_PEER: [PerCpuRunnablePeer; narf_lib::percpu::MAX_CPUS] =
-    [const { PerCpuRunnablePeer(AtomicBool::new(false)) }; narf_lib::percpu::MAX_CPUS];
+struct PerCpuRunnableState {
+    peer: AtomicBool,
+    class_mask: core::sync::atomic::AtomicU8,
+}
+static RUNNABLE_STATE: [PerCpuRunnableState; narf_lib::percpu::MAX_CPUS] = [const {
+    PerCpuRunnableState {
+        peer: AtomicBool::new(false),
+        class_mask: core::sync::atomic::AtomicU8::new(0),
+    }
+};
+    narf_lib::percpu::MAX_CPUS];
 
 #[inline]
 pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
-    if cpu < RUNNABLE_PEER.len() {
-        RUNNABLE_PEER[cpu].0.store(present, Ordering::Release);
+    if cpu < RUNNABLE_STATE.len() {
+        RUNNABLE_STATE[cpu].peer.store(present, Ordering::Release);
     }
+}
+
+/// Record a class that can appear on this CPU. The mask is monotone outside
+/// hermetic test resets: stale high bits only disable the shortcut, while a
+/// missing high bit could violate strict class ordering. Admission/migration
+/// publishes before the slot becomes visible on the destination queue.
+#[inline]
+fn publish_possible_class(cpu: usize, rank: u8) {
+    if cpu < RUNNABLE_STATE.len() {
+        let bit = 1u8 << rank;
+        if RUNNABLE_STATE[cpu].class_mask.load(Ordering::Relaxed) & bit != 0 {
+            return;
+        }
+        RUNNABLE_STATE[cpu]
+            .class_mask
+            .fetch_or(bit, Ordering::Release);
+    }
+}
+
+#[inline]
+pub(crate) fn has_higher_possible_class(cpu: usize, rank: u8) -> bool {
+    if cpu >= RUNNABLE_STATE.len() {
+        return true;
+    }
+    let higher = u8::MAX << rank.saturating_add(1);
+    RUNNABLE_STATE[cpu].class_mask.load(Ordering::Acquire) & higher != 0
 }
 
 /// A task became runnable on `home`. Do not count a wake of the task already
@@ -885,11 +1102,11 @@ pub(crate) fn publish_runnable_peer(cpu: usize, present: bool) {
 #[inline]
 fn note_runnable_peer(home: u32, task: u64) {
     let cpu = home as usize;
-    if cpu >= RUNNABLE_PEER.len() {
+    if task == 0 || cpu >= RUNNABLE_STATE.len() {
         return;
     }
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != task {
-        RUNNABLE_PEER[cpu].0.store(true, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(true, Ordering::Release);
     }
 }
 
@@ -1708,7 +1925,16 @@ pub fn init() {
     }
     for (cpu, q) in READY.iter().enumerate() {
         *q.lock() = Some(VecDeque::new());
-        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
+        URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
+        let urgent = URGENT_WAKE_CELL[cpu]
+            .0
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !urgent.is_null() {
+            // SAFETY: the atomic slot owns one Arc strong reference.
+            unsafe { drop(Arc::from_raw(urgent)) };
+        }
     }
     // Wire the default `ClassScheduler` into the policy slot
     // before any `run_until_empty` call dispatches. Idempotent — if a
@@ -1738,7 +1964,16 @@ pub fn __reset_queues_for_test() {
         if let Some(d) = q.lock().as_mut() {
             d.clear();
         }
-        RUNNABLE_PEER[cpu].0.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].peer.store(false, Ordering::Release);
+        RUNNABLE_STATE[cpu].class_mask.store(0, Ordering::Release);
+        URGENT_WAKE_NEXT[cpu].0.store(0, Ordering::Release);
+        let urgent = URGENT_WAKE_CELL[cpu]
+            .0
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !urgent.is_null() {
+            // SAFETY: the atomic slot owns one Arc strong reference.
+            unsafe { drop(Arc::from_raw(urgent)) };
+        }
     }
     // Clear any tasks left staged on the per-CPU wake inboxes so they don't
     // carry over between tests. Dropping the `TaskSlot`s runs their normal Drop.
@@ -2259,7 +2494,7 @@ fn drain_wake_list(cpu: usize) {
         // lock (the dispatch path already owns the round on this CPU) and
         // attributes the Enqueued event to this CPU.
         slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-        if slot.awake.flag.load(Ordering::Acquire) {
+        if slot.awake.executor_runnable() {
             note_runnable_peer(cpu as u32, slot.id.raw());
         }
         policy::with_scheduler(CpuId(cpu as u32), |scheduler| {
@@ -2306,8 +2541,18 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
     // Record the slot's home CPU so a cross-core waker knows where to
     // send the reschedule IPI. Updated again each time the slot is
     // polled (it may have been work-stolen onto a different CPU).
+    let previous_home = slot.awake.cpu.load(Ordering::Relaxed) as usize;
+    if matches!(
+        reason,
+        policy::TaskEnqueueReason::Admitted | policy::TaskEnqueueReason::Migrated
+    ) || previous_home != cpu
+    {
+        // Publish before the slot becomes visible on this CPU. The monotone
+        // mask is only a strict-class fast-path guard, never dispatch authority.
+        publish_possible_class(cpu, slot.spec.class.rank());
+    }
     slot.awake.cpu.store(cpu as u32, Ordering::Relaxed);
-    let awake = slot.awake.flag.load(Ordering::Acquire);
+    let awake = slot.awake.executor_runnable();
     if awake {
         note_runnable_peer(cpu as u32, slot.id.raw());
     }
@@ -2376,7 +2621,7 @@ fn enqueue_on(cpu: usize, mut slot: TaskSlot, reason: policy::TaskEnqueueReason)
 
 #[inline]
 fn slot_is_dispatchable(slot: &TaskSlot, now: u64) -> bool {
-    if !slot.awake.flag.load(Ordering::Acquire) {
+    if !slot.awake.executor_runnable() {
         return false;
     }
     slot.account.view(now, &slot.spec.budget).eligibility != BudgetEligibility::Throttled
@@ -2387,7 +2632,7 @@ fn next_budget_replenishment(cpu: usize, now: u64) -> Option<u64> {
     q.as_ref().and_then(|ready| {
         ready
             .iter()
-            .filter(|slot| slot.awake.flag.load(Ordering::Acquire))
+            .filter(|slot| slot.awake.executor_runnable())
             .filter_map(|slot| {
                 let view = slot.account.view(now, &slot.spec.budget);
                 (view.eligibility == BudgetEligibility::Throttled)
@@ -2410,7 +2655,7 @@ fn notify_cpu_idle(cpu: usize) {
         let mut borrowable = 0usize;
         let mut next_budget_replenishment = None;
         for slot in ready {
-            if !slot.awake.flag.load(Ordering::Acquire) {
+            if !slot.awake.executor_runnable() {
                 parked += 1;
                 continue;
             }
@@ -2477,15 +2722,10 @@ where
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let cpu = target_cpu(&spec);
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
+    let awake = new_wake_cell(id, 0, false);
     let slot = TaskSlot {
         task: Box::pin(f),
-        awake: Arc::new(WakeCell {
-            flag: AtomicBool::new(true),
-            cpu: AtomicU32::new(0),
-            task: id.raw(),
-            wake_cyc: AtomicU64::new(0),
-            wake_halt_gen: AtomicU64::new(0),
-        }),
+        awake,
         id,
         spec,
         affinity_generation,
@@ -2539,15 +2779,10 @@ where
     spec.work_kind = WorkKind::KernelThread;
     let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
     let affinity_generation = register_task_affinity(id, spec.affinity, true);
+    let awake = new_wake_cell(id, cpu as u32, false);
     let slot = TaskSlot {
         task: Box::pin(stackful::StackfulAdapter::with_options(f, opts)),
-        awake: Arc::new(WakeCell {
-            flag: AtomicBool::new(true),
-            cpu: AtomicU32::new(cpu as u32),
-            task: id.raw(),
-            wake_cyc: AtomicU64::new(0),
-            wake_halt_gen: AtomicU64::new(0),
-        }),
+        awake,
         id,
         spec,
         affinity_generation,
@@ -2765,15 +3000,17 @@ where
     let task: BoxedTask = Box::pin(f);
     let cpu = target_cpu(&spec);
     let affinity_generation = register_task_affinity(id, spec.affinity, false);
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    let direct_eligible = spec.class == SchedClass::Default
+        && spec.priority == Priority::NORMAL
+        && spec.budget == ResourceBudget::unthrottled()
+        && spec.budget_cap.is_none();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let direct_eligible = false;
+    let awake = new_wake_cell(id, 0, direct_eligible);
     let slot = TaskSlot {
         task,
-        awake: Arc::new(WakeCell {
-            flag: AtomicBool::new(true),
-            cpu: AtomicU32::new(0),
-            task: id.raw(),
-            wake_cyc: AtomicU64::new(0),
-            wake_halt_gen: AtomicU64::new(0),
-        }),
+        awake,
         id,
         spec,
         affinity_generation,
@@ -3117,7 +3354,7 @@ pub fn donate_to(target: TaskId, cap: &Cap<Task, Invoke>) -> Result<(), DonateEr
                             budget: d.spec.budget,
                             account: d.account,
                             budget_state: d.account.view(narf_time::now_cycles(), &d.spec.budget),
-                            runnable: d.awake.flag.load(Ordering::Acquire),
+                            runnable: d.awake.executor_runnable(),
                             affinity: d.spec.affinity,
                             addr_space: d.addr_space.is_some(),
                             vruntime: d.vruntime,
@@ -3339,7 +3576,7 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         // A provider dequeued this exact exclusive waiter. Unlike the generic
         // opt-in wake-next policy, publish the one-shot hint unconditionally
         // and on the wakee's home queue, where pick_next_slot will consume it.
-        hint_urgent_next_on(home, task);
+        hint_urgent_next_on(home, task, ptr);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
@@ -3433,6 +3670,21 @@ fn make_waker(cell: Arc<WakeCell>) -> Waker {
     // representation encoded in `raw`.
     // SAFETY: Valid memory or trusted environment
     unsafe { Waker::from_raw(RawWaker::new(raw, &TASK_VTABLE)) }
+}
+
+/// Clone the scheduler-owned WakeCell behind one of our executor wakers.
+/// StackfulAdapter uses this on its first ordinary poll to publish the stable
+/// KernelTask back-pointer without changing the generic boxed-future layout.
+pub(crate) fn scheduler_wake_cell(waker: &Waker) -> Option<Arc<WakeCell>> {
+    if !core::ptr::eq(waker.vtable(), &TASK_VTABLE) {
+        return None;
+    }
+    let ptr = waker.data().cast::<WakeCell>();
+    // SAFETY: TASK_VTABLE identity proves `data` came from Arc<WakeCell>, and
+    // borrowing the Waker keeps the original strong reference live.
+    unsafe { Arc::increment_strong_count(ptr) };
+    // SAFETY: the increment above created the strong reference returned here.
+    Some(unsafe { Arc::from_raw(ptr) })
 }
 
 /// Run the ready queue until it's empty.
@@ -3554,6 +3806,9 @@ pub fn poll_one_round() -> usize {
         // Advance this CPU's EEVDF virtual-time floor to the dispatched task's
         // vruntime (monotone), then publish its scheduling snapshot so a later
         // wake-preemption check can read it. See VFLOOR / CURRENT_SCHED.
+        slot.vruntime = slot
+            .vruntime
+            .wrapping_add(slot.awake.direct_runtime_cycles.swap(0, Ordering::AcqRel));
         bump_vfloor(cpu, slot.vruntime);
         publish_current_sched(cpu, &slot);
         let waker = make_waker(slot.awake.clone());
@@ -3588,7 +3843,8 @@ pub fn poll_one_round() -> usize {
         let interrupt_elapsed = accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
         let elapsed = Instant::now()
             .cycles_since(start)
-            .saturating_sub(interrupt_elapsed);
+            .saturating_sub(interrupt_elapsed)
+            .saturating_sub(stackful::take_direct_foreign_cycles());
         let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
         // EEVDF-lite: charge the cycles this dispatch ran to the task's virtual
         // runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`, one add.
@@ -3628,7 +3884,9 @@ pub fn poll_one_round() -> usize {
                         notify_slot_reaped(slot.id);
                         continue;
                     }
-                    ChargeOutcome::Demote => slot.spec.class = SchedClass::Idle,
+                    ChargeOutcome::Demote => {
+                        slot.spec.class = SchedClass::Idle;
+                    }
                     ChargeOutcome::Throttle => {
                         slot.awake.flag.store(false, Ordering::Release);
                     }
@@ -3832,13 +4090,20 @@ unsafe fn read_active_address_space_root() -> u64 {
 
 #[cfg(target_arch = "x86_64")]
 #[inline]
-unsafe fn restore_active_address_space_root(root: u64, cpu: usize) {
+unsafe fn restore_active_address_space_root(root: u64, _cpu: usize) {
+    // Preserve the incoming nonzero PCID just as Linux's switch_mm_irqs_off()
+    // does when its generation is current. Process-residency bits remain set:
+    // with NOFLUSH they describe conservative TLB history, not only the
+    // context executing at this instant.
+    // A nonzero process tag is allocated only after the all-online-CPU PCIDE
+    // gate closes, so the tag itself is the hot-path capability proof.
+    let value = if root & 0xFFF != 0 {
+        root | (1u64 << 63)
+    } else {
+        root
+    };
     // SAFETY: `root` is the complete CR3 value captured on this CPU.
-    unsafe { narf_arch::x86_64::cr::write_cr3(root) };
-    // A plain restore flushes PCID 0. Clear residency only after it, so a
-    // concurrent shared-MM mutation cannot omit this CPU while stale user
-    // translations remain usable.
-    narf_memory::tlb_shootdown::clear_active_as(cpu as u32, 0);
+    unsafe { narf_arch::x86_64::cr::write_cr3(value) };
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -4011,6 +4276,9 @@ pub fn run_until_empty() {
             // Advance this CPU's EEVDF virtual-time floor to the dispatched
             // task's vruntime (monotone), then publish its scheduling snapshot
             // for a later wake-preemption check. See VFLOOR / CURRENT_SCHED.
+            slot.vruntime = slot
+                .vruntime
+                .wrapping_add(slot.awake.direct_runtime_cycles.swap(0, Ordering::AcqRel));
             bump_vfloor(cpu, slot.vruntime);
             publish_current_sched(cpu, &slot);
 
@@ -4078,7 +4346,8 @@ pub fn run_until_empty() {
                 accounting::interrupt_cycles(cpu).saturating_sub(interrupt_start);
             let elapsed = Instant::now()
                 .cycles_since(start)
-                .saturating_sub(interrupt_elapsed);
+                .saturating_sub(interrupt_elapsed)
+                .saturating_sub(stackful::take_direct_foreign_cycles());
             let burst_outcome = slot.account.charge(elapsed, &slot.spec.budget);
             // EEVDF-lite: charge the cycles this dispatch ran to the task's
             // virtual runtime (see VFLOOR / TaskSlot::vruntime). Same `elapsed`.
@@ -4625,7 +4894,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
     debug_assert!(cpu < CURRENT_SCHED.len(), "CPU id out of scheduler range");
     let cpu = if cpu < CURRENT_SCHED.len() { cpu } else { 0 };
     if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
-        && RUNNABLE_PEER[cpu].0.load(Ordering::Acquire)
+        && RUNNABLE_STATE[cpu].peer.load(Ordering::Acquire)
     {
         return true;
     }
@@ -4752,7 +5021,7 @@ pub fn dbg_slot_state(task_id: u64) -> Option<(bool, u32, usize, u64, u32, bool)
             // forever with `awake` never cleared — so report whether this
             // queue's CPU is even permitted to run it.
             return Some((
-                slot.awake.flag.load(Ordering::Acquire),
+                slot.awake.executor_runnable(),
                 home,
                 d.len(),
                 allowed.bits(),
@@ -4790,7 +5059,7 @@ pub fn dbg_ready_slots(cpu: usize) -> alloc::vec::Vec<(u64, bool, u32, u64, bool
         let allowed = slot.spec.affinity.allowed;
         out.push((
             slot.id.raw(),
-            slot.awake.flag.load(Ordering::Acquire),
+            slot.awake.executor_runnable(),
             slot.awake.cpu.load(Ordering::Relaxed),
             allowed.bits(),
             allowed.contains(CpuId(cpu as u32)),
@@ -4810,10 +5079,7 @@ pub fn dbg_cpu_stall(cpu: usize) -> (usize, usize, bool, bool) {
     match READY[cpu].try_lock() {
         Some(g) => match g.as_ref() {
             Some(d) => {
-                let awake = d
-                    .iter()
-                    .filter(|s| s.awake.flag.load(Ordering::Acquire))
-                    .count();
+                let awake = d.iter().filter(|s| s.awake.executor_runnable()).count();
                 (d.len(), awake, halted, false)
             }
             None => (0, 0, halted, false),
@@ -5439,6 +5705,10 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         task: 0,
         wake_cyc: AtomicU64::new(0),
         wake_halt_gen: AtomicU64::new(0),
+        stackful: AtomicPtr::new(core::ptr::null_mut()),
+        direct_eligible: AtomicBool::new(false),
+        direct_claimed: AtomicBool::new(false),
+        direct_runtime_cycles: AtomicU64::new(0),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

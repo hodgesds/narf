@@ -1947,6 +1947,35 @@ kernel_test_in!(
     smoke_abi_ioerrno_open_reports_emfile_at_the_limit
 );
 
+fn smoke_abi_ioerrno_emfile_create_has_no_side_effect() -> TestResult {
+    with_memfs("/abi", "abi", &[], || {
+        // Linux `FD_ADD(flags, do_file_open(...))` reserves the fd before it
+        // evaluates the create expression. With stdio filling this limit,
+        // O_CREAT must fail before the directory is mutated.
+        set_nofile(3)?;
+        const O_CREAT_RDWR: u64 = 0o100 | 0o2;
+        match call_open(c"/abi/not-created".as_ptr() as u64, O_CREAT_RDWR) {
+            Some(v) if v == EMFILE => {}
+            _ => return Err("O_CREAT at RLIMIT_NOFILE must be -EMFILE"),
+        }
+
+        // Raise the limit so descriptor exhaustion cannot mask lookup. If the
+        // failed create leaked an inode, this read-only open would succeed.
+        set_nofile(16)?;
+        match call_open(
+            c"/abi/not-created".as_ptr() as u64,
+            crate::fd::O_RDONLY as u64,
+        ) {
+            Some(v) if v == ENOENT => Ok(()),
+            _ => Err("O_CREAT returning EMFILE left a visible inode behind"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_emfile_create_has_no_side_effect
+);
+
 fn smoke_abi_ioerrno_dup_reports_emfile() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"x")], || {
         set_nofile(4)?;

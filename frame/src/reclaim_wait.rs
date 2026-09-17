@@ -6,19 +6,27 @@
 //! (or finishes attempting) progress. The table is deliberately fixed: a page
 //! fault must never grow a collection or allocate while handling a trap.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::Waker;
 
 use narf_lib::sync::IrqSafeSpinLock;
-use narf_memory::{AddressSpace, AddressSpaceError, VirtAddr};
+use narf_memory::reclaim::ReclaimTicket;
+use narf_memory::{AddressSpace, AddressSpaceError, VirtAddr, FRAME_MAX_NUMA_NODES};
 
 /// One slot for every user task the scheduler can admit. Consequently every
 /// live stackful user fault can park; `Full` remains a fail-safe for broken
 /// admission/accounting rather than an expected pressure behavior.
 const MAX_RECLAIM_WAITERS: usize = narf_scheduler::MAX_USER_TASKS;
 
-static RECLAIM_GENERATION: AtomicU64 = AtomicU64::new(0);
-static RECLAIM_WAITERS: [IrqSafeSpinLock<Option<Waker>>; MAX_RECLAIM_WAITERS] =
+static RECLAIM_COMPLETED: [AtomicU32; FRAME_MAX_NUMA_NODES] =
+    [const { AtomicU32::new(0) }; FRAME_MAX_NUMA_NODES];
+
+struct Waiter {
+    ticket: ReclaimTicket,
+    waker: Waker,
+}
+
+static RECLAIM_WAITERS: [IrqSafeSpinLock<Option<Waiter>>; MAX_RECLAIM_WAITERS] =
     [const { IrqSafeSpinLock::new(None) }; MAX_RECLAIM_WAITERS];
 
 struct Registration {
@@ -40,22 +48,57 @@ enum RegisterResult {
     Full,
 }
 
-fn register_waiter(observed: u64, waker: Waker) -> RegisterResult {
-    let mut waker = Some(waker);
+/// Sequence arithmetic over request IDs 1..=2^30-1. At most 2^29 requests
+/// may be outstanding on one node, vastly beyond the fixed waiter capacity.
+fn sequence_reached(completed: u32, target: u32) -> bool {
+    const MODULUS: u32 = 0x3fff_ffff;
+    const HALF_RANGE: u32 = MODULUS / 2;
+    if completed == 0 || target == 0 {
+        return false;
+    }
+    let completed = completed - 1;
+    let target = target - 1;
+    let distance = completed.wrapping_add(MODULUS).wrapping_sub(target) % MODULUS;
+    distance <= HALF_RANGE
+}
+
+/// Whether a live fault waiter owns any request coalesced into `ticket`'s
+/// cycle. User-fault OOM authority expires when this becomes false, so a late
+/// kswapd pass cannot kill an unrelated process after the original allocator
+/// failure was handled or its task exited.
+#[allow(dead_code)] // kswapd is compiled out of several test-only frame images.
+pub(crate) fn has_waiter_for(ticket: ReclaimTicket) -> bool {
+    RECLAIM_WAITERS.iter().any(|slot| {
+        slot.lock().as_ref().is_some_and(|waiter| {
+            waiter.ticket.node == ticket.node
+                && sequence_reached(ticket.sequence, waiter.ticket.sequence)
+        })
+    })
+}
+
+fn ticket_completed(ticket: ReclaimTicket) -> bool {
+    RECLAIM_COMPLETED.get(ticket.node).is_some_and(|completed| {
+        sequence_reached(completed.load(Ordering::SeqCst), ticket.sequence)
+    })
+}
+
+fn register_waiter(ticket: ReclaimTicket, waker: Waker) -> RegisterResult {
+    let mut waiter = Some(Waiter { ticket, waker });
     for (slot_index, slot) in RECLAIM_WAITERS.iter().enumerate() {
         let mut entry = slot.lock();
         if entry.is_some() {
             continue;
         }
-        *entry = waker.take();
+        *entry = waiter.take();
         drop(entry);
 
         let registration = Registration { slot: slot_index };
         // SeqCst makes the classic prepare-to-wait ordering explicit: either
-        // this load follows kswapd's generation bump and observes it, or the
-        // bump follows this load and kswapd's subsequent scan observes the
-        // installed slot. There is no scan-before-install + stale-load gap.
-        if RECLAIM_GENERATION.load(Ordering::SeqCst) != observed {
+        // this load follows completion of the exact request and observes it,
+        // or completion follows this load and kswapd's subsequent scan sees
+        // the installed slot. There is no scan-before-install + stale-load
+        // gap, and an unrelated older cycle cannot satisfy this ticket.
+        if ticket_completed(ticket) {
             drop(registration);
             return RegisterResult::RetryNow;
         }
@@ -64,14 +107,11 @@ fn register_waiter(observed: u64, waker: Waker) -> RegisterResult {
     RegisterResult::Full
 }
 
-/// Current completion generation, sampled before an allocation attempt.
-#[inline]
-fn generation() -> u64 {
-    RECLAIM_GENERATION.load(Ordering::SeqCst)
-}
-
-/// Publish reclaim completion/progress and wake every currently registered
-/// fault waiter. Called only by kswapd task context, never by a trap.
+/// Publish completion of one bounded reclaim/OOM balancing cycle and wake
+/// fault waiters whose requests were consumed by that cycle. Gross
+/// page-eviction progress and unrelated background cycles are deliberately
+/// not published: neither proves that this fault's request has completed.
+/// Called only by the matching node's kswapd task context, never by a trap.
 ///
 /// Slots are cloned but deliberately not removed here. Their owners remove
 /// them after resume, so a newly registering waiter can never reuse a slot
@@ -80,10 +120,17 @@ fn generation() -> u64 {
     any(feature = "boot-smoke", feature = "idt-selftest"),
     allow(dead_code)
 )]
-pub(crate) fn notify_reclaim_progress() {
-    RECLAIM_GENERATION.fetch_add(1, Ordering::SeqCst);
+pub(crate) fn notify_reclaim_progress(ticket: ReclaimTicket) {
+    let Some(completed) = RECLAIM_COMPLETED.get(ticket.node) else {
+        return;
+    };
+    completed.store(ticket.sequence, Ordering::SeqCst);
     for slot in &RECLAIM_WAITERS {
-        let waker = slot.lock().clone();
+        let waker = slot.lock().as_ref().and_then(|waiter| {
+            (waiter.ticket.node == ticket.node
+                && sequence_reached(ticket.sequence, waiter.ticket.sequence))
+            .then(|| waiter.waker.clone())
+        });
         if let Some(waker) = waker {
             // Do not invoke scheduler wake code while holding a waiter lock.
             waker.wake();
@@ -93,11 +140,11 @@ pub(crate) fn notify_reclaim_progress() {
 
 /// Park the current stackful task until reclaim advances. `false` is the safe
 /// fallback outside stackful execution or when the fixed waiter table is full.
-fn park_until_reclaim(observed: u64) -> bool {
+fn park_until_reclaim(ticket: ReclaimTicket) -> bool {
     let Some(waker) = narf_scheduler::stackful::current_stackful_waker() else {
         return false;
     };
-    match register_waiter(observed, waker) {
+    match register_waiter(ticket, waker) {
         RegisterResult::RetryNow => true,
         RegisterResult::Full => false,
         RegisterResult::Armed(registration) => {
@@ -126,26 +173,21 @@ fn try_demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), Address
 
 fn retry_once_after_pressure(
     mut attempt: impl FnMut() -> Result<(), AddressSpaceError>,
-    mut wait: impl FnMut() -> bool,
+    mut wait: impl FnMut(ReclaimTicket) -> bool,
     may_wait: bool,
 ) -> Result<(), AddressSpaceError> {
     let first = attempt();
-    if first != Err(AddressSpaceError::ReclaimPressure) || !may_wait || !wait() {
-        return first;
+    match first {
+        Err(AddressSpaceError::ReclaimPressure(ticket)) if may_wait && wait(ticket) => attempt(),
+        result => result,
     }
-    attempt()
 }
 
 /// Resolve one demand fault, parking only for anonymous reserve pressure and
 /// retrying at most once. No-stackful/full-table/zero-progress paths all
 /// terminate after the original or second allocation result; none busy-yield.
 pub(crate) fn demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-    let observed = generation();
-    retry_once_after_pressure(
-        || try_demand_page(aspace, vaddr),
-        || park_until_reclaim(observed),
-        true,
-    )
+    retry_once_after_pressure(|| try_demand_page(aspace, vaddr), park_until_reclaim, true)
 }
 
 /// Resolve one demand fault without entering the reclaim wait path.
@@ -160,7 +202,7 @@ pub(crate) fn demand_page_no_wait(
 ) -> Result<(), AddressSpaceError> {
     retry_once_after_pressure(
         || try_demand_page(aspace, vaddr),
-        || unreachable!("no-wait demand fault entered reclaim parking"),
+        |_| unreachable!("no-wait demand fault entered reclaim parking"),
         false,
     )
 }
@@ -194,14 +236,33 @@ mod tests {
         unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &TEST_VTABLE)) }
     }
 
+    fn next_ticket(node: usize) -> ReclaimTicket {
+        let current = RECLAIM_COMPLETED[node].load(Ordering::Relaxed);
+        ReclaimTicket {
+            node,
+            sequence: if current == 0x3fff_ffff {
+                1
+            } else {
+                current + 1
+            },
+        }
+    }
+
     fn smoke_reclaim_wait_registration_is_lost_wake_free() -> TestResult {
+        const NODE: usize = FRAME_MAX_NUMA_NODES - 1;
         WAKES.store(0, Ordering::Relaxed);
-        let observed = generation();
-        let registration = match register_waiter(observed, counting_waker()) {
+        let ticket = next_ticket(NODE);
+        let registration = match register_waiter(ticket, counting_waker()) {
             RegisterResult::Armed(registration) => registration,
             _ => return TestResult::Fail("fixed reclaim waiter could not register"),
         };
-        notify_reclaim_progress();
+        // An overlapping cycle on another node cannot satisfy this request.
+        notify_reclaim_progress(next_ticket(NODE - 1));
+        if WAKES.load(Ordering::Relaxed) != 0 {
+            drop(registration);
+            return TestResult::Fail("unrelated reclaim completion woke a waiter");
+        }
+        notify_reclaim_progress(ticket);
         if WAKES.load(Ordering::Relaxed) != 1 {
             drop(registration);
             return TestResult::Fail("reclaim progress did not wake an armed fault waiter");
@@ -210,9 +271,9 @@ mod tests {
 
         // Completion before prepare-to-wait must force an immediate retry,
         // not leave a waker installed for a cycle that already ended.
-        let stale = generation();
-        notify_reclaim_progress();
-        match register_waiter(stale, counting_waker()) {
+        let completed = next_ticket(NODE);
+        notify_reclaim_progress(completed);
+        match register_waiter(completed, counting_waker()) {
             RegisterResult::RetryNow => TestResult::Pass,
             RegisterResult::Armed(registration) => {
                 drop(registration);
@@ -224,16 +285,20 @@ mod tests {
     kernel_test_in!("frame", smoke_reclaim_wait_registration_is_lost_wake_free);
 
     fn smoke_reclaim_wait_retry_is_bounded() -> TestResult {
+        let ticket = ReclaimTicket {
+            node: 0,
+            sequence: 1,
+        };
         let mut attempts = 0usize;
         let result = retry_once_after_pressure(
             || {
                 attempts += 1;
-                Err(AddressSpaceError::ReclaimPressure)
+                Err(AddressSpaceError::ReclaimPressure(ticket))
             },
-            || true,
+            |_| true,
             true,
         );
-        if result != Err(AddressSpaceError::ReclaimPressure) || attempts != 2 {
+        if result != Err(AddressSpaceError::ReclaimPressure(ticket)) || attempts != 2 {
             return TestResult::Fail("zero-progress pressure did not stop after one retry");
         }
 
@@ -244,7 +309,7 @@ mod tests {
                 nonpressure_attempts += 1;
                 Err(AddressSpaceError::Unmapped)
             },
-            || {
+            |_| {
                 waited = true;
                 true
             },
@@ -258,20 +323,24 @@ mod tests {
     kernel_test_in!("frame", smoke_reclaim_wait_retry_is_bounded);
 
     fn smoke_reclaim_no_wait_never_parks_or_retries() -> TestResult {
+        let ticket = ReclaimTicket {
+            node: 0,
+            sequence: 1,
+        };
         let mut attempts = 0usize;
         let mut waited = false;
         let result = retry_once_after_pressure(
             || {
                 attempts += 1;
-                Err(AddressSpaceError::ReclaimPressure)
+                Err(AddressSpaceError::ReclaimPressure(ticket))
             },
-            || {
+            |_| {
                 waited = true;
                 true
             },
             false,
         );
-        if result == Err(AddressSpaceError::ReclaimPressure) && attempts == 1 && !waited {
+        if result == Err(AddressSpaceError::ReclaimPressure(ticket)) && attempts == 1 && !waited {
             TestResult::Pass
         } else {
             TestResult::Fail("guarded-uaccess pressure waited or retried")

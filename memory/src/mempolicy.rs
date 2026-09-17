@@ -470,8 +470,8 @@ fn alloc_preferred_many(
     for &node in &candidates[..count] {
         match u_alloc_strict(node, node) {
             Ok(frame) => return Ok(frame),
-            Err(FrameAllocError::ReservePressure) => {
-                return Err(FrameAllocError::ReservePressure);
+            Err(error @ FrameAllocError::ReservePressure(_)) => {
+                return Err(error);
             }
             Err(_) => {}
         }
@@ -480,8 +480,8 @@ fn alloc_preferred_many(
         if (allowed >> node) & 1 != 0 && (preferred >> node) & 1 == 0 {
             match u_alloc_strict(node, anchor) {
                 Ok(frame) => return Ok(frame),
-                Err(FrameAllocError::ReservePressure) => {
-                    return Err(FrameAllocError::ReservePressure);
+                Err(error @ FrameAllocError::ReservePressure(_)) => {
+                    return Err(error);
                 }
                 Err(_) => {}
             }
@@ -496,8 +496,8 @@ fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, F
     if preferred < MAX_NUMA_NODES && (allowed >> preferred) & 1 != 0 {
         match u_alloc_strict(preferred, preferred) {
             Ok(frame) => return Ok(frame),
-            Err(FrameAllocError::ReservePressure) => {
-                return Err(FrameAllocError::ReservePressure);
+            Err(error @ FrameAllocError::ReservePressure(_)) => {
+                return Err(error);
             }
             Err(_) => {}
         }
@@ -506,8 +506,8 @@ fn alloc_preferred_within(preferred: usize, allowed: u64) -> Result<PhysFrame, F
         if node != preferred && (allowed >> node) & 1 != 0 {
             match u_alloc_strict(node, preferred) {
                 Ok(frame) => return Ok(frame),
-                Err(FrameAllocError::ReservePressure) => {
-                    return Err(FrameAllocError::ReservePressure);
+                Err(error @ FrameAllocError::ReservePressure(_)) => {
+                    return Err(error);
                 }
                 Err(_) => {}
             }
@@ -554,8 +554,8 @@ fn alloc_bind(mask: u64, home_node: u32) -> Result<PhysFrame, FrameAllocError> {
     for &node in &candidates[..count] {
         match u_alloc_strict(node, preferred) {
             Ok(frame) => return Ok(frame),
-            Err(FrameAllocError::ReservePressure) => {
-                return Err(FrameAllocError::ReservePressure);
+            Err(error @ FrameAllocError::ReservePressure(_)) => {
+                return Err(error);
             }
             Err(_) => {}
         }

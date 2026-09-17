@@ -49,6 +49,13 @@ pub struct Task {
     /// POSIX pid (thread-group id). PIDs ARE reused (lowest-free
     /// pool), so pid-keyed state must be cleaned at reap.
     pub pid: AtomicU64,
+    /// Effective uid/gid packed as `uid | gid << 32` for the current-task
+    /// credential fast path. Linux reaches these through the immutable `cred`
+    /// pointer hanging directly off `current`; making a sharded B-tree lookup
+    /// for every permission-checked syscall is both slower and less faithful to
+    /// that shape. Rare credential writers update the pair with one atomic
+    /// store, so readers never observe a torn uid/gid combination.
+    effective_ids: AtomicU64,
     /// Cached process-group id in internal TaskId space.
     ///
     /// Linux reaches this state as `current->signal->pids[PIDTYPE_PGID]`.
@@ -122,6 +129,7 @@ impl Task {
         let t = Arc::new(Task {
             tid,
             pid: AtomicU64::new(pid),
+            effective_ids: AtomicU64::new(0),
             process_group_id: AtomicU64::new(tid),
             state: AtomicU32::new(TASK_RUNNING),
             exit_code: AtomicI32::new(0),
@@ -200,6 +208,61 @@ pub(crate) fn current_process_group_id() -> Option<u64> {
     // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
     // in-flight `UserTaskFuture` retains that Arc while this hook can run.
     Some(unsafe { (*ptr).process_group_id.load(Ordering::Acquire) })
+}
+
+/// Current task identity from the scheduler-published `Task`, without cloning
+/// its Arc or consulting the task/credential registries. The packed effective
+/// ids are updated by the same credential mutation funnel that updates the
+/// authoritative credential table.
+#[inline]
+pub(crate) fn current_cached_identity(expected_tid: u64) -> Option<(u64, u32, u32)> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc for this complete syscall.
+    let task = unsafe { &*ptr };
+    if expected_tid != 0 && task.tid != expected_tid {
+        return None;
+    }
+    Some(cached_identity(task))
+}
+
+#[inline]
+fn cached_identity(task: &Task) -> (u64, u32, u32) {
+    let ids = task.effective_ids.load(Ordering::Acquire);
+    (
+        task.pid.load(Ordering::Acquire),
+        ids as u32,
+        (ids >> 32) as u32,
+    )
+}
+
+/// Inspect the mirror without requiring a live scheduler stack context.  The
+/// scheduler independently tests that its opaque user-context slot follows
+/// the current task across context switches.
+#[doc(hidden)]
+pub(crate) fn __test_cached_identity(tid: u64) -> Option<(u64, u32, u32)> {
+    task_get(tid).map(|task| cached_identity(&task))
+}
+
+/// Mirror a successful effective-credential mutation into the task-local
+/// current fast path. Cross-task writers are rare and retain the authoritative
+/// task registry lookup; current readers remain lock-free.
+pub(crate) fn cache_effective_ids(tid: u64, uid: u32, gid: u32) {
+    if let Some(task) = task_get(tid) {
+        task.effective_ids
+            .store(u64::from(uid) | (u64::from(gid) << 32), Ordering::Release);
+    }
+}
+
+/// Reset the mirror alongside the test-only credential table reset.
+#[doc(hidden)]
+pub(crate) fn reset_effective_ids() {
+    for task in TASKS.lock().values() {
+        task.effective_ids.store(0, Ordering::Release);
+    }
 }
 
 /// Seed a just-created child before it can run. Fork and thread-clone both

@@ -131,6 +131,17 @@ pub unsafe fn x86_64::user_mode::user_fs_base_for_cpu(cpu: usize) -> u64;
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn x86_64::user_mode::set_user_fs_base(fs_base: u64);
 
+/// Process PCIDs are independent of the PKS/PCID domain backend. Boot calls
+/// `enable_pcide` on every CPU, then closes the global gate after SMP discovery.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn x86_64::pcid::enable_pcide();
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::pcid::finalize_process_pcid(online_cpu_mask: u64);
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::pcid::process_pcid_ready() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub fn x86_64::pcid::process_pcid_cpu_count() -> u64;
+
 /// EL0 entry/resume variants that first abandon the current EL1 frames and
 /// reset SP_EL1 to the supplied per-task kernel-stack top.
 #[cfg(target_arch = "aarch64")]
@@ -406,6 +417,14 @@ pub mod xsave {
   so the cache cannot authorize PCID-tagged CR3 or INVPCID operations on that
   CPU. The live control register remains the enforcement mechanism; the cache
   only avoids a read-side virtualization exit.
+- Process-PCID readiness is a global post-SMP decision over a boot-only per-CPU
+  capability bitmap. A CPU enters that bitmap only after CR4.PCIDE is live and
+  CPUID advertises INVPCID, which is required to retire an inactive lifetime
+  tag before reuse. The address-space allocator issues no nonzero process PCID
+  unless every online CPU is present; the PCID value itself remains per-address-
+  space and identical on every CPU. A later CPU re-entry must support both
+  features and performs a local all-context invalidation before publishing
+  itself online, covering process-tag retirements missed while it was offline.
 
 ### aarch64
 

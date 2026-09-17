@@ -88,7 +88,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-use crate::zpool::{Zpool, ZpoolHandle, ZPAGE_SIZE};
+use crate::zpool::{Zpool, ZpoolError, ZpoolHandle, ZPAGE_COMPRESSED_MAX, ZPAGE_SIZE};
 use crate::PhysAddr;
 
 /// A single swap slot — one 4 KiB page's worth of backing store.
@@ -124,6 +124,10 @@ pub enum SwapError {
     SlotNotFound,
     /// A page-table walk / frame alloc failed while faulting a page in.
     MapFailed,
+    /// Swap-in frame allocation was refused at the protected userspace
+    /// reserve. The fault path may park on this exact reclaim request and
+    /// retry without relabeling recoverable pressure as a mapping failure.
+    ReclaimPressure(crate::reclaim::ReclaimTicket),
     /// The cgroup `memory.swap.max` limit would be exceeded by this
     /// page-out. The batch is rolled back and the caller keeps the
     /// frames resident.
@@ -352,10 +356,17 @@ pub struct ZramBackend {
 #[derive(Debug)]
 struct ZramInner {
     pool: Zpool,
-    /// `slot index → live zpool handle`. `None` = slot unpopulated.
-    /// Grows on demand; indices match `SwapSlot::raw()`.
-    handles: Vec<Option<ZpoolHandle>>,
+    /// Reused by every page encoded while `inner` is locked. Keeping the
+    /// worst-case LZ4 output here avoids an order-1 heap allocation per page.
+    encode_scratch: [u8; ZPAGE_COMPRESSED_MAX],
+    /// `slot index → live zpool handle`. `None` = slot unpopulated. Page-sized
+    /// chunks avoid a multi-megabyte contiguous Vec growth under pressure.
+    /// Indices still match `SwapSlot::raw()` exactly.
+    handle_chunks: Vec<Vec<Option<ZpoolHandle>>>,
 }
+
+const ZRAM_HANDLES_PER_CHUNK: usize = ZPAGE_SIZE / core::mem::size_of::<Option<ZpoolHandle>>();
+const _: () = assert!(ZRAM_HANDLES_PER_CHUNK > 0);
 
 impl ZramBackend {
     /// A fresh, empty compressed-RAM backend.
@@ -363,7 +374,8 @@ impl ZramBackend {
         Self {
             inner: IrqSafeSpinLock::new(ZramInner {
                 pool: Zpool::new(),
-                handles: Vec::new(),
+                encode_scratch: [0; ZPAGE_COMPRESSED_MAX],
+                handle_chunks: Vec::new(),
             }),
         }
     }
@@ -376,11 +388,46 @@ impl Default for ZramBackend {
 }
 
 impl ZramInner {
-    /// Ensure `handles` is long enough to index `slot`.
-    fn ensure_slot(&mut self, slot: usize) {
-        if slot >= self.handles.len() {
-            self.handles.resize(slot + 1, None);
+    fn store_page(&mut self, page: &[u8; ZPAGE_SIZE]) -> Result<ZpoolHandle, ZpoolError> {
+        self.pool.store_with_scratch(page, &mut self.encode_scratch)
+    }
+
+    /// Ensure the chunk containing `slot` exists without a large contiguous
+    /// allocation. This runs before page compression, so failure leaves the
+    /// batch and every existing handle unchanged.
+    fn ensure_slot(&mut self, slot: usize) -> Result<(), ZpoolError> {
+        let needed = slot / ZRAM_HANDLES_PER_CHUNK + 1;
+        if needed <= self.handle_chunks.len() {
+            return Ok(());
         }
+        self.handle_chunks
+            .try_reserve(needed - self.handle_chunks.len())
+            .map_err(|_| ZpoolError::OutOfMemory)?;
+        while self.handle_chunks.len() < needed {
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(ZRAM_HANDLES_PER_CHUNK)
+                .map_err(|_| ZpoolError::OutOfMemory)?;
+            chunk.resize(ZRAM_HANDLES_PER_CHUNK, None);
+            self.handle_chunks.push(chunk);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn handle(&self, slot: usize) -> Option<ZpoolHandle> {
+        self.handle_chunks
+            .get(slot / ZRAM_HANDLES_PER_CHUNK)?
+            .get(slot % ZRAM_HANDLES_PER_CHUNK)
+            .copied()
+            .flatten()
+    }
+
+    #[inline]
+    fn handle_mut(&mut self, slot: usize) -> Option<&mut Option<ZpoolHandle>> {
+        self.handle_chunks
+            .get_mut(slot / ZRAM_HANDLES_PER_CHUNK)?
+            .get_mut(slot % ZRAM_HANDLES_PER_CHUNK)
     }
 }
 
@@ -393,9 +440,18 @@ impl SwapBackend for ZramBackend {
         debug_assert_eq!(slots.len(), pages.len());
         let mut inner = self.inner.lock();
 
+        if let Some(max_slot) = slots.iter().map(|slot| slot.raw() as usize).max() {
+            inner
+                .ensure_slot(max_slot)
+                .map_err(|_| SwapError::BackendFull)?;
+        }
+
         // Commit each page; on any failure roll back what we stored so
         // the run is all-or-nothing (the SwapBackend contract).
-        let mut committed: Vec<(usize, ZpoolHandle)> = Vec::with_capacity(slots.len());
+        let mut committed: Vec<(usize, ZpoolHandle)> = Vec::new();
+        committed
+            .try_reserve_exact(slots.len())
+            .map_err(|_| SwapError::BackendFull)?;
         for (slot, phys) in slots.iter().zip(pages.iter()) {
             let idx = slot.raw() as usize;
             // Read the 4 KiB frame contents through the kernel's RAM
@@ -407,7 +463,7 @@ impl SwapBackend for ZramBackend {
             // for the duration of this batched write; `kernel_ptr`
             // yields a mapping valid for a 4 KiB read.
             let page: &[u8; ZPAGE_SIZE] = unsafe { &*(src as *const [u8; ZPAGE_SIZE]) };
-            match inner.pool.store(page) {
+            match inner.store_page(page) {
                 Ok(h) => committed.push((idx, h)),
                 Err(_) => {
                     // Roll back: free every handle stored this batch.
@@ -420,10 +476,13 @@ impl SwapBackend for ZramBackend {
         }
         // All stores succeeded — publish the handles.
         for (idx, h) in committed {
-            inner.ensure_slot(idx);
             // A live handle already here would be a double-write to the
             // same slot — free it first to avoid leaking the old copy.
-            if let Some(old) = inner.handles[idx].replace(h) {
+            let old = inner
+                .handle_mut(idx)
+                .expect("preallocated zram handle slot disappeared")
+                .replace(h);
+            if let Some(old) = old {
                 inner.pool.free(old);
             }
         }
@@ -433,12 +492,7 @@ impl SwapBackend for ZramBackend {
     fn read(&self, slot: SwapSlot, out: &mut [u8; ZPAGE_SIZE]) -> Result<(), SwapError> {
         let inner = self.inner.lock();
         let idx = slot.raw() as usize;
-        let handle = inner
-            .handles
-            .get(idx)
-            .copied()
-            .flatten()
-            .ok_or(SwapError::SlotNotFound)?;
+        let handle = inner.handle(idx).ok_or(SwapError::SlotNotFound)?;
         inner
             .pool
             .load(handle, out)
@@ -452,10 +506,7 @@ impl SwapBackend for ZramBackend {
         let inner = self.inner.lock();
         for (slot, phys) in slots.iter().zip(pages.iter()) {
             let handle = inner
-                .handles
-                .get(slot.raw() as usize)
-                .copied()
-                .flatten()
+                .handle(slot.raw() as usize)
                 .ok_or(SwapError::SlotNotFound)?;
             // SAFETY: the swap-in batch owns each fresh destination frame
             // exclusively until every backend read succeeds.
@@ -471,7 +522,7 @@ impl SwapBackend for ZramBackend {
     fn discard(&self, slot: SwapSlot) {
         let mut inner = self.inner.lock();
         let idx = slot.raw() as usize;
-        if let Some(slot_mut) = inner.handles.get_mut(idx) {
+        if let Some(slot_mut) = inner.handle_mut(idx) {
             if let Some(h) = slot_mut.take() {
                 inner.pool.free(h);
             }
@@ -481,7 +532,7 @@ impl SwapBackend for ZramBackend {
     fn discard_batch(&self, slots: &[SwapSlot]) {
         let mut inner = self.inner.lock();
         for slot in slots {
-            if let Some(slot_mut) = inner.handles.get_mut(slot.raw() as usize) {
+            if let Some(slot_mut) = inner.handle_mut(slot.raw() as usize) {
                 if let Some(handle) = slot_mut.take() {
                     inner.pool.free(handle);
                 }
@@ -564,6 +615,44 @@ impl SlotAllocator {
     fn free_slot(&mut self, slot: u64) {
         if slot < self.high_water && !self.free.contains(&slot) {
             self.free.push(slot);
+        }
+    }
+
+    /// Return a sorted, deduplicated batch. A descending teardown feeds the
+    /// current high-water suffix here, so the common pressure path contracts
+    /// the implicit-free tail without allocating or growing `free` at all.
+    fn free_slots(&mut self, slots: &[SwapSlot]) {
+        if slots.is_empty() {
+            return;
+        }
+        let mut suffix_start = slots.len();
+        let mut expected = self.high_water;
+        for (index, slot) in slots.iter().enumerate().rev() {
+            let raw = slot.raw();
+            if raw.checked_add(1) != Some(expected) {
+                break;
+            }
+            suffix_start = index;
+            expected = raw;
+        }
+        if suffix_start < slots.len() {
+            self.high_water = expected;
+            if !self.free.is_empty() {
+                self.free.sort_unstable();
+                self.free.dedup();
+                while self
+                    .free
+                    .last()
+                    .is_some_and(|slot| slot.checked_add(1) == Some(self.high_water))
+                {
+                    self.high_water = self.free.pop().unwrap_or(self.high_water);
+                }
+            }
+        }
+        // Non-tail frees retain the existing sparse representation. The input
+        // has already been sorted and deduplicated by retire_slots_by_area.
+        for slot in &slots[..suffix_start] {
+            self.free_slot(slot.raw());
         }
     }
 
@@ -982,7 +1071,7 @@ pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>
     // SAFETY: forwarded from the public primitive's ownership contract. The
     // no-op publisher is correct only because that contract requires the
     // caller to have detached ownership metadata itself.
-    unsafe { swap_out_batch_owned(victims, |_| {}) }
+    unsafe { swap_out_batch_owned(victims, None, |_| {}) }
 }
 
 /// Ownership-integrated implementation used by `AddressSpace` reclaim.
@@ -991,6 +1080,7 @@ pub unsafe fn swap_out_batch(victims: &[SwapVictim]) -> Result<usize, SwapError>
 #[cfg(target_arch = "x86_64")]
 pub(crate) unsafe fn swap_out_batch_owned(
     victims: &[SwapVictim],
+    context_tag: Option<u16>,
     publish: impl FnOnce(&[(SwapVictim, PhysAddr)]),
 ) -> Result<usize, SwapError> {
     use crate::paging::translate;
@@ -1100,12 +1190,14 @@ pub(crate) unsafe fn swap_out_batch_owned(
     publish(&resolved);
 
     // ONE local + residency-filtered peer invalidation for the entire batch,
-    // before any old frame can return to the allocator. All process roots use
-    // flushing PCID 0 and publish exact scheduler residency for that tag.
-    // SAFETY: every present leaf in the batch was replaced above; user PTEs
-    // are non-global, so the local non-global flush retires every victim.
-    unsafe { crate::paging::flush_user_tlb_local() };
-    crate::tlb_shootdown::shootdown_remote_full_for_tag(0);
+    // before any old frame can return to the allocator. AddressSpace-owned
+    // callers supply its lifetime PCID; the raw compatibility entry point has
+    // no root→tag ownership proof and therefore takes the safe all-context
+    // fallback.
+    crate::tlb_shootdown::shootdown(context_tag.map_or_else(
+        crate::tlb_shootdown::ShootdownRequest::full,
+        crate::tlb_shootdown::ShootdownRequest::for_tag,
+    ));
 
     // ── 6. Only after the batch flush, free all evicted frames. ──
     for (_, phys) in &resolved {
@@ -1264,13 +1356,18 @@ pub(crate) fn swap_in_batch_owned(
 
     let mut frames = Vec::with_capacity(requests.len());
     for _ in requests {
-        match crate::frame::alloc_frame() {
+        match crate::mempolicy::alloc_frame_policied(crate::frame::local_node()) {
             Ok(frame) => frames.push(frame),
-            Err(_) => {
+            Err(error) => {
                 for frame in frames {
                     crate::frame::free_frame(frame);
                 }
-                return Err(SwapError::MapFailed);
+                return match error {
+                    crate::FrameAllocError::ReservePressure(ticket) => {
+                        Err(SwapError::ReclaimPressure(ticket))
+                    }
+                    _ => Err(SwapError::MapFailed),
+                };
             }
         }
     }
@@ -1368,9 +1465,7 @@ fn retire_slots_by_area(entries: &[SwapPte], count_in: bool) -> usize {
         }
         let mut swap = SWAP.lock();
         if let Some(area) = swap.area_mut(ty) {
-            for slot in &gslots {
-                area.slots.free_slot(slot.raw());
-            }
+            area.slots.free_slots(&gslots);
             area.resident = area.resident.saturating_sub(gslots.len() as u64);
             if count_in {
                 area.pages_in += gslots.len() as u64;
@@ -1434,6 +1529,51 @@ pub fn swap_discard_batch(entries: &[SwapPte]) {
     swap_uncharge(retired as u64);
 }
 
+/// Allocation-free teardown form. The caller supplies one scratch slot per
+/// entry; this routine sorts/deduplicates the bounded entry window in place,
+/// groups by area, releases backend payloads, and returns slots to the area.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn swap_discard_batch_noalloc(entries: &mut [SwapPte], scratch: &mut [SwapSlot]) {
+    if entries.is_empty() {
+        return;
+    }
+    assert!(
+        scratch.len() >= entries.len(),
+        "swap teardown scratch must cover every entry"
+    );
+    entries.sort_unstable_by_key(|entry| (entry.swap_type, entry.offset));
+    let mut retired = 0usize;
+    let mut start = 0usize;
+    while start < entries.len() {
+        let ty = entries[start].swap_type;
+        let mut end = start;
+        let mut count = 0usize;
+        let mut previous = None;
+        while end < entries.len() && entries[end].swap_type == ty {
+            let offset = entries[end].offset;
+            if previous != Some(offset) {
+                scratch[count] = SwapSlot(offset);
+                count += 1;
+                previous = Some(offset);
+            }
+            end += 1;
+        }
+        let slots = &scratch[..count];
+        let backend = SWAP.lock().backend_of(ty);
+        if let Some(backend) = backend {
+            backend.discard_batch(slots);
+        }
+        let mut swap = SWAP.lock();
+        if let Some(area) = swap.area_mut(ty) {
+            area.slots.free_slots(slots);
+            area.resident = area.resident.saturating_sub(count as u64);
+        }
+        retired += count;
+        start = end;
+    }
+    swap_uncharge(retired as u64);
+}
+
 // ── Leaf-PTE helpers (x86_64) ──────────────────────────────────────
 //
 // The paging module's `map_4kb`/`unmap_4kb`/`translate` operate on
@@ -1493,14 +1633,37 @@ pub(crate) unsafe fn take_swap_entries(
     pml4_phys: PhysAddr,
     pages: &[crate::VirtAddr],
 ) -> Result<Vec<SwapPte>, SwapError> {
+    let mut entries = alloc_crate::vec![
+        SwapPte {
+            swap_type: 0,
+            offset: 0,
+        };
+        pages.len()
+    ];
+    // SAFETY: this function has the same live-root/stable-page contract as
+    // the allocation-free primitive; the fresh output covers every input.
+    unsafe { take_swap_entries_into(pml4_phys, pages, &mut entries)? };
+    Ok(entries)
+}
+
+/// Allocation-free form of [`take_swap_entries`] for memory-pressure teardown.
+/// `entries` must cover `pages`; decoded entries are written in input order.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn take_swap_entries_into(
+    pml4_phys: PhysAddr,
+    pages: &[crate::VirtAddr],
+    entries: &mut [SwapPte],
+) -> Result<(), SwapError> {
+    if entries.len() < pages.len() {
+        return Err(SwapError::InvalidBatch);
+    }
     let _guard = crate::paging::pt_lock_for(pml4_phys).lock();
-    let mut entries = Vec::with_capacity(pages.len());
     for (index, virt) in pages.iter().enumerate() {
         if virt.as_u64() & (ZPAGE_SIZE as u64 - 1) != 0 || pages[..index].contains(virt) {
             return Err(SwapError::InvalidBatch);
         }
         let raw = read_leaf_pte(pml4_phys, *virt).ok_or(SwapError::SlotNotFound)?;
-        entries.push(SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?);
+        entries[index] = SwapPte::decode(raw).ok_or(SwapError::SlotNotFound)?;
     }
     for virt in pages {
         let leaf = walk_to_leaf(pml4_phys, *virt).ok_or(SwapError::SlotNotFound)?;
@@ -1517,7 +1680,7 @@ pub(crate) unsafe fn take_swap_entries(
             unsafe { crate::paging::invlpg(*virt) };
         }
     }
-    Ok(entries)
+    Ok(())
 }
 
 // Test-only: reset all global swap state so each test starts clean.
@@ -1645,6 +1808,23 @@ mod tests {
         if b3 != 7 {
             return TestResult::Fail("oversized run didn't bump past free block");
         }
+        // Pressure teardown retires the newest slots first. Returning the
+        // high-water suffix must contract implicit space without growing the
+        // explicit free vector; bridging the older free run then collapses it.
+        a.free_slots(&[
+            SwapSlot(7),
+            SwapSlot(8),
+            SwapSlot(9),
+            SwapSlot(10),
+            SwapSlot(11),
+        ]);
+        if a.stats() != (7, 4) {
+            return TestResult::Fail("tail batch did not contract slot high-water");
+        }
+        a.free_slots(&[SwapSlot(4), SwapSlot(5), SwapSlot(6)]);
+        if a.stats() != (0, 0) {
+            return TestResult::Fail("tail batch did not absorb adjacent free slots");
+        }
         TestResult::Pass
     }
     kernel_test_in!("memory/swap", smoke_swap_slot_run_alloc_free);
@@ -1723,6 +1903,26 @@ mod tests {
         result
     }
     kernel_test_in!("memory/swap", smoke_zram_backend_batch_roundtrip);
+
+    fn smoke_zram_handle_index_crosses_page_chunks() -> TestResult {
+        let backend = ZramBackend::new();
+        let mut inner = backend.inner.lock();
+        let last = ZRAM_HANDLES_PER_CHUNK * 2;
+        if inner.ensure_slot(last).is_err() {
+            return TestResult::Fail("chunked zram handle growth failed");
+        }
+        if inner.handle_chunks.len() != 3
+            || inner
+                .handle_chunks
+                .iter()
+                .any(|chunk| chunk.len() != ZRAM_HANDLES_PER_CHUNK)
+            || inner.handle(last).is_some()
+        {
+            return TestResult::Fail("chunked zram handle index has the wrong shape");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("memory/swap", smoke_zram_handle_index_crosses_page_chunks);
 
     // ── 4. End-to-end: map → write → batched swap-out → fault-in ──
 

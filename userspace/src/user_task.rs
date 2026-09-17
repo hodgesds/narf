@@ -912,6 +912,43 @@ fn park_should_block(
 
     // Deadline-based park (sleep / nanosleep / pause / blocking poll·epoll·futex).
     let deadline = uc.sleep_deadline_ns.load(Ordering::Acquire);
+    // Infinite SysV semaphore waits have a durable queue-local waker and no
+    // timer. Keep their hot handoff out of the generic I/O/futex/flock/timer
+    // decision tree while preserving the same signal arm-then-recheck rule.
+    // The routing-field guards make this fast path exclusive to a pure
+    // semaphore park; any stale or combined state falls back to the full path.
+    if deadline == u64::MAX
+        && uc.sem_wait_pending.load(Ordering::Acquire)
+        && !uc.net_io_wait.load(Ordering::Acquire)
+        && !uc.msg_wait_pending.load(Ordering::Acquire)
+        && uc.futex_uaddr.load(Ordering::Acquire) == 0
+        && uc.sigwait_set.load(Ordering::Acquire) == 0
+        && uc.flock_key.load(Ordering::Acquire) == 0
+    {
+        if crate::handlers::has_interrupting_signal(task_id) {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            return false;
+        }
+        uc.sigwait_reserve.store(0, Ordering::Release);
+        let park_state = crate::sysvipc::register_sem_wait_waker_at(
+            task_id,
+            uc.sem_wait_ipc_ns.load(Ordering::Relaxed),
+            uc.sem_wait_id.load(Ordering::Relaxed),
+            waker.clone(),
+        );
+        if crate::handlers::is_signal_pending(task_id) {
+            uc.sleep_deadline_ns.store(0, Ordering::Release);
+            return false;
+        }
+        return match park_state {
+            crate::sysvipc::SemParkState::Pending => true,
+            crate::sysvipc::SemParkState::Ready | crate::sysvipc::SemParkState::NotWaiting => {
+                uc.sem_wait_pending.store(false, Ordering::Release);
+                uc.sleep_deadline_ns.store(0, Ordering::Release);
+                false
+            }
+        };
+    }
     if deadline != 0 {
         let now = narf_scheduler::narf_time::monotonic_ns();
         // Linux interruptible-sleep semantics: a deliverable pending signal
