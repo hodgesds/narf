@@ -119,8 +119,28 @@ pub(crate) fn sys_listns(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let owner_filter = match user_ns_id {
         0 => None,
+        // `do_listns_userns`: `if (kls->user_ns_id == LISTNS_CURRENT_USER)
+        // ns = to_ns_common(current_user_ns());` — always resolves.
         LISTNS_CURRENT_USER => Some(crate::namespaces::current_user_ns(task).id()),
-        other => Some(other),
+        other => {
+            // `else if (kls->user_ns_id) ns = lookup_ns_id(kls->user_ns_id,
+            // CLONE_NEWUSER); if (!ns) return -EINVAL;`
+            //
+            // An owner id that names NOTHING, or names a namespace of some
+            // other flavour, is -EINVAL — not an empty result. The two are
+            // very different answers to a caller: "the user namespace you
+            // asked about is gone" versus "it still exists and owns
+            // nothing", and a supervisor polling a sandbox it created needs
+            // to tell them apart. Filtering on the id without resolving it
+            // first would have reported the second for both.
+            match crate::namespaces::ns_tree_lookup(other) {
+                Some(e) if e.ns_type == ns_type::USER => Some(other),
+                _ => {
+                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+                    return;
+                }
+            }
+        }
     };
 
     let candidates = crate::namespaces::ns_tree_entries_from(cursor, req_ns_type, owner_filter);

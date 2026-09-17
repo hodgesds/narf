@@ -1493,6 +1493,31 @@ fn smoke_abi_listns_owner_filter() -> TestResult {
         if out[..n] != [owned.id()] {
             return Err("the owner filter did not select exactly the owned namespace");
         }
+        // An owner id that names nothing is -EINVAL, NOT an empty result.
+        // `do_listns_userns` resolves the id to a user namespace first:
+        // `if (!ns) return -EINVAL;`. The two answers mean different things
+        // — "the user namespace you asked about is gone" versus "it exists
+        // and owns nothing" — and a supervisor polling a sandbox it created
+        // needs to tell them apart.
+        let gone = ns_id_req(32, 0, 0, 0x7FFF_FFFF_FFFF);
+        if call(
+            Syscall::Listns.raw(),
+            a3(gone.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("an owner id that names no namespace must be -EINVAL");
+        }
+        // And an id that names a namespace of the WRONG flavour: the lookup
+        // is `lookup_ns_id(id, CLONE_NEWUSER)`, so an IPC id is not a valid
+        // owner either.
+        let wrong = ns_id_req(32, 0, 0, owned.id());
+        if call(
+            Syscall::Listns.raw(),
+            a3(wrong.as_ptr() as u64, out.as_mut_ptr() as u64, 16, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("an owner id naming a non-user namespace must be -EINVAL");
+        }
         // LISTNS_CURRENT_USER resolves to the caller's own user namespace,
         // so it must not be treated as the literal id u64::MAX.
         let cur = ns_id_req(32, 0, 0, LISTNS_CURRENT_USER);
