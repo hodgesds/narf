@@ -165,6 +165,75 @@ fn smoke_memory_adjacent_anonymous_mmaps_coalesce() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_adjacent_anonymous_mmaps_coalesce);
 
+/// Sparse private-anonymous reservations may coalesce without materializing
+/// their implicit tails. A permission split must still retain virtual coverage
+/// when its fragments have no explicit backing slots.
+fn smoke_memory_sparse_anonymous_metadata_preserves_offsets() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use alloc::vec::Vec;
+
+    let aspace = AddressSpace::empty();
+    let base = 0x0000_0100_6400_0000;
+    if aspace
+        .map_private_anonymous_region_limited(
+            Region {
+                base: VirtAddr::new(base),
+                len: 2 * 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: Vec::new(),
+            },
+            false,
+            u64::MAX,
+            false,
+        )
+        .is_err()
+        || aspace
+            .map_private_anonymous_region_limited(
+                Region {
+                    base: VirtAddr::new(base + 2 * 4096),
+                    len: 4096,
+                    perms: RegionPerms::READ | RegionPerms::WRITE,
+                    phys: Vec::new(),
+                },
+                false,
+                u64::MAX,
+                false,
+            )
+            .is_err()
+    {
+        return TestResult::Fail("sparse anonymous setup failed");
+    }
+    let reserved = aspace.regions_snapshot();
+    if reserved.len() != 1 || reserved[0].len != 3 * 4096 || !reserved[0].phys.is_empty() {
+        return TestResult::Fail("sparse reservation coalescing materialized its tail");
+    }
+
+    if aspace
+        .mprotect_range(VirtAddr::new(base + 4096), 4096, RegionPerms::READ)
+        .is_err()
+    {
+        return TestResult::Fail("sparse middle mprotect failed");
+    }
+    let split = aspace.regions_snapshot();
+    if split.len() != 3
+        || split.iter().any(|region| region.len != 4096)
+        || split[0].base.as_u64() != base
+        || split[1].base.as_u64() != base + 4096
+        || split[2].base.as_u64() != base + 2 * 4096
+        || !split[0].phys.is_empty()
+        || !split[1].phys.is_empty()
+        || !split[2].phys.is_empty()
+        || split[1].perms.prot_only() != RegionPerms::READ
+    {
+        return TestResult::Fail("sparse mprotect split lost virtual/backing coverage");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "memory",
+    smoke_memory_sparse_anonymous_metadata_preserves_offsets
+);
+
 /// Random fixed-page insertion must converge to the same compact anonymous
 /// VMA shape as ordinary mmap, without weakening fixed replacement semantics.
 fn smoke_memory_fixed_anonymous_mmaps_coalesce() -> TestResult {
@@ -3982,10 +4051,10 @@ fn smoke_memory_mmap_arena_fails_closed_at_ceiling() -> TestResult {
 }
 kernel_test_in!("memory", smoke_memory_mmap_arena_fails_closed_at_ceiling);
 
-/// Linux get_unmapped_area searches the live VMA topology rather than burning
-/// virtual address space through a monotonic cursor. A private-anonymous hole
-/// released by munmap must therefore be selected again, and a usable non-fixed
-/// hint must win without becoming MAP_FIXED.
+/// Linux get_unmapped_area treats its cached high-water address as a hint, not
+/// authority: a no-hint mapping normally advances above the live high-water,
+/// an empty/fallback search can reuse a released hole, and a usable caller
+/// hint wins without becoming MAP_FIXED.
 fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
     use crate::{AddressSpace, PhysAddr, Region, RegionPerms, VirtAddr};
 
@@ -4043,6 +4112,24 @@ fn smoke_memory_anonymous_mmap_reuses_holes_and_honours_hints() -> TestResult {
     };
     if after_occupied.as_u64() != first.as_u64() + LEN {
         return TestResult::Fail("occupied non-fixed hint did not fall back to the first gap");
+    }
+
+    if aspace.punch_fixed(reused, LEN).is_err() {
+        return TestResult::Fail("could not create a hole below the high-water mark");
+    }
+    let high_water = match aspace.map_private_anonymous_region_anywhere_limited(
+        lazy_region(),
+        VirtAddr::new(0),
+        4096,
+        false,
+        u64::MAX,
+        false,
+    ) {
+        Ok(base) => base,
+        Err(_) => return TestResult::Fail("high-water anonymous placement failed"),
+    };
+    if high_water.as_u64() != after_occupied.as_u64() + LEN {
+        return TestResult::Fail("no-hint mmap rescanned a low hole before its high-water hint");
     }
 
     let unaligned_hint = AddressSpace::MMAP_CURSOR_BASE + 0x20_0001;
@@ -6172,7 +6259,7 @@ fn smoke_alloc_pages_on_rejects_oversize_order() -> TestResult {
         Err(FrameAllocError::Uninitialised) => {
             TestResult::Skip("frame allocator not initialised in this flavour")
         }
-        Err(FrameAllocError::ReservePressure)
+        Err(FrameAllocError::ReservePressure(_))
         | Err(FrameAllocError::NotSupported)
         | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant for oversize order")
@@ -6781,7 +6868,7 @@ fn smoke_buddy_alloc_pages_on_order_round_trip() -> TestResult {
             TestResult::Skip("frame allocator not up in this flavour")
         }
         Err(FrameAllocError::Exhausted) => TestResult::Skip("buddy exhausted on this test image"),
-        Err(FrameAllocError::ReservePressure)
+        Err(FrameAllocError::ReservePressure(_))
         | Err(FrameAllocError::NotSupported)
         | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant from alloc_pages_on")
@@ -6802,7 +6889,7 @@ fn smoke_buddy_alloc_pages_on_max_order_boundary() -> TestResult {
             TestResult::Pass
         }
         Err(FrameAllocError::Exhausted) | Err(FrameAllocError::Uninitialised) => TestResult::Pass,
-        Err(FrameAllocError::ReservePressure)
+        Err(FrameAllocError::ReservePressure(_))
         | Err(FrameAllocError::NotSupported)
         | Err(FrameAllocError::AuthorityRevoked) => {
             TestResult::Fail("unexpected error variant at MAX_ORDER boundary")
@@ -7232,6 +7319,73 @@ fn smoke_memory_collect_anon_reclaim_candidates() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_collect_anon_reclaim_candidates);
 
+/// Bounded reclaim batches must continue where the preceding batch stopped.
+/// Restarting at the first VMA makes sustained pressure quadratic once an
+/// early prefix is swapped because every kswapd wake rescans that dead prefix.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_anon_reclaim_cursor_rotates() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(a) => a,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    const N: usize = 6;
+    const BATCH: usize = 2;
+    let base = VirtAddr::new(0x0000_0080_0028_0000);
+    let mut phys = alloc::vec::Vec::with_capacity(N);
+    for _ in 0..N {
+        match crate::alloc_frame() {
+            Ok(f) => phys.push(f.start_address()),
+            Err(_) => return TestResult::Skip("frame allocator drained"),
+        }
+    }
+    if aspace
+        .map_region(Region {
+            base,
+            len: N as u64 * 4096,
+            perms: RegionPerms::READ | RegionPerms::WRITE,
+            phys,
+        })
+        .is_err()
+    {
+        return TestResult::Fail("map_region failed");
+    }
+    // SAFETY: aspace owns a live root and the validated region.
+    if unsafe { aspace.materialize() }.is_err() {
+        return TestResult::Fail("materialize failed");
+    }
+
+    let result = (|| {
+        for batch in 0..3usize {
+            let mut out = alloc::vec::Vec::new();
+            aspace.collect_anon_reclaim_candidates(&mut out, BATCH);
+            if out.len() != 1
+                || out[0].pages != BATCH
+                || out[0].base.as_u64() != base.as_u64() + (batch * BATCH * 4096) as u64
+            {
+                return TestResult::Fail("bounded reclaim batch did not advance the cursor");
+            }
+        }
+
+        let mut wrapped = alloc::vec::Vec::new();
+        aspace.collect_anon_reclaim_candidates(&mut wrapped, BATCH);
+        if wrapped.len() != 1
+            || wrapped[0].pages != BATCH
+            || wrapped[0].base.as_u64() != base.as_u64()
+        {
+            return TestResult::Fail("reclaim cursor did not wrap to the first VMA");
+        }
+        TestResult::Pass
+    })();
+
+    let _ = aspace.unmap_region(base);
+    result
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("memory", smoke_memory_anon_reclaim_cursor_rotates);
+
 /// End-to-end anon reclaim: the VMA scan's candidates must feed
 /// `plan_reclaim_ranges` and `swap_out_reclaim_plan` and actually swap the
 /// pages out — proving the scan emits executor-compatible ranges (the risk the
@@ -7440,6 +7594,79 @@ fn smoke_memory_brk_grow_is_demand_paged() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_brk_grow_is_demand_paged);
+
+/// Ordinary private-anonymous mappings use the same sparse demand-zero
+/// representation as brk: reservation is O(1), while a fault grows only the
+/// materialized prefix and still returns a freshly zeroed owned frame.
+#[cfg(target_arch = "x86_64")]
+fn smoke_memory_private_anonymous_reservation_is_sparse() -> TestResult {
+    use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
+    use alloc::vec::Vec;
+
+    // SAFETY: paging and the frame allocator are live in the kernel suite.
+    let aspace = match unsafe { AddressSpace::new_for_user() } {
+        Ok(aspace) => aspace,
+        Err(_) => return TestResult::Skip("new_for_user failed"),
+    };
+    let base = VirtAddr::new(0x0000_0100_7800_0000);
+    const PAGES: usize = 64;
+    if aspace
+        .map_private_anonymous_region_limited(
+            Region {
+                base,
+                len: PAGES as u64 * 4096,
+                perms: RegionPerms::READ | RegionPerms::WRITE,
+                phys: Vec::new(),
+            },
+            false,
+            u64::MAX,
+            false,
+        )
+        .is_err()
+    {
+        return TestResult::Fail("private-anonymous sparse publication failed");
+    }
+    let reserved = aspace.lookup(base).expect("private-anonymous VMA missing");
+    if reserved.len != PAGES as u64 * 4096
+        || !reserved.phys.is_empty()
+        || !reserved.perms.contains(RegionPerms::ANON_MERGEABLE)
+    {
+        return TestResult::Fail("private-anonymous reservation allocated backing metadata");
+    }
+
+    let fault = VirtAddr::new(base.as_u64() + 10 * 4096);
+    // SAFETY: this is the normal first-touch path for the mapped user page.
+    if unsafe { aspace.demand_alloc_page(fault) }.is_err() {
+        return TestResult::Fail("private-anonymous sparse demand fault failed");
+    }
+    let faulted = aspace.lookup(base).expect("faulted VMA missing");
+    if faulted.phys.len() != 11
+        || faulted.phys[..10].iter().any(|phys| phys.raw() != 0)
+        || faulted.phys[10].raw() == 0
+    {
+        return TestResult::Fail("demand fault did not preserve sparse slot identity");
+    }
+    // SAFETY: the fault path published exclusive, resident region backing.
+    if unsafe { core::slice::from_raw_parts(faulted.phys[10].kernel_ptr::<u8>(), 4096) }
+        .iter()
+        .any(|byte| *byte != 0)
+    {
+        return TestResult::Fail("private-anonymous demand page was not zeroed");
+    }
+    if aspace.madvise_dontneed(base, PAGES as u64 * 4096).is_err() {
+        return TestResult::Fail("MADV_DONTNEED rejected an implicit sparse tail");
+    }
+    let discarded = aspace.lookup(base).expect("advised VMA missing");
+    if discarded.phys.iter().any(|phys| phys.raw() != 0) {
+        return TestResult::Fail("MADV_DONTNEED retained sparse resident backing");
+    }
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!(
+    "memory",
+    smoke_memory_private_anonymous_reservation_is_sparse
+);
 
 #[cfg(target_arch = "x86_64")]
 fn smoke_memory_brk_shrink_punches_demand_paged() -> TestResult {
@@ -9685,6 +9912,51 @@ fn smoke_zpool_free_reuses_slots() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_zpool_free_reuses_slots);
+
+fn smoke_zpool_metadata_crosses_page_chunks() -> TestResult {
+    use crate::zpool::{Zpool, ZPAGE_SIZE, ZPOOL_SLOTS_PER_CHUNK};
+
+    // Zpool's historical flat slot Vec doubled to a 16 MiB contiguous
+    // allocation at about 262k swapped pages and panicked under pressure.
+    // A few hundred small compressed pages cross more than one page-sized
+    // directory chunk without making this smoke itself memory-heavy.
+    let count = ZPOOL_SLOTS_PER_CHUNK * 2 + 1;
+    let mut pool = Zpool::new();
+    let mut handles = alloc::vec::Vec::new();
+    let mut raw = [0u8; ZPAGE_SIZE];
+    for i in 0..count {
+        raw[0..4].copy_from_slice(&(i as u32).to_le_bytes());
+        match pool.store(&raw) {
+            Ok(handle) => handles.push(handle),
+            Err(_) => return TestResult::Fail("chunked zpool metadata growth failed"),
+        }
+    }
+    if pool.slot_capacity() != count || pool.stats().stored_pages != count as u64 {
+        return TestResult::Fail("chunked zpool directory lost a slot");
+    }
+    let mut out = [0u8; ZPAGE_SIZE];
+    for index in [
+        0usize,
+        ZPOOL_SLOTS_PER_CHUNK - 1,
+        ZPOOL_SLOTS_PER_CHUNK,
+        ZPOOL_SLOTS_PER_CHUNK * 2 - 1,
+        ZPOOL_SLOTS_PER_CHUNK * 2,
+    ] {
+        if pool.load(handles[index], &mut out).is_err()
+            || u32::from_le_bytes(out[0..4].try_into().unwrap()) != index as u32
+        {
+            return TestResult::Fail("zpool handle crossed into the wrong chunk");
+        }
+    }
+    for handle in handles {
+        pool.free(handle);
+    }
+    if pool.stats().stored_pages != 0 || pool.stats().eviction_count != count as u64 {
+        return TestResult::Fail("chunked zpool teardown lost accounting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_zpool_metadata_crosses_page_chunks);
 
 fn smoke_zpool_invalid_handle() -> TestResult {
     use crate::zpool::{Zpool, ZpoolError, ZPAGE_SIZE};

@@ -78,8 +78,9 @@ pages or one backing descriptor per untouched virtual page unless
 `MAP_POPULATE` requests a best-effort prefault. The VMA's materialized backing
 prefix grows through each faulted page, and its omitted tail retains normal
 demand-zero semantics. `MAP_NONBLOCK` suppresses prefaulting without changing
-VMA publication. No-hint private-anonymous placement uses the first suitable
-gap from the locked live topology; caller hints remain advisory. Anonymous
+VMA publication. No-hint private-anonymous placement first validates the
+address-space high-water candidate and falls back to the locked live-topology
+search when necessary; caller hints remain advisory. Anonymous
 `MAP_SHARED` mappings eagerly allocate zeroed frames whose unnamed ownership is
 tracked by cache-line-isolated, per-page reference shards. A creator reference
 keeps each page live until VMA publication or rollback completes; VMA and fork

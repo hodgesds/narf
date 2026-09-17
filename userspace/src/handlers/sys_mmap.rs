@@ -867,22 +867,27 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             || perms.contains(RegionPerms::EXEC));
     let mut population_frames = alloc::vec::Vec::new();
     let mut phys_list: alloc::vec::Vec<narf_memory::PhysAddr> = if anonymous {
-        // Lazy-back: phys[i] == 0; the #PF handler demand-allocates + zeros
-        // each page on first access.
-        //
-        // Allocate the per-page slot vector FALLIBLY. A userspace mmap of an
-        // absurd length — e.g. baloo's LMDB opens with a ~256 GiB map size, so
-        // `pages` is ~64M and this vector is ~512 MiB — must never panic the
-        // kernel: the infallible `vec![_; n]` calls `handle_alloc_error` on OOM,
-        // which is a kernel panic. `try_reserve_exact` + `resize` returns
-        // -ENOMEM to the process instead (a normal mmap failure).
-        let mut v = alloc::vec::Vec::new();
-        if v.try_reserve_exact(pages).is_err() {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
-            return;
+        if map_type == MAP_PRIVATE && !populate_anonymous {
+            // Linux publishes a lazy anonymous VMA without one descriptor per
+            // virtual page. NARF represents the same demand-zero tail as an
+            // implicit run after the materialized `Region::phys` prefix; the
+            // fault path grows that prefix only through the page actually
+            // touched. This keeps an untouched multi-gigabyte reservation O(1)
+            // while preserving zero-on-first-access and all normal admission.
+            alloc::vec::Vec::new()
+        } else {
+            // Shared and eagerly populated mappings still need an explicit
+            // slot for every page before their backing transaction begins.
+            // Reserve fallibly so a huge userspace request returns ENOMEM
+            // rather than entering the kernel allocator's abort path.
+            let mut v = alloc::vec::Vec::new();
+            if v.try_reserve_exact(pages).is_err() {
+                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+                return;
+            }
+            v.resize(pages, narf_memory::PhysAddr::new(0));
+            v
         }
-        v.resize(pages, narf_memory::PhysAddr::new(0));
-        v
     } else {
         // File-backed MAP_PRIVATE: stream the file's [offset, offset+len)
         // bytes straight into per-page private frames (zero past EOF),
@@ -1635,7 +1640,13 @@ mod tests {
         });
         let nonblock_lazy = aspace
             .lookup(VirtAddr::new(NONBLOCK_BASE))
-            .is_some_and(|region| region.phys.first().is_some_and(|phys| phys.as_u64() == 0));
+            .is_some_and(|region| {
+                let page = ((NONBLOCK_BASE - region.base.as_u64()) >> 12) as usize;
+                region
+                    .phys
+                    .get(page)
+                    .is_none_or(|phys| phys.as_u64() == 0)
+            });
         // SAFETY: same test-owned live-root contract as above.
         let nonblock_unmapped = unsafe {
             narf_memory::x86_64::paging::translate(aspace.root, VirtAddr::new(NONBLOCK_BASE))

@@ -308,15 +308,17 @@ fn mremap_core_limited(
             // between validation and the fixed punch.
             let old_end = old_addr.checked_add(old_len).ok_or(EFAULT)?;
             // SAFETY: the enclosing closure holds the VMA transaction. Shared
-            // aliases may cover a subrange; private relocation retains the
-            // existing exact-VMA restriction. A zero old length identifies
-            // the containing shared VMA for Linux's legacy duplication mode.
+            // aliases and ordinary private relocation may cover a subrange. A
+            // zero old length identifies the containing shared VMA for
+            // Linux's legacy duplication mode; private DONTUNMAP still needs
+            // an exact source until its retained-source split is implemented.
             let covering_perms = unsafe {
                 as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len)
             }
             .ok_or(EFAULT)?;
             let source_perms = if old_len == 0
                 || covering_perms.contains(RegionPerms::SHARED)
+                || flags & MREMAP_DONTUNMAP == 0
             {
                 covering_perms
             } else {
@@ -474,13 +476,12 @@ fn mremap_core_limited(
     let _shm_guard = shm_transaction.lock();
 
     let moved = as_ref.with_vma_transaction(|| {
-        // NARF's region table is the VMA authority. This exact-region
-        // restriction is temporary; keeping it under the transaction at least
-        // makes every accepted operation atomic with CLONE_VM peers.
+        // NARF's region table is the VMA authority. Keep source validation and
+        // every accepted operation atomic with CLONE_VM peers.
         let old_end = old_addr.checked_add(old_len).ok_or(EFAULT)?;
         // SAFETY: the enclosing closure holds the VMA transaction. Shared
-        // aliases may cover a subrange and old_len==0 identifies the VMA at
-        // old_addr; private moves remain exact-VMA operations for now.
+        // aliases and ordinary private remaps may cover a subrange, while
+        // old_len==0 identifies the VMA at old_addr.
         let covering_perms = unsafe {
             as_ref.region_perms_covering_locked(VirtAddr::new(old_addr), old_len)
         }
@@ -492,7 +493,10 @@ fn mremap_core_limited(
         if old_len == 0 && !source_shared {
             return Err(EINVAL);
         }
-        let source_perms = if old_len == 0 || source_shared {
+        let source_perms = if old_len == 0
+            || source_shared
+            || flags & MREMAP_DONTUNMAP == 0
+        {
             covering_perms
         } else {
             // SAFETY: the enclosing closure holds the VMA transaction. An
@@ -763,7 +767,8 @@ fn mremap_core_limited(
             Err(narf_memory::AddressSpaceError::MappingLimit)
             | Err(narf_memory::AddressSpaceError::AllocationFailed) => return Err(ENOMEM),
             Err(narf_memory::AddressSpaceError::Overlap)
-            | Err(narf_memory::AddressSpaceError::OutOfRange) => {}
+            | Err(narf_memory::AddressSpaceError::OutOfRange)
+            | Err(narf_memory::AddressSpaceError::Unmapped) => {}
             Err(_) => return Err(ENOMEM),
         }
         if flags & MREMAP_MAYMOVE == 0 {
@@ -884,6 +889,97 @@ mod tests {
         TestResult::Pass
     }
     kernel_test_in!("userspace", smoke_mremap_shrink_really_unmaps_tail);
+
+    /// Linux permits an `mremap` source to select one interval inside a
+    /// larger, coalesced VMA. This is the normal shape produced when libc's
+    /// individually allocated anonymous mappings merge with compatible
+    /// neighbours; rejecting it forces realloc to allocate and copy instead.
+    fn smoke_mremap_private_interval_preserves_neighbours() -> TestResult {
+        const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x10_0000;
+        const DESTINATION: u64 = BASE + 0x40_0000;
+        let aspace = AddressSpace::empty();
+        let original = lazy_region(BASE, 6);
+        let expected_head = original.phys[..2].to_vec();
+        let expected_moved = original.phys[2..4].to_vec();
+        let expected_tail = original.phys[4..].to_vec();
+        if aspace.map_region(original).is_err() {
+            return TestResult::Fail("private interval setup failed");
+        }
+        if mremap_core(
+            &aspace,
+            BASE + 2 * 4096,
+            2 * 4096,
+            2 * 4096,
+            MREMAP_MAYMOVE | MREMAP_FIXED,
+            DESTINATION,
+        ) != Ok(DESTINATION)
+        {
+            return TestResult::Fail("contained private interval did not move");
+        }
+        let head = aspace.lookup(VirtAddr::new(BASE));
+        let hole = aspace.lookup(VirtAddr::new(BASE + 2 * 4096));
+        let tail = aspace.lookup(VirtAddr::new(BASE + 4 * 4096));
+        let moved = aspace.lookup(VirtAddr::new(DESTINATION));
+        if !head.is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_head)
+            || hole.is_some()
+            || !tail.is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_tail)
+            || !moved
+                .is_some_and(|region| region.len == 2 * 4096 && region.phys == expected_moved)
+        {
+            return TestResult::Fail("contained move lost source neighbours or backing offsets");
+        }
+
+        const GROW: u64 = BASE + 0x80_0000;
+        if aspace.map_region(lazy_region(GROW, 4)).is_err()
+            || mremap_core(&aspace, GROW + 2 * 4096, 2 * 4096, 3 * 4096, 0, 0)
+                != Ok(GROW + 2 * 4096)
+            || aspace
+                .lookup(VirtAddr::new(GROW))
+                .is_none_or(|region| region.len != 5 * 4096)
+        {
+            return TestResult::Fail("contained suffix did not grow in place");
+        }
+
+        // A prefix cannot grow in place because the remainder of its
+        // coalesced VMA occupies the requested tail. MAYMOVE must relocate
+        // just that prefix rather than misclassifying the contained source as
+        // unmapped; the original suffix remains a valid independent VMA.
+        const PREFIX: u64 = BASE + 0xc0_0000;
+        let original = lazy_region(PREFIX, 3);
+        let first_phys = original.phys[0];
+        let suffix_phys = original.phys[1..].to_vec();
+        if aspace.map_region(original).is_err() {
+            return TestResult::Fail("contained prefix setup failed");
+        }
+        let destination = match mremap_core(
+            &aspace,
+            PREFIX,
+            4096,
+            2 * 4096,
+            MREMAP_MAYMOVE,
+            0,
+        ) {
+            Ok(destination) if destination != PREFIX => destination,
+            _ => return TestResult::Fail("contained prefix MAYMOVE did not relocate"),
+        };
+        if aspace.lookup(VirtAddr::new(PREFIX)).is_some()
+            || !aspace
+                .lookup(VirtAddr::new(PREFIX + 4096))
+                .is_some_and(|region| region.len == 2 * 4096 && region.phys == suffix_phys)
+            || !aspace.lookup(VirtAddr::new(destination)).is_some_and(|region| {
+                region.len == 2 * 4096
+                    && region.phys.first() == Some(&first_phys)
+                    && region.phys.get(1) == Some(&PhysAddr::new(0))
+            })
+        {
+            return TestResult::Fail("contained prefix relocation lost suffix or backing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mremap_private_interval_preserves_neighbours
+    );
 
     fn smoke_mremap_ordinary_shared_resize_and_move() -> TestResult {
         const BASE: u64 = AddressSpace::MMAP_CURSOR_BASE + 0x20_0000;

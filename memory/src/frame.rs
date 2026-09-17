@@ -181,7 +181,7 @@ pub enum FrameAllocError {
     Exhausted,
     /// A user-backing allocation was refused to preserve the kernel's
     /// protected minimum free-memory reserve.
-    ReservePressure,
+    ReservePressure(crate::reclaim::ReclaimTicket),
     /// Allocator not initialised yet (`init_from_map` hasn't run).
     Uninitialised,
     /// The currently-installed `FrameAlloc` impl does not support
@@ -900,8 +900,8 @@ impl AllocContext {
 /// Enforced once, here, so every allocation entry inherits the same policy —
 /// an ordinary user path cannot silently drain the reserve.
 #[inline]
-fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
-    let node = current_cpu_node();
+fn reserve_permits(ctx: AllocContext, node: usize) -> Result<(), FrameAllocError> {
+    let node = node.min(MAX_NUMA_NODES - 1);
     // Start background balancing at the low watermark for both kernel and user
     // allocations rather than waiting for either to collide with the protected
     // minimum. Kernel allocations may consume the reserve but must still wake
@@ -919,12 +919,14 @@ fn reserve_permits(ctx: AllocContext) -> Result<(), FrameAllocError> {
         // pressure reclaims a hog rather than only failing the faulting task.
         // Under `Never` (the default) this stays a graceful ENOMEM — no
         // process is killed.
-        if crate::reclaim::user_pressure_arms_oom() {
-            crate::reclaim::request_reclaim_with_oom(node, 1);
+        let ticket = if crate::reclaim::user_pressure_arms_oom() {
+            crate::reclaim::request_reclaim_ticket(node, 1, true)
         } else {
-            crate::reclaim::request_reclaim(node, 1);
-        }
-        return Err(FrameAllocError::ReservePressure);
+            crate::reclaim::request_reclaim_ticket(node, 1, false)
+        };
+        return ticket.map_or(Err(FrameAllocError::Exhausted), |ticket| {
+            Err(FrameAllocError::ReservePressure(ticket))
+        });
     }
     Ok(())
 }
@@ -958,7 +960,7 @@ pub fn alloc_frame_on_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, F
 
 /// Reserve-respecting variant of [`alloc_frame_anywhere`].
 pub fn alloc_frame_anywhere_ctx(ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
-    reserve_permits(ctx)?;
+    reserve_permits(ctx, current_cpu_node())?;
     alloc_frame_anywhere()
 }
 
@@ -1269,7 +1271,7 @@ pub(crate) fn alloc_frame_on_strict_for_ctx(
     preferred: usize,
     ctx: AllocContext,
 ) -> Result<PhysFrame, FrameAllocError> {
-    reserve_permits(ctx)?;
+    reserve_permits(ctx, node)?;
     #[cfg(feature = "cgroup")]
     if !crate::cgroup_charge::try_charge(PAGE_SIZE) {
         return Err(FrameAllocError::Exhausted);
@@ -1320,7 +1322,7 @@ fn alloc_frame_on_inner(node: usize) -> Result<PhysFrame, FrameAllocError> {
 /// are refused (and the reclaimer woken) once they would breach the `min`
 /// watermark reserve; `Kernel` allocations may consume it.
 fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame, FrameAllocError> {
-    reserve_permits(ctx)?;
+    reserve_permits(ctx, node)?;
     // cgroup memory accounting: charge one page to the current task's
     // cgroup chain *before* the allocation commits. A `false` return
     // means a `memory.max` would be exceeded, so the allocation is
@@ -1340,15 +1342,14 @@ fn alloc_frame_on_inner_ctx(node: usize, ctx: AllocContext) -> Result<PhysFrame,
     }
     if r.is_err() {
         if ctx == AllocContext::Kernel {
-            // A KERNEL allocation could not be satisfied even into the `min`
-            // reserve — genuine, unrecoverable exhaustion (a `User` alloc would
-            // have been refused earlier by `reserve_permits`, keeping this reserve
-            // intact). Arm the reclaimer's OOM killer. This does NOT fire on the
-            // transient below-`min` dips a fork/vmalloc storm produces, only when
-            // a kernel request actually fails — so a workload the reserve +
-            // vmalloc already carry is never needlessly OOM-killed.
+            // A generic kernel allocation can be fallible (`try_reserve`, zram
+            // metadata growth, cache population). Its caller may handle the
+            // failure, so an asynchronous OOM authorization would outlive the
+            // operation and later kill an unrelated process. Request reclaim
+            // only. User demand faults carry a live request ticket before they
+            // authorize OOM; cgroup limits use their explicit scoped policy.
             let reclaim_node = node.min(MAX_NUMA_NODES - 1);
-            crate::reclaim::request_reclaim_with_oom(reclaim_node, 1);
+            crate::reclaim::request_reclaim(reclaim_node, 1);
         } else {
             // The reserve check passed but the selected buddy/cpuset could not
             // satisfy the allocation (for example fragmentation or strict-node

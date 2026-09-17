@@ -29,10 +29,16 @@ pub struct PhysFrame;     // owned 4 KiB physical frame (base page)
 pub struct VirtAddr(u64);
 pub struct DomainId(u8);  // 0..16
 
+pub struct ReclaimTicket {
+    pub node: usize,
+    pub sequence: u32,
+}
+
 pub enum FrameAllocError {
     Exhausted,
-    /// User backing was refused before consuming the protected kernel reserve.
-    ReservePressure,
+    /// User backing was refused before consuming the protected kernel reserve;
+    /// the ticket identifies the exact kswapd request that must finish first.
+    ReservePressure(ReclaimTicket),
     Uninitialised,
     NotSupported,
     AuthorityRevoked,
@@ -224,8 +230,11 @@ pub fn request_reclaim_with_oom(node: usize, target_pages: usize);
 pub struct ReclaimRequest {
     pub target_pages: usize,
     pub oom_authorized: bool,
+    pub oom_requires_waiter: bool,
+    pub ticket: Option<ReclaimTicket>,
 }
-/// Atomically consume one node's coalesced target and OOM authorization.
+/// Atomically consume one node's coalesced target, newest ticket, and OOM
+/// authorization while retaining the sequence base for later requests.
 pub fn take_reclaim_request(node: usize) -> ReclaimRequest;
 /// Serialize global victim selection, re-check viability, and reap before
 /// another node may select a victim.
@@ -282,6 +291,10 @@ pub unsafe fn swap_out_plan(plan: &ReclaimBatchPlan) -> SwapBatchReport;
 #[cfg(target_arch = "x86_64")]
 pub fn swap_in_batch(requests: &[SwapInRequest]) -> Result<Vec<PhysAddr>, SwapError>;
 
+/// `SwapError::ReclaimPressure(ticket)` distinguishes a reserve-gated
+/// swap-in allocation from malformed mappings, missing slots, and backend
+/// failures so the user-fault path can wait for that exact reclaim cycle.
+
 /// Hugepage allocation is local-first with SLIT-ordered fallback.
 /// Boot-only reservation skips every protected half-open physical range and
 /// returns the additional ranges which the buddy must exclude.
@@ -311,6 +324,17 @@ pub struct HugeRegion {
     pub perms: RegionPerms,
     pub size: HugeSize,
     pub frames: Vec<HugeFrame>,
+}
+
+/// Ordinary base-page VMA metadata. `phys[i]` is page `i`'s backing, with
+/// zero denoting an unbacked demand-zero page. BRK_HEAP, STACK_SEGMENT,
+/// FILE_DEMAND, and ANON_MERGEABLE regions may omit a trailing run of zero
+/// entries; all other region kinds retain one entry per virtual page.
+pub struct Region {
+    pub base: VirtAddr,
+    pub len: u64,
+    pub perms: RegionPerms,
+    pub phys: Vec<PhysAddr>,
 }
 
 /// POSIX protection bits plus internal address-space state. COW preserves the
@@ -381,6 +405,15 @@ impl AddressSpace {
         &self,
         plan: &ReclaimBatchPlan,
     ) -> SwapBatchReport;
+    /// Select bounded private-anonymous resident runs with CLOCK ageing.
+    /// A region-lock-protected virtual cursor resumes after the last inspected
+    /// page and wraps through the address space, so successive bounded passes
+    /// do not repeatedly walk an already-swapped low-address prefix.
+    pub fn collect_anon_reclaim_candidates(
+        &self,
+        out: &mut Vec<ReclaimRangeCandidate>,
+        max_pages: usize,
+    );
     /// Materialize every recorded base-page region; used for exec build and
     /// callers that explicitly require eager population.
     pub unsafe fn materialize(&self) -> Result<(), AddressSpaceError>;
@@ -390,9 +423,9 @@ impl AddressSpace {
     /// Region backing; huge mappings are copied and installed eagerly.
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError>;
     /// Back one anonymous/file-demand page. Anonymous reserve refusal returns
-    /// `AddressSpaceError::ReclaimPressure` only after its page ticket and all
-    /// address-space/allocator locks have been released; `Unmapped` and
-    /// `OutOfRange` retain their non-reclaim meanings.
+    /// `AddressSpaceError::ReclaimPressure(ReclaimTicket)` only after its page
+    /// claim and all address-space/allocator locks have been released;
+    /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.
     pub unsafe fn demand_alloc_page(
         &self,
         vaddr: VirtAddr,
@@ -490,16 +523,19 @@ impl AddressSpace {
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
-    /// Publish an ordinary private anonymous VMA and best-effort
-    /// coalesce exact-adjacent compatible anonymous VMAs. COW is retained but
-    /// ignored for compatibility because its authority is per backing page.
+    /// Publish an ordinary private anonymous VMA. Compatible neighbours are
+    /// coalesced best-effort while preserving each materialized page's virtual
+    /// offset; padding needed before appending a resident prefix is fallible.
+    /// COW is retained but ignored for compatibility because its authority is
+    /// per backing page.
     pub fn map_private_anonymous_region_limited(
         &self, region: Region, explicit_lock: bool,
         limit_bytes: u64, bypass_limit: bool,
     ) -> Result<(), AddressSpaceError>;
     /// Atomically select a reusable aligned mmap gap and publish an ordinary
-    /// private anonymous VMA; a free non-zero hint wins, otherwise the first
-    /// suitable gap at or above MMAP_CURSOR_BASE is selected.
+    /// private anonymous VMA; a free non-zero hint wins, otherwise the current
+    /// mmap high-water candidate is tried before falling back to the first
+    /// suitable gap at or above MMAP_CURSOR_BASE.
     pub fn map_private_anonymous_region_anywhere_limited(
         &self, region: Region, hint: VirtAddr, align: u64,
         explicit_lock: bool, limit_bytes: u64, bypass_limit: bool,
@@ -574,9 +610,10 @@ impl AddressSpace {
         -> Result<MappingReceipt, AddressSpaceError>;
     /// Locked VMA resize/move admits growth against an explicit MremapLimits
     /// snapshot (MEMLOCK, AS, DATA soft+hard) before mutation. Proportional
-    /// backing-vector metadata and arena-backed VMA index nodes are fallibly
-    /// reserved before publication; exhaustion returns `AllocationFailed`
-    /// without changing the source.
+    /// exact-scatter backing-vector metadata and arena-backed VMA index nodes
+    /// are fallibly reserved before publication; a demand-zero sparse tail
+    /// grows without proportional descriptors. Exhaustion returns
+    /// `AllocationFailed` without changing the source.
     /// Eager population occurs only after the IRQ-safe transaction is released.
     pub fn grow_region_limited(/* ... */) -> Result<(), AddressSpaceError>;
     pub unsafe fn grow_region_locked_limited(/* ... */)
@@ -585,11 +622,12 @@ impl AddressSpace {
         -> Result<(), AddressSpaceError>;
     pub unsafe fn relocate_region_locked_limited(/* ... */)
         -> Result<Option<(u64, u64)>, AddressSpaceError>;
-    /// Private relocation currently requires one exact Region; Linux's
-    /// cross-VMA move-only extension remains unsupported. Fixed relocation
-    /// reports target_punched and source_shrunk independently after a later
-    /// failure, so external file/SysV ownership mirrors Linux's target-retire,
-    /// source-truncate, move ordering exactly for the supported shape.
+    /// Private relocation may select one interval contained in one Region;
+    /// unselected head/tail fragments retain their original backing offsets.
+    /// Linux's cross-VMA move-only extension remains unsupported. Fixed
+    /// relocation reports target_punched and source_shrunk independently
+    /// after a later failure, so external file/SysV ownership mirrors Linux's
+    /// target-retire, source-truncate, move ordering for the supported shape.
     pub unsafe fn relocate_region_fixed_limited(/* ... */)
         -> Result<(), FixedRelocationError>;
     pub unsafe fn relocate_region_fixed_locked_limited(/* ... */)
@@ -942,22 +980,35 @@ x86_64 is rejected at runtime.
   cached frames are visible in the zone; alternative allocators use the
   scalar default.
 - Ordinary private anonymous mmap regions, including MAP_FIXED replacements,
-  carry explicit provenance and may coalesce only when exact-adjacent and
-  otherwise permission-identical. File, shared, heap, stack, guard, and
-  special mappings never carry that provenance. A region-wide COW marker is
-  ignored only for compatibility and ORed into the result; virtual addresses,
-  PTEs, backing order, per-page COW refcounts, and lock accounting are
-  unchanged. Fixed replacement completes external-owner retirement in the
-  same transaction and exposes no receipt invalidated by coalescing. If
-  backing-vector growth cannot be reserved, publication remains successful as
-  a separate VMA. MAP_FIXED_NOREPLACE publishes at the exact address through
-  a non-destructive map operation while that same VMA transaction is held;
+  carry explicit provenance and represent an omitted trailing run of unbacked
+  pages without allocating one `Region.phys` entry per virtual page. A demand
+  fault grows the materialized prefix fallibly through its exact page before
+  leaf/rmap publication, using amortized spare vector capacity so sequential
+  faults do not reallocate the complete prefix per page; allocation failure
+  retires the page ticket and leaves frame ownership with the fault path.
+  Teardown, split, mincore, madvise,
+  reclaim, migration, fork, and mremap clamp backing work to that prefix while
+  retaining full virtual coverage. Exact-adjacent compatible VMAs may coalesce:
+  a fully lazy source appends no metadata, while a materialized source first
+  fallibly zero-pads a short destination prefix so every resident frame keeps
+  its virtual-page offset. Reserve failure leaves the VMAs separate.
+  File, shared, heap, stack, guard, and special mappings never carry ordinary
+  anonymous provenance. A region-wide COW marker is ignored only for
+  compatibility and ORed into a full-vector merge; virtual addresses, PTEs,
+  backing order, per-page COW refcounts, and lock accounting are unchanged.
+  Fixed replacement completes external-owner retirement in the same
+  transaction and exposes no receipt invalidated by coalescing. If merge
+  metadata cannot be reserved, publication remains successful as a separate
+  VMA. MAP_FIXED_NOREPLACE publishes at the exact address through a
+  non-destructive map operation while that same VMA transaction is held;
   an unlocked fast rejection is advisory only, so a racing CLONE_VM insertion
   returns overlap without punching its mapping or retiring external owners.
-  Ordinary non-fixed private-anonymous placement follows Linux's unmapped-area
-  model: it accepts a suitably aligned free caller hint and otherwise selects
-  the first aligned hole in the mmap window. Non-fixed movable private mremap
-  uses the same topology search rather than consuming the monotonic
+  Ordinary non-fixed private-anonymous placement follows Linux's cached
+  unmapped-area model: it accepts a suitably aligned free caller hint, tries
+  the address-space high-water candidate for a no-hint request, then falls
+  back to the first aligned hole in the mmap window if that candidate is no
+  longer free or reached the ceiling. Non-fixed movable private mremap uses
+  the locked first-hole topology search rather than consuming the monotonic
   compatibility cursor. Selection and VMA publication share the
   per-address-space transaction, so holes released by munmap remain reusable,
   later failure consumes no virtual interval, and no CLONE_VM peer can claim
@@ -974,11 +1025,12 @@ x86_64 is rejected at runtime.
   suffix ranges remain implicit and allocate no per-page metadata. Every
   proportional vector and required VMA-index arena slot is fallibly prepared
   before PTE mutation. Provisional Region nodes are then published
-  allocation-free; rollback removes those nodes and destination leaves while
-  the original source remains authoritative. Private moves require one exact
-  Region; ordinary SHARED moves may select an interval contained in one Region.
-  Cross-Region/cross-VMA moves are explicit unsupported outcomes. For any fixed
-  shrinking move, Linux ordering
+  allocation-free; rollback removes those nodes and
+  destination leaves while the original source remains authoritative. Private
+  and ordinary SHARED moves may select an interval contained in one Region;
+  unselected head/tail fragments retain disjoint backing slices and only the
+  selected source leaf/rmap range moves. Cross-Region/cross-VMA moves are
+  explicit unsupported outcomes. For any fixed shrinking move, Linux ordering
   is intentionally destructive: target retirement precedes source-tail
   truncation, which precedes the move.
   A later failure reports both committed steps so external ownership can make
@@ -1039,11 +1091,16 @@ x86_64 is rejected at runtime.
   fallback policy walks preserve that result rather than collapsing it into
   ordinary exhaustion. The fault reports `ReclaimPressure` only after
   cancelling its exact page ticket and releasing the region and allocator
-  locks. The frame fault path may then register the current stackful task in a
-  fixed allocation-free waiter table, park, and retry once after kswapd
-  progress or completion. A generation handshake orders waiter publication
+  locks. The error carries the exact node/request ticket published by the
+  allocator. The frame fault path may then register the current stackful task
+  in a fixed allocation-free waiter table, park, and retry once only after the
+  node's kswapd completes a cycle that consumed that ticket. Completion of an
+  overlapping older or background-only cycle cannot satisfy it. Intermediate
+  gross eviction is not a retry signal because swap metadata or compressed
+  payload allocation can consume those pages before the buddy reserve becomes
+  usable. A sequentially consistent ticket handshake orders waiter publication
   against completion, while absent stackful context, full waiter capacity, and
-  a second zero-progress failure all fail without sleeping again. File refusal,
+  a second pressure failure all fail without sleeping again. File refusal,
   missing VMAs, and ordinary placement/range exhaustion never enter this wait
   path.
 - COW write faults use the same page-scoped exclusion principle. The ticket
@@ -1132,13 +1189,45 @@ x86_64 is rejected at runtime.
   is serialized across node workers and the chosen victim is reaped before a
   competing worker may select another. OOM authorization is
   packed into the same per-node atomic word as its matching reclaim target and
-  consumed with one swap, so neither an existing ordinary request nor a failure
-  arriving during a pass can mismatch the two fields. A `brk` extension
+  monotonic completion sequence. User-fault OOM authority also carries a
+  waiter-required bit: it expires if no live waiter owns a ticket consumed by
+  that cycle, so a handled failure or exited stressor cannot make a late pass
+  kill an unrelated process. Generic kernel allocation failures request
+  reclaim without authorizing OOM because fallible heap callers may handle the
+  error; explicitly scoped non-fault OOM policy does not require a waiter. One
+  compare-exchange transaction consumes the target/authorization/
+  ticket while preserving the sequence base, so neither an existing ordinary
+  request nor a failure arriving during a pass can mismatch completion with
+  another cycle. Once a node enters the low band, kswapd keeps
+  balancing against the live deficit to high rather than treating gross page
+  eviction as net watermark progress; one zero-yield CLOCK ageing pass is
+  retried before declaring no progress. A `brk` extension
   reserves virtual address space only; physical user frames are allocated
   lazily by the demand-fault path and inherit the same watermark policy.
 - PSS is a range-selection weight, never evidence that physical memory was
   released. Watermark progress advances only by conservative reverse-map
   `expected_free_pages`; locked, malformed, and zero-yield ranges are skipped.
+  Private-anonymous CLOCK selection retains an approximate virtual scan cursor
+  under the authoritative region lock. A bounded pass resumes after its last
+  inspected page and wraps once; VMA mutation may leave the cursor in a hole,
+  which is handled by seeking to the next ordered region. Candidate execution
+  still revalidates residency, eligibility, and ownership independently.
+- Order-0 watermark reclaim does not trigger compaction. Higher-order allocator
+  failure remains the compaction admission signal and invokes the bounded
+  node-local direct-compaction path before giving up, matching Linux's
+  separation between kswapd and order-aware kcompactd work.
+- The zram backend owns one encoder scratch buffer under its existing pool
+  lock and reuses it across a batch. Each successful page-out fallibly allocates
+  only the exact compressed payload; encoder scratch is never charged as
+  persistent swap storage and an allocation failure leaves the batch resident.
+  The zpool slot directory and zram slot-to-handle index grow in fallible
+  page-sized chunks, so sustained reclaim never depends on geometrically
+  doubling a multi-megabyte physically contiguous metadata vector.
+- Final address-space teardown retires swapped leaves and backend slots in
+  fixed, at-most-512-entry stack batches. It never allocates vectors proportional to a
+  pressure victim's swapped-page count; each batch clears validated leaves
+  under the root lock, removes the matching authoritative records, and then
+  discards their backend slots before page-table reuse.
 - Boot huge-page reservation never claims the architecture-reserved low-memory
   window or any caller-protected physical range. The loaded kernel image is a
   mandatory protected range, and every successful claim is returned as a buddy
@@ -1193,7 +1282,11 @@ x86_64 is rejected at runtime.
 - A swap-in batch validates and reads every requested slot into unpublished
   frames before atomically replacing the same-root swap leaves. Failure leaves
   all PTEs and slots unchanged. Backend I/O runs without the global swap-device
-  lock or a page-table mutation lock held.
+  lock or a page-table mutation lock held. Its frames use the active userspace
+  NUMA policy and protected-reserve admission. A reserve refusal rolls back
+  every unpublished frame and returns the allocator's exact reclaim ticket;
+  the fault path restores `Loading -> Swapped`, parks, and retries the batch
+  only after that ticket's kswapd cycle completes.
 - Live anonymous-private x86_64 swap uses region-table transitions
   `Evicting -> Swapped -> Loading -> Resident`. PTE publication transfers the
   corresponding `Region::phys` ownership before TLB invalidation/free; page-in

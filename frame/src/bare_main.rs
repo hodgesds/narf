@@ -143,6 +143,8 @@ async fn kswapd_kthread(node: usize) {
         let request = narf_memory::reclaim::take_reclaim_request(node);
         let requested = request.target_pages;
         let oom_requested = request.oom_authorized;
+        let oom_requires_waiter = request.oom_requires_waiter;
+        let request_ticket = request.ticket;
         let mut explicit_remaining = requested;
 
         // Batch floor scales with the online CPU count (concurrent allocators);
@@ -156,11 +158,18 @@ async fn kswapd_kthread(node: usize) {
         // fork/vmalloc storm produces.
         let mut pass = 0;
         let mut total_freed = 0usize;
+        let mut zero_progress_passes = 0usize;
+        // Once a node crosses low, keep balancing against its actual free-page
+        // deficit until high. Gross eviction is not the stop condition because
+        // compressed swap payload and metadata consume part of every batch.
+        let mut balance_to_high = narf_memory::reclaim::under_low_watermark_node(node);
         while pass < MAX_PASSES
-            && (explicit_remaining > 0 || narf_memory::reclaim::under_low_watermark_node(node))
+            && (explicit_remaining > 0
+                || (balance_to_high && narf_memory::reclaim::reclaim_goal_node(node) > 0))
         {
             let under_low = narf_memory::reclaim::under_low_watermark_node(node);
-            let target = if under_low {
+            balance_to_high |= under_low;
+            let target = if balance_to_high {
                 narf_memory::reclaim::reclaim_goal_node(node)
                     .max(cpu_floor)
                     .max(explicit_remaining)
@@ -199,14 +208,28 @@ async fn kswapd_kthread(node: usize) {
 
             let freed = anon_freed.saturating_add(file_freed).saturating_add(spill);
             if freed == 0 {
-                // No forward progress — nothing more to shed this wake.
-                break;
+                // A CLOCK pass may only clear accessed bits. Give it one
+                // allocation-free second-chance pass before treating the
+                // cycle as genuinely unable to reclaim anything.
+                pass += 1;
+                if zero_progress_passes != 0 {
+                    break;
+                }
+                zero_progress_passes += 1;
+                narf_scheduler::yield_now().await;
+                continue;
             }
+            zero_progress_passes = 0;
             total_freed = total_freed.saturating_add(freed);
             explicit_remaining = explicit_remaining.saturating_sub(freed);
-            // Release fault waiters promptly after real progress rather than
-            // keeping them asleep until the complete high-watermark batch.
-            reclaim_wait::notify_reclaim_progress();
+            balance_to_high |= narf_memory::reclaim::under_low_watermark_node(node);
+            // Keep reserve-pressure fault waiters parked until this bounded
+            // balancing cycle finishes. `freed` is gross reclaim progress:
+            // swap metadata and compressed payload allocations can consume
+            // some of it before the buddy reserve rises. Waking after the
+            // first positive batch lets the fault's single retry race kswapd
+            // while the reserve is still blocked and turns recoverable
+            // pressure into SIGSEGV.
             pass += 1;
             narf_scheduler::yield_now().await;
         }
@@ -217,7 +240,9 @@ async fn kswapd_kthread(node: usize) {
         // failed allocation can request another bounded pass. Non-requested
         // nodes cannot consume this node-scoped signal before the failing node
         // has had its reclaim opportunity.
-        if oom_requested && total_freed == 0 {
+        let oom_authority_live =
+            !oom_requires_waiter || request_ticket.is_some_and(reclaim_wait::has_waiter_for);
+        if oom_requested && oom_authority_live && total_freed == 0 {
             // The OOM helper serializes policy across all node workers, then
             // re-checks the same <=min predicate that refused the allocation.
             // It reaps the selected victim before another node may select one.
@@ -232,23 +257,19 @@ async fn kswapd_kthread(node: usize) {
         }
         narf_memory::oom::reap_all();
 
-        // Also publish completion after a zero-progress pass and after OOM
-        // reaping. A waiter retries once and then fails, so an unreclaimable
-        // workload cannot leave a task asleep forever.
-        reclaim_wait::notify_reclaim_progress();
-
-        // Gentle background compaction on THIS node when it was under memory
-        // pressure this wake (`pass > 0`): one bounded dual-scanner pass migrates
-        // movable pages toward the low end so free memory consolidates into
-        // higher-order blocks (allocations succeed instead of falling back to
-        // vmalloc). The scanner's persistent cursors resume across wakes, so it
-        // sweeps the node incrementally without re-migrating a page. Bounded and
-        // off the allocation path, so it never blocks a faulting task. x86_64
-        // only (migration is x86-only).
-        #[cfg(target_arch = "x86_64")]
-        if pass > 0 {
-            let _ = narf_memory::migrate::compact_node_dualscan(node, 32);
+        // Complete only the allocation-pressure requests this cycle consumed.
+        // A proactive/background cycle has no ticket and cannot wake a fault
+        // that raced it; that request remains queued for the next cycle.
+        if let Some(ticket) = request_ticket {
+            reclaim_wait::notify_reclaim_progress(ticket);
         }
+
+        // Do not compact merely because order-0 reclaim ran. Linux keeps
+        // kcompactd separate from kswapd, ignores order-0 wake requests, and
+        // suppresses proactive compaction while kswapd is active. NARF's
+        // higher-order allocator already invokes bounded direct compaction on
+        // failure; running the dual scanner here makes every demand-fault
+        // reclaim cycle migrate unrelated live pages.
     }
 }
 

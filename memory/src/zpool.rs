@@ -13,13 +13,15 @@
 //! enforcement is the consumer's job (the `CompressedRamDisk` in
 //! `compressed_block.rs` caps it by capacity).
 
-use alloc::vec;
 use alloc::vec::Vec;
+use core::mem::size_of;
 
 use crate::compress::{self, CompressError};
 
 /// 4 KiB — the only page size the pool understands.
 pub const ZPAGE_SIZE: usize = 4096;
+/// Scratch bytes required to encode one page in the worst case.
+pub const ZPAGE_COMPRESSED_MAX: usize = compress::lz4_max_compressed_len(ZPAGE_SIZE);
 
 /// Opaque handle returned by `Zpool::store`. Refers to a slot in the
 /// pool's internal `Vec`; recycled when a slot is freed. `Copy` so
@@ -68,12 +70,19 @@ enum ZpoolSlot {
     Free(Option<u32>), // next-free index, or None for end of list
 }
 
+/// Keep slot-directory growth to one base-page allocation at a time. Linux's
+/// zsmalloc likewise grows from page-backed zspages and slab handles rather
+/// than doubling one physically contiguous metadata array under pressure.
+pub(crate) const ZPOOL_SLOTS_PER_CHUNK: usize = ZPAGE_SIZE / size_of::<ZpoolSlot>();
+const _: () = assert!(ZPOOL_SLOTS_PER_CHUNK > 0);
+
 /// Compressed-page pool. `Send`/`Sync`-able trivially — internal
 /// vectors are owned. Concurrency control is the caller's job; the
 /// `CompressedRamDisk` consumer wraps this in an `IrqSafeSpinLock`.
 #[derive(Debug)]
 pub struct Zpool {
-    slots: Vec<ZpoolSlot>,
+    slot_chunks: Vec<Vec<ZpoolSlot>>,
+    slot_count: usize,
     free_head: Option<u32>,
     stats: ZpoolStats,
 }
@@ -88,7 +97,8 @@ impl Zpool {
     /// Empty pool. Doesn't pre-allocate any slots.
     pub const fn new() -> Self {
         Self {
-            slots: Vec::new(),
+            slot_chunks: Vec::new(),
+            slot_count: 0,
             free_head: None,
             stats: ZpoolStats {
                 stored_pages: 0,
@@ -99,14 +109,78 @@ impl Zpool {
         }
     }
 
+    #[inline]
+    fn slot(&self, index: usize) -> Option<&ZpoolSlot> {
+        if index >= self.slot_count {
+            return None;
+        }
+        self.slot_chunks
+            .get(index / ZPOOL_SLOTS_PER_CHUNK)?
+            .get(index % ZPOOL_SLOTS_PER_CHUNK)
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, index: usize) -> Option<&mut ZpoolSlot> {
+        if index >= self.slot_count {
+            return None;
+        }
+        self.slot_chunks
+            .get_mut(index / ZPOOL_SLOTS_PER_CHUNK)?
+            .get_mut(index % ZPOOL_SLOTS_PER_CHUNK)
+    }
+
+    /// Append one slot without ever geometrically reallocating the complete
+    /// directory. Both the page-sized inner chunk and the small outer index
+    /// grow fallibly before an infallible push publishes the new slot.
+    fn push_slot(&mut self, slot: ZpoolSlot) -> Result<u32, ZpoolError> {
+        if self.slot_count >= u32::MAX as usize {
+            return Err(ZpoolError::OutOfMemory);
+        }
+        let index = self.slot_count;
+        let chunk_index = index / ZPOOL_SLOTS_PER_CHUNK;
+        if chunk_index == self.slot_chunks.len() {
+            self.slot_chunks
+                .try_reserve(1)
+                .map_err(|_| ZpoolError::OutOfMemory)?;
+            let mut chunk = Vec::new();
+            chunk
+                .try_reserve_exact(ZPOOL_SLOTS_PER_CHUNK)
+                .map_err(|_| ZpoolError::OutOfMemory)?;
+            self.slot_chunks.push(chunk);
+        }
+        let chunk = &mut self.slot_chunks[chunk_index];
+        debug_assert_eq!(chunk.len(), index % ZPOOL_SLOTS_PER_CHUNK);
+        debug_assert!(chunk.len() < chunk.capacity());
+        chunk.push(slot);
+        self.slot_count += 1;
+        Ok(index as u32)
+    }
+
     /// Compress and store `raw`. Returns an opaque handle.
     pub fn store(&mut self, raw: &[u8; ZPAGE_SIZE]) -> Result<ZpoolHandle, ZpoolError> {
-        // Bound by `lz4_max_compressed_len`; on a typical 4 KiB page
-        // that's ~4112 bytes. Allocate inline and shrink afterward
-        // to avoid wasting heap on slack.
-        let bound = compress::lz4_max_compressed_len(raw.len());
-        let mut buf = vec![0u8; bound];
-        let n = match compress::lz4_encode(raw, &mut buf) {
+        let mut scratch = Vec::new();
+        scratch
+            .try_reserve_exact(ZPAGE_COMPRESSED_MAX)
+            .map_err(|_| ZpoolError::OutOfMemory)?;
+        scratch.resize(ZPAGE_COMPRESSED_MAX, 0);
+        self.store_with_scratch(raw, &mut scratch)
+    }
+
+    /// Compress and store one page using caller-owned reusable scratch.
+    ///
+    /// The zram batch path keeps this scratch beside its locked pool. This
+    /// avoids allocating and returning an order-1 buddy block for every page
+    /// merely to hold the encoder's 4,128-byte worst-case output. Only the
+    /// exact compressed payload becomes persistent heap ownership.
+    pub(crate) fn store_with_scratch(
+        &mut self,
+        raw: &[u8; ZPAGE_SIZE],
+        scratch: &mut [u8],
+    ) -> Result<ZpoolHandle, ZpoolError> {
+        if scratch.len() < ZPAGE_COMPRESSED_MAX {
+            return Err(ZpoolError::OutOfMemory);
+        }
+        let n = match compress::lz4_encode(raw, scratch) {
             Ok(n) => n,
             Err(CompressError::OutputTooSmall) => return Err(ZpoolError::OutOfMemory),
             // `lz4_encode` can't return other errors with a
@@ -114,31 +188,32 @@ impl Zpool {
             // codec can grow new error kinds without breaking us.
             Err(_) => return Err(ZpoolError::OutOfMemory),
         };
-        buf.truncate(n);
-        buf.shrink_to_fit();
+        let mut data = Vec::new();
+        data.try_reserve_exact(n)
+            .map_err(|_| ZpoolError::OutOfMemory)?;
+        data.extend_from_slice(&scratch[..n]);
 
         let slot = ZpoolSlot::Live {
-            data: buf,
+            data,
             raw_len: raw.len() as u32,
         };
 
         let idx = if let Some(free) = self.free_head {
             // Pop the free list. The slot at `free` is `Free(next)`.
-            let next = match &self.slots[free as usize] {
-                ZpoolSlot::Free(next) => *next,
-                ZpoolSlot::Live { .. } => unreachable!("free-list contained a live slot"),
+            let next = match self.slot(free as usize) {
+                Some(ZpoolSlot::Free(next)) => *next,
+                Some(ZpoolSlot::Live { .. }) => {
+                    unreachable!("free-list contained a live slot")
+                }
+                None => unreachable!("free-list index outside slot directory"),
             };
-            self.slots[free as usize] = slot;
+            *self
+                .slot_mut(free as usize)
+                .expect("validated free-list slot disappeared") = slot;
             self.free_head = next;
             free
         } else {
-            // 2^32 - 1 slots ought to be enough — but be defensive
-            // anyway since the API explicitly returns `OutOfMemory`.
-            if self.slots.len() == u32::MAX as usize {
-                return Err(ZpoolError::OutOfMemory);
-            }
-            self.slots.push(slot);
-            (self.slots.len() - 1) as u32
+            self.push_slot(slot)?
         };
 
         self.stats.stored_pages += 1;
@@ -149,10 +224,7 @@ impl Zpool {
 
     /// Decompress the slot identified by `h` into `out`.
     pub fn load(&self, h: ZpoolHandle, out: &mut [u8; ZPAGE_SIZE]) -> Result<(), ZpoolError> {
-        let slot = self
-            .slots
-            .get(h.0 as usize)
-            .ok_or(ZpoolError::InvalidHandle)?;
+        let slot = self.slot(h.0 as usize).ok_or(ZpoolError::InvalidHandle)?;
         let (data, raw_len) = match slot {
             ZpoolSlot::Live { data, raw_len } => (data, *raw_len as usize),
             ZpoolSlot::Free(_) => return Err(ZpoolError::InvalidHandle),
@@ -172,17 +244,20 @@ impl Zpool {
     /// hot paths and treats double-frees as benign.)
     pub fn free(&mut self, h: ZpoolHandle) {
         let idx = h.0 as usize;
-        if idx >= self.slots.len() {
+        let next_free = self.free_head;
+        let Some(slot) = self.slot_mut(idx) else {
             return;
-        }
-        if let ZpoolSlot::Live { data, raw_len } = &self.slots[idx] {
-            self.stats.compressed_bytes -= data.len() as u64;
-            self.stats.raw_bytes -= *raw_len as u64;
-            self.stats.stored_pages -= 1;
-            self.stats.eviction_count += 1;
-            self.slots[idx] = ZpoolSlot::Free(self.free_head);
-            self.free_head = Some(h.0);
-        }
+        };
+        let (compressed_bytes, raw_bytes) = match slot {
+            ZpoolSlot::Live { data, raw_len } => (data.len() as u64, *raw_len as u64),
+            ZpoolSlot::Free(_) => return,
+        };
+        *slot = ZpoolSlot::Free(next_free);
+        self.free_head = Some(h.0);
+        self.stats.compressed_bytes -= compressed_bytes;
+        self.stats.raw_bytes -= raw_bytes;
+        self.stats.stored_pages -= 1;
+        self.stats.eviction_count += 1;
     }
 
     /// Snapshot of pool counters.
@@ -193,6 +268,6 @@ impl Zpool {
     /// Number of live + freed slots in the backing `Vec`. Test-only.
     #[doc(hidden)]
     pub fn slot_capacity(&self) -> usize {
-        self.slots.len()
+        self.slot_count
     }
 }

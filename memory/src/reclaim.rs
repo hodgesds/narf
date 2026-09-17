@@ -92,7 +92,7 @@ extern crate alloc as alloc_crate;
 
 use alloc_crate::collections::VecDeque;
 use alloc_crate::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
@@ -347,17 +347,32 @@ pub fn user_alloc_would_breach_reserve() -> bool {
 
 static KSWAPD_WAKE_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-/// High bit packed into each request word when the matching failure authorizes
-/// OOM policy. Pages and authorization share one atomic linearization point so
-/// kswapd cannot pair one producer's flag with another producer's target.
-const RECLAIM_OOM_BIT: usize = 1usize << (usize::BITS - 1);
-const RECLAIM_PAGE_MASK: usize = RECLAIM_OOM_BIT - 1;
+/// One atomic request word keeps the target, completion sequence, and OOM
+/// authorization at one linearization point. 32 target bits cover 16 TiB of
+/// base pages; the 30-bit sequence is ample because fewer than 2^29 requests
+/// can be outstanding while wrap ordering remains unambiguous. One bit marks
+/// OOM authority that remains valid only while a fault waiter owns a consumed
+/// ticket, preventing a handled/retired allocation failure from killing a
+/// later unrelated process.
+const RECLAIM_PAGE_MASK: u64 = u32::MAX as u64;
+const RECLAIM_SEQUENCE_SHIFT: u32 = 32;
+const RECLAIM_SEQUENCE_MAX: u64 = 0x3fff_ffff;
+const RECLAIM_SEQUENCE_MASK: u64 = RECLAIM_SEQUENCE_MAX << RECLAIM_SEQUENCE_SHIFT;
+const RECLAIM_OOM_WAITER_BIT: u64 = 1 << 62;
+const RECLAIM_OOM_BIT: u64 = 1 << 63;
 
 /// Requested reclaim work for each NUMA node. Multiple producers coalesce to
 /// the largest outstanding page target and OR their OOM authorization; the
 /// node's sole kswapd consumes both fields in one swap.
-static RECLAIM_REQUESTS: [AtomicUsize; crate::frame::MAX_NUMA_NODES] =
-    [const { AtomicUsize::new(0) }; crate::frame::MAX_NUMA_NODES];
+static RECLAIM_REQUESTS: [AtomicU64; crate::frame::MAX_NUMA_NODES] =
+    [const { AtomicU64::new(0) }; crate::frame::MAX_NUMA_NODES];
+
+/// Exact completion identity for one allocation-pressure request.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ReclaimTicket {
+    pub node: usize,
+    pub sequence: u32,
+}
 
 /// One atomically consumed background-reclaim request.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -366,29 +381,69 @@ pub struct ReclaimRequest {
     pub target_pages: usize,
     /// Whether at least one coalesced allocation failure authorized OOM policy.
     pub oom_authorized: bool,
+    /// OOM authority came only from a user fault and expires if no waiter owns
+    /// a ticket consumed by this cycle.
+    pub oom_requires_waiter: bool,
+    /// Newest request coalesced into this cycle. Completing it also completes
+    /// every older ticket consumed by the same atomic take.
+    pub ticket: Option<ReclaimTicket>,
 }
 
 impl ReclaimRequest {
     const NONE: Self = Self {
         target_pages: 0,
         oom_authorized: false,
+        oom_requires_waiter: false,
+        ticket: None,
     };
 }
 
-fn publish_reclaim_request(node: usize, pages: usize, authorize_oom: bool) {
+fn publish_reclaim_request(
+    node: usize,
+    pages: usize,
+    authorize_oom: bool,
+    oom_requires_waiter: bool,
+) -> Option<ReclaimTicket> {
     if pages == 0 {
-        return;
+        return None;
     }
-    let Some(request) = RECLAIM_REQUESTS.get(node) else {
-        return;
-    };
-    let pages = pages.min(RECLAIM_PAGE_MASK);
+    let request = RECLAIM_REQUESTS.get(node)?;
+    let pages = (pages as u64).min(RECLAIM_PAGE_MASK);
     let oom = if authorize_oom { RECLAIM_OOM_BIT } else { 0 };
-    let _ = request.fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-        let target = (current & RECLAIM_PAGE_MASK).max(pages);
-        Some((current & RECLAIM_OOM_BIT) | oom | target)
-    });
+    let previous = request
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            let target = (current & RECLAIM_PAGE_MASK).max(pages);
+            let sequence = (current & RECLAIM_SEQUENCE_MASK) >> RECLAIM_SEQUENCE_SHIFT;
+            let next = if sequence == RECLAIM_SEQUENCE_MAX {
+                1
+            } else {
+                sequence + 1
+            };
+            let current_oom = current & RECLAIM_OOM_BIT != 0;
+            let combined_oom = current_oom || authorize_oom;
+            let requires_waiter = (!current_oom || current & RECLAIM_OOM_WAITER_BIT != 0)
+                && (!authorize_oom || oom_requires_waiter);
+            let waiter_bit = if combined_oom && requires_waiter {
+                RECLAIM_OOM_WAITER_BIT
+            } else {
+                0
+            };
+            Some(
+                oom | (current & RECLAIM_OOM_BIT)
+                    | waiter_bit
+                    | (next << RECLAIM_SEQUENCE_SHIFT)
+                    | target,
+            )
+        })
+        .ok()?;
+    let previous_sequence = (previous & RECLAIM_SEQUENCE_MASK) >> RECLAIM_SEQUENCE_SHIFT;
+    let sequence = if previous_sequence == RECLAIM_SEQUENCE_MAX {
+        1
+    } else {
+        previous_sequence + 1
+    } as u32;
     wake_kswapd(node);
+    Some(ReclaimTicket { node, sequence })
 }
 
 /// Ask the background reclaimer for up to `pages` base pages on `node`.
@@ -397,14 +452,25 @@ fn publish_reclaim_request(node: usize, pages: usize, authorize_oom: bool) {
 /// than addition so a burst of failures cannot manufacture an unbounded debt.
 /// A zero-sized or out-of-range request is ignored.
 pub fn request_reclaim(node: usize, pages: usize) {
-    publish_reclaim_request(node, pages, false);
+    let _ = publish_reclaim_request(node, pages, false, false);
 }
 
 /// Publish background work for a genuinely failed allocation and authorize OOM
 /// policy if its reclaim pass makes no progress. Target and authorization are
 /// one atomic update, including when an ordinary request is already pending.
 pub fn request_reclaim_with_oom(node: usize, pages: usize) {
-    publish_reclaim_request(node, pages, true);
+    let _ = publish_reclaim_request(node, pages, true, false);
+}
+
+/// Publish allocation-pressure work and return its exact completion identity.
+/// The ticket lets a page-fault waiter ignore completion of an older kswapd
+/// cycle that happened to overlap its failed allocation.
+pub(crate) fn request_reclaim_ticket(
+    node: usize,
+    pages: usize,
+    authorize_oom: bool,
+) -> Option<ReclaimTicket> {
+    publish_reclaim_request(node, pages, authorize_oom, authorize_oom)
 }
 
 /// Consume the coalesced target and its OOM authorization for `node` in one
@@ -412,17 +478,31 @@ pub fn request_reclaim_with_oom(node: usize, pages: usize) {
 pub fn take_reclaim_request(node: usize) -> ReclaimRequest {
     let packed = RECLAIM_REQUESTS
         .get(node)
-        .map_or(0, |request| request.swap(0, Ordering::AcqRel));
+        .and_then(|request| {
+            request
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    Some(current & RECLAIM_SEQUENCE_MASK)
+                })
+                .ok()
+        })
+        .unwrap_or(0);
+    let target_pages = (packed & RECLAIM_PAGE_MASK) as usize;
+    let sequence = ((packed & RECLAIM_SEQUENCE_MASK) >> RECLAIM_SEQUENCE_SHIFT) as u32;
     ReclaimRequest {
-        target_pages: packed & RECLAIM_PAGE_MASK,
+        target_pages,
         oom_authorized: packed & RECLAIM_OOM_BIT != 0,
+        oom_requires_waiter: packed & RECLAIM_OOM_WAITER_BIT != 0,
+        ticket: (target_pages != 0).then_some(ReclaimTicket { node, sequence }),
     }
 }
 
 mod reclaim_request_tests {
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    use super::{request_reclaim, request_reclaim_with_oom, take_reclaim_request, ReclaimRequest};
+    use super::{
+        request_reclaim, request_reclaim_ticket, request_reclaim_with_oom, take_reclaim_request,
+        ReclaimRequest,
+    };
 
     fn smoke_reclaim_requests_coalesce_and_consume() -> TestResult {
         const NODE: usize = crate::frame::MAX_NUMA_NODES - 2;
@@ -432,17 +512,32 @@ mod reclaim_request_tests {
         request_reclaim(NODE, 7);
         request_reclaim(NODE, 3);
         request_reclaim(NODE, 0);
-        if take_reclaim_request(NODE)
-            != (ReclaimRequest {
-                target_pages: 7,
-                oom_authorized: false,
-            })
+        let first = take_reclaim_request(NODE);
+        if first.target_pages != 7
+            || first.oom_authorized
+            || first.oom_requires_waiter
+            || first
+                .ticket
+                .is_none_or(|ticket| ticket.node != NODE || ticket.sequence == 0)
         {
             return TestResult::Fail("reclaim requests did not coalesce by maximum");
         }
         if take_reclaim_request(NODE) != ReclaimRequest::NONE {
             return TestResult::Fail("reclaim request was not consumed exactly once");
         }
+
+        let Some(fault_ticket) = request_reclaim_ticket(NODE, 5, true) else {
+            return TestResult::Fail("user-fault reclaim request did not return a ticket");
+        };
+        let fault = take_reclaim_request(NODE);
+        if fault.target_pages != 5
+            || !fault.oom_authorized
+            || !fault.oom_requires_waiter
+            || fault.ticket != Some(fault_ticket)
+        {
+            return TestResult::Fail("user-fault OOM authority was not waiter-scoped");
+        }
+
         request_reclaim(crate::frame::MAX_NUMA_NODES, 9);
         if take_reclaim_request(crate::frame::MAX_NUMA_NODES) != ReclaimRequest::NONE {
             return TestResult::Fail("out-of-range reclaim request was retained");
@@ -454,20 +549,24 @@ mod reclaim_request_tests {
         // authorization together; neither may leak into the next request.
         request_reclaim(NODE, 2);
         request_reclaim_with_oom(NODE, 4);
-        if take_reclaim_request(NODE)
-            != (ReclaimRequest {
-                target_pages: 4,
-                oom_authorized: true,
-            })
+        let authorized = take_reclaim_request(NODE);
+        if authorized.target_pages != 4
+            || !authorized.oom_authorized
+            || authorized.oom_requires_waiter
+            || authorized
+                .ticket
+                .is_none_or(|ticket| ticket.node != NODE || ticket.sequence == 0)
         {
             return TestResult::Fail("OOM authorization was not paired with its request");
         }
         request_reclaim(NODE, 3);
-        if take_reclaim_request(NODE)
-            != (ReclaimRequest {
-                target_pages: 3,
-                oom_authorized: false,
-            })
+        let ordinary = take_reclaim_request(NODE);
+        if ordinary.target_pages != 3
+            || ordinary.oom_authorized
+            || ordinary.oom_requires_waiter
+            || ordinary
+                .ticket
+                .is_none_or(|ticket| ticket.node != NODE || ticket.sequence == 0)
         {
             return TestResult::Fail("OOM authorization leaked into the next request");
         }
