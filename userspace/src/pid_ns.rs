@@ -54,6 +54,19 @@ pub struct PidNamespace {
     /// Immediate ancestor PID namespace. None means the implicit root
     /// namespace; every descendant maps the same root-namespace task id.
     parent: Option<Arc<PidNamespace>>,
+    /// The INITIAL namespace translates identically: inner == outer, and
+    /// every task is visible.
+    ///
+    /// Linux says the same thing differently — `init_pid_ns` is an ordinary
+    /// namespace whose `struct pid` `numbers[0]` IS the global id — but the
+    /// effect is what matters here: a lookup in the initial namespace can
+    /// never miss, because there is nothing to have been bound.
+    ///
+    /// This is what lets the initial namespace be a real object instead of
+    /// the absence of one. Without it a freshly built `PidNamespace` starts
+    /// with EMPTY maps and mints inner ids from a watermark, which is the
+    /// opposite of what the initial namespace does.
+    identity: bool,
 }
 
 impl Drop for PidNamespace {
@@ -84,21 +97,19 @@ impl PidNamespace {
         parent: Option<Arc<Self>>,
         owner: Option<Arc<crate::namespaces::UserNamespace>>,
     ) -> Arc<Self> {
-        let id = crate::namespaces::alloc_ns_id();
-        crate::namespaces::ns_tree_add(
-            id,
-            crate::namespaces::ns_type::PID,
-            owner.as_ref().map_or(0, |u| u.id()),
-        );
-        Arc::new(Self {
-            id,
+        let owner_id = owner.as_ref().map_or(0, |u| u.id());
+        let ns = Arc::new(Self {
+            id: crate::namespaces::alloc_ns_id(),
+            identity: false,
             watermark: AtomicU64::new(1),
             inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
             outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
             free: IrqSafeSpinLock::new(BTreeSet::new()),
             owner: IrqSafeSpinLock::new(owner),
             parent,
-        })
+        });
+        register(&ns, owner_id);
+        ns
     }
 
     /// Immediate ancestor, or `None` when the parent is the implicit root
@@ -166,6 +177,15 @@ impl PidNamespace {
 
         if outer == 0 {
             return Err(EINVAL);
+        }
+        // The initial namespace has nothing to bind: a task's id there IS
+        // its outer id. Recording one would be a second, redundant copy of
+        // the identity map that could then drift from it.
+        if self.identity {
+            return match requested {
+                Some(want) if want != outer => Err(EEXIST),
+                _ => Ok(outer),
+            };
         }
         if let Some(&inner) = self.outer_to_inner.lock().get(&outer) {
             return match requested {
@@ -282,12 +302,18 @@ impl PidNamespace {
     /// Translate an inner pid to its outer pid. None if the inner
     /// pid is not bound in this namespace.
     pub fn inner_to_outer(&self, inner: u64) -> Option<u64> {
+        if self.identity {
+            return Some(inner);
+        }
         self.inner_to_outer.lock().get(&inner).copied()
     }
 
     /// Translate an outer pid to its inner pid in this namespace.
     /// None if the outer pid was never registered here.
     pub fn outer_to_inner(&self, outer: u64) -> Option<u64> {
+        if self.identity {
+            return Some(outer);
+        }
         self.outer_to_inner.lock().get(&outer).copied()
     }
 
@@ -301,6 +327,101 @@ impl PidNamespace {
     pub fn live_count(&self) -> usize {
         self.outer_to_inner.lock().len()
     }
+}
+
+/// The INITIAL pid namespace — a real object, as `init_pid_ns` is in Linux.
+///
+/// Every task that has not unshared is in THIS namespace, rather than in the
+/// absence of one. That distinction is not cosmetic: `may_see_all_namespaces`
+/// asks "is the caller in the initial pid namespace", and answering it by
+/// testing for the absence of a namespace makes a permission check depend on
+/// a representation detail — one that silently inverts the moment the
+/// representation changes.
+/// `OnceLock`, not a lock-guarded `Option`: this is read on EVERY pid
+/// translation — `self_inner_pid` is on the `getpid` path — and a spinlock
+/// acquire plus an `Arc` clone per call would be a real cost for something
+/// that is written once at boot. `OnceLock::get` is an acquire load and
+/// hands back a `&T`, so the hot path neither locks nor touches a refcount.
+static INITIAL_PID_NS: narf_lib::sync::OnceLock<Arc<PidNamespace>> =
+    narf_lib::sync::OnceLock::new();
+
+/// The initial pid namespace, created on first use and never dropped.
+///
+/// Identity-translating: a task's id here IS its outer id, so a lookup can
+/// never miss. `init_namespaces` materialises it at boot so the namespace
+/// tree holds it from the start.
+pub fn initial_pid_ns() -> &'static Arc<PidNamespace> {
+    INITIAL_PID_NS.get_or_init(|| {
+        let ns = Arc::new(PidNamespace {
+            id: crate::namespaces::initial_pid_ns_id(),
+            identity: true,
+            watermark: AtomicU64::new(1),
+            inner_to_outer: IrqSafeSpinLock::new(BTreeMap::new()),
+            outer_to_inner: IrqSafeSpinLock::new(BTreeMap::new()),
+            free: IrqSafeSpinLock::new(BTreeSet::new()),
+            owner: IrqSafeSpinLock::new(None),
+            parent: None,
+        });
+        register(&ns, 0);
+        ns
+    })
+}
+
+/// `NsObject` for the pid namespace — lives here rather than beside its
+/// siblings in `namespaces.rs` because `PidNamespace::id` is private to
+/// this module.
+impl narf_filesystem::NsObject for PidNamespace {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn ns_id(&self) -> u64 {
+        self.id
+    }
+    fn ns_type(&self) -> u32 {
+        crate::namespaces::ns_type::PID
+    }
+}
+
+/// Publish a fully-constructed namespace into the tree.
+///
+/// Registration follows `Arc::new` because the tree stores a `Weak` handle
+/// and there is nothing to downgrade before the `Arc` exists
+/// (`userspace/specification/namespace-tree.md` R7).
+/// Re-state the initial pid namespace in the tree.
+///
+/// `initial_pid_ns` memoises, so it registers only on the very first call;
+/// `init_namespaces` needs a way to restore the entry after the tree has
+/// been reset. The insert is idempotent.
+pub(crate) fn register_initial() {
+    register(initial_pid_ns(), 0);
+}
+
+fn register(ns: &Arc<PidNamespace>, owner_user_ns: crate::namespaces::NsId) {
+    crate::namespaces::ns_tree_add(
+        ns.id,
+        crate::namespaces::ns_type::PID,
+        owner_user_ns,
+        Arc::downgrade(ns) as alloc::sync::Weak<dyn narf_filesystem::NsObject>,
+    );
+}
+
+/// Borrow the pid namespace `task` is in, without cloning an `Arc`.
+///
+/// The translation helpers below call this on every lookup, so it takes the
+/// borrow rather than a reference count: `ns_of` hands back an owned `Arc`
+/// only when the task really has unshared, and the initial namespace is a
+/// `&'static` that costs nothing to reach.
+fn with_pid_ns<R>(task: u64, f: impl FnOnce(&PidNamespace) -> R) -> R {
+    match ns_of(task) {
+        Some(ns) => f(&ns),
+        None => f(initial_pid_ns()),
+    }
+}
+
+/// The pid namespace `task` is in — never `None`, because every task is in
+/// one. Replaces the old `ns_of(task)` + "None means initial" idiom.
+pub fn current_pid_ns(task: u64) -> Arc<PidNamespace> {
+    ns_of(task).unwrap_or_else(|| initial_pid_ns().clone())
 }
 
 /// PID allocation prepared before the scheduler task becomes runnable.
@@ -607,10 +728,11 @@ pub fn attach_to_ns(task: u64, outer_pid: u64, ns: Arc<PidNamespace>) -> u64 {
 /// namespace (a process in a sibling/parent namespace it must not see). Drives
 /// `/proc` enumeration so a namespaced reader lists only its own namespace.
 pub fn ns_visible_inner(task: u64, outer: u64) -> Option<u64> {
-    match ns_of(task) {
-        Some(ns) => ns.outer_to_inner(outer),
-        None => Some(outer),
-    }
+    // No `None` arm: the initial namespace is an object that translates
+    // identically, so `outer_to_inner` there returns `Some(outer)` on its
+    // own. The special case moved into the namespace, which is where it
+    // belongs — every caller had to remember it before.
+    with_pid_ns(task, |ns| ns.outer_to_inner(outer))
 }
 
 /// Translate `task`'s outer pid through whichever namespace it
@@ -619,8 +741,8 @@ pub fn ns_visible_inner(task: u64, outer: u64) -> Option<u64> {
 /// Linux does for credential and peer-PID queries; only the root namespace
 /// falls back to the outer PID.
 pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
-    match ns_of(task) {
-        Some(ns) => {
+    with_pid_ns(task, |ns| {
+        {
             if let Some(inner) = ns.outer_to_inner(outer_pid) {
                 inner
             } else {
@@ -653,8 +775,7 @@ pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
                 }
             }
         }
-        None => outer_pid,
-    }
+    })
 }
 
 /// Translate an in-namespace pid (as observed by `task`) to its
@@ -662,10 +783,7 @@ pub fn self_inner_pid(task: u64, outer_pid: u64) -> u64 {
 /// None if `inner_pid` is not bound in the calling task's namespace.
 /// If the calling task is in the root namespace, returns `Some(inner_pid)`.
 pub fn resolve_inner_pid(task: u64, inner_pid: u64) -> Option<u64> {
-    match ns_of(task) {
-        Some(ns) => ns.inner_to_outer(inner_pid),
-        None => Some(inner_pid),
-    }
+    with_pid_ns(task, |ns| ns.inner_to_outer(inner_pid))
 }
 
 /// Test/reset hook — wipe all namespace state.

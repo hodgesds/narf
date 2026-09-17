@@ -2892,7 +2892,10 @@ static NS_TREE_REMOVE_HOOK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the namespace-tree hooks (userspace `ns_tree_add`/`ns_tree_remove`).
-pub fn install_ns_tree_hooks(add: fn(u64, u32, u64), remove: fn(u64)) {
+pub fn install_ns_tree_hooks(
+    add: fn(u64, u32, u64, alloc::sync::Weak<dyn NsObject>),
+    remove: fn(u64),
+) {
     NS_TREE_ADD_HOOK.store(add as usize, core::sync::atomic::Ordering::Release);
     NS_TREE_REMOVE_HOOK.store(remove as usize, core::sync::atomic::Ordering::Release);
 }
@@ -2901,7 +2904,12 @@ pub fn install_ns_tree_hooks(add: fn(u64, u32, u64), remove: fn(u64)) {
 pub const NS_TYPE_MNT: u32 = 1 << 17;
 pub const NS_TYPE_CGROUP: u32 = 1 << 25;
 
-pub(crate) fn ns_tree_add(id: u64, ns_type: u32, owner_user_ns: u64) {
+pub(crate) fn ns_tree_add(
+    id: u64,
+    ns_type: u32,
+    owner_user_ns: u64,
+    object: alloc::sync::Weak<dyn NsObject>,
+) {
     if id == 0 {
         return;
     }
@@ -2910,9 +2918,12 @@ pub(crate) fn ns_tree_add(id: u64, ns_type: u32, owner_user_ns: u64) {
         return;
     }
     // SAFETY: v was stored by `install_ns_tree_hooks` as a
-    // `fn(u64, u32, u64)` pointer; non-zero confirms it was installed.
-    let f: fn(u64, u32, u64) = unsafe { core::mem::transmute::<usize, fn(u64, u32, u64)>(v) };
-    f(id, ns_type, owner_user_ns);
+    // `fn(u64, u32, u64, Weak<dyn NsObject>)` pointer; non-zero confirms it
+    // was installed.
+    let f: fn(u64, u32, u64, alloc::sync::Weak<dyn NsObject>) = unsafe {
+        core::mem::transmute::<usize, fn(u64, u32, u64, alloc::sync::Weak<dyn NsObject>)>(v)
+    };
+    f(id, ns_type, owner_user_ns, object);
 }
 
 pub(crate) fn ns_tree_remove(id: u64) {
@@ -3040,6 +3051,26 @@ pub fn drm_prime_export(card_index: u32, gem_handle: u32) -> Option<Arc<dyn File
 /// namespace's lifetime: a table would keep every user namespace that ever
 /// owned a mount namespace alive, and would have to be pruned from a place
 /// that cannot see when the last reference goes away.
+/// A namespace object, of any flavour, as the namespace tree holds it.
+///
+/// Defined in this crate rather than in `userspace` because two flavours —
+/// mount and cgroup — live HERE and cannot name userspace types, while the
+/// tree that holds them all lives above. A trait both sides can see is the
+/// only thing that crosses.
+///
+/// `as_any` is what lets a holder recover the concrete namespace: the tree
+/// stores one uniform handle, and a caller that needs `MountNamespace`
+/// specifically downcasts. Keeping `id`/`ns_type` on the trait too means the
+/// tree can answer a filtered query without upgrading a single weak
+/// reference.
+pub trait NsObject: Send + Sync + core::fmt::Debug {
+    fn as_any(&self) -> &dyn core::any::Any;
+    /// This namespace's globally unique id.
+    fn ns_id(&self) -> u64;
+    /// The `enum ns_type` bit for this flavour.
+    fn ns_type(&self) -> u32;
+}
+
 pub trait NsOwner: Send + Sync + core::fmt::Debug {
     fn as_any(&self) -> &dyn core::any::Any;
 
@@ -3051,6 +3082,18 @@ pub trait NsOwner: Send + Sync + core::fmt::Debug {
     }
 }
 
+impl NsObject for MountNamespace {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn ns_id(&self) -> u64 {
+        self.id
+    }
+    fn ns_type(&self) -> u32 {
+        NS_TYPE_MNT
+    }
+}
+
 impl Drop for MountNamespace {
     fn drop(&mut self) {
         // Retire the tree entry: an entry outliving its namespace would
@@ -3059,9 +3102,29 @@ impl Drop for MountNamespace {
     }
 }
 
+/// Where a mount namespace keeps its mount table.
+///
+/// The INITIAL mount namespace is not a snapshot of the global registry —
+/// it IS the global registry. Giving it `Owned` storage seeded from
+/// `REGISTRY` would fork the table at boot: a later `mount(2)` through the
+/// registry would be invisible to the namespace object, and the two would
+/// drift apart silently. `VfsRegistry` and a namespace's private storage
+/// are the same two fields, so the initial namespace can borrow the
+/// registry outright.
+///
+/// See `userspace/specification/namespace-tree.md` R30.
+#[derive(Debug)]
+enum MountStore {
+    /// Private storage, as `copy_mnt_ns` gives an `unshare(CLONE_NEWNS)`.
+    Owned(VfsRegistry),
+    /// `init_mnt_ns` — the live global mount table.
+    Registry,
+}
+
 /// Snapshot-shaped mount table. Holds an owned Vec of mounts so a
-/// per-task NS can diverge from the global registry without
-/// affecting it.
+/// per-task NS can diverge from the global registry without affecting it —
+/// except for the initial namespace, which borrows the registry
+/// ([`MountStore`]).
 #[derive(Debug)]
 pub struct MountNamespace {
     /// Stable namespace id (nsfs inode in Linux), drawn from the
@@ -3072,11 +3135,81 @@ pub struct MountNamespace {
     /// namespace. `None` is the initial user namespace — every mount
     /// namespace built before any `unshare(CLONE_NEWUSER)`.
     owner: Option<Arc<dyn NsOwner>>,
-    inner: IrqSafeSpinLock<Vec<Mount>>,
-    mountinfo_generation: core::sync::atomic::AtomicU64,
+    store: MountStore,
+}
+
+/// `MNT_NS_INIT_ID` (`include/uapi/linux/nsfs.h:78`) — the initial mount
+/// namespace's reserved id.
+///
+/// Duplicated here rather than imported because the reserved-id block lives
+/// with the namespace tree in `narf-userspace`, which sits ABOVE this crate.
+/// `smoke_ns_init_ids_agree_across_crates` asserts the two agree.
+pub const NS_INIT_ID_MNT: u64 = 8;
+
+/// `init_mnt_ns` — the initial mount namespace.
+///
+/// Borrows the global registry rather than snapshotting it, so a `mount(2)`
+/// through either is visible through both. Never dropped, like every
+/// initial namespace.
+static INITIAL_MOUNT_NS: IrqSafeSpinLock<Option<Arc<MountNamespace>>> = IrqSafeSpinLock::new(None);
+
+/// The initial mount namespace, created on first use and never dropped.
+///
+/// Every flavour NARF implements needs a real object behind its initial
+/// tree entry: an entry whose weak handle cannot be upgraded is
+/// indistinguishable from a stale one
+/// (`userspace/specification/namespace-tree.md` R30).
+/// Re-state the initial mount namespace in the tree.
+///
+/// [`initial_mount_ns`] memoises, so it registers only on its first call;
+/// the boot path needs a way to restore the entry after a test has reset
+/// the tree. `ns_tree_add` is an idempotent insert keyed by id.
+pub fn register_initial_mount_ns() {
+    let ns = initial_mount_ns();
+    ns_tree_add(
+        NS_INIT_ID_MNT,
+        NS_TYPE_MNT,
+        0,
+        Arc::downgrade(&ns) as alloc::sync::Weak<dyn NsObject>,
+    );
+}
+
+pub fn initial_mount_ns() -> Arc<MountNamespace> {
+    // The `Arc` is cloned out and the guard dropped before returning, so no
+    // caller can drop a `MountNamespace` — and re-enter `ns_tree_remove` —
+    // while this lock is held.
+    let mut g = INITIAL_MOUNT_NS.lock();
+    if let Some(ns) = g.as_ref() {
+        return ns.clone();
+    }
+    let ns = Arc::new(MountNamespace {
+        id: NS_INIT_ID_MNT,
+        owner: None,
+        store: MountStore::Registry,
+    });
+    ns_tree_add(
+        NS_INIT_ID_MNT,
+        NS_TYPE_MNT,
+        0,
+        Arc::downgrade(&ns) as alloc::sync::Weak<dyn NsObject>,
+    );
+    *g = Some(ns.clone());
+    ns
 }
 
 impl MountNamespace {
+    /// The table this namespace reads and writes.
+    ///
+    /// One accessor rather than a branch in each of the twenty-odd methods
+    /// below: the two storage shapes are the same type, so only the
+    /// *address* differs.
+    fn store(&self) -> &VfsRegistry {
+        match &self.store {
+            MountStore::Owned(v) => v,
+            MountStore::Registry => &REGISTRY,
+        }
+    }
+
     fn from_mounts(mounts: &[Mount], owner: Option<Arc<dyn NsOwner>>) -> Arc<Self> {
         let copied = mounts
             .iter()
@@ -3091,13 +3224,24 @@ impl MountNamespace {
             })
             .collect();
         let id = alloc_mount_ns_id();
-        ns_tree_add(id, NS_TYPE_MNT, owner.as_ref().map_or(0, |o| o.ns_id()));
-        Arc::new(Self {
+        let owner_id = owner.as_ref().map_or(0, |o| o.ns_id());
+        // Registration happens AFTER the `Arc` exists: the tree holds a weak
+        // handle, and there is nothing to downgrade until the object is built.
+        let ns = Arc::new(Self {
             id,
             owner,
-            inner: IrqSafeSpinLock::new(copied),
-            mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
-        })
+            store: MountStore::Owned(VfsRegistry {
+                inner: IrqSafeSpinLock::new(copied),
+                mountinfo_generation: core::sync::atomic::AtomicU64::new(1),
+            }),
+        });
+        ns_tree_add(
+            id,
+            NS_TYPE_MNT,
+            owner_id,
+            Arc::downgrade(&ns) as alloc::sync::Weak<dyn NsObject>,
+        );
+        ns
     }
 
     /// Build a private namespace seeded with the current global
@@ -3134,7 +3278,7 @@ impl MountNamespace {
     /// that unshares a user namespace and then a mount namespace owns the
     /// result even though it copied a table it did not own.
     pub fn snapshot_owned_by(&self, owner: Option<Arc<dyn NsOwner>>) -> Arc<Self> {
-        let g = self.inner.lock();
+        let g = self.store().inner.lock();
         Self::from_mounts(&g, owner)
     }
 
@@ -3147,7 +3291,8 @@ impl MountNamespace {
     /// this namespace. It advances after every visible attach, detach, or
     /// move, matching Linux's `POLLPRI` mountinfo notification contract.
     pub fn mountinfo_generation(&self) -> u64 {
-        self.mountinfo_generation
+        self.store()
+            .mountinfo_generation
             .load(core::sync::atomic::Ordering::Acquire)
     }
 
@@ -3164,7 +3309,7 @@ impl MountNamespace {
         // is an IrqSafeSpinLock, so holding it across `f` deadlocks the box
         // (see VfsRegistry::resolve_absolute for the full rationale).
         let (fs, rel) = {
-            let q = self.inner.lock();
+            let q = self.store().inner.lock();
             let mut best: Option<&Mount> = None;
             for m in q.iter() {
                 let is_match = abs == m.path.as_str()
@@ -3190,7 +3335,7 @@ impl MountNamespace {
     where
         F: FnOnce(&dyn FsInstance, &str, u64) -> R,
     {
-        let (fs, rel_start, mount_id) = single_mount_resolution(&self.inner.lock(), abs)?;
+        let (fs, rel_start, mount_id) = single_mount_resolution(&self.store().inner.lock(), abs)?;
         Some(f(&*fs, &abs[rel_start..], mount_id))
     }
 
@@ -3232,7 +3377,7 @@ impl MountNamespace {
         // `f` may block on block I/O and `inner` is an IrqSafeSpinLock, so
         // holding it across `f` deadlocks the box (see `resolve_absolute`).
         let (fs, dir) = {
-            let q = self.inner.lock();
+            let q = self.store().inner.lock();
             let mut best: Option<&Mount> = None;
             for m in q.iter() {
                 let is_match = parent_path == m.path.as_str()
@@ -3291,7 +3436,7 @@ impl MountNamespace {
         let (a_parent, a_leaf) = split(a)?;
         let (b_parent, b_leaf) = split(b)?;
         let (fs, a_dir, b_dir) = {
-            let q = self.inner.lock();
+            let q = self.store().inner.lock();
             let best_mount = |parent_path: &str| -> Option<&Mount> {
                 let mut best: Option<&Mount> = None;
                 for m in q.iter() {
@@ -3340,7 +3485,7 @@ impl MountNamespace {
         if abs.is_empty() || abs.as_bytes()[0] != b'/' {
             return None;
         }
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         let mut best: Option<&Mount> = None;
         for m in q.iter() {
             let is_match = abs == m.path.as_str()
@@ -3372,7 +3517,7 @@ impl MountNamespace {
 
     /// List the mount paths in this namespace.
     pub fn list(&self) -> Vec<String> {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         q.iter().map(|m| m.path.clone()).collect()
     }
 
@@ -3381,7 +3526,7 @@ impl MountNamespace {
     /// surface the per-mount FsInstance name without exposing the
     /// internal `Mount` shape.
     pub fn list_with_names(&self) -> Vec<(String, String)> {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         q.iter()
             .map(|m| (m.path.clone(), String::from(m.fs.name())))
             .collect()
@@ -3391,7 +3536,7 @@ impl MountNamespace {
     /// the two option fields `/proc/mounts` concatenates into its fourth
     /// column.
     pub fn list_with_options(&self) -> Vec<(String, String, String, String)> {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         q.iter()
             .map(|m| {
                 (
@@ -3408,7 +3553,7 @@ impl MountNamespace {
     /// longest-prefix rule resolution uses, or `None` when no mount covers
     /// it.
     pub fn flags_at(&self, abs: &str) -> Option<u64> {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         mount_flags_for(&q, abs)
     }
 
@@ -3416,7 +3561,7 @@ impl MountNamespace {
     /// `do_reconfigure_mnt`, which changes an existing attachment rather
     /// than creating one.
     pub fn set_flags_at(&self, path: &str, flags: u64) -> bool {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         let Some(mount) = q.iter().rev().find(|m| m.path == path) else {
             return false;
         };
@@ -3424,19 +3569,20 @@ impl MountNamespace {
             .flags
             .store(flags, core::sync::atomic::Ordering::Release);
         note_mnt_flags(flags);
-        self.mountinfo_generation
+        self.store()
+            .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         true
     }
 
     /// Mount identity and hierarchy in attachment order.
     pub fn list_mountinfo(&self) -> Vec<MountInfoRow> {
-        mountinfo_rows(&self.inner.lock())
+        mountinfo_rows(&self.store().inner.lock())
     }
 
     /// ID of the newest visible mount covering `abs`.
     pub fn mount_id_at(&self, abs: &str) -> Option<u64> {
-        let q = self.inner.lock();
+        let q = self.store().inner.lock();
         q.iter()
             .filter(|m| {
                 abs == m.path
@@ -3471,7 +3617,7 @@ impl MountNamespace {
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let handle = Cap::<MountPoint, Write>::bootstrap();
-        self.inner.lock().push(Mount {
+        self.store().inner.lock().push(Mount {
             path: String::from(path),
             fs,
             handle,
@@ -3479,7 +3625,8 @@ impl MountNamespace {
             flags: core::sync::atomic::AtomicU64::new(flags),
         });
         note_mnt_flags(flags);
-        self.mountinfo_generation
+        self.store()
+            .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         notify_mount_change();
         Ok(handle)
@@ -3494,7 +3641,7 @@ impl MountNamespace {
     ) -> Result<Cap<MountPoint, Write>, FsError> {
         authority.check_live()?;
         let (source_fs, rel) = {
-            let q = self.inner.lock();
+            let q = self.store().inner.lock();
             let source_mount = q
                 .iter()
                 .filter(|m| {
@@ -3518,13 +3665,14 @@ impl MountNamespace {
 
     /// Detach the topmost mount at `path` from this private namespace.
     pub fn unmount(&self, path: &str) -> Result<(), FsError> {
-        let mut q = self.inner.lock();
+        let mut q = self.store().inner.lock();
         let index = q
             .iter()
             .rposition(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
         q.remove(index);
-        self.mountinfo_generation
+        self.store()
+            .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
         notify_mount_change();
@@ -3533,13 +3681,14 @@ impl MountNamespace {
 
     /// Move the topmost mount at `source` to `target`.
     pub fn move_mount(&self, source: &str, target: &str) -> Result<(), FsError> {
-        let mut q = self.inner.lock();
+        let mut q = self.store().inner.lock();
         let index = q
             .iter()
             .rposition(|m| m.path == source)
             .ok_or(FsError::NotFound)?;
         q[index].path = String::from(target);
-        self.mountinfo_generation
+        self.store()
+            .mountinfo_generation
             .fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         drop(q);
         notify_mount_change();

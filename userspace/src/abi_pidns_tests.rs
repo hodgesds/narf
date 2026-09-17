@@ -1533,3 +1533,182 @@ fn smoke_abi_listns_owner_filter() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_listns_owner_filter);
+
+// ── Reserved initial-namespace ids ───────────────────────────────
+//
+// `enum init_ns_id` (`include/uapi/linux/nsfs.h:71`) fixes the id of each
+// flavour's INITIAL namespace, and `is_ns_init_id()` is spelled
+// `ns->ns_id <= NS_LAST_INIT_ID` — so the values must be exactly those and
+// exactly contiguous. See `userspace/specification/namespace-tree.md` R2.
+
+/// The initial namespace of every flavour carries its reserved UAPI id.
+///
+/// These were previously drawn from the shared counter, which made an
+/// initial namespace's id depend on boot ordering and match the UAPI
+/// constants only by coincidence. The negative half is what makes this a
+/// real check: a *non*-initial namespace must never land in the reserved
+/// block, or `is_ns_init_id` would call it initial and the refcount rules
+/// that hang off that predicate would apply to the wrong object.
+fn smoke_abi_ns_initial_ids_are_reserved() -> TestResult {
+    use crate::namespaces::{init_ns_id, is_init_ns_id, ns_tree_lookup, ns_type};
+    with_setup(|| {
+        crate::namespaces::init_namespaces();
+        for (id, want, what) in [
+            (init_ns_id::IPC, ns_type::IPC, "ipc"),
+            (init_ns_id::UTS, ns_type::UTS, "uts"),
+            (init_ns_id::USER, ns_type::USER, "user"),
+            (init_ns_id::PID, ns_type::PID, "pid"),
+            (init_ns_id::NET, ns_type::NET, "net"),
+            (init_ns_id::MNT, ns_type::MNT, "mnt"),
+        ] {
+            let entry = ns_tree_lookup(id)
+                .ok_or("an initial namespace is missing from the tree at its reserved id")?;
+            if entry.ns_type != want {
+                let _ = what;
+                return Err("a reserved id is held by the wrong flavour");
+            }
+            if !is_init_ns_id(id) {
+                return Err("a reserved id did not read as an initial-namespace id");
+            }
+        }
+        // The UAPI block is 1..=8 and NOTHING else may fall in it.
+        if is_init_ns_id(0) || is_init_ns_id(init_ns_id::LAST + 1) {
+            return Err("the reserved id range does not match NS_LAST_INIT_ID");
+        }
+        // Negative control: a freshly minted namespace must land ABOVE the
+        // block. Without the counter starting at NS_LAST_INIT_ID + 1 this is
+        // the assertion that fails.
+        let fresh = crate::namespaces::UtsNamespace::new_default();
+        if is_init_ns_id(fresh.id()) {
+            return Err("a newly created namespace was minted inside the reserved id block");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ns_initial_ids_are_reserved);
+
+/// `narf-filesystem` spells the reserved MNT id itself, because the
+/// reserved block lives in the crate ABOVE it. The two must agree.
+///
+/// Without this, a rename or a renumber on one side would silently give the
+/// initial mount namespace two different identities depending on which
+/// crate you asked.
+fn smoke_abi_ns_init_ids_agree_across_crates() -> TestResult {
+    if narf_filesystem::NS_INIT_ID_MNT != crate::namespaces::init_ns_id::MNT {
+        return TestResult::Fail("narf-filesystem's NS_INIT_ID_MNT disagrees with init_ns_id::MNT");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("syscall_abi", smoke_abi_ns_init_ids_agree_across_crates);
+
+/// The initial mount namespace IS the global registry, not a snapshot.
+///
+/// A snapshot would fork the table at boot: a later `mount(2)` through the
+/// registry would be invisible through the namespace object, and the two
+/// would drift apart with nothing reporting it. A private namespace must
+/// still diverge — that is the negative control, and it is what says this
+/// test is measuring sharing rather than measuring nothing.
+fn smoke_abi_initial_mount_ns_shares_the_registry() -> TestResult {
+    with_setup(|| {
+        let init = narf_filesystem::initial_mount_ns();
+        let private = narf_filesystem::MountNamespace::snapshot_global();
+        let before_init = init.list().len();
+        let before_private = private.list().len();
+
+        // Mount through the REGISTRY, not through either namespace object —
+        // that is the path the initial namespace has to observe.
+        let auth = narf_filesystem::bootstrap_mount_authority();
+        let fs: alloc::sync::Arc<dyn narf_filesystem::FsInstance> =
+            alloc::sync::Arc::new(narf_filesystem::VirtiofsMount::new("nstree-probe"));
+        let handle = match narf_filesystem::registry().mount_arc(&auth, "/abi-nstree-probe", fs) {
+            Ok(h) => h,
+            Err(_) => return Err("could not mount the probe filesystem in the registry"),
+        };
+
+        let grew_init = init.list().len() > before_init;
+        let grew_private = private.list().len() > before_private;
+        let _ = narf_filesystem::registry().unmount(&handle, "/abi-nstree-probe");
+
+        if !grew_init {
+            return Err("a mount through the registry was invisible to the initial namespace");
+        }
+        if grew_private {
+            return Err("a mount through the registry leaked into a private namespace");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_initial_mount_ns_shares_the_registry
+);
+
+/// Namespace churn retires trees, and every retired tree is reclaimed.
+///
+/// Each add and remove publishes a fresh map and retires the previous one,
+/// so a few hundred namespaces retire a few hundred trees — well past the
+/// 64-entry ceiling the collector's per-CPU queue used to have, when an
+/// over-capacity enqueue was silently discarded. The leak itself is fixed
+/// in `narf-rcu` and pinned there by
+/// `smoke_rcu_retire_far_past_old_bucket_cap_reclaims_all`; this asserts
+/// the tree is a well-behaved consumer of the fixed collector — the queue
+/// drains to empty, and the tree is still correct after churning through it.
+fn smoke_abi_nstree_churn_reclaims_retired_trees() -> TestResult {
+    use crate::namespaces::UtsNamespace;
+    with_setup(|| {
+        const N: usize = 256;
+        narf_rcu::report_quiescent();
+        for _ in 0..N {
+            let ns = UtsNamespace::new_default();
+            if crate::namespaces::ns_tree_lookup(ns.id()).is_none() {
+                return Err("a namespace created during churn was not in the tree");
+            }
+        }
+        // Every one of those maps must be reclaimABLE, not discarded.
+        if narf_rcu::qsbr::overflow_count_this_cpu() != 0 {
+            return Err("the collector discarded a retired tree");
+        }
+        narf_rcu::sync();
+        if narf_rcu::qsbr::deferred_len_this_cpu() != 0 {
+            return Err("retired trees were still queued after a grace period");
+        }
+        // And the tree itself survived the churn: those namespaces are gone
+        // (each `Arc` dropped at its iteration's end), so what remains must
+        // still be a whole map and not a half-published intermediate.
+        crate::namespaces::init_namespaces();
+        if crate::namespaces::ns_tree_lookup(crate::namespaces::init_ns_id::USER).is_none() {
+            return Err("the tree lost an initial namespace across the churn");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_churn_reclaims_retired_trees);
+
+/// A reader holding a tree snapshot survives a concurrent removal.
+///
+/// This is the property the copy-on-write cell exists for: `ns_tree_entries_from`
+/// hands back owned entries taken under a pin, and a namespace dropped
+/// afterwards cannot invalidate them. Under the old spinlock the same
+/// sequence was safe only because no caller held a borrow across a drop —
+/// a rule maintained by hand at every call site.
+fn smoke_abi_nstree_snapshot_survives_removal() -> TestResult {
+    use crate::namespaces::UtsNamespace;
+    with_setup(|| {
+        let ns = UtsNamespace::new_default();
+        let id = ns.id();
+        let snapshot = crate::namespaces::ns_tree_entries_from(0, 0, None);
+        if !snapshot.iter().any(|e| e.id == id) {
+            return Err("the snapshot did not contain the namespace that was live when taken");
+        }
+        drop(ns);
+        // The snapshot is owned, so it still names the id; the TREE must not.
+        if !snapshot.iter().any(|e| e.id == id) {
+            return Err("a snapshot taken before the drop lost its entry");
+        }
+        if crate::namespaces::ns_tree_lookup(id).is_some() {
+            return Err("a dropped namespace is still reachable through the tree");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_snapshot_survives_removal);

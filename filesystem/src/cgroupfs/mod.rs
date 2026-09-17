@@ -932,6 +932,18 @@ pub fn memory_limit_read_charge_reentry_for_test(pid: u64, file: &str, delta_byt
 
 // ── cgroup namespace (CLONE_NEWCGROUP) ──────────────────────────────
 
+impl crate::NsObject for CgroupNamespace {
+    fn as_any(&self) -> &dyn core::any::Any {
+        self
+    }
+    fn ns_id(&self) -> u64 {
+        self.id
+    }
+    fn ns_type(&self) -> u32 {
+        crate::NS_TYPE_CGROUP
+    }
+}
+
 impl Drop for CgroupNamespace {
     fn drop(&mut self) {
         // Retire the tree entry: an entry outliving its namespace would
@@ -960,12 +972,17 @@ impl CgroupNamespace {
 
     fn new_owned_by(root: Arc<Cgroup>, owner: Option<Arc<dyn crate::NsOwner>>) -> Arc<Self> {
         let id = crate::alloc_mount_ns_id();
+        let owner_id = owner.as_ref().map_or(0, |o| o.ns_id());
+        // After the `Arc`: the tree holds a weak handle, so there is nothing
+        // to downgrade until the object exists.
+        let ns = Arc::new(Self { id, root, owner });
         crate::ns_tree_add(
             id,
             crate::NS_TYPE_CGROUP,
-            owner.as_ref().map_or(0, |o| o.ns_id()),
+            owner_id,
+            Arc::downgrade(&ns) as alloc::sync::Weak<dyn crate::NsObject>,
         );
-        Arc::new(Self { id, root, owner })
+        ns
     }
 
     pub fn id(&self) -> u64 {
