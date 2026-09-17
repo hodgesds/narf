@@ -193,6 +193,24 @@ pub fn setup() {
 
 pub fn teardown() {
     fd::__test_clear_nofile_limit_lookup();
+    // Signal state was the hole in the fresh-view promise `setup` makes.
+    // `setup` resets it via `init_per_task_state` -> `signal_init`, so every
+    // `with_setup` case starts clean — but nothing reset it on the way OUT,
+    // so a case that left a signal pending handed it to whatever ran next.
+    // For another `with_setup` case that is invisible (its own `setup`
+    // clears it); for a case that runs BARE it is not, and the bare case
+    // then fails on its predecessor's residue.
+    //
+    // That is not hypothetical, and it is the same shape as the namespace
+    // leak documented in `setup`: `smoke_abi_signal_rt_sigqueueinfo_pos`
+    // queues SIGUSR1 (signal 10 = bit 9) and never clears it, while the
+    // bare `smoke_abi_signal_sigkill_pending_at_sig_bit_9` asserts bit 9 is
+    // clear. Test order comes from a linker section, so which case precedes
+    // which changes whenever any file in the registry changes size — adding
+    // four unrelated namespace cases was enough to put them next to each
+    // other and turn a latent dependency into a deterministic aarch64
+    // failure. Resetting here fixes the class, not the one case.
+    crate::handlers::__test_signal_reset();
     crate::handlers::__test_mount_namespaces_reset();
     crate::handlers::__test_root_dir_reset();
     #[cfg(feature = "container")]
