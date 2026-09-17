@@ -6832,7 +6832,30 @@ pub fn clear_mempolicy_for_fault() {
 // a per-task side table so getattr reflects setattr.
 
 /// `SCHED_ATTR_SIZE_VER0` — the smallest valid `struct sched_attr`.
-const SCHED_ATTR_SIZE: usize = 48;
+/// `SCHED_ATTR_SIZE_VER0` (`include/uapi/linux/sched/types.h:7`) — the first
+/// published `struct sched_attr`, and the largest NARF knows.
+///
+/// Linux's current `sizeof(struct sched_attr)` is `SCHED_ATTR_SIZE_VER1`
+/// (56): VER1 added `sched_util_min`/`sched_util_max`, which need uclamp
+/// support in the scheduler. NARF has none, so it reports VER0 — which is
+/// not a shortfall in the ABI but a legitimate configuration of it. A
+/// modern caller passing 56 bytes with those fields ZERO is accepted
+/// (`copy_struct_from_user` ignores a zero tail); one that actually asks
+/// for util clamping gets -E2BIG, which is exactly what a pre-VER1 kernel
+/// answers and is how the caller learns to stop asking.
+const SCHED_ATTR_SIZE_VER0: usize = 48;
+/// `SCHED_ATTR_SIZE_VER1` — named so the `SCHED_FLAG_UTIL_CLAMP` rule can
+/// cite the size it requires, even though NARF never accepts one this big.
+const SCHED_ATTR_SIZE_VER1: usize = 56;
+/// The largest `sched_attr` this kernel understands.
+const SCHED_ATTR_SIZE: usize = SCHED_ATTR_SIZE_VER0;
+
+/// `SCHED_FLAG_UTIL_CLAMP` (`include/uapi/linux/sched.h:140`) —
+/// `UTIL_CLAMP_MIN | UTIL_CLAMP_MAX`.
+const SCHED_FLAG_UTIL_CLAMP: u64 = 0x20 | 0x40;
+/// `SCHED_FLAG_ALL` — every flag the ABI defines. A flag outside this is a
+/// caller expecting something no kernel does.
+const SCHED_FLAG_ALL: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
 
 static SCHED_ATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, [u8; SCHED_ATTR_SIZE]>>,

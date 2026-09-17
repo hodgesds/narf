@@ -847,19 +847,141 @@ fn smoke_abi_sched_setattr_nonzero_flags_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_nonzero_flags_neg);
 
+/// `-E2BIG` for an unusable size, not `-EINVAL` — and the required size is
+/// written BACK into the caller's `size` field.
+///
+/// `sched_copy_attr`'s `err_size` label:
+///
+/// ```text
+/// err_size:
+///         put_user(sizeof(*attr), &uattr->size);
+///         return -E2BIG;
+/// ```
+///
+/// This case previously asserted -EINVAL, which is what `mnt_id_req` and
+/// `ns_id_req` answer — `sched_attr` is the odd one out. The write-back is
+/// the half that matters in practice: it is the only way a caller compiled
+/// against a different struct version learns what this kernel wants, and
+/// without it a too-small caller can only guess.
 fn smoke_abi_sched_setattr_short_size_neg() -> TestResult {
+    const E2BIG: i64 = -7;
     with_setup(|| {
         let mut attr = [0u8; 48];
-        // Declared size 16 < SCHED_ATTR_SIZE (48) ⇒ EINVAL.
         attr[..4].copy_from_slice(&16u32.to_le_bytes());
         let args = a3(0, attr.as_ptr() as u64, 0, 0);
-        match call(Syscall::SchedSetattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("sched_setattr with short size should return -EINVAL"),
+        if call(Syscall::SchedSetattr.raw(), args) != Some(E2BIG) {
+            return Err("sched_setattr with an undersized struct must be -E2BIG");
         }
+        if u32::from_ne_bytes(attr[..4].try_into().unwrap()) != 48 {
+            return Err("sched_setattr must write the required size back on -E2BIG");
+        }
+        // Above PAGE_SIZE takes the same label, so the same two answers.
+        attr[..4].copy_from_slice(&5000u32.to_le_bytes());
+        if call(Syscall::SchedSetattr.raw(), args) != Some(E2BIG) {
+            return Err("sched_setattr past PAGE_SIZE must be -E2BIG");
+        }
+        if u32::from_ne_bytes(attr[..4].try_into().unwrap()) != 48 {
+            return Err("the oversize path must write the required size back too");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_short_size_neg);
+
+/// A size of ZERO means `SCHED_ATTR_SIZE_VER0` — the documented quirk.
+///
+/// `/* ABI compatibility quirk: */ if (!size) size = SCHED_ATTR_SIZE_VER0;`
+/// A caller that zeroes the whole struct and fills in only the fields it
+/// cares about never sets `size`, and Linux accepts that. Treating it as
+/// "too small" refuses exactly those callers.
+fn smoke_abi_sched_setattr_zero_size_means_ver0() -> TestResult {
+    with_setup(|| {
+        let attr = [0u8; 48];
+        let args = a3(0, attr.as_ptr() as u64, 0, 0);
+        if call(Syscall::SchedSetattr.raw(), args) != Some(0) {
+            return Err("sched_setattr with size 0 must be accepted as VER0");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_zero_size_means_ver0);
+
+/// A struct larger than this kernel knows is accepted only if its tail is
+/// ZERO; a field set beyond VER0 is `-E2BIG`.
+///
+/// This is the whole point of the extensible-struct rule, and the failure it
+/// prevents is silent: truncating instead would discard a field the caller
+/// set and believes is in effect. A VER1 caller asking for util clamping
+/// would think it got it.
+fn smoke_abi_sched_setattr_rejects_set_fields_past_ver0() -> TestResult {
+    const E2BIG: i64 = -7;
+    with_setup(|| {
+        // VER1-sized, tail all zero: accepted, because nothing was asked for.
+        let mut attr = [0u8; 56];
+        attr[..4].copy_from_slice(&56u32.to_le_bytes());
+        let args = a3(0, attr.as_ptr() as u64, 0, 0);
+        if call(Syscall::SchedSetattr.raw(), args) != Some(0) {
+            return Err("a larger struct with a zero tail must be accepted");
+        }
+        // Same size, but a byte set past VER0: refused rather than dropped.
+        attr[48] = 1;
+        if call(Syscall::SchedSetattr.raw(), args) != Some(E2BIG) {
+            return Err("a field set past the known struct must be -E2BIG, not truncated");
+        }
+        if u32::from_ne_bytes(attr[..4].try_into().unwrap()) != 48 {
+            return Err("the tail-check path must write the required size back");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setattr_rejects_set_fields_past_ver0
+);
+
+/// Target and flag validation: a negative pid, a pid that names nothing,
+/// an out-of-range policy, and flags no kernel defines.
+///
+/// The ESRCH half matters beyond tidiness: without it, attributes are
+/// recorded against a pid nobody can see, and `sched_getattr` then answers
+/// for a process that does not exist.
+fn smoke_abi_sched_setattr_target_and_flags_neg() -> TestResult {
+    with_setup(|| {
+        let mut attr = [0u8; 48];
+        attr[..4].copy_from_slice(&48u32.to_le_bytes());
+        let p = attr.as_ptr() as u64;
+
+        // `if (unlikely(!uattr || pid < 0 || flags)) return -EINVAL;`
+        if call(Syscall::SchedSetattr.raw(), a3((-1i64) as u64, p, 0, 0)) != Some(EINVAL) {
+            return Err("a negative pid must be -EINVAL");
+        }
+        // A pid that names no task.
+        if call(Syscall::SchedSetattr.raw(), a3(0x7f00_0001, p, 0, 0)) != Some(ESRCH) {
+            return Err("a pid that names no task must be -ESRCH");
+        }
+        // `if ((int)attr.sched_policy < 0) return -EINVAL;` — the cast is
+        // load-bearing: sched_policy is a __u32.
+        attr[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        if call(Syscall::SchedSetattr.raw(), a3(0, p, 0, 0)) != Some(EINVAL) {
+            return Err("a policy that is negative as a signed int must be -EINVAL");
+        }
+        attr[4..8].copy_from_slice(&0u32.to_le_bytes());
+        // A flag outside SCHED_FLAG_ALL.
+        attr[8..16].copy_from_slice(&0x8000u64.to_le_bytes());
+        if call(Syscall::SchedSetattr.raw(), a3(0, p, 0, 0)) != Some(EINVAL) {
+            return Err("a flag no kernel defines must be -EINVAL");
+        }
+        // SCHED_FLAG_UTIL_CLAMP needs VER1, which this kernel does not
+        // publish — -EINVAL, not the -E2BIG the size checks give, because
+        // the size was fine and the combination was not.
+        attr[8..16].copy_from_slice(&0x20u64.to_le_bytes());
+        if call(Syscall::SchedSetattr.raw(), a3(0, p, 0, 0)) != Some(EINVAL) {
+            return Err("SCHED_FLAG_UTIL_CLAMP below VER1 must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_setattr_target_and_flags_neg);
 
 // ── sched_getattr(pid, attr*, size, flags) ──────────────────────────
 
@@ -886,15 +1008,55 @@ kernel_test_in!("syscall_abi", smoke_abi_sched_getattr_pos);
 fn smoke_abi_sched_getattr_short_size_neg() -> TestResult {
     with_setup(|| {
         let mut attr = [0u8; 48];
-        // Buffer size 16 < SCHED_ATTR_SIZE (48) ⇒ EINVAL.
-        let args = a3(0, attr.as_mut_ptr() as u64, 16, 0);
-        match call(Syscall::SchedGetattr.raw(), args) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("sched_getattr with short size should return -EINVAL"),
+        let p = attr.as_mut_ptr() as u64;
+        // `usize < SCHED_ATTR_SIZE_VER0` — -EINVAL here, where the SETTER
+        // answers -E2BIG. The setter negotiates about a struct the caller
+        // wrote and can rewrite; the getter is handed a buffer, and one too
+        // small for the first published version is just a bad argument.
+        if call(Syscall::SchedGetattr.raw(), a3(0, p, 16, 0)) != Some(EINVAL) {
+            return Err("sched_getattr with an undersized buffer must be -EINVAL");
         }
+        if call(Syscall::SchedGetattr.raw(), a3(0, p, 5000, 0)) != Some(EINVAL) {
+            return Err("sched_getattr past PAGE_SIZE must be -EINVAL");
+        }
+        if call(Syscall::SchedGetattr.raw(), a3((-1i64) as u64, p, 48, 0)) != Some(EINVAL) {
+            return Err("sched_getattr with a negative pid must be -EINVAL");
+        }
+        if call(Syscall::SchedGetattr.raw(), a3(0x7f00_0001, p, 48, 0)) != Some(ESRCH) {
+            return Err("sched_getattr for a pid that names no task must be -ESRCH");
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getattr_short_size_neg);
+
+/// A buffer larger than the struct must have its TAIL ZEROED.
+///
+/// `copy_struct_to_user`: `if (usize > ksize) clear_user(dst + size, rest);`
+/// Leaving it alone hands the caller back whatever was already in its own
+/// buffer as though the kernel had written it — a VER1 caller reads its own
+/// stack garbage as `sched_util_min`/`sched_util_max` and cannot tell.
+/// `size` reports what was actually filled in, which is how it knows where
+/// the real data stops.
+fn smoke_abi_sched_getattr_zeroes_the_tail() -> TestResult {
+    with_setup(|| {
+        // Poison the whole buffer first: zeroing it here would make the
+        // assertion below vacuous.
+        let mut attr = [0xAAu8; 64];
+        let p = attr.as_mut_ptr() as u64;
+        if call(Syscall::SchedGetattr.raw(), a3(0, p, 64, 0)) != Some(0) {
+            return Err("sched_getattr with a larger buffer should succeed");
+        }
+        if u32::from_ne_bytes(attr[..4].try_into().unwrap()) != 48 {
+            return Err("sched_getattr must report how much of the buffer it filled");
+        }
+        if attr[48..64].iter().any(|&b| b != 0) {
+            return Err("sched_getattr left the caller's tail holding its own stale bytes");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_getattr_zeroes_the_tail);
 
 // ── membarrier(cmd, flags) ──────────────────────────────────────────
 
