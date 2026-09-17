@@ -936,6 +936,11 @@ impl crate::NsObject for CgroupNamespace {
     fn as_any(&self) -> &dyn core::any::Any {
         self
     }
+    fn into_any_arc(
+        self: alloc::sync::Arc<Self>,
+    ) -> alloc::sync::Arc<dyn core::any::Any + Send + Sync> {
+        self
+    }
     fn ns_id(&self) -> u64 {
         self.id
     }

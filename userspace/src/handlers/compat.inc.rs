@@ -2946,6 +2946,44 @@ pub fn namespace_fd_for_task(
     Some(NsFd::new(held))
 }
 
+/// `kernel/nscommon.c::may_see_all_namespaces`.
+///
+/// ```text
+/// return (task_active_pid_ns(current) == &init_pid_ns) &&
+///        ns_capable_noaudit(init_pid_ns.user_ns, CAP_SYS_ADMIN);
+/// ```
+///
+/// Both halves matter: CAP_SYS_ADMIN inside a pid namespace is authority
+/// over that namespace, not over the system, so a container root must not be
+/// able to enumerate its host's namespaces.
+#[cfg(feature = "container")]
+fn may_see_all_namespaces(task: u64) -> bool {
+    let in_initial_pid_ns = crate::pid_ns::ns_of(task).is_none();
+    in_initial_pid_ns && capable(CAP_SYS_ADMIN)
+}
+
+/// `current_in_namespace` for the two flavours whose per-task tables live in
+/// this layer. See `namespaces::task_is_in_namespace`, which dispatches here.
+#[cfg(feature = "container")]
+pub fn task_is_in_fs_namespace(task: u64, held: &crate::namespaces::HeldNs) -> bool {
+    use crate::namespaces::HeldNs;
+    match held {
+        HeldNs::Mnt(ns) => {
+            // No per-task entry means the task is in the INITIAL mount
+            // namespace, which is a real object with a reserved id.
+            let mine = mount_namespace_of(task)
+                .map_or(narf_filesystem::NS_INIT_ID_MNT, |n| n.id());
+            mine == ns.id()
+        }
+        #[cfg(feature = "cgroup")]
+        HeldNs::Cgroup(ns) => {
+            let pid = task_to_pid_raw(task).unwrap_or(task);
+            narf_filesystem::cgroupfs::cgroup_namespace_of(pid).id() == ns.id()
+        }
+        _ => false,
+    }
+}
+
 /// Rejoin the initial mount namespace: drop the per-task override, so
 /// the task reads the global registry again.
 #[cfg(feature = "container")]
@@ -11367,6 +11405,9 @@ mod handler_sys_mseal;
 #[cfg(feature = "container")]
 #[path = "sys_listns.rs"]
 mod handler_sys_listns;
+#[cfg(feature = "container")]
+#[path = "nsfs.rs"]
+mod handler_nsfs;
 #[path = "sys_statmount.rs"]
 mod handler_sys_statmount;
 #[path = "sys_xattrat.rs"]

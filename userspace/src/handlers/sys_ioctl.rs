@@ -28,6 +28,27 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // ── nsfs (`fs/nsfs.c::ns_ioctl`) ──────────────────────────────────
+    //
+    // Handled here rather than behind `FileOps::ioctl` because four of
+    // these mint a new fd, and the fd table belongs to this layer — the
+    // same reason TIOCGPTPEER and DRM_IOCTL_PRIME_HANDLE_TO_FD are here.
+    //
+    // Gated on the fd actually being an ns-fd: the 0xb7 ioctl type is
+    // nsfs's, but a caller aiming it at some other descriptor should get
+    // that descriptor's answer, not a namespace error.
+    #[cfg(feature = "container")]
+    if super::handler_nsfs::is_nsfs_ioctl(cmd) {
+        if let Some(held) = ops
+            .as_any()
+            .and_then(|a| a.downcast_ref::<crate::namespaces::NsFd>())
+            .map(|nsfd| nsfd.held().clone())
+        {
+            let r = super::handler_nsfs::nsfs_ioctl(task, &held, cmd, arg);
+            ctx.set_return(SyscallReturn::ok(r as u64));
+            return;
+        }
+    }
     // ── FS_IOC_GETFLAGS / FS_IOC_SETFLAGS — `chattr`'s inode flags ────
     //
     // `fs/file_attr.c`. Handled here rather than in `FileOps::ioctl`

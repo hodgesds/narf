@@ -1712,3 +1712,565 @@ fn smoke_abi_nstree_snapshot_survives_removal() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_nstree_snapshot_survives_removal);
+
+/// The cursor's end-of-list answer comes from the SELECTED tree.
+///
+/// `do_listns` decides it with `lookup_ns_id_at(last + 1, ns_type)`, where
+/// `ns_type` is non-zero only when the caller named EXACTLY ONE type bit
+/// (`hweight32(kls->ns_type) == 1`). The two halves pull in opposite
+/// directions, which is why both are pinned:
+///
+/// - One type bit walks that flavour's tree, so running out of THAT flavour
+///   is genuinely the end of the list — `-ENOENT` — even with higher-id
+///   namespaces of other flavours present.
+/// - Zero bits, or two or more, walk the unified tree, so the same
+///   situation is an empty success. That half is
+///   `smoke_abi_listns_multi_bit_filter_uses_the_unified_tree`.
+///
+/// An implementation that always consulted the unified tree gets the first
+/// wrong and a paging loop never terminates; one that always applied the
+/// caller's full mask gets the second wrong and a supervisor reads the tree
+/// as exhausted while it is not.
+fn smoke_abi_listns_cursor_enoent_uses_the_selected_tree() -> TestResult {
+    use crate::namespaces::{ns_type, IpcNamespace, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        // One UTS, then an IPC with a HIGHER id. Ids come from one counter,
+        // so creation order is id order.
+        let uts = UtsNamespace::new_default();
+        let ipc = IpcNamespace::new();
+        if ipc.id() <= uts.id() {
+            return Err("the fixture needs the IPC namespace to sort after the UTS one");
+        }
+        let mut out = [0u64; 8];
+        let list = |cursor: u64, ty: u32, out: &mut [u64; 8]| {
+            let req = ns_id_req(32, cursor, ty, 0);
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, 8, 0),
+            )
+        };
+        // Single-bit: the UTS tree is exhausted, so end-of-list. The IPC
+        // namespace above the cursor lives in a different tree and does not
+        // count.
+        if list(uts.id(), ns_type::UTS, &mut out) != Some(-2) {
+            return Err("a single-type cursor past its flavour's last namespace must be -ENOENT");
+        }
+        // Unfiltered, past every id: also end-of-list. This is what keeps
+        // the rule from degenerating into "a type filter always means
+        // ENOENT".
+        if list(ipc.id(), 0, &mut out) != Some(-2) {
+            return Err("an unfiltered cursor past every namespace must be -ENOENT");
+        }
+        // Unfiltered, with the IPC namespace still above the cursor: not the
+        // end, so it enumerates rather than erroring.
+        if list(uts.id(), 0, &mut out) != Some(1) {
+            return Err("an unfiltered cursor with more namespaces above it must not be -ENOENT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_listns_cursor_enoent_uses_the_selected_tree
+);
+
+/// A multi-bit type filter selects the UNIFIED tree, not a per-type one.
+///
+/// `hweight32(kls->ns_type) == 1` is the test, so two bits fall through to
+/// `ns_type = 0`. The mask still filters per element via `ns_requested`, so
+/// the RESULT set is unchanged — what changes is the cursor lookup, which
+/// then consults the unified tree and applies no type constraint at all.
+fn smoke_abi_listns_multi_bit_filter_uses_the_unified_tree() -> TestResult {
+    use crate::namespaces::{ns_type, IpcNamespace, NetNamespace, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let uts = UtsNamespace::new_default();
+        let ipc = IpcNamespace::new();
+        let net = NetNamespace::new_with_loopback();
+        let mut out = [0u64; 8];
+        let list = |cursor: u64, ty: u32, out: &mut [u64; 8]| {
+            let req = ns_id_req(32, cursor, ty, 0);
+            call(
+                Syscall::Listns.raw(),
+                a3(req.as_ptr() as u64, out.as_mut_ptr() as u64, 8, 0),
+            )
+        };
+        // Two bits: both flavours come back, neither is dropped.
+        let both = ns_type::UTS | ns_type::IPC;
+        let n = match list(0, both, &mut out) {
+            Some(n) if n >= 2 => n as usize,
+            _ => return Err("a two-bit filter should enumerate both flavours"),
+        };
+        let got = out[..n].to_vec();
+        if !got.contains(&uts.id()) || !got.contains(&ipc.id()) {
+            return Err("a two-bit filter omitted one of the flavours it named");
+        }
+        if got.contains(&net.id()) {
+            return Err("a two-bit filter returned a flavour it did not name");
+        }
+        // Cursor past the last MATCH of the two-bit filter, with the net
+        // namespace still above it: the unified tree has more, so 0.
+        let last_match = core::cmp::max(uts.id(), ipc.id());
+        if last_match < net.id() && list(last_match, both, &mut out) != Some(0) {
+            return Err("a multi-bit cursor consulted a per-type tree instead of the unified one");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_listns_multi_bit_filter_uses_the_unified_tree
+);
+
+/// Ordered next/previous traversal over one flavour.
+///
+/// `__ns_tree_adjoined_rcu` walks the per-type list forward or backward and
+/// reports `-ENOENT` at either end. It is what `NS_MNT_GET_NEXT`/`PREV` ride
+/// on, and the property that makes it usable is that stepping forward then
+/// back returns where you started — a traversal that skipped or repeated
+/// would silently give an enumerating caller the wrong set.
+fn smoke_abi_nstree_adjoined_walks_one_flavour() -> TestResult {
+    use crate::namespaces::{ns_tree_adjoined, ns_type, IpcNamespace, UtsNamespace};
+    with_setup(|| {
+        crate::namespaces::__test_ns_tree_reset();
+        let a = UtsNamespace::new_default();
+        // An IPC namespace BETWEEN the two UTS ones: traversal must step
+        // over it, which is what says the flavour constraint is real.
+        let mid = IpcNamespace::new();
+        let b = UtsNamespace::new_default();
+
+        let next = ns_tree_adjoined(a.id(), ns_type::UTS, false)
+            .ok_or("next from the first UTS namespace should find the second")?;
+        if next.id != b.id() {
+            return Err("traversal did not step over a namespace of another flavour");
+        }
+        let prev = ns_tree_adjoined(b.id(), ns_type::UTS, true)
+            .ok_or("previous from the second UTS namespace should find the first")?;
+        if prev.id != a.id() {
+            return Err("stepping forward then back did not return to the start");
+        }
+        // Both ends report nothing rather than wrapping.
+        if ns_tree_adjoined(b.id(), ns_type::UTS, false).is_some() {
+            return Err("traversal past the last namespace of a flavour should find nothing");
+        }
+        if ns_tree_adjoined(a.id(), ns_type::UTS, true).is_some() {
+            return Err("traversal before the first namespace of a flavour should find nothing");
+        }
+        // Unfiltered, the in-between namespace IS the next one — the
+        // negative control for the flavour filter above.
+        let any = ns_tree_adjoined(a.id(), 0, false)
+            .ok_or("unfiltered traversal should find the next namespace of any flavour")?;
+        if any.id != mid.id() {
+            return Err("unfiltered traversal skipped a namespace");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nstree_adjoined_walks_one_flavour);
+
+// ── nsfs: `fs/nsfs.c` ────────────────────────────────────────────
+//
+// An ns-fd was opaque: a caller could hold one and `setns` to it, but not
+// ask what it WAS. These are the ioctls `nsenter`, `lsns` and systemd's
+// `pidref_namespace_open_by_type` use to interrogate one.
+
+/// Install `held` as an fd in the harness task's table.
+#[cfg(feature = "container")]
+fn install_ns_fd(held: crate::namespaces::HeldNs) -> Result<u32, &'static str> {
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> = crate::namespaces::NsFd::new(held);
+    crate::fd::install(
+        FAKE_TASK,
+        crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        },
+    )
+    .ok_or("could not install an ns-fd")
+}
+
+/// `_IO(NSIO, nr)` / `_IOR(NSIO, nr, size)` — the exact encodings, computed
+/// against `<linux/ioctl.h>` with gcc rather than assembled by hand.
+#[cfg(feature = "container")]
+const fn nsio(nr: u32) -> u64 {
+    (0xb7u32 << 8 | nr) as u64
+}
+#[cfg(feature = "container")]
+const fn nsio_r(nr: u32, size: u32) -> u64 {
+    ((2u32 << 30) | (size << 16) | (0xb7u32 << 8) | nr) as u64
+}
+
+/// The identity ioctls: what flavour is this, and which namespace.
+///
+/// `NS_GET_NSTYPE` is the odd one — it returns the `CLONE_NEW*` value AS
+/// THE RETURN VALUE rather than writing through the argument, so a caller
+/// reading it out of a buffer would read uninitialised memory and a kernel
+/// writing it there would corrupt the caller's stack.
+fn smoke_abi_nsfs_identity_ioctls() -> TestResult {
+    use crate::namespaces::{ns_type, HeldNs, UtsNamespace};
+    with_setup(|| {
+        let ns = UtsNamespace::new_default();
+        let id = ns.id();
+        let fd = install_ns_fd(HeldNs::Uts(ns))?;
+
+        // NS_GET_NSTYPE -> CLONE_NEWUTS, as the return value.
+        let got = call(Syscall::Ioctl.raw(), a2(fd as u64, nsio(3), 0));
+        if got != Some(i64::from(ns_type::UTS)) {
+            return Err("NS_GET_NSTYPE must return the CLONE_NEW* value itself");
+        }
+
+        // NS_GET_ID -> the namespace id, written through the argument.
+        let mut out = [0u64; 1];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(13, 8), out.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("NS_GET_ID should succeed on an ns-fd");
+        }
+        if out[0] != id {
+            return Err("NS_GET_ID reported the wrong namespace id");
+        }
+
+        // NS_GET_MNTNS_ID is the mount-only spelling of the same question,
+        // so it must refuse a UTS namespace rather than answer it.
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(5, 8), out.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("NS_GET_MNTNS_ID on a non-mount namespace must be -EINVAL");
+        }
+
+        // A command in nsfs's ioctl range that nsfs does not define is
+        // -ENOTTY, and so is one with the right number but the wrong
+        // argument size — that is what `nsfs_ioctl_valid` is for, and
+        // without it a caller's mis-sized buffer would be written anyway.
+        const ENOTTY: i64 = -25;
+        if call(Syscall::Ioctl.raw(), a2(fd as u64, nsio(0x7e), 0)) != Some(ENOTTY) {
+            return Err("an undefined nsfs ioctl must be -ENOTTY");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(13, 4), out.as_mut_ptr() as u64),
+        ) != Some(ENOTTY)
+        {
+            return Err("NS_GET_ID with the wrong argument size must be -ENOTTY");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_identity_ioctls);
+
+/// `NS_GET_USERNS` / `NS_GET_PARENT` mint a real fd, and refuse to hand out
+/// a namespace above the caller.
+///
+/// `ns_get_owner` walks from the owner up through `->parent` looking for
+/// the CALLER's user namespace, and `-EPERM`s if it never meets it. That
+/// walk is the whole permission model: without it an ns-fd held inside a
+/// container would hand out a route to the host's user namespace.
+/// `NS_GET_PARENT` on the initial user namespace hits the same wall from
+/// the other side — it has no parent, which is `!p -> -EPERM`.
+fn smoke_abi_nsfs_get_userns_and_parent() -> TestResult {
+    use crate::namespaces::{ns_type, HeldNs, UserNamespace, UtsNamespace};
+    with_setup(|| {
+        // A UTS namespace owned by the initial user namespace: the caller
+        // IS in that user namespace, so the walk meets it immediately.
+        let host = crate::namespaces::global_user();
+        let uts = UtsNamespace::clone_from_in(&UtsNamespace::new_default(), Some(host.clone()));
+        let fd = install_ns_fd(HeldNs::Uts(uts))?;
+        let owner_fd = match call(Syscall::Ioctl.raw(), a2(fd as u64, nsio(1), 0)) {
+            Some(f) if f >= 0 => f as u64,
+            _ => return Err("NS_GET_USERNS should return an fd for an owner in reach"),
+        };
+        // The fd it returns is a real ns-fd — it answers the identity
+        // ioctls — rather than a placeholder.
+        if call(Syscall::Ioctl.raw(), a2(owner_fd, nsio(3), 0)) != Some(i64::from(ns_type::USER)) {
+            return Err("NS_GET_USERNS did not return a user-namespace fd");
+        }
+        let mut out = [0u64; 1];
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(owner_fd, nsio_r(13, 8), out.as_mut_ptr() as u64),
+        );
+        if out[0] != host.id() {
+            return Err("NS_GET_USERNS named the wrong user namespace");
+        }
+
+        // The initial user namespace has no parent, so asking for one is
+        // -EPERM. This is the negative control for the walk above: without
+        // it, every NS_GET_PARENT would look like it worked.
+        let host_fd = install_ns_fd(HeldNs::User(host))?;
+        if call(Syscall::Ioctl.raw(), a2(host_fd as u64, nsio(2), 0)) != Some(-1) {
+            return Err("NS_GET_PARENT on the initial user namespace must be -EPERM");
+        }
+        // A child user namespace's parent IS reachable — it is the
+        // caller's own — so that direction must still work.
+        let child = UserNamespace::new_child(crate::namespaces::global_user(), 0);
+        let child_fd = install_ns_fd(HeldNs::User(child))?;
+        match call(Syscall::Ioctl.raw(), a2(child_fd as u64, nsio(2), 0)) {
+            Some(f) if f >= 0 => {}
+            _ => return Err("NS_GET_PARENT on a child user namespace should return an fd"),
+        }
+        // A flavour with no parent at all is -EINVAL, not -EPERM: the
+        // question does not apply, rather than being refused.
+        if call(Syscall::Ioctl.raw(), a2(fd as u64, nsio(2), 0)) != Some(EINVAL) {
+            return Err("NS_GET_PARENT on a flavour without parents must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_get_userns_and_parent);
+
+/// `NS_GET_OWNER_UID` reports the owner uid THROUGH the caller's id map.
+///
+/// `from_kuid_munged` is what makes this safe to expose: a caller in a
+/// namespace that does not map the owner sees the overflow id rather than
+/// the host uid, so the ioctl cannot be used to read host identity from
+/// inside a container. It is -EINVAL for every flavour but user.
+fn smoke_abi_nsfs_owner_uid() -> TestResult {
+    use crate::namespaces::{HeldNs, UserNamespace, UtsNamespace};
+    with_setup(|| {
+        let child = UserNamespace::new_child(crate::namespaces::global_user(), 4242);
+        let fd = install_ns_fd(HeldNs::User(child))?;
+        let mut out = [0u32; 1];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio(4), out.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("NS_GET_OWNER_UID should succeed on a user namespace");
+        }
+        // The caller is in the initial user namespace, whose map is the
+        // identity, so the owner uid comes back unchanged.
+        if out[0] != 4242 {
+            return Err("NS_GET_OWNER_UID reported the wrong owner uid");
+        }
+        let uts_fd = install_ns_fd(HeldNs::Uts(UtsNamespace::new_default()))?;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(uts_fd as u64, nsio(4), out.as_mut_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("NS_GET_OWNER_UID on a non-user namespace must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_owner_uid);
+
+/// `NS_MNT_GET_INFO` reports the mount count and id; traversal needs
+/// system-wide visibility.
+///
+/// The `size` field is what a caller compiled against a later struct reads
+/// to know how much of its buffer this kernel filled — without it, a larger
+/// struct's trailing zeroes would be indistinguishable from real data.
+fn smoke_abi_nsfs_mnt_info_and_traversal() -> TestResult {
+    use crate::namespaces::HeldNs;
+    with_setup(|| {
+        let ns = narf_filesystem::MountNamespace::snapshot_global();
+        let want_id = ns.id();
+        let want_mounts = ns.list().len() as u32;
+        let fd = install_ns_fd(HeldNs::Mnt(ns))?;
+        let mut info = [0u8; 16];
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(10, 16), info.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("NS_MNT_GET_INFO should succeed on a mount-namespace fd");
+        }
+        if u32::from_ne_bytes(info[0..4].try_into().unwrap()) != 16 {
+            return Err("NS_MNT_GET_INFO must report the struct size it filled in");
+        }
+        if u32::from_ne_bytes(info[4..8].try_into().unwrap()) != want_mounts {
+            return Err("NS_MNT_GET_INFO reported the wrong mount count");
+        }
+        if u64::from_ne_bytes(info[8..16].try_into().unwrap()) != want_id {
+            return Err("NS_MNT_GET_INFO reported the wrong namespace id");
+        }
+        // A buffer smaller than the first published struct is -EINVAL, and
+        // a NULL one is too: reporting into it is the command's whole job.
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(10, 8), info.as_mut_ptr() as u64),
+        ) != Some(-25)
+        {
+            return Err("an undersized NS_MNT_GET_INFO must not be accepted");
+        }
+        if call(Syscall::Ioctl.raw(), a2(fd as u64, nsio_r(10, 16), 0)) != Some(EINVAL) {
+            return Err("NS_MNT_GET_INFO with a NULL buffer must be -EINVAL");
+        }
+        // Traversal is privileged even though INFO is not — `may_use_nsfs_ioctl`
+        // gates only NEXT/PREV. The harness task is in the initial pid
+        // namespace WITH CAP_SYS_ADMIN, so here it is allowed;
+        // `smoke_abi_nsfs_traversal_is_privileged` is the refusal half.
+        match call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(11, 16), info.as_mut_ptr() as u64),
+        ) {
+            // Either a further mount namespace, or the end of the list.
+            Some(f) if f >= 0 => {}
+            Some(-2) => {}
+            _ => return Err("NS_MNT_GET_NEXT should return an fd or -ENOENT"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_mnt_info_and_traversal);
+
+/// An nsfs file handle round-trips, and the cross-checks reject a forged one.
+///
+/// `nsfs_encode_fh` carries id, type and inode. The id alone would locate
+/// the namespace; the other two are what let the decoder notice a handle
+/// that no longer names what it did — ids are unique within a boot but
+/// minted afresh on the next one, so a persisted handle would otherwise
+/// resolve silently to some unrelated namespace.
+fn smoke_abi_nsfs_file_handle_round_trip() -> TestResult {
+    use crate::namespaces::{ns_type, HeldNs, UtsNamespace};
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const ESTALE: i64 = -116;
+    with_setup(|| {
+        let ns = UtsNamespace::new_default();
+        let id = ns.id();
+        let fd = install_ns_fd(HeldNs::Uts(ns))?;
+
+        // name_to_handle_at(fd, "", &handle, &mnt_id, AT_EMPTY_PATH).
+        let mut handle = [0u8; 24];
+        handle[0..4].copy_from_slice(&16u32.to_ne_bytes());
+        let empty = b"\0";
+        if call(
+            Syscall::NameToHandleAt.raw(),
+            a4(
+                fd as u64,
+                empty.as_ptr() as u64,
+                handle.as_mut_ptr() as u64,
+                0,
+                AT_EMPTY_PATH,
+            ),
+        ) != Some(0)
+        {
+            return Err("name_to_handle_at on an ns-fd should succeed");
+        }
+        if i32::from_ne_bytes(handle[4..8].try_into().unwrap()) != 0xf1 {
+            return Err("an ns-fd must encode to a FILEID_NSFS handle");
+        }
+        if u64::from_ne_bytes(handle[8..16].try_into().unwrap()) != id {
+            return Err("the handle carried the wrong namespace id");
+        }
+        if u32::from_ne_bytes(handle[16..20].try_into().unwrap()) != ns_type::UTS {
+            return Err("the handle carried the wrong namespace type");
+        }
+
+        // open_by_handle_at gives back an fd naming the same namespace.
+        let reopened = match call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(0, handle.as_ptr() as u64, 0),
+        ) {
+            Some(f) if f >= 0 => f as u64,
+            _ => return Err("open_by_handle_at should reopen an nsfs handle"),
+        };
+        let mut out = [0u64; 1];
+        let _ = call(
+            Syscall::Ioctl.raw(),
+            a2(reopened, nsio_r(13, 8), out.as_mut_ptr() as u64),
+        );
+        if out[0] != id {
+            return Err("the reopened handle named a different namespace");
+        }
+
+        // A handle whose TYPE disagrees with the namespace the id names is
+        // stale, not silently accepted. This is the check that catches a
+        // handle kept across a reboot.
+        let mut forged = handle;
+        forged[16..20].copy_from_slice(&ns_type::NET.to_ne_bytes());
+        if call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(0, forged.as_ptr() as u64, 0),
+        ) != Some(ESTALE)
+        {
+            return Err("a handle whose type contradicts its id must be -ESTALE");
+        }
+        // So is one whose INODE disagrees.
+        let mut forged = handle;
+        forged[20..24].copy_from_slice(&0xdead_beefu32.to_ne_bytes());
+        if call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(0, forged.as_ptr() as u64, 0),
+        ) != Some(ESTALE)
+        {
+            return Err("a handle whose inode contradicts its id must be -ESTALE");
+        }
+        // `!fid->ns_inum != !fid->ns_type` — both set or neither.
+        let mut forged = handle;
+        forged[20..24].copy_from_slice(&0u32.to_ne_bytes());
+        if call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(0, forged.as_ptr() as u64, 0),
+        ) != Some(ESTALE)
+        {
+            return Err("a handle with a type but no inode must be -ESTALE");
+        }
+        // And an id that names nothing.
+        let mut forged = handle;
+        forged[8..16].copy_from_slice(&u64::MAX.to_ne_bytes());
+        if call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(0, forged.as_ptr() as u64, 0),
+        ) != Some(ESTALE)
+        {
+            return Err("a handle naming no namespace must be -ESTALE");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_file_handle_round_trip);
+
+/// Mount-namespace traversal needs system-wide visibility; the other nsfs
+/// ioctls do not.
+///
+/// `may_use_nsfs_ioctl` returns `may_see_all_namespaces()` for NEXT/PREV
+/// and `true` for everything else, and the refusal is `-EPERM` rather than
+/// `-ENOTTY`: the command exists, this caller may not use it. Enumerating
+/// the system's mount namespaces is exactly the capability a container must
+/// not have, so the gate is the whole point of the command.
+///
+/// The INFO half is the control. Without it a broken implementation that
+/// refused EVERY nsfs ioctl would pass the interesting assertion.
+fn smoke_abi_nsfs_traversal_is_privileged() -> TestResult {
+    use crate::namespaces::HeldNs;
+    with_setup(|| {
+        let ns = narf_filesystem::MountNamespace::snapshot_global();
+        let fd = install_ns_fd(HeldNs::Mnt(ns))?;
+        let mut info = [0u8; 16];
+        drop_to_unprivileged_uid()?;
+
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(11, 16), info.as_mut_ptr() as u64),
+        ) != Some(-1)
+        {
+            return Err("NS_MNT_GET_NEXT without CAP_SYS_ADMIN must be -EPERM");
+        }
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(12, 16), info.as_mut_ptr() as u64),
+        ) != Some(-1)
+        {
+            return Err("NS_MNT_GET_PREV without CAP_SYS_ADMIN must be -EPERM");
+        }
+        // Unprivileged callers may still ask what their OWN namespace is —
+        // the gate gates traversal, not the whole file.
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, nsio_r(10, 16), info.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("NS_MNT_GET_INFO must not require CAP_SYS_ADMIN");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_nsfs_traversal_is_privileged);
