@@ -228,6 +228,115 @@ fn current_single_mount_root(
     };
     Some((root, &path[rel_start..], mount_id))
 }
+// ── openat2 resolution scope ────────────────────────────────────
+//
+// Linux carries these on `current->nameidata`, which is why
+// `nd_jump_link` can consult them from deep inside a magic-link jump
+// without every frame between passing them down. NARF keeps the same
+// shape: the scope is per-task, installed for exactly the duration of one
+// `openat2` and read by the resolver, so no existing caller's signature
+// changes and no other syscall can accidentally inherit it.
+
+/// The `RESOLVE_*` constraints of an in-flight `openat2`.
+#[derive(Clone, Default, Debug)]
+pub(crate) struct ResolveScope {
+    /// `RESOLVE_NO_SYMLINKS` — any symlink encountered is -ELOOP. Also set
+    /// for a mount carrying `MOUNT_ATTR_NOSYMFOLLOW`, which `fs/namei.c`
+    /// funnels into the same check.
+    pub no_symlinks: bool,
+    /// `RESOLVE_NO_MAGICLINKS` — a procfs-style link is -ELOOP.
+    pub no_magiclinks: bool,
+    /// `RESOLVE_NO_XDEV` — leaving the starting mount is -EXDEV.
+    pub no_xdev: bool,
+    /// `RESOLVE_BENEATH` — the result must stay under [`Self::root`].
+    pub beneath: bool,
+    /// `RESOLVE_IN_ROOT` — [`Self::root`] acts as "/" for this call.
+    pub in_root: bool,
+    /// The dirfd's absolute path, for `beneath` / `in_root`.
+    pub root: alloc::string::String,
+}
+
+impl ResolveScope {
+    fn is_scoped(&self) -> bool {
+        self.beneath || self.in_root
+    }
+}
+
+static RESOLVE_SCOPE: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, ResolveScope>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Whether ANY task currently has a scope installed.
+///
+/// Read on every path resolution, so it must not take the table lock in
+/// the overwhelmingly common case of nobody being inside an `openat2`.
+static RESOLVE_SCOPE_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// Run `body` with `scope` installed for `task`.
+///
+/// Restores rather than clears: `openat2` is not reentrant today, but a
+/// future magic-link jump that re-enters the open path must not drop an
+/// outer scope on the way back out.
+pub(crate) fn with_resolve_scope<R>(task: u64, scope: ResolveScope, body: impl FnOnce() -> R) -> R {
+    let prev = {
+        let mut g = RESOLVE_SCOPE.lock();
+        let m = g.get_or_insert_with(alloc::collections::BTreeMap::new);
+        m.insert(task, scope)
+    };
+    RESOLVE_SCOPE_ACTIVE.fetch_add(1, Ordering::AcqRel);
+    let out = body();
+    {
+        let mut g = RESOLVE_SCOPE.lock();
+        if let Some(m) = g.as_mut() {
+            match prev {
+                Some(p) => {
+                    m.insert(task, p);
+                }
+                None => {
+                    m.remove(&task);
+                }
+            }
+        }
+    }
+    RESOLVE_SCOPE_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+    out
+}
+
+/// The calling task's resolution scope, if it is inside an `openat2`.
+pub(crate) fn current_resolve_scope() -> Option<ResolveScope> {
+    if RESOLVE_SCOPE_ACTIVE.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let task = current_task_id();
+    RESOLVE_SCOPE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).cloned())
+}
+
+/// Test hook — drop every installed scope.
+#[doc(hidden)]
+pub fn __test_resolve_scope_reset() {
+    *RESOLVE_SCOPE.lock() = None;
+    RESOLVE_SCOPE_ACTIVE.store(0, Ordering::Release);
+}
+
+/// `-ELOOP` when this walk may not follow a symlink.
+///
+/// `fs/namei.c:2036`: `if (nd->flags & LOOKUP_NO_SYMLINKS ||
+/// link->mnt->mnt_flags & MNT_NOSYMFOLLOW) return ERR_PTR(-ELOOP);` — the
+/// per-call flag and the per-mount attribute are ONE check in Linux, so
+/// they are one check here. ELOOP rather than EPERM or EACCES: the caller
+/// asked for a path with no symlinks in it, and what it got was a symlink,
+/// which is the same shape of answer as running out of link budget.
+fn symlink_refused(scope: Option<&ResolveScope>, link_path: &str) -> bool {
+    if scope.is_some_and(|s| s.no_symlinks) {
+        return true;
+    }
+    // `MOUNT_ATTR_NOSYMFOLLOW` on the mount the LINK lives on.
+    current_mount_flags_at(link_path) & narf_filesystem::mnt_flags::NOSYMFOLLOW != 0
+}
+
 
 /// Fast path for [`resolve_vfs_symlink_path`]: a single O(depth) forward walk
 /// that carries the parent-directory handle and looks each component up
@@ -243,6 +352,7 @@ fn current_single_mount_root(
 fn resolve_vfs_symlink_path_fast(
     expanded: &str,
     follow_final: bool,
+    scope: &Option<ResolveScope>,
 ) -> Option<alloc::string::String> {
     // Clone the covering mount's root `Arc` AND the path RELATIVE to that
     // mount OUT of the mount-table lock before any (block-)I/O: the lookups
@@ -294,6 +404,13 @@ fn resolve_vfs_symlink_path_fast(
 
         let kind = node.stat().mode.file_type;
         if kind == narf_filesystem::FileType::Symlink {
+            // A refusal must not be answered by the fast path's
+            // "return the path unchanged" fallback, or the caller would
+            // open the link's target after being told nothing. Bail to the
+            // slow walk, which reports it.
+            if (follow_final || !is_final) && symlink_refused(scope.as_ref(), expanded) {
+                return None;
+            }
             if is_final && !follow_final {
                 // NOFOLLOW final symlink: the link itself is the answer;
                 // nothing to expand. Mirrors the slow loop's
@@ -428,11 +545,75 @@ pub(crate) fn resolve_vfs_symlink_path(
     path: &str,
     follow_final: bool,
 ) -> Option<alloc::string::String> {
-    let mut expanded = normalize_abs(path);
+    // The unscoped callers — chdir, mount, file_attr — keep the shape they
+    // had. A per-mount `MNT_NOSYMFOLLOW` still applies to them, because it
+    // is a property of the mount and not of the call; a refusal reaches
+    // them as `None`, which is the "could not resolve" they already handle.
+    resolve_vfs_symlink_path_scoped(path, follow_final).ok()
+}
 
-    if let Some(resolved) = resolve_vfs_symlink_path_fast(&expanded, follow_final) {
-        return Some(resolved);
+/// [`resolve_vfs_symlink_path`] reporting WHY it refused.
+///
+/// `openat2` needs the errno: -ELOOP for a symlink the scope forbids,
+/// -EXDEV for leaving the permitted subtree or mount. Every other caller
+/// only needs to know that resolution did not produce a path.
+pub(crate) fn resolve_vfs_symlink_path_scoped(
+    path: &str,
+    follow_final: bool,
+) -> Result<alloc::string::String, i64> {
+    const ELOOP: i64 = -40;
+    const EXDEV: i64 = -18;
+    let scope = current_resolve_scope();
+
+    // `RESOLVE_IN_ROOT` — "treat the directory referred to by dirfd as the
+    // root directory". An absolute path is interpreted inside it, and `..`
+    // cannot climb past it. That is chroot's rule, applied to one call, so
+    // it reuses the same composition: prefix, then normalise, where
+    // `normalize_abs` already stops `..` at the string root.
+    let path_owned;
+    let path = if scope.as_ref().is_some_and(|s| s.in_root) && path.starts_with('/') {
+        let root = &scope.as_ref().expect("checked").root;
+        path_owned = normalize_abs(&alloc::format!("{root}/{path}"));
+        path_owned.as_str()
+    } else {
+        path
+    };
+
+    let mut expanded = normalize_abs(path);
+    // `RESOLVE_NO_XDEV`: the mount the walk STARTS on is the only one it may
+    // be on. Sampled before resolution so a symlink that lands elsewhere is
+    // caught by the comparison after it.
+    let start_mount = scope
+        .as_ref()
+        .filter(|s| s.no_xdev)
+        .and_then(|_| current_mount_id_at(&expanded));
+
+    let finish = |resolved: alloc::string::String| -> Result<alloc::string::String, i64> {
+        if let Some(sc) = scope.as_ref() {
+            // `RESOLVE_BENEATH` / `RESOLVE_IN_ROOT`: the result must lie
+            // under the permitted root. Checked AFTER expansion, which is
+            // what makes it cover symlink escapes and not just lexical
+            // `..` — a link pointing outside is indistinguishable from
+            // `../..` by the time the path is normalised, and both are the
+            // escape the flag exists to stop.
+            if sc.is_scoped() && !path_is_within(&resolved, &sc.root) {
+                return Err(EXDEV);
+            }
+            if sc.no_xdev {
+                let end_mount = current_mount_id_at(&resolved);
+                if end_mount != start_mount {
+                    return Err(EXDEV);
+                }
+            }
+        }
+        Ok(resolved)
+    };
+
+    if let Some(resolved) = resolve_vfs_symlink_path_fast(&expanded, follow_final, &scope) {
+        return finish(resolved);
     }
+    // The fast walk bails to here on a refusal as well as on a link it
+    // cannot expand, so the slow walk below re-derives which it was.
 
     for _ in 0..SYMLOOP_MAX {
         let components: alloc::vec::Vec<&str> = expanded
@@ -465,19 +646,33 @@ pub(crate) fn resolve_vfs_symlink_path(
             {
                 continue;
             }
+            if symlink_refused(scope.as_ref(), &prefix) {
+                return Err(ELOOP);
+            }
 
             let mut bytes = alloc::vec![0u8; 4096];
-            let n = poll_blocking(node.read(0, &mut bytes)).and_then(|result| result.ok())?;
-            let target = core::str::from_utf8(&bytes[..n]).ok()?;
+            let Some(n) = poll_blocking(node.read(0, &mut bytes)).and_then(|r| r.ok()) else {
+                return Err(ELOOP);
+            };
+            let Ok(target) = core::str::from_utf8(&bytes[..n]) else {
+                return Err(ELOOP);
+            };
             if target.is_empty() {
-                return None;
+                return Err(ELOOP);
             }
             let parent = prefix
                 .rsplit_once('/')
                 .map(|(parent, _)| parent)
                 .unwrap_or("");
             let target_path = if target.starts_with('/') {
-                apply_chroot(target)
+                // Under `RESOLVE_IN_ROOT` an absolute link target is
+                // interpreted inside the scope root, exactly as the initial
+                // path was — otherwise a link to "/etc/passwd" would step
+                // straight out of the sandbox the caller asked for.
+                match scope.as_ref().filter(|s| s.in_root) {
+                    Some(sc) => normalize_abs(&alloc::format!("{}/{}", sc.root, target)),
+                    None => apply_chroot(target),
+                }
             } else if parent.is_empty() {
                 normalize_abs(&alloc::format!("/{target}"))
             } else {
@@ -494,10 +689,26 @@ pub(crate) fn resolve_vfs_symlink_path(
         }
 
         if !followed {
-            return Some(expanded);
+            return finish(expanded);
         }
     }
-    None
+    // Ran out of link budget. `SYMLOOP_MAX` hops without settling is what
+    // ELOOP means, and it is what the unscoped wrapper turns back into
+    // `None`.
+    Err(ELOOP)
+}
+
+/// Is `path` the same as `root`, or below it?
+///
+/// Component-wise, not a string prefix: `/rootfoo` must not count as inside
+/// `/root`, and a `starts_with` would say it does — which is precisely the
+/// lexical trickery `RESOLVE_BENEATH` exists to refuse.
+fn path_is_within(path: &str, root: &str) -> bool {
+    if root == "/" || root.is_empty() {
+        return true;
+    }
+    let root = root.trim_end_matches('/');
+    path == root || (path.len() > root.len() && path.starts_with(root) && path.as_bytes()[root.len()] == b'/')
 }
 
 /// The join-and-normalize half of [`resolve_cwd_path`] — the USER-VIEW

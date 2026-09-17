@@ -3960,3 +3960,224 @@ fn smoke_abi_quotactl_fd_argument_rules() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_quotactl_fd_argument_rules);
+
+// ── openat2 RESOLVE_* ────────────────────────────────────────────
+//
+// These are the whole reason `openat2` exists: `openat` cannot express
+// "resolve this path, but refuse if it would leave here or traverse a
+// symlink". They were previously accepted and never enforced, so a sandbox
+// asking for one was told it succeeded and got no restriction at all.
+
+const RESOLVE_NO_XDEV: u64 = 0x01;
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+const RESOLVE_BENEATH: u64 = 0x08;
+const RESOLVE_IN_ROOT: u64 = 0x10;
+const RESOLVE_CACHED: u64 = 0x20;
+const ELOOP: i64 = -40;
+const EXDEV: i64 = -18;
+
+fn openat2_how(flags: u64, mode: u64, resolve: u64) -> [u8; 24] {
+    let mut how = [0u8; 24];
+    how[0..8].copy_from_slice(&flags.to_ne_bytes());
+    how[8..16].copy_from_slice(&mode.to_ne_bytes());
+    how[16..24].copy_from_slice(&resolve.to_ne_bytes());
+    how
+}
+
+fn openat2_at(dirfd: u64, path: &[u8], how: &[u8; 24]) -> Option<i64> {
+    call(
+        Syscall::Openat2.raw(),
+        a3(dirfd, path.as_ptr() as u64, how.as_ptr() as u64, 24),
+    )
+}
+
+/// The extensible-struct rules `open_how` follows.
+///
+/// Note the order differs from `clone3`: openat2 tests `usize <
+/// OPEN_HOW_SIZE_VER0` BEFORE `usize > PAGE_SIZE`. Unobservable — no size is
+/// both — but the two syscalls genuinely differ and the code should not be
+/// "tidied" into agreeing.
+fn smoke_abi_pathx_openat2_struct_rules() -> TestResult {
+    const E2BIG: i64 = -7;
+    with_memfs("/o2", "o2", &[("f", b"hi")], || {
+        let path = b"/o2/f\0";
+        let how = openat2_how(0, 0, 0);
+        // A short or absent struct.
+        if openat2_at(AT_FDCWD, path, &how) == Some(-22) {
+            return Err("a valid 24-byte open_how should be accepted");
+        }
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, how.as_ptr() as u64, 16),
+        ) != Some(EINVAL)
+        {
+            return Err("openat2 with usize < 24 must be -EINVAL");
+        }
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, how.as_ptr() as u64, 5000),
+        ) != Some(E2BIG)
+        {
+            return Err("openat2 past PAGE_SIZE must be -E2BIG");
+        }
+        // A larger struct is accepted only with a zero tail. Truncating
+        // instead would drop a field the caller set and believes applies.
+        let mut big = [0u8; 32];
+        big[..24].copy_from_slice(&how);
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, big.as_ptr() as u64, 32),
+        ) == Some(E2BIG)
+        {
+            return Err("a larger open_how with a zero tail must be accepted");
+        }
+        big[24] = 1;
+        if call(
+            Syscall::Openat2.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, big.as_ptr() as u64, 32),
+        ) != Some(E2BIG)
+        {
+            return Err("a field set past the known open_how must be -E2BIG");
+        }
+        // `if (how->mode != 0) return -EINVAL;` unless creating. `openat`
+        // ignores a stray mode; openat2 refuses it, which is the difference
+        // the newer syscall exists to make.
+        let moded = openat2_how(0, 0o644, 0);
+        if openat2_at(AT_FDCWD, path, &moded) != Some(EINVAL) {
+            return Err("a non-zero mode without O_CREAT must be -EINVAL");
+        }
+        // A flag outside VALID_OPEN_FLAGS, and O_DIRECTORY|O_CREAT.
+        if openat2_at(AT_FDCWD, path, &openat2_how(1 << 40, 0, 0)) != Some(EINVAL) {
+            return Err("an undefined open flag must be -EINVAL");
+        }
+        const O_CREAT: u64 = 0o100;
+        const O_DIRECTORY: u64 = 0o200000;
+        if openat2_at(
+            AT_FDCWD,
+            path,
+            &openat2_how(O_CREAT | O_DIRECTORY, 0o644, 0),
+        ) != Some(EINVAL)
+        {
+            return Err("O_DIRECTORY|O_CREAT must be -EINVAL");
+        }
+        // An undefined resolve bit.
+        if openat2_at(AT_FDCWD, path, &openat2_how(0, 0, 1 << 20)) != Some(EINVAL) {
+            return Err("an undefined resolve flag must be -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_struct_rules);
+
+/// `RESOLVE_NO_SYMLINKS` refuses a symlink anywhere in the path.
+///
+/// -ELOOP, the same answer as running out of link budget: the caller asked
+/// for a path with no symlinks and what it got was a symlink. The control
+/// is the same open WITHOUT the flag — without it, this case would pass
+/// against a kernel that simply could not open the file.
+fn smoke_abi_pathx_openat2_no_symlinks() -> TestResult {
+    with_memfs("/o2s", "o2s", &[("real", b"hi")], || {
+        // /o2s/link -> real
+        if call(
+            Syscall::Symlink.raw(),
+            a1(b"real\0".as_ptr() as u64, b"/o2s/link\0".as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("could not create the symlink fixture");
+        }
+        let link = b"/o2s/link\0";
+        // Control: it opens fine without the flag, so the refusal below is
+        // the flag's doing and not a broken fixture.
+        match openat2_at(AT_FDCWD, link, &openat2_how(0, 0, 0)) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("the symlink should open when symlinks are permitted"),
+        }
+        if openat2_at(AT_FDCWD, link, &openat2_how(0, 0, RESOLVE_NO_SYMLINKS)) != Some(ELOOP) {
+            return Err("RESOLVE_NO_SYMLINKS must refuse a symlink with -ELOOP");
+        }
+        // A path with no symlink in it is unaffected.
+        match openat2_at(
+            AT_FDCWD,
+            b"/o2s/real\0",
+            &openat2_how(0, 0, RESOLVE_NO_SYMLINKS),
+        ) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("RESOLVE_NO_SYMLINKS must not refuse a symlink-free path"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_no_symlinks);
+
+/// `RESOLVE_BENEATH` refuses anything outside the dirfd, `RESOLVE_IN_ROOT`
+/// reinterprets it there.
+///
+/// Both are -EXDEV on escape. The distinction matters: BENEATH refuses a
+/// path that climbs out, while IN_ROOT makes the climb land back at the
+/// root instead — the difference between "no" and "chroot for one call".
+fn smoke_abi_pathx_openat2_scoped() -> TestResult {
+    with_memfs("/o2b", "o2b", &[("f", b"hi")], || {
+        const O_PATH: u64 = 0o10000000;
+        const O_DIRECTORY: u64 = 0o200000;
+        let dir = b"/o2b\0";
+        let dfd = match openat2_at(AT_FDCWD, dir, &openat2_how(O_PATH | O_DIRECTORY, 0, 0)) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("could not open the scope directory"),
+        };
+        // Inside the scope: permitted.
+        match openat2_at(dfd, b"f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("RESOLVE_BENEATH must permit a path inside the scope"),
+        }
+        // Climbing out is refused at the STEP, so `../o2b/f` is rejected
+        // even though it lands back inside — `follow_dotdot` never lets the
+        // walk leave. Checking only the destination would permit it, which
+        // is weaker than what the caller asked for.
+        if openat2_at(dfd, b"../o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
+            return Err("RESOLVE_BENEATH must refuse a `..` step, even one that returns");
+        }
+        // An absolute pathname is not below the dirfd by construction, so
+        // BENEATH refuses it even though this one names a file inside.
+        if openat2_at(dfd, b"/o2b/f\0", &openat2_how(0, 0, RESOLVE_BENEATH)) != Some(EXDEV) {
+            return Err("RESOLVE_BENEATH must refuse an absolute pathname");
+        }
+        // IN_ROOT: the same climb lands back at the root rather than
+        // escaping, so it resolves instead of failing.
+        match openat2_at(dfd, b"/f\0", &openat2_how(0, 0, RESOLVE_IN_ROOT)) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("RESOLVE_IN_ROOT must resolve an absolute path inside the scope"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_scoped);
+
+/// `RESOLVE_NO_MAGICLINKS` refuses a procfs magic link; `RESOLVE_CACHED`
+/// reports that this kernel cannot answer without blocking.
+///
+/// NARF's walk drives `poll_blocking` at every component and has no
+/// cached-only mode, so `RESOLVE_CACHED` can never be satisfied and says so
+/// with -EAGAIN — which is what the flag is for. Claiming success would be
+/// the wrong answer; so would pretending the flag does not exist.
+fn smoke_abi_pathx_openat2_magiclinks_and_cached() -> TestResult {
+    const EAGAIN: i64 = -11;
+    with_memfs("/o2m", "o2m", &[("f", b"hi")], || {
+        let path = b"/o2m/f\0";
+        if openat2_at(AT_FDCWD, path, &openat2_how(0, 0, RESOLVE_CACHED)) != Some(EAGAIN) {
+            return Err("RESOLVE_CACHED must report -EAGAIN rather than blocking");
+        }
+        // A path with no magic link in it is unaffected by NO_MAGICLINKS.
+        match openat2_at(AT_FDCWD, path, &openat2_how(0, 0, RESOLVE_NO_MAGICLINKS)) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("RESOLVE_NO_MAGICLINKS must not refuse an ordinary path"),
+        }
+        // NO_XDEV against a path on the starting mount is likewise fine.
+        match openat2_at(AT_FDCWD, path, &openat2_how(0, 0, RESOLVE_NO_XDEV)) {
+            Some(fd) if fd >= 0 => {}
+            _ => return Err("RESOLVE_NO_XDEV must not refuse a path on one mount"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_magiclinks_and_cached);
