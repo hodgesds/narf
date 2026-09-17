@@ -192,7 +192,14 @@ target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
 ownership, and PMU attribution. Switch-out saves the same state first. A remote,
 contended, first-run, periodic, capped, donated, higher-class, or external-policy
 target declines to the ordinary exact-buddy/full-validation path. Generic
-every-wake preemption and wake-next remain opt-in.
+every-wake preemption and wake-next remain opt-in. The direct path exchanges
+the target's strong address-space owner into the CPU-local active slot under
+its IRQ-safe lock after activation succeeds. The displaced source owner is
+carried by the handoff and moved back on return, so both hardware-root
+transitions retain the outgoing page tables without extra Arc clones or an
+observable ownerless interval. When the global perf gate is off, switch
+attribution stops before the cross-crate callback; an enabled gate still
+reaches the perf registry's authoritative live-event check.
 Syscall-frequency per-CPU wake, urgent-handoff, and runnable-peer cells occupy
 separate cache lines; independent CPUs never serialize their local scheduling
 hints through false sharing. This is a representation rule only: the same

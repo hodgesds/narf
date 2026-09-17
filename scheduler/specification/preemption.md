@@ -68,6 +68,10 @@ awake target while its slot remains resident in the local ready queue, saves the
 source FP/SIMD and task-domain state, publishes and activates the target's task
 identity/address space, restores its kernel-stack target, TLS, saved domain
 state, and FP/SIMD ownership, then switches to the target continuation. The
+CPU-local active-address-space slot is held across activation and atomically
+exchanged only after success; the displaced source Arc becomes the handoff's
+root owner and is moved back on return. Thus neither transition exposes an
+ownerless live root or needs a second active-slot lock acquisition. The
 target's executor pointer is the source's root executor continuation, not the
 source stack. A target yield, completion, or tick preemption normally restores
 the root identity/address space and switches to the executor. When the target

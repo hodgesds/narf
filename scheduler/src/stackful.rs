@@ -373,6 +373,13 @@ pub fn set_user_perf_switch_hook(hook: fn(u64, bool)) {
 
 #[inline]
 fn user_perf_switch(task: u64, running: bool) {
+    // The userspace perf registry owns this global fast gate and toggles it on
+    // the same 0<->1 live-event transitions that make the switch hook useful.
+    // Keep ordinary task switches to one predictable load/branch rather than
+    // paying an indirect cross-crate call merely to repeat the same empty test.
+    if !narf_lib::perf::enabled() {
+        return;
+    }
     let hook = USER_PERF_SWITCH_HOOK.load(Ordering::Acquire);
     if hook != 0 {
         // SAFETY: only `set_user_perf_switch_hook` writes this slot.
@@ -809,7 +816,7 @@ unsafe fn try_direct_handoff(
             republish(cell.task);
             return false;
         }
-        let Some(target) = crate::claim_direct_handoff_target(cpu, cell) else {
+        let Some(mut target) = crate::claim_direct_handoff_target(cpu, cell) else {
             // The scalar id preserves ordinary exact-buddy selection after a
             // direct claim declines (policy, budget, migration, or first run).
             republish(urgent_id);
@@ -837,12 +844,14 @@ unsafe fn try_direct_handoff(
             republish(target.id);
             return false;
         }
-        let root_as = crate::current_address_space();
-        if crate::activate_direct_task(target.id, target.addr_space.clone()).is_err() {
-            crate::release_direct_handoff_target(&target.cell, false);
-            republish(target.id);
-            return false;
-        }
+        let root_as = match crate::activate_direct_task(target.id, target.addr_space.take()) {
+            Ok(root_as) => root_as,
+            Err(()) => {
+                crate::release_direct_handoff_target(&target.cell, false);
+                republish(target.id);
+                return false;
+            }
+        };
 
         // SAFETY: source is the uniquely running task whose continuation this
         // switch saves; no executor can access its off-queue slot concurrently.
@@ -938,8 +947,9 @@ unsafe fn finish_direct_handoff(cpu: usize, current: *mut KernelTask, preempted:
 
     let root_cell = task_wake_cell(root_ref).expect("direct root lost wake cell");
     let root_as = direct_state.root_as.lock().take();
-    crate::activate_direct_task(root_cell.task, root_as)
+    let displaced = crate::activate_direct_task(root_cell.task, root_as)
         .expect("direct handoff could not restore root address space");
+    drop(displaced);
     narf_arch::set_current_domain_byte(root_ref.domain_byte.load(Ordering::Relaxed));
     // SAFETY: same owned target-cell reference established above.
     user_perf_switch(unsafe { (*target).task }, false);
@@ -6931,6 +6941,7 @@ pub mod tests {
         }
 
         struct Target {
+            addr_space: Arc<narf_memory::AddressSpace>,
             #[cfg(target_arch = "x86_64")]
             fpu: Box<DirectFpuArea>,
         }
@@ -6942,6 +6953,12 @@ pub mod tests {
                 if PHASE.load(Ordering::Acquire) == 0 {
                     if current_direct_identity().is_none() {
                         fail(1);
+                    }
+                    if !crate::current_address_space()
+                        .as_ref()
+                        .is_some_and(|active| Arc::ptr_eq(active, &_this.addr_space))
+                    {
+                        fail(20);
                     }
                     #[cfg(target_arch = "x86_64")]
                     if !direct_fpu_install(&mut _this.fpu, TARGET_FPU) {
@@ -6958,6 +6975,12 @@ pub mod tests {
                 }
                 if PHASE.load(Ordering::Acquire) != 2 {
                     fail(3);
+                }
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &_this.addr_space))
+                {
+                    fail(21);
                 }
                 // A nested stackful poll returns through the same completion
                 // hook while this target is active. It must leave the outer
@@ -7005,68 +7028,102 @@ pub mod tests {
         ROOT_TASK.store(0, Ordering::Release);
         let handoffs_before = direct_handoff_count();
         let returns_before = direct_return_count();
-        let target = crate::spawn_stackful(Target {
-            #[cfg(target_arch = "x86_64")]
-            fpu: Box::new(DirectFpuArea::reset()),
-        });
+        // SAFETY: paging is live in the distributed kernel-test environment.
+        let target_as = Arc::new(
+            unsafe { narf_memory::AddressSpace::new_for_user() }.expect("alloc direct target AS"),
+        );
+        // SAFETY: as above; this root must remain distinct from the target.
+        let root_as = Arc::new(
+            unsafe { narf_memory::AddressSpace::new_for_user() }.expect("alloc direct root AS"),
+        );
+        let target = crate::spawn_user(
+            crate::alloc_task_id(),
+            Target {
+                addr_space: Arc::clone(&target_as),
+                #[cfg(target_arch = "x86_64")]
+                fpu: Box::new(DirectFpuArea::reset()),
+            },
+            crate::TaskSpec::unthrottled(),
+            Arc::clone(&target_as),
+        );
         #[cfg(target_arch = "x86_64")]
         let mut root_fpu = Box::new(DirectFpuArea::reset());
-        crate::spawn_stackful(async move {
-            let Some((root_task, root_waker)) = current_direct_identity() else {
-                fail(9);
-                return;
-            };
-            #[cfg(target_arch = "x86_64")]
-            if !direct_fpu_install(&mut root_fpu, ROOT_FPU) {
-                fail(10);
-                return;
-            }
-            ROOT_TASK.store(root_task, Ordering::Release);
-            *ROOT_WAKER.lock() = Some(root_waker);
-            if PHASE.load(Ordering::Acquire) != 1 {
-                fail(11);
-                return;
-            }
-            let wake = TARGET_WAKER.lock().clone();
-            let Some(wake) = wake else {
-                fail(12);
-                return;
-            };
-            PHASE.store(2, Ordering::Release);
-            crate::wake_urgent_task(&wake, target.raw());
-            if !cooperative_yield() {
-                fail(13);
-            }
-            if PHASE.load(Ordering::Acquire) != 3 {
-                fail(14);
-            }
-            #[cfg(target_arch = "x86_64")]
-            if !direct_fpu_expect(ROOT_FPU) {
-                fail(15);
-            }
-            let cpu = this_cpu();
-            let root = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
-            if root.is_null() || DIRECT_HANDOFF[cpu].returned_root.load(Ordering::Acquire) != root {
-                fail(16);
-            }
-            let returns = DIRECT_HANDOFF[cpu].returns.load(Ordering::Acquire);
-            if returns != 1 {
-                fail(17);
-            }
-            if !direct_handoff_gate_open(cpu, root) {
-                fail(18);
-            }
-            DIRECT_HANDOFF[cpu]
-                .returns
-                .store(MAX_DIRECT_ROOT_RETURNS, Ordering::Release);
-            if direct_handoff_gate_open(cpu, root) {
-                fail(19);
-            }
-            DIRECT_HANDOFF[cpu]
-                .returns
-                .store(returns, Ordering::Release);
-            PHASE.store(4, Ordering::Release);
-        });
+        let root_expected = Arc::clone(&root_as);
+        crate::spawn_user(
+            crate::alloc_task_id(),
+            async move {
+                let Some((root_task, root_waker)) = current_direct_identity() else {
+                    fail(9);
+                    return;
+                };
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &root_expected))
+                {
+                    fail(22);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_install(&mut root_fpu, ROOT_FPU) {
+                    fail(10);
+                    return;
+                }
+                ROOT_TASK.store(root_task, Ordering::Release);
+                *ROOT_WAKER.lock() = Some(root_waker);
+                if PHASE.load(Ordering::Acquire) != 1 {
+                    fail(11);
+                    return;
+                }
+                let wake = TARGET_WAKER.lock().clone();
+                let Some(wake) = wake else {
+                    fail(12);
+                    return;
+                };
+                PHASE.store(2, Ordering::Release);
+                crate::wake_urgent_task(&wake, target.raw());
+                if !cooperative_yield() {
+                    fail(13);
+                }
+                if PHASE.load(Ordering::Acquire) != 3 {
+                    fail(14);
+                }
+                if !crate::current_address_space()
+                    .as_ref()
+                    .is_some_and(|active| Arc::ptr_eq(active, &root_expected))
+                {
+                    fail(23);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if !direct_fpu_expect(ROOT_FPU) {
+                    fail(15);
+                }
+                let cpu = this_cpu();
+                let root = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+                if root.is_null()
+                    || DIRECT_HANDOFF[cpu].returned_root.load(Ordering::Acquire) != root
+                {
+                    fail(16);
+                }
+                let returns = DIRECT_HANDOFF[cpu].returns.load(Ordering::Acquire);
+                if returns != 1 {
+                    fail(17);
+                }
+                if !direct_handoff_gate_open(cpu, root) {
+                    fail(18);
+                }
+                DIRECT_HANDOFF[cpu]
+                    .returns
+                    .store(MAX_DIRECT_ROOT_RETURNS, Ordering::Release);
+                if direct_handoff_gate_open(cpu, root) {
+                    fail(19);
+                }
+                DIRECT_HANDOFF[cpu]
+                    .returns
+                    .store(returns, Ordering::Release);
+                PHASE.store(4, Ordering::Release);
+            },
+            crate::TaskSpec::unthrottled(),
+            Arc::clone(&root_as),
+        );
         crate::run_until_empty();
         *TARGET_WAKER.lock() = None;
         *ROOT_WAKER.lock() = None;
@@ -7094,6 +7151,12 @@ pub mod tests {
             17 => return TestResult::Fail("direct-root return count was not advanced once"),
             18 => return TestResult::Fail("direct-root batch closed before its bound"),
             19 => return TestResult::Fail("direct-root batch remained open at its bound"),
+            20 => {
+                return TestResult::Fail("target executor poll published the wrong address space")
+            }
+            21 => return TestResult::Fail("source-to-target transfer lost target address space"),
+            22 => return TestResult::Fail("root executor poll published the wrong address space"),
+            23 => return TestResult::Fail("target-to-root transfer lost root address space"),
             _ => return TestResult::Fail("unexpected direct-transfer smoke failure"),
         }
         if PHASE.load(Ordering::Acquire) != 5 {

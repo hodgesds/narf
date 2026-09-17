@@ -892,27 +892,31 @@ pub(crate) fn release_direct_handoff_target(cell: &WakeCell, completed: bool) {
 }
 
 /// Publish a direct target's identity/address space before its continuation is
-/// entered. The old Arc stays installed until activation completes, so no live
-/// page-table root can be freed during the hardware transition.
+/// entered, returning ownership of the displaced active address space. The
+/// active slot stays locked and the old Arc stays locally owned across the
+/// hardware transition, so no live page-table root can be freed or observed
+/// half-published.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub(crate) fn activate_direct_task(id: u64, next: Option<Arc<AddressSpace>>) -> Result<(), ()> {
-    let same = {
-        let active = active_user_as_slot().lock();
-        match (active.as_ref(), next.as_ref()) {
-            (Some(active), Some(next)) => Arc::ptr_eq(active, next),
-            (None, None) => true,
-            _ => false,
-        }
+pub(crate) fn activate_direct_task(
+    id: u64,
+    next: Option<Arc<AddressSpace>>,
+) -> Result<Option<Arc<AddressSpace>>, ()> {
+    let mut active = active_user_as_slot().lock();
+    let same = match (active.as_ref(), next.as_ref()) {
+        (Some(active), Some(next)) => Arc::ptr_eq(active, next),
+        (None, None) => true,
+        _ => false,
     };
     if !same {
         let Some(ref next_as) = next else {
             return Err(());
         };
         next_as.activate().map_err(|_| ())?;
-        *active_user_as_slot().lock() = next;
     }
+    let previous = core::mem::replace(&mut *active, next);
+    drop(active);
     current_task_slot().store(id, Ordering::Release);
-    Ok(())
+    Ok(previous)
 }
 
 fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {

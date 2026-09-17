@@ -995,3 +995,15 @@ argument = "A timer tick writes need_resched only on the live KernelTask publish
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The tick still delegates strict budget and expired-slice admission to tick_preemption_required, including runnable-competitor and idle-borrow rules. The earlier fair-quantum request is published only when an eligible sibling is observed. Syscall exit consumes that established decision without rescanning time or queues; urgent exact wakes still prove a runnable peer, and ordinary wakes still consult the installed policy with elapsed runtime. A block or explicit yield clears the bit only because that same switch ends the charged slice and begins a new one. Affinity, class order, budget eligibility, wake-policy observability, direct-handoff bounds, and executor revalidation are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The optimization remains inside the existing scheduler executor TCB. It changes only ownership transfer for the already-specified direct address-space handoff and bypasses an installed perf callback only while the existing global instrumentation gate is false; it adds no trusted subsystem, task-selection path, mapping authority, capability, domain, or user-visible entry point."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The CPU-local ACTIVE_USER_AS lock retains the outgoing Arc while the target root is activated, replaces the publication only after successful activation, and returns the displaced owner to the direct-handoff record. The reverse transition moves that owner back and retains the displaced target until hardware again references the root. A failed activation leaves the old publication owned and unchanged, while task identity is published only after the successful exchange. Therefore no live page-table root can be freed or observed without a strong owner during either transition."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "A false narf_lib perf master gate proves that no registered perf event requires switch attribution because first-event publication enables that same gate. A true or conservatively stale gate still calls the existing userspace hook, whose live-event refcount remains authoritative; active-event accounting, PMU programming, rollback, and task identity are unchanged. The shortcut neither exposes scheduling metadata nor alters which task runs."
