@@ -12097,6 +12097,73 @@ pub fn __test_set_fsids(task: u64, fsuid: u32, fsgid: u32) {
     });
 }
 
+/// `CAP_SYS_PTRACE` — inspect and modify another process's memory and
+/// registers regardless of whose it is.
+pub(crate) const CAP_SYS_PTRACE: u32 = 19;
+
+/// `__ptrace_may_access` (`kernel/ptrace.c`) — may `caller` trace `target`?
+///
+/// ```text
+/// if (same_thread_group(task, current))       return 0;
+/// caller_uid = cred->uid;  caller_gid = cred->gid;   /* REALCREDS */
+/// if (uid_eq(caller_uid, tcred->euid) && uid_eq(caller_uid, tcred->suid) &&
+///     uid_eq(caller_uid, tcred->uid)  && gid_eq(caller_gid, tcred->egid) &&
+///     gid_eq(caller_gid, tcred->sgid) && gid_eq(caller_gid, tcred->gid))
+///         goto ok;
+/// if (ptrace_has_cap(tcred->user_ns, mode))   goto ok;
+/// return -EPERM;
+/// ok:
+/// if (mm && get_dumpable(mm) != SUID_DUMP_USER && !ptrace_has_cap(..))
+///         return -EPERM;
+/// ```
+///
+/// NARF had NO equivalent: `PTRACE_ATTACH` checked that the pid existed,
+/// that it was not the caller, and that nothing else was already tracing
+/// it. Any task could therefore attach to any other regardless of uid and
+/// `PTRACE_POKEDATA` into it, which is a write primitive into a more
+/// privileged process.
+///
+/// Both halves matter and they are not the same question. The credential
+/// comparison asks "is this the same user"; the dumpable gate asks "did
+/// that user's process ask not to be inspected", which is what a
+/// `PR_SET_DUMPABLE(0)` agent (ssh-agent, gpg-agent) relies on to keep a
+/// same-uid process out of its key material. Checking only the first
+/// leaves that request recorded and unhonoured.
+///
+/// ALL SIX id comparisons are required, not just the effective pair: a
+/// process that has dropped euid but kept a privileged real or saved uid
+/// can restore it, so treating it as the caller's peer would hand over a
+/// process that is one `setuid` away from being root.
+pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
+    if caller == target {
+        return true;
+    }
+    // `ptrace_has_cap`, consulted twice below. Capability over the whole
+    // system, not over a namespace: NARF's ptrace tables are keyed on the
+    // outer pid, so an inner-namespace tracer has already been translated
+    // by the time it reaches here.
+    let privileged = task_capable(caller, CAP_SYS_PTRACE);
+
+    let c = read_uidgid(caller);
+    let t = read_uidgid(target);
+    let same_user = c.uid == t.euid
+        && c.uid == t.suid
+        && c.uid == t.uid
+        && c.gid == t.egid
+        && c.gid == t.sgid
+        && c.gid == t.gid;
+    if !same_user && !privileged {
+        return false;
+    }
+    // The `ok:` label. Reached by EITHER route, so a same-user caller is
+    // still refused a non-dumpable target — that is the whole point of the
+    // flag, and it is why this is not folded into the branch above.
+    if !read_prctl(target).dumpable && !privileged {
+        return false;
+    }
+    true
+}
+
 fn read_uidgid(task: u64) -> UidGid {
     let g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
     g.as_ref()

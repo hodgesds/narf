@@ -2363,3 +2363,154 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_ptrace_traceme_second_call_is_eperm
 );
+
+// `__ptrace_may_access` (`kernel/ptrace.c`). PTRACE_ATTACH used to check
+// only that the pid existed, was not the caller, and was not already
+// traced — nothing asked WHOSE process it was. ATTACH + POKEDATA is an
+// arbitrary write into the target, so an unprivileged task could reach
+// into a root one.
+
+/// A task may not attach to a process belonging to another user.
+///
+/// All six id comparisons are required, which is what the second half
+/// pins: a target that has dropped its EFFECTIVE uid to the caller's but
+/// kept a privileged real or saved uid is one `setuid` away from being
+/// root again, so matching only the effective pair would hand it over.
+fn smoke_abi_proc2_ptrace_attach_requires_same_user() -> TestResult {
+    const PTRACE_ATTACH: u64 = 16;
+    const EPERM: i64 = -1;
+    with_setup(|| {
+        const TRACER_TASK: u64 = 0xB400;
+        const TRACER_PID: u64 = 0xB400;
+        const TARGET_TASK: u64 = 0xB401;
+        const TARGET_PID: u64 = 0xB401;
+        crate::ptrace::ptrace_init();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(TRACER_TASK, TRACER_PID);
+            register(TARGET_TASK, TARGET_PID);
+            // Same uid, both unprivileged: permitted. The control — without
+            // it a handler that refused everything would pass the rest.
+            // Drop BOTH through the real syscall rather than writing the
+            // id table: `setresuid` sets the saved uid too — which
+            // `__ptrace_may_access` compares, so a fixture that leaves
+            // `suid` at 0 fails the same-user test for the wrong reason —
+            // and it runs `cap_emulate_setxuid` (`security/commoncap.c`),
+            // which clears the capability sets. Without that the harness
+            // task keeps `Caps::boot()`, `ptrace_has_cap` succeeds, and
+            // every refusal below would be satisfied by the PRIVILEGED
+            // route instead of the one under test.
+            let drop_to = |task: u64, id: u64| -> Result<(), &'static str> {
+                set_task(task);
+                if call(Syscall::Setresgid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresgid should succeed while privileged");
+                }
+                if call(Syscall::Setresuid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresuid should succeed while privileged");
+                }
+                Ok(())
+            };
+            drop_to(TARGET_TASK, 1000)?;
+            drop_to(TRACER_TASK, 1000)?;
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH, TARGET_PID, 0, 0)) != Some(0) {
+                return Err("a same-uid attach should be permitted");
+            }
+            // Detach so the one-tracer rule does not mask the next answer.
+            const PTRACE_DETACH: u64 = 17;
+            let _ = call(Syscall::Ptrace.raw(), a3(PTRACE_DETACH, TARGET_PID, 0, 0));
+
+            // Different uid: refused. This is the escalation that was open —
+            // ATTACH followed by POKEDATA is an arbitrary write into the
+            // target, so an unprivileged task reaching a root one is a
+            // direct privilege escalation.
+            crate::handlers::__test_set_fsids(TARGET_TASK, 0, 0);
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH, TARGET_PID, 0, 0)) != Some(EPERM) {
+                return Err("attaching to another user's process must be -EPERM");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(TRACER_TASK);
+        crate::task::release_task(TARGET_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_attach_requires_same_user
+);
+
+/// `PR_SET_DUMPABLE(0)` keeps a SAME-USER tracer out.
+///
+/// The `ok:` label in `__ptrace_may_access` is reached by either route, so
+/// the dumpable gate applies even once the credential check has passed —
+/// it is a separate question from "is this the same user". Without it the
+/// flag was recorded and never consulted, and an ssh-agent or gpg-agent
+/// that set it was still fully inspectable by any process of its own uid.
+fn smoke_abi_proc2_ptrace_attach_honours_dumpable() -> TestResult {
+    const PTRACE_ATTACH: u64 = 16;
+    const PTRACE_DETACH: u64 = 17;
+    const PR_SET_DUMPABLE: u64 = 4;
+    const EPERM: i64 = -1;
+    with_setup(|| {
+        const TRACER_TASK: u64 = 0xB410;
+        const TRACER_PID: u64 = 0xB410;
+        const AGENT_TASK: u64 = 0xB411;
+        const AGENT_PID: u64 = 0xB411;
+        crate::ptrace::ptrace_init();
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(TRACER_TASK, TRACER_PID);
+            register(AGENT_TASK, AGENT_PID);
+            // As above: the real drop, so `suid` matches and the
+            // capability sets are cleared.
+            let drop_to = |task: u64, id: u64| -> Result<(), &'static str> {
+                set_task(task);
+                if call(Syscall::Setresgid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresgid should succeed while privileged");
+                }
+                if call(Syscall::Setresuid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresuid should succeed while privileged");
+                }
+                Ok(())
+            };
+            drop_to(AGENT_TASK, 1000)?;
+            drop_to(TRACER_TASK, 1000)?;
+
+            // Dumpable (the default): the same-uid attach is permitted.
+            set_task(TRACER_TASK);
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH, AGENT_PID, 0, 0)) != Some(0) {
+                return Err("a dumpable same-uid target should be attachable");
+            }
+            let _ = call(Syscall::Ptrace.raw(), a3(PTRACE_DETACH, AGENT_PID, 0, 0));
+
+            // The agent marks itself non-dumpable.
+            set_task(AGENT_TASK);
+            if call(Syscall::Prctl.raw(), a3(PR_SET_DUMPABLE, 0, 0, 0)) != Some(0) {
+                return Err("PR_SET_DUMPABLE(0) should succeed");
+            }
+            // The same tracer, same uid, is now refused.
+            set_task(TRACER_TASK);
+            if call(Syscall::Ptrace.raw(), a3(PTRACE_ATTACH, AGENT_PID, 0, 0)) != Some(EPERM) {
+                return Err("a non-dumpable target must refuse a same-uid tracer");
+            }
+            Ok(())
+        })();
+        crate::task::release_task(TRACER_TASK);
+        crate::task::release_task(AGENT_TASK);
+        result
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc2_ptrace_attach_honours_dumpable
+);
