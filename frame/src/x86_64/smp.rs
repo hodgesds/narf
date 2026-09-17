@@ -335,8 +335,12 @@ pub extern "C" fn _ap_start_rust(logical_id: u64) -> ! {
     //
     //     For the PKS path the same logic applies: AP CR4.PKS must
     //     mirror BSP. We enable both per the BSP's effective backend.
-    // Process address spaces use PCIDs independently of the domain enforcer.
-    // AP trampoline CR3 has PCID 0; unsupported/masked vCPUs safely decline.
+    // SAFETY: process address spaces use PCIDs independently of the domain
+    // enforcer, so this AP must enable CR4.PCIDE whatever the backend. The
+    // prerequisite holds: the trampoline loaded CR3 with PCID 0 in its low
+    // bits, which is what CR4.PCIDE requires at the moment it is set. A vCPU
+    // without PCID support, or with it masked, declines safely — see the
+    // block above for the full per-CPU CR4 argument.
     unsafe { narf_arch::x86_64::pcid::enable_pcide() };
 
     if narf_arch::effective_backend() == narf_arch::DomainBackend::Pks {
