@@ -1330,3 +1330,275 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_misc_implemented_syscall_still_dispatches
 );
+
+// ── syslog(2) ────────────────────────────────────────────────────
+//
+// `kernel/printk/printk.c::do_syslog`. `dmesg` and `systemd-journald` read
+// the kernel log through this; before it, the ring was reachable only via
+// `/dev/kmsg`.
+
+/// `include/linux/syslog.h` action numbers.
+const SYSLOG_CLOSE: u64 = 0;
+const SYSLOG_OPEN: u64 = 1;
+const SYSLOG_READ: u64 = 2;
+const SYSLOG_READ_ALL: u64 = 3;
+const SYSLOG_READ_CLEAR: u64 = 4;
+const SYSLOG_CLEAR: u64 = 5;
+const SYSLOG_CONSOLE_OFF: u64 = 6;
+const SYSLOG_CONSOLE_ON: u64 = 7;
+const SYSLOG_CONSOLE_LEVEL: u64 = 8;
+const SYSLOG_SIZE_UNREAD: u64 = 9;
+const SYSLOG_SIZE_BUFFER: u64 = 10;
+
+/// Argument validation, in `do_syslog`'s order.
+///
+/// The order is the substance. A null buffer with a zero length is -EINVAL
+/// rather than a successful no-op, because `if (!buf || len < 0)` is tested
+/// before `if (!len) return 0` — a caller probing with (NULL, 0) must learn
+/// its buffer is wrong, not that there was nothing to read.
+fn smoke_abi_syslog_arg_validation() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        let mut buf = [0u8; 64];
+        let p = buf.as_mut_ptr() as u64;
+
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, 0, 64)) != Some(EINVAL) {
+            return Err("syslog with a NULL buffer must be -EINVAL");
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, 0, 0)) != Some(EINVAL) {
+            return Err("a NULL buffer is -EINVAL even at length 0");
+        }
+        if call(
+            Syscall::Syslog.raw(),
+            a2(SYSLOG_READ_ALL, p, (-1i64) as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("a negative length must be -EINVAL, not an enormous read");
+        }
+        // A valid buffer with length 0 IS the successful no-op.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 0)) != Some(0) {
+            return Err("a zero-length read of a valid buffer should return 0");
+        }
+        // An action this kernel does not define.
+        if call(Syscall::Syslog.raw(), a2(99, p, 64)) != Some(EINVAL) {
+            return Err("an unknown syslog action must be -EINVAL");
+        }
+        // CLOSE and OPEN are no-ops in Linux too — the log has no
+        // per-opener state.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CLOSE, 0, 0)) != Some(0) {
+            return Err("SYSLOG_ACTION_CLOSE should succeed");
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_OPEN, 0, 0)) != Some(0) {
+            return Err("SYSLOG_ACTION_OPEN should succeed");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_arg_validation);
+
+/// Reading the log: SIZE_BUFFER, READ_ALL, and the destructive READ cursor.
+///
+/// READ_ALL returns the LAST `len` bytes, not the first. `dmesg` with a
+/// small buffer wants the most recent output; a head-first read would hand
+/// it the boot banner forever and it would never see what just happened.
+/// READ, by contrast, consumes — a second call continues where the first
+/// stopped, which is what makes it a drain rather than a repeat.
+fn smoke_abi_syslog_read() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_BUFFER, 0, 0))
+            != Some(narf_console::klog::RING_CAPACITY as i64)
+        {
+            return Err("SIZE_BUFFER must report the ring capacity");
+        }
+
+        // Put a known marker in the log.
+        narf_console::klog::record("narf-syslog-probe-alpha\n");
+        let mut buf = [0u8; 4096];
+        let p = buf.as_mut_ptr() as u64;
+        let n = match call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 4096)) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("READ_ALL should return the tail of the log"),
+        };
+        let seen = &buf[..n];
+        if !seen
+            .windows(b"narf-syslog-probe-alpha".len())
+            .any(|w| w == b"narf-syslog-probe-alpha")
+        {
+            return Err("READ_ALL did not return the most recent output");
+        }
+        // Non-destructive: asking again returns it again.
+        let again = call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 4096));
+        if again != Some(n as i64) {
+            return Err("READ_ALL must not consume — a second call should match the first");
+        }
+
+        // READ consumes. Drain whatever is pending, then confirm a second
+        // READ has nothing left and SIZE_UNREAD agrees.
+        loop {
+            match call(Syscall::Syslog.raw(), a2(SYSLOG_READ, p, 4096)) {
+                Some(n) if n > 0 => continue,
+                Some(0) => break,
+                _ => return Err("READ should drain the log and then return 0"),
+            }
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_UNREAD, 0, 0)) != Some(0) {
+            return Err("SIZE_UNREAD must be 0 once READ has drained the log");
+        }
+        // New output shows up for both.
+        narf_console::klog::record("narf-syslog-probe-beta\n");
+        let unread = call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_UNREAD, 0, 0));
+        match unread {
+            Some(n) if n > 0 => {}
+            _ => return Err("SIZE_UNREAD must count output written after the drain"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_read);
+
+/// CLEAR moves READ_ALL's floor; READ_CLEAR does both in one call.
+fn smoke_abi_syslog_clear() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        let mut buf = [0u8; 4096];
+        let p = buf.as_mut_ptr() as u64;
+
+        narf_console::klog::record("narf-syslog-before-clear\n");
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CLEAR, 0, 0)) != Some(0) {
+            return Err("SYSLOG_ACTION_CLEAR should succeed");
+        }
+        // Everything written before the clear is now below READ_ALL's floor.
+        let n = call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 4096));
+        if n != Some(0) {
+            return Err("READ_ALL after CLEAR must not report pre-clear output");
+        }
+        // And output after it is visible again — the control that says
+        // CLEAR moved a floor rather than breaking the reader.
+        narf_console::klog::record("narf-syslog-after-clear\n");
+        let n = match call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 4096)) {
+            Some(n) if n > 0 => n as usize,
+            _ => return Err("READ_ALL should report output written after CLEAR"),
+        };
+        if !buf[..n]
+            .windows(b"narf-syslog-after-clear".len())
+            .any(|w| w == b"narf-syslog-after-clear")
+        {
+            return Err("READ_ALL returned the wrong bytes after CLEAR");
+        }
+        // READ_CLEAR reads AND clears: the same call returns data, the next
+        // one returns nothing.
+        match call(Syscall::Syslog.raw(), a2(SYSLOG_READ_CLEAR, p, 4096)) {
+            Some(n) if n > 0 => {}
+            _ => return Err("READ_CLEAR should return the pending output"),
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_READ_ALL, p, 4096)) != Some(0) {
+            return Err("READ_CLEAR must clear what it returned");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_clear);
+
+/// The console-level actions, including the save/restore pairing.
+///
+/// `CONSOLE_OFF` parks the current level only `if (saved == LOGLEVEL_DEFAULT)`,
+/// so two OFFs in a row do not save the minimum over the real level and
+/// leave `CONSOLE_ON` restoring nothing. `CONSOLE_LEVEL` then implicitly
+/// re-enables, or a later `CONSOLE_ON` would undo the caller's explicit
+/// choice.
+fn smoke_abi_syslog_console_level() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        let level = narf_console::klog::console_loglevel;
+        let min = narf_console::klog::MINIMUM_CONSOLE_LOGLEVEL;
+
+        // Out of range in both directions.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_LEVEL, 0, 0)) != Some(EINVAL) {
+            return Err("CONSOLE_LEVEL 0 must be -EINVAL");
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_LEVEL, 0, 9)) != Some(EINVAL) {
+            return Err("CONSOLE_LEVEL 9 must be -EINVAL");
+        }
+        // In range: takes effect.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_LEVEL, 0, 5)) != Some(0) {
+            return Err("CONSOLE_LEVEL 5 should succeed");
+        }
+        if level() != 5 {
+            return Err("CONSOLE_LEVEL did not set the console loglevel");
+        }
+
+        // OFF drops to the minimum and remembers 5.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_OFF, 0, 0)) != Some(0) {
+            return Err("CONSOLE_OFF should succeed");
+        }
+        if level() != min {
+            return Err("CONSOLE_OFF did not drop to the minimum loglevel");
+        }
+        // A second OFF must not overwrite the saved level with the minimum.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_OFF, 0, 0)) != Some(0) {
+            return Err("a second CONSOLE_OFF should succeed");
+        }
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_ON, 0, 0)) != Some(0) {
+            return Err("CONSOLE_ON should succeed");
+        }
+        if level() != 5 {
+            return Err("CONSOLE_ON restored the wrong level after two OFFs");
+        }
+        // ON with nothing saved leaves the level alone.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_CONSOLE_ON, 0, 0)) != Some(0) {
+            return Err("a redundant CONSOLE_ON should succeed");
+        }
+        if level() != 5 {
+            return Err("CONSOLE_ON with nothing saved must not change the level");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_console_level);
+
+/// Every syslog action needs CAP_SYSLOG, and the check happens BEFORE the
+/// action is looked at.
+///
+/// `check_syslog_permissions` runs first in `do_syslog`, so an unprivileged
+/// caller cannot map out which actions exist by comparing errnos — an
+/// undefined action and a real one both answer -EPERM.
+///
+/// NARF's `kernel/dmesg_restrict` is `1`, which makes
+/// `syslog_action_restricted()` true for every action including READ_ALL
+/// and SIZE_BUFFER. Reading the policy off that file rather than assuming
+/// Linux's default `0` is the point: the sysctl and the syscall must not
+/// disagree about the same question.
+fn smoke_abi_syslog_requires_cap_syslog() -> TestResult {
+    with_setup(|| {
+        crate::handlers::__test_syslog_reset();
+        let mut buf = [0u8; 64];
+        let p = buf.as_mut_ptr() as u64;
+        // Privileged first, so the case proves the drop is what changed the
+        // answer rather than the action being broken outright.
+        if call(Syscall::Syslog.raw(), a2(SYSLOG_SIZE_BUFFER, 0, 0))
+            != Some(narf_console::klog::RING_CAPACITY as i64)
+        {
+            return Err("SIZE_BUFFER should work while privileged");
+        }
+        drop_to_unprivileged_uid()?;
+
+        for action in [
+            SYSLOG_READ,
+            SYSLOG_READ_ALL,
+            SYSLOG_READ_CLEAR,
+            SYSLOG_CLEAR,
+            SYSLOG_CONSOLE_OFF,
+            SYSLOG_CONSOLE_ON,
+            SYSLOG_SIZE_UNREAD,
+            SYSLOG_SIZE_BUFFER,
+            99,
+        ] {
+            if call(Syscall::Syslog.raw(), a2(action, p, 64)) != Some(EPERM) {
+                return Err("every syslog action must need CAP_SYSLOG under dmesg_restrict");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_syslog_requires_cap_syslog);

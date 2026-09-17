@@ -255,12 +255,25 @@ fn write_sched_rt_period_us(v: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-// kernel/printk: "4 4 1 7\n"
-// Format: console_loglevel default_loglevel minimum_loglevel default_console_loglevel
-// NARF does not implement per-level filtering yet; the values are
-// informational stubs matching Linux defaults.
+// kernel/printk: "<console> <default> <minimum> <default_console>\n"
+//
+// The first field is LIVE: `syslog(2)`'s SYSLOG_ACTION_CONSOLE_{OFF,ON,LEVEL}
+// write it, and a caller that set a level and then read this file back had
+// to see its own value — a stub here would have made the two disagree about
+// the same knob. The other three are the compile-time constants Linux also
+// reports unchanged.
+//
+// NARF's console has no per-message level, so the value does not yet FILTER
+// anything; see `narf_console::klog::console_loglevel`, which says so once
+// rather than at each caller.
 fn read_printk() -> String {
-    String::from("4 4 1 7\n")
+    alloc::format!(
+        "{}\t{}\t{}\t{}\n",
+        narf_console::klog::console_loglevel(),
+        narf_console::klog::DEFAULT_MESSAGE_LOGLEVEL,
+        narf_console::klog::MINIMUM_CONSOLE_LOGLEVEL,
+        narf_console::klog::DEFAULT_CONSOLE_LOGLEVEL,
+    )
 }
 
 // kernel/dmesg_restrict: NARF uses capability gating, not this sysctl.
@@ -835,11 +848,32 @@ kernel_test_in!(
     smoke_kernel_sched_rt_period_us_default
 );
 
+/// `kernel/printk` — four TAB-separated integers, the first of them live.
+///
+/// Two things were wrong with the stub this replaces. Sysctl arrays are
+/// tab-separated (`kernel/sysctl.c:630` puts `\t` between elements and `\n`
+/// after the last), not space-separated. And `4 4 1 7` was internally
+/// inconsistent: fields 1 and 4 are both `CONSOLE_LOGLEVEL_DEFAULT` in
+/// Linux, so they cannot differ.
+///
+/// The first field now tracks `syslog(2)`'s console-level actions, so a
+/// caller that sets a level and reads this file back sees its own value
+/// rather than a constant.
 fn smoke_kernel_printk_default() -> TestResult {
     register_all();
+    narf_console::klog::set_console_loglevel(narf_console::klog::DEFAULT_CONSOLE_LOGLEVEL);
     match read_sys("kernel/printk") {
-        Some(s) if s == "4 4 1 7\n" => TestResult::Pass,
-        _ => TestResult::Fail("kernel/printk mismatch"),
+        Some(s) if s == "7\t4\t1\t7\n" => {}
+        _ => return TestResult::Fail("kernel/printk default mismatch"),
+    }
+    // The live half: the file must follow the knob, or the sysctl and
+    // `syslog(2)` would disagree about the same value.
+    narf_console::klog::set_console_loglevel(3);
+    let live = read_sys("kernel/printk");
+    narf_console::klog::set_console_loglevel(narf_console::klog::DEFAULT_CONSOLE_LOGLEVEL);
+    match live {
+        Some(s) if s == "3\t4\t1\t7\n" => TestResult::Pass,
+        _ => TestResult::Fail("kernel/printk did not follow the console loglevel"),
     }
 }
 kernel_test_in!("filesystem/procfs/sys_kernel", smoke_kernel_printk_default);

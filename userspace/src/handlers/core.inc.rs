@@ -599,11 +599,22 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
 
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 type AllAsLookupFn = fn() -> alloc::vec::Vec<Arc<AddressSpace>>;
+/// Resolve an ARBITRARY task's address space, not just the caller's.
+///
+/// `AsLookupFn` answers only "the currently-polling task's", which is all
+/// most syscalls need. `process_mrelease(2)` acts on a target named by a
+/// pidfd, and Linux's `move_pages(2)` likewise addresses a foreign mm — both
+/// were unreachable without this. The scheduler already exposes
+/// `address_space_of(id)`; this is the bridge for it, in the same
+/// install-at-boot shape as the two above (a direct dependency would close
+/// a narf-userspace -> narf-scheduler -> narf-userspace cycle).
+type AsForTaskLookupFn = fn(u64) -> Option<Arc<AddressSpace>>;
 
 // Like TASK_LOOKUP, this callback is immutable after boot outside sequential
 // tests. Keep address-space-heavy syscalls and private futex operations off a
 // global IRQ-disabling callback lock.
 static AS_LOOKUP: AtomicUsize = AtomicUsize::new(0);
+static AS_FOR_TASK_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -621,6 +632,39 @@ pub fn install_address_space_lookup(lookup: AsLookupFn) {
 /// live aliases without introducing a userspace↔scheduler crate cycle.
 pub fn install_all_address_spaces_lookup(lookup: AllAsLookupFn) {
     *ALL_AS_LOOKUP.lock() = Some(lookup);
+}
+
+/// Install the by-task-id address-space resolver. See [`AsForTaskLookupFn`].
+pub fn install_address_space_for_task_lookup(lookup: AsForTaskLookupFn) {
+    AS_FOR_TASK_LOOKUP.store(lookup as usize, Ordering::Release);
+}
+
+/// The address space of `task`, or `None` when the task has none (a kernel
+/// task, or one that has already torn its down) or no resolver is installed.
+pub fn address_space_of_task(task: u64) -> Option<Arc<AddressSpace>> {
+    let raw = AS_FOR_TASK_LOOKUP.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: every non-zero AS_FOR_TASK_LOOKUP value was stored from an
+    // `AsForTaskLookupFn` by `install_address_space_for_task_lookup`.
+    let f: AsForTaskLookupFn = unsafe { core::mem::transmute::<usize, AsForTaskLookupFn>(raw) };
+    f(task)
+}
+
+/// Test hook — swap the by-task resolver, returning the previous one.
+#[doc(hidden)]
+pub fn __test_swap_as_for_task_lookup(lookup: Option<AsForTaskLookupFn>) -> Option<AsForTaskLookupFn> {
+    let prev = AS_FOR_TASK_LOOKUP.swap(
+        lookup.map(|f| f as usize).unwrap_or(0),
+        Ordering::AcqRel,
+    );
+    if prev == 0 {
+        None
+    } else {
+        // SAFETY: as in `address_space_of_task`.
+        Some(unsafe { core::mem::transmute::<usize, AsForTaskLookupFn>(prev) })
+    }
 }
 
 fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
@@ -4305,6 +4349,10 @@ pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;
+/// `CAP_SYSLOG` — read the kernel log and control what reaches the console.
+/// Split out of CAP_SYS_ADMIN in 2.6.37 precisely so a log reader need not
+/// be given the whole of it.
+pub(crate) const CAP_SYSLOG: u32 = 34;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
 /// Linux checkpoint/restore authority accepted by clone3(set_tid), alongside
 /// CAP_SYS_ADMIN.

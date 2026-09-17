@@ -1724,6 +1724,13 @@ pub enum Syscall {
     /// restarting.
     /// Linux `listns` (x86_64=470, aarch64=470).
     Listns,
+    /// `syslog(2)` — read the kernel log ring and control what reaches the
+    /// console. x86_64 103, generic 116. `dmesg` and `systemd-journald`.
+    Syslog,
+    /// `process_mrelease(2)` — reclaim the anonymous memory of an already-
+    /// dying process named by a pidfd, without waiting for it to run its own
+    /// teardown. 448 on both tables. systemd-oomd / Android lmkd.
+    ProcessMrelease,
     /// `mseal(start, len, flags)` — make a range permanently immune to the
     /// operations that could replace what is mapped there (munmap, mremap,
     /// mprotect, MAP_FIXED, destructive madvise). Monotonic: there is no
@@ -2588,6 +2595,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::FileGetattr, 468),
     (Syscall::FileSetattr, 469),
     (Syscall::Listns, 470),
+    (Syscall::Syslog, 103),
+    (Syscall::ProcessMrelease, 448),
     (Syscall::Lremovexattr, 198),
     (Syscall::Fremovexattr, 199),
     (Syscall::Creat, 85),
@@ -3065,6 +3074,8 @@ const LINUX_TABLE: &[(Syscall, u32)] = &[
     (Syscall::FileGetattr, 468),
     (Syscall::FileSetattr, 469),
     (Syscall::Listns, 470),
+    (Syscall::Syslog, 116),
+    (Syscall::ProcessMrelease, 448),
     (Syscall::Lremovexattr, 15),
     (Syscall::Fremovexattr, 16),
     (Syscall::Utimensat, 88),
