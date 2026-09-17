@@ -599,11 +599,22 @@ pub(crate) fn poll_io_to_completion<F: core::future::Future>(mut fut: F) -> Opti
 
 type AsLookupFn = fn() -> Option<Arc<AddressSpace>>;
 type AllAsLookupFn = fn() -> alloc::vec::Vec<Arc<AddressSpace>>;
+/// Resolve an ARBITRARY task's address space, not just the caller's.
+///
+/// `AsLookupFn` answers only "the currently-polling task's", which is all
+/// most syscalls need. `process_mrelease(2)` acts on a target named by a
+/// pidfd, and Linux's `move_pages(2)` likewise addresses a foreign mm — both
+/// were unreachable without this. The scheduler already exposes
+/// `address_space_of(id)`; this is the bridge for it, in the same
+/// install-at-boot shape as the two above (a direct dependency would close
+/// a narf-userspace -> narf-scheduler -> narf-userspace cycle).
+type AsForTaskLookupFn = fn(u64) -> Option<Arc<AddressSpace>>;
 
 // Like TASK_LOOKUP, this callback is immutable after boot outside sequential
 // tests. Keep address-space-heavy syscalls and private futex operations off a
 // global IRQ-disabling callback lock.
 static AS_LOOKUP: AtomicUsize = AtomicUsize::new(0);
+static AS_FOR_TASK_LOOKUP: AtomicUsize = AtomicUsize::new(0);
 static ALL_AS_LOOKUP: narf_lib::sync::IrqSafeSpinLock<Option<AllAsLookupFn>> =
     narf_lib::sync::IrqSafeSpinLock::new(None);
 
@@ -621,6 +632,39 @@ pub fn install_address_space_lookup(lookup: AsLookupFn) {
 /// live aliases without introducing a userspace↔scheduler crate cycle.
 pub fn install_all_address_spaces_lookup(lookup: AllAsLookupFn) {
     *ALL_AS_LOOKUP.lock() = Some(lookup);
+}
+
+/// Install the by-task-id address-space resolver. See [`AsForTaskLookupFn`].
+pub fn install_address_space_for_task_lookup(lookup: AsForTaskLookupFn) {
+    AS_FOR_TASK_LOOKUP.store(lookup as usize, Ordering::Release);
+}
+
+/// The address space of `task`, or `None` when the task has none (a kernel
+/// task, or one that has already torn its down) or no resolver is installed.
+pub fn address_space_of_task(task: u64) -> Option<Arc<AddressSpace>> {
+    let raw = AS_FOR_TASK_LOOKUP.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: every non-zero AS_FOR_TASK_LOOKUP value was stored from an
+    // `AsForTaskLookupFn` by `install_address_space_for_task_lookup`.
+    let f: AsForTaskLookupFn = unsafe { core::mem::transmute::<usize, AsForTaskLookupFn>(raw) };
+    f(task)
+}
+
+/// Test hook — swap the by-task resolver, returning the previous one.
+#[doc(hidden)]
+pub fn __test_swap_as_for_task_lookup(lookup: Option<AsForTaskLookupFn>) -> Option<AsForTaskLookupFn> {
+    let prev = AS_FOR_TASK_LOOKUP.swap(
+        lookup.map(|f| f as usize).unwrap_or(0),
+        Ordering::AcqRel,
+    );
+    if prev == 0 {
+        None
+    } else {
+        // SAFETY: as in `address_space_of_task`.
+        Some(unsafe { core::mem::transmute::<usize, AsForTaskLookupFn>(prev) })
+    }
 }
 
 fn all_address_spaces() -> alloc::vec::Vec<Arc<AddressSpace>> {
@@ -4305,6 +4349,10 @@ pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
 pub(crate) const CAP_SYS_ADMIN: u32 = 21;
+/// `CAP_SYSLOG` — read the kernel log and control what reaches the console.
+/// Split out of CAP_SYS_ADMIN in 2.6.37 precisely so a log reader need not
+/// be given the whole of it.
+pub(crate) const CAP_SYSLOG: u32 = 34;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
 /// Linux checkpoint/restore authority accepted by clone3(set_tid), alongside
 /// CAP_SYS_ADMIN.
@@ -6784,7 +6832,30 @@ pub fn clear_mempolicy_for_fault() {
 // a per-task side table so getattr reflects setattr.
 
 /// `SCHED_ATTR_SIZE_VER0` — the smallest valid `struct sched_attr`.
-const SCHED_ATTR_SIZE: usize = 48;
+/// `SCHED_ATTR_SIZE_VER0` (`include/uapi/linux/sched/types.h:7`) — the first
+/// published `struct sched_attr`, and the largest NARF knows.
+///
+/// Linux's current `sizeof(struct sched_attr)` is `SCHED_ATTR_SIZE_VER1`
+/// (56): VER1 added `sched_util_min`/`sched_util_max`, which need uclamp
+/// support in the scheduler. NARF has none, so it reports VER0 — which is
+/// not a shortfall in the ABI but a legitimate configuration of it. A
+/// modern caller passing 56 bytes with those fields ZERO is accepted
+/// (`copy_struct_from_user` ignores a zero tail); one that actually asks
+/// for util clamping gets -E2BIG, which is exactly what a pre-VER1 kernel
+/// answers and is how the caller learns to stop asking.
+const SCHED_ATTR_SIZE_VER0: usize = 48;
+/// `SCHED_ATTR_SIZE_VER1` — named so the `SCHED_FLAG_UTIL_CLAMP` rule can
+/// cite the size it requires, even though NARF never accepts one this big.
+const SCHED_ATTR_SIZE_VER1: usize = 56;
+/// The largest `sched_attr` this kernel understands.
+const SCHED_ATTR_SIZE: usize = SCHED_ATTR_SIZE_VER0;
+
+/// `SCHED_FLAG_UTIL_CLAMP` (`include/uapi/linux/sched.h:140`) —
+/// `UTIL_CLAMP_MIN | UTIL_CLAMP_MAX`.
+const SCHED_FLAG_UTIL_CLAMP: u64 = 0x20 | 0x40;
+/// `SCHED_FLAG_ALL` — every flag the ABI defines. A flag outside this is a
+/// caller expecting something no kernel does.
+const SCHED_FLAG_ALL: u64 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
 
 static SCHED_ATTR_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, [u8; SCHED_ATTR_SIZE]>>,

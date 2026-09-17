@@ -191,14 +191,16 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_current_ucred_task_cache);
 const NOCHANGE: u64 = u32::MAX as u64;
 
 // ── setuid ───────────────────────────────────────────────────────────
-// Without the `container` feature there is no user-ns gate, so the only
-// failure mode is "uid/gid table not initialised" ⇒ Ok(-1). With it
-// initialised ⇒ Ok(0). Accept both Ok shapes.
+// These used to accept "0 or -1", on the grounds that the uid/gid table
+// might not be initialised. `with_setup` runs `init_per_task_state`, which
+// calls `uidgid_init`, so it always is — and -1 is EPERM, so accepting it
+// meant the case would still pass if the privileged branch stopped working
+// altogether. That is the shape that hid the setfsuid/setregid/setresgid
+// bugs: a test that accepts the failure it is meant to rule out.
 fn smoke_abi_creds_setuid_pos() -> TestResult {
     with_setup(|| {
-        let r = call(Syscall::SetUid.raw(), a0(0)).ok_or("setuid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setuid(0) returned an unexpected value");
+        if call(Syscall::SetUid.raw(), a0(0)) != Some(0) {
+            return Err("setuid(0) as root should succeed");
         }
         Ok(())
     })
@@ -237,9 +239,8 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setuid_neg);
 // ── setgid ───────────────────────────────────────────────────────────
 fn smoke_abi_creds_setgid_pos() -> TestResult {
     with_setup(|| {
-        let r = call(Syscall::SetGid.raw(), a0(0)).ok_or("setgid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setgid(0) returned an unexpected value");
+        if call(Syscall::SetGid.raw(), a0(0)) != Some(0) {
+            return Err("setgid(0) as root should succeed");
         }
         Ok(())
     })
@@ -268,15 +269,22 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setgid_neg);
 // ── setreuid ─────────────────────────────────────────────────────────
 fn smoke_abi_creds_setreuid_pos() -> TestResult {
     with_setup(|| {
-        // (-1, -1) ⇒ leave both unchanged; Ok(0) when table init, Ok(-1)
-        // when not.
-        let r = call(
+        // (-1, -1) leaves both unchanged, which `__sys_setreuid` reaches
+        // through its permitted branch and therefore succeeds.
+        if call(
             Syscall::Setreuid.raw(),
             a1(u32::MAX as u64, u32::MAX as u64),
-        )
-        .ok_or("setreuid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setreuid(-1,-1) unexpected value");
+        ) != Some(0)
+        {
+            return Err("setreuid(-1, -1) should succeed and change nothing");
+        }
+        // "Changes nothing" is the half worth pinning: a handler that wrote
+        // the sentinel through would set both ids to 4294967295.
+        if call(Syscall::GetUid.raw(), a0(0)) != Some(0) {
+            return Err("setreuid(-1, -1) altered the real uid");
+        }
+        if call(Syscall::Geteuid.raw(), a0(0)) != Some(0) {
+            return Err("setreuid(-1, -1) altered the effective uid");
         }
         Ok(())
     })
@@ -306,13 +314,18 @@ kernel_test_in!("syscall_abi", smoke_abi_creds_setreuid_neg);
 // ── setregid ─────────────────────────────────────────────────────────
 fn smoke_abi_creds_setregid_pos() -> TestResult {
     with_setup(|| {
-        let r = call(
+        if call(
             Syscall::Setregid.raw(),
             a1(u32::MAX as u64, u32::MAX as u64),
-        )
-        .ok_or("setregid not Ok")?;
-        if r != 0 && r != -1 {
-            return Err("setregid(-1,-1) unexpected value");
+        ) != Some(0)
+        {
+            return Err("setregid(-1, -1) should succeed and change nothing");
+        }
+        if call(Syscall::GetGid.raw(), a0(0)) != Some(0) {
+            return Err("setregid(-1, -1) altered the real gid");
+        }
+        if call(Syscall::Getegid.raw(), a0(0)) != Some(0) {
+            return Err("setregid(-1, -1) altered the effective gid");
         }
         Ok(())
     })

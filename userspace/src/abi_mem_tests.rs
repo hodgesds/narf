@@ -1618,3 +1618,139 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_mem_mbind_nodemask_efault_precedes_flag_einval_pos
 );
+
+// ── process_mrelease(2) ──────────────────────────────────────────
+//
+// `mm/oom_kill.c`. Reclaims the anonymous memory of an ALREADY-DYING
+// process named by a pidfd, so a userspace low-memory killer
+// (systemd-oomd, Android lmkd) gets the memory back promptly instead of
+// whenever the victim next runs.
+
+/// Install a pidfd for `pid` in the harness task's table.
+fn install_pidfd(pid: u64, alive: bool) -> Result<u32, &'static str> {
+    let st = crate::pidfd::mint_for(pid, pid, alive);
+    let ops: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+        alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(st));
+    crate::fd::install(
+        FAKE_TASK,
+        crate::fd::FdEntry {
+            ops,
+            offset: 0,
+            flags: 0,
+            status_flags: 0,
+        },
+    )
+    .ok_or("could not install a pidfd")
+}
+
+/// Argument and target validation, in `do_process_mrelease`'s order.
+///
+/// `if (flags) return -EINVAL` comes before the fd is looked at, so an
+/// unknown flag is reported rather than silently ignored — and a caller
+/// cannot use a bad fd to mask a flag this kernel does not implement.
+fn smoke_abi_mem_process_mrelease_validation() -> TestResult {
+    const EAGAIN: i64 = -11;
+    with_setup(|| {
+        // A non-zero flag is rejected even with a bogus fd, which is what
+        // pins the ORDER rather than just the errno.
+        if call(Syscall::ProcessMrelease.raw(), a1(999, 1)) != Some(EINVAL) {
+            return Err("process_mrelease with a non-zero flag must be -EINVAL");
+        }
+        // Not an open fd at all.
+        if call(Syscall::ProcessMrelease.raw(), a1(999, 0)) != Some(EBADF) {
+            return Err("process_mrelease with a bogus pidfd must be -EBADF");
+        }
+        // An open fd that is not a pidfd is also -EBADF: `pidfd_get_task`
+        // rejects the file type, it does not fall through to the target.
+        let not_a_pidfd = match crate::fd::install(
+            FAKE_TASK,
+            crate::fd::FdEntry {
+                ops: alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(crate::pidfd::mint_for(
+                    4242, 4242, true,
+                ))) as alloc::sync::Arc<dyn narf_filesystem::FileOps>,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        ) {
+            Some(f) => f,
+            None => return Err("could not install a probe fd"),
+        };
+        // A pidfd naming a pid with no task behind it is -ESRCH: the
+        // descriptor is fine, the process is gone. A pidfd deliberately
+        // outlives its process, so this is the ordinary race.
+        if call(Syscall::ProcessMrelease.raw(), a1(not_a_pidfd as u64, 0)) != Some(ESRCH) {
+            return Err("process_mrelease on a departed process must be -ESRCH");
+        }
+        let _ = EAGAIN;
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_process_mrelease_validation);
+
+/// A LIVE process is -EINVAL; a dying one is released.
+///
+/// This is the whole security argument for the syscall. `task_will_free_mem`
+/// gates it, and without that gate any caller holding a pidfd could destroy
+/// a running process's memory out from under it. The live half is therefore
+/// not a nicety — it is the property being asserted, and the dying half is
+/// the control that says the refusal is a real check and not the syscall
+/// failing for everyone.
+fn smoke_abi_mem_process_mrelease_only_dying() -> TestResult {
+    with_setup(|| {
+        const VICTIM: u64 = 7311;
+        // A live, registered task with an address space.
+        let _t = crate::task::Task::new_registered(VICTIM, VICTIM);
+        crate::handlers::register_task_to_pid(VICTIM, VICTIM);
+        crate::handlers::register_pid_task_mapping(VICTIM, VICTIM);
+        let fd = install_pidfd(VICTIM, true)?;
+
+        // No address space for the victim yet: nothing to release, -ESRCH.
+        // (`find_lock_task_mm` failing.)
+        if call(Syscall::ProcessMrelease.raw(), a1(fd as u64, 0)) != Some(ESRCH) {
+            return Err("process_mrelease on a task with no address space must be -ESRCH");
+        }
+
+        // Give it one, still alive → -EINVAL, because it is not dying.
+        // SAFETY: same construction the other memory cases use — a fresh
+        // user address space with no mappings.
+        let as_arc = match unsafe { AddressSpace::new_for_user() } {
+            Ok(a) => alloc::sync::Arc::new(a),
+            Err(_) => return Err("could not build a victim address space"),
+        };
+        let prev = crate::handlers::__test_swap_as_for_task_lookup(Some(victim_as_lookup));
+        VICTIM_AS.lock().replace(as_arc.clone());
+        let live = call(Syscall::ProcessMrelease.raw(), a1(fd as u64, 0));
+
+        // Now mark it dying, exactly as `exit_group(2)` would.
+        if let Some(t) = crate::task::task_get(VICTIM) {
+            t.group_exiting
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+        let dying = call(Syscall::ProcessMrelease.raw(), a1(fd as u64, 0));
+
+        *VICTIM_AS.lock() = None;
+        crate::handlers::__test_swap_as_for_task_lookup(prev);
+
+        if live != Some(EINVAL) {
+            return Err("process_mrelease on a LIVE process must be -EINVAL");
+        }
+        match dying {
+            // Released, or nothing to release — both are success. -EAGAIN
+            // would mean the reaper deferred, which is also not a refusal.
+            Some(0) | Some(-11) => {}
+            _ => return Err("process_mrelease on a dying process should not be refused"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_process_mrelease_only_dying);
+
+/// The address space the by-task resolver hands back during the case above.
+static VICTIM_AS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::sync::Arc<narf_memory::AddressSpace>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+fn victim_as_lookup(_task: u64) -> Option<alloc::sync::Arc<narf_memory::AddressSpace>> {
+    VICTIM_AS.lock().clone()
+}

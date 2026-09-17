@@ -133,6 +133,23 @@ pub fn live_len() -> usize {
     }
 }
 
+/// The live region's extent, as (total bytes ever written, live length).
+///
+/// Both under ONE lock. `bytes_written()` and `live_len()` separately would
+/// let a concurrent `record()` land between them, and a reader computing
+/// "where does the live region start" from a torn pair
+/// (`written - live_len`) would name a byte the ring no longer holds.
+/// `syslog(2)`'s cursors are absolute positions, so they need this.
+pub fn span() -> (u64, usize) {
+    let g = RING.lock();
+    let live = if g.written < RING_CAPACITY as u64 {
+        g.written as usize
+    } else {
+        RING_CAPACITY
+    };
+    (g.written, live)
+}
+
 /// Copy the live region starting at chronological byte `offset` into `out`,
 /// returning the number of bytes copied (0 at or past the end). Equivalent
 /// to `snapshot()[offset..][..n]` but without allocating: it reads the
@@ -216,4 +233,37 @@ pub fn __reset_for_test() {
     g.buf = [0u8; RING_CAPACITY];
     g.head = 0;
     g.written = 0;
+}
+
+// ── console loglevel ────────────────────────────────────────────────
+
+/// `console_loglevel` — messages at a level NUMERICALLY LOWER than this go
+/// to the console (`kernel/printk/printk.c`). `syslog(2)`'s
+/// `SYSLOG_ACTION_CONSOLE_{OFF,ON,LEVEL}` read and write it, and
+/// `/proc/sys/kernel/printk` reports it as its first field.
+///
+/// NARF's console has no per-message level: `record()` takes a `&str` and
+/// every caller's output goes to the same place, so this value is carried
+/// and reported faithfully but does not yet FILTER anything. That is a gap
+/// in the console subsystem, not in `syslog(2)` — closing it means giving
+/// every kernel print a level, which is a far wider change than the syscall
+/// that reads the knob. Stated here rather than at each caller so the
+/// limitation is not discovered by surprise.
+static CONSOLE_LOGLEVEL: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(7);
+
+/// `minimum_console_loglevel` — `CONSOLE_LEVEL` is clamped up to this, so
+/// console output can never be silenced below emergencies.
+pub const MINIMUM_CONSOLE_LOGLEVEL: u32 = 1;
+/// `default_message_loglevel`.
+pub const DEFAULT_MESSAGE_LOGLEVEL: u32 = 4;
+/// `default_console_loglevel` — also `CONSOLE_ON`'s restore target when no
+/// level was saved.
+pub const DEFAULT_CONSOLE_LOGLEVEL: u32 = 7;
+
+pub fn console_loglevel() -> u32 {
+    CONSOLE_LOGLEVEL.load(Ordering::Relaxed)
+}
+
+pub fn set_console_loglevel(level: u32) {
+    CONSOLE_LOGLEVEL.store(level, Ordering::Relaxed);
 }

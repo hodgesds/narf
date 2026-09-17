@@ -10068,6 +10068,16 @@ pub fn install_core_syscalls(table: &mut SyscallTable) {
         RawFnHandler(handler_sys_listns::sys_listns),
     );
     table.install_raw(
+        Syscall::Syslog,
+        "syslog",
+        RawFnHandler(handler_sys_syslog::sys_syslog),
+    );
+    table.install_raw(
+        Syscall::ProcessMrelease,
+        "process_mrelease",
+        RawFnHandler(handler_sys_process_mrelease::sys_process_mrelease),
+    );
+    table.install_raw(
         Syscall::FileGetattr,
         "file_getattr",
         RawFnHandler(sys_file_getattr),
@@ -11405,6 +11415,11 @@ mod handler_sys_mseal;
 #[cfg(feature = "container")]
 #[path = "sys_listns.rs"]
 mod handler_sys_listns;
+#[path = "sys_syslog.rs"]
+mod handler_sys_syslog;
+#[path = "sys_process_mrelease.rs"]
+mod handler_sys_process_mrelease;
+pub use handler_sys_syslog::__test_syslog_reset;
 #[cfg(feature = "container")]
 #[path = "nsfs.rs"]
 mod handler_nsfs;

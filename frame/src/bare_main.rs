@@ -4610,6 +4610,11 @@ fn boot_userspace_init() {
     // The handlers reach `current_task_id()` then look up its
     // address space — this lookup goes through the scheduler's
     // ready-queue scan.
+    // The by-task-id resolver, for syscalls that act on a target named by a
+    // pidfd rather than on the caller. No `current_address_space()`
+    // short-circuit here: that would answer for the CALLER whenever the
+    // target happened not to be on the run queue.
+    narf_userspace::install_address_space_for_task_lookup(narf_scheduler::address_space_of);
     install_address_space_lookup(|| {
         // Prefer the executor-published "currently-polling AS" —
         // address_space_of searches the run-queue, which doesn't
