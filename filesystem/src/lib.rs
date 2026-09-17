@@ -2506,6 +2506,13 @@ pub mod mnt_flags {
     pub const NODEV: u64 = 1 << 2;
     /// `MNT_NOEXEC` — nothing on this mount may be executed.
     pub const NOEXEC: u64 = 1 << 3;
+    /// `MNT_NOSYMFOLLOW` — a symlink on this mount is never followed.
+    ///
+    /// `fs/namei.c:2036` checks it in the SAME breath as
+    /// `LOOKUP_NO_SYMLINKS`, so a mount carrying it gives every walk the
+    /// constraint `openat2`'s `RESOLVE_NO_SYMLINKS` asks for per call:
+    /// encountering a symlink is -ELOOP, not a silent traversal.
+    pub const NOSYMFOLLOW: u64 = 1 << 4;
 
     /// Render the set the way `/proc/mounts` does: `rw` or `ro` first,
     /// then each restriction that is on. `show_mountinfo` and `show_vfsmnt`
@@ -2513,7 +2520,14 @@ pub mod mnt_flags {
     /// against the options a mount unit asked for.
     pub fn render(flags: u64) -> alloc::string::String {
         let mut out = alloc::string::String::from(if flags & READONLY != 0 { "ro" } else { "rw" });
-        for (bit, name) in [(NOSUID, ",nosuid"), (NODEV, ",nodev"), (NOEXEC, ",noexec")] {
+        // Same order `show_mountinfo` emits them, and `nosymfollow` is in
+        // that list — a mount unit that asked for it reads this back.
+        for (bit, name) in [
+            (NOSUID, ",nosuid"),
+            (NODEV, ",nodev"),
+            (NOEXEC, ",noexec"),
+            (NOSYMFOLLOW, ",nosymfollow"),
+        ] {
             if flags & bit != 0 {
                 out.push_str(name);
             }

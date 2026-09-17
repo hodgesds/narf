@@ -1216,6 +1216,17 @@ fn open_impl(
     // O_NOFOLLOW still preserves a final link, while intermediate links must
     // always be traversed.
     let proc_magic_path = chroot_path_matches(task, &path_owned, "/proc", true);
+    // `RESOLVE_NO_MAGICLINKS`: `nd_jump_link` refuses with -ELOOP before it
+    // jumps. NARF's magic links are the procfs ones — `/proc/self/fd/N` and
+    // `/proc/<pid>/ns/<flavour>` — and they are reached through the
+    // `proc_magic_path` branches below rather than by reading a symlink
+    // target, so the refusal belongs here rather than in the resolver.
+    // ELOOP, matching the flag's sibling `RESOLVE_NO_SYMLINKS`: what the
+    // caller hit was a link it asked not to traverse.
+    if proc_magic_path && current_resolve_scope().is_some_and(|s| s.no_magiclinks) {
+        ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+        return;
+    }
     let mut fast_create = if mnt_len == 0
         && !proc_magic_path
         && flags & O_CREAT != 0
@@ -1229,7 +1240,19 @@ fn open_impl(
     let path_owned = if fast_create.is_some() {
         path_owned
     } else if mnt_len == 0 && !proc_magic_path {
-        resolve_vfs_symlink_path(&path_owned, flags & 0o400000 == 0).unwrap_or(path_owned)
+        // Under an `openat2` scope a refusal is the ANSWER, not a reason to
+        // fall back: `unwrap_or(path_owned)` would hand the caller the very
+        // path it asked the kernel to refuse. Outside one, an unresolvable
+        // path keeps the long-standing "use it as written and let the
+        // lookup fail" behaviour, which is what the other callers rely on.
+        match resolve_vfs_symlink_path_scoped(&path_owned, flags & 0o400000 == 0) {
+            Ok(resolved) => resolved,
+            Err(errno) if current_resolve_scope().is_some() => {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
+                return;
+            }
+            Err(_) => path_owned,
+        }
     } else {
         path_owned
     };

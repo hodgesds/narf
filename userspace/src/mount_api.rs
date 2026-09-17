@@ -17,8 +17,11 @@
 //!
 //! `open_tree` / `open_tree_attr` / `fspick` grab an existing mount's fs via
 //! `registry().fs_arc_at`. Mount attributes are ABI-validated but accepted as
-//! no-ops (NARF doesn't model per-mount RO/NOSUID attributes at this layer,
-//! matching how `sys_mount` swallows the `MS_*` flags).
+//! `mount_setattr` applies the four attributes NARF's mount table carries
+//! (RDONLY / NOSUID / NODEV / NOEXEC), which are the same `MNT_*` bits
+//! `mount(2)` sets from `MS_*` and the same ones `mnt_want_write` and the
+//! exec path already enforce. The atime family and NOSYMFOLLOW are
+//! validated and then have nowhere to go — see `apply_mount_attr`.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -30,13 +33,15 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::fd;
 use crate::handlers::{
-    apply_chroot, copy_from_user_vec, copy_user_cstr, current_clone_mount_subtree,
-    current_clone_tree_at, current_fs_arc_at, current_mount_arc, current_task_id, fd_path_for_task,
-    parse_proc_self_fd,
+    apply_chroot, copy_from_user_vec, copy_user_cstr, copy_user_cstr_checked,
+    current_clone_mount_subtree, current_clone_tree_at, current_fs_arc_at, current_mount_arc,
+    current_mount_flags_at, current_set_mount_flags, current_task_id, fd_path_for_task,
+    mount_admin, parse_proc_self_fd, resolve_cwd_path,
 };
 use crate::syscall::{SyscallReturn, TrapContext};
 
 // ── errno (negated-long convention) ─────────────────────────────────
+const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
 const E2BIG: i64 = 7;
 const EBADF: i64 = 9;
@@ -80,6 +85,19 @@ const MOUNT_ATTR__ATIME: u64 = 0x0000_0070;
 const MOUNT_ATTR_NOATIME: u64 = 0x0000_0010;
 const MOUNT_ATTR_STRICTATIME: u64 = 0x0000_0020;
 const MOUNT_ATTR_IDMAP: u64 = 0x0010_0000;
+/// The four attributes NARF's mount table can actually carry, as
+/// `filesystem::mnt_flags`. `mount(2)` already translates the matching
+/// `MS_*` bits into these and enforces them (`mnt_want_write` refuses a
+/// read-only mount, exec and suid consult the rest), so `mount_setattr`
+/// setting them is the same knob reached from the newer syscall.
+const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+const MOUNT_ATTR_NOSUID: u64 = 0x0000_0002;
+const MOUNT_ATTR_NODEV: u64 = 0x0000_0004;
+const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
+/// `MOUNT_ATTR_NOSYMFOLLOW` — a symlink on this mount is never followed.
+/// `fs/namei.c` checks it in the same breath as `RESOLVE_NO_SYMLINKS`, so
+/// the resolver honours both through one check.
+const MOUNT_ATTR_NOSYMFOLLOW: u64 = 0x0020_0000;
 const MOUNT_SETATTR_VALID_FLAGS: u64 = 0x0030_00ff;
 const MOUNT_SETATTR_PROPAGATION_FLAGS: u64 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20);
 const PAGE_SIZE: usize = 4096;
@@ -370,12 +388,26 @@ fn validate_open_tree_flags(flags: u64) -> Result<(), i64> {
 /// E2BIG, an inaccessible byte is EFAULT, and a non-zero unknown extension is
 /// E2BIG. Attribute values are validated even though NARF currently treats
 /// the supported per-mount settings as compatibility no-ops.
-fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<(), i64> {
+/// The parsed, validated `struct mount_attr`.
+struct MountAttr {
+    attr_set: u64,
+    attr_clr: u64,
+}
+
+fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<MountAttr, i64> {
     if size > PAGE_SIZE {
         return Err(E2BIG);
     }
     if size < MOUNT_ATTR_SIZE_VER0 {
         return Err(EINVAL);
+    }
+    // `if (!may_mount()) return -EPERM;` — after the size checks and before
+    // the struct is read, which is where `wants_mount_setattr` puts it.
+    // `may_mount()` is `ns_capable(mnt_ns->user_ns, CAP_SYS_ADMIN)`: the
+    // MOUNT namespace's owner, not the host, so a container that unshared
+    // its own mount namespace may still change attributes inside it.
+    if !mount_admin(current_task_id()) {
+        return Err(EPERM);
     }
     // SAFETY: copy_from_user_vec validates the complete caller-provided range
     // and converts guarded-copy faults into errno without dereferencing it here.
@@ -433,7 +465,7 @@ fn validate_mount_attr(ptr: u64, size: usize, idmap_replace: bool) -> Result<(),
         return Err(if exists { EINVAL } else { EBADF });
     }
 
-    Ok(())
+    Ok(MountAttr { attr_set, attr_clr })
 }
 
 struct ReturnCapture<'a> {
@@ -939,6 +971,15 @@ pub fn sys_fspick(ctx: &mut dyn TrapContext) {
 }
 
 /// `mount_setattr(dfd, path, flags, attr, size)`.
+/// `SYSCALL_DEFINE5(mount_setattr, int dfd, const char __user *path,
+/// unsigned int flags, struct mount_attr __user *uattr, size_t usize)`.
+///
+/// This used to validate and then return 0 without touching anything, which
+/// is the worst of the three possible answers: a caller that asked for
+/// `MOUNT_ATTR_RDONLY` was told it succeeded and got a writable mount. The
+/// four attributes NARF's mount table carries are applied now; the rest are
+/// accepted-and-unapplied for the reason stated below, which is the same
+/// reason `mount(2)` already documents for `MS_RELATIME`.
 pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     let a = *ctx.args();
     const ALLOWED_FLAGS: u64 = AT_EMPTY_PATH | AT_RECURSIVE | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT;
@@ -946,8 +987,76 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(EINVAL));
         return;
     }
-    match validate_mount_attr(a.arg3, a.arg4 as usize, false) {
+    let attr = match validate_mount_attr(a.arg3, a.arg4 as usize, false) {
+        Ok(attr) => attr,
+        Err(errno) => {
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    // `if (attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation == 0)
+    // return 0; /* Tell caller to not bother. */` — a no-op request does not
+    // resolve the path, so it cannot fail on it either.
+    if attr.attr_set == 0 && attr.attr_clr == 0 {
+        ctx.set_return(ok(0));
+        return;
+    }
+    let path = match copy_user_cstr_checked(a.arg1, 4096) {
+        Ok(p) => p,
+        Err(errno) => {
+            // `copy_user_cstr_checked` reports a POSITIVE errno and `err`
+            // negates it, so pass it through rather than negating twice.
+            ctx.set_return(err(errno));
+            return;
+        }
+    };
+    let path = resolve_cwd_path(current_task_id(), &path);
+    match apply_mount_attr(&path, &attr) {
         Ok(()) => ctx.set_return(ok(0)),
         Err(errno) => ctx.set_return(err(errno)),
+    }
+}
+
+/// Translate `MOUNT_ATTR_*` to `mnt_flags` and write them onto the mount.
+///
+/// Five of the seven move. `MOUNT_ATTR_NOSYMFOLLOW` reaches the same
+/// resolver check `openat2`'s `RESOLVE_NO_SYMLINKS` does, which is how
+/// Linux implements it too (`fs/namei.c:2036` tests them together).
+///
+/// The atime family (`MOUNT_ATTR__ATIME`, `MOUNT_ATTR_NODIRATIME`) has
+/// nowhere to go: NARF has no per-inode access-time policy to relax, which
+/// is the same reason `mount(2)` already accepts and ignores `MS_RELATIME`.
+/// They are validated above — a nonsensical combination is still -EINVAL —
+/// and then have no effect, exactly as on a kernel whose filesystem does
+/// not implement them.
+fn apply_mount_attr(path: &str, attr: &MountAttr) -> Result<(), i64> {
+    use narf_filesystem::mnt_flags;
+    const PAIRS: [(u64, u64); 5] = [
+        (MOUNT_ATTR_RDONLY, mnt_flags::READONLY),
+        (MOUNT_ATTR_NOSUID, mnt_flags::NOSUID),
+        (MOUNT_ATTR_NODEV, mnt_flags::NODEV),
+        (MOUNT_ATTR_NOEXEC, mnt_flags::NOEXEC),
+        (MOUNT_ATTR_NOSYMFOLLOW, mnt_flags::NOSYMFOLLOW),
+    ];
+    let current = current_mount_flags_at(path);
+    let mut next = current;
+    for (uapi, mnt) in PAIRS {
+        // `attr_clr` is applied before `attr_set`, so a request naming the
+        // same bit in both ends up SET — Linux builds `mnt_flags` the same
+        // way round in `build_mount_kattr`.
+        if attr.attr_clr & uapi != 0 {
+            next &= !mnt;
+        }
+        if attr.attr_set & uapi != 0 {
+            next |= mnt;
+        }
+    }
+    if next == current {
+        return Ok(());
+    }
+    if current_set_mount_flags(path, next) {
+        Ok(())
+    } else {
+        Err(ENOENT)
     }
 }
