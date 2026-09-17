@@ -4081,7 +4081,7 @@ fn smoke_abi_pathx_openat2_no_symlinks() -> TestResult {
         // /o2s/link -> real
         if call(
             Syscall::Symlink.raw(),
-            a1(b"real\0".as_ptr() as u64, b"/o2s/link\0".as_ptr() as u64),
+            a1(c"real".as_ptr() as u64, c"/o2s/link".as_ptr() as u64),
         ) != Some(0)
         {
             return Err("could not create the symlink fixture");
