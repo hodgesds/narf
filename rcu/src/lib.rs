@@ -450,12 +450,41 @@ pub fn report_idle() {
 
 /// Wait one grace period and drain the resulting drop batch.
 ///
-/// This is the synchronous form intended for kernel-thread-style use and
-/// for the test harness; the async `sync_async()` form awaits a yield
-/// between polls. For Stage-2 single-CPU kernels the synchronous form
-/// is sufficient because `report_quiescent` happens at poll boundaries.
+/// Blocks for as long as the grace period takes — see
+/// [`qsbr::sync_blocking`] for why it no longer gives up partway, and
+/// what that means for a caller that cannot block indefinitely or that
+/// runs with interrupts masked. `sync_until` takes a deadline and
+/// reports whether the grace period actually elapsed; `sync_async`
+/// yields to the executor instead of spinning.
 pub fn sync() {
     qsbr::sync_blocking();
+}
+
+/// [`sync`] with an absolute `narf_time::monotonic_ns` deadline.
+///
+/// Returns whether the grace period elapsed. `false` means it did NOT,
+/// and nothing retired before the call may be freed.
+#[must_use = "false means the grace period did NOT elapse"]
+pub fn sync_until(deadline_ns: u64) -> bool {
+    qsbr::sync_until(deadline_ns)
+}
+
+/// Grace periods that waited past [`qsbr::STALL_WARN_NS`] on `cpu` —
+/// spec §3.3's `stuck_quiescent_cpu`.
+pub fn stuck_quiescent_cpu(cpu: usize) -> u64 {
+    qsbr::stuck_quiescent_cpu(cpu)
+}
+
+/// Times a grace-period wait was refused because the caller held a live
+/// read guard on its own CPU.
+pub fn sync_reader_held_count() -> u64 {
+    qsbr::sync_reader_held_count()
+}
+
+/// Test-only re-export of [`qsbr::__test_last_quiescent`].
+#[doc(hidden)]
+pub fn __test_last_quiescent(cpu: usize) -> u64 {
+    qsbr::__test_last_quiescent(cpu)
 }
 
 /// Async form of `sync()`. Yields to the executor between polls so a

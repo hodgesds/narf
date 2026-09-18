@@ -14,10 +14,11 @@
 //!   Draining happens either in `sync()` or (Stage-3 main track) from
 //!   a per-domain reclamation-worker Future.
 //!
-//! Stage-2 scope (this crate):
-//! - Single-CPU Stage-2 means `all_cpus_past` is cheap, but we still
-//!   write it in the general SMP form so Stage-3 AP bring-up works
-//!   without re-plumbing.
+//! Scope (this crate):
+//! - `all_cpus_past` is a real wait now that APs are up: peers cross the
+//!   target epoch at their own poll boundaries, and an idle CPU
+//!   publishes the `u64::MAX` "inactive" sentinel so it never holds a
+//!   grace period open.
 //! - `MAX_CPUS` from `narf_lib::percpu::MAX_CPUS` caps the arrays.
 //! - Reclamation runs in-line on `sync()`; no worker Future yet.
 //!
@@ -360,28 +361,120 @@ fn min_last_quiescent() -> u64 {
 
 // ── sync() ──────────────────────────────────────────────────────────
 
-/// Publish a new target epoch and loop until every CPU has crossed it.
+/// Spec §3.3's first detection window: a CPU that has not reported
+/// quiescence for this long starts incrementing [`stuck_quiescent_cpu`].
+pub const STALL_WARN_NS: u64 = 100_000_000;
+
+/// Per-CPU count of grace periods that waited past [`STALL_WARN_NS`] on
+/// that CPU — spec §3.3's `stuck_quiescent_cpu`.
+static STUCK_QUIESCENT_CPU: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Times a grace-period wait was refused because the CALLER held a live
+/// read guard.
+static SYNC_READER_HELD: AtomicU64 = AtomicU64::new(0);
+
+/// Grace periods that waited past [`STALL_WARN_NS`] on `cpu`.
+///
+/// Non-zero means some CPU was slow to reach a poll boundary while a peer
+/// waited on it. It is a latency signal, not a failure: the wait continues.
+pub fn stuck_quiescent_cpu(cpu: usize) -> u64 {
+    STUCK_QUIESCENT_CPU
+        .get(cpu)
+        .map(|c| c.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
+/// Times [`sync_blocking`] / [`sync_until`] returned without a grace
+/// period because the caller was inside its own read critical section.
+pub fn sync_reader_held_count() -> u64 {
+    SYNC_READER_HELD.load(Ordering::Relaxed)
+}
+
+/// Publish a new target epoch and wait until every CPU has crossed it.
+///
+/// Waits for as long as that takes. It used to give up after eight
+/// rounds — "we refuse to deadlock" — and return as though the grace
+/// period had elapsed, which is the one outcome a reclamation primitive
+/// may not produce: the caller frees on that word. Eight tight iterations
+/// are nanoseconds, so on SMP the wait was over before any peer could
+/// plausibly reach a poll boundary, and `sync()` degenerated into a
+/// no-op whenever a peer was active. Single-CPU hid it — one pass really
+/// did suffice, as the comment said.
+///
+/// Spec §3.3 is explicit that the bound is DETECTION, not an escape
+/// hatch: its own pseudocode loops with no cap, and the counters exist
+/// because "without detection, reclamation stalls indefinitely with no
+/// visible symptom until memory pressure surfaces it". So this reports
+/// and keeps waiting. The 1 s RCU stall watchdog in `frame/`'s timer
+/// path — which already reads [`stalled_cpu_mask`] — is what turns a
+/// genuine wedge into a dump, and owns the panic-or-continue policy.
+///
+/// The corollary is that a caller who cannot block indefinitely wants
+/// [`sync_until`] or the async `sync_async`, and that blocking here with
+/// interrupts masked defeats the watchdog that would have diagnosed it.
 pub fn sync_blocking() {
+    // With no deadline the only `false` [`sync_until`] can produce is the
+    // guard-held refusal, which it has already counted and asserted.
+    let _ = sync_until(u64::MAX);
+}
+
+/// [`sync_blocking`] with a deadline. Returns whether the grace period
+/// actually elapsed — `false` means it did NOT, and nothing retired
+/// before the call may be freed.
+///
+/// `deadline_ns` is an absolute `narf_time::monotonic_ns` value;
+/// `u64::MAX` waits indefinitely.
+#[must_use = "false means the grace period did NOT elapse"]
+pub fn sync_until(deadline_ns: u64) -> bool {
+    let cell = this_cpu();
+
+    // A caller inside its own read critical section can never satisfy the
+    // wait: `report_quiescent` deliberately no-ops while a guard is live,
+    // so this CPU would never cross the target. Spec §3.3 forbids it
+    // ("you may not `await` inside a read critical section"), and it is
+    // the one case the old eight-round cap was really protecting against
+    // — at the cost of silently truncating the wait for every correct
+    // caller too. Refuse it by name instead.
+    if cell.active_readers.load(Ordering::Acquire) != 0 {
+        SYNC_READER_HELD.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(
+            false,
+            "rcu::sync() called while this CPU holds a live ReadGuard"
+        );
+        return false;
+    }
+
     let target = GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel) + 1;
-    // Drive quiescence locally. Stage-2 single-CPU: we ARE the only CPU
-    // so one pass suffices. A multi-CPU implementation would kick peers
-    // to run their poll loop.
-    let mut rounds = 0;
+    let started_ns = narf_time::monotonic_ns();
+    let mut warned = false;
     loop {
+        // This CPU's own quiescent state is ours to declare; peers reach
+        // theirs at their executor poll boundaries.
         report_quiescent();
         if all_cpus_past(target) {
             break;
         }
-        rounds += 1;
-        // Bounded-grace-period discipline per spec §3.3. In Stage-2
-        // single-CPU this only fires if a caller forgot to drop a
-        // guard — we refuse to deadlock.
-        if rounds > 8 {
-            break;
+
+        let now = narf_time::monotonic_ns();
+        if !warned && now.saturating_sub(started_ns) >= STALL_WARN_NS {
+            warned = true;
+            let mut stalled = stalled_cpu_mask(now, STALL_WARN_NS);
+            while stalled != 0 {
+                let cpu = stalled.trailing_zeros() as usize;
+                stalled &= stalled - 1;
+                STUCK_QUIESCENT_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+            }
         }
+        if now >= deadline_ns {
+            return false;
+        }
+        core::hint::spin_loop();
     }
-    // Drain every CPU's bucket. Stage-2 single-CPU so this is just us.
-    drain_local_bucket(this_cpu());
+
+    // Only this CPU's bucket: each CPU drains its own at its own quiescent
+    // points, and reaching in would race the owner's `UnsafeCell`.
+    drain_local_bucket(cell);
+    true
 }
 
 fn all_cpus_past(target: u64) -> bool {
@@ -429,12 +522,14 @@ impl Future for SyncFuture {
             drain_local_bucket(this_cpu());
             return Poll::Ready(());
         }
-        this.pollcount += 1;
-        // Bounded-grace-period discipline (§3.3).
-        if this.pollcount > 64 {
-            drain_local_bucket(this_cpu());
-            return Poll::Ready(());
-        }
+        // No poll cap. Completing after 64 polls regardless told the
+        // awaiting task its grace period had elapsed when it had not —
+        // the same silent truncation `sync_blocking` carried, and this is
+        // the form spec §3.3's pseudocode describes, which loops until
+        // `all_cpus_past`. Unlike the blocking form this yields, so an
+        // unsatisfied wait costs a re-poll rather than a wedged CPU, and
+        // the executor keeps every other task running meanwhile.
+        this.pollcount = this.pollcount.saturating_add(1);
         cx.waker().wake_by_ref();
         Poll::Pending
     }
@@ -455,6 +550,17 @@ pub fn deferred_len_this_cpu() -> usize {
 /// Global epoch at this moment.
 pub fn global_epoch() -> u64 {
     GLOBAL_EPOCH.load(Ordering::Acquire)
+}
+
+/// Test-only: a CPU's last reported quiescent epoch, or `u64::MAX` when
+/// that CPU is inactive. Lets a smoke assert the invariant `sync()` is
+/// supposed to establish — every CPU at or past the published target —
+/// rather than just that it returned.
+#[doc(hidden)]
+pub fn __test_last_quiescent(cpu: usize) -> u64 {
+    CPUS.get(cpu)
+        .map(|c| c.last_quiescent.load(Ordering::Acquire))
+        .unwrap_or(u64::MAX)
 }
 
 /// Number of enqueues discarded because this CPU's queue could not take
