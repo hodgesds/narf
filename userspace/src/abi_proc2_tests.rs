@@ -2514,3 +2514,72 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_proc2_ptrace_attach_honours_dumpable
 );
+
+/// exec resets dumpability in BOTH directions.
+///
+/// `begin_new_exec` (`/usr/src/linux/fs/exec.c:1205`) clears the flag when
+/// the new image runs with credentials its invoker does not have, and sets
+/// it otherwise. Clearing is what stops a set-uid program being inspected
+/// by whoever launched it — `__ptrace_may_access`'s credential comparison
+/// alone would not refuse them, because they still own the process.
+///
+/// The RESTORE is the half that is easy to forget: a process that called
+/// `PR_SET_DUMPABLE(0)` and then execs an ordinary binary must become
+/// dumpable again, or an unrelated program is un-debuggable because of
+/// something its predecessor did.
+///
+/// Driven through `__test_bprm_fill_uid`, which calls the same
+/// `exec_apply_credentials` the exec path does. Calling the dumpability
+/// step directly — which is what this case did first — verified the
+/// function and not the WIRING: removing the call from the exec path left
+/// it passing. The two steps are one function now precisely so that cannot
+/// happen.
+fn smoke_abi_proc2_exec_resets_dumpable() -> TestResult {
+    const OWNER: u32 = 4242;
+    const CALLER: u32 = 1000;
+    with_memfs("/dmp", "dmp", &[("plain", b"\x7fELF")], || {
+        let task = FAKE_TASK;
+        let path = "/dmp/plain";
+        let cpath = b"/dmp/plain\0";
+
+        // An ORDINARY image (no set-user-ID bit): euid stays == uid, so the
+        // exec must leave the task dumpable even though it asked not to be.
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o755)) != Some(0) {
+            return Err("chmod of the probe binary failed");
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        crate::handlers::__test_set_dumpable_for_test(task, false);
+        let _ = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if !crate::handlers::__test_dumpable(task) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("exec of an ordinary image must restore dumpability");
+        }
+
+        // A SET-USER-ID image owned by someone else: euid moves away from
+        // uid, so the exec must clear dumpability.
+        if call(
+            Syscall::Chown.raw(),
+            a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),
+        ) != Some(0)
+        {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chown of the probe binary failed");
+        }
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) != Some(0) {
+            crate::handlers::__test_uidgid_reset();
+            return Err("chmod +s of the probe binary failed");
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let dumpable = crate::handlers::__test_dumpable(task);
+        crate::handlers::__test_uidgid_reset();
+        if euid != OWNER {
+            return Err("the fixture did not actually perform a set-user-ID transition");
+        }
+        if dumpable {
+            return Err("exec of a set-user-ID image must clear dumpability");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc2_exec_resets_dumpable);

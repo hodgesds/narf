@@ -1743,7 +1743,11 @@ fn do_execve_resolved(
     if image_override_used {
         let _ = task;
     } else {
-        let _ = bprm_fill_uid(task, &cur_path, followed_shebang);
+        // The set-user-ID transition AND `begin_new_exec`'s dumpability
+        // step, in that order because the second reads the credentials the
+        // first may have changed. One call, so the pair cannot be
+        // half-applied.
+        exec_apply_credentials(task, &cur_path, followed_shebang);
     }
 
     // Step 4: load the new image. exec REPLACES this process's image, so the

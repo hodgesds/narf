@@ -5137,6 +5137,63 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     Some(new)
 }
 
+/// `begin_new_exec`'s dumpability step (`/usr/src/linux/fs/exec.c:1205`).
+///
+/// ```text
+/// if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
+///     !(uid_eq(current_euid(), current_uid()) &&
+///       gid_eq(current_egid(), current_gid())))
+///         set_dumpable(current->mm, suid_dumpable);
+/// else
+///         set_dumpable(current->mm, SUID_DUMP_USER);
+/// ```
+///
+/// Runs on EVERY exec, and both directions matter.
+///
+/// Clearing it is what stops a set-uid program being inspected by the user
+/// who launched it: the new image is running with privilege its invoker
+/// does not have, and `__ptrace_may_access`'s credential comparison alone
+/// would not refuse them — they still own the process. Without this, every
+/// set-uid binary was ptrace-able by whoever ran it, which is the attack
+/// the dumpable gate exists for.
+///
+/// SETTING it back is equally load-bearing and easier to forget: a process
+/// that called `PR_SET_DUMPABLE(0)` and then execs an ordinary binary must
+/// become dumpable again. The new image did not ask to be protected, and
+/// leaving the flag on would silently make an ordinary program
+/// un-debuggable because of something its predecessor did.
+///
+/// Note the comparison is against the CURRENT credentials after
+/// `bprm_fill_uid` has run, not against a "was this file set-uid" flag —
+/// Linux's own comment says testing `current` is "wrong, but userspace
+/// depends on it". Matching the observable behaviour, not the intent.
+///
+/// `suid_dumpable` is the `/proc/sys/fs/suid_dumpable` sysctl, whose
+/// default is 0 (`SUID_DUMP_DISABLE`); NARF has no knob for it, so the
+/// privileged case is always non-dumpable.
+fn exec_set_dumpable(task: u64) {
+    let ids = read_uidgid(task);
+    let privileged = ids.euid != ids.uid || ids.egid != ids.gid;
+    modify_prctl(task, |s| s.dumpable = !privileged);
+}
+
+/// The credential half of `begin_new_exec`, as ONE step.
+///
+/// `bprm_fill_uid` and the dumpability reset are separate functions in
+/// Linux but a single ordered obligation: the second reads the credentials
+/// the first may have just changed, and an exec that ran one without the
+/// other would either leak a set-uid image to its invoker's debugger or
+/// leave an ordinary image carrying its predecessor's `PR_SET_DUMPABLE(0)`.
+///
+/// They are joined here so the exec path has one call to make rather than
+/// two to remember, and so the test hook below exercises the composition
+/// instead of each piece in isolation — a case that called them separately
+/// would keep passing if the exec path stopped calling one of them.
+pub(crate) fn exec_apply_credentials(task: u64, path: &str, from_script: bool) {
+    let _ = bprm_fill_uid(task, path, from_script);
+    exec_set_dumpable(task);
+}
+
 /// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
 /// bits when a file is modified".
 pub(crate) const CAP_FSETID: u32 = 4;
@@ -5265,9 +5322,25 @@ fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
 /// regeneration a setuid-root binary depends on.
 #[doc(hidden)]
 pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
-    let _ = bprm_fill_uid(task, path, from_script);
+    // The whole credential step, not just `bprm_fill_uid`: this is what the
+    // exec path calls, so a case driving this hook covers the composition.
+    exec_apply_credentials(task, path, from_script);
     let ids = read_uidgid(task);
     (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
+/// `PR_GET_DUMPABLE` for an explicit task — the observable the exec
+/// dumpability step writes.
+#[doc(hidden)]
+pub fn __test_dumpable(task: u64) -> bool {
+    read_prctl(task).dumpable
+}
+
+/// Seed the flag for an explicit task, so a case can set up the
+/// "predecessor asked not to be dumpable" state without being that task.
+#[doc(hidden)]
+pub fn __test_set_dumpable_for_test(task: u64, dumpable: bool) {
+    modify_prctl(task, |s| s.dumpable = dumpable);
 }
 
 /// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
