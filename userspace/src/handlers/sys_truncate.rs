@@ -68,6 +68,14 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(errno as u64));
         return;
     }
+    // `notify_change` -> `inode_newsize_ok`: RLIMIT_FSIZE bounds a truncate
+    // that GROWS the file. Ahead of `file_remove_privs` for the same reason
+    // the write path is — a resize refused with -EFBIG must not strip the
+    // set-user-ID bit on its way out.
+    if let Err(errno) = fsize_check_resize(current_task_id(), ops.stat().size, new_size) {
+        ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        return;
+    }
     // `do_truncate` passes `ATTR_KILL_SUID | ATTR_KILL_SGID` alongside the
     // size change, for the same reason a write does.
     file_remove_privs(ops.as_ref(), current_task_id());

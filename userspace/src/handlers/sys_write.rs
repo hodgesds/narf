@@ -63,15 +63,33 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // bit (and set-group-ID, when it is a privilege rather than the
     // mandatory-locking marker). Without this, anyone who can write a
     // set-user-ID-root binary keeps it set-user-ID-root.
-    file_remove_privs(endpoint.ops.as_ref(), task);
-
-    const CHUNK: usize = 64 * 1024;
-    let mut total = 0usize;
+    // The starting position is needed BEFORE `file_remove_privs`: Linux
+    // reaches `generic_write_checks` (and its RLIMIT_FSIZE test) from inside
+    // `generic_file_write_iter`, ahead of the `file_modified` that strips
+    // set-user-ID. A write refused with -EFBIG must therefore leave the mode
+    // bits alone — stripping them would let an unprivileged caller disarm a
+    // set-user-ID binary with a write it is not even allowed to perform.
+    //
+    // For an O_APPEND write the position is `i_size`, read under the append
+    // lock taken above, so the limit is tested against the offset the write
+    // will actually use.
     let mut offset = if endpoint.append() {
         endpoint.ops.stat().size
     } else {
         endpoint.description.offset()
     };
+    let count = match fsize_check_write(task, offset, count, || endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File) {
+        Ok(c) => c,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
+
+    file_remove_privs(endpoint.ops.as_ref(), task);
+
+    const CHUNK: usize = 64 * 1024;
+    let mut total = 0usize;
     let pipe_write = endpoint
         .ops
         .as_any()

@@ -4353,3 +4353,196 @@ kernel_test_in!(
     "syscall_abi",
     smoke_abi_fdio_fcntl_handled_commands_still_work
 );
+
+// ── RLIMIT_FSIZE ────────────────────────────────────────────────────
+//
+// `fs/read_write.c::generic_write_check_limits` for writes and
+// `fs/attr.c::inode_newsize_ok` for resizes. Both were unenforced: the
+// limit round-tripped through get/setrlimit and nothing ever read it, so a
+// process that lowered RLIMIT_FSIZE kept writing past it and never saw the
+// SIGXFSZ that tells a shell the process was killed rather than the write
+// merely failing.
+//
+// The two rules differ in ways that are easy to conflate, and the tests
+// below pin each difference rather than just the headline -EFBIG:
+//
+//   * a write STARTING below the limit and crossing it is a SHORT WRITE and
+//     a success, with no signal — only one starting at or past the limit is
+//     refused. An all-or-nothing implementation passes the -EFBIG test and
+//     fails this one.
+//   * a resize is tested with `>` against the FINAL size, so growing to
+//     exactly the limit is allowed, and SHRINKING is never limited at all.
+//   * neither applies to a pipe. "Maximum file size" has nothing to say
+//     about bytes that never land in a file.
+
+/// `RLIMIT_FSIZE` resource index.
+const RLIMIT_FSIZE_RES: u64 = 1;
+const EFBIG_ERR: i64 = -27;
+/// SIGXFSZ is signal 25 ⇒ bit 24 of the pending mask.
+const SIGXFSZ_BIT: u64 = 1u64 << 24;
+
+fn set_fsize_limit(cur: u64) -> Result<(), &'static str> {
+    let pair = [cur, u64::MAX];
+    match call(
+        Syscall::Setrlimit.raw(),
+        a1(RLIMIT_FSIZE_RES, pair.as_ptr() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("could not set RLIMIT_FSIZE"),
+    }
+}
+
+/// Block SIGXFSZ so it can be OBSERVED instead of delivered.
+///
+/// `rt_sigpending` reports `pending & blocked`, exactly as Linux does, so an
+/// unblocked SIGXFSZ is acted on rather than left sitting in the set. Every
+/// test below blocks it first — including the ones asserting the signal is
+/// NOT raised, which would otherwise pass without the signal ever being
+/// observable and prove nothing at all.
+fn block_sigxfsz() -> Result<(), &'static str> {
+    const SIG_BLOCK: u64 = 0;
+    let set = [SIGXFSZ_BIT];
+    match call(
+        Syscall::Sigprocmask.raw(),
+        a3(SIG_BLOCK, set.as_ptr() as u64, 0, 8),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("could not block SIGXFSZ"),
+    }
+}
+
+/// Read the pending-signal mask through `rt_sigpending(2)` rather than any
+/// internal helper — whether userspace can SEE the signal is the property
+/// under test.
+fn sigxfsz_pending() -> Result<bool, &'static str> {
+    let mut set = [0u64; 1];
+    match call(Syscall::RtSigpending.raw(), a1(set.as_mut_ptr() as u64, 8)) {
+        Some(0) => Ok(set[0] & SIGXFSZ_BIT != 0),
+        _ => Err("rt_sigpending failed"),
+    }
+}
+
+fn smoke_abi_fdio_fsize_refuses_write_at_limit() -> TestResult {
+    with_memfs("/fsz", "fsz", &[("f", b"")], || {
+        let fd = open_fd(b"/fsz/f\0")?;
+        block_sigxfsz()?;
+        set_fsize_limit(4)?;
+        if sigxfsz_pending()? {
+            return Err("SIGXFSZ was pending before the test wrote anything");
+        }
+        // pos == limit: `if (pos >= limit)` — refused, and the signal is
+        // raised alongside the errno.
+        let buf = b"xxxx";
+        match call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, buf.as_ptr() as u64, 4, 4),
+        ) {
+            Some(v) if v == EFBIG_ERR => {}
+            _ => return Err("pwrite at RLIMIT_FSIZE was not -EFBIG"),
+        }
+        if !sigxfsz_pending()? {
+            return Err("a write refused by RLIMIT_FSIZE did not raise SIGXFSZ");
+        }
+        // Past the limit is the same answer.
+        match call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, buf.as_ptr() as u64, 4, 99),
+        ) {
+            Some(v) if v == EFBIG_ERR => Ok(()),
+            _ => Err("pwrite past RLIMIT_FSIZE was not -EFBIG"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fsize_refuses_write_at_limit);
+
+fn smoke_abi_fdio_fsize_shortens_a_crossing_write() -> TestResult {
+    with_memfs("/fsz", "fsz", &[("f", b"")], || {
+        let fd = open_fd(b"/fsz/f\0")?;
+        block_sigxfsz()?;
+        set_fsize_limit(4)?;
+        // Starts at 2, asks for 8, so `*count = min(*count, limit - pos)`
+        // leaves 2. Linux reports a SHORT WRITE and success — refusing the
+        // whole thing would make every write loop report failure where
+        // Linux reports progress.
+        let buf = b"xxxxxxxx";
+        match call(
+            Syscall::Pwrite64.raw(),
+            a3(fd as u64, buf.as_ptr() as u64, 8, 2),
+        ) {
+            Some(2) => {}
+            Some(v) if v == EFBIG_ERR => {
+                return Err("a write crossing RLIMIT_FSIZE was refused instead of shortened")
+            }
+            _ => return Err("a write crossing RLIMIT_FSIZE returned the wrong count"),
+        }
+        // And no signal: Linux raises SIGXFSZ only on the refused arm.
+        if sigxfsz_pending()? {
+            return Err("a SHORTENED write must not raise SIGXFSZ");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_fsize_shortens_a_crossing_write
+);
+
+fn smoke_abi_fdio_fsize_bounds_growth_not_shrink() -> TestResult {
+    with_memfs("/fsz", "fsz", &[("f", b"abcdefgh")], || {
+        let fd = open_fd(b"/fsz/f\0")?;
+        block_sigxfsz()?;
+        set_fsize_limit(4)?;
+        // Shrinking is never limited — including from ABOVE the limit,
+        // which is how a process gets back under one it just lowered. The
+        // file seeded at 8 bytes is already over.
+        match call(Syscall::Ftruncate.raw(), a1(fd as u64, 2)) {
+            Some(0) => {}
+            _ => return Err("shrinking below RLIMIT_FSIZE was refused"),
+        }
+        // Growing to EXACTLY the limit is allowed: `offset > limit`, not >=.
+        match call(Syscall::Ftruncate.raw(), a1(fd as u64, 4)) {
+            Some(0) => {}
+            _ => return Err("growing to exactly RLIMIT_FSIZE was refused"),
+        }
+        if sigxfsz_pending()? {
+            return Err("a permitted resize raised SIGXFSZ");
+        }
+        // One byte over is -EFBIG, with the signal.
+        match call(Syscall::Ftruncate.raw(), a1(fd as u64, 5)) {
+            Some(v) if v == EFBIG_ERR => {}
+            _ => return Err("growing past RLIMIT_FSIZE was not -EFBIG"),
+        }
+        if !sigxfsz_pending()? {
+            return Err("a resize refused by RLIMIT_FSIZE did not raise SIGXFSZ");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fsize_bounds_growth_not_shrink);
+
+fn smoke_abi_fdio_fsize_spares_pipes() -> TestResult {
+    with_setup(|| {
+        let mut fds = [0u32; 2];
+        if call(Syscall::Pipe.raw(), a0(fds.as_mut_ptr() as u64)) != Some(0) {
+            return Err("pipe() failed");
+        }
+        // A limit of 1 byte would refuse everything below if the check
+        // applied. Linux reaches the RLIMIT_FSIZE test through
+        // `generic_write_checks`, which `pipe_write` never calls.
+        block_sigxfsz()?;
+        set_fsize_limit(1)?;
+        let buf = b"12345678";
+        match call(
+            Syscall::Write.raw(),
+            a2(fds[1] as u64, buf.as_ptr() as u64, 8),
+        ) {
+            Some(8) => {}
+            _ => return Err("RLIMIT_FSIZE was applied to a pipe write"),
+        }
+        if sigxfsz_pending()? {
+            return Err("a pipe write raised SIGXFSZ");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fsize_spares_pipes);

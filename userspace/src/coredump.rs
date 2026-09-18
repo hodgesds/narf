@@ -110,7 +110,20 @@ unsafe fn slice_from_ref<T>(val: &T) -> &[u8] {
     unsafe { core::slice::from_raw_parts(val as *const T as *const u8, core::mem::size_of::<T>()) }
 }
 
-fn write_at(file: &dyn FileOps, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+/// Emit `buf` at `offset`, clipped to the RLIMIT_CORE ceiling.
+///
+/// `fs/coredump.c::__dump_emit` stops writing once `cprm->written + nr`
+/// would exceed `cprm->limit`, so an over-large dump is TRUNCATED rather
+/// than abandoned — a partial core still identifies the faulting frame,
+/// which is the whole reason to set a non-zero limit instead of zero. This
+/// writer addresses the file by absolute offset rather than sequentially,
+/// so the equivalent test is on the end of the range.
+fn write_at(file: &dyn FileOps, limit: u64, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+    if offset >= limit {
+        return Ok(());
+    }
+    let room = (limit - offset) as usize;
+    let buf = if buf.len() > room { &buf[..room] } else { buf };
     let mut written = 0;
     while written < buf.len() {
         let chunk = &buf[written..];
@@ -128,6 +141,23 @@ fn write_at(file: &dyn FileOps, offset: u64, buf: &[u8]) -> Result<(), FsError> 
 }
 
 pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
+    // `fs/coredump.c`: `cprm.limit = rlimit(RLIMIT_CORE)`, then
+    // `if (cprm->limit < binfmt->min_coredump) return false;` — and
+    // binfmt_elf sets `min_coredump = ELF_EXEC_PAGESIZE`. So a limit under
+    // one page produces NO core file at all, which is the case that matters
+    // here: NARF's default RLIMIT_CORE soft limit is already 0, deliberately
+    // matching Linux, and nothing consulted it — so this kernel wrote a core
+    // dump on every fatal signal where a stock Linux writes none.
+    //
+    // The check comes before the file is touched. Linux never opens the core
+    // file in this case, and the unlink below would otherwise delete a core
+    // from an earlier crash on its way to writing nothing.
+    const ELF_MIN_COREDUMP: u64 = 4096;
+    let limit = crate::handlers::coredump_limit(task);
+    if limit < ELF_MIN_COREDUMP {
+        return;
+    }
+
     // Resolve address space
     let as_ref = match narf_scheduler::address_space_of(narf_scheduler::TaskId(task)) {
         Some(a) => a,
@@ -278,7 +308,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     // Write Elf64_Ehdr
     // SAFETY: ehdr is valid reference, size matches.
     let ehdr_slice = unsafe { slice_from_ref(&ehdr) };
-    if write_at(file.as_ref(), 0, ehdr_slice).is_err() {
+    if write_at(file.as_ref(), limit, 0, ehdr_slice).is_err() {
         return;
     }
 
@@ -286,7 +316,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     for (i, ph) in phdrs.iter().enumerate() {
         // SAFETY: ph is valid reference, size matches.
         let ph_slice = unsafe { slice_from_ref(ph) };
-        if write_at(file.as_ref(), 64 + i as u64 * 56, ph_slice).is_err() {
+        if write_at(file.as_ref(), limit, 64 + i as u64 * 56, ph_slice).is_err() {
             return;
         }
     }
@@ -306,7 +336,7 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
     let regs_slice = unsafe { slice_from_ref(&user_regs) };
     note_buf.extend_from_slice(regs_slice);
 
-    if write_at(file.as_ref(), note_offset, &note_buf).is_err() {
+    if write_at(file.as_ref(), limit, note_offset, &note_buf).is_err() {
         return;
     }
 
@@ -326,12 +356,12 @@ pub fn write_coredump(task: u64, _signum: u32, state: &UserState) {
                 let ptr = phys.kernel_ptr::<u8>();
                 // SAFETY: reading chunk_len <= 4096 from page is safe.
                 let slice = unsafe { core::slice::from_raw_parts(ptr, chunk_len as usize) };
-                if write_at(file.as_ref(), offset, slice).is_err() {
+                if write_at(file.as_ref(), limit, offset, slice).is_err() {
                     return;
                 }
             } else {
                 let zeros = [0u8; 4096];
-                if write_at(file.as_ref(), offset, &zeros[..chunk_len as usize]).is_err() {
+                if write_at(file.as_ref(), limit, offset, &zeros[..chunk_len as usize]).is_err() {
                     return;
                 }
             }
