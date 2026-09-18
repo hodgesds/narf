@@ -50,6 +50,20 @@ fn is_opaque(dir: &dyn DirOps) -> bool {
     dir.lookup(OPAQUE_MARKER).is_some()
 }
 
+// Async counterparts of the two probes above. A block-backed lower (ext4) only
+// resolves entries through `lookup_async`/`lookup_dir_async` — its synchronous
+// `lookup` returns `None` for anything not already cached — so every lower probe
+// on the async lookup/traverse path MUST go through these, or the lower's files
+// are invisible through the overlay (e.g. an ext4 home's `~/.config` vanished,
+// black-screening the Plasma session).
+async fn has_whiteout_async(dir: &dyn DirOps, name: &str) -> bool {
+    dir.lookup_async(&whiteout_name(name)).await.is_ok()
+}
+
+async fn is_opaque_async(dir: &dyn DirOps) -> bool {
+    dir.lookup_async(OPAQUE_MARKER).await.is_ok()
+}
+
 /// Lazily materialized upper-directory path. Each lower-only descendant has
 /// one slot pointing at its parent slot; a mutation walks to the nearest
 /// existing upper ancestor and creates the missing directory chain.
@@ -234,19 +248,35 @@ impl OverlayDir {
         self.upper.get()
     }
 
-    fn lower_kind(&self, name: &str) -> Option<LayerKind> {
+    /// Which layer, if any, positively holds `name` in a lower (a file or a
+    /// directory), stopping at the first whiteout. Async so a block-backed
+    /// (ext4) lower is probed through the async path. (The sync counterpart was
+    /// removed once every caller — remove_entry / rename / link — became async.)
+    async fn lower_kind_async(&self, name: &str) -> Option<LayerKind> {
         for lower in &self.lowers {
-            if has_whiteout(lower.as_ref(), name) {
+            if has_whiteout_async(lower.as_ref(), name).await {
                 return None;
             }
-            if lower.lookup(name).is_some() {
-                return Some(LayerKind::File);
-            }
-            if lower.lookup_dir(name).is_some() {
+            // Dir before file: a block-backed FS (ext2) answers `lookup` for
+            // directories too, so a file-first probe would misclassify a dir.
+            if lower.lookup_dir_async(name).await.is_ok() {
                 return Some(LayerKind::Dir);
+            }
+            if lower.lookup_async(name).await.is_ok() {
+                return Some(LayerKind::File);
             }
         }
         None
+    }
+
+    /// Async "does the upper layer already hold `name` as a plain file?" — used by
+    /// the copy-up decision on rename/link so a block-backed layer is probed via
+    /// the async path.
+    async fn upper_has_file_async(&self, name: &str) -> bool {
+        match self.upper_dir() {
+            Some(dir) => dir.lookup_async(name).await.is_ok(),
+            None => false,
+        }
     }
 
     fn lower_file(&self, name: &str) -> Option<Arc<dyn FileOps>> {
@@ -255,6 +285,22 @@ impl OverlayDir {
                 return None;
             }
             if let Some(file) = lower.lookup(name) {
+                return Some(file);
+            }
+        }
+        None
+    }
+
+    /// Async counterpart of [`lower_file`], for a block-backed (ext4) lower whose
+    /// entries only resolve through `lookup_async`.
+    async fn lower_file_async(&self, name: &str) -> Option<Arc<dyn FileOps>> {
+        for lower in &self.lowers {
+            if has_whiteout_async(lower.as_ref(), name).await
+                || lower.lookup_dir_async(name).await.is_ok()
+            {
+                return None;
+            }
+            if let Ok(file) = lower.lookup_async(name).await {
                 return Some(file);
             }
         }
@@ -280,11 +326,11 @@ impl OverlayDir {
 
     async fn copy_up_file(&self, name: &str) -> Result<Arc<dyn FileOps>, FsError> {
         if let Some(upper) = self.upper_dir() {
-            if let Some(file) = upper.lookup(name) {
+            if let Ok(file) = upper.lookup_async(name).await {
                 return Ok(file);
             }
         }
-        let lower = self.lower_file(name).ok_or(FsError::NotFound)?;
+        let lower = self.lower_file_async(name).await.ok_or(FsError::NotFound)?;
         OverlayFile::new(Arc::clone(&self.upper), name.to_string(), lower)
             .ensure_copied_up()
             .await
@@ -310,15 +356,80 @@ impl OverlayDir {
             .is_some_and(|dir| is_opaque(dir.as_ref()));
         if !upper_opaque {
             for lower in &self.lowers {
-                if has_whiteout(lower.as_ref(), name) || lower.lookup(name).is_some() {
+                if has_whiteout(lower.as_ref(), name) {
                     break;
                 }
+                // Check DIR first: a block-backed FS (ext2) answers `lookup` for
+                // directories too, so `lookup(name).is_some()` cannot distinguish
+                // a file from a directory. `lookup_dir` is dir-only.
                 if let Some(dir) = lower.lookup_dir(name) {
                     let opaque = is_opaque(dir.as_ref());
                     children.push(dir);
                     if opaque {
                         break;
                     }
+                    continue;
+                }
+                // Not a directory here; a plain file masks any deeper-lower dir.
+                if lower.lookup(name).is_some() {
+                    break;
+                }
+            }
+        }
+        if upper_child.is_none() && children.is_empty() {
+            None
+        } else {
+            Some(ChildLayers {
+                upper: upper_child,
+                lowers: children,
+            })
+        }
+    }
+
+    /// Async counterpart of [`child_layers`], for a block-backed (ext4) lower.
+    async fn child_layers_async(&self, name: &str) -> Option<ChildLayers> {
+        let upper = self.upper_dir();
+        if let Some(dir) = upper.as_ref() {
+            if dir.lookup_async(name).await.is_ok() {
+                return None;
+            }
+        }
+        let upper_child = match upper.as_ref() {
+            Some(dir) => dir.lookup_dir_async(name).await.ok(),
+            None => None,
+        };
+        if upper_child.is_none() {
+            if let Some(dir) = upper.as_ref() {
+                if has_whiteout_async(dir.as_ref(), name).await {
+                    return None;
+                }
+            }
+        }
+
+        let mut children = Vec::new();
+        let upper_opaque = match upper_child.as_ref() {
+            Some(dir) => is_opaque_async(dir.as_ref()).await,
+            None => false,
+        };
+        if !upper_opaque {
+            for lower in &self.lowers {
+                if has_whiteout_async(lower.as_ref(), name).await {
+                    break;
+                }
+                // Check DIR first: a block-backed FS (ext2) answers `lookup` for
+                // directories too, so a file-first probe would treat an ext2
+                // subdirectory (e.g. ~/.config) as a file and refuse to merge it.
+                if let Ok(dir) = lower.lookup_dir_async(name).await {
+                    let opaque = is_opaque_async(dir.as_ref()).await;
+                    children.push(dir);
+                    if opaque {
+                        break;
+                    }
+                    continue;
+                }
+                // Not a directory here; a plain file masks any deeper-lower dir.
+                if lower.lookup_async(name).await.is_ok() {
+                    break;
                 }
             }
         }
@@ -336,7 +447,10 @@ impl OverlayDir {
         if !valid_visible_name(name) {
             return Err(FsError::InvalidPath);
         }
-        if self.lookup(name).is_some() || self.lookup_dir(name).is_some() {
+        // Async probes: a block-backed lower's existing entry must block a
+        // conflicting create (a sync probe would miss it and let the create
+        // shadow the lower).
+        if self.lookup_async(name).await.is_ok() || self.lookup_dir_async(name).await.is_ok() {
             return Err(FsError::Busy);
         }
         let upper = self.upper.ensure().await?;
@@ -357,8 +471,10 @@ impl OverlayDir {
         if !valid_visible_name(name) {
             return Err(FsError::InvalidPath);
         }
-        let visible_dir = self.lookup_dir(name);
-        let visible_file = self.lookup(name);
+        // Async layer probes so a block-backed (ext4) lower's entry is seen —
+        // otherwise the emptiness check and the whiteout decision are wrong.
+        let visible_dir = self.lookup_dir_async(name).await.ok();
+        let visible_file = self.lookup_async(name).await.ok();
         if directory {
             let child = visible_dir.ok_or_else(|| {
                 if visible_file.is_some() {
@@ -367,7 +483,7 @@ impl OverlayDir {
                     FsError::NotFound
                 }
             })?;
-            if !child.enumerate(0, 1).is_empty() {
+            if !child.enumerate_async(0, 1).await?.is_empty() {
                 return Err(FsError::Busy);
             }
         } else if visible_file.is_none() {
@@ -378,19 +494,19 @@ impl OverlayDir {
             });
         }
 
-        let lower_positive = self.lower_kind(name).is_some();
+        let lower_positive = self.lower_kind_async(name).await.is_some();
         let upper = self.upper.ensure().await?;
         if directory {
-            if let Some(raw_child) = upper.lookup_dir(name) {
+            if let Ok(raw_child) = upper.lookup_dir_async(name).await {
                 // An empty merged directory may contain only internal markers.
-                for (marker, _) in raw_child.enumerate(0, usize::MAX) {
+                for (marker, _) in raw_child.enumerate_async(0, usize::MAX).await? {
                     if marker.starts_with(WHITEOUT_PREFIX) {
                         raw_child.unlink(&marker).await?;
                     }
                 }
                 upper.rmdir(name).await?;
             }
-        } else if upper.lookup(name).is_some() {
+        } else if upper.lookup_async(name).await.is_ok() {
             upper.unlink(name).await?;
         }
         if lower_positive {
@@ -430,7 +546,35 @@ impl DirOps for OverlayDir {
     }
 
     fn lookup_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn FileOps>> {
-        Box::pin(async move { self.lookup(name).ok_or(FsError::NotFound) })
+        // Mirror `lookup`, but resolve every layer through the async path so a
+        // block-backed (ext4) lower is actually visible. `lookup` alone (which
+        // the previous impl wrapped) uses synchronous lower probes that a block
+        // FS answers `None` to unless already cached.
+        Box::pin(async move {
+            if !valid_visible_name(name) {
+                return Err(FsError::NotFound);
+            }
+            if let Some(upper) = self.upper_dir() {
+                if let Ok(file) = upper.lookup_async(name).await {
+                    return Ok(file);
+                }
+                if upper.lookup_dir_async(name).await.is_ok()
+                    || has_whiteout_async(upper.as_ref(), name).await
+                {
+                    return Err(FsError::NotFound);
+                }
+            }
+            self.lower_file_async(name)
+                .await
+                .map(|file| {
+                    Arc::new(OverlayFile::new(
+                        Arc::clone(&self.upper),
+                        name.to_string(),
+                        file,
+                    )) as Arc<dyn FileOps>
+                })
+                .ok_or(FsError::NotFound)
+        })
     }
 
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
@@ -448,7 +592,24 @@ impl DirOps for OverlayDir {
     }
 
     fn lookup_dir_async<'a>(&'a self, name: &'a str) -> FsFuture<'a, Arc<dyn DirOps>> {
-        Box::pin(async move { self.lookup_dir(name).ok_or(FsError::NotFound) })
+        // Mirror `lookup_dir` via the async layer probes so an ext4 lower's
+        // subdirectories (e.g. ~/.config/kdedefaults) resolve.
+        Box::pin(async move {
+            if !valid_visible_name(name) {
+                return Err(FsError::NotFound);
+            }
+            let child = self
+                .child_layers_async(name)
+                .await
+                .ok_or(FsError::NotFound)?;
+            let metadata = child.lowers.first().cloned();
+            Ok(Arc::new(OverlayDir {
+                upper: UpperDir::child(Arc::clone(&self.upper), name, child.upper, metadata),
+                lowers: child.lowers,
+                mount_id: Arc::clone(&self.mount_id),
+                writable: self.writable,
+            }) as Arc<dyn DirOps>)
+        })
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
@@ -495,7 +656,44 @@ impl DirOps for OverlayDir {
         cursor: usize,
         max: usize,
     ) -> FsFuture<'a, Vec<(String, FileType)>> {
-        Box::pin(async move { Ok(self.enumerate(cursor, max)) })
+        // Merge layers via ASYNC enumeration so a block-backed (ext4) lower's
+        // entries are actually listed — its synchronous `enumerate` (which the
+        // previous impl wrapped) returns nothing that is not already cached, so
+        // an ext4 home's ~/.config listed empty through the overlay.
+        Box::pin(async move {
+            let mut merged = BTreeMap::new();
+            let mut hidden = BTreeSet::new();
+            let mut layers = Vec::new();
+            if let Some(upper) = self.upper_dir() {
+                layers.push(upper);
+            }
+            layers.extend(self.lowers.iter().cloned());
+
+            for layer in layers {
+                let entries = layer.enumerate_async(0, usize::MAX).await?;
+                let mut opaque = false;
+                for (name, _) in &entries {
+                    if name == OPAQUE_MARKER {
+                        opaque = true;
+                    } else if let Some(target) = name.strip_prefix(WHITEOUT_PREFIX) {
+                        hidden.insert(target.to_string());
+                    }
+                }
+                for (name, file_type) in entries {
+                    if name.starts_with(WHITEOUT_PREFIX)
+                        || hidden.contains(&name)
+                        || merged.contains_key(&name)
+                    {
+                        continue;
+                    }
+                    merged.insert(name, file_type);
+                }
+                if opaque {
+                    break;
+                }
+            }
+            Ok(merged.into_iter().skip(cursor).take(max).collect())
+        })
     }
 
     fn dir_mode(&self) -> u16 {
@@ -619,21 +817,22 @@ impl DirOps for OverlayDir {
                 return Err(FsError::InvalidPath);
             }
             if old_name == new_name {
-                return (self.lookup(old_name).is_some() || self.lookup_dir(old_name).is_some())
-                    .then_some(())
-                    .ok_or(FsError::NotFound);
+                return (self.lookup_async(old_name).await.is_ok()
+                    || self.lookup_dir_async(old_name).await.is_ok())
+                .then_some(())
+                .ok_or(FsError::NotFound);
             }
-            let lower_positive = self.lower_kind(old_name).is_some();
-            let source_is_dir = self.lookup_dir(old_name).is_some();
+            let lower_positive = self.lower_kind_async(old_name).await.is_some();
+            let source_is_dir = self.lookup_dir_async(old_name).await.is_ok();
             if source_is_dir && lower_positive {
                 // Linux's default redirect_dir=off behavior is EXDEV for a
                 // lower or merged directory.
                 return Err(FsError::CrossDevice);
             }
-            if !source_is_dir && self.lookup(old_name).is_none() {
+            if !source_is_dir && self.lookup_async(old_name).await.is_err() {
                 return Err(FsError::NotFound);
             }
-            if !source_is_dir && self.upper_dir().and_then(|d| d.lookup(old_name)).is_none() {
+            if !source_is_dir && !self.upper_has_file_async(old_name).await {
                 self.copy_up_file(old_name).await?;
             }
             let upper = self.prepare_destination(new_name).await?;
@@ -664,24 +863,26 @@ impl DirOps for OverlayDir {
             if flags & !0x3 != 0 || flags == 0x3 {
                 return Err(FsError::Unsupported);
             }
-            let lower_positive = self.lower_kind(old_name).is_some();
-            let source_is_dir = self.lookup_dir(old_name).is_some();
+            let lower_positive = self.lower_kind_async(old_name).await.is_some();
+            let source_is_dir = self.lookup_dir_async(old_name).await.is_ok();
             if source_is_dir && lower_positive {
                 return Err(FsError::CrossDevice);
             }
-            if !source_is_dir && self.lookup(old_name).is_none() {
+            if !source_is_dir && self.lookup_async(old_name).await.is_err() {
                 return Err(FsError::NotFound);
             }
-            if flags == 0x2 && (lower_positive || destination.lower_kind(new_name).is_some()) {
+            if flags == 0x2
+                && (lower_positive || destination.lower_kind_async(new_name).await.is_some())
+            {
                 return Err(FsError::Unsupported);
             }
             if flags == 0x1
-                && (destination.lookup(new_name).is_some()
-                    || destination.lookup_dir(new_name).is_some())
+                && (destination.lookup_async(new_name).await.is_ok()
+                    || destination.lookup_dir_async(new_name).await.is_ok())
             {
                 return Err(FsError::Busy);
             }
-            if !source_is_dir && self.upper_dir().and_then(|d| d.lookup(old_name)).is_none() {
+            if !source_is_dir && !self.upper_has_file_async(old_name).await {
                 self.copy_up_file(old_name).await?;
             }
             let source_upper = self.upper.ensure().await?;
@@ -699,14 +900,10 @@ impl DirOps for OverlayDir {
 
     fn link<'a>(&'a self, old_name: &'a str, new_name: &'a str) -> FsFuture<'a, ()> {
         Box::pin(async move {
-            if self.lookup_dir(old_name).is_some() {
+            if self.lookup_dir_async(old_name).await.is_ok() {
                 return Err(FsError::InvalidPath);
             }
-            if self
-                .upper_dir()
-                .and_then(|dir| dir.lookup(old_name))
-                .is_none()
-            {
+            if !self.upper_has_file_async(old_name).await {
                 self.copy_up_file(old_name).await?;
             }
             let upper = self.prepare_create(new_name).await?;
@@ -726,14 +923,10 @@ impl DirOps for OverlayDir {
                 .and_then(|any| any.downcast_ref::<OverlayDir>())
                 .filter(|dir| Arc::ptr_eq(&self.mount_id, &dir.mount_id))
                 .ok_or(FsError::CrossDevice)?;
-            if self.lookup_dir(old_name).is_some() {
+            if self.lookup_dir_async(old_name).await.is_ok() {
                 return Err(FsError::InvalidPath);
             }
-            if self
-                .upper_dir()
-                .and_then(|dir| dir.lookup(old_name))
-                .is_none()
-            {
+            if !self.upper_has_file_async(old_name).await {
                 self.copy_up_file(old_name).await?;
             }
             let source_upper = self.upper.ensure().await?;

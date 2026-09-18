@@ -5059,6 +5059,104 @@ fn smoke_overlay_create_lands_in_upper() -> TestResult {
 }
 kernel_test_in!("filesystem", smoke_overlay_create_lands_in_upper);
 
+/// A `DirOps` whose SYNCHRONOUS probes always miss, modelling a block-backed
+/// filesystem (ext4) that only resolves entries through the async path. The
+/// overlay must resolve such a lower via `lookup_async`/`lookup_dir_async`/
+/// `enumerate_async`; the previous impl wrapped the sync probes, so an ext4
+/// lower's files were invisible through the overlay (an ext4 home's ~/.config
+/// vanished, black-screening the Plasma user session).
+struct AsyncOnlyDir(alloc::sync::Arc<dyn crate::DirOps>);
+impl crate::DirOps for AsyncOnlyDir {
+    fn ino(&self) -> u64 {
+        self.0.ino()
+    }
+    fn lookup(&self, _name: &str) -> Option<alloc::sync::Arc<dyn crate::FileOps>> {
+        None
+    }
+    fn lookup_dir(&self, _name: &str) -> Option<alloc::sync::Arc<dyn crate::DirOps>> {
+        None
+    }
+    fn iter<'a>(&'a self) -> alloc::boxed::Box<dyn Iterator<Item = crate::DirEntry> + 'a> {
+        alloc::boxed::Box::new(core::iter::empty())
+    }
+    fn enumerate(
+        &self,
+        _cursor: usize,
+        _max: usize,
+    ) -> alloc::vec::Vec<(alloc::string::String, crate::FileType)> {
+        alloc::vec::Vec::new()
+    }
+    fn lookup_async<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> crate::FsFuture<'a, alloc::sync::Arc<dyn crate::FileOps>> {
+        self.0.lookup_async(name)
+    }
+    fn lookup_dir_async<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> crate::FsFuture<'a, alloc::sync::Arc<dyn crate::DirOps>> {
+        alloc::boxed::Box::pin(async move {
+            let d = self.0.lookup_dir_async(name).await?;
+            Ok(alloc::sync::Arc::new(AsyncOnlyDir(d)) as alloc::sync::Arc<dyn crate::DirOps>)
+        })
+    }
+    fn enumerate_async<'a>(
+        &'a self,
+        cursor: usize,
+        max: usize,
+    ) -> crate::FsFuture<'a, alloc::vec::Vec<(alloc::string::String, crate::FileType)>> {
+        self.0.enumerate_async(cursor, max)
+    }
+    fn dir_mode(&self) -> u16 {
+        self.0.dir_mode()
+    }
+    fn dir_owners(&self) -> (u32, u32) {
+        self.0.dir_owners()
+    }
+}
+
+/// Regression: an overlay over an ASYNC-ONLY (ext4-like) lower must expose the
+/// lower's files through `lookup_async` and list them through `enumerate_async`.
+/// Fails on the old sync-wrapping impl; passes once the async paths resolve
+/// lowers via the async probes.
+fn smoke_overlay_async_only_lower_visible() -> TestResult {
+    use crate::{DirOps, FsInstance, MemFs, OverlayFs};
+    use alloc::sync::Arc;
+    use alloc::vec;
+
+    let backing = Arc::new(MemFs::with_seeds("ao-lower", &[("kdeglobals", b"REAL-CFG")]));
+    let lower = Arc::new(AsyncOnlyDir(backing.root())) as Arc<dyn DirOps>;
+    let upper = Arc::new(MemFs::new("ao-upper"));
+    let ov = OverlayFs::new("ao-ov", upper.root(), vec![lower]);
+    let root = ov.root();
+
+    // Sync lookup misses (async-only lower) — this WAS the failure mode.
+    if root.lookup("kdeglobals").is_some() {
+        return TestResult::Fail("sync lookup unexpectedly resolved an async-only lower");
+    }
+    // Async lookup must resolve the lower file and read its content.
+    let f = match poll_once_overlay(root.lookup_async("kdeglobals")) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("async lookup did not resolve the async-only lower file"),
+    };
+    let mut buf = [0u8; 16];
+    match poll_once_overlay(f.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"REAL-CFG" => {}
+        _ => return TestResult::Fail("async read-through content mismatch"),
+    }
+    // Async enumerate must list the lower entry.
+    let entries = match poll_once_overlay(root.enumerate_async(0, usize::MAX)) {
+        Some(Ok(e)) => e,
+        _ => return TestResult::Fail("enumerate_async failed"),
+    };
+    if !entries.iter().any(|(n, _)| n == "kdeglobals") {
+        return TestResult::Fail("async enumerate did not list the async-only lower entry");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem", smoke_overlay_async_only_lower_visible);
+
 /// Unlinking a lower-only file records a whiteout in upper: the file
 /// vanishes from the union while the lower layer itself is untouched.
 fn smoke_overlay_whiteout_unlink() -> TestResult {
