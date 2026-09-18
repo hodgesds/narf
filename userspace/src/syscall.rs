@@ -1864,9 +1864,9 @@ pub enum Syscall {
     Splice,
 
     /// `membarrier(cmd, flags, cpu_id)` — process-wide memory barrier.
-    /// QUERY returns the supported-command mask; barrier commands are
-    /// no-ops on the cooperative single-CPU kernel. Linux `membarrier`
-    /// (x86_64=324, aarch64=283).
+    /// QUERY returns the supported-command mask; the expedited commands
+    /// interrupt every online CPU and wait for each to execute a full
+    /// barrier. Linux `membarrier` (x86_64=324, aarch64=283).
     Membarrier,
 
     /// `clock_getres(clockid, timespec*)` — report a clock's

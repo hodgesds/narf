@@ -13,7 +13,8 @@
 //! | 0     | RESCHED        | "wake target CPU's scheduler"  |
 //! | 1     | TLB_SHOOTDOWN  | "invalidate VA range"          |
 //! | 2     | PANIC_HALT     | "halt — printer is using serial"|
-//! | 3..15 | reserved       |                                |
+//! | 3     | MEMBARRIER     | "execute a full barrier + ack"  |
+//! | 4..15 | reserved       |                                |
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,6 +37,17 @@ pub const SGI_RESCHED: u8 = 0;
 pub const SGI_TLB_SHOOTDOWN: u8 = 1;
 /// IPI vector for "panic — stop touching the serial port + halt."
 pub const SGI_PANIC_HALT: u8 = 2;
+/// IPI vector for the `membarrier(2)` rendezvous: execute a full memory
+/// barrier and acknowledge the CPUs waiting on it.
+///
+/// Unlike [`SGI_TLB_SHOOTDOWN`], this one carries a real contract on
+/// aarch64. TLB invalidation rides on hardware inner-shareable broadcast,
+/// so that SGI is diagnostic only; a memory barrier on a *peer* CPU has no
+/// such hardware equivalent, and the sender genuinely has to wait for the
+/// handler to run. The handler and its ack protocol live in
+/// `narf_lib::smp::service_pending_barriers`; `narf_interrupts::
+/// install_membarrier_ipi` binds them to this INTID.
+pub const SGI_MEMBARRIER: u8 = 3;
 
 /// Per-CPU "scheduler should look for work next time it polls"
 /// flag. Set by `default_resched_handler` on SGI_RESCHED receipt;
