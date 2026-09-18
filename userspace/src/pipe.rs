@@ -585,7 +585,7 @@ impl PipeShared {
         }
         let q = self.queue.lock();
         if !self.readiness_active.swap(true, Ordering::AcqRel) {
-            self.publish_readiness_state_with_policy(0, q.len(), q.is_full(), false);
+            self.publish_readiness_state_with_policy(0, q.len(), q.is_full(), false, true);
         }
     }
 
@@ -609,20 +609,41 @@ impl PipeShared {
 
     #[inline]
     fn sync_readiness_state(&self, event: u32, len: usize, full: bool) {
-        self.sync_readiness_state_with_policy(event, len, full, false);
+        self.sync_readiness_state_with_policy(event, len, full, false, true);
+    }
+
+    /// Keep direct handoff for token-sized traffic. Page-sized and bulk pipe
+    /// traffic still gets an exact-waiter wake, but lets the running endpoint
+    /// fill or drain the ring before it naturally blocks.
+    #[inline]
+    fn sync_readiness_after_transfer(
+        &self,
+        event: u32,
+        len: usize,
+        full: bool,
+        transferred: usize,
+    ) {
+        self.sync_readiness_state_with_policy(event, len, full, false, transferred < PIPE_BUF);
     }
 
     #[inline]
     fn sync_readiness_state_all(&self, event: u32, len: usize, full: bool) {
-        self.sync_readiness_state_with_policy(event, len, full, true);
+        self.sync_readiness_state_with_policy(event, len, full, true, false);
     }
 
     #[inline]
-    fn sync_readiness_state_with_policy(&self, event: u32, len: usize, full: bool, wake_all: bool) {
+    fn sync_readiness_state_with_policy(
+        &self,
+        event: u32,
+        len: usize,
+        full: bool,
+        wake_all: bool,
+        urgent_handoff: bool,
+    ) {
         if !self.readiness_active.load(Ordering::Acquire) {
             return;
         }
-        self.publish_readiness_state_with_policy(event, len, full, wake_all);
+        self.publish_readiness_state_with_policy(event, len, full, wake_all, urgent_handoff);
     }
 
     fn publish_readiness_state_with_policy(
@@ -631,6 +652,7 @@ impl PipeShared {
         len: usize,
         full: bool,
         wake_all: bool,
+        urgent_handoff: bool,
     ) {
         let writer_closed = self.writer_closed.load(Ordering::Acquire);
         let reader_closed = self.reader_closed.load(Ordering::Acquire);
@@ -676,20 +698,27 @@ impl PipeShared {
                 notify,
                 |task_id, waker| {
                     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-                    narf_scheduler::wake_urgent_task(waker, task_id);
+                    if urgent_handoff {
+                        narf_scheduler::wake_urgent_task(waker, task_id);
+                    } else {
+                        waker.wake_by_ref();
+                    }
                     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
                     waker.wake_by_ref();
                 },
             );
             // Linux uses `wake_up_interruptible_sync_poll` (WF_SYNC) for pipe
             // reader/writer wakeups: the consumer should run promptly and
-            // generate/free the next token. The readiness cell has already made
-            // the exact exclusive blocker runnable; pass only that selected task
-            // into the scheduler's existing, revalidated next-buddy hint. Plain
-            // poll/epoll observers are non-exclusive and never take this path.
+            // generate/free the next token. For a token-sized transfer, pass
+            // only the exact exclusive blocker selected above into the
+            // scheduler's revalidated handoff hint. Page-sized/bulk transfers
+            // keep the ordinary targeted wake so the running endpoint can
+            // batch. Plain poll/epoll observers never take this path.
             #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-            if let Some(task_id) = selected {
-                narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+            if urgent_handoff {
+                if let Some(task_id) = selected {
+                    narf_scheduler::stackful::note_urgent_wake_preempt(task_id);
+                }
             }
         }
     }
@@ -863,8 +892,12 @@ impl PipeWrite {
         drop(q);
         if written != 0 && (was_empty || new_full || self.shared.poll_usage.load(Ordering::Acquire))
         {
-            self.shared
-                .sync_readiness_state(narf_filesystem::POLL_IN, new_len, new_full);
+            self.shared.sync_readiness_after_transfer(
+                narf_filesystem::POLL_IN,
+                new_len,
+                new_full,
+                written,
+            );
         }
         if written == 0 {
             if let Some(errno) = first_error {
@@ -898,8 +931,12 @@ impl PipeWrite {
         let new_full = q.is_full();
         drop(q);
         if n != 0 && (was_empty || new_full || self.shared.poll_usage.load(Ordering::Acquire)) {
-            self.shared
-                .sync_readiness_state(narf_filesystem::POLL_IN, new_len, new_full);
+            self.shared.sync_readiness_after_transfer(
+                narf_filesystem::POLL_IN,
+                new_len,
+                new_full,
+                n,
+            );
             narf_net::readiness::bump_generation();
         }
         Ok(n)
@@ -992,8 +1029,12 @@ impl PipeRead {
         if copied != 0
             && (was_full || new_len == 0 || self.shared.poll_usage.load(Ordering::Acquire))
         {
-            self.shared
-                .sync_readiness_state(narf_filesystem::POLL_OUT, new_len, new_full);
+            self.shared.sync_readiness_after_transfer(
+                narf_filesystem::POLL_OUT,
+                new_len,
+                new_full,
+                copied,
+            );
         }
         if copied == 0 {
             if let Some(errno) = first_error {

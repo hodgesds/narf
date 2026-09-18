@@ -609,11 +609,14 @@ poll and persistent epoll observers still wake. This mirrors Linux's
 `wait_event_interruptible_exclusive` pipe queues and avoids a reader or writer
 thundering herd without changing readiness or errno semantics. Final endpoint
 closure uses the corresponding wake-all path so every blocked peer runs to
-observe EOF or `EPIPE`. A normal pipe event that selects an exclusive blocker
-passes that exact task to the scheduler's revalidated urgent-handoff hint,
-matching Linux's synchronous (`WF_SYNC`) pipe wakeup: ordinary poll/epoll
-observers do not request a handoff, and remote or ineligible targets fall back
-to normal scheduling.
+observe EOF or `EPIPE`. A normal pipe event wakes the exact exclusive blocker
+selected by the readiness cell. Sub-`PIPE_BUF` token transfers also pass that
+task to the scheduler's revalidated urgent-handoff hint, matching the latency
+intent of Linux's synchronous (`WF_SYNC`) pipe wakeup. Page-sized and bulk
+transfers retain the exact targeted wake but use ordinary next-buddy scheduling,
+allowing the running endpoint to batch ring work until it naturally blocks.
+Ordinary poll/epoll observers do not request a handoff, and remote or ineligible
+targets fall back to normal scheduling.
 Readiness wakeups are being consolidated behind a single durable per-descriptor
 cell (`narf_lib::readiness::Readiness`): registering a waiter and checking the
 current readiness are fused under one lock, so a `poll`/`epoll` waiter can never
