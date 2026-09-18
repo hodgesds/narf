@@ -37,6 +37,15 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // `do_truncate` -> `notify_change` -> `inode_newsize_ok`: RLIMIT_FSIZE
+    // bounds a truncate that GROWS the file. Shrinking is always allowed,
+    // including from above the limit — that is how a process gets back under
+    // one it has just lowered.
+    if let Err(errno) = fsize_check_resize(task, endpoint.ops.stat().size, len) {
+        ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        return;
+    }
+
     match poll_blocking(endpoint.ops.truncate(len)) {
         Some(Ok(())) => {
             // inotify: truncate changes file content → IN_MODIFY.

@@ -50,6 +50,15 @@ pub(crate) fn sys_pwrite64(ctx: &mut dyn TrapContext) {
     const CHUNK: usize = 64 * 1024;
     let mut total = 0usize;
     let mut offset = offset;
+    // RLIMIT_FSIZE against the EXPLICIT offset — pwrite never appends, so
+    // there is no i_size to consult.
+    let count = match fsize_check_write(task, offset, count, || endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File) {
+        Ok(c) => c,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         // SAFETY: the complete source range passed validate_rw_user_range;

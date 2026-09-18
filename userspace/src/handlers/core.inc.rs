@@ -7492,15 +7492,38 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
     const CHUNK: usize = 64 * 1024;
     let mut off = pos;
     let mut total = 0usize;
+    // RLIMIT_FSIZE, against the explicit offset. The limit bounds the whole
+    // transfer rather than any one iovec, so it becomes a budget on the
+    // staged list below: entries past it are dropped and the one straddling
+    // it is trimmed, which is how `generic_write_checks` shortening `count`
+    // manifests for a vectored write.
+    let budget = if is_write {
+        match fsize_check_write(task, off, count, || {
+            endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File
+        }) {
+            Ok(c) => c,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
+            }
+        }
+    } else {
+        count
+    };
     let mut pending: alloc::vec::Vec<ImportedRwIovec> = alloc::vec::Vec::new();
-    for iovec in &iovecs {
+    let mut staged = 0usize;
+    'stage: for iovec in &iovecs {
         let mut remaining = *iovec;
         while remaining.len != 0 {
-            let step = core::cmp::min(CHUNK, remaining.len);
+            if staged >= budget {
+                break 'stage;
+            }
+            let step = core::cmp::min(CHUNK, remaining.len).min(budget - staged);
             pending.push(ImportedRwIovec {
                 base: remaining.base,
                 len: step,
             });
+            staged += step;
             remaining.base += step as u64;
             remaining.len -= step;
         }
@@ -13235,6 +13258,105 @@ const RLIMIT_DATA: usize = 2;
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_MEMLOCK: usize = 8;
 const RLIMIT_AS: usize = 9;
+const RLIMIT_FSIZE: usize = 1;
+const RLIMIT_CORE: usize = 4;
+
+/// `SIGXFSZ` — raised when a write or resize is refused by RLIMIT_FSIZE.
+/// Its default action is a core dump, so a shell reports the process as
+/// killed rather than the write as failed; that is the whole point of the
+/// signal accompanying the errno.
+const SIGXFSZ: u32 = 25;
+
+/// This task's `RLIMIT_FSIZE` soft limit.
+fn fsize_limit(task: u64) -> u64 {
+    read_rlimit(task, RLIMIT_FSIZE).map_or(RLIM_INFINITY, |p| p.cur)
+}
+
+/// `fs/read_write.c::generic_write_check_limits`, RLIMIT_FSIZE half:
+///
+/// ```text
+/// if (limit != RLIM_INFINITY) {
+///         if (pos >= limit) {
+///                 send_sig(SIGXFSZ, current, 0);
+///                 return -EFBIG;
+///         }
+///         *count = min(*count, limit - pos);
+/// }
+/// ```
+///
+/// Returns the count to write, which may be SHORTER than requested. A write
+/// that merely crosses the limit is a SHORT WRITE and a success — only one
+/// starting at or past the limit is refused, and only that one raises the
+/// signal. Treating the whole thing as all-or-nothing would make `dd` and
+/// every `write()` loop report failure where Linux reports progress, and
+/// would fire SIGXFSZ on a write that Linux completes.
+///
+/// Applies to regular files only. Linux reaches this through
+/// `generic_write_checks`, which pipes, sockets and most character devices
+/// never call — a limit on "maximum file size" has nothing to say about
+/// bytes that do not land in a file.
+///
+/// `is_regular_file` is a closure so the common case — no limit set, which
+/// `read_rlimit` answers from one atomic load — costs nothing. Resolving it
+/// eagerly would put a `stat()` on every `write(2)`.
+fn fsize_check_write(
+    task: u64,
+    pos: u64,
+    count: usize,
+    is_regular_file: impl FnOnce() -> bool,
+) -> Result<usize, i64> {
+    let limit = fsize_limit(task);
+    if limit == RLIM_INFINITY || !is_regular_file() {
+        return Ok(count);
+    }
+    if pos >= limit {
+        raise_signal_pending(task, SIGXFSZ);
+        return Err(27); // -EFBIG
+    }
+    Ok(count.min((limit - pos) as usize))
+}
+
+/// `fs/attr.c::inode_newsize_ok`, RLIMIT_FSIZE half:
+///
+/// ```text
+/// if (inode->i_size < offset) {
+///         limit = rlimit(RLIMIT_FSIZE);
+///         if (limit != RLIM_INFINITY && offset > limit)
+///                 goto out_sig;        /* send_sig(SIGXFSZ); return -EFBIG */
+/// ```
+///
+/// Two details that differ from the write path and are easy to get wrong:
+/// the test is `>` against the FINAL size rather than `>=` against a start
+/// position, so a truncate to exactly the limit is allowed; and it applies
+/// only when the file GROWS — shrinking a file that is already over the
+/// limit is always permitted, which is how a process lowers itself back
+/// under one.
+fn fsize_check_resize(task: u64, current_size: u64, new_size: u64) -> Result<(), i64> {
+    if new_size <= current_size {
+        return Ok(());
+    }
+    let limit = fsize_limit(task);
+    if limit != RLIM_INFINITY && new_size > limit {
+        raise_signal_pending(task, SIGXFSZ);
+        return Err(27); // -EFBIG
+    }
+    Ok(())
+}
+
+/// `fs/coredump.c`: `cprm.limit = rlimit(RLIMIT_CORE)`, the ceiling on the
+/// core file a fatal signal may write.
+pub(crate) fn coredump_limit(task: u64) -> u64 {
+    read_rlimit(task, RLIMIT_CORE).map_or(RLIM_INFINITY, |p| p.cur)
+}
+
+/// Test hook: raise/lower a limit through the SAME transaction `setrlimit`
+/// uses, so nothing is bypassed. It exists because the coredump fixtures run
+/// against a stubbed task that never issues a syscall of its own, and
+/// `RLIMIT_CORE` now decides whether they produce a file at all.
+#[doc(hidden)]
+pub fn __test_set_rlimit(task: u64, resource: usize, cur: u64, max: u64) -> bool {
+    update_rlimit_atomic(task, None, resource, Some(RLimitPair { cur, max })).is_ok()
+}
 
 #[derive(Copy, Clone)]
 struct MlockAuthority {

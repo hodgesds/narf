@@ -5388,7 +5388,43 @@ fn smoke_process_coredump_e2e() -> TestResult {
         state.rax = 0xbeef;
     }
 
-    // 5. Force termination with core_dumped = true
+    // 5a. NEGATIVE CONTROL, before the limit is raised: RLIMIT_CORE's soft
+    // limit defaults to 0, and `fs/coredump.c` refuses any limit below
+    // binfmt_elf's `min_coredump` (one page). A dump attempted now must
+    // therefore create NOTHING — including not unlinking a core from an
+    // earlier crash on its way to writing nothing. Until RLIMIT_CORE was
+    // enforced this call wrote a full ELF core, which is what this kernel
+    // did on every fatal signal where a stock Linux writes none.
+    {
+        // SAFETY: the child task is not enqueued-running in this stubbed
+        // test context, so no other CPU touches its uctx.
+        let state = unsafe { &*child_task.uctx.state.get() };
+        crate::coredump::write_coredump(child_task_raw, 11, state);
+    }
+    {
+        let probe = crate::handlers::resolve_cwd_path(PARENT, "core");
+        if let Some((dir, leaf)) = crate::handlers::resolve_parent_dir_async(&probe) {
+            if dir.lookup(&leaf).is_some() {
+                crate::task::release_task(child_task_raw);
+                teardown_process_state();
+                *PROC_PARENT_AS.lock() = None;
+                return TestResult::Fail("core written despite RLIMIT_CORE = 0");
+            }
+        }
+    }
+
+    // 5b. Raise RLIMIT_CORE, as `ulimit -c unlimited` does, so the dump
+    // below is permitted. The pair is the whole test: the same fixture must
+    // produce no file under the default limit and a valid ELF core once it
+    // is lifted.
+    if !crate::handlers::__test_set_rlimit(child_task_raw, 4, u64::MAX, u64::MAX) {
+        crate::task::release_task(child_task_raw);
+        teardown_process_state();
+        *PROC_PARENT_AS.lock() = None;
+        return TestResult::Fail("could not raise RLIMIT_CORE");
+    }
+
+    // 6. Force termination with core_dumped = true
     crate::user_task::install_current(
         &child_task.uctx as *const crate::user_task::UserTaskCtx
             as *mut crate::user_task::UserTaskCtx,

@@ -60,6 +60,16 @@ pub(crate) fn sys_writev(ctx: &mut dyn TrapContext) {
     } else {
         endpoint.description.offset()
     };
+    // RLIMIT_FSIZE, as `generic_write_checks` applies it to the whole iov
+    // run: the limit is a property of the file position, not of any one
+    // iovec, so it shortens the total and the loop below stops early.
+    let count = match fsize_check_write(task, offset, count, || endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File) {
+        Ok(c) => c,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            return;
+        }
+    };
     let mut iov_index = 0usize;
     let mut iov_offset = 0usize;
     while total < count {
