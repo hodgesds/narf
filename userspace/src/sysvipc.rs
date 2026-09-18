@@ -485,6 +485,31 @@ fn local_sem_lookup_cache_slot(object: IpcObjectKey) -> &'static SemLookupCacheS
     &SEM_LOOKUP_CACHE[cpu][sem_lookup_cache_way(object)]
 }
 
+/// Drop every CPU's cached reference to `object`.
+///
+/// Called from both places a set leaves `state.sets`: `IPC_RMID` and
+/// `ipc_namespace_drop`. The cache is per-CPU, so the removing CPU has to
+/// reach across to slots it does not otherwise touch — a set removed on one
+/// CPU while another has it cached is exactly the case that breaks.
+///
+/// Only the one way this object hashes to is examined, so the sweep is
+/// `MAX_CPUS` lock acquisitions rather than the whole table.
+fn invalidate_sem_lookup_cache(object: IpcObjectKey) {
+    let way = sem_lookup_cache_way(object);
+    for cpu in SEM_LOOKUP_CACHE.iter() {
+        let stale = {
+            let mut slot = cpu[way].0.lock();
+            if slot.as_ref().is_some_and(|entry| entry.object == object) {
+                slot.take()
+            } else {
+                None
+            }
+        };
+        // Arc destruction can cascade; keep it outside the IRQ-safe lock.
+        drop(stale);
+    }
+}
+
 fn lookup_sem_set(object: IpcObjectKey) -> Option<SemSetRef> {
     let slot = local_sem_lookup_cache_slot(object);
     if let Some(set) = {
@@ -520,11 +545,20 @@ fn lookup_sem_set(object: IpcObjectKey) -> Option<SemSetRef> {
 /// decrementing one shared Arc refcount on every syscall; Linux's RCU lookup
 /// likewise reaches the array without a per-operation object reference bump.
 ///
-/// Removed entries may remain cached. This is safe and bounded: the complete
-/// sequence-bearing id cannot alias a replacement object, and `SemSet::removed`
-/// is checked under the set lock before every operation. Only the owning CPU
-/// accesses its cache slot, so holding the slot across `f` cannot block another
-/// CPU now that removal does not synchronously invalidate remote slots.
+/// Removal DOES invalidate every CPU's slot — see
+/// [`invalidate_sem_lookup_cache`], called from both paths that drop a set
+/// out of `state.sets`. This comment used to claim the opposite, on the
+/// argument that "the complete sequence-bearing id cannot alias a
+/// replacement object, and `SemSet::removed` is checked under the set lock
+/// before every operation". That does not hold: an id IS reused once its
+/// set is gone, and a stale slot then answers a lookup for the NEW set with
+/// the old, removed one — whose `removed` flag makes every subsequent
+/// operation fail. Restoring the invalidation took the sysvipc suite from
+/// 27 failures to none.
+///
+/// Only the owning CPU reads its slot, so holding it across `f` still
+/// cannot block another CPU; invalidation is a write from the removing CPU
+/// and is rare.
 fn with_cached_sem_set<R>(object: IpcObjectKey, f: impl FnOnce(&SemSetRef) -> R) -> Option<R> {
     let slot = local_sem_lookup_cache_slot(object);
     let mut cached = slot.0.lock();
@@ -3224,6 +3258,7 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                                 return Err(EIDRM);
                             }
                             state.sets.remove(&object);
+                            invalidate_sem_lookup_cache(object);
                             state
                                 .ids
                                 .get_mut(&ipc_ns)
