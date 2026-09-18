@@ -131,6 +131,17 @@ fn with_mounts<R>(f: impl FnOnce(&mut BTreeMap<u64, MountObject>) -> R) -> R {
     f(g.get_or_insert_with(BTreeMap::new))
 }
 
+/// Per-detached-mount attributes pending from `mount_setattr(fd, AT_EMPTY_PATH)`,
+/// keyed by the same id as [`MOUNTS`]. NARF applies mount flags at the mount
+/// POINT, but the new-mount-API sets a mount read-only (etc.) while it is still
+/// detached, before `move_mount` gives it a path. Record it here and apply it in
+/// `sys_move_mount` once the mount is attached.
+static MOUNT_ATTRS: IrqSafeSpinLock<Option<BTreeMap<u64, MountAttr>>> = IrqSafeSpinLock::new(None);
+fn with_mount_attrs<R>(f: impl FnOnce(&mut BTreeMap<u64, MountAttr>) -> R) -> R {
+    let mut g = MOUNT_ATTRS.lock();
+    f(g.get_or_insert_with(BTreeMap::new))
+}
+
 fn context_of(task: u64, fd_no: u32) -> Option<u64> {
     fd::with_table(task, |t| t.get(fd_no).and_then(|e| e.ops.fs_context_id())).flatten()
 }
@@ -389,6 +400,7 @@ fn validate_open_tree_flags(flags: u64) -> Result<(), i64> {
 /// E2BIG. Attribute values are validated even though NARF currently treats
 /// the supported per-mount settings as compatibility no-ops.
 /// The parsed, validated `struct mount_attr`.
+#[derive(Clone, Copy)]
 struct MountAttr {
     attr_set: u64,
     attr_clr: u64,
@@ -722,6 +734,13 @@ pub fn sys_move_mount(ctx: &mut dyn TrapContext) {
         ctx.set_return(err(EBUSY));
         return;
     }
+    // Apply any attrs recorded by `mount_setattr(fd, AT_EMPTY_PATH)` while this
+    // mount was detached — it now has a mount point, so the flags can land.
+    // Best-effort: an unattachable attr must not undo the successful attach
+    // (Linux applied it at mount_setattr time; NARF defers to here).
+    if let Some(attr) = with_mount_attrs(|m| m.remove(&mid)) {
+        let _ = apply_mount_attr(&target, &attr);
+    }
     for (relative, fs) in mount.descendants {
         let child_target = if target == "/" {
             alloc::format!("/{}", relative.trim_start_matches('/'))
@@ -1000,6 +1019,25 @@ pub fn sys_mount_setattr(ctx: &mut dyn TrapContext) {
     if attr.attr_set == 0 && attr.attr_clr == 0 {
         ctx.set_return(ok(0));
         return;
+    }
+    // `AT_EMPTY_PATH`: the target is the mount referred to by the fd (arg0),
+    // not a path. systemd's new-mount-API sandbox sets a DETACHED fsmount /
+    // open_tree mount read-only/nosuid/etc. this way BEFORE `move_mount`
+    // attaches it. Resolving the empty name as a path would apply the attrs to
+    // the wrong mount (or fail), which aborted namespacing with EXIT_NAMESPACE
+    // for every ProtectProc / PrivateDevices service — the logind/userdbd
+    // failure. NARF applies mount flags at the mount POINT, so record the attrs
+    // against the detached mount now and apply them in `sys_move_mount`. A
+    // non-mount fd (e.g. AT_FDCWD with an empty name) falls through to the
+    // path branch below, which resolves the empty name against the cwd.
+    if a.arg2 & AT_EMPTY_PATH != 0 {
+        if let Some(mid) = mount_of(current_task_id(), a.arg0 as u32) {
+            with_mount_attrs(|m| {
+                m.insert(mid, attr);
+            });
+            ctx.set_return(ok(0));
+            return;
+        }
     }
     let path = match copy_user_cstr_checked(a.arg1, 4096) {
         Ok(p) => p,
