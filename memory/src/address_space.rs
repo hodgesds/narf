@@ -1597,6 +1597,15 @@ pub struct AddressSpace {
     /// Resident base pages temporarily made inaccessible by automatic NUMA
     /// balancing. The next access is a NUMA hint fault, not demand paging.
     numa_hints: IrqSafeSpinLock<NumaHints>,
+    /// `membarrier(2)` registration state, Linux's `mm->membarrier_state`.
+    ///
+    /// Owned by the ADDRESS SPACE, not the task: Linux is explicit that the
+    /// registration covers "threads belonging to different thread groups
+    /// which use the same mm (CLONE_VM but not CLONE_THREAD)"
+    /// (`membarrier_register_private_expedited`). Sharing the `Arc` gives
+    /// that for free, and a fresh AS — fork, or the one `execve` installs —
+    /// starts unregistered, matching `membarrier_exec_mmap`.
+    membarrier_state: core::sync::atomic::AtomicU32,
 }
 
 // `clone_for_fork` is intentionally a by-value interface today. Keep the
@@ -1673,6 +1682,7 @@ impl AddressSpace {
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
+            membarrier_state: core::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -1857,6 +1867,28 @@ impl AddressSpace {
         {
             0
         }
+    }
+
+    /// `membarrier(2)` registration state for this address space — Linux's
+    /// `atomic_read(&mm->membarrier_state)`.
+    ///
+    /// Bit values are the `MEMBARRIER_STATE_*` enum from
+    /// `include/linux/sched/mm.h`; the syscall layer owns their meaning, this
+    /// is only the storage.
+    #[inline]
+    pub fn membarrier_state(&self) -> u32 {
+        self.membarrier_state
+            .load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set `bits` in the `membarrier(2)` registration state, returning the
+    /// state as it was before. Linux's `atomic_or`: registration is
+    /// monotonic within an address space's lifetime, and concurrent
+    /// registration from two CLONE_VM peers must not lose either bit.
+    #[inline]
+    pub fn membarrier_state_or(&self, bits: u32) -> u32 {
+        self.membarrier_state
+            .fetch_or(bits, core::sync::atomic::Ordering::AcqRel)
     }
 
     /// Run one compound VMA mutation while excluding CLONE_VM peers.
@@ -2503,6 +2535,7 @@ impl AddressSpace {
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
+            membarrier_state: core::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -2534,6 +2567,7 @@ impl AddressSpace {
             program_data_bytes: core::sync::atomic::AtomicU64::new(0),
             vm_shared: core::sync::atomic::AtomicBool::new(false),
             numa_hints: IrqSafeSpinLock::new(NumaHints::new()),
+            membarrier_state: core::sync::atomic::AtomicU32::new(0),
         })
     }
 

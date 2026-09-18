@@ -1114,6 +1114,12 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // → IPI fan-out hook so the asid/pcid-isolation surface
             // also benefits from cross-CPU dispatch.
             narf_interrupts::install_tlb_shootdown_bridge();
+            // membarrier(2)'s expedited commands: a real cross-CPU barrier
+            // rendezvous, not a notification. Gated on x2APIC for the same
+            // reason as the shootdown bridge — without it there is no way to
+            // interrupt a peer, and `remote_barrier` then reports itself
+            // unavailable so the syscall stops advertising those commands.
+            narf_interrupts::install_membarrier_ipi();
             // Let a CPU spinning on an IrqSafeSpinLock (IRQs masked) drain a
             // shootdown a peer published to it — otherwise the peer's ack-wait
             // would spin to its cap and give up, stranding a stale TLB on a
@@ -1218,6 +1224,10 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
             // Install the unified `narf_memory::tlb_shootdown::shootdown`
             // → SGI fan-out hook on aarch64 too.
             narf_interrupts::install_tlb_shootdown_bridge();
+            // membarrier(2)'s cross-CPU barrier SGI. Unlike the shootdown
+            // SGI this one is load-bearing on aarch64: inner-shareable TLBI
+            // broadcasts in hardware, a peer's memory barrier does not.
+            narf_interrupts::install_membarrier_ipi();
         } else {
             let _ = writeln!(
                 console::Writer,

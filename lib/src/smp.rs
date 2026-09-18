@@ -10,12 +10,14 @@
 //! / PSCI CPU_ON on aarch64 — is layered on top of this surface
 //! and lives in `frame/`.
 //!
-//! Today the kernel runs single-CPU. `cpu_count()` and
-//! `online_cpus()` both return 1 (BSP). Once AP bring-up lands,
-//! the same accessors expose the discovered topology without
-//! caller changes.
+//! APs are brought up for real, so `cpu_count()` / `online_bitmap()`
+//! report the discovered topology rather than a BSP-only stub, and user
+//! tasks run on application processors (`narf_scheduler::enable_user_task_smp`).
+//! The cross-CPU barrier rendezvous at the end of this file exists because
+//! of that: primitives that were vacuous on a uniprocessor kernel now have
+//! to be real.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 pub use crate::percpu::MAX_CPUS;
 
@@ -290,4 +292,195 @@ pub unsafe fn count_aarch64_cpus_in_dtb(dtb_phys: u64) -> u32 {
         }
     }
     count
+}
+
+// ── Cross-CPU barrier rendezvous ─────────────────────────────────
+//
+// The "interrupt a set of CPUs and wait until each has executed a full
+// memory barrier" primitive behind `membarrier(2)`'s expedited commands.
+// Linux spells this `smp_call_function_many(mask, ipi_mb, NULL, 1)`, where
+// `ipi_mb()` is literally `smp_mb()` (kernel/sched/membarrier.c) — the
+// load-bearing property is the synchronous rendezvous, not the work the
+// handler does.
+//
+// The protocol is arch-neutral and lives here; only "poke this CPU set"
+// is per-arch, and `narf-interrupts` installs it at boot (the same
+// inversion `narf_memory::tlb_shootdown::set_ipi_fanout` uses, for the
+// same reason: `narf-lib` sits below the interrupt controllers).
+//
+// The poke is allowed to be over-broad — aarch64's GICv3 `broadcast_others`
+// has no target list, and a CPU that runs the handler without a pending
+// request simply finds an empty bitmap. Under-poking is what would break
+// the contract, so the ack set is tracked exactly and the wait covers only
+// the CPUs the caller selected.
+
+/// Bit `source` set ⇒ that source CPU is waiting for THIS target to
+/// execute its barrier. A target claims the whole batch with `swap(0)`,
+/// so one poke can discharge several concurrent senders.
+static BARRIER_PENDING: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Per-source ack bitmap. Target `n` sets bit `n` only after its barrier
+/// has executed. The source waits for exactly the bits it selected.
+static BARRIER_ACKED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
+/// Serializes nested/concurrent publishers on one CPU, and (being
+/// IRQ-safe) keeps `current_cpu()` stable for the lifetime of the lane.
+static BARRIER_OUTGOING: [crate::sync::IrqSafeSpinLock<()>; MAX_CPUS] =
+    [const { crate::sync::IrqSafeSpinLock::new(()) }; MAX_CPUS];
+
+/// Completed rendezvous count, for smokes and diagnostics.
+static BARRIER_SENT: AtomicU64 = AtomicU64::new(0);
+
+/// Handler invocations that found at least one pending source.
+static BARRIER_SERVICED: AtomicU64 = AtomicU64::new(0);
+
+/// Per-arch "raise the barrier IPI on this CPU set". Installed once at
+/// boot by `narf-interrupts`; `0` means no interrupt controller has
+/// claimed the vector yet (UP boot, or pre-bring-up).
+static BARRIER_POKE: AtomicUsize = AtomicUsize::new(0);
+
+type BarrierPokeFn = fn(targets: u64);
+
+/// Wire the per-arch barrier poke. Called once, after the vector (x86_64)
+/// or SGI handler (aarch64) is installed.
+pub fn set_barrier_poke(f: BarrierPokeFn) {
+    BARRIER_POKE.store(f as usize, Ordering::Release);
+}
+
+/// Whether [`remote_barrier`] can actually deliver its guarantee.
+///
+/// True on a single-CPU system (there is no peer to synchronize with, so
+/// the guarantee is vacuous and Linux returns success early for the same
+/// reason) and on an SMP system whose barrier IPI is wired. Callers that
+/// advertise a capability to userspace — `membarrier(2)`'s QUERY mask and
+/// its registration commands — must gate on this rather than claim support
+/// they cannot honour.
+pub fn remote_barrier_available() -> bool {
+    cpu_count() <= 1 || BARRIER_POKE.load(Ordering::Acquire) != 0
+}
+
+/// Execute a full memory barrier on every online CPU in `targets`, and
+/// return only once all of them have done so.
+///
+/// The calling CPU is excluded (it executes its own barrier inline, and a
+/// migration mid-call implies a context switch, which is itself a barrier).
+/// Offline CPUs are dropped: they cannot hold user state, and their next
+/// dispatch goes through a context switch.
+///
+/// Returns `false` without waiting when the rendezvous is unavailable —
+/// see [`remote_barrier_available`]. Callers must not report success to
+/// userspace in that case.
+pub fn remote_barrier(targets: u64) -> bool {
+    let source = crate::percpu::current_cpu().min(MAX_CPUS - 1);
+    let source_bit = 1u64 << source;
+
+    // (a) in Linux's ordering table: the caller's own writes must precede
+    // the IPI, since system-call entry is not a barrier.
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    let targets = targets & online_bitmap() & !source_bit;
+    if targets == 0 {
+        // Nothing to rendezvous with. The fence above and the one below
+        // still give the caller the local half of the guarantee.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        return true;
+    }
+
+    let poke = BARRIER_POKE.load(Ordering::Acquire);
+    if poke == 0 {
+        return false;
+    }
+    // SAFETY: only `BarrierPokeFn as usize` is ever stored, and it is
+    // non-null here.
+    let poke: BarrierPokeFn = unsafe { core::mem::transmute(poke) };
+
+    // IRQs stay masked for the lane's lifetime, so `source` cannot change
+    // under us and a local nested publisher cannot reuse the ack cell.
+    let _outgoing = BARRIER_OUTGOING[source].lock();
+    BARRIER_ACKED[source].store(0, Ordering::Relaxed);
+
+    let mut pending = targets;
+    let mut kick = 0u64;
+    while pending != 0 {
+        let target = pending.trailing_zeros() as usize;
+        pending &= pending - 1;
+        // Only an empty→non-empty transition needs a new poke; an
+        // in-flight IPI or a spinning peer will drain the added bit.
+        if BARRIER_PENDING[target].fetch_or(source_bit, Ordering::Release) == 0 {
+            kick |= 1u64 << target;
+        }
+    }
+    if kick != 0 {
+        poke(kick);
+    }
+
+    // Two senders that pick each other as targets would otherwise wait
+    // forever: both spin with IRQs masked, so neither can take the other's
+    // IPI. Servicing our own inbox inside the spin breaks that cycle —
+    // the same reason the TLB shootdown sender polls.
+    while BARRIER_ACKED[source].load(Ordering::Acquire) & targets != targets {
+        service_pending_barriers();
+        core::hint::spin_loop();
+    }
+
+    // (c) in Linux's ordering table: exit from the system call is not a
+    // barrier either, so the caller's subsequent loads must not be
+    // reordered before the last ack.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    BARRIER_SENT.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Target side of the rendezvous. Executes this CPU's barrier and
+/// acknowledges every source waiting on it.
+///
+/// Idempotent and safe to call with nothing pending, so it doubles as the
+/// sender's anti-deadlock poll. Called from the barrier IPI handler
+/// (x86_64 vector / aarch64 SGI), from [`remote_barrier`]'s wait, and from
+/// the lock spin path in `crate::sync` — a CPU spinning with IRQs masked
+/// cannot take the IPI, and unlike a shootdown the sender here never gives
+/// up, so a stranded request would hang it.
+///
+/// Migrating between claiming the batch and acknowledging it is harmless.
+/// `target` is read once and names the same CPU on both sides, and a
+/// migration is a context switch, which is itself a full barrier on the CPU
+/// being left — so the barrier the source asked for did happen, after its
+/// request was published. This is the same property Linux leans on when it
+/// skips the current CPU in `membarrier_global_expedited`.
+pub fn service_pending_barriers() {
+    let target = crate::percpu::current_cpu().min(MAX_CPUS - 1);
+    let sources = BARRIER_PENDING[target].swap(0, Ordering::AcqRel);
+    if sources == 0 {
+        return;
+    }
+
+    // THE barrier. Claiming the batch above and acknowledging below must
+    // sandwich a full fence, or an ack could be observed by the source
+    // before this CPU's prior accesses are globally visible.
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    // Counted BEFORE the acknowledgements, not after. The ack is what
+    // releases the sender, so a counter bumped afterwards can still be
+    // invisible to it when `remote_barrier` returns — the release/acquire
+    // pair on BARRIER_ACKED is what publishes this store. Ordering it the
+    // other way made the rendezvous smoke fail on aarch64 and pass on
+    // x86_64, which is the signature of exactly this mistake.
+    BARRIER_SERVICED.fetch_add(1, Ordering::Relaxed);
+
+    let mut remaining = sources;
+    while remaining != 0 {
+        let source = remaining.trailing_zeros() as usize;
+        remaining &= remaining - 1;
+        BARRIER_ACKED[source].fetch_or(1u64 << target, Ordering::Release);
+    }
+}
+
+/// Completed [`remote_barrier`] rendezvous since boot.
+pub fn barrier_sent_count() -> u64 {
+    BARRIER_SENT.load(Ordering::Relaxed)
+}
+
+/// Barrier handler invocations that found work, since boot.
+pub fn barrier_serviced_count() -> u64 {
+    BARRIER_SERVICED.load(Ordering::Relaxed)
 }

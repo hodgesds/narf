@@ -59,6 +59,13 @@ pub const VECTOR_TLB_SHOOTDOWN: u8 = 0xF0;
 /// The handler does nothing — the act of being interrupted is the whole
 /// point; the dispatch framework EOIs afterward.
 pub const VECTOR_RESCHED: u8 = 0xF1;
+/// Cross-CPU memory-barrier IPI, behind `membarrier(2)`'s expedited
+/// commands. Unlike [`VECTOR_RESCHED`] this is a rendezvous, not a
+/// notification: the sender waits until every selected CPU has executed a
+/// full barrier and acknowledged. The protocol lives in
+/// `narf_lib::smp::service_pending_barriers`; this vector only delivers the
+/// interrupt (Linux's `ipi_mb`, kernel/sched/membarrier.c).
+pub const VECTOR_MEMBARRIER: u8 = 0xF2;
 pub const VECTOR_APIC_ERROR: u8 = 0xFE;
 pub const VECTOR_SPURIOUS: u8 = 0xFF;
 
@@ -93,6 +100,53 @@ pub unsafe fn eoi() {}
 /// one CPU is online).
 pub fn install_tlb_shootdown_bridge() {
     narf_memory::tlb_shootdown::set_ipi_fanout(ipi_fanout_bridge);
+}
+
+/// Wire `narf_lib::smp::remote_barrier`'s poke to the per-arch IPI and
+/// install the receiving handler. Until this runs, `remote_barrier` reports
+/// itself unavailable rather than pretending to synchronize — which is what
+/// keeps `membarrier(2)` from advertising expedited commands it cannot
+/// honour on a boot whose interrupt controller never came up.
+///
+/// Idempotent: `dispatch::install` / `sgi::set_handler` both replace in
+/// place, and the poke hook is a plain store.
+pub fn install_membarrier_ipi() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        dispatch::install(VECTOR_MEMBARRIER, narf_lib::smp::service_pending_barriers);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        aarch64::sgi::set_handler(
+            aarch64::sgi::SGI_MEMBARRIER,
+            narf_lib::smp::service_pending_barriers,
+        );
+    }
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    narf_lib::smp::set_barrier_poke(membarrier_poke);
+}
+
+/// Raise [`VECTOR_MEMBARRIER`] on every CPU in `targets`.
+#[cfg(target_arch = "x86_64")]
+fn membarrier_poke(targets: u64) {
+    x86_64::apic::send_fixed_ipi(targets, VECTOR_MEMBARRIER);
+}
+
+/// GICv3's `ICC_SGI1R_EL1` broadcast form takes no target list, so this
+/// pokes every other CPU regardless of `targets`. That is sound but not
+/// minimal: the rendezvous tracks acknowledgements per target, so a CPU
+/// interrupted without a pending request finds an empty bitmap and returns.
+/// Over-poking costs a spurious IRQ; under-poking would hang the sender.
+#[cfg(target_arch = "aarch64")]
+fn membarrier_poke(targets: u64) {
+    if targets == 0 {
+        return;
+    }
+    // SAFETY: GICv3 sysreg interface is online once the boot path has run
+    // `gic::init_per_cpu`, which precedes the hook installation.
+    unsafe {
+        aarch64::sgi::broadcast_others(aarch64::sgi::SGI_MEMBARRIER);
+    }
 }
 
 /// Install the notification-only reschedule-IPI handler for [`VECTOR_RESCHED`].

@@ -1058,32 +1058,252 @@ fn smoke_abi_sched_getattr_zeroes_the_tail() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_getattr_zeroes_the_tail);
 
-// ── membarrier(cmd, flags) ──────────────────────────────────────────
+// ── membarrier(cmd, flags, cpu_id) ──────────────────────────────────
+//
+// `kernel/sched/membarrier.c`. The expedited commands are a rendezvous, so
+// the interesting assertions are the ones a no-op handler fails: that
+// `flags` is read at all, that an unregistered address space is refused,
+// and that registration is visible afterwards.
+//
+// Every command below except QUERY / GLOBAL reads `current->mm`, and the
+// ABI harness deliberately starts each test with none — hence the explicit
+// `install_test_address_space()`. It hands out a FRESH address space per
+// test, which is what keeps the "unregistered ⇒ EPERM" case independent of
+// registry order.
+
+const MB_QUERY: u64 = 0;
+const MB_GLOBAL: u64 = 1 << 0;
+const MB_GLOBAL_EXPEDITED: u64 = 1 << 1;
+const MB_REGISTER_GLOBAL_EXPEDITED: u64 = 1 << 2;
+const MB_PRIVATE_EXPEDITED: u64 = 1 << 3;
+const MB_REGISTER_PRIVATE_EXPEDITED: u64 = 1 << 4;
+const MB_PRIVATE_EXPEDITED_SYNC_CORE: u64 = 1 << 5;
+const MB_PRIVATE_EXPEDITED_RSEQ: u64 = 1 << 7;
+const MB_GET_REGISTRATIONS: u64 = 1 << 9;
+const MB_FLAG_CPU: u64 = 1 << 0;
+
+/// The mask this configuration must report: every command except QUERY,
+/// minus the SYNC_CORE and RSEQ pairs (no `sync_core_before_usermode`, and
+/// `rseq(2)` is -ENOSYS). Matches Linux's `MEMBARRIER_CMD_BITMASK` with
+/// both CONFIGs off.
+const MB_SUPPORTED: u64 = MB_GLOBAL
+    | MB_GLOBAL_EXPEDITED
+    | MB_REGISTER_GLOBAL_EXPEDITED
+    | MB_PRIVATE_EXPEDITED
+    | MB_REGISTER_PRIVATE_EXPEDITED
+    | MB_GET_REGISTRATIONS;
+
+fn membarrier(cmd: u64, flags: u64) -> Option<i64> {
+    call(Syscall::Membarrier.raw(), a1(cmd, flags))
+}
 
 fn smoke_abi_sched_membarrier_query_pos() -> TestResult {
     with_setup(|| {
-        // cmd 0 (MEMBARRIER_CMD_QUERY) returns the supported-command bitmask.
-        // Supported = GLOBAL|GLOBAL_EXPEDITED|REGISTER_GLOBAL_EXPEDITED|
-        //             PRIVATE_EXPEDITED|REGISTER_PRIVATE_EXPEDITED
-        //           = bits 0..=4 = 0b11111 = 31.
-        match call(Syscall::Membarrier.raw(), a1(0, 0)) {
-            Some(31) => Ok(()),
-            _ => Err("membarrier QUERY should report supported mask (31)"),
+        // QUERY answers the supported-command bitmask — and answers 0 when
+        // the cross-CPU rendezvous is unavailable, rather than advertising
+        // barriers this kernel cannot deliver.
+        let expect = if narf_lib::smp::remote_barrier_available() {
+            MB_SUPPORTED as i64
+        } else {
+            0
+        };
+        match membarrier(MB_QUERY, 0) {
+            Some(v) if v == expect => {}
+            _ => return Err("membarrier QUERY reported the wrong supported mask"),
         }
+        // The two unsupported pairs must be absent from the mask AND
+        // rejected when issued — Linux's CONFIG-off shape. A mask that
+        // advertised them would send a JIT down a path that never
+        // serializes.
+        if expect as u64 & (MB_PRIVATE_EXPEDITED_SYNC_CORE | MB_PRIVATE_EXPEDITED_RSEQ) != 0 {
+            return Err("QUERY advertised SYNC_CORE/RSEQ, which are not implemented");
+        }
+        for cmd in [MB_PRIVATE_EXPEDITED_SYNC_CORE, MB_PRIVATE_EXPEDITED_RSEQ] {
+            match membarrier(cmd, 0) {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("an unadvertised membarrier command must be -EINVAL"),
+            }
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_membarrier_query_pos);
 
 fn smoke_abi_sched_membarrier_bad_cmd_neg() -> TestResult {
     with_setup(|| {
-        // cmd 0x4000 is not a supported single-bit command ⇒ EINVAL.
-        match call(Syscall::Membarrier.raw(), a1(0x4000, 0)) {
-            Some(v) if v == EINVAL => Ok(()),
-            _ => Err("membarrier with unsupported cmd should return -EINVAL"),
+        // Not a defined command bit at all.
+        match membarrier(0x4000, 0) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("membarrier with unsupported cmd should return -EINVAL"),
         }
+        // Two supported bits OR'd together is still not a command: Linux
+        // switches on the value, it does not test bits, so this lands in
+        // `default:`. A handler that masked instead would accept it.
+        match membarrier(MB_GLOBAL | MB_PRIVATE_EXPEDITED, 0) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("a combination of two command bits must be -EINVAL"),
+        }
+        // Negative cmd — `int cmd` is signed and nothing below QUERY exists.
+        match membarrier((-1i64) as u64, 0) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("a negative membarrier cmd must be -EINVAL"),
+        }
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_sched_membarrier_bad_cmd_neg);
+
+fn smoke_abi_sched_membarrier_rejects_flags() -> TestResult {
+    with_setup(|| {
+        if !narf_lib::smp::remote_barrier_available() {
+            return Ok(());
+        }
+        // `flags` used to be read by nothing: every one of these was a
+        // success. Linux validates per-command BEFORE dispatching, and only
+        // PRIVATE_EXPEDITED_RSEQ tolerates a non-zero value.
+        for cmd in [
+            MB_GLOBAL,
+            MB_GLOBAL_EXPEDITED,
+            MB_REGISTER_GLOBAL_EXPEDITED,
+            MB_PRIVATE_EXPEDITED,
+            MB_REGISTER_PRIVATE_EXPEDITED,
+            MB_GET_REGISTRATIONS,
+        ] {
+            for flags in [MB_FLAG_CPU, 0xDEAD_BEEF] {
+                match membarrier(cmd, flags) {
+                    Some(v) if v == EINVAL => {}
+                    _ => return Err("membarrier with non-zero flags must be -EINVAL"),
+                }
+            }
+        }
+        // QUERY is not exempt from the flags rule either.
+        match membarrier(MB_QUERY, 1) {
+            Some(v) if v == EINVAL => {}
+            _ => return Err("membarrier QUERY with flags set must be -EINVAL"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_membarrier_rejects_flags);
+
+fn smoke_abi_sched_membarrier_registration_gates_expedited() -> TestResult {
+    with_setup(|| {
+        if !narf_lib::smp::remote_barrier_available() {
+            return Ok(());
+        }
+        install_test_address_space()?;
+
+        // Fresh address space: nothing registered, so GET_REGISTRATIONS is
+        // empty and PRIVATE_EXPEDITED is refused. Linux returns -EPERM for
+        // an mm without MEMBARRIER_STATE_PRIVATE_EXPEDITED_READY; returning
+        // 0 here is the failure mode this whole test exists to catch.
+        match membarrier(MB_GET_REGISTRATIONS, 0) {
+            Some(0) => {}
+            _ => return Err("a fresh address space must report no registrations"),
+        }
+        match membarrier(MB_PRIVATE_EXPEDITED, 0) {
+            Some(v) if v == EPERM => {}
+            _ => return Err("PRIVATE_EXPEDITED without registration must be -EPERM"),
+        }
+
+        // Register, and the same call must now succeed. Together with the
+        // -EPERM above this pins BOTH directions: a registration that did
+        // nothing would leave this -EPERM, and a missing gate would have
+        // made the -EPERM above a 0.
+        match membarrier(MB_REGISTER_PRIVATE_EXPEDITED, 0) {
+            Some(0) => {}
+            _ => return Err("REGISTER_PRIVATE_EXPEDITED should succeed"),
+        }
+        match membarrier(MB_PRIVATE_EXPEDITED, 0) {
+            Some(0) => {}
+            _ => return Err("PRIVATE_EXPEDITED after registration should succeed"),
+        }
+        match membarrier(MB_GET_REGISTRATIONS, 0) {
+            Some(v) if v == MB_REGISTER_PRIVATE_EXPEDITED as i64 => {}
+            _ => return Err("GET_REGISTRATIONS should report the private registration"),
+        }
+
+        // Registration is idempotent, and the global one is tracked
+        // separately — GET_REGISTRATIONS reports the OR of both.
+        match membarrier(MB_REGISTER_PRIVATE_EXPEDITED, 0) {
+            Some(0) => {}
+            _ => return Err("re-registering should be a no-op success"),
+        }
+        match membarrier(MB_REGISTER_GLOBAL_EXPEDITED, 0) {
+            Some(0) => {}
+            _ => return Err("REGISTER_GLOBAL_EXPEDITED should succeed"),
+        }
+        let both = (MB_REGISTER_PRIVATE_EXPEDITED | MB_REGISTER_GLOBAL_EXPEDITED) as i64;
+        match membarrier(MB_GET_REGISTRATIONS, 0) {
+            Some(v) if v == both => {}
+            _ => return Err("GET_REGISTRATIONS should report both registrations"),
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_membarrier_registration_gates_expedited
+);
+
+fn smoke_abi_sched_membarrier_global_needs_no_mm() -> TestResult {
+    with_setup(|| {
+        if !narf_lib::smp::remote_barrier_available() {
+            return Ok(());
+        }
+        // GLOBAL and GLOBAL_EXPEDITED never read `current->mm` in Linux, and
+        // GLOBAL needs no registration — that is the property distinguishing
+        // it from GLOBAL_EXPEDITED. The harness installs no address space,
+        // so this also proves the handler does not demand one.
+        for cmd in [MB_GLOBAL, MB_GLOBAL_EXPEDITED] {
+            match membarrier(cmd, 0) {
+                Some(0) => {}
+                _ => return Err("GLOBAL/GLOBAL_EXPEDITED should succeed without an mm"),
+            }
+        }
+        // The mm-backed commands, by contrast, must report the missing
+        // address space rather than quietly succeeding.
+        for cmd in [
+            MB_PRIVATE_EXPEDITED,
+            MB_REGISTER_PRIVATE_EXPEDITED,
+            MB_GET_REGISTRATIONS,
+        ] {
+            match membarrier(cmd, 0) {
+                Some(-12) => {}
+                _ => return Err("an mm-backed membarrier command needs an address space"),
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_sched_membarrier_global_needs_no_mm);
+
+fn smoke_abi_sched_membarrier_rendezvous_reaches_peers() -> TestResult {
+    with_setup(|| {
+        // The barrier itself. On a uniprocessor there is no peer and
+        // `remote_barrier` is vacuously true; on SMP it must interrupt every
+        // online peer and collect an acknowledgement from each, so the
+        // handler-side counter has to move. A no-op barrier — the bug this
+        // replaces — leaves it exactly where it was.
+        let targets = narf_lib::smp::online_bitmap();
+        let peers = targets & !(1u64 << narf_lib::percpu::current_cpu());
+        let before = narf_lib::smp::barrier_serviced_count();
+        if !narf_lib::smp::remote_barrier(targets) {
+            if narf_lib::smp::remote_barrier_available() {
+                return Err("remote_barrier failed while reporting itself available");
+            }
+            return Ok(());
+        }
+        if peers != 0 && narf_lib::smp::barrier_serviced_count() == before {
+            return Err("remote_barrier returned without any peer servicing it");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_membarrier_rendezvous_reaches_peers
+);
 
 // ── set_robust_list(head*, len) / get_robust_list(pid, head**, len*) ─
 // Round-trip: set_robust_list stores (head, len); get_robust_list reads

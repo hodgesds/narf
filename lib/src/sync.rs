@@ -57,6 +57,14 @@ pub fn contended_irq_lock(cpu: usize) -> usize {
 /// xAPIC fallback where shootdowns aren't broadcast).
 #[inline(always)]
 fn run_lock_spin_hook() {
+    // The `membarrier(2)` rendezvous has the same stranding problem the
+    // installed shootdown hook solves, and one worse consequence: the sender
+    // does not give up. A CPU spinning here with IRQs masked cannot take the
+    // barrier IPI, so a peer waiting on its acknowledgement would spin
+    // forever. This lives in the crate rather than behind LOCK_SPIN_HOOK
+    // because the protocol is arch-neutral and must be drained on aarch64
+    // too, which installs no hook. One relaxed load when nothing is pending.
+    crate::smp::service_pending_barriers();
     let h = LOCK_SPIN_HOOK.load(Ordering::Acquire);
     if h != 0 {
         // SAFETY: only `set_lock_spin_hook` ever writes this cell, always with
