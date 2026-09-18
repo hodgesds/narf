@@ -75,5 +75,8 @@ pub(crate) fn sys_setuid(ctx: &mut dyn TrapContext) {
     // -> cap_emulate_setxuid: the capability sets follow the uid change, so
     // dropping away from root actually drops privilege.
     cap_emulate_setxuid(task, old, read_uidgid(task));
+    // `flag_nproc_exceeded(new)`: a uid change never FAILS for
+    // RLIMIT_NPROC, it arms the next execve instead. See the helper.
+    flag_nproc_exceeded(task);
     ctx.set_return(SyscallReturn::ok(0));
 }
