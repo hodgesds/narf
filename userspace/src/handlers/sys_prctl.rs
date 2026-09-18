@@ -130,15 +130,37 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(0));
         }
         PR_SET_KEEPCAPS => {
+            // `security/commoncap.c:1384`:
+            //
+            //     if (arg2 > 1) return -EINVAL;
+            //     if (issecure(SECURE_KEEP_CAPS_LOCKED)) return -EPERM;
+            //     if (arg2) new->securebits |=  issecure_mask(SECURE_KEEP_CAPS);
+            //     else      new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+            //
+            // This writes the SECUREBIT. It is not a separate flag that
+            // happens to mean the same thing — `PR_GET_KEEPCAPS` is
+            // `issecure(SECURE_KEEP_CAPS)`, and `PR_SET_SECUREBITS` can set
+            // the same bit, so two stores would let them disagree about
+            // which one `cap_emulate_setxuid` obeys.
             if arg_a > 1 {
                 ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                 return;
             }
-            modify_prctl(task, |s| s.keep_caps = arg_a != 0);
+            // The lock is why this is EPERM and not EINVAL: the request is
+            // well-formed, the caller has simply given up the right to make
+            // it.
+            if issecure(task, SECURE_KEEP_CAPS_LOCKED) {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
+            let bits = task_securebits(task);
+            let mask = 1u64 << SECURE_KEEP_CAPS;
+            set_task_securebits(task, if arg_a != 0 { bits | mask } else { bits & !mask });
             ctx.set_return(SyscallReturn::ok(0));
         }
         PR_GET_KEEPCAPS => {
-            ctx.set_return(SyscallReturn::ok(read_prctl(task).keep_caps as u64));
+            // `return !!issecure(SECURE_KEEP_CAPS);`
+            ctx.set_return(SyscallReturn::ok(u64::from(issecure(task, SECURE_KEEP_CAPS))));
         }
         PR_SET_CHILD_SUBREAPER => {
             modify_prctl(task, |s| s.child_subreaper = arg_a != 0);
@@ -221,7 +243,7 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                         ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                         return;
                     }
-                    modify_prctl(task, |s| s.ambient_caps = 0);
+                    ambient_clear_all(task);
                     ctx.set_return(SyscallReturn::ok(0));
                 }
                 PR_CAP_AMBIENT_RAISE | PR_CAP_AMBIENT_LOWER | PR_CAP_AMBIENT_IS_SET => {
@@ -229,20 +251,31 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
                         ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                         return;
                     }
-                    let bit = 1u64 << arg_b;
+                    let cap = arg_b as u32;
                     match arg_a {
+                        // `if (!cap_raised(pP, arg3) || !cap_raised(pI, arg3)
+                        //  || issecure(SECURE_NO_CAP_AMBIENT_RAISE))
+                        //          return -EPERM;`
+                        //
+                        // These preconditions were absent, and the write
+                        // went to a field nothing read — so the ambient set
+                        // could neither be raised in a way that mattered nor
+                        // refused when it should have been.
                         PR_CAP_AMBIENT_RAISE => {
-                            modify_prctl(task, |s| s.ambient_caps |= bit);
-                            ctx.set_return(SyscallReturn::ok(0));
+                            if ambient_raise(task, cap) {
+                                ctx.set_return(SyscallReturn::ok(0));
+                            } else {
+                                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                            }
                         }
                         PR_CAP_AMBIENT_LOWER => {
-                            modify_prctl(task, |s| s.ambient_caps &= !bit);
+                            ambient_lower(task, cap);
                             ctx.set_return(SyscallReturn::ok(0));
                         }
                         // IS_SET: 1 if raised, 0 otherwise.
                         _ => {
-                            let set = read_prctl(task).ambient_caps & bit != 0;
-                            ctx.set_return(SyscallReturn::ok(set as u64));
+                            let set = task_ambient(task) & (1u64 << cap) != 0;
+                            ctx.set_return(SyscallReturn::ok(u64::from(set)));
                         }
                     }
                 }
@@ -291,11 +324,18 @@ pub(crate) fn sys_prctl(ctx: &mut dyn TrapContext) {
             // and EPERM as "you lack CAP_SETPCAP" — the second is what a
             // caller poking at a bit outside the mask must see, or it
             // concludes the securebit model itself is unavailable.
-            if arg_a & !0xFF != 0 {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
-            } else {
-                modify_prctl(task, |s| s.securebits = arg_a);
+            // All four arms, not just [3]. [1] refuses CHANGING a bit
+            // whose lock is set and [2] refuses CLEARING a lock — together
+            // they are what makes a securebit one-way, which is the entire
+            // security property: a sandbox that locks NOROOT must not be
+            // talked out of it later. [4] is `capable(CAP_SETPCAP)`,
+            // because changing a securebit changes how every later
+            // capability decision is made.
+            if securebits_change_permitted(task, arg_a) {
+                set_task_securebits(task, arg_a);
                 ctx.set_return(SyscallReturn::ok(0));
+            } else {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
             }
         }
         21 /* PR_GET_SECCOMP */ => {

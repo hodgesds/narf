@@ -4868,6 +4868,174 @@ pub(crate) fn capable_in_own_ns(cap: u32) -> bool {
     task_capable_in_own_ns(current_task_id(), cap)
 }
 
+// ── securebits (`include/uapi/linux/securebits.h`) ───────────────
+//
+// One `u64` per task, exactly as Linux keeps one `securebits` word in
+// `struct cred`. NARF previously kept `keep_caps` as a SEPARATE bool
+// beside it, which split a single Linux field in two: `PR_SET_KEEPCAPS`
+// is literally `securebits |= issecure_mask(SECURE_KEEP_CAPS)`
+// (`security/commoncap.c:1394`) and `PR_GET_KEEPCAPS` is
+// `issecure(SECURE_KEEP_CAPS)` (`:1382`), so the two stores could disagree
+// about the same bit and `PR_SET_SECUREBITS` could not reach the one the
+// setuid path actually read.
+
+/// `CAP_SETPCAP` — "modify the capability sets". The gate on
+/// `PR_SET_SECUREBITS`, because changing a securebit changes how every
+/// later capability decision is made.
+pub(crate) const CAP_SETPCAP: u32 = 8;
+
+pub(crate) const SECURE_NOROOT: u32 = 0;
+pub(crate) const SECURE_NO_SETUID_FIXUP: u32 = 2;
+pub(crate) const SECURE_KEEP_CAPS: u32 = 4;
+/// Each settable bit has its LOCK one position higher; setting the lock
+/// makes the bit immutable, which is what makes a securebit one-way.
+pub(crate) const SECURE_KEEP_CAPS_LOCKED: u32 = 5;
+pub(crate) const SECURE_NO_CAP_AMBIENT_RAISE: u32 = 6;
+
+const fn issecure_mask(bit: u32) -> u64 {
+    1u64 << bit
+}
+
+/// `SECURE_ALL_BITS` — the four settable bits. Each has a LOCK one
+/// position higher, hence `<< 1`.
+const SECURE_ALL_BITS: u64 = issecure_mask(SECURE_NOROOT)
+    | issecure_mask(SECURE_NO_SETUID_FIXUP)
+    | issecure_mask(SECURE_KEEP_CAPS)
+    | issecure_mask(SECURE_NO_CAP_AMBIENT_RAISE);
+/// `SECURE_ALL_LOCKS`.
+const SECURE_ALL_LOCKS: u64 = SECURE_ALL_BITS << 1;
+
+/// `issecure(bit)` for an explicit task.
+pub(crate) fn issecure(task: u64, bit: u32) -> bool {
+    read_prctl(task).securebits & issecure_mask(bit) != 0
+}
+
+pub(crate) fn task_securebits(task: u64) -> u64 {
+    read_prctl(task).securebits
+}
+
+pub(crate) fn set_task_securebits(task: u64, bits: u64) {
+    modify_prctl(task, |s| s.securebits = bits);
+}
+
+/// `cap_task_prctl`'s PR_SET_SECUREBITS guard (`security/commoncap.c:1336`).
+///
+/// ```text
+/// if ((((old->securebits & SECURE_ALL_LOCKS) >> 1)
+///      & (old->securebits ^ arg2))                        /*[1]*/
+///     || ((old->securebits & SECURE_ALL_LOCKS & ~arg2))   /*[2]*/
+///     || (arg2 & ~(SECURE_ALL_LOCKS | SECURE_ALL_BITS))   /*[3]*/
+///     || (cap_capable(...CAP_SETPCAP...) != 0))           /*[4]*/
+///         return -EPERM;
+/// ```
+///
+/// All four are -EPERM, including [3], the "bit this kernel does not know"
+/// arm — libcap reads EINVAL as "too old to have securebits at all", so the
+/// distinction is load-bearing.
+///
+/// [1] refuses CHANGING a bit whose lock is set; [2] refuses CLEARING a
+/// lock. Together they are what makes a securebit one-way, which is the
+/// entire security property: a sandbox that locks NOROOT must not be able
+/// to be talked out of it later.
+pub(crate) fn securebits_change_permitted(task: u64, want: u64) -> bool {
+    let old = task_securebits(task);
+    if ((old & SECURE_ALL_LOCKS) >> 1) & (old ^ want) != 0 {
+        return false;
+    }
+    if old & SECURE_ALL_LOCKS & !want != 0 {
+        return false;
+    }
+    if want & !(SECURE_ALL_LOCKS | SECURE_ALL_BITS) != 0 {
+        return false;
+    }
+    task_capable(task, CAP_SETPCAP)
+}
+
+/// Seed the inheritable set — the precondition `PR_CAP_AMBIENT_RAISE`
+/// checks, which the boot credential leaves empty.
+#[doc(hidden)]
+pub fn __test_set_inheritable(task: u64, bits: u64) {
+    let caps = read_caps(task);
+    write_caps(
+        task,
+        Caps {
+            inheritable: bits,
+            ..caps
+        },
+    );
+}
+
+/// Ambient set of an explicit task, for a case to observe.
+#[doc(hidden)]
+pub fn __test_ambient(task: u64) -> u64 {
+    read_caps(task).ambient
+}
+
+/// Ambient set of an explicit task — `cred->cap_ambient`.
+pub(crate) fn task_ambient(task: u64) -> u64 {
+    read_caps(task).ambient
+}
+
+/// `PR_CAP_AMBIENT_RAISE` (`security/commoncap.c:1421`).
+///
+/// ```text
+/// if (arg2 == PR_CAP_AMBIENT_RAISE &&
+///     (!cap_raised(current_cred()->cap_permitted, arg3) ||
+///      !cap_raised(current_cred()->cap_inheritable, arg3) ||
+///      issecure(SECURE_NO_CAP_AMBIENT_RAISE)))
+///         return -EPERM;
+/// ```
+///
+/// Both set memberships are required. Ambient is the set that SURVIVES an
+/// exec into permitted and effective, so raising one you do not already
+/// hold permitted-and-inheritable would manufacture privilege out of the
+/// exec rather than carry it across — which is the invariant
+/// `cap_ambient_invariant_ok` exists to assert.
+pub(crate) fn ambient_raise(task: u64, cap: u32) -> bool {
+    if u64::from(cap) > CAP_LAST_CAP {
+        return false;
+    }
+    let bit = 1u64 << cap;
+    let caps = read_caps(task);
+    if caps.permitted & bit == 0
+        || caps.inheritable & bit == 0
+        || issecure(task, SECURE_NO_CAP_AMBIENT_RAISE)
+    {
+        return false;
+    }
+    write_caps(
+        task,
+        Caps {
+            ambient: caps.ambient | bit,
+            ..caps
+        },
+    );
+    true
+}
+
+/// `cap_lower(new->cap_ambient, arg3)`. Unconditional: dropping a
+/// capability never needs permission.
+pub(crate) fn ambient_lower(task: u64, cap: u32) {
+    if u64::from(cap) > CAP_LAST_CAP {
+        return;
+    }
+    let caps = read_caps(task);
+    write_caps(
+        task,
+        Caps {
+            ambient: caps.ambient & !(1u64 << cap),
+            ..caps
+        },
+    );
+}
+
+/// `cap_clear(new->cap_ambient)`.
+pub(crate) fn ambient_clear_all(task: u64) {
+    let caps = read_caps(task);
+    write_caps(task, Caps { ambient: 0, ..caps });
+}
+
+
 /// `security/commoncap.c::cap_emulate_setxuid` — make the capability sets
 /// follow a uid change.
 ///
@@ -4895,7 +5063,7 @@ pub(crate) fn capable_in_own_ns(cap: u32) -> bool {
 /// restores effective from permitted, which is how a set-uid-root helper
 /// regains its powers after temporarily dropping them.
 ///
-/// `SECURE_KEEP_CAPS` is honored through the per-task `keep_caps` flag that
+/// `SECURE_KEEP_CAPS` is honored through the securebit that
 /// `PR_SET_KEEPCAPS` maintains: a task that asked to keep its capabilities
 /// across a uid change retains its permitted/effective sets, exactly as
 /// `!issecure(SECURE_KEEP_CAPS)` gates the clear in Linux. Ambient is
@@ -4910,15 +5078,28 @@ pub(crate) fn capable_in_own_ns(cap: u32) -> bool {
 /// broker child aborted, the system bus never came up, and logind
 /// fail-looped — no graphical session.
 ///
-/// LINUX-GAP: `SECURE_NO_SETUID_FIXUP` (which suppresses this fixup
-/// entirely) is not modelled; it defaults off, so the fixup still runs.
+/// `SECURE_NO_SETUID_FIXUP` suppresses this fixup ENTIRELY, and is checked
+/// first: a task that set it manages its own capability sets across uid
+/// changes, and applying half the rules would leave it with neither its
+/// own policy nor the kernel's.
 fn cap_emulate_setxuid(task: u64, old: UidGid, new: UidGid) {
+    // `cap_task_fix_setuid`: `if (!issecure(SECURE_NO_SETUID_FIXUP))
+    // cap_emulate_setxuid(new, old);` — the whole juggle is suppressed, not
+    // parts of it. A process that set the bit is saying "I manage my own
+    // capability sets across uid changes", and applying half the rules
+    // would leave it with neither its own policy nor the kernel's.
+    if issecure(task, SECURE_NO_SETUID_FIXUP) {
+        return;
+    }
     let was_root = old.uid == 0 || old.euid == 0 || old.suid == 0;
     let is_root = new.uid == 0 || new.euid == 0 || new.suid == 0;
     let mut caps = read_caps(task);
     let mut changed = false;
     if was_root && !is_root {
-        if !read_prctl(task).keep_caps {
+        // `if (!issecure(SECURE_KEEP_CAPS))`. Reads the SECUREBIT, which is
+        // the same storage `PR_SET_KEEPCAPS` writes — they are one field in
+        // Linux and one field here.
+        if !issecure(task, SECURE_KEEP_CAPS) {
             caps.permitted = 0;
             caps.effective = 0;
         }
@@ -5038,7 +5219,15 @@ fn cap_emulate_setfsuid(task: u64, old_fsuid: u32, new_fsuid: u32) {
 /// when the EFFECTIVE uid is root: a binary that merely leaves the real
 /// uid at 0 gets the permissions but must raise them itself.
 fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
+    // `root_privileged()` is `!issecure(SECURE_NOROOT)`
+    // (`security/commoncap.c:805`). SECURE_NOROOT says "uid 0 is just a
+    // uid" — the root-gets-everything shortcut below is exactly what it
+    // exists to switch off, so a task that set it must not be handed the
+    // full set by execing something owned by root.
     if new_ids.euid != 0 && new_ids.uid != 0 {
+        return;
+    }
+    if issecure(task, SECURE_NOROOT) {
         return;
     }
     let mut caps = read_caps(task);
@@ -5047,6 +5236,59 @@ fn cap_exec_privileged_root(task: u64, new_ids: UidGid) {
         caps.effective = caps.permitted;
     }
     write_caps(task, caps);
+}
+
+/// The ambient half of `cap_bprm_creds_from_file`
+/// (`security/commoncap.c:966`).
+///
+/// ```text
+/// /* File caps or setid cancels ambient. */
+/// if (has_fcap || id_changed)
+///         cap_clear(new->cap_ambient);
+/// /* pP' = (X & fP) | (pI & fI) | pA' */
+/// new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
+/// /* pE' = (fE ? pP' : pA') */
+/// if (effective) new->cap_effective = new->cap_permitted;
+/// else           new->cap_effective = new->cap_ambient;
+/// ...
+/// new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+/// ```
+///
+/// This is the ONLY thing that makes the ambient set worth having: it is
+/// the set that survives an exec, joining permitted and becoming
+/// effective. Without it `PR_CAP_AMBIENT_RAISE` is a write to a field that
+/// never influences anything, which is what it was.
+///
+/// `id_changed` cancels ambient because the new image is already gaining
+/// privilege from the set-user-ID bit; carrying a second, independently
+/// granted set across the same exec would stack two privilege sources the
+/// caller never combined deliberately.
+///
+/// NARF has no file capabilities, so `has_fcap` and `effective` are always
+/// false — which is why `pE' = pA'` here rather than the `fE ? pP' : pA'`
+/// choice, and why the `X & fP` and `pI & fI` terms of `pP'` contribute
+/// nothing. Stated rather than silently simplified.
+fn cap_exec_ambient(task: u64, ids: UidGid, id_changed: bool) {
+    let mut caps = read_caps(task);
+    if id_changed {
+        caps.ambient = 0;
+    }
+    caps.permitted |= caps.ambient;
+    // `pE' = fE ? pP' : pA'`. `fE` has two sources in Linux: a file
+    // capability's effective bit, and `handle_privileged_root`, which sets
+    // `effective = true` when the new euid is root and SECURE_NOROOT is
+    // clear. NARF has no file capabilities, so the second is the only one —
+    // which is exactly the condition `cap_exec_privileged_root` above uses
+    // to hand out the full set, and computing it differently here would let
+    // the two disagree about the same exec.
+    let fe = ids.euid == 0 && !issecure(task, SECURE_NOROOT);
+    caps.effective = if fe { caps.permitted } else { caps.ambient };
+    write_caps(task, caps);
+    // `new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS)` — KEEP_CAPS is
+    // about surviving a uid change, not an exec, and leaving it set would
+    // apply the previous image's choice to the new one.
+    let bits = task_securebits(task);
+    set_task_securebits(task, bits & !(1u64 << SECURE_KEEP_CAPS));
 }
 
 /// `fs/exec.c::bprm_fill_uid` — the set-user-ID / set-group-ID transition
@@ -5135,6 +5377,69 @@ fn bprm_fill_uid(task: u64, path: &str, from_script: bool) -> Option<UidGid> {
     write_uidgid(task, |e| *e = new);
     cap_exec_privileged_root(task, new);
     Some(new)
+}
+
+/// `begin_new_exec`'s dumpability step (`/usr/src/linux/fs/exec.c:1205`).
+///
+/// ```text
+/// if (bprm->interp_flags & BINPRM_FLAGS_ENFORCE_NONDUMP ||
+///     !(uid_eq(current_euid(), current_uid()) &&
+///       gid_eq(current_egid(), current_gid())))
+///         set_dumpable(current->mm, suid_dumpable);
+/// else
+///         set_dumpable(current->mm, SUID_DUMP_USER);
+/// ```
+///
+/// Runs on EVERY exec, and both directions matter.
+///
+/// Clearing it is what stops a set-uid program being inspected by the user
+/// who launched it: the new image is running with privilege its invoker
+/// does not have, and `__ptrace_may_access`'s credential comparison alone
+/// would not refuse them — they still own the process. Without this, every
+/// set-uid binary was ptrace-able by whoever ran it, which is the attack
+/// the dumpable gate exists for.
+///
+/// SETTING it back is equally load-bearing and easier to forget: a process
+/// that called `PR_SET_DUMPABLE(0)` and then execs an ordinary binary must
+/// become dumpable again. The new image did not ask to be protected, and
+/// leaving the flag on would silently make an ordinary program
+/// un-debuggable because of something its predecessor did.
+///
+/// Note the comparison is against the CURRENT credentials after
+/// `bprm_fill_uid` has run, not against a "was this file set-uid" flag —
+/// Linux's own comment says testing `current` is "wrong, but userspace
+/// depends on it". Matching the observable behaviour, not the intent.
+///
+/// `suid_dumpable` is the `/proc/sys/fs/suid_dumpable` sysctl, whose
+/// default is 0 (`SUID_DUMP_DISABLE`); NARF has no knob for it, so the
+/// privileged case is always non-dumpable.
+fn exec_set_dumpable(task: u64) {
+    let ids = read_uidgid(task);
+    let privileged = ids.euid != ids.uid || ids.egid != ids.gid;
+    modify_prctl(task, |s| s.dumpable = !privileged);
+}
+
+/// The credential half of `begin_new_exec`, as ONE step.
+///
+/// `bprm_fill_uid` and the dumpability reset are separate functions in
+/// Linux but a single ordered obligation: the second reads the credentials
+/// the first may have just changed, and an exec that ran one without the
+/// other would either leak a set-uid image to its invoker's debugger or
+/// leave an ordinary image carrying its predecessor's `PR_SET_DUMPABLE(0)`.
+///
+/// They are joined here so the exec path has one call to make rather than
+/// two to remember, and so the test hook below exercises the composition
+/// instead of each piece in isolation — a case that called them separately
+/// would keep passing if the exec path stopped calling one of them.
+pub(crate) fn exec_apply_credentials(task: u64, path: &str, from_script: bool) {
+    let id_changed = bprm_fill_uid(task, path, from_script).is_some();
+    let ids = read_uidgid(task);
+    // Ambient BEFORE dumpability: it reads the credentials `bprm_fill_uid`
+    // may have changed, and dumpability reads them too. Order is
+    // `cap_bprm_creds_from_file` then `begin_new_exec`'s dumpability step,
+    // as in Linux.
+    cap_exec_ambient(task, ids, id_changed);
+    exec_set_dumpable(task);
 }
 
 /// Linux `CAP_FSETID` — "don't clear set-user-ID and set-group-ID mode
@@ -5265,9 +5570,25 @@ fn in_group_or_capable(task: u64, file_uid: u32, file_gid: u32) -> bool {
 /// regeneration a setuid-root binary depends on.
 #[doc(hidden)]
 pub fn __test_bprm_fill_uid(task: u64, path: &str, from_script: bool) -> (u32, u32, u32, u64) {
-    let _ = bprm_fill_uid(task, path, from_script);
+    // The whole credential step, not just `bprm_fill_uid`: this is what the
+    // exec path calls, so a case driving this hook covers the composition.
+    exec_apply_credentials(task, path, from_script);
     let ids = read_uidgid(task);
     (ids.euid, ids.egid, ids.fsuid, read_caps(task).effective)
+}
+
+/// `PR_GET_DUMPABLE` for an explicit task — the observable the exec
+/// dumpability step writes.
+#[doc(hidden)]
+pub fn __test_dumpable(task: u64) -> bool {
+    read_prctl(task).dumpable
+}
+
+/// Seed the flag for an explicit task, so a case can set up the
+/// "predecessor asked not to be dumpable" state without being that task.
+#[doc(hidden)]
+pub fn __test_set_dumpable_for_test(task: u64, dumpable: bool) {
+    modify_prctl(task, |s| s.dumpable = dumpable);
 }
 
 /// Fork inherits all five sets unchanged (`kernel/fork.c` copies the
@@ -12097,6 +12418,73 @@ pub fn __test_set_fsids(task: u64, fsuid: u32, fsgid: u32) {
     });
 }
 
+/// `CAP_SYS_PTRACE` — inspect and modify another process's memory and
+/// registers regardless of whose it is.
+pub(crate) const CAP_SYS_PTRACE: u32 = 19;
+
+/// `__ptrace_may_access` (`kernel/ptrace.c`) — may `caller` trace `target`?
+///
+/// ```text
+/// if (same_thread_group(task, current))       return 0;
+/// caller_uid = cred->uid;  caller_gid = cred->gid;   /* REALCREDS */
+/// if (uid_eq(caller_uid, tcred->euid) && uid_eq(caller_uid, tcred->suid) &&
+///     uid_eq(caller_uid, tcred->uid)  && gid_eq(caller_gid, tcred->egid) &&
+///     gid_eq(caller_gid, tcred->sgid) && gid_eq(caller_gid, tcred->gid))
+///         goto ok;
+/// if (ptrace_has_cap(tcred->user_ns, mode))   goto ok;
+/// return -EPERM;
+/// ok:
+/// if (mm && get_dumpable(mm) != SUID_DUMP_USER && !ptrace_has_cap(..))
+///         return -EPERM;
+/// ```
+///
+/// NARF had NO equivalent: `PTRACE_ATTACH` checked that the pid existed,
+/// that it was not the caller, and that nothing else was already tracing
+/// it. Any task could therefore attach to any other regardless of uid and
+/// `PTRACE_POKEDATA` into it, which is a write primitive into a more
+/// privileged process.
+///
+/// Both halves matter and they are not the same question. The credential
+/// comparison asks "is this the same user"; the dumpable gate asks "did
+/// that user's process ask not to be inspected", which is what a
+/// `PR_SET_DUMPABLE(0)` agent (ssh-agent, gpg-agent) relies on to keep a
+/// same-uid process out of its key material. Checking only the first
+/// leaves that request recorded and unhonoured.
+///
+/// ALL SIX id comparisons are required, not just the effective pair: a
+/// process that has dropped euid but kept a privileged real or saved uid
+/// can restore it, so treating it as the caller's peer would hand over a
+/// process that is one `setuid` away from being root.
+pub(crate) fn ptrace_may_access(caller: u64, target: u64) -> bool {
+    if caller == target {
+        return true;
+    }
+    // `ptrace_has_cap`, consulted twice below. Capability over the whole
+    // system, not over a namespace: NARF's ptrace tables are keyed on the
+    // outer pid, so an inner-namespace tracer has already been translated
+    // by the time it reaches here.
+    let privileged = task_capable(caller, CAP_SYS_PTRACE);
+
+    let c = read_uidgid(caller);
+    let t = read_uidgid(target);
+    let same_user = c.uid == t.euid
+        && c.uid == t.suid
+        && c.uid == t.uid
+        && c.gid == t.egid
+        && c.gid == t.sgid
+        && c.gid == t.gid;
+    if !same_user && !privileged {
+        return false;
+    }
+    // The `ok:` label. Reached by EITHER route, so a same-user caller is
+    // still refused a non-dumpable target — that is the whole point of the
+    // flag, and it is why this is not folded into the branch above.
+    if !read_prctl(target).dumpable && !privileged {
+        return false;
+    }
+    true
+}
+
 fn read_uidgid(task: u64) -> UidGid {
     let g = CREDENTIAL_TABLES[credential_shard(task)].uidgid.lock();
     g.as_ref()
@@ -13041,14 +13429,14 @@ struct PrctlState {
     /// PR_SET_CHILD_SUBREAPER: this task volunteers to absorb the
     /// orphans of its descendants (instead of them going unreaped).
     child_subreaper: bool,
-    /// Linux capability-retention compatibility state. NARF authority is
-    /// capability-object based, so this round-trips for consumers such as
-    /// dbus-broker but does not grant or retain NARF capabilities.
-    keep_caps: bool,
-    /// Ambient capability set as a bitmask (bit N ⇒ capability N raised).
-    ambient_caps: u64,
-    /// PR_SET_SECUREBITS value. Stored-not-enforced (NARF's privilege
-    /// model is uid/gid only); PR_GET_SECUREBITS must round-trip it so
+    /// `cred->securebits`. The SINGLE store for all four settable bits and
+    /// their locks, including `SECURE_KEEP_CAPS` — `PR_SET_KEEPCAPS` and
+    /// `PR_SET_SECUREBITS` write the same bit here, as they do in Linux.
+    /// Read by `cap_emulate_setxuid` (KEEP_CAPS, NO_SETUID_FIXUP), the exec
+    /// credential path (NOROOT), and `PR_CAP_AMBIENT_RAISE`
+    /// (NO_CAP_AMBIENT_RAISE).
+    ///
+    /// PR_GET_SECUREBITS must round-trip it so
     /// systemd's executor `if (prctl(PR_GET_SECUREBITS) != secure_bits)`
     /// check sees the default 0 and skips the (privileged) SET — an
     /// unimplemented GET returned -1, forcing a doomed SET on every
@@ -13065,8 +13453,6 @@ impl Default for PrctlState {
             no_new_privs: false,
             pdeathsig: 0,
             child_subreaper: false,
-            keep_caps: false,
-            ambient_caps: 0, // empty ambient set at exec, per Linux
             securebits: 0,   // SECBIT_* all clear, per Linux default
             seccomp_mode: 0,
         }

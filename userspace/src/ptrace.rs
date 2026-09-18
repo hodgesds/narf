@@ -811,6 +811,17 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
                 return;
             }
+            // `ptrace_attach` -> `__ptrace_may_access(task,
+            // PTRACE_MODE_ATTACH_REALCREDS)`. Nothing here asked whose
+            // process the target was, so any task could attach to any other
+            // and then `PTRACE_POKEDATA` into it — a write primitive into a
+            // more privileged process. The REALCREDS mode is why the check
+            // compares the caller's REAL uid: this is a syscall that
+            // explicitly names another process, not a filesystem access.
+            if !crate::handlers::ptrace_may_access(caller, tid) {
+                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                return;
+            }
             {
                 let mut g = PTRACE_STATE.lock();
                 if let Some(r) = g.as_mut() {

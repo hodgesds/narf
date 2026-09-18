@@ -599,7 +599,26 @@ fn smoke_abi_proc_prctl_cap_ambient() -> TestResult {
             Some(0) => {}
             _ => return Err("PR_CAP_AMBIENT_IS_SET after clear did not read 0"),
         }
-        // RAISE then IS_SET reads back 1.
+        // RAISE has PRECONDITIONS (`security/commoncap.c:1421`): the
+        // capability must already be in BOTH permitted and inheritable.
+        // The harness task boots with a full permitted set and an EMPTY
+        // inheritable one — `init_cred` uses `CAP_FULL_SET` for
+        // permitted/effective/bset and nothing for pI — so the raise is
+        // -EPERM until inheritable is populated. This case previously
+        // asserted it succeeded outright, which is what a handler with no
+        // preconditions does.
+        match call(
+            Syscall::Prctl.raw(),
+            a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN),
+        ) {
+            Some(-1) => {}
+            _ => return Err("RAISE without the cap in inheritable must be -EPERM"),
+        }
+        // Grant it inheritable, and the same raise is permitted. Ambient is
+        // the set that survives an exec into permitted and effective, so
+        // raising one the task does not already hold both ways would
+        // manufacture privilege rather than carry it.
+        crate::handlers::__test_set_inheritable(FAKE_TASK, 1u64 << CAP_NET_ADMIN);
         match call(
             Syscall::Prctl.raw(),
             a2(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_NET_ADMIN),
@@ -2256,3 +2275,194 @@ fn smoke_abi_proc_seccomp_new_listener_is_einval() -> TestResult {
 }
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("syscall_abi", smoke_abi_proc_seccomp_new_listener_is_einval);
+
+// ── securebits (`security/commoncap.c::cap_task_prctl`) ──────────
+//
+// `PrctlState.securebits` had no readers: it round-tripped through
+// PR_GET_SECUREBITS and nothing else consulted it, so every bit was
+// decorative. It is the single store for all four settable bits now,
+// including SECURE_KEEP_CAPS — which `PR_SET_KEEPCAPS` also writes, as it
+// does in Linux.
+
+const PR_SET_SECUREBITS: u64 = 28;
+const PR_GET_SECUREBITS: u64 = 27;
+const PR_SET_KEEPCAPS_OPT: u64 = 8;
+const PR_GET_KEEPCAPS_OPT: u64 = 7;
+const SECBIT_KEEP_CAPS: u64 = 1 << 4;
+const SECBIT_KEEP_CAPS_LOCKED: u64 = 1 << 5;
+const SECBIT_NOROOT: u64 = 1 << 0;
+const SECBIT_NOROOT_LOCKED: u64 = 1 << 1;
+
+/// A lock makes its bit immutable, in both directions.
+///
+/// `cap_task_prctl`'s PR_SET_SECUREBITS guard has four arms and NARF only
+/// had the last one:
+///
+/// ```text
+/// if ((((old->securebits & SECURE_ALL_LOCKS) >> 1)
+///      & (old->securebits ^ arg2))                        /*[1]*/
+///     || ((old->securebits & SECURE_ALL_LOCKS & ~arg2))   /*[2]*/
+///     || (arg2 & ~(SECURE_ALL_LOCKS | SECURE_ALL_BITS))   /*[3]*/
+///     || (cap_capable(...CAP_SETPCAP...) != 0))           /*[4]*/
+///         return -EPERM;
+/// ```
+///
+/// [1] and [2] together are the whole security property: without them a
+/// securebit is a suggestion. A sandbox locks NOROOT precisely so that code
+/// running later — including code an attacker controls — cannot turn it
+/// back off.
+fn smoke_abi_proc_prctl_securebits_locks() -> TestResult {
+    const EPERM: i64 = -1;
+    with_setup(|| {
+        // Set NOROOT and lock it.
+        let want = SECBIT_NOROOT | SECBIT_NOROOT_LOCKED;
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, want)) != Some(0) {
+            return Err("setting NOROOT with its lock should succeed while privileged");
+        }
+        if call(Syscall::Prctl.raw(), a0(PR_GET_SECUREBITS)) != Some(want as i64) {
+            return Err("PR_GET_SECUREBITS did not read back what was set");
+        }
+        // [1] — clearing a LOCKED bit.
+        if call(
+            Syscall::Prctl.raw(),
+            a1(PR_SET_SECUREBITS, SECBIT_NOROOT_LOCKED),
+        ) != Some(EPERM)
+        {
+            return Err("clearing a locked securebit must be -EPERM");
+        }
+        // [2] — clearing the LOCK itself.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, SECBIT_NOROOT)) != Some(EPERM) {
+            return Err("clearing a securebit lock must be -EPERM");
+        }
+        // [3] — a bit outside the defined mask. EPERM, not EINVAL: libcap
+        // reads EINVAL as "this kernel has no securebits at all".
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, 1 << 20)) != Some(EPERM) {
+            return Err("an undefined securebit must be -EPERM");
+        }
+        // Setting the same value again is a no-op change, so it is allowed —
+        // the control that says the locks refuse CHANGES, not every write.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, want)) != Some(0) {
+            return Err("re-setting the same securebits must still be permitted");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_securebits_locks);
+
+/// `PR_SET_KEEPCAPS` and `PR_SET_SECUREBITS` write the SAME bit.
+///
+/// `PR_SET_KEEPCAPS` is `securebits |= issecure_mask(SECURE_KEEP_CAPS)`
+/// (`security/commoncap.c:1394`) and `PR_GET_KEEPCAPS` is
+/// `issecure(SECURE_KEEP_CAPS)` (`:1382`). NARF kept a separate `keep_caps`
+/// bool beside `securebits`, so the two could disagree about the same bit
+/// and `PR_SET_SECUREBITS` could not reach the one `cap_emulate_setxuid`
+/// actually read.
+fn smoke_abi_proc_prctl_keepcaps_is_a_securebit() -> TestResult {
+    const EPERM: i64 = -1;
+    with_setup(|| {
+        // Set through KEEPCAPS, observe through SECUREBITS.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS_OPT, 1)) != Some(0) {
+            return Err("PR_SET_KEEPCAPS(1) should succeed");
+        }
+        match call(Syscall::Prctl.raw(), a0(PR_GET_SECUREBITS)) {
+            Some(bits) if bits as u64 & SECBIT_KEEP_CAPS != 0 => {}
+            _ => return Err("PR_SET_KEEPCAPS did not set SECBIT_KEEP_CAPS"),
+        }
+        // Clear through SECUREBITS, observe through KEEPCAPS.
+        if call(Syscall::Prctl.raw(), a1(PR_SET_SECUREBITS, 0)) != Some(0) {
+            return Err("clearing securebits should succeed");
+        }
+        if call(Syscall::Prctl.raw(), a0(PR_GET_KEEPCAPS_OPT)) != Some(0) {
+            return Err("clearing SECBIT_KEEP_CAPS did not clear PR_GET_KEEPCAPS");
+        }
+        // The lock applies to PR_SET_KEEPCAPS too — same bit, same rules.
+        if call(
+            Syscall::Prctl.raw(),
+            a1(PR_SET_SECUREBITS, SECBIT_KEEP_CAPS_LOCKED),
+        ) != Some(0)
+        {
+            return Err("locking SECBIT_KEEP_CAPS should succeed");
+        }
+        if call(Syscall::Prctl.raw(), a1(PR_SET_KEEPCAPS_OPT, 1)) != Some(EPERM) {
+            return Err("PR_SET_KEEPCAPS under SECURE_KEEP_CAPS_LOCKED must be -EPERM");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_prctl_keepcaps_is_a_securebit);
+
+/// Ambient survives an ordinary exec into permitted and effective, and a
+/// set-user-ID exec cancels it.
+///
+/// This is what makes the ambient set worth having (`cap_bprm_creds_from_file`,
+/// `security/commoncap.c:966`). Without it `PR_CAP_AMBIENT_RAISE` writes a
+/// field that never influences anything — which, with the set split across
+/// two stores, is exactly what it did.
+fn smoke_abi_proc_ambient_survives_exec() -> TestResult {
+    const CAP_NET_ADMIN: u64 = 12;
+    const OWNER: u32 = 4300;
+    const CALLER: u32 = 1300;
+    with_memfs("/amb", "amb", &[("prog", b"\x7fELF")], || {
+        let task = FAKE_TASK;
+        let path = "/amb/prog";
+        let cpath = b"/amb/prog\0";
+        let bit = 1u64 << CAP_NET_ADMIN;
+
+        // Raise it ambient: needs permitted AND inheritable.
+        crate::handlers::__test_set_inheritable(task, bit);
+        if call(
+            Syscall::Prctl.raw(),
+            a2(
+                47, /* PR_CAP_AMBIENT */
+                2,  /* RAISE */
+                CAP_NET_ADMIN,
+            ),
+        ) != Some(0)
+        {
+            return Err("the ambient raise fixture failed");
+        }
+
+        // An ORDINARY exec (no set-user-ID bit) as a non-root uid: the
+        // effective set collapses to the ambient one, so the raised
+        // capability is what survives.
+        if call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o755)) != Some(0) {
+            return Err("chmod of the probe binary failed");
+        }
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (_, _, _, effective) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        if effective & bit == 0 {
+            crate::handlers::__test_uidgid_reset();
+            crate::handlers::__test_caps_reset();
+            return Err("an ambient capability did not survive an ordinary exec");
+        }
+
+        // A SET-USER-ID exec cancels ambient: the new image is already
+        // gaining privilege from the file, and carrying a second
+        // independently granted set across the same exec would stack two
+        // sources the caller never combined deliberately.
+        crate::handlers::__test_caps_reset();
+        crate::handlers::__test_set_inheritable(task, bit);
+        let _ = call(Syscall::Prctl.raw(), a2(47, 2, CAP_NET_ADMIN));
+        let chown_ok = call(
+            Syscall::Chown.raw(),
+            a2(cpath.as_ptr() as u64, OWNER as u64, OWNER as u64),
+        ) == Some(0)
+            && call(Syscall::Chmod.raw(), a1(cpath.as_ptr() as u64, 0o4755)) == Some(0);
+        crate::handlers::__test_set_fsids(task, CALLER, CALLER);
+        let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
+        let ambient_after = crate::handlers::__test_ambient(task);
+        crate::handlers::__test_uidgid_reset();
+        crate::handlers::__test_caps_reset();
+        if !chown_ok {
+            return Err("staging the set-user-ID probe binary failed");
+        }
+        if euid != OWNER {
+            return Err("the set-user-ID transition did not happen — the case is vacuous");
+        }
+        if ambient_after != 0 {
+            return Err("a set-user-ID exec must cancel the ambient set");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_ambient_survives_exec);
