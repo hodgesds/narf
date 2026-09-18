@@ -876,12 +876,14 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     // Same key, two owners, overlapping write requests.
     let key: usize = 0xDEAD_BEEF;
     let a = locks::Lock {
+        kind: locks::LockKind::Posix,
         owner: 1,
         ty: locks::F_WRLCK,
         start: 0,
         len: 100,
     };
     let b = locks::Lock {
+        kind: locks::LockKind::Posix,
         owner: 2,
         ty: locks::F_WRLCK,
         start: 50,
@@ -903,12 +905,14 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     // Two readers must coexist.
     locks::__test_reset();
     let r1 = locks::Lock {
+        kind: locks::LockKind::Posix,
         owner: 1,
         ty: locks::F_RDLCK,
         start: 0,
         len: 100,
     };
     let r2 = locks::Lock {
+        kind: locks::LockKind::Posix,
         owner: 2,
         ty: locks::F_RDLCK,
         start: 50,

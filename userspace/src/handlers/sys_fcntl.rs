@@ -93,12 +93,26 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // F_GETLK / F_SETLK / F_SETLKW: advisory POSIX locking. Always
-    // compiled in (the Linux ABI surface is unconditional); the wire
-    // `struct flock` layout + BTreeMap lock table serve Linux ABI consumers.
+    // F_GETLK / F_SETLK / F_SETLKW and their F_OFD_* counterparts:
+    // advisory record locking. Always compiled in (the Linux ABI surface is
+    // unconditional); the wire `struct flock` layout + BTreeMap lock table
+    // serve Linux ABI consumers.
+    //
+    // The OFD trio shares this entire path. `fcntl_setlk`/`fcntl_getlk`
+    // reuse the POSIX implementation and differ in three places, all of
+    // them below: `l_pid` must be zero on input, the owner is the open file
+    // description instead of the process, and a reported OFD lock has
+    // `l_pid = -1` because `locks_translate_pid` refuses to invent a
+    // process for an owner that is not one.
     {
-        if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW {
-            // Resolve the open-file identity from the fd table.
+        let is_ofd = cmd == F_OFD_GETLK || cmd == F_OFD_SETLK || cmd == F_OFD_SETLKW;
+        let is_getlk = cmd == F_GETLK || cmd == F_OFD_GETLK;
+        let is_wait = cmd == F_SETLKW || cmd == F_OFD_SETLKW;
+        if cmd == F_GETLK || cmd == F_SETLK || cmd == F_SETLKW || is_ofd {
+            // Resolve the open-file identity from the fd table. `key` is the
+            // FileOps identity (per inode — locks are a property of the file,
+            // whoever opened it); `owner_desc` is the description identity,
+            // which is what an OFD lock is owned BY.
             let ops_key = fd::with_table(task, |t| {
                 t.get(fd).map(|e| {
                     (
@@ -113,6 +127,18 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
                     return;
                 }
+            };
+            let owner_desc = fd::with_table(task, |t| t.description_lock_owner(fd)).flatten();
+            let (lock_owner, lock_kind) = if is_ofd {
+                match owner_desc {
+                    Some(d) => (d, crate::fd::locks::LockKind::Ofd),
+                    None => {
+                        ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                        return;
+                    }
+                }
+            } else {
+                (task, crate::fd::locks::LockKind::Posix)
             };
             // Pull the `struct flock` from user memory.
             let mut bytes = alloc::vec![0u8; flock_size()];
@@ -136,15 +162,45 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 );
                 tmp
             };
-            // Only SEEK_SET (l_whence = 0) is supported on the wire
-            // path. Other whence values would need the current offset
-            // / file size, which is OFD-tier work.
-            if uf.l_whence != 0 {
+            // `flock_to_posix_lock`: l_start is relative to l_whence, and
+            // all three origins are legal. This used to accept only
+            // SEEK_SET and call the rest "OFD-tier work" — both inputs it
+            // needs are right here, the description's offset and the file
+            // size, so the restriction went away with the OFD commands that
+            // prompted it. `sqlite` locks at SEEK_SET offsets, but plenty of
+            // code locks the tail of a file with SEEK_END.
+            const SEEK_SET: i16 = 0;
+            const SEEK_CUR: i16 = 1;
+            const SEEK_END: i16 = 2;
+            let origin: i64 = match uf.l_whence {
+                SEEK_SET => 0,
+                SEEK_CUR => fd::with_table(task, |t| t.offset(fd))
+                    .flatten()
+                    .unwrap_or(0) as i64,
+                SEEK_END => ops.stat().size as i64,
+                _ => {
+                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    return;
+                }
+            };
+            // `if (l->l_start > OFFSET_MAX - start) return -EOVERFLOW;`
+            let Some(abs_start) = origin.checked_add(uf.l_start) else {
+                ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+                return;
+            };
+            let mut uf = uf;
+            uf.l_start = abs_start;
+            // `if (flock->l_pid != 0) goto out;` — the OFD commands reject a
+            // non-zero l_pid outright rather than ignoring it, so a caller
+            // that filled the field in (as it would for F_GETLK) learns the
+            // struct means something different here.
+            if is_ofd && uf.l_pid != 0 {
                 ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
                 return;
             }
             let req = crate::fd::locks::Lock {
-                owner: task,
+                owner: lock_owner,
+                kind: lock_kind,
                 ty: uf.l_type,
                 start: uf.l_start,
                 len: uf.l_len,
@@ -172,8 +228,15 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 type_: uf.l_type as u32,
                 pid: task as u32,
             };
-            if cmd == F_GETLK {
-                match poll_blocking(ops.get_lock(task, native)) {
+            if is_getlk {
+                // `lock_owner`, not `task`: a filesystem that implements
+                // locking itself (FUSE forwards them to its server) is
+                // handed Linux's `fl_owner`, which is the description for an
+                // OFD lock and the process for a POSIX one. Passing `task`
+                // for both would make a server see two distinct OFD locks
+                // from one process as the same owner, and stop them
+                // conflicting.
+                match poll_blocking(ops.get_lock(lock_owner, native)) {
                     Some(Ok(lock)) => {
                         let mut out = uf;
                         out.l_type = lock.type_ as i16;
@@ -213,10 +276,18 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                         out.l_type = b.ty;
                         out.l_start = b.start;
                         out.l_len = b.len;
-                        // Owner is a TaskId; report it in the caller's ns view
-                        // (see the get_lock path above).
-                        out.l_pid =
-                            report_pid_to(task, task_to_pid_raw(b.owner).unwrap_or(b.owner)) as i32;
+                        // `locks_translate_pid`: an OFD lock reports -1,
+                        // whatever asked. Its owner is an open file
+                        // description, so there is no process to name — and
+                        // the description may well outlive the task that
+                        // created it, or be shared by several. Reporting the
+                        // creator's pid would send `lslocks` (and anything
+                        // else acting on l_pid) after the wrong process.
+                        out.l_pid = if b.kind == crate::fd::locks::LockKind::Ofd {
+                            -1
+                        } else {
+                            report_pid_to(task, task_to_pid_raw(b.owner).unwrap_or(b.owner)) as i32
+                        };
                     }
                 }
                 if write_flock_to_user(arg, &out).is_err() {
@@ -227,7 +298,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 return;
             }
             // F_SETLK / F_SETLKW.
-            match poll_blocking(ops.set_lock(task, native, cmd == F_SETLKW)) {
+            match poll_blocking(ops.set_lock(lock_owner, native, is_wait)) {
                 Some(Ok(())) => {
                     ctx.set_return(SyscallReturn::ok(0));
                     return;
@@ -263,7 +334,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                     ctx.set_return(SyscallReturn::ok(0));
                 }
-                Err(_) if cmd == F_SETLKW => {
+                Err(_) if is_wait => {
                     // Blocking acquire. Linux F_SETLKW is signal-
                     // interruptible (EINTR) — check before parking so a
                     // pending signal breaks the wait instead of being
@@ -525,9 +596,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             //
             //   * F_OFD_SETLK / F_OFD_SETLKW (37/38) returned "lock acquired"
             //     to every caller at once, so two processes could each believe
-            //     they held the same exclusive range. Callers that probe for
-            //     OFD support (sqlite, LMDB) take EINVAL as "not available"
-            //     and fall back to POSIX locks, which NARF does implement.
+            //     they held the same exclusive range. That was then narrowed
+            //     to -EINVAL, which callers that probe for OFD support
+            //     (sqlite, LMDB) read as "not available" so they fall back to
+            //     POSIX locks. The three commands are now implemented and
+            //     handled above, so neither answer applies to them any more.
             //   * F_SETOWN / F_SETSIG (8/10) returned "owner installed", so a
             //     caller waiting for SIGIO on that descriptor waits forever
             //     instead of learning async I/O is unavailable.

@@ -66,6 +66,21 @@ pub(crate) struct OpenFileDescription {
     append_lock_index: usize,
 }
 
+impl Drop for OpenFileDescription {
+    /// `fcntl(2)`: an OFD lock "is released when the last file descriptor
+    /// referring to the open file description is closed".
+    ///
+    /// Hanging it off `Drop` rather than off the close path is deliberate.
+    /// The description is reached through `dup`, `dup2`, `fork` and
+    /// `SCM_RIGHTS` aliases, and a release wired into any one of those
+    /// paths would leak a lock whenever the last reference went away
+    /// through a different one — pinning that range for the rest of the
+    /// boot with no owner left to unlock it.
+    fn drop(&mut self) {
+        locks::release_ofd_owner(self.lock_owner());
+    }
+}
+
 pub(crate) type Description = Arc<OpenFileDescription>;
 
 const APPEND_LOCK_SHARDS: usize = 64;
@@ -87,6 +102,15 @@ fn append_lock_index(ops: &Arc<dyn FileOps>) -> usize {
 }
 
 impl OpenFileDescription {
+    /// This description's identity, used as the owner of its OFD locks.
+    ///
+    /// The same address `Arc::as_ptr` yields, and the same address `Drop`
+    /// sees, so a lock taken through one descriptor is released when the
+    /// last alias of the description goes away.
+    pub(crate) fn lock_owner(&self) -> u64 {
+        self as *const Self as usize as u64
+    }
+
     pub(crate) fn offset(&self) -> u64 {
         self.state.lock().offset
     }
@@ -624,6 +648,13 @@ impl FdTable {
     /// Mutable borrow — used by Read/Write to advance the offset.
     pub fn get_mut(&mut self, fd: u32) -> Option<&mut FdEntry> {
         self.slots.get_mut(fd as usize).and_then(Option::as_mut)
+    }
+
+    /// The OFD-lock owner identity behind `fd` — the description, not the
+    /// descriptor. Two fds produced by `dup` share it, which is exactly why
+    /// an OFD lock survives closing one of them.
+    pub fn description_lock_owner(&self, fd: u32) -> Option<u64> {
+        Some(self.descriptions.get(fd as usize)?.as_ref()?.lock_owner())
     }
 
     /// Snapshot the shared open-file-description position.
@@ -1683,9 +1714,35 @@ pub mod locks {
     pub const F_WRLCK: i16 = 1;
     pub const F_UNLCK: i16 = 2;
 
+    /// Which OWNER NAMESPACE a lock's `owner` field names.
+    ///
+    /// Linux's `fl_owner` is `current->files` for a traditional POSIX
+    /// record lock and the `struct file *` for an open-file-description
+    /// lock, so the two are never the same owner even when one process
+    /// holds both.
+    ///
+    /// What actually separates them here is the owner VALUE — a task id
+    /// versus a description address, which do not collide in practice.
+    /// Stubbing this discriminant out changes no test; stubbing the OFD
+    /// owner back to the task fails five. So this is belt-and-braces: it
+    /// removes the reliance on those two value spaces staying disjoint,
+    /// rather than being the thing that makes the rule work. Recorded
+    /// because the difference matters to anyone deciding it is redundant.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LockKind {
+        /// `fl_owner = current->files` — released when the process exits,
+        /// and (on Linux) by closing ANY descriptor to the file.
+        Posix,
+        /// `FL_OFDLCK`, `fl_owner = filp` — released only when the last
+        /// descriptor referring to that open file description is closed,
+        /// and inherited across fork because the description is shared.
+        Ofd,
+    }
+
     #[derive(Clone, Copy, Debug)]
     pub struct Lock {
         pub owner: u64,
+        pub kind: LockKind,
         pub ty: i16, // F_RDLCK or F_WRLCK
         pub start: i64,
         pub len: i64, // 0 = to EOF
@@ -1703,8 +1760,17 @@ pub mod locks {
         pub fn overlaps(&self, other: &Lock) -> bool {
             self.start <= other.end() && other.start <= self.end()
         }
+        /// Same owner in the same namespace — Linux `posix_same_owner`.
+        ///
+        /// A process's own OFD lock and its own POSIX lock are NOT the same
+        /// owner, and do conflict. That is the point of the feature: a
+        /// thread can take an OFD lock the rest of its own process must
+        /// respect.
+        pub fn same_owner(&self, other: &Lock) -> bool {
+            self.kind == other.kind && self.owner == other.owner
+        }
         pub fn conflicts(&self, other: &Lock) -> bool {
-            if self.owner == other.owner {
+            if self.same_owner(other) {
                 return false;
             }
             if !self.overlaps(other) {
@@ -1731,7 +1797,7 @@ pub mod locks {
         let map = g.as_mut().unwrap();
         let bucket = map.entry(key).or_default();
         if req.ty == F_UNLCK {
-            bucket.retain(|l| !(l.owner == req.owner && l.overlaps(&req)));
+            bucket.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
             return Ok(());
         }
         for l in bucket.iter() {
@@ -1740,7 +1806,7 @@ pub mod locks {
             }
         }
         // Merge with same-owner locks of the same type, drop covered.
-        bucket.retain(|l| !(l.owner == req.owner && l.overlaps(&req)));
+        bucket.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
         bucket.push(req);
         Ok(())
     }
@@ -1759,6 +1825,18 @@ pub mod locks {
     /// actually lost a lock — the caller wakes their F_SETLKW waiters
     /// (the wake needs `wake_one`, which lives with the handlers).
     pub fn release_owner(owner: u64) -> Vec<usize> {
+        release_owner_of_kind(owner, LockKind::Posix)
+    }
+
+    /// Drop every OFD lock held by one open file description. Called from
+    /// that description's `Drop`, which is precisely "the last descriptor
+    /// referring to it was closed" — the release rule an OFD lock has
+    /// instead of the process-exit one.
+    pub fn release_ofd_owner(owner: u64) -> Vec<usize> {
+        release_owner_of_kind(owner, LockKind::Ofd)
+    }
+
+    fn release_owner_of_kind(owner: u64, kind: LockKind) -> Vec<usize> {
         let mut g = TABLE.lock();
         let map = match g.as_mut() {
             Some(m) => m,
@@ -1767,7 +1845,7 @@ pub mod locks {
         let mut touched = Vec::new();
         for (key, bucket) in map.iter_mut() {
             let before = bucket.len();
-            bucket.retain(|l| l.owner != owner);
+            bucket.retain(|l| !(l.kind == kind && l.owner == owner));
             if bucket.len() != before {
                 touched.push(*key);
             }
