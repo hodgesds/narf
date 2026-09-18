@@ -58,6 +58,11 @@ Trap entry is written in arch assembly and materialises the architecture-owned
 selected type and fans out to a Rust dispatcher. The scheduler consumes that
 shared type directly; it does not define or cast a mirror layout.
 
+The bare `zram` kernel-command-line flag explicitly installs memory's built-in
+compressed-RAM swap backend during userspace bootstrap. Without it, NARF boots
+with no swap area, matching Linux until a future `swapon(2)` path configures
+one.
+
 ## 4. Invariants & safety properties
 
 - There is exactly one `CpuLocal` per CPU, pinned to its per-CPU page.
@@ -67,10 +72,11 @@ shared type directly; it does not define or cast a mirror layout.
   allocator locks, and frame has cleared the active per-CPU mempolicy slot.
   The waiter registry is a fixed `MAX_USER_TASKS`-entry array; registration and
   notification are bounded, allocate nothing, and use the task-owned scheduler
-  waker so CPU migration/hotplug do not invalidate a wait. Reclaim progress/completion wakes
-  every installed waiter through a generation-ordered handshake. A task retries
-  once; no stackful task, table exhaustion, or repeated zero progress fails
-  without another park or busy-yield.
+  waker so CPU migration/hotplug do not invalidate a wait. Exact reclaim-cycle
+  completion wakes matching waiters through a generation-ordered handshake. A
+  task retries only after such completion, for at most Linux's sixteen-cycle
+  reclaim bound; no stackful task or table exhaustion fails without another
+  park, and no path busy-yields.
 - A kernel/current-EL fault inside guarded uaccess never enters that reclaim
   wait. The trap may make one non-parking demand-allocation attempt; reserve
   pressure falls through to the architecture probe fixup and becomes `EFAULT`.

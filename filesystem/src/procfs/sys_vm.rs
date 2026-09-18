@@ -232,8 +232,9 @@ pub fn register_all() {
     });
 
     // overcommit_memory: 0=heuristic 1=always 2=never. WIRED to the reclaimer's
-    // OOM policy: `Never` (2, NARF default) surfaces user pressure as ENOMEM;
-    // `Heuristic`/`Always` (0/1) let the OOM killer reclaim a hog. Linux ref:
+    // OOM policy: `Never` (2) surfaces user pressure as ENOMEM;
+    // `Heuristic` (0, Linux/NARF default) and `Always` (1) let the OOM killer
+    // reclaim a hog. Linux ref:
     // `mm/util.c` `overcommit_memory` handler.
     register_sysctl(SysctlEntry {
         path: "vm/overcommit_memory",
@@ -457,14 +458,17 @@ kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_drop_caches_write_3);
 
 fn smoke_vm_overcommit_memory_valid() -> TestResult {
     ensure_registered();
+    let saved = narf_memory::reclaim::overcommit_mode() as u8;
     for &v in &[b"0\n" as &[u8], b"1\n", b"2\n"] {
         if !matches!(
             sysctl_write(&["sys", "vm", "overcommit_memory"], v),
             Some(Ok(_))
         ) {
+            narf_memory::reclaim::set_overcommit_mode(saved);
             return TestResult::Fail("vm/overcommit_memory valid write failed");
         }
     }
+    narf_memory::reclaim::set_overcommit_mode(saved);
     TestResult::Pass
 }
 kernel_test_in!("filesystem/procfs/sys_vm", smoke_vm_overcommit_memory_valid);

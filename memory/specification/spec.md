@@ -202,6 +202,12 @@ pub fn watermark_low() -> u64;
 pub fn watermark_high() -> u64;
 pub fn reclaim_goal_pages() -> usize;
 
+/// Linux-compatible overcommit policy; boot default is Heuristic (0).
+pub enum OvercommitMode { Heuristic = 0, Always = 1, Never = 2 }
+pub const DEFAULT_OVERCOMMIT_MODE: OvercommitMode;
+pub fn set_overcommit_mode(raw: u8);
+pub fn overcommit_mode() -> OvercommitMode;
+
 /// Cache reclaim is denominated exclusively in 4 KiB base pages. `count`
 /// returns an upper bound; `scan(n)` may free fewer pages but must neither free
 /// nor report more than `n`.
@@ -274,6 +280,11 @@ pub trait SwapBackend: Send + Sync {
         -> Result<(), SwapError>;
     fn discard_batch(&self, slots: &[SwapSlot]);
 }
+/// Swap remains disabled until a backend is explicitly installed; pageout
+/// never creates an implicit area. This matches Linux's swapless boot state.
+pub fn install_swap_backend<B: SwapBackend>(backend: B);
+/// Used by frame's explicit `zram` boot option until swapon(2) is available.
+pub fn install_default_swap_if_unset();
 #[cfg(target_arch = "x86_64")]
 pub struct SwapVictim { pub pml4_phys: PhysAddr, pub virt: VirtAddr }
 #[cfg(target_arch = "x86_64")]
@@ -1103,16 +1114,20 @@ x86_64 is rejected at runtime.
   cancelling its exact page ticket and releasing the region and allocator
   locks. The error carries the exact node/request ticket published by the
   allocator. The frame fault path may then register the current stackful task
-  in a fixed allocation-free waiter table, park, and retry once only after the
-  node's kswapd completes a cycle that consumed that ticket. Completion of an
+  in a fixed allocation-free waiter table, park, and retry only after the
+  node's kswapd completes a cycle that consumed that ticket. As in Linux's
+  `MAX_RECLAIM_RETRIES`, repeated pressure is bounded to sixteen completed
+  cycles before the fault fails; a successful allocation or a non-pressure
+  error terminates the loop immediately. Completion of an
   overlapping older or background-only cycle cannot satisfy it. Intermediate
   gross eviction is not a retry signal because swap metadata or compressed
   payload allocation can consume those pages before the buddy reserve becomes
   usable. A sequentially consistent ticket handshake orders waiter publication
-  against completion, while absent stackful context, full waiter capacity, and
-  a second pressure failure all fail without sleeping again. File refusal,
-  missing VMAs, and ordinary placement/range exhaustion never enter this wait
-  path.
+  against completion, while absent stackful context and full waiter capacity
+  fail without sleeping again. File refusal, missing VMAs, and ordinary
+  placement/range exhaustion never enter this wait path. The boot overcommit
+  mode is Linux's heuristic value `0`; values `1` and `2` retain their Linux
+  sysctl meanings.
 - COW write faults use the same page-scoped exclusion principle. The ticket
   owner takes a temporary source-frame reference before releasing the region
   lock, allocates and copies outside that lock, and republishes only if the
