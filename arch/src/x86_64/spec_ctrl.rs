@@ -16,11 +16,12 @@
 //! - CPUID(7, 0).EDX[27] = STIBP supported.
 //! - CPUID(7, 0).EDX[31] = SSBD supported.
 //! - CPUID(7, 0).EDX[28] = L1D_FLUSH supported.
+//! - CPUID(0x8000_0021, 0).EAX[8] = AMD Automatic IBRS supported.
 //!
-//! Stage cut: feature detection + per-CPU enable for IBRS+STIBP+SSBD,
-//! plus `ibpb()` and `l1d_flush()` standalone barriers. The latter
-//! two are issued at context-switch points and on entry to a
-//! sensitive critical section by the caller.
+//! Stage cut: feature detection + per-CPU enable for Automatic IBRS (falling
+//! back to legacy IBRS), STIBP, and SSBD, plus `ibpb()` and `l1d_flush()`
+//! standalone barriers. The latter two are issued at context-switch points
+//! and on entry to a sensitive critical section by the caller.
 
 #![cfg(target_arch = "x86_64")]
 #![allow(dead_code)]
@@ -28,7 +29,7 @@
 use core::sync::atomic::{AtomicU8, Ordering};
 
 use crate::x86_64::cpuid::cpuid;
-use crate::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp};
+use crate::x86_64::msr::{rdmsr_or_gp, wrmsr_or_gp, IA32_EFER};
 
 pub const MSR_IA32_SPEC_CTRL: u32 = 0x48;
 pub const MSR_IA32_PRED_CMD: u32 = 0x49;
@@ -37,6 +38,9 @@ pub const MSR_IA32_FLUSH_CMD: u32 = 0x10B;
 pub const SPEC_CTRL_IBRS: u64 = 1 << 0;
 pub const SPEC_CTRL_STIBP: u64 = 1 << 1;
 pub const SPEC_CTRL_SSBD: u64 = 1 << 2;
+
+/// `IA32_EFER.AIBRSE` enables AMD Automatic IBRS.
+pub const EFER_AUTOIBRS: u64 = 1 << 21;
 
 pub const PRED_CMD_IBPB: u64 = 1 << 0;
 pub const FLUSH_CMD_L1D: u64 = 1 << 0;
@@ -56,6 +60,7 @@ pub struct SpecCtrlFeatures {
     pub stibp: bool,
     pub ssbd: bool,
     pub l1d_flush: bool,
+    pub auto_ibrs: bool,
 }
 
 impl SpecCtrlFeatures {
@@ -63,11 +68,21 @@ impl SpecCtrlFeatures {
     pub fn probe() -> Self {
         // SAFETY: leaf 7 is always defined.
         let (_, _, _, edx) = unsafe { cpuid(7, 0) };
+        // SAFETY: the maximum extended leaf is always defined; leaf 0x8000_0021
+        // is queried only when the CPU reports it.
+        let max_ext = unsafe { cpuid(0x8000_0000, 0).0 };
+        let auto_ibrs = if max_ext >= 0x8000_0021 {
+            // SAFETY: guarded by the maximum extended-leaf value above.
+            unsafe { cpuid(0x8000_0021, 0).0 & (1 << 8) != 0 }
+        } else {
+            false
+        };
         Self {
             ibrs: edx & (1 << 26) != 0,
             stibp: edx & (1 << 27) != 0,
             ssbd: edx & (1 << 31) != 0,
             l1d_flush: edx & (1 << 28) != 0,
+            auto_ibrs,
         }
     }
 }
@@ -83,13 +98,15 @@ pub fn features() -> SpecCtrlFeatures {
             stibp: cached & 2 != 0,
             ssbd: cached & 4 != 0,
             l1d_flush: cached & 8 != 0,
+            auto_ibrs: cached & 16 != 0,
         };
     }
     let f = SpecCtrlFeatures::probe();
     let bits = (f.ibrs as u8)
         | ((f.stibp as u8) << 1)
         | ((f.ssbd as u8) << 2)
-        | ((f.l1d_flush as u8) << 3);
+        | ((f.l1d_flush as u8) << 3)
+        | ((f.auto_ibrs as u8) << 4);
     FEATURES_RAW.store(bits, Ordering::Release);
     f
 }
@@ -160,21 +177,76 @@ pub unsafe fn apply_default_controls(enable: bool) -> ApplyResult {
         Ok(value) => value,
         Err(_) => return ApplyResult::Fault,
     };
-    let (new, supported) = match desired_value(old, local_features, enable) {
+    let (mut new, supported) = match desired_value(old, local_features, enable) {
         Some(values) => values,
         None => return ApplyResult::Unsupported,
     };
+    let old_efer = if local_features.auto_ibrs {
+        match rdmsr_or_gp(IA32_EFER) {
+            Ok(value) => value,
+            Err(_) => return ApplyResult::Fault,
+        }
+    } else {
+        0
+    };
+    let mut auto_ibrs_enabled = false;
+    if enable && local_features.auto_ibrs {
+        let requested_efer = old_efer | EFER_AUTOIBRS;
+        auto_ibrs_enabled = wrmsr_or_gp(IA32_EFER, requested_efer).is_ok()
+            && matches!(
+                rdmsr_or_gp(IA32_EFER),
+                Ok(observed) if observed & EFER_AUTOIBRS != 0
+            );
+        if !auto_ibrs_enabled {
+            // A hypervisor can enumerate AutoIBRS but reject the EFER bit.
+            // Restore the entry value and retain legacy IBRS as the secure
+            // fallback instead of failing the CPU bring-up.
+            let _ = wrmsr_or_gp(IA32_EFER, old_efer);
+        }
+    }
+    if auto_ibrs_enabled {
+        // Automatic IBRS restricts predictions on the privilege transition,
+        // so leaving legacy IBRS asserted in user mode only adds overhead.
+        new &= !SPEC_CTRL_IBRS;
+    }
     if wrmsr_or_gp(MSR_IA32_SPEC_CTRL, new).is_err() {
+        let _ = wrmsr_or_gp(MSR_IA32_SPEC_CTRL, old);
+        if auto_ibrs_enabled {
+            let _ = wrmsr_or_gp(IA32_EFER, old_efer);
+        }
         return ApplyResult::Fault;
     }
-    match rdmsr_or_gp(MSR_IA32_SPEC_CTRL) {
-        Ok(observed) if observed & supported == new & supported => ApplyResult::Applied,
-        _ => ApplyResult::Fault,
+    if !matches!(
+        rdmsr_or_gp(MSR_IA32_SPEC_CTRL),
+        Ok(observed) if observed & supported == new & supported
+    ) {
+        let _ = wrmsr_or_gp(MSR_IA32_SPEC_CTRL, old);
+        if auto_ibrs_enabled {
+            let _ = wrmsr_or_gp(IA32_EFER, old_efer);
+        }
+        return ApplyResult::Fault;
     }
+    if !enable && local_features.auto_ibrs {
+        let requested_efer = old_efer & !EFER_AUTOIBRS;
+        if wrmsr_or_gp(IA32_EFER, requested_efer).is_err()
+            || !matches!(
+                rdmsr_or_gp(IA32_EFER),
+                Ok(observed) if observed & EFER_AUTOIBRS == 0
+            )
+        {
+            // Preserve the entry policy if its final AutoIBRS transition did
+            // not complete. Best-effort rollback still reports Fault so the
+            // cross-CPU policy layer cannot publish a partial transition.
+            let _ = wrmsr_or_gp(MSR_IA32_SPEC_CTRL, old);
+            let _ = wrmsr_or_gp(IA32_EFER, old_efer);
+            return ApplyResult::Fault;
+        }
+    }
+    ApplyResult::Applied
 }
 
-/// Enable IBRS + STIBP + SSBD on this CPU (best-effort; only the
-/// subset reported by `features()` is set).
+/// Enable Automatic IBRS where available, otherwise legacy IBRS, plus the
+/// supported STIBP and SSBD controls on this CPU.
 ///
 /// # Safety
 /// CPL = 0.
