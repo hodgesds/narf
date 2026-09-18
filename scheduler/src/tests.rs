@@ -4046,3 +4046,28 @@ kernel_test_in!(
     "scheduler",
     smoke_scheduler_try_with_scheduler_is_non_blocking
 );
+
+/// A synchronous wake may request co-location only at the waker's ordinary
+/// requeue boundary. The destination remains a hint: the live allowed mask and
+/// online topology are authoritative, and a same-CPU request is a no-op.
+fn smoke_sync_requeue_candidate_respects_affinity_and_online() -> TestResult {
+    let allowed = crate::CpuSet::from_bits((1 << 1) | (1 << 3));
+    let online = crate::CpuSet::from_bits((1 << 0) | (1 << 1) | (1 << 2));
+    if crate::sync_requeue_candidate(1, 0, allowed, online) != Some(1) {
+        return TestResult::Fail("valid synchronous requeue destination was rejected");
+    }
+    if crate::sync_requeue_candidate(1, 1, allowed, online).is_some() {
+        return TestResult::Fail("same-CPU synchronous requeue was treated as migration");
+    }
+    if crate::sync_requeue_candidate(2, 0, allowed, online).is_some() {
+        return TestResult::Fail("synchronous requeue bypassed the affinity mask");
+    }
+    if crate::sync_requeue_candidate(3, 0, allowed, online).is_some() {
+        return TestResult::Fail("synchronous requeue selected an offline CPU");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_sync_requeue_candidate_respects_affinity_and_online
+);

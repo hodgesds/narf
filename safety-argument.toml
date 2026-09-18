@@ -1,7 +1,7 @@
 [safety_argument]
 schema_version = 1
 agent = "OpenAI Codex GPT-5"
-prompt_hash = "670b3a0ee69f4f0c60cd759cca1b5f2a373551335f76a807639914857a7a3296"
+prompt_hash = "3a766ac1ed4f30a34907fc8d2d907aa0a026c4fbd749627511c74ba3a6e51ad8"
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
@@ -1063,3 +1063,15 @@ argument = "Direct task-to-task handoff is now confined to a target already resi
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "Moving the bounded demand-fault claim array behind separately owned stable storage changes only the placement of metadata protected by the existing per-address-space region lock. The complete MAX_CPUS table is fallibly allocated before the architecture page-table root, so construction failure exposes the existing ENOMEM path without leaking a root; after publication, common demand claims remain allocation-free and retain the same ticket, deduplication, cancellation, and overflow-map rules. The table moves with and is dropped by its sole AddressSpace owner, while every mapping, frame, reverse-map, COW, TLB, domain, and capability authority remains unchanged. The compile-time AddressSpace size bound prevents this metadata from again overflowing a kernel-task stack into adjacent trusted heap objects."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Synchronous-wake co-location remains entirely inside the existing scheduler executor TCB. It adds one scheduler-owned scalar placement hint to existing task wake metadata and no trusted subsystem, capability kind, mapping authority, DomainId, user-visible entry point, or raw cross-CPU context-switch destination."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "An exact wake may publish only the wakee's observed authoritative home into the running waker's one-shot hint. The wake path never moves the executing continuation. After poll return, while the executor owns the off-queue slot, consumption revalidates the task's live hard-affinity mask, online topology, and CPU lifecycle and then uses the existing enqueue_on migration path. That path retains the task's WakeCell, address-space owner, kernel stack, TLS, saved domain state, and FP/SIMD image until ordinary dispatch restores them on the destination CPU. Invalid, same-CPU, and concurrently replaced hints fall back conservatively; if the wakee moved after publication, the stale hint can cause only an ordinary migration to a CPU still allowed and online for the waker."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Only a sleeping direct-eligible exact wakee may request co-location, and only a currently published direct-eligible waker records it. The destination executor still performs ordinary policy selection, class and budget eligibility checks, task-lifetime validation, address-space activation, domain restore, and FPU/SIMD restore before polling. Once co-located, the existing fixed-pair 64-return direct-handoff bound remains the fairness and RCU-quiescence limit; the hint neither extends a batch nor creates a target-to-third-task edge."

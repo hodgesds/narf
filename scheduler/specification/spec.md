@@ -182,6 +182,19 @@ follows ordinary dispatch through the executor's scoped `active_mm` handoff;
 the direct path never moves a task or hardware address-space owner across run
 queues. Dispatch and stealing skip a locally claimed target until the final
 switch has completed.
+When an exact synchronous wake makes a sleeping, direct-eligible partner
+runnable on another CPU, the running direct-eligible waker may publish that
+partner's authoritative home as a one-shot co-location hint. The waker does
+not migrate inside the wake path: it consumes the hint only after its poll
+returns to the executor, revalidates the destination against the task's live
+hard-affinity mask and the online CPU lifecycle state, and requeues through the
+ordinary migration path. An invalid, same-CPU, offline, affinity-excluded, or
+concurrently replaced hint is ignored. A wakee that moves between publication
+and consumption can leave a placement-stale hint, but it can cause only an
+ordinary migration to a CPU still allowed and online for the waker. This is
+NARF's cooperative analogue of Linux `WF_SYNC` wake-affine placement; once the
+pair is co-located, the existing bounded local direct path may handle later
+exchanges.
 The target normally returns to the source's root executor continuation. If it
 urgently wakes that exact off-queue root, it may instead switch directly to the
 root's saved task continuation. That same fixed root may begin another exact
@@ -642,6 +655,12 @@ control callback.
   A remotely queued target is not admitted to direct handoff. It remains on and
   is woken through its authoritative-home executor path, which retains
   ownership of cross-CPU task placement and address-space switching.
+  A remote exact synchronous wake may ask the running waker to join that home,
+  but only through a one-shot hint consumed after poll return. The executor
+  checks the live allowed mask, online topology, and CPU lifecycle before the
+  ordinary `enqueue_on(..., Migrated)` path changes queue ownership; the wake
+  path never transfers a running continuation, address-space owner, saved
+  domain state, or FP/SIMD image across CPUs.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held
