@@ -378,6 +378,9 @@ pub struct StackGrowthLimits {
 impl AddressSpace {
     /// Allocate an architecture user root and reserve one lifetime process
     /// PCID/ASID when the architecture pool and boot capability gate permit.
+    /// The MAX_CPUS demand-claim fast table is fallibly preallocated before
+    /// the root; metadata exhaustion returns `OutOfRange` (Linux `ENOMEM`)
+    /// without stranding a page-table frame.
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError>;
     /// Lifetime process PCID/ASID, or zero for the flushing fallback.
     pub fn translation_tag(&self) -> u16;
@@ -970,6 +973,13 @@ x86_64 is rejected at runtime.
   backing. Region teardown, MAP_FIXED punching, and MADV_DONTNEED retire leaves
   and complete the required TLB flush before dropping backing owners through
   the allocator's batch interface.
+  The bounded MAX_CPUS demand-fault claim table is separately preallocated so
+  faults through the common table remain allocation-free without embedding a
+  KiB-scale array in every by-value `AddressSpace` temporary. Construction
+  reserves this storage before allocating the architecture root, and failure
+  follows the existing `OutOfRange`/`ENOMEM` surface. A compile-time size bound
+  keeps `AddressSpace` at or below 1 KiB so the fork call chain cannot silently
+  exhaust the 32 KiB kernel-task stack as fixed-capacity metadata grows.
   The buddy implementation pre-reserves its final-owner result before locking
   a COW shard, locks each touched shard once, and sends only final-owner /
   unregistered frames through scalar-equivalent cgroup uncharge and optional

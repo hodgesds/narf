@@ -2328,11 +2328,27 @@ impl<'a> TrapContext for X86TrapContext<'a> {
         let ec = f.error_code;
         let _ = writeln!(
             narf_console::Writer,
-            "  pf-errcode={:#x} [P={} W={} U={}]",
+            "  pf-errcode={:#x} [P={} W={} U={} RSVD={} I={}]",
             ec,
             ec & 1,
             (ec >> 1) & 1,
-            (ec >> 2) & 1
+            (ec >> 2) & 1,
+            (ec >> 3) & 1,
+            (ec >> 4) & 1
+        );
+        // Fatal-path-only context evidence.  Keep this out of the trap hot
+        // path: an intermittent SMP fault is timing-sensitive, while a CR3
+        // read here happens only after the process has already taken its
+        // terminal default action.
+        // SAFETY: MOV from CR3 is always legal at CPL=0 and has no side
+        // effects; the arch wrapper supplies the required compiler fences.
+        let cr3 = unsafe { narf_arch::x86_64::cr::read_cr3() };
+        let _ = writeln!(
+            narf_console::Writer,
+            "  live-cr3={:#018x} root={:#018x} pcid={}",
+            cr3,
+            cr3 & 0x000f_ffff_ffff_f000,
+            cr3 & 0xfff
         );
         let _ = writeln!(
             narf_console::Writer,

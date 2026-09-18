@@ -7951,6 +7951,83 @@ pub fn sync_signal_hook() -> Option<SyncSignalHook> {
 ///                                 si_addr = trapping RIP.
 ///   #BP (3)         → SIGTRAP, si_code = TRAP_BRKPT (1),
 ///                                 si_addr = trapping RIP.
+#[cfg(target_arch = "x86_64")]
+fn dump_fatal_x86_address_space(fault_va: u64) {
+    use core::fmt::Write;
+    use narf_memory::x86_64::paging::{PageTable, PageTableEntry, PtFlags, WalkIndices};
+    use narf_memory::{PhysAddr, VirtAddr};
+
+    fn entry_at(table: PhysAddr, index: usize) -> Option<PageTableEntry> {
+        // A damaged upper entry can name arbitrary physical memory.  Validate
+        // that the complete candidate table is reachable through the kernel
+        // direct map before dereferencing it in this already-fatal path.
+        if !narf_memory::kernel_ram_range_mapped(table, 4096) {
+            return None;
+        }
+        // SAFETY: kernel_ram_range_mapped verified the complete PageTable
+        // object is reachable, and WalkIndices fields are all in 0..512.
+        Some(unsafe { (*table.kernel_ptr::<PageTable>()).entries[index] })
+    }
+
+    let Some(address_space) = narf_scheduler::current_address_space() else {
+        let _ = writeln!(narf_console::Writer, "  expected-as=<none>");
+        return;
+    };
+    let root = address_space.root;
+    let _ = writeln!(
+        narf_console::Writer,
+        "  expected-as: id={} root={:#018x} pcid={}",
+        address_space.identity(),
+        root.raw(),
+        address_space.translation_tag()
+    );
+
+    let idx = WalkIndices::from_virt(VirtAddr::new(fault_va));
+    let Some(pml4e) = entry_at(root, idx.pml4) else {
+        let _ = writeln!(narf_console::Writer, "  expected-walk: pml4=<unreachable>");
+        return;
+    };
+    let _ = writeln!(
+        narf_console::Writer,
+        "  expected-walk: idx={}/{}/{}/{} pml4e={:#018x}",
+        idx.pml4,
+        idx.pdpt,
+        idx.pd,
+        idx.pt,
+        pml4e.raw()
+    );
+    if !pml4e.is_present() {
+        return;
+    }
+
+    let Some(pdpte) = entry_at(pml4e.addr(), idx.pdpt) else {
+        let _ = writeln!(narf_console::Writer, "  expected-walk: pdpte=<unreachable>");
+        return;
+    };
+    let _ = writeln!(narf_console::Writer, "  expected-walk: pdpte={:#018x}", pdpte.raw());
+    if !pdpte.is_present() || pdpte.flags().contains(PtFlags::HUGE_PAGE) {
+        return;
+    }
+
+    let Some(pde) = entry_at(pdpte.addr(), idx.pd) else {
+        let _ = writeln!(narf_console::Writer, "  expected-walk: pde=<unreachable>");
+        return;
+    };
+    let _ = writeln!(narf_console::Writer, "  expected-walk: pde={:#018x}", pde.raw());
+    if !pde.is_present() || pde.flags().contains(PtFlags::HUGE_PAGE) {
+        return;
+    }
+
+    match entry_at(pde.addr(), idx.pt) {
+        Some(pte) => {
+            let _ = writeln!(narf_console::Writer, "  expected-walk: pte={:#018x}", pte.raw());
+        }
+        None => {
+            let _ = writeln!(narf_console::Writer, "  expected-walk: pte=<unreachable>");
+        }
+    }
+}
+
 pub fn default_sync_signal_delivery(
     ctx: &mut dyn TrapContext,
     vector: u64,
@@ -8007,6 +8084,8 @@ pub fn default_sync_signal_delivery(
                 // pin whether the fault is a slightly-off pointer (adjacent
                 // overwrite / stale TLB) or a wild value (deeper corruption).
                 ctx.dump_gprs();
+                #[cfg(target_arch = "x86_64")]
+                dump_fatal_x86_address_space(info.addr);
                 // Dump plausible return addresses off the faulting stack so
                 // the CALLER can be symbolized (a leaf like strlen faults with
                 // [rsp] == its caller's return address). Print only words that

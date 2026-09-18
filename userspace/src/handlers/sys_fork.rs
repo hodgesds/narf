@@ -22,9 +22,10 @@ fn round_robin_cpu(mut candidates: u64, sequence: u64) -> Option<narf_scheduler:
     }
 }
 
-/// Spread forked process groups across every online CPU. Pthread siblings
-/// subsequently inherit this CPU, retaining their shared-memory locality.
-fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
+/// Spread newly forked process groups across every online CPU. This is shared
+/// by `fork(2)` and process-creating `clone(2)`/`clone3(2)`; pthread siblings
+/// subsequently inherit the creator CPU, retaining shared-memory locality.
+pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
     let candidates = allowed.intersection(narf_scheduler::online_cpu_set()).bits();
     round_robin_cpu(candidates, NEXT_FORK_CPU.fetch_add(1, Ordering::Relaxed))
 }

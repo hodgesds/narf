@@ -71,10 +71,11 @@ fn smoke_abi_fdio_read_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_read_neg);
 
-// A FIFO read/write must re-enqueue an own-stack-parked peer by bumping the
-// io-waiter generation (the fix for named-pipe reads sleeping to the ~1 ms
-// lost-wake backstop instead of waking on the write — stress-ng --fifo 499 ->
-// 43405 bogo-ops). A non-FIFO fd must not, so the gate is free for other fds.
+// A FIFO read/write on the legacy longjmp execution model must re-enqueue its
+// peer by bumping the io-waiter generation (the historical fix for named-pipe
+// reads sleeping to the retry backstop). Own-stack production tasks use the
+// exact durable Readiness waker instead; this test starts with that mode reset.
+// A non-FIFO fd must not bump the generation in either mode.
 fn smoke_fifo_read_write_bump_io_waiter_generation() -> TestResult {
     use narf_filesystem::fifo::{FifoHandle, FifoNode};
     use narf_filesystem::FileOps;
@@ -3179,6 +3180,81 @@ fn smoke_abi_fdio_vmsplice_from_pipe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_vmsplice_from_pipe);
 
+/// `O_DIRECT` packet mode belongs to ordinary `pipe_write`, not to buffers
+/// inserted by `vmsplice`. Conversely, vmsplice's pipe-to-user splice actor
+/// advances only the copied prefix of an existing packet instead of applying
+/// read(2)'s packet-tail discard rule.
+fn smoke_abi_fdio_vmsplice_packet_boundaries_match_linux() -> TestResult {
+    with_setup(|| {
+        let (rd, wr) = make_packet_pipe(crate::fd::O_NONBLOCK as u64)?;
+
+        // vmsplice into an O_DIRECT pipe remains a byte stream.
+        let gathered = *b"abcdef";
+        let mut gathered_iov = [0u8; 16];
+        gathered_iov[..8].copy_from_slice(&(gathered.as_ptr() as u64).to_le_bytes());
+        gathered_iov[8..].copy_from_slice(&(gathered.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(wr, gathered_iov.as_ptr() as u64, 1, 0),
+        ) != Some(gathered.len() as i64)
+        {
+            return Err("vmsplice failed to gather into an O_DIRECT pipe");
+        }
+        let mut first = [0u8; 3];
+        let mut second = [0u8; 3];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd, first.as_mut_ptr() as u64, first.len() as u64),
+        ) != Some(3)
+            || call(
+                Syscall::Read.raw(),
+                a2(rd, second.as_mut_ptr() as u64, second.len() as u64),
+            ) != Some(3)
+            || first != *b"abc"
+            || second != *b"def"
+        {
+            return Err("vmsplice incorrectly packetized bytes on an O_DIRECT pipe");
+        }
+
+        // An ordinary write does create a packet, but vmsplice from the read
+        // end consumes only its copied prefix and retains the tail.
+        let packet = *b"ghijkl";
+        if call(
+            Syscall::Write.raw(),
+            a2(wr, packet.as_ptr() as u64, packet.len() as u64),
+        ) != Some(packet.len() as i64)
+        {
+            return Err("failed to seed vmsplice packet-source fixture");
+        }
+        let mut prefix = [0u8; 3];
+        let mut prefix_iov = [0u8; 16];
+        prefix_iov[..8].copy_from_slice(&(prefix.as_mut_ptr() as u64).to_le_bytes());
+        prefix_iov[8..].copy_from_slice(&(prefix.len() as u64).to_le_bytes());
+        if call(
+            Syscall::Vmsplice.raw(),
+            a3(rd, prefix_iov.as_ptr() as u64, 1, 0),
+        ) != Some(3)
+            || prefix != *b"ghi"
+        {
+            return Err("read-end vmsplice did not copy the packet prefix");
+        }
+        let mut tail = [0u8; 3];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd, tail.as_mut_ptr() as u64, tail.len() as u64),
+        ) != Some(3)
+            || tail != *b"jkl"
+        {
+            return Err("read-end vmsplice discarded the packet tail");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/vmsplice",
+    smoke_abi_fdio_vmsplice_packet_boundaries_match_linux
+);
+
 /// A failed pipe→user vmsplice must not consume the source bytes.  Linux's
 /// pipe-to-user actor advances the pipe only for bytes successfully copied;
 /// this pins the stronger all-or-nothing behavior of NARF's guarded copy.
@@ -3713,6 +3789,79 @@ fn smoke_abi_fdio_vmsplice_named_fifo_copy_transaction() -> TestResult {
 kernel_test_in!(
     "syscall_abi/vmsplice",
     smoke_abi_fdio_vmsplice_named_fifo_copy_transaction
+);
+
+/// `write(2)` into a named FIFO follows `anon_pipe_write`: peer and fullness
+/// checks happen before the source is copied.  A canonical-but-unmapped source
+/// therefore loses to EAGAIN on a full nonblocking FIFO and to EPIPE after the
+/// last reader closes, but returns EFAULT when space and a reader are present.
+/// The EFAULT transaction must not publish its reserved bytes.
+fn smoke_abi_fdio_fifo_write_errno_order_and_rollback() -> TestResult {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    const S_IFIFO: u64 = 0o010000;
+    const O_WRONLY: u64 = 1;
+    const O_NONBLOCK: u64 = 0o4000;
+    const UNMAPPED_USER: u64 = 0x0000_0080_0000_0000;
+
+    with_memfs("/abi", "abi", &[], || {
+        let path = b"/abi/write-order.fifo\0";
+        if call(
+            Syscall::Mknodat.raw(),
+            a3(AT_FDCWD, path.as_ptr() as u64, S_IFIFO | 0o600, 0),
+        ) != Some(0)
+        {
+            return Err("failed to create FIFO write-order fixture");
+        }
+        let rd = open_fd_flags(path, O_NONBLOCK)?;
+        let wr = open_fd_flags(path, O_WRONLY | O_NONBLOCK)?;
+
+        let page = [0xA5u8; 4096];
+        for _ in 0..16 {
+            if call(
+                Syscall::Write.raw(),
+                a2(wr as u64, page.as_ptr() as u64, page.len() as u64),
+            ) != Some(page.len() as i64)
+            {
+                return Err("failed to fill named FIFO");
+            }
+        }
+        if call(Syscall::Write.raw(), a2(wr as u64, UNMAPPED_USER, 8)) != Some(EAGAIN) {
+            return Err("full named FIFO did not prioritize EAGAIN over EFAULT");
+        }
+
+        let mut drain = [0u8; 8];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd as u64, drain.as_mut_ptr() as u64, drain.len() as u64),
+        ) != Some(drain.len() as i64)
+            || drain != [0xA5; 8]
+        {
+            return Err("failed to make FIFO room for fault transaction");
+        }
+        if call(Syscall::Write.raw(), a2(wr as u64, UNMAPPED_USER, 8)) != Some(EFAULT) {
+            return Err("writable named FIFO with bad source was not EFAULT");
+        }
+        let refill = [0x5Au8; 8];
+        if call(
+            Syscall::Write.raw(),
+            a2(wr as u64, refill.as_ptr() as u64, refill.len() as u64),
+        ) != Some(refill.len() as i64)
+        {
+            return Err("faulting named-FIFO write did not roll back reserved bytes");
+        }
+
+        if call(Syscall::Close.raw(), a0(rd as u64)) != Some(0) {
+            return Err("failed to close named-FIFO reader");
+        }
+        if call(Syscall::Write.raw(), a2(wr as u64, UNMAPPED_USER, 8)) != Some(EPIPE) {
+            return Err("reader-less named FIFO did not prioritize EPIPE over EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/fifo",
+    smoke_abi_fdio_fifo_write_errno_order_and_rollback
 );
 
 /// A nonblocking `vmsplice(SPLICE_F_NONBLOCK)` into a full pipe returns

@@ -50,7 +50,7 @@ pub(super) enum TransactionalReadError {
 pub(super) fn transactional_stream_read(
     ops: &dyn narf_filesystem::FileOps,
     max: usize,
-    copy: impl Fn(&[u8]) -> Result<(), u64>,
+    copy: impl FnMut(&[u8]) -> Result<(), u64>,
 ) -> Option<Result<usize, TransactionalReadError>> {
     if let Some(pipe) = ops
         .as_any()
@@ -171,10 +171,17 @@ pub(crate) fn sys_read(ctx: &mut dyn TrapContext) {
                     }),
             )
         } else {
+            let mut copied = 0usize;
             transactional_stream_read(endpoint.ops.as_ref(), want, |bytes| {
                 // SAFETY: read(2) validated the original range; this guarded
                 // copy catches protection changes racing that validation.
-                unsafe { copy_to_user(user_ptr + total as u64, bytes) }
+                let result = unsafe {
+                    copy_to_user(user_ptr + total as u64 + copied as u64, bytes)
+                };
+                if result.is_ok() {
+                    copied += bytes.len();
+                }
+                result
             })
         };
         if let Some(outcome) = transactional {

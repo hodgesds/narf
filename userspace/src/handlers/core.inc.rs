@@ -8915,6 +8915,19 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         if child_spec.affinity.allowed.contains(parent_cpu) {
             child_spec.affinity.preferred = Some(parent_cpu);
         }
+    } else {
+        // A clone that creates a process follows the same initial-placement
+        // policy as fork. Linux passes WF_FORK to wake_up_new_task() for both
+        // and balances across the allowed scheduling domain. Keeping the
+        // generic AP-only user-task preference here can stall a burst when
+        // every AP is occupied by a parent entering __WCLONE wait4 and no
+        // child is initially queued on the idle BSP; eventual stealing is not
+        // a first-run liveness guarantee. Include every online allowed CPU, as
+        // the fork path does. The hint remains soft and ordinary stealing
+        // remains available after first placement.
+        if let Some(cpu) = handler_sys_fork::fork_cpu(child_spec.affinity.allowed) {
+            child_spec.affinity.preferred = Some(cpu);
+        }
     }
     let mut pending_child = match child_state {
         Some(state) => crate::user_task::prepare_user_process_resume(
@@ -9333,22 +9346,27 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
 // and restore WRITE on the faulting AS. Large brk heaps no
 // longer pay an up-front memcpy at fork time.
 
-/// FIFO wake bridge. A named-pipe read or write changes the buffer state, and
-/// a blocked peer — a reader on an empty buffer, a writer on a full one — may be
-/// own-stack parked on the io-waiter registry. `Readiness::set` already fired
-/// that peer's per-fd waker, but for a task switched out of the poll rotation
-/// that only stores an awake bit nothing re-scans, so without this the peer
-/// sleeps to the ~1 ms lost-wake backstop (an anonymous pipe self-notifies; a
-/// FIFO's `FileOps` live in the fs crate, which can't reach the net readiness
-/// layer). Bumping the io-waiter generation re-enqueues the parked peer now.
+/// Legacy FIFO wake bridge. A named-pipe read or write changes the buffer state,
+/// and a peer using the old longjmp execution model parks only on the global
+/// I/O-waiter registry. It therefore still needs the generation bump + broadcast
+/// below.
+///
+/// Own-stack tasks instead arm the FIFO's durable per-fd `Readiness` cell before
+/// parking. `Readiness::set` fires that exact slot waker, whose raw wake path
+/// marks the task runnable, publishes it as next-buddy, and sends a remote
+/// reschedule IPI when needed. Broadcasting through all 32 global I/O-waker
+/// shards after that targeted wake is redundant and makes independent FIFOs
+/// contend on one generation cache line, so the production own-stack path skips
+/// this compatibility bridge.
 ///
 /// Downcast-gated to FIFOs, so sockets / pipes / regular files pay only a
 /// vtable type check.
 pub(crate) fn wake_fifo_io_waiters(ops: &dyn narf_filesystem::FileOps) {
-    if ops
-        .as_any()
-        .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
-        .is_some()
+    if !narf_scheduler::stackful::user_own_stack_enabled()
+        && ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>())
+            .is_some()
     {
         narf_net::readiness::notify(0);
     }

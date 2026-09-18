@@ -786,6 +786,28 @@ impl PipeWrite {
         src_uptr: u64,
         len: usize,
     ) -> Result<Result<usize, narf_filesystem::FsError>, u64> {
+        let packet = self.packetized.load(Ordering::Acquire);
+        self.copy_from_user_into_pipe(src_uptr, len, packet)
+    }
+
+    /// Linux `vmsplice(2)` inserts user-backed pipe buffers without applying
+    /// the destination file's `O_DIRECT` packet mode. `iter_to_pipe` carries
+    /// only splice flags such as `PIPE_BUF_FLAG_GIFT`; packet framing belongs
+    /// to `pipe_write` alone.
+    pub(crate) fn vmsplice_from_user(
+        &self,
+        src_uptr: u64,
+        len: usize,
+    ) -> Result<Result<usize, narf_filesystem::FsError>, u64> {
+        self.copy_from_user_into_pipe(src_uptr, len, false)
+    }
+
+    fn copy_from_user_into_pipe(
+        &self,
+        src_uptr: u64,
+        len: usize,
+        packet: bool,
+    ) -> Result<Result<usize, narf_filesystem::FsError>, u64> {
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Ok(Err(narf_filesystem::FsError::BrokenPipe));
         }
@@ -795,7 +817,6 @@ impl PipeWrite {
         if self.shared.reader_closed.load(Ordering::Acquire) {
             return Ok(Err(narf_filesystem::FsError::BrokenPipe));
         }
-        let packet = self.packetized.load(Ordering::Acquire);
         let room = q.room(packet);
         if len <= PIPE_BUF && room < len {
             return Ok(Ok(0));
@@ -903,6 +924,21 @@ impl PipeRead {
         dst: u64,
         max: usize,
     ) -> Result<usize, VmspliceDrainError> {
+        self.copy_direct_to_user(dst, max, true)
+    }
+
+    /// Copy a pipe prefix directly into user memory, committing one
+    /// Linux-sized pipe buffer after each successful guarded copy.
+    ///
+    /// `discard_packets` selects read(2)'s packet-tail discard. Splice actors
+    /// pass false: Linux advances a partially copied pipe buffer and leaves its
+    /// tail queued, even when the buffer carries `PIPE_BUF_FLAG_PACKET`.
+    fn copy_direct_to_user(
+        &self,
+        dst: u64,
+        max: usize,
+        discard_packets: bool,
+    ) -> Result<usize, VmspliceDrainError> {
         let mut q = self.shared.queue.lock();
         if q.is_empty() {
             return if self.shared.writer_closed.load(Ordering::Acquire) {
@@ -944,9 +980,9 @@ impl PipeRead {
                 first_error = Some(errno);
                 break;
             }
-            q.commit(consumed);
+            q.commit(if discard_packets { consumed } else { n });
             copied += n;
-            if packet {
+            if discard_packets && packet {
                 break;
             }
         }
@@ -1166,15 +1202,10 @@ impl PipeRead {
         dst: u64,
         max: usize,
     ) -> Result<usize, VmspliceDrainError> {
-        crate::handlers::validate_user_range(dst, max).map_err(VmspliceDrainError::User)?;
-        // `discard_packets: false` — vmsplice drains through the splice actor
-        // (`pipe_to_user`), which advances a partially-copied buffer instead of
-        // retiring it. The packet discard belongs to `pipe_read` alone.
-        self.drain_to_user(max, false, |bytes| {
-            // SAFETY: validate_user_range accepted the complete destination;
-            // guarded copy catches a racing unmap/protection change.
-            unsafe { crate::handlers::copy_to_user(dst, bytes) }
-        })
+        // sys_vmsplice imported and validated the complete destination before
+        // pipe lookup, preserving Linux's errno order. The direct copies still
+        // catch a racing unmap before committing the affected pipe buffer.
+        self.copy_direct_to_user(dst, max, false)
     }
 
     /// Transactional pipe read used by read/readv/vmsplice: copy a stable

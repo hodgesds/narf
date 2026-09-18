@@ -916,13 +916,6 @@ pub(crate) fn direct_handoff_allowed(cpu: CpuId) -> bool {
     with_scheduler(cpu, policy_allows_direct_handoff)
 }
 
-/// Best-effort direct-handoff policy check for a remote CPU. Contention must
-/// decline rather than spin because callers can be in another CPU's syscall
-/// wake path with interrupts disabled by an unrelated provider lock.
-pub(crate) fn try_direct_handoff_allowed(cpu: CpuId) -> bool {
-    try_with_scheduler(cpu, policy_allows_direct_handoff).unwrap_or(false)
-}
-
 /// Non-blocking `with_scheduler`: run `f` against `cpu`'s policy slot only if
 /// the slot lock is uncontended, otherwise return `None` without spinning.
 ///

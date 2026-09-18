@@ -177,10 +177,11 @@ handoff when both tasks are stackful tasks using the same execution kind, the
 target is an awake default-class/normal-priority task with no period, budget
 cap, or donation, and the installed source and target policies are the built-in
 class or FIFO policy. A local target remains in its home queue under a
-core-owned atomic claim. A remote target is claimed and removed under a
-nonblocking home-policy/home-queue transaction, then re-enqueued within its
-allowed mask on the source CPU while still claimed. In both cases dispatch and
-stealing skip it until the final switch has completed.
+core-owned atomic claim. A remote target stays on its authoritative home and
+follows ordinary dispatch through the executor's scoped `active_mm` handoff;
+the direct path never moves a task or hardware address-space owner across run
+queues. Dispatch and stealing skip a locally claimed target until the final
+switch has completed.
 The target normally returns to the source's root executor continuation. If it
 urgently wakes that exact off-queue root, it may instead switch directly to the
 root's saved task continuation. That same fixed root may begin another exact
@@ -638,10 +639,9 @@ control callback.
   state before its first resumed instruction; only that fixed root may start
   another transfer and the 64th return forces the next yield through the
   executor, so the batch cannot extend to a third task or run unbounded.
-  A remotely queued target is first claimed under its old queue lock and moved
-  through the normal migrated dequeue/enqueue lifecycle; affinity and policy
-  checks precede that move, and a contended or rejected claim leaves the task
-  on and wakes its prior authoritative home.
+  A remotely queued target is not admitted to direct handoff. It remains on and
+  is woken through its authoritative-home executor path, which retains
+  ownership of cross-CPU task placement and address-space switching.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held

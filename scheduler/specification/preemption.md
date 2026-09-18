@@ -65,8 +65,9 @@ The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 An exact synchronous wake followed by an own-stack source park may take a
 bounded direct path instead of first resuming the executor. The core claims the
 awake target under its home ready-queue lock. A local slot remains resident; a
-remote slot is removed and migrated onto the source CPU while still claimed
-and non-dispatchable. The core then saves the source FP/SIMD and task-domain
+remote slot stays on its authoritative home for ordinary executor dispatch.
+This keeps cross-CPU task placement and address-space ownership behind the
+executor boundary. The core then saves the source FP/SIMD and task-domain
 state, publishes and activates the target's task
 identity/address space, restores its kernel-stack target, TLS, saved domain
 state, and FP/SIMD ownership, then switches to the target continuation. The
@@ -177,10 +178,9 @@ rolling generation-ordered cutover.
   because EL0 may write it directly.
 - Direct handoff is bounded to one claimed target at a time and 64 returns
   to one fixed exact root: executor dispatch and stealing skip the target until
-  each switch completes; a remote target is claimed under its prior policy and
-  queue locks, checked against destination affinity, then rehomed through the
-  migrated dequeue/enqueue lifecycle while still non-dispatchable. Contention
-  and rejection leave or wake it on the authoritative home. Nested sources and
+  each switch completes. Only a target already resident on the source CPU may
+  take this path; remote targets stay on or wake through the ordinary
+  authoritative-home executor path. Nested sources and
   arbitrary third-task transfers are refused; the root's next yield after the
   64th return must pass through the executor. Address-space ownership, TLS, domain
   state, and FP/SIMD ownership are restored before each resumed task's first

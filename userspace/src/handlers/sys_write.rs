@@ -76,6 +76,10 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         .ops
         .as_any()
         .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>());
+    let fifo_write = endpoint
+        .ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<narf_filesystem::fifo::FifoHandle>());
     while total < count {
         let want = core::cmp::min(CHUNK, count - total);
         let outcome = if let Some(pipe) = pipe_write {
@@ -86,6 +90,30 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                     return;
                 }
                 Err(_) => break,
+            }
+        } else if let Some(fifo) = fifo_write {
+            let copied = fifo.write_from_user(want, |dst| {
+                // SAFETY: the complete original range passed
+                // validate_rw_user_range; the guarded copy catches a racing
+                // unmap after FIFO peer/fullness checks, as Linux does.
+                unsafe { copy_from_user(dst, user_ptr + total as u64) }
+            });
+            match copied {
+                Ok(written) => Ok(written),
+                Err(narf_filesystem::fifo::FifoWriteError::WouldBlock) => {
+                    Err(narf_filesystem::FsError::WouldBlock)
+                }
+                Err(narf_filesystem::fifo::FifoWriteError::BadFd) => {
+                    Err(narf_filesystem::FsError::BadFd)
+                }
+                Err(narf_filesystem::fifo::FifoWriteError::BrokenPipe) => {
+                    Err(narf_filesystem::FsError::BrokenPipe)
+                }
+                Err(narf_filesystem::fifo::FifoWriteError::User(errno)) if total == 0 => {
+                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    return;
+                }
+                Err(narf_filesystem::fifo::FifoWriteError::User(_)) => break,
             }
         } else {
             // SAFETY: the complete original range passed validate_rw_user_range;

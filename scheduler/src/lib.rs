@@ -466,9 +466,7 @@ pub fn hint_io_next(task: u64) {
 
 /// Name the target of an urgent synchronous handoff as this CPU's one-shot
 /// next-buddy. Unlike the opt-in generic wake-next experiment, only a wake path
-/// that dequeued a real waiter may use it. This scalar-only helper retains the
-/// local fallback behavior; direct remote transfer requires the owning
-/// `WakeCell` published by `hint_urgent_next_on`.
+/// that dequeued a real waiter may use it.
 pub(crate) fn hint_urgent_next(task: u64) {
     if task == 0 {
         return;
@@ -505,14 +503,6 @@ fn hint_urgent_next_on(home: u32, task: u64, cell: *const WakeCell) {
             }
         }
     }
-}
-
-#[inline]
-pub(crate) fn urgent_wake_targets_cpu(cpu: usize, task: u64) -> bool {
-    task != 0
-        && URGENT_WAKE_NEXT
-            .get(cpu)
-            .is_some_and(|slot| slot.0.load(Ordering::Acquire) == task)
 }
 
 /// Consume the exact synchronous-wake cell on `cpu`. Used first by a running
@@ -858,13 +848,17 @@ fn direct_handoff_slot_eligible(slot: &TaskSlot, destination: CpuId) -> bool {
         && slot.donation.is_none()
 }
 
+#[inline]
+pub(crate) fn direct_handoff_is_local(home: usize, destination: usize) -> bool {
+    home == destination
+}
+
 /// Claim one exact urgent wakee for direct execution on `cpu`.
 ///
-/// A local target remains resident in its queue. A remote target is removed
-/// under its home policy/queue locks, claimed before those locks are released,
-/// and re-enqueued on the source CPU while non-dispatchable. That keeps queue
-/// ownership and policy lifecycle explicit while preventing either executor or
-/// an idle thief from racing the cross-CPU handoff.
+/// The target must already reside on `cpu` and remains in that queue under an
+/// atomic claim. A remote target stays on its authoritative home and follows
+/// ordinary executor dispatch, which owns cross-CPU task and address-space
+/// migration.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub(crate) fn claim_direct_handoff_target(
     cpu: usize,
@@ -879,81 +873,31 @@ pub(crate) fn claim_direct_handoff_target(
     }
 
     let home = cell.cpu.load(Ordering::Acquire) as usize;
-    if home >= READY.len() {
+    if home >= READY.len() || !direct_handoff_is_local(home, cpu) {
         return None;
     }
 
-    if home == cpu {
-        let mut ready = READY[cpu].lock();
-        let queue = ready.as_mut()?;
-        let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell))?;
-        if !direct_handoff_slot_eligible(slot, CpuId(cpu as u32)) {
-            return None;
-        }
-        let task = cell.stackful.load(Ordering::Acquire);
-        if task.is_null() {
-            return None;
-        }
-        // The home queue lock excludes every executor removal/steal of this
-        // slot. Publish the claim before consuming the wake bit so all later
-        // scans skip it even if another wake races the direct continuation.
-        cell.direct_claimed.store(true, Ordering::Release);
-        cell.flag.store(false, Ordering::Release);
-        publish_current_sched(cpu, slot);
-        return Some(DirectHandoffTarget {
-            task,
-            id: cell.task,
-            cell: cell.clone(),
-            addr_space: slot.addr_space.clone(),
-        });
+    let mut ready = READY[cpu].lock();
+    let queue = ready.as_mut()?;
+    let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell))?;
+    if !direct_handoff_slot_eligible(slot, CpuId(cpu as u32)) {
+        return None;
     }
-
-    let home_id = CpuId(home as u32);
-    let destination = CpuId(cpu as u32);
-    let moved = policy::try_with_scheduler(home_id, |scheduler| {
-        if !policy::policy_allows_direct_handoff(scheduler) {
-            return None;
-        }
-        let mut ready = READY[home].try_lock()?;
-        let queue = ready.as_mut()?;
-        let pos = queue
-            .iter()
-            .position(|slot| Arc::ptr_eq(&slot.awake, cell))?;
-        let slot = &queue[pos];
-        if !direct_handoff_slot_eligible(slot, destination) {
-            return None;
-        }
-        let task = cell.stackful.load(Ordering::Acquire);
-        if task.is_null() {
-            return None;
-        }
-        cell.direct_claimed.store(true, Ordering::Release);
-        cell.flag.store(false, Ordering::Release);
-        publish_current_sched(cpu, slot);
-        let addr_space = slot.addr_space.clone();
-        let slot = queue
-            .remove(pos)
-            .expect("remote direct-handoff position disappeared under queue lock");
-        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
-            scheduler.on_task_queue_event(
-                home_id,
-                policy::TaskQueueEvent::Dequeued {
-                    task: policy::TaskMeta::from_slot(&slot),
-                    reason: policy::TaskDequeueReason::Migrated,
-                },
-            );
-        }
-        Some((slot, task, addr_space))
-    })
-    .flatten()?;
-
-    let (slot, task, addr_space) = moved;
-    enqueue_on(cpu, slot, policy::TaskEnqueueReason::Migrated);
+    let task = cell.stackful.load(Ordering::Acquire);
+    if task.is_null() {
+        return None;
+    }
+    // The home queue lock excludes every executor removal/steal of this slot.
+    // Publish the claim before consuming the wake bit so all later scans skip
+    // it even if another wake races the direct continuation.
+    cell.direct_claimed.store(true, Ordering::Release);
+    cell.flag.store(false, Ordering::Release);
+    publish_current_sched(cpu, slot);
     Some(DirectHandoffTarget {
         task,
         id: cell.task,
         cell: cell.clone(),
-        addr_space,
+        addr_space: slot.addr_space.clone(),
     })
 }
 
@@ -3655,37 +3599,18 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
     }
-    let mut defer_home_kick = false;
     if urgent_task == Some(task) {
         // A provider dequeued this exact exclusive waiter. Unlike the generic
-        // opt-in wake-next policy, publish the one-shot hint unconditionally.
-        // A direct-eligible stackful source may consume a remote target itself:
-        // publish on that source CPU and let the syscall-exit/park boundary
-        // migrate the exact claimed slot before switching. Otherwise retain the
-        // ordinary home-queue hint and wake.
-        let source_cpu = narf_lib::percpu::current_cpu();
-        let direct_source = source_cpu < URGENT_WAKE_NEXT.len()
-            && source_cpu as u32 != home
-            && policy::try_direct_handoff_allowed(CpuId(source_cpu as u32))
-            && stackful::current_stackful_waker()
-                .and_then(|waker| scheduler_wake_cell(&waker))
-                .is_some_and(|source| {
-                    source.task != task && source.direct_eligible.load(Ordering::Acquire)
-                });
-        if direct_source {
-            hint_urgent_next_on(source_cpu as u32, task, ptr);
-            defer_home_kick = true;
-        } else {
-            hint_urgent_next_on(home, task, ptr);
-        }
+        // opt-in wake-next policy, publish the one-shot hint unconditionally
+        // on the wakee's authoritative home. Direct handoff is deliberately
+        // local; remote wakees proceed through normal executor dispatch.
+        hint_urgent_next_on(home, task, ptr);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
     }
-    if !defer_home_kick {
-        resched_remote(home);
-        wake_place_hint(home);
-    }
+    resched_remote(home);
+    wake_place_hint(home);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {

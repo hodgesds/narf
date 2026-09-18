@@ -657,9 +657,13 @@ processor on the common contiguous topology); pthread siblings created by each
 child then retain group locality. This uses otherwise-idle BSP capacity under
 process-level oversubscription without bouncing a group's shared lock data
 between CPUs.
-On aarch64, switch-out reads live `TPIDR_EL0` because EL0 may update it without
-a syscall, fork/clone inherit that live value and FPSIMD image, and exec clears
-both in line with Linux arm64 `copy_thread`/`flush_thread` semantics.
+Fork/clone children inherit the parent's live FP/SIMD image on both
+architectures. On x86_64 this includes x87 control/data plus the boot-enabled
+XMM/YMM/ZMM xstate, matching Linux `fpu_clone`; on aarch64 it includes the
+complete FPSIMD image. On aarch64, switch-out also reads live `TPIDR_EL0`
+because EL0 may update it without a syscall, fork/clone inherit that live value,
+and exec clears both TLS and FPSIMD in line with Linux arm64
+`copy_thread`/`flush_thread` semantics.
 Private futex wait queues are keyed by `(address-space identity, user address)`;
 `CLONE_VM` threads share wakes, while unrelated processes that map the same
 virtual address cannot consume one another's `FUTEX_WAKE_PRIVATE` events.
