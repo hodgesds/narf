@@ -2466,3 +2466,145 @@ fn smoke_abi_proc_ambient_survives_exec() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_ambient_survives_exec);
+
+// ── RLIMIT_CPU ──────────────────────────────────────────────────────
+//
+// `kernel/time/posix-cpu-timers.c::check_process_timers`. The limit used to
+// appear exactly once in this tree, in a comment listing default values as
+// `= INFINITY`; setrlimit accepted it and nothing ever read it, so a process
+// held to one second of CPU ran forever.
+//
+// The sampling hook is the timer tick's return-to-user path, so these drive
+// it directly rather than waiting on wall time.
+
+const RLIMIT_CPU_RES: u64 = 0;
+/// SIGXCPU is signal 24 ⇒ bit 23 (`sig_bit(n) == 1 << (n - 1)`).
+const SIGXCPU_PENDING: u64 = 1u64 << 23;
+/// SIGKILL is signal 9 ⇒ bit 8. It cannot be blocked, so it is read from the
+/// raw pending bitmap rather than through `rt_sigpending`.
+const SIGKILL_PENDING: u64 = 1u64 << 8;
+const ONE_SEC_NS: u64 = 1_000_000_000;
+
+fn set_cpu_limit(cur: u64, max: u64) -> Result<(), &'static str> {
+    let pair = [cur, max];
+    match call(
+        Syscall::Setrlimit.raw(),
+        a1(RLIMIT_CPU_RES, pair.as_ptr() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("could not set RLIMIT_CPU"),
+    }
+}
+
+fn cpu_soft_limit() -> Result<u64, &'static str> {
+    let mut pair = [0u64; 2];
+    match call(
+        Syscall::Getrlimit.raw(),
+        a1(RLIMIT_CPU_RES, pair.as_mut_ptr() as u64),
+    ) {
+        Some(0) => Ok(pair[0]),
+        _ => Err("could not read RLIMIT_CPU"),
+    }
+}
+
+/// Burn `ns` of CPU on the harness task, through the field the real
+/// accounting path writes.
+fn burn_cpu_ns(ns: u64) -> Result<(), &'static str> {
+    if crate::task::__test_add_cpu_ns(FAKE_TASK, ns, 0) {
+        Ok(())
+    } else {
+        Err("harness task is not registered")
+    }
+}
+
+/// Start from a known zero. The harness task is registered once for the
+/// whole run, so its CPU accounting is cumulative across smokes — without
+/// this, whichever of these tests ran first decided whether the others saw
+/// a task that had already burned a minute.
+fn reset_cpu_ns() {
+    crate::task::__test_reset_cpu_ns(FAKE_TASK);
+}
+
+fn smoke_abi_proc_rlimit_cpu_soft_warns_and_rearms() -> TestResult {
+    with_setup(|| {
+        reset_cpu_ns();
+        set_cpu_limit(1, u64::MAX)?;
+
+        // Under the limit: nothing fires. Without this arm the test would
+        // pass for a hook that signalled unconditionally.
+        burn_cpu_ns(ONE_SEC_NS / 10)?;
+        crate::handlers::numa_balance_tick();
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGXCPU_PENDING != 0 {
+            return Err("SIGXCPU raised below RLIMIT_CPU");
+        }
+        if cpu_soft_limit()? != 1 {
+            return Err("the soft limit moved before it was reached");
+        }
+
+        // At the limit. `check_rlimit` fires on `time >= limit`, not `>`.
+        burn_cpu_ns(ONE_SEC_NS)?;
+        crate::handlers::numa_balance_tick();
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGXCPU_PENDING == 0 {
+            return Err("reaching RLIMIT_CPU did not raise SIGXCPU");
+        }
+
+        // The distinctive part: the soft limit RAISES ITSELF by a second.
+        // That is how Linux implements "a SIGXCPU every second", and it is
+        // visible to the process — `getrlimit` now reports a limit larger
+        // than the one it set.
+        if cpu_soft_limit()? != 2 {
+            return Err("the soft limit did not re-arm one second later");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_rlimit_cpu_soft_warns_and_rearms
+);
+
+fn smoke_abi_proc_rlimit_cpu_hard_kills() -> TestResult {
+    with_setup(|| {
+        // soft 1s, hard 3s.
+        reset_cpu_ns();
+        set_cpu_limit(1, 3)?;
+
+        // Between the two: warned, not killed. The hard arm returning
+        // immediately is what makes this ordering observable.
+        burn_cpu_ns(2 * ONE_SEC_NS)?;
+        crate::handlers::numa_balance_tick();
+        let pending = crate::handlers::signal_pending_of(FAKE_TASK);
+        if pending & SIGXCPU_PENDING == 0 {
+            return Err("past the soft limit did not raise SIGXCPU");
+        }
+        if pending & SIGKILL_PENDING != 0 {
+            return Err("SIGKILL raised before the hard limit");
+        }
+
+        // At the hard limit: SIGKILL.
+        burn_cpu_ns(2 * ONE_SEC_NS)?;
+        crate::handlers::numa_balance_tick();
+        if crate::handlers::signal_pending_of(FAKE_TASK) & SIGKILL_PENDING == 0 {
+            return Err("reaching the RLIMIT_CPU hard limit did not raise SIGKILL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_cpu_hard_kills);
+
+fn smoke_abi_proc_rlimit_cpu_infinity_is_free() -> TestResult {
+    with_setup(|| {
+        reset_cpu_ns();
+        // The default is RLIM_INFINITY, and the sampler must take its early
+        // return — otherwise every task on the system pays a thread-group
+        // walk on every timer tick.
+        burn_cpu_ns(60 * ONE_SEC_NS)?;
+        crate::handlers::numa_balance_tick();
+        let pending = crate::handlers::signal_pending_of(FAKE_TASK);
+        if pending & (SIGXCPU_PENDING | SIGKILL_PENDING) != 0 {
+            return Err("an unlimited RLIMIT_CPU still signalled");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_cpu_infinity_is_free);

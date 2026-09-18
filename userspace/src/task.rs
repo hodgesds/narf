@@ -345,6 +345,63 @@ pub(crate) fn cpu_times(tid: u64) -> (u64, u64) {
     })
 }
 
+/// Test hook: add CPU time to a registry entry directly.
+///
+/// The production path (`account_current_cpu_ns`) writes these same fields,
+/// but only when the scheduler has published an in-flight user context —
+/// which the ABI harness, having no real user task, never does. Writing the
+/// field the real accounting writes keeps the RLIMIT_CPU smokes exercising
+/// the real sampling path rather than a parallel one.
+#[doc(hidden)]
+pub fn __test_add_cpu_ns(tid: u64, user_ns: u64, kernel_ns: u64) -> bool {
+    task_get(tid).is_some_and(|task| {
+        task.user_cpu_ns.fetch_add(user_ns, Ordering::Relaxed);
+        task.kernel_cpu_ns.fetch_add(kernel_ns, Ordering::Relaxed);
+        true
+    })
+}
+
+/// Test hook: zero a registry entry's CPU accounting.
+///
+/// The harness task is created once for the whole run and its CPU time is
+/// cumulative, so a smoke that burns a minute of CPU leaves every later one
+/// starting from a minute. A test asserting "below the limit, nothing
+/// fires" has to begin from a known zero or it silently depends on
+/// registration order.
+#[doc(hidden)]
+pub fn __test_reset_cpu_ns(tid: u64) {
+    if let Some(task) = task_get(tid) {
+        task.user_cpu_ns.store(0, Ordering::Relaxed);
+        task.kernel_cpu_ns.store(0, Ordering::Relaxed);
+    }
+}
+
+/// Total CPU time (user + system) of thread group `pid`, in nanoseconds —
+/// Linux's `CPUCLOCK_PROF` sample for a process.
+///
+/// `RLIMIT_CPU` is a PROCESS limit, not a per-thread one: a four-thread
+/// process that could each burn the limit separately would get four times
+/// the CPU it asked to be held to. Summing is what makes the limit mean
+/// what it says.
+///
+/// `try_lock`, because the only caller is the timer-tick hook and that runs
+/// in IRQ context — the same reason [`cpu_times_try`] exists. `None` is lock
+/// contention, and the caller simply rechecks on the next tick; a limit
+/// measured in whole seconds does not care about a missed sample.
+pub(crate) fn thread_group_cpu_ns_try(pid: u64) -> Option<u64> {
+    let tasks = TASKS.try_lock()?;
+    Some(
+        tasks
+            .values()
+            .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
+            .fold(0u64, |total, task| {
+                total
+                    .saturating_add(task.user_cpu_ns.load(Ordering::Relaxed))
+                    .saturating_add(task.kernel_cpu_ns.load(Ordering::Relaxed))
+            }),
+    )
+}
+
 /// Non-blocking form for timer-trap diagnostics. `None` means registry lock
 /// contention; an absent task is a successful zero snapshot.
 #[cfg(feature = "unix-latency-trace")]
