@@ -31,6 +31,20 @@ pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler
 }
 
 pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
+    // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
+    // MACHINE; this bounds ONE user, so a single unprivileged account cannot
+    // consume every slot that cap allows.
+    //
+    // Ahead of the address-space work on purpose: `copy_process` runs
+    // `copy_creds` — and this check — long before `copy_mm`, so a process
+    // over its limit gets -EAGAIN rather than the -ENOMEM an AS failure
+    // would report. The two errnos mean very different things to a caller
+    // deciding whether to retry.
+    if nproc_fork_would_exceed(current_task_id()) {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+
     let parent_as = match current_address_space() {
         Some(a) => a,
         None => {

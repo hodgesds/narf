@@ -1483,6 +1483,21 @@ fn do_execve_resolved(
     envp_uptr: u64,
     mut image_override: Option<alloc::vec::Vec<u8>>,
 ) {
+    // `fs/exec.c::do_execveat_common`, before the binary is even opened:
+    //
+    //     if ((current->flags & PF_NPROC_EXCEEDED) &&
+    //         is_rlimit_overlimit(current_ucounts(), UCOUNT_RLIMIT_NPROC,
+    //                             rlimit(RLIMIT_NPROC)))
+    //             return -EAGAIN;
+    //
+    // This is where a set*uid() that landed on an over-quota uid finally
+    // fails. Both execve and execveat funnel through here, which is the
+    // same consolidation Linux relies on.
+    if nproc_exceeded_blocks_exec(current_task_id()) {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+
     // fexecve via the /proc/self/fd/N (or /proc/<pid>/fd/N) magic symlink:
     // glibc's fexecve and systemd 257's sd-executor spawn open the binary
     // O_PATH then execve("/proc/self/fd/<N>"). Resolve N to the fd's real

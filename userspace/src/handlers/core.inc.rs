@@ -8887,6 +8887,20 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
         }
     };
 
+    // Per-uid RLIMIT_NPROC. The global live-task cap below bounds the whole
+    // MACHINE; this bounds ONE user, so a single unprivileged account cannot
+    // consume every slot that cap allows.
+    //
+    // Ahead of the address-space work on purpose: `copy_process` runs
+    // `copy_creds` — and this check — long before `copy_mm`, so a process
+    // over its limit gets -EAGAIN rather than the -ENOMEM an AS failure
+    // would report. The two errnos mean very different things to a caller
+    // deciding whether to retry.
+    if nproc_fork_would_exceed(current_task_id()) {
+        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        return;
+    }
+
     // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
     // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
     if !narf_scheduler::user_nproc_available() {
@@ -11021,6 +11035,9 @@ fn release_task_tables(tid: u64) {
     }
     if let Some(m) = CREDENTIAL_TABLES[credential_shard].groups.lock().as_mut() {
         m.remove(&tid);
+    }
+    if let Some(set) = NPROC_EXCEEDED.lock().as_mut() {
+        set.remove(&tid);
     }
     if let Some(m) = CAP_TABLE.lock().as_mut() {
         m.remove(&tid);
@@ -13265,6 +13282,7 @@ const RLIMIT_STACK: usize = 3;
 const RLIMIT_MEMLOCK: usize = 8;
 const RLIMIT_AS: usize = 9;
 const RLIMIT_CPU: usize = 0;
+const RLIMIT_NPROC: usize = 6;
 const RLIMIT_FSIZE: usize = 1;
 const RLIMIT_CORE: usize = 4;
 
@@ -13446,6 +13464,130 @@ fn rlimit_cpu_tick(task: u64) {
             max: limits.max,
         }),
     );
+}
+
+/// `CAP_SYS_RESOURCE` — "override resource limits". Either this or
+/// CAP_SYS_ADMIN exempts a task from RLIMIT_NPROC.
+pub(crate) const CAP_SYS_RESOURCE: u32 = 24;
+
+/// Live tasks whose REAL uid is `uid`.
+///
+/// Counted from the credential rows rather than from a maintained counter,
+/// on purpose. A per-uid counter has to be incremented at every task
+/// creation, decremented at every exit, and MOVED on every set*uid — and a
+/// single missed decrement wedges that uid's ability to fork for the rest
+/// of the boot, silently and permanently. The rows are removed at reap
+/// (see the teardown block), so each live or zombie task contributes
+/// exactly one, and counting them cannot drift from the truth it is
+/// supposed to describe.
+///
+/// Zombies count, matching Linux: the ucount is released in
+/// `release_task`, not at exit, so a process that has exited but not been
+/// reaped still occupies a slot.
+fn nproc_count_for_uid(uid: u32) -> u64 {
+    CREDENTIAL_TABLES.iter().fold(0u64, |total, shard| {
+        let guard = shard.uidgid.lock();
+        let n = guard
+            .as_ref()
+            .map_or(0, |m| m.values().filter(|ids| ids.uid == uid).count());
+        total.saturating_add(n as u64)
+    })
+}
+
+/// Whether `uid` is at or over its RLIMIT_NPROC, as
+/// `is_rlimit_overlimit` measures it for a task that is about to be added.
+///
+/// Linux increments the new task's ucount in `copy_creds` BEFORE testing
+/// `val > max`, so the count under test includes the task being created:
+/// a limit of N permits N tasks and the (N+1)-th attempt is the one that
+/// fails.
+fn nproc_over_limit(task: u64, uid: u32, extra: u64) -> bool {
+    let Some(limits) = read_rlimit(task, RLIMIT_NPROC) else {
+        return false;
+    };
+    if limits.cur == RLIM_INFINITY {
+        return false;
+    }
+    nproc_count_for_uid(uid).saturating_add(extra) > limits.cur
+}
+
+/// `kernel/fork.c::copy_process`:
+///
+/// ```text
+/// retval = -EAGAIN;
+/// if (is_rlimit_overlimit(task_ucounts(p), UCOUNT_RLIMIT_NPROC, rlimit(RLIMIT_NPROC))) {
+///         if (p->real_cred->user != INIT_USER &&
+///             !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN))
+///                 goto bad_fork_cleanup_count;
+/// }
+/// ```
+///
+/// The exemptions are the whole reason a fork bomb from root is a
+/// different problem from one by a user: uid 0 (`INIT_USER`) is never
+/// refused here, and neither is a task holding either capability. The
+/// global live-task cap, which this sits beside, is what covers root.
+pub(crate) fn nproc_fork_would_exceed(task: u64) -> bool {
+    let uid = read_uidgid(task).uid;
+    if uid == 0 {
+        return false;
+    }
+    if !nproc_over_limit(task, uid, 1) {
+        return false;
+    }
+    !capable(CAP_SYS_RESOURCE) && !capable(CAP_SYS_ADMIN)
+}
+
+/// Tasks carrying Linux's `PF_NPROC_EXCEEDED`: they changed to a uid that
+/// was already at its RLIMIT_NPROC, and owe the -EAGAIN at their next
+/// `execve`.
+static NPROC_EXCEEDED: narf_lib::sync::IrqSafeSpinLock<Option<alloc::collections::BTreeSet<u64>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// `kernel/sys.c::flag_nproc_exceeded`, called after a real-uid change.
+///
+/// set*uid() does NOT fail for RLIMIT_NPROC, and the comment in Linux says
+/// why in as many words: "too many poorly written programs don't check
+/// set*uid() return code, assuming it never fails if called by root. We may
+/// still enforce NPROC limit for programs doing set*uid()+execve() by
+/// harmlessly deferring the failure to the execve() stage." Dropping
+/// privilege then exec'ing is exactly the shape a daemon uses, so deferring
+/// catches the case that matters without breaking the callers that ignore
+/// the return value.
+pub(crate) fn flag_nproc_exceeded(task: u64) {
+    let uid = read_uidgid(task).uid;
+    let exceeded = uid != 0 && nproc_over_limit(task, uid, 0);
+    let mut g = NPROC_EXCEEDED.lock();
+    let set = g.get_or_insert_with(alloc::collections::BTreeSet::new);
+    if exceeded {
+        set.insert(task);
+    } else {
+        set.remove(&task);
+    }
+}
+
+/// `fs/exec.c`: `if ((current->flags & PF_NPROC_EXCEEDED) &&
+/// is_rlimit_overlimit(...)) return -EAGAIN;`, then clear the flag.
+///
+/// The RECHECK is load-bearing — the flag only says the limit was exceeded
+/// when the uid changed, and other tasks may have exited since. Linux's own
+/// comment: "We're below the limit (still or again), so we don't want to
+/// make further execve() calls fail."
+pub(crate) fn nproc_exceeded_blocks_exec(task: u64) -> bool {
+    let flagged = NPROC_EXCEEDED
+        .lock()
+        .as_ref()
+        .is_some_and(|set| set.contains(&task));
+    if !flagged {
+        return false;
+    }
+    let uid = read_uidgid(task).uid;
+    if uid != 0 && nproc_over_limit(task, uid, 0) {
+        return true;
+    }
+    if let Some(set) = NPROC_EXCEEDED.lock().as_mut() {
+        set.remove(&task);
+    }
+    false
 }
 
 /// Test hook: raise/lower a limit through the SAME transaction `setrlimit`

@@ -2608,3 +2608,193 @@ fn smoke_abi_proc_rlimit_cpu_infinity_is_free() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_cpu_infinity_is_free);
+
+// ── RLIMIT_NPROC ────────────────────────────────────────────────────
+//
+// `kernel/fork.c::copy_process`. The limit had appeared exactly once in
+// this tree — in a comment in `sys_fork` explaining what the GLOBAL
+// live-task cap stands in for — so a single unprivileged account could
+// consume every slot that cap allows.
+//
+// Counted per REAL uid, over live and zombie tasks alike, and exempting
+// uid 0 (`INIT_USER`) plus CAP_SYS_RESOURCE / CAP_SYS_ADMIN. The harness
+// holds one task, so its own credential row is the count.
+
+const RLIMIT_NPROC_RES: u64 = 6;
+#[cfg(target_arch = "x86_64")]
+const NOCHANGE_ID: u64 = u64::MAX;
+
+fn set_nproc_limit(cur: u64) -> Result<(), &'static str> {
+    let pair = [cur, u64::MAX];
+    match call(
+        Syscall::Setrlimit.raw(),
+        a1(RLIMIT_NPROC_RES, pair.as_ptr() as u64),
+    ) {
+        Some(0) => Ok(()),
+        _ => Err("could not set RLIMIT_NPROC"),
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_rlimit_nproc_refuses_fork() -> TestResult {
+    with_setup(|| {
+        // A real privilege drop, not a fsuid poke: the count is over REAL
+        // uids, and `cap_emulate_setxuid` has to run so the capability
+        // exemption below is not silently granted.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("could not drop to an unprivileged uid");
+        }
+        // One task owns uid 1000, so a limit of 1 is exactly full: Linux
+        // increments for the task being created and then tests `val > max`,
+        // so N tasks fit and the (N+1)-th attempt fails.
+        set_nproc_limit(1)?;
+        // -EAGAIN outranks the harness's no-address-space -ENOMEM, because
+        // `copy_creds` runs long before `copy_mm`. A check placed after the
+        // AS lookup would report ENOMEM here and this would read as a pass
+        // for the wrong reason.
+        match call(Syscall::Fork.raw(), a0(0)) {
+            Some(v) if v == EAGAIN => {}
+            Some(v) if v == ENOMEM => {
+                return Err("RLIMIT_NPROC was checked after the address space, not before")
+            }
+            _ => return Err("fork over RLIMIT_NPROC was not -EAGAIN"),
+        }
+        // Raising the limit lets it through to the normal no-AS path again,
+        // which proves the refusal came from the limit and not from
+        // something the privilege drop broke.
+        set_nproc_limit(64)?;
+        match call(Syscall::Fork.raw(), a0(0)) {
+            Some(v) if v == ENOMEM => Ok(()),
+            _ => Err("fork under RLIMIT_NPROC did not reach the address-space path"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_nproc_refuses_fork);
+
+/// v3 capability header version, as `abi_creds_tests` spells it.
+#[cfg(target_arch = "x86_64")]
+const NPROC_CAP_VERSION_3: u32 = 0x2008_0522;
+/// CAP_SYS_ADMIN (21) and CAP_SYS_RESOURCE (24) — the two that exempt a
+/// task from RLIMIT_NPROC. Both are below 32, so both live in word 0.
+#[cfg(target_arch = "x86_64")]
+const NPROC_EXEMPTING_CAPS: u32 = (1u32 << 21) | (1u32 << 24);
+
+/// Drop CAP_SYS_ADMIN and CAP_SYS_RESOURCE, keeping everything else.
+///
+/// Without this, a test of the uid-0 exemption is VACUOUS: root also holds
+/// both capabilities, so the capability arm answers first and deleting the
+/// uid check changes nothing. Found exactly that way — stubbing the uid
+/// check out left the test passing.
+#[cfg(target_arch = "x86_64")]
+fn drop_nproc_exempting_caps() -> Result<(), &'static str> {
+    let mut hdr = [0u32; 2];
+    hdr[0] = NPROC_CAP_VERSION_3;
+    // capget writes three u32 pairs: effective, permitted, inheritable.
+    let mut data = [0u32; 6];
+    if call(
+        Syscall::Capget.raw(),
+        a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("capget failed");
+    }
+    // Word 0 of each set is data[0], data[2], data[4]; word 1 is the odd
+    // indices and holds no capability this cares about.
+    for i in [0usize, 2, 4] {
+        data[i] &= !NPROC_EXEMPTING_CAPS;
+    }
+    hdr[0] = NPROC_CAP_VERSION_3;
+    if call(
+        Syscall::Capset.raw(),
+        a1(hdr.as_mut_ptr() as u64, data.as_mut_ptr() as u64),
+    ) != Some(0)
+    {
+        return Err("capset failed to drop the exempting capabilities");
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_rlimit_nproc_exempts_root() -> TestResult {
+    with_setup(|| {
+        set_nproc_limit(0)?;
+        // Isolate the uid-0 arm by removing the other reason root would be
+        // exempt. What remains under test is `p->real_cred->user != INIT_USER`
+        // alone.
+        drop_nproc_exempting_caps()?;
+        match call(Syscall::Fork.raw(), a0(0)) {
+            Some(v) if v == ENOMEM => Ok(()),
+            Some(v) if v == EAGAIN => Err("RLIMIT_NPROC was applied to uid 0"),
+            _ => Err("fork as root returned an unexpected error"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_nproc_exempts_root);
+
+#[cfg(target_arch = "x86_64")]
+fn smoke_abi_proc_rlimit_nproc_exempts_capable() -> TestResult {
+    with_setup(|| {
+        // Real uid 1000 with effective uid 0: COUNTED under 1000, so the
+        // uid-0 arm cannot answer, while the capabilities survive because
+        // `cap_emulate_setxuid` only drops them on an EFFECTIVE transition
+        // away from root. That isolates the capability arm.
+        if call(Syscall::Setresuid.raw(), a2(1000, NOCHANGE_ID, NOCHANGE_ID)) != Some(0) {
+            return Err("could not set a non-root real uid");
+        }
+        set_nproc_limit(0)?;
+        match call(Syscall::Fork.raw(), a0(0)) {
+            Some(v) if v == ENOMEM => Ok(()),
+            Some(v) if v == EAGAIN => {
+                Err("CAP_SYS_RESOURCE did not exempt the task from RLIMIT_NPROC")
+            }
+            _ => Err("fork with CAP_SYS_RESOURCE returned an unexpected error"),
+        }
+    })
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("syscall_abi", smoke_abi_proc_rlimit_nproc_exempts_capable);
+
+fn smoke_abi_proc_rlimit_nproc_defers_setuid_failure_to_execve() -> TestResult {
+    with_setup(|| {
+        // Zero, so the uid the task moves to is over quota the moment it
+        // arrives (`val > max` with one task and a limit of none).
+        set_nproc_limit(0)?;
+
+        // set*uid() must SUCCEED anyway. Linux is explicit that it does not
+        // fail here because "too many poorly written programs don't check
+        // set*uid() return code" — the failure is deferred instead.
+        if call(Syscall::Setresuid.raw(), a2(1000, 1000, 1000)) != Some(0) {
+            return Err("set*uid() must not fail for RLIMIT_NPROC");
+        }
+
+        // ...and execve is where it lands. The path does not exist: -EAGAIN
+        // rather than -ENOENT is what shows the check runs before the binary
+        // is resolved, as `do_execveat_common` does it.
+        let path = b"/nonexistent-nproc-probe\0";
+        match call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+            Some(v) if v == EAGAIN => {}
+            Some(v) if v == ENOENT => {
+                return Err("the deferred RLIMIT_NPROC failure ran after path resolution")
+            }
+            _ => return Err("execve after an over-quota set*uid() was not -EAGAIN"),
+        }
+
+        // The recheck: back under the limit, execve must stop failing.
+        // Linux clears the flag rather than latching it — "we're below the
+        // limit (still or again), so we don't want to make further execve()
+        // calls fail."
+        set_nproc_limit(64)?;
+        match call(Syscall::Execve.raw(), a2(path.as_ptr() as u64, 0, 0)) {
+            Some(v) if v == EAGAIN => {
+                Err("the RLIMIT_NPROC exec flag latched instead of being rechecked")
+            }
+            _ => Ok(()),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_proc_rlimit_nproc_defers_setuid_failure_to_execve
+);
