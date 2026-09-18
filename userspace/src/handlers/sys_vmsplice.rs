@@ -152,13 +152,18 @@ impl VmspliceReadEnd<'_> {
                     crate::pipe::VmspliceDrainError::WouldBlock => VmspliceReadError::WouldBlock,
                     crate::pipe::VmspliceDrainError::User(errno) => VmspliceReadError::User(errno),
                 }),
-            Self::Named(fifo) => fifo
-                .vmsplice_to_user(max, |bytes| {
+            Self::Named(fifo) => {
+                let mut copied = 0usize;
+                fifo.vmsplice_to_user(max, |bytes| {
                     // SAFETY: validate_vmsplice_iovecs accepted this complete
                     // destination range. The guarded copy catches a racing
                     // unmap/protection change while the FIFO transaction still
                     // owns, but has not consumed, the queue prefix.
-                    unsafe { copy_to_user(dst, bytes) }
+                    let result = unsafe { copy_to_user(dst + copied as u64, bytes) };
+                    if result.is_ok() {
+                        copied += bytes.len();
+                    }
+                    result
                 })
                 .map_err(|error| match error {
                     narf_filesystem::fifo::VmspliceDrainError::WouldBlock => {
@@ -168,7 +173,8 @@ impl VmspliceReadEnd<'_> {
                         VmspliceReadError::User(errno)
                     }
                     narf_filesystem::fifo::VmspliceDrainError::BadFd => VmspliceReadError::BadFd,
-                }),
+                })
+            }
         }
     }
 }
@@ -227,6 +233,9 @@ fn vmsplice_to_pipe(
         }
         // Kernel-test context (no executor): fall through to a best-effort copy.
     }
+    let pipe_write = ops
+        .as_any()
+        .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>());
     let mut total: usize = 0;
     for i in 0..nr {
         let o = i * 16;
@@ -235,19 +244,37 @@ fn vmsplice_to_pipe(
         if len == 0 {
             continue;
         }
-        // SAFETY: `base` is a user VA; copy_from_user_vec validates it.
-        let kbuf = match unsafe { copy_from_user_vec(base, len) } {
-            Ok(b) => b,
-            Err(_) => {
-                if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
-                    return;
+        let w = if let Some(pipe) = pipe_write {
+            // sys_vmsplice already imported and validated every iovec. Copy
+            // directly into the pipe's uncommitted ring space so the common
+            // anonymous-pipe path avoids a heap allocation and bounce copy.
+            match pipe.vmsplice_from_user(base, len) {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    if total == 0 {
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        return;
+                    }
+                    break;
                 }
-                break;
             }
+        } else {
+            // Named and provider-defined pipes retain the generic FileOps path.
+            // SAFETY: `base` is a validated user VA; the guarded copy catches
+            // a racing mapping change.
+            let kbuf = match unsafe { copy_from_user_vec(base, len) } {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    if total == 0 {
+                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        return;
+                    }
+                    break;
+                }
+            };
+            poll_blocking(ops.write(0, &kbuf))
+                .unwrap_or(Err(narf_filesystem::FsError::ReadOnly))
         };
-        let w =
-            poll_blocking(ops.write(0, &kbuf)).unwrap_or(Err(narf_filesystem::FsError::ReadOnly));
         match w {
             Ok(0) if total == 0 && ops.write_should_block() => {
                 // The pipe may have become full after the readiness sample.

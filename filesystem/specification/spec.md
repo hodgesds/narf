@@ -181,8 +181,12 @@ blocking `open`. A read-only handle opened before any writer suppresses
 `POLLHUP` until its own writer-presence snapshot changes, matching Linux's
 per-file `f_pipe`/`w_counter` rule. Data reads/writes arm the ordinary per-file
 readiness cell. `FifoHandle::vmsplice_to_user` holds the observed queue prefix
-through its copy callback and consumes it only after success, so a failed user
-copy neither discards nor reorders named-FIFO data.
+through one or two direct copy callbacks and consumes it only after every copy
+succeeds, so a failed user copy neither discards nor reorders named-FIFO data.
+`FifoHandle::write_from_user` likewise performs peer/fullness checks before its
+direct copy callback and rolls back reserved queue space on a copy fault. This
+preserves Linux's EPIPE/EAGAIN-before-EFAULT ordering without per-I/O heap or
+boxed-future allocation on the named-FIFO syscall path.
 
 `DevFs` identifies itself as `devtmpfs`. Character and block nodes remain
 distinct through VFS stat and readdir translation, carry Linux `st_rdev`

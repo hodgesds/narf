@@ -816,8 +816,8 @@ unsafe fn try_direct_handoff(
             return false;
         }
         let Some(mut target) = crate::claim_direct_handoff_target(cpu, &cell) else {
-            // Restore the ordinary home wake after a remote/direct claim
-            // declines (policy, budget, queue contention, or first run).
+            // Restore the ordinary home wake after a direct claim declines
+            // (remote target, policy, budget, queue contention, or first run).
             fallback(&cell);
             return false;
         };
@@ -3194,8 +3194,8 @@ pub fn note_wake_preempt(woken: u64) {
 /// protecting the syscall-dense waker for the normal RUN_TO_PARITY batching
 /// window only adds handoff latency. Unlike generic wake-preemption, this
 /// narrow path is always live: it ignores self-wakes and yields only if the
-/// exact dequeued waiter is runnable locally or has been published as this
-/// CPU's remote direct-transfer candidate.
+/// exact dequeued waiter is runnable locally. Remote wakees are kicked on their
+/// authoritative CPU and follow ordinary executor dispatch.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub fn note_urgent_wake_preempt(woken: u64) {
     if !USE_OWN_STACK.load(Ordering::Acquire) {
@@ -3211,7 +3211,7 @@ pub fn note_urgent_wake_preempt(woken: u64) {
     if crate::current_task_id().raw() == woken {
         return;
     }
-    if !crate::task_runnable_on_current_cpu(woken) && !crate::urgent_wake_targets_cpu(cpu, woken) {
+    if !crate::task_runnable_on_current_cpu(woken) {
         return;
     }
     URGENT_WAKE_PREEMPT.inner[cpu]

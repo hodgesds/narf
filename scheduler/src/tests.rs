@@ -7,6 +7,17 @@
 
 use narf_kernel_test::{kernel_test_in, TestResult};
 
+fn smoke_scheduler_direct_handoff_is_local_only() -> TestResult {
+    if !crate::direct_handoff_is_local(3, 3)
+        || crate::direct_handoff_is_local(3, 4)
+        || crate::direct_handoff_is_local(4, 3)
+    {
+        return TestResult::Fail("direct handoff crossed a run-queue boundary");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_direct_handoff_is_local_only);
+
 fn smoke_scheduler_steal_leaves_runnable_on_victim() -> TestResult {
     if crate::victim_has_stealable_surplus(false, 0)
         || crate::victim_has_stealable_surplus(false, 1)

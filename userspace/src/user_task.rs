@@ -2045,6 +2045,21 @@ impl UserTaskFuture {
         unsafe {
             *task.uctx.state.get() = state;
         }
+        let mut fpu = FpuArea::reset_boxed();
+        // Linux's fpu_clone() snapshots the parent's live user xstate into
+        // every fork/clone child.  A syscall does not reset FP/SIMD state:
+        // control words and live x87/XMM/YMM/ZMM registers must therefore be
+        // identical when the child resumes at the post-syscall continuation.
+        // Materialize a deferred parent image first, then save the still-live
+        // hardware state directly into the child's independently owned area.
+        // The kernel is built soft-float, so nothing in this path changes the
+        // user register file between trap entry and this snapshot.
+        let _ = narf_scheduler::stackful::materialize_current_user_fpu();
+        // SAFETY: `fpu` is a live FPU_AREA_SIZE-byte, 64-byte-aligned standard
+        // xstate image and CR4.OSXSAVE/OSFXSR is initialized on every CPU.
+        unsafe {
+            narf_arch::x86_64::xsave::fpu_save(&mut *fpu as *mut FpuArea as *mut u8);
+        }
         Self {
             process,
             task,
@@ -2055,11 +2070,7 @@ impl UserTaskFuture {
             state: TaskState::Running,
             saved_cr3: core::cell::Cell::new(None),
             sleep_handle: None,
-            // A `fork(2)` child resumes immediately after the `int 0x80`
-            // that issued the clone — XMM/x87 are caller-saved across the
-            // syscall per the SysV ABI, so a canonical reset image (not
-            // the parent's live FPU) is the correct seed.
-            fpu: FpuArea::reset_boxed(),
+            fpu,
             set_child_tid: None,
         }
     }

@@ -15,6 +15,7 @@
 //! but the shape is stable enough that Stage-4 loader code can
 //! compile and test against it.
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::cell::Cell;
@@ -57,7 +58,7 @@ type AddressSpaceDropHook = fn(u64);
 static ADDRESS_SPACE_DROP_HOOK: IrqSafeSpinLock<Option<AddressSpaceDropHook>> =
     IrqSafeSpinLock::new(None);
 /// Monotonic address-space incarnation allocator. Zero remains the lazy,
-/// unassigned sentinel used by `AddressSpace::empty()`'s const constructor.
+/// unassigned sentinel used by `AddressSpace::empty()`.
 static NEXT_ADDRESS_SPACE_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 fn allocate_address_space_id() -> u64 {
@@ -597,23 +598,38 @@ struct DemandClaimEntry {
 /// capacity exhaustion correct instead of turning it into an ownerless retry.
 #[derive(Clone, Debug)]
 struct DemandClaims {
-    inline: [DemandClaimEntry; INLINE_DEMAND_CLAIMS],
+    /// Preallocated separately so this MAX_CPUS-sized fast path does not make
+    /// every by-value `AddressSpace` temporary consume another KiB of kernel
+    /// stack. Fault handling still performs no allocation until overflow.
+    inline: Box<[DemandClaimEntry]>,
     len: usize,
     overflow: BTreeMap<u64, u64>,
     next_ticket: u64,
 }
 
 impl DemandClaims {
-    const fn new() -> Self {
-        Self {
-            inline: [DemandClaimEntry {
+    fn try_new() -> Result<Self, AddressSpaceError> {
+        let mut inline = Vec::new();
+        inline
+            .try_reserve_exact(INLINE_DEMAND_CLAIMS)
+            .map_err(|_| AddressSpaceError::OutOfRange)?;
+        inline.resize(
+            INLINE_DEMAND_CLAIMS,
+            DemandClaimEntry {
                 vaddr: 0,
                 ticket: 0,
-            }; INLINE_DEMAND_CLAIMS],
+            },
+        );
+        Ok(Self {
+            inline: inline.into_boxed_slice(),
             len: 0,
             overflow: BTreeMap::new(),
             next_ticket: 1,
-        }
+        })
+    }
+
+    fn new() -> Self {
+        Self::try_new().expect("allocate pre-sized demand-claim table")
     }
 
     fn get(&self, vaddr: u64) -> Option<u64> {
@@ -752,19 +768,23 @@ enum SwapPageState {
 }
 
 impl RegionTable {
-    const fn new() -> Self {
-        Self {
+    fn try_new() -> Result<Self, AddressSpaceError> {
+        Ok(Self {
             by_base: RegionIndex::new(),
             next_mapping_id: 1,
             future_lock: FutureLockPolicy::None,
-            demand_pages: DemandClaims::new(),
+            demand_pages: DemandClaims::try_new()?,
             cow_pages: BTreeMap::new(),
             swap_pages: BTreeMap::new(),
             mapped_bytes_cache: Cell::new(Some(0)),
             stack_chain_cache: Cell::new(None),
             #[cfg(target_arch = "x86_64")]
             anon_reclaim_cursor: Cell::new(0),
-        }
+        })
+    }
+
+    fn new() -> Self {
+        Self::try_new().expect("allocate pre-sized address-space metadata")
     }
 
     #[inline]
@@ -1579,6 +1599,12 @@ pub struct AddressSpace {
     numa_hints: IrqSafeSpinLock<NumaHints>,
 }
 
+// `clone_for_fork` is intentionally a by-value interface today. Keep the
+// value small enough that nested syscall/fork frames cannot silently consume
+// a material fraction of the 32 KiB kernel-task stack again. Large bounded
+// tables belong behind preallocated stable storage, not inline here.
+const _: () = assert!(core::mem::size_of::<AddressSpace>() <= 1024);
+
 #[cfg(target_arch = "x86_64")]
 #[inline]
 const fn ordinary_mutation_needs_remote_tlb(tag: u16, vm_shared: bool) -> bool {
@@ -1633,7 +1659,7 @@ impl AddressSpace {
 
     /// Fresh address space with no regions. Stage-4 arch backend
     /// must assign `root` to a freshly-allocated page-table frame.
-    pub const fn empty() -> Self {
+    pub fn empty() -> Self {
         Self {
             root: PhysAddr::new(0),
             address_space_id: core::sync::atomic::AtomicU64::new(0),
@@ -2459,6 +2485,9 @@ impl AddressSpace {
     /// AS is safe to build up and activate per the normal flow.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        // Allocate fallible metadata before the paging root so ENOMEM cannot
+        // strand an otherwise-unpublished page-table frame.
+        let regions = RegionTable::try_new()?;
         // SAFETY: contract documented on the function.
         let phys = unsafe { crate::x86_64::paging::new_user_pml4() }
             .map_err(|_| AddressSpaceError::OutOfRange)?;
@@ -2466,7 +2495,7 @@ impl AddressSpace {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
             context_tag: crate::asid_alloc::allocate_process_context(),
-            regions: IrqSafeSpinLock::new(RegionTable::new()),
+            regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
@@ -2484,6 +2513,9 @@ impl AddressSpace {
     /// `map_region` and install via `activate()`.
     #[cfg(target_arch = "aarch64")]
     pub unsafe fn new_for_user() -> Result<Self, AddressSpaceError> {
+        // Allocate fallible metadata before the paging root so ENOMEM cannot
+        // strand an otherwise-unpublished page-table frame.
+        let regions = RegionTable::try_new()?;
         // SAFETY: contract documented on the function. aarch64's
         // split translation means the user root starts empty —
         // the kernel sits behind TTBR1 and is unaffected.
@@ -2494,7 +2526,7 @@ impl AddressSpace {
             root: phys,
             address_space_id: core::sync::atomic::AtomicU64::new(0),
             context_tag: crate::asid_alloc::allocate_process_context(),
-            regions: IrqSafeSpinLock::new(RegionTable::new()),
+            regions: IrqSafeSpinLock::new(regions),
             huge_regions: IrqSafeSpinLock::new(Vec::new()),
             vma_transaction: IrqSafeSpinLock::new(()),
             mmap_cursor: core::sync::atomic::AtomicU64::new(Self::MMAP_CURSOR_BASE),
@@ -12341,7 +12373,8 @@ fn smoke_memory_demand_claim_inline_overflow_is_lossless() -> TestResult {
     }
     {
         let regions = a.regions.lock();
-        if regions.demand_pages.len != INLINE_DEMAND_CLAIMS
+        if regions.demand_pages.inline.len() != INLINE_DEMAND_CLAIMS
+            || regions.demand_pages.len != INLINE_DEMAND_CLAIMS
             || regions.demand_pages.overflow.len() != 1
         {
             return TestResult::Fail("demand claim did not use bounded inline overflow");

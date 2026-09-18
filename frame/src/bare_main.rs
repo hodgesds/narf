@@ -4614,7 +4614,9 @@ fn boot_userspace_init() {
     // pidfd rather than on the caller. No `current_address_space()`
     // short-circuit here: that would answer for the CALLER whenever the
     // target happened not to be on the run queue.
-    narf_userspace::install_address_space_for_task_lookup(narf_scheduler::address_space_of);
+    narf_userspace::install_address_space_for_task_lookup(|task| {
+        narf_scheduler::address_space_of(narf_scheduler::TaskId(task))
+    });
     install_address_space_lookup(|| {
         // Prefer the executor-published "currently-polling AS" —
         // address_space_of searches the run-queue, which doesn't

@@ -58,6 +58,17 @@ pub enum VmspliceDrainError {
     BadFd,
 }
 
+/// Result classes for the named-FIFO direct user-copy write path.  Keeping
+/// readiness and peer failures distinct from a guarded-copy failure lets the
+/// syscall layer preserve Linux's EAGAIN/EPIPE-before-EFAULT ordering.
+#[derive(Debug)]
+pub enum FifoWriteError {
+    WouldBlock,
+    User(u64),
+    BadFd,
+    BrokenPipe,
+}
+
 /// The shared, mutable state of a named pipe: the byte queue plus live
 /// reader/writer OPEN counts. Both counts are the per-open population of
 /// [`FifoHandle`]s currently referencing this FIFO, incremented when a
@@ -424,15 +435,12 @@ impl FifoHandle {
     pub fn vmsplice_to_user(
         &self,
         max: usize,
-        copy: impl FnOnce(&[u8]) -> Result<(), u64>,
+        mut copy: impl FnMut(&[u8]) -> Result<(), u64>,
     ) -> Result<usize, VmspliceDrainError> {
         if !self.can_read {
             return Err(VmspliceDrainError::BadFd);
         }
 
-        // Allocate before taking the IRQ-safe queue lock. A FIFO cannot supply
-        // more than its fixed capacity, even for a larger user iovec.
-        let mut staging = alloc::vec::Vec::with_capacity(core::cmp::min(max, FIFO_BUF_BYTES));
         let mut q = self.shared.queue.lock();
         let avail = q.len();
         if avail == 0 {
@@ -443,14 +451,68 @@ impl FifoHandle {
             };
         }
         let n = core::cmp::min(max, avail);
-        staging.extend(q.iter().copied().take(n));
-
-        copy(&staging).map_err(VmspliceDrainError::User)?;
+        // VecDeque exposes its logical prefix as at most two physical slices.
+        // Copy those slices directly while the prefix is stable instead of
+        // allocating and bouncing every read through a temporary Vec.  If
+        // either guarded copy faults, no byte is consumed; user memory may
+        // contain a copied prefix, matching Linux copy_page_to_iter semantics.
+        {
+            let (first, second) = q.as_slices();
+            let first_n = core::cmp::min(n, first.len());
+            if first_n != 0 {
+                copy(&first[..first_n]).map_err(VmspliceDrainError::User)?;
+            }
+            let second_n = n - first_n;
+            if second_n != 0 {
+                copy(&second[..second_n]).map_err(VmspliceDrainError::User)?;
+            }
+        }
         q.drain(..n);
         drop(q);
         if n != 0 {
             self.shared.sync_readiness();
         }
+        Ok(n)
+    }
+
+    /// Copy from userspace into this FIFO only after peer/fullness checks.
+    ///
+    /// Linux's `anon_pipe_write` takes the pipe mutex, checks readers and
+    /// available buffer slots, and only then calls `copy_page_from_iter`.
+    /// Reserving initialized deque space before invoking `copy` gives the
+    /// named FIFO the same ordering without a heap allocation or boxed async
+    /// future on the syscall hot path. A failed copy truncates the reservation,
+    /// leaving the queue unchanged.
+    pub fn write_from_user(
+        &self,
+        max: usize,
+        copy: impl FnOnce(&mut [u8]) -> Result<(), u64>,
+    ) -> Result<usize, FifoWriteError> {
+        if !self.can_write {
+            return Err(FifoWriteError::BadFd);
+        }
+
+        let mut q = self.shared.queue.lock();
+        if self.shared.readers.load(Ordering::Acquire) == 0 {
+            return Err(FifoWriteError::BrokenPipe);
+        }
+        let room = FIFO_BUF_BYTES.saturating_sub(q.len());
+        if room == 0 || (max <= PIPE_BUF && room < max) {
+            return Err(FifoWriteError::WouldBlock);
+        }
+        let n = core::cmp::min(max, room);
+        let old_len = q.len();
+        q.resize(old_len + n, 0);
+        let copied = {
+            let contiguous = q.make_contiguous();
+            copy(&mut contiguous[old_len..old_len + n])
+        };
+        if let Err(errno) = copied {
+            q.truncate(old_len);
+            return Err(FifoWriteError::User(errno));
+        }
+        drop(q);
+        self.shared.sync_readiness();
         Ok(n)
     }
 

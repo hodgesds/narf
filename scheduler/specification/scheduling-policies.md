@@ -67,12 +67,10 @@ path.
 Before returning through the executor, the core may directly enter that exact
 wakee only for the built-in class/FIFO policies and a default-class,
 normal-priority stackful task with no period, budget cap, or donation. A local
-target remains resident under a home-run-queue claim. A remote target is
-claimed and removed through a nonblocking home-policy/home-queue transaction,
-then enqueued on the source CPU as a claimed, non-dispatchable migration before
-the switch. Affinity and both CPUs' policy eligibility are checked first;
-contention or rejection falls back to the target's authoritative home. Target
-runtime is charged back to its own virtual runtime. External and wrapper
+target remains resident under a home-run-queue claim. A remote target stays on
+its authoritative home and runs through ordinary executor dispatch; direct
+handoff never rehomes a task across run queues. Target runtime is charged back
+to its own virtual runtime. External and wrapper
 policies are never bypassed: their wakees return through `pick_next` so policy
 observation and ordering remain complete.
 
