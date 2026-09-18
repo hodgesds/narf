@@ -3985,6 +3985,7 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
         .ok_or("fd should resolve to an ops key")?;
         crate::fd::locks::__test_reset();
         let foreign = crate::fd::locks::Lock {
+            kind: crate::fd::locks::LockKind::Posix,
             owner: 0xF0E1,
             ty: crate::fd::locks::F_WRLCK,
             start: 0,
@@ -4138,6 +4139,7 @@ fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
         crate::handlers::register_task_to_pid(FOREIGN_TASK, FOREIGN_PID);
         crate::handlers::register_pid_task_mapping(FOREIGN_PID, FOREIGN_TASK);
         let foreign = crate::fd::locks::Lock {
+            kind: crate::fd::locks::LockKind::Posix,
             owner: FOREIGN_TASK,
             ty: F_WRLCK,
             start: 0,
@@ -4240,45 +4242,75 @@ fn smoke_abi_fdio_fcntl_setlease_is_einval() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_setlease_is_einval);
 
-/// The dangerous member of the group: open-file-description locks.
+/// Open-file-description locks must GRANT, and must still refuse a real
+/// conflict.
 ///
-/// NARF implements POSIX record locks (F_SETLK/F_GETLK/F_SETLKW above) but
-/// not OFD locks, whose owner is the open file description rather than the
-/// process — a different conflict rule, so routing them into the POSIX table
-/// would answer confidently and wrongly. Reporting 0 was worse still: every
-/// caller was told the range was theirs, so two processes could each believe
-/// they held the same exclusive lock. Probers (sqlite, LMDB) read EINVAL as
-/// "no OFD support here" and fall back to POSIX locks, which do work.
+/// This case used to assert the opposite. NARF answered -EINVAL for the OFD
+/// commands, because routing them into the POSIX table would have applied
+/// the wrong conflict rule — their owner is the open file description, not
+/// the process — and answering 0 was worse still: every caller was told the
+/// range was theirs. -EINVAL at least sent probers (sqlite, LMDB) down
+/// their POSIX fallback.
 ///
-/// Both commands are checked: a fallback path keyed on F_OFD_SETLK alone
-/// still deadlocks if F_OFD_SETLKW fabricates a grant.
-fn smoke_abi_fdio_fcntl_ofd_locks_are_einval() -> TestResult {
+/// They are implemented now, so the assertion inverts: the grant is real,
+/// and the second acquire through a DIFFERENT description conflicts. Both
+/// halves matter — a handler that granted unconditionally would pass the
+/// first and fail the second, which is the exact failure the old -EINVAL
+/// was protecting callers from.
+fn smoke_abi_fdio_fcntl_ofd_locks_are_granted() -> TestResult {
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_WRLCK: i16 = 1;
+    const F_UNLCK: i16 = 2;
     const SEEK_SET: i16 = 0;
     with_memfs("/abi-fcntl-ofd", "abi-fcntl-ofd", &[("f", b"xxxx")], || {
         // O_RDWR (2).
         let fd = open_fd_flags(b"/abi-fcntl-ofd/f\0", 2)?;
+        let other = open_fd_flags(b"/abi-fcntl-ofd/f\0", 2)?;
         // struct flock: l_type@0(i16) l_whence@2(i16) l_start@8(i64)
-        // l_len@16(i64) l_pid@24(i32) — the layout the F_GETLK cases above
-        // already write by hand.
+        // l_len@16(i64) l_pid@24(i32).
         let mut bytes = [0u8; 32];
         bytes[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
         bytes[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
         let arg = bytes.as_mut_ptr() as u64;
-        for (cmd, name) in [(F_OFD_SETLK, "F_OFD_SETLK"), (F_OFD_SETLKW, "F_OFD_SETLKW")] {
-            let _ = name;
+        // Both commands, because a path keyed on F_OFD_SETLK alone would
+        // leave F_OFD_SETLKW answering differently.
+        for cmd in [F_OFD_SETLK, F_OFD_SETLKW] {
             match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, cmd, arg)).value as i64 {
-                v if v == EINVAL => {}
-                0 => return Err("an OFD lock command reported a lock that was never taken"),
-                _ => return Err("OFD lock commands must be -EINVAL, not a fabricated grant"),
+                0 => {}
+                v if v == EINVAL => {
+                    return Err("an OFD lock command is still rejected as unimplemented")
+                }
+                _ => return Err("an OFD lock command returned an unexpected error"),
             }
+            // A second description over the same range must be refused.
+            let mut rival = [0u8; 32];
+            rival[0..2].copy_from_slice(&F_WRLCK.to_le_bytes());
+            rival[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+            match call_raw(
+                Syscall::Fcntl.raw(),
+                a2(other as u64, F_OFD_SETLK, rival.as_mut_ptr() as u64),
+            )
+            .value as i64
+            {
+                v if v == EAGAIN => {}
+                0 => return Err("an OFD lock was granted over one already held"),
+                _ => return Err("the conflicting OFD lock returned an unexpected error"),
+            }
+            // Release for the next iteration.
+            let mut rel = [0u8; 32];
+            rel[0..2].copy_from_slice(&F_UNLCK.to_le_bytes());
+            rel[2..4].copy_from_slice(&SEEK_SET.to_le_bytes());
+            let _ = call_raw(
+                Syscall::Fcntl.raw(),
+                a2(fd as u64, F_OFD_SETLK, rel.as_mut_ptr() as u64),
+            );
         }
+        crate::fd::locks::__test_reset();
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_ofd_locks_are_einval);
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_ofd_locks_are_granted);
 
 /// F_SETOWN/F_SETSIG must not promise SIGIO that never arrives.
 ///
@@ -4546,3 +4578,210 @@ fn smoke_abi_fdio_fsize_spares_pipes() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_fsize_spares_pipes);
+
+// ── F_OFD_SETLK / F_OFD_SETLKW / F_OFD_GETLK ────────────────────────
+//
+// Open-file-description locks. `fcntl` used to answer -EINVAL for all
+// three, which sqlite and LMDB read as "not available" and fall back to
+// POSIX record locks — correct, but it gave up the one property they want
+// the feature for.
+//
+// They share the POSIX implementation and differ in the OWNER: Linux's
+// `fl_owner` is `current->files` for a POSIX lock and the `struct file *`
+// for an OFD lock. Everything below tests a consequence of that
+// difference, because the parts they share are already covered above.
+
+const F_OFD_GETLK: u64 = 36;
+const F_OFD_SETLK: u64 = 37;
+const OFD_F_RDLCK: i16 = 0;
+const OFD_F_WRLCK: i16 = 1;
+const OFD_F_UNLCK: i16 = 2;
+
+/// `struct flock`: l_type@0(i16) l_whence@2(i16) l_start@8(i64)
+/// l_len@16(i64) l_pid@24(i32).
+fn ofd_flock(ty: i16, whence: i16, start: i64, len: i64, pid: i32) -> [u8; 32] {
+    let mut fl = [0u8; 32];
+    fl[0..2].copy_from_slice(&ty.to_le_bytes());
+    fl[2..4].copy_from_slice(&whence.to_le_bytes());
+    fl[8..16].copy_from_slice(&start.to_le_bytes());
+    fl[16..24].copy_from_slice(&len.to_le_bytes());
+    fl[24..28].copy_from_slice(&pid.to_le_bytes());
+    fl
+}
+
+fn ofd_open(path: &[u8]) -> Result<u64, &'static str> {
+    const AT_FDCWD: u64 = (-100i64) as u64;
+    match call(
+        Syscall::Openat.raw(),
+        a3(AT_FDCWD, path.as_ptr() as u64, 2, 0), // O_RDWR
+    ) {
+        Some(fd) if fd >= 0 => Ok(fd as u64),
+        _ => Err("open O_RDWR should succeed"),
+    }
+}
+
+fn smoke_abi_fdio_ofd_lock_conflicts_with_own_posix_lock() -> TestResult {
+    with_memfs("/ofd", "ofd", &[("f", b"hello")], || {
+        let a = ofd_open(b"/ofd/f\0")?;
+        // A SECOND open of the same file: a distinct description, so a
+        // distinct OFD owner, but the same process and the same inode.
+        let b = ofd_open(b"/ofd/f\0")?;
+
+        // Two POSIX locks from one process never conflict — they are the
+        // same `fl_owner`. This is the baseline the OFD case departs from,
+        // and asserting it here is what makes the next block meaningful.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(Syscall::Fcntl.raw(), a2(a, 6, fl.as_mut_ptr() as u64)) != Some(0) {
+            return Err("F_SETLK should take a write lock");
+        }
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(Syscall::Fcntl.raw(), a2(b, 6, fl.as_mut_ptr() as u64)) != Some(0) {
+            return Err("a second POSIX lock from the same process must not conflict");
+        }
+        // Release, so the OFD attempt below meets only what it should.
+        let mut fl = ofd_flock(OFD_F_UNLCK, 0, 0, 16, 0);
+        let _ = call(Syscall::Fcntl.raw(), a2(a, 6, fl.as_mut_ptr() as u64));
+        let mut fl = ofd_flock(OFD_F_UNLCK, 0, 0, 16, 0);
+        let _ = call(Syscall::Fcntl.raw(), a2(b, 6, fl.as_mut_ptr() as u64));
+
+        // Now the same shape with OFD locks. Two descriptions, one process
+        // — and they DO conflict, because the owner is the description.
+        // That is the entire reason the feature exists: a thread can take a
+        // lock the rest of its own process has to respect.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(a, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_SETLK should take a write lock");
+        }
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        match call(
+            Syscall::Fcntl.raw(),
+            a2(b, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == EAGAIN => {}
+            Some(0) => return Err("two OFD locks on one file from one process must conflict"),
+            _ => return Err("the conflicting F_OFD_SETLK returned an unexpected error"),
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_ofd_lock_conflicts_with_own_posix_lock
+);
+
+fn smoke_abi_fdio_ofd_getlk_reports_minus_one_pid() -> TestResult {
+    with_memfs("/ofd", "ofd", &[("f", b"hello")], || {
+        let a = ofd_open(b"/ofd/f\0")?;
+        let b = ofd_open(b"/ofd/f\0")?;
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(a, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_SETLK should take a write lock");
+        }
+        // `locks_translate_pid` returns -1 for an OFD lock: its owner is a
+        // description, not a process, so there is no pid to name. Reporting
+        // the creating task would point `lslocks` at the wrong process, and
+        // the description can outlive that task entirely.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(b, F_OFD_GETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_GETLK should return 0");
+        }
+        if i16::from_le_bytes(fl[0..2].try_into().unwrap()) != OFD_F_WRLCK {
+            return Err("F_OFD_GETLK should report the blocking write lock");
+        }
+        let l_pid = i32::from_le_bytes(fl[24..28].try_into().unwrap());
+        if l_pid != -1 {
+            return Err("an OFD lock must be reported with l_pid == -1");
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_ofd_getlk_reports_minus_one_pid
+);
+
+fn smoke_abi_fdio_ofd_rejects_nonzero_l_pid() -> TestResult {
+    with_memfs("/ofd", "ofd", &[("f", b"hello")], || {
+        let fd = ofd_open(b"/ofd/f\0")?;
+        // `if (flock->l_pid != 0) goto out;` — rejected outright rather
+        // than ignored, so a caller that filled l_pid in (as it would for
+        // F_GETLK) finds out the struct means something different here.
+        for cmd in [F_OFD_GETLK, F_OFD_SETLK] {
+            let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 1234);
+            match call(Syscall::Fcntl.raw(), a2(fd, cmd, fl.as_mut_ptr() as u64)) {
+                Some(v) if v == EINVAL => {}
+                _ => return Err("an OFD command with a non-zero l_pid must be -EINVAL"),
+            }
+        }
+        // The same request with l_pid == 0 is accepted, so the rejection
+        // above is about that field and not about the command.
+        let mut fl = ofd_flock(OFD_F_RDLCK, 0, 0, 16, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(fd, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_SETLK with l_pid == 0 should succeed");
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_ofd_rejects_nonzero_l_pid);
+
+fn smoke_abi_fdio_lock_whence_is_honoured() -> TestResult {
+    with_memfs("/ofd", "ofd", &[("f", b"0123456789")], || {
+        let a = ofd_open(b"/ofd/f\0")?;
+        let b = ofd_open(b"/ofd/f\0")?;
+        // SEEK_END with a negative start: the last two bytes of a ten-byte
+        // file, i.e. [8, 10). Both inputs this needs — the file size and
+        // the description's offset — were always available; the path used
+        // to reject every whence but SEEK_SET.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 2, -2, 2, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(a, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_SETLK with SEEK_END should succeed");
+        }
+        // A SEEK_SET request over [8, 10) must now collide, which proves
+        // the whence was resolved to an absolute range rather than ignored.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 8, 2, 0);
+        match call(
+            Syscall::Fcntl.raw(),
+            a2(b, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) {
+            Some(v) if v == EAGAIN => {}
+            Some(0) => return Err("SEEK_END was not resolved against the file size"),
+            _ => return Err("the overlapping lock returned an unexpected error"),
+        }
+        // And a range below it is free, so the lock did not become
+        // whole-file by accident.
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 4, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(b, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("a non-overlapping range should still be lockable");
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_lock_whence_is_honoured);

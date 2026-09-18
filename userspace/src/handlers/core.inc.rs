@@ -2268,6 +2268,12 @@ const F_SETFL: u64 = 4;
 const F_GETLK: u64 = 5;
 const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
+/// Open-file-description locks. Same `struct flock` wire shape as the
+/// three above; what differs is the OWNER (`fl_owner = filp`, not
+/// `current->files`) and therefore when the lock is released.
+const F_OFD_GETLK: u64 = 36;
+const F_OFD_SETLK: u64 = 37;
+const F_OFD_SETLKW: u64 = 38;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 /// Linux fcntl `F_ADD_SEALS` (1033) — add seal bits to a memfd.
 const F_ADD_SEALS: u64 = 1033;
