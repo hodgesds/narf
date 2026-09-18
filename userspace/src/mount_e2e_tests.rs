@@ -1663,6 +1663,91 @@ fn smoke_open_tree_move_mount() -> TestResult {
 }
 kernel_test_in!("userspace/mount", smoke_open_tree_move_mount);
 
+// Regression: `mount_setattr(fd, "", AT_EMPTY_PATH, attr)` targets the mount
+// named by the fd — not a path. systemd's new-mount-API sandbox sets a DETACHED
+// fsmount/open_tree mount read-only this way BEFORE `move_mount` attaches it.
+// NARF used to resolve the EMPTY path, which failed (or hit the wrong mount),
+// aborting ProtectProc/PrivateDevices namespacing with EXIT_NAMESPACE — the
+// systemd-logind / systemd-userdbd failure that kept the KDE greeter from a
+// seat. The attr must be recorded against the detached mount and applied when
+// `move_mount` gives it a mount point.
+fn smoke_mount_setattr_at_empty_path_detached_mount() -> TestResult {
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    let task: u64 = 0x71_2a;
+    set_task(task);
+    crate::fd::__test_reset();
+    crate::handlers::__test_root_dir_reset();
+    crate::handlers::clear_current_mount_namespace_for_test();
+    let _ = unmount_for_test("/mse_src");
+    let _ = unmount_for_test("/mse_dst");
+
+    let mut msrc = StubCtx {
+        args: mount_args(b"tmpfs\0", b"/mse_src\0", b"tmpfs\0", 0),
+        ret: None,
+    };
+    crate::handlers::sys_mount_for_test(&mut msrc);
+    if !matches!(msrc.ret, Some(r) if r.value == 0) {
+        return TestResult::Fail("source mount /mse_src failed");
+    }
+    const OPEN_TREE_CLONE: u64 = 0x0000_0001;
+    let mut otctx = StubCtx {
+        args: open_tree_args(0, b"/mse_src\0", OPEN_TREE_CLONE),
+        ret: None,
+    };
+    crate::mount_api::sys_open_tree(&mut otctx);
+    let tree_fd = match otctx.ret {
+        Some(r) if r.status == SyscallReturn::OK && (r.value as i64) >= 0 => r.value,
+        _ => {
+            let _ = unmount_for_test("/mse_src");
+            return TestResult::Fail("open_tree(CLONE) did not return an fd");
+        }
+    };
+
+    // mount_setattr(tree_fd, "", AT_EMPTY_PATH, { attr_set: MOUNT_ATTR_RDONLY }, 32)
+    const AT_EMPTY_PATH: u64 = 0x0000_1000;
+    let mut attr = [0u8; 32];
+    attr[0..8].copy_from_slice(&1u64.to_ne_bytes()); // attr_set = MOUNT_ATTR_RDONLY
+    let empty = b"\0";
+    let mut sactx = StubCtx {
+        args: SyscallArgs {
+            arg0: tree_fd,
+            arg1: empty.as_ptr() as u64,
+            arg2: AT_EMPTY_PATH,
+            arg3: attr.as_ptr() as u64,
+            arg4: 32,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    crate::handlers::with_kernel_buffers(|| crate::mount_api::sys_mount_setattr(&mut sactx));
+    let setattr_ok = matches!(sactx.ret, Some(r) if r.value == 0);
+
+    // move_mount attaches the detached mount and applies the recorded attr.
+    let mut mmctx = StubCtx {
+        args: move_mount_args(tree_fd, b"\0", 0, b"/mse_dst\0"),
+        ret: None,
+    };
+    crate::mount_api::sys_move_mount(&mut mmctx);
+    let moved = matches!(mmctx.ret, Some(r) if r.value == 0);
+
+    let _ = unmount_for_test("/mse_src");
+    let _ = unmount_for_test("/mse_dst");
+
+    if !setattr_ok {
+        return TestResult::Fail(
+            "mount_setattr(fd, AT_EMPTY_PATH) on a detached mount must succeed, not resolve the empty path and fail",
+        );
+    }
+    if !moved {
+        return TestResult::Fail("move_mount after mount_setattr(AT_EMPTY_PATH) failed");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "userspace/mount",
+    smoke_mount_setattr_at_empty_path_detached_mount
+);
+
 // ── Smoke 8b: move_mount onto an OCCUPIED path stacks, not EBUSY ───
 // systemd's ProtectHostname= sandbox clones /proc/sys/kernel/domainname with
 // open_tree(CLONE) and move_mount()s the read-only copy back over the live

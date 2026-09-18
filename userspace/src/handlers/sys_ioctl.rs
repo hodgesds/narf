@@ -28,6 +28,47 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    // ── FIONBIO (0x5421) — generic O_NONBLOCK toggle ──────────────────
+    //
+    // `fs/ioctl.c::ioctl_fionbio`: read the `int` at `argp`; a non-zero value
+    // sets O_NONBLOCK on the open file, zero clears it; return 0 (or EFAULT for
+    // a bad pointer). Linux dispatches this in `do_vfs_ioctl` BEFORE reaching
+    // `f_op->unlocked_ioctl`, so it works on any fd type — pipe, file, socket,
+    // tty. Handled here for the same reason: it is a VFS flag toggle, not a
+    // device op, and returning ENOTTY for it (the old default) broke every
+    // Linux Rust binary — `std`'s `FileDesc::set_nonblocking` is
+    // `ioctl(fd, FIONBIO, &on)`, so `Command::output()` (which sets its
+    // stdout/stderr pipes non-blocking) panicked with "Inappropriate ioctl".
+    const FIONBIO: u32 = 0x5421;
+    if cmd == FIONBIO {
+        let mut raw = [0u8; 4];
+        // SAFETY: the UAPI argument is a single `int`; copy_from_user
+        // range-validates the four bytes.
+        if unsafe { copy_from_user(&mut raw, arg as u64) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            return;
+        }
+        let on = i32::from_ne_bytes(raw) != 0;
+        // Keep O_NONBLOCK in sync across the same three sinks F_SETFL updates
+        // (see sys_fcntl `F_SETFL`): a socket's own nonblock flag, the mqueue
+        // state, and the fd-table status flags F_GETFL reports.
+        if let Some(sock) = current_socket(fd) {
+            sock.set_nonblock(on);
+        }
+        crate::mqueue::set_fd_nonblock(task, fd, on);
+        let _ = fd::with_table(task, |t| {
+            if let Some(old) = t.status_flags(fd) {
+                let new = if on {
+                    old | crate::fd::O_NONBLOCK
+                } else {
+                    old & !crate::fd::O_NONBLOCK
+                };
+                let _ = t.set_status_flags(fd, new);
+            }
+        });
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
+    }
     // ── nsfs (`fs/nsfs.c::ns_ioctl`) ──────────────────────────────────
     //
     // Handled here rather than behind `FileOps::ioctl` because four of
