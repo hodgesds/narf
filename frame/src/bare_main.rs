@@ -4567,6 +4567,12 @@ fn boot_userspace_init() {
     // highest-badness process (and the reaper reclaim it) once in-kernel
     // reclaim can no longer hold the free pool above the emergency watermark.
     narf_userspace::oom::install();
+    // Linux boots without swap until userspace explicitly enables an area.
+    // NARF has no swapon(2) path yet, so the bare `zram` boot flag is the
+    // explicit opt-in for its built-in compressed-RAM backend.
+    if narf_boot::args().has_flag("zram") {
+        narf_memory::install_default_swap_if_unset();
+    }
     // Install the anon-reclaim policy so kswapd can swap out cold private
     // anonymous pages once clean caches + shrinkers no longer cover the
     // watermark deficit (before resorting to the OOM killer).

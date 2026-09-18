@@ -587,11 +587,9 @@ mod reclaim_request_tests {
 // whether that user memory pressure also arms the OOM killer to reclaim a hog:
 //
 //   * Never (2)     — graceful ENOMEM only; the kernel never OOM-kills for user
-//                     pressure. Matches the reserve's no-overcommit behaviour
-//                     and lets stress-ng-style workloads that expect ENOMEM
-//                     (and abort on a killed worker) run clean. NARF default.
+//                     pressure. Matches the reserve's no-overcommit behaviour.
 //   * Heuristic (0) — Linux's default: user pressure the reclaimer can't clear
-//                     kills the highest-badness process.
+//                     kills the highest-badness process. NARF default.
 //   * Always (1)    — same OOM behaviour as Heuristic here (both allow the
 //                     killer); kept distinct for the sysctl ABI value.
 
@@ -603,12 +601,14 @@ pub enum OvercommitMode {
     Never = 2,
 }
 
-/// Default: `Never` — user pressure surfaces as ENOMEM, not an OOM-kill. This
-/// is stricter than Linux's default (`Heuristic`) on purpose: NARF's reserve
-/// already prevents the kernel from failing, so killing a process is a genuine
-/// last resort reserved for real kernel exhaustion.
+/// Boot value for the Linux-compatible overcommit policy.
+pub const DEFAULT_OVERCOMMIT_MODE: OvercommitMode = OvercommitMode::Heuristic;
+
+/// Match Linux's default (`Heuristic`): sustained user pressure may select an
+/// OOM victim after reclaim fails, while the protected kernel reserve remains
+/// unavailable to userspace allocations.
 static OVERCOMMIT: core::sync::atomic::AtomicU8 =
-    core::sync::atomic::AtomicU8::new(OvercommitMode::Never as u8);
+    core::sync::atomic::AtomicU8::new(DEFAULT_OVERCOMMIT_MODE as u8);
 
 /// Set the overcommit mode from a raw sysctl value (0/1/2). Out-of-range
 /// values are ignored. Backs a future `/proc/sys/vm/overcommit_memory`.
@@ -632,6 +632,21 @@ pub fn overcommit_mode() -> OvercommitMode {
 pub fn user_pressure_arms_oom() -> bool {
     !matches!(overcommit_mode(), OvercommitMode::Never)
 }
+
+#[cfg(feature = "kernel-test")]
+fn smoke_overcommit_boot_default_matches_linux() -> narf_kernel_test::TestResult {
+    if DEFAULT_OVERCOMMIT_MODE == OvercommitMode::Heuristic {
+        narf_kernel_test::TestResult::Pass
+    } else {
+        narf_kernel_test::TestResult::Fail("boot overcommit policy is not Linux heuristic mode")
+    }
+}
+
+#[cfg(feature = "kernel-test")]
+narf_kernel_test::kernel_test_in!(
+    "memory/reclaim",
+    smoke_overcommit_boot_default_matches_linux
+);
 
 /// Install the reclaimer wake hook (the kernel binary passes a `fn(usize)` that
 /// wakes the parked `kswapd<node>` kthread for the given NUMA node). Call once

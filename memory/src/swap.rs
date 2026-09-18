@@ -819,9 +819,10 @@ pub fn add_swap_area<B: SwapBackend>(backend: B, priority: i32) -> Option<u8> {
     None
 }
 
-/// Install the default compressed-RAM backend as the primary area if no area is
-/// set yet. Called from the pageout path so callers never hit a missing
-/// backend. Idempotent.
+/// Explicitly install the default compressed-RAM backend as the primary area
+/// if no area is set yet. The pageout path does not call this implicitly:
+/// matching Linux, a boot with no configured swap area remains swapless and
+/// sustained pressure proceeds to the OOM policy. Idempotent.
 pub fn install_default_if_unset() {
     let mut swap = SWAP.lock();
     if !swap.any_installed() {
@@ -1088,8 +1089,6 @@ pub(crate) unsafe fn swap_out_batch_owned(
     if victims.is_empty() {
         return Ok(0);
     }
-    install_default_if_unset();
-
     // Cap the batch at the knob so an oversized caller list still
     // writes in bounded chunks. (We take the first `batch` here; the
     // caller loops if it has more.)
@@ -1702,6 +1701,23 @@ pub fn __reset_for_test() {
 mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
+
+    fn smoke_swap_backend_requires_explicit_install() -> TestResult {
+        __reset_for_test();
+        if backend_name().is_some() {
+            return TestResult::Fail("swap backend existed before explicit installation");
+        }
+        install_default_if_unset();
+        let installed = backend_name() == Some("zram");
+        __reset_for_test();
+        if installed {
+            TestResult::Pass
+        } else {
+            TestResult::Fail("explicit default swap installation did not install zram")
+        }
+    }
+
+    kernel_test_in!("memory/swap", smoke_swap_backend_requires_explicit_install);
 
     // ── 1. swap-entry PTE encode/decode round-trip ───────────────
 

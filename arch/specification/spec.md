@@ -356,7 +356,11 @@ pub mod xsave {
   after write/read-back completion. Callers must pin/non-preempt the CPU;
   remote policy changes require a rendezvous. NMI/SError handlers must be
   correct under either the old or new policy. Disabling additionally requires
-  policy authorisation and quiescence from protected-boundary entry.
+  policy authorisation and quiescence from protected-boundary entry. On x86,
+  Protected prefers verified AMD Automatic IBRS and clears legacy IBRS only
+  after AIBRSE is active; rejected AIBRSE writes retain legacy IBRS. Failed
+  multi-MSR transitions attempt to restore the complete entry policy before
+  publishing `Failed`.
 - **All domain / TLB / cache / MSR intrinsics are wrapped with
   `compiler_fence(SeqCst)` before and after the `asm!`.** Under fat
   LTO (see `build/` §4) the `"memory"` clobber alone is not enough

@@ -6,20 +6,25 @@
 
 This spec also defines the cross-architecture, per-CPU **baseline**
 speculation policy in `arch::speculation`. The protected boot default maps to
-IBRS + STIBP + SSBD on x86_64 and PSTATE.SSBS on aarch64, limited to controls
-advertised and accepted by each logical CPU. Unlike a boot-global switch, the
-API can later be invoked by a pinned IPI/rendezvous on one selected CPU.
-Unsupported hardware degrades explicitly; an advertised control whose
-privileged write or read-back fails is `State::Failed` and fails CPU bring-up.
+AMD Automatic IBRS when advertised and accepted, otherwise legacy IBRS, plus
+STIBP + SSBD on x86_64; aarch64 uses PSTATE.SSBS. Automatic IBRS is enabled
+through `IA32_EFER.AIBRSE` and legacy `IA32_SPEC_CTRL.IBRS` is then cleared, so
+the privilege-transition protection does not penalise user-mode indirect
+branches. A hypervisor that enumerates but rejects AIBRSE falls back to legacy
+IBRS. Every transition preserves unrelated MSR bits and verifies the selected
+mechanism on each logical CPU. Unlike a boot-global switch, the API can later
+be invoked by a pinned IPI/rendezvous on one selected CPU. Unsupported hardware
+degrades explicitly; a transition whose privileged write or read-back cannot
+be completed or rolled back is `State::Failed` and fails CPU bring-up.
 
 `State::Protected` means the controls represented by this baseline were
 verified, **not** that every speculative-execution vulnerability is mitigated.
-On x86 without enhanced IBRS, vendor guidance requires rewriting IBRS after a
-less-privileged→more-privileged predictor transition; NARF does not yet have
-that entry-stub hook or a retpoline build. IBPB between mutually untrusted
-same-privilege tasks, RSB filling/PBRSB, BHI, Spectre-v1 gadget hardening,
-MDS/TAA buffer clearing, and L1TF policy remain separate work. The status
-surface must not report those protections based on this baseline alone.
+On x86 without Automatic/enhanced IBRS, vendor guidance requires rewriting
+IBRS after a less-privileged→more-privileged predictor transition; NARF does
+not yet have that entry-stub hook or a retpoline build. IBPB between mutually
+untrusted same-privilege tasks, RSB filling/PBRSB, BHI, Spectre-v1 gadget
+hardening, MDS/TAA buffer clearing, and L1TF policy remain separate work. The
+status surface must not report those protections based on this baseline alone.
 
 The transition masks ordinary IRQs and restores the entry mask exactly. This
 prevents an IRQ handler from crossing a boundary mid-transition, while the

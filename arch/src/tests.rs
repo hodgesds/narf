@@ -149,6 +149,7 @@ fn smoke_spec_ctrl_policy_mask_preserves_unowned_bits() -> TestResult {
         stibp: false,
         ssbd: true,
         l1d_flush: false,
+        auto_ibrs: false,
     };
     let (enabled, supported) = match desired_value(unowned | SPEC_CTRL_STIBP, features, true) {
         Some(values) => values,

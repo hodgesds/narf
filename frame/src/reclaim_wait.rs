@@ -21,6 +21,11 @@ const MAX_RECLAIM_WAITERS: usize = narf_scheduler::MAX_USER_TASKS;
 static RECLAIM_COMPLETED: [AtomicU32; FRAME_MAX_NUMA_NODES] =
     [const { AtomicU32::new(0) }; FRAME_MAX_NUMA_NODES];
 
+/// Linux bounds consecutive reclaim failures at `MAX_RECLAIM_RETRIES` before
+/// entering its OOM path. NARF's reclaim/OOM work runs in kswapd rather than
+/// inline, so each iteration below waits for one exact completed cycle.
+const MAX_RECLAIM_RETRIES: usize = 16;
+
 struct Waiter {
     ticket: ReclaimTicket,
     waker: Waker,
@@ -171,23 +176,33 @@ fn try_demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), Address
     result
 }
 
-fn retry_once_after_pressure(
+fn retry_after_pressure(
     mut attempt: impl FnMut() -> Result<(), AddressSpaceError>,
     mut wait: impl FnMut(ReclaimTicket) -> bool,
     may_wait: bool,
 ) -> Result<(), AddressSpaceError> {
-    let first = attempt();
-    match first {
-        Err(AddressSpaceError::ReclaimPressure(ticket)) if may_wait && wait(ticket) => attempt(),
-        result => result,
+    let mut result = attempt();
+    if !may_wait {
+        return result;
     }
+
+    for _ in 0..MAX_RECLAIM_RETRIES {
+        let Err(AddressSpaceError::ReclaimPressure(ticket)) = result else {
+            return result;
+        };
+        if !wait(ticket) {
+            return result;
+        }
+        result = attempt();
+    }
+    result
 }
 
 /// Resolve one demand fault, parking only for anonymous reserve pressure and
-/// retrying at most once. No-stackful/full-table/zero-progress paths all
-/// terminate after the original or second allocation result; none busy-yield.
+/// retrying after completed reclaim cycles with Linux's bounded retry count.
+/// No-stackful/full-table paths terminate immediately; none busy-yield.
 pub(crate) fn demand_page(aspace: &AddressSpace, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-    retry_once_after_pressure(|| try_demand_page(aspace, vaddr), park_until_reclaim, true)
+    retry_after_pressure(|| try_demand_page(aspace, vaddr), park_until_reclaim, true)
 }
 
 /// Resolve one demand fault without entering the reclaim wait path.
@@ -200,7 +215,7 @@ pub(crate) fn demand_page_no_wait(
     aspace: &AddressSpace,
     vaddr: VirtAddr,
 ) -> Result<(), AddressSpaceError> {
-    retry_once_after_pressure(
+    retry_after_pressure(
         || try_demand_page(aspace, vaddr),
         |_| unreachable!("no-wait demand fault entered reclaim parking"),
         false,
@@ -290,21 +305,28 @@ mod tests {
             sequence: 1,
         };
         let mut attempts = 0usize;
-        let result = retry_once_after_pressure(
+        let mut waits = 0usize;
+        let result = retry_after_pressure(
             || {
                 attempts += 1;
                 Err(AddressSpaceError::ReclaimPressure(ticket))
             },
-            |_| true,
+            |_| {
+                waits += 1;
+                true
+            },
             true,
         );
-        if result != Err(AddressSpaceError::ReclaimPressure(ticket)) || attempts != 2 {
-            return TestResult::Fail("zero-progress pressure did not stop after one retry");
+        if result != Err(AddressSpaceError::ReclaimPressure(ticket))
+            || attempts != MAX_RECLAIM_RETRIES + 1
+            || waits != MAX_RECLAIM_RETRIES
+        {
+            return TestResult::Fail("zero-progress pressure exceeded the Linux retry bound");
         }
 
         let mut nonpressure_attempts = 0usize;
         let mut waited = false;
-        let result = retry_once_after_pressure(
+        let result = retry_after_pressure(
             || {
                 nonpressure_attempts += 1;
                 Err(AddressSpaceError::Unmapped)
@@ -329,7 +351,7 @@ mod tests {
         };
         let mut attempts = 0usize;
         let mut waited = false;
-        let result = retry_once_after_pressure(
+        let result = retry_after_pressure(
             || {
                 attempts += 1;
                 Err(AddressSpaceError::ReclaimPressure(ticket))

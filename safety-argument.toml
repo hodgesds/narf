@@ -670,7 +670,7 @@ argument = "Anonymous demand allocation reports reserve pressure only after canc
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "The page-fault backpressure path allocates no memory and performs only a bounded fixed-table scan before switching out. It clears the per-CPU mempolicy publication before parking, invokes no wake callback while holding a waiter lock, and retries demand allocation at most once after kswapd completes a bounded cycle. Missing stackful context, full waiter capacity, non-pressure errors, and a second pressure failure all fail closed without sleeping or spinning, so trap progress cannot depend on an unbounded reclaim loop."
+argument = "The page-fault backpressure path allocates no memory and performs only a bounded fixed-table scan before switching out. It clears the per-CPU mempolicy publication before every park, invokes no wake callback while holding a waiter lock, and retries demand allocation only after kswapd completes the exact ticketed cycle. The loop admits at most Linux's sixteen reclaim retries; missing stackful context, full waiter capacity, non-pressure errors, and exhaustion of that fixed budget fail closed without sleeping again or spinning, so trap progress cannot depend on an unbounded reclaim loop."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
@@ -694,7 +694,11 @@ argument = "The x86 TLB-shootdown receiver updates INVPCID-path, ACK, and ever-r
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Guarded kernel uaccess publishes a cache-line-isolated marker only on the executing CPU while its single-depth recovery probe and interrupt mask are live and, on x86_64, while the SMAP AC window is open. A current-EL translation fault may still install immediately available backing, but reserve pressure uses an allocation-only path that neither registers a reclaim waiter nor switches tasks; it falls through to the already-armed architecture fixup and surfaces EFAULT before the marker, probe, and access window are disarmed in order. Lower-EL demand faults retain generation-ordered reclaim parking and one bounded retry, so the change prevents per-CPU recovery state from crossing task migration without changing mapping authority, frame ownership, or user-fault reclaim progress."
+argument = "Guarded kernel uaccess publishes a cache-line-isolated marker only on the executing CPU while its single-depth recovery probe and interrupt mask are live and, on x86_64, while the SMAP AC window is open. A current-EL translation fault may still install immediately available backing, but reserve pressure uses an allocation-only path that neither registers a reclaim waiter nor switches tasks; it falls through to the already-armed architecture fixup and surfaces EFAULT before the marker, probe, and access window are disarmed in order. Lower-EL demand faults retain exact-ticket reclaim parking with a fixed sixteen-cycle bound, so the change prevents per-CPU recovery state from crossing task migration without changing mapping authority, frame ownership, or user-fault reclaim progress."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Changing the boot overcommit value from Never to Linux's Heuristic policy alters only when the existing waiter-scoped OOM authority may select a victim after bounded reclaim. Removing implicit zram creation makes swap ownership explicit: without a configured backend, pageout returns NoSlots without changing any PTE or frame owner and the same bounded cycle may enter OOM; with an explicitly installed backend, the existing transactional swap publication and TLB-before-reuse rules remain unchanged. Neither change grants mapping, capability, domain, or frame authority."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
