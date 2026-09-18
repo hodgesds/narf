@@ -1324,6 +1324,14 @@ fn smoke_abi_fsx_nosuid_mount_confers_no_privilege() -> TestResult {
         crate::handlers::__test_set_fsids(task, CALLER, CALLER);
         let (euid, ..) = crate::handlers::__test_bprm_fill_uid(task, path, false);
         crate::handlers::__test_uidgid_reset();
+        // `__test_bprm_fill_uid` performs the WHOLE exec credential step,
+        // and that step ends in `pE' = fE ? pP' : pA'` — so an exec as a
+        // non-root uid clears the effective set, exactly as Linux does. The
+        // harness uses this hook as a credential setter and then keeps
+        // issuing privileged syscalls (the second mount below), so it has
+        // to put the boot credential back; a real process would have been
+        // replaced by the new image instead.
+        crate::handlers::__test_caps_reset();
         if euid != OWNER {
             return finish(Err(
                 "the baseline setuid transition did not happen — test is vacuous",
