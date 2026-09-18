@@ -4847,3 +4847,140 @@ fn smoke_abi_fdio_lock_whence_is_honoured() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_lock_whence_is_honoured);
+
+// ── flock(2) ownership ──────────────────────────────────────────────
+//
+// `flock` locks belong to the OPEN FILE DESCRIPTION (`fl_file`), not the
+// task. NARF used to key them by task id with an anonymous count of shared
+// holders, which made three distinct things wrong. Each is a case below,
+// because each was silently the wrong answer rather than an error.
+
+const LOCK_SH_OP: u64 = 1;
+const LOCK_EX_OP: u64 = 2;
+const LOCK_NB_OP: u64 = 4;
+const LOCK_UN_OP: u64 = 8;
+
+fn flock_op(fd: u64, op: u64) -> Option<i64> {
+    call(Syscall::Flock.raw(), a1(fd, op))
+}
+
+fn smoke_abi_fdio_flock_two_opens_conflict() -> TestResult {
+    with_memfs("/flk", "flk", &[("f", b"hi")], || {
+        let a = open_fd(b"/flk/f\0")? as u64;
+        let b = open_fd(b"/flk/f\0")? as u64;
+        // Two independent opens are two descriptions. Owned by task, they
+        // were indistinguishable and the second acquire "succeeded" by
+        // matching its own owner — so the single-instance guard every
+        // `flock(lockfd, LOCK_EX|LOCK_NB)` daemon relies on never fired
+        // against a second copy in the same process.
+        if flock_op(a, LOCK_EX_OP | LOCK_NB_OP) != Some(0) {
+            return Err("first LOCK_EX should succeed");
+        }
+        match flock_op(b, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(v) if v == EAGAIN => {}
+            Some(0) => return Err("a second open acquired an exclusive flock already held"),
+            _ => return Err("the conflicting flock returned an unexpected error"),
+        }
+        // Released, the rival takes it — so the refusal was the lock, not
+        // something broken about the second descriptor.
+        if flock_op(a, LOCK_UN_OP) != Some(0) {
+            return Err("LOCK_UN should succeed");
+        }
+        match flock_op(b, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(0) => Ok(()),
+            _ => Err("after LOCK_UN the rival should acquire"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_two_opens_conflict);
+
+fn smoke_abi_fdio_flock_unlock_releases_only_own() -> TestResult {
+    with_memfs("/flk", "flk", &[("f", b"hi")], || {
+        let holder = open_fd(b"/flk/f\0")? as u64;
+        let stranger = open_fd(b"/flk/f\0")? as u64;
+        let rival = open_fd(b"/flk/f\0")? as u64;
+        if flock_op(holder, LOCK_SH_OP | LOCK_NB_OP) != Some(0) {
+            return Err("LOCK_SH should succeed");
+        }
+        // A description that holds NOTHING unlocking is a no-op success —
+        // and must not release the holder's lock. The old model decremented
+        // a shared count with no check that the caller held anything, so
+        // this call dropped someone else's lock.
+        if flock_op(stranger, LOCK_UN_OP) != Some(0) {
+            return Err("LOCK_UN by a non-holder should still return 0");
+        }
+        // The shared lock must still be standing, which an exclusive
+        // acquire from a third description proves by failing.
+        match flock_op(rival, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(v) if v == EAGAIN => Ok(()),
+            Some(0) => Err("a stranger's LOCK_UN released the holder's shared lock"),
+            _ => Err("the exclusive probe returned an unexpected error"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_unlock_releases_only_own);
+
+fn smoke_abi_fdio_flock_shared_holds_are_attributable() -> TestResult {
+    with_memfs("/flk", "flk", &[("f", b"hi")], || {
+        let one = open_fd(b"/flk/f\0")? as u64;
+        let two = open_fd(b"/flk/f\0")? as u64;
+        let rival = open_fd(b"/flk/f\0")? as u64;
+        // Shared locks stack across descriptions...
+        for fd in [one, two] {
+            if flock_op(fd, LOCK_SH_OP | LOCK_NB_OP) != Some(0) {
+                return Err("LOCK_SH should succeed alongside another shared holder");
+            }
+        }
+        // ...and an exclusive is refused while ANY of them stands.
+        match flock_op(rival, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(v) if v == EAGAIN => {}
+            _ => return Err("LOCK_EX should be refused while shared locks are held"),
+        }
+        // Releasing one leaves the other, so the count is per-owner and not
+        // a single anonymous tally.
+        if flock_op(one, LOCK_UN_OP) != Some(0) {
+            return Err("LOCK_UN should succeed");
+        }
+        match flock_op(rival, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(v) if v == EAGAIN => {}
+            Some(0) => return Err("releasing one shared holder released both"),
+            _ => return Err("the exclusive probe returned an unexpected error"),
+        }
+        // Releasing the last one lets it through.
+        if flock_op(two, LOCK_UN_OP) != Some(0) {
+            return Err("LOCK_UN should succeed");
+        }
+        match flock_op(rival, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(0) => Ok(()),
+            _ => Err("LOCK_EX should succeed once every shared holder released"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_flock_shared_holds_are_attributable
+);
+
+fn smoke_abi_fdio_flock_relock_converts() -> TestResult {
+    with_memfs("/flk", "flk", &[("f", b"hi")], || {
+        let a = open_fd(b"/flk/f\0")? as u64;
+        let rival = open_fd(b"/flk/f\0")? as u64;
+        // `flock_lock_inode` CONVERTS the description's existing lock
+        // rather than adding a second, so SH→EX→SH leaves exactly one.
+        for op in [LOCK_SH_OP, LOCK_EX_OP, LOCK_SH_OP] {
+            if flock_op(a, op | LOCK_NB_OP) != Some(0) {
+                return Err("re-locking one's own description should convert, not conflict");
+            }
+        }
+        // One LOCK_UN is therefore enough to clear it. If the conversions
+        // had stacked, the rival would still be blocked here.
+        if flock_op(a, LOCK_UN_OP) != Some(0) {
+            return Err("LOCK_UN should succeed");
+        }
+        match flock_op(rival, LOCK_EX_OP | LOCK_NB_OP) {
+            Some(0) => Ok(()),
+            _ => Err("a converted lock took more than one LOCK_UN to clear"),
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_relock_converts);

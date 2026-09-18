@@ -11144,16 +11144,11 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = TASK_TERMIOS.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = FLOCK_TABLE.lock().as_mut() {
-        // flock(2) exclusive locks die with their owner. Shared holds
-        // are an anonymous count and can't be attributed — left to the
-        // fd-close path (pre-existing behaviour).
-        for e in m.values_mut() {
-            if e.exclusive_owner == tid {
-                e.exclusive_owner = 0;
-            }
-        }
-    }
+    // flock(2) locks are NOT swept by task here any more. They are owned by
+    // the open file description, so `fd::detach` dropping this task's table
+    // drops those descriptions, and `Drop for OpenFileDescription` releases
+    // them — including the shared holds this sweep could never attribute and
+    // therefore leaked for the life of the boot.
     if let Some(m) = BOOTSTRAP_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
