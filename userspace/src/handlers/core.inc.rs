@@ -7016,6 +7016,12 @@ pub fn numa_balance_tick() {
     // without automatic NUMA balancing still rotate oversubscribed counters.
     crate::perf_event::on_multiplex_tick(current_task_id());
 
+    // RLIMIT_CPU, sampled where Linux samples process CPU timers. It must
+    // run ahead of the NUMA early-return below, which bails for any task
+    // without a balancing entry — that is nearly every task, and putting the
+    // check after it would have made the limit fire for almost nobody.
+    rlimit_cpu_tick(current_task_id());
+
     const SCAN_TICKS: u16 = 256;
     const SEARCH_BUDGET: usize = 16;
     let task = current_task_id();
@@ -13258,6 +13264,7 @@ const RLIMIT_DATA: usize = 2;
 const RLIMIT_STACK: usize = 3;
 const RLIMIT_MEMLOCK: usize = 8;
 const RLIMIT_AS: usize = 9;
+const RLIMIT_CPU: usize = 0;
 const RLIMIT_FSIZE: usize = 1;
 const RLIMIT_CORE: usize = 4;
 
@@ -13347,6 +13354,98 @@ fn fsize_check_resize(task: u64, current_size: u64, new_size: u64) -> Result<(),
 /// core file a fatal signal may write.
 pub(crate) fn coredump_limit(task: u64) -> u64 {
     read_rlimit(task, RLIMIT_CORE).map_or(RLIM_INFINITY, |p| p.cur)
+}
+
+/// `SIGXCPU` — the soft-limit warning. Its default action terminates, so a
+/// process that wants the warning has to handle or block it.
+const SIGXCPU: u32 = 24;
+
+/// `kernel/time/posix-cpu-timers.c::check_process_timers`, RLIMIT_CPU arm:
+///
+/// ```text
+/// soft = task_rlimit(tsk, RLIMIT_CPU);
+/// if (soft != RLIM_INFINITY) {
+///         unsigned long hard = task_rlimit_max(tsk, RLIMIT_CPU);
+///         u64 ptime = samples[CPUCLOCK_PROF];
+///         u64 softns = (u64)soft * NSEC_PER_SEC;
+///         u64 hardns = (u64)hard * NSEC_PER_SEC;
+///
+///         /* At the hard limit, send SIGKILL. No further action. */
+///         if (hard != RLIM_INFINITY &&
+///             check_rlimit(ptime, hardns, SIGKILL, false, true))
+///                 return;
+///
+///         /* At the soft limit, send a SIGXCPU every second */
+///         if (check_rlimit(ptime, softns, SIGXCPU, false, false)) {
+///                 sig->rlim[RLIMIT_CPU].rlim_cur = soft + 1;
+///                 softns += NSEC_PER_SEC;
+///         }
+/// }
+/// ```
+///
+/// Three things that are not obvious from the name of the limit:
+///
+/// * The comparison is `>=` — `check_rlimit` returns false only for
+///   `time < limit` — and RLIMIT_CPU counts SECONDS while the sample is
+///   nanoseconds.
+/// * The soft limit RAISES ITSELF by one second each time it fires. That is
+///   the whole implementation of "a SIGXCPU every second", and it is
+///   observable: after the first warning `getrlimit(RLIMIT_CPU)` reports a
+///   larger soft limit than the process set.
+/// * Both signals go to the THREAD GROUP, and the hard limit's SIGKILL
+///   returns immediately — a process at its hard limit is killed, not
+///   warned first.
+///
+/// Sampled from the timer tick's return-to-user hook, which is where Linux
+/// samples process CPU timers too.
+fn rlimit_cpu_tick(task: u64) {
+    // Fast path first: `read_rlimit` answers from one atomic load while no
+    // process has set any custom limit, so a kernel where nobody uses
+    // RLIMIT_CPU pays almost nothing per tick.
+    let Some(limits) = read_rlimit(task, RLIMIT_CPU) else {
+        return;
+    };
+    if limits.cur == RLIM_INFINITY {
+        return;
+    }
+    let Some(pid) = task_to_pid_raw(task) else {
+        return;
+    };
+    // Registry contention just defers to the next tick (see
+    // `thread_group_cpu_ns_try`).
+    let Some(folded) = crate::task::thread_group_cpu_ns_try(pid) else {
+        return;
+    };
+    // Add the slice this task is in the middle of. A task spinning in user
+    // mode without syscalls folds its slice only when something preempts it,
+    // so without this the very process the limit exists to stop is the one
+    // whose accounting lags furthest behind.
+    let ptime = folded.saturating_add(narf_scheduler::stackful::current_slice_elapsed_ns());
+    const NSEC_PER_SEC: u64 = 1_000_000_000;
+
+    // Hard limit: SIGKILL, and nothing further.
+    if limits.max != RLIM_INFINITY && ptime >= limits.max.saturating_mul(NSEC_PER_SEC) {
+        kill_process(pid, 9); // SIGKILL
+        return;
+    }
+
+    if ptime < limits.cur.saturating_mul(NSEC_PER_SEC) {
+        return;
+    }
+    kill_process(pid, SIGXCPU);
+    // `sig->rlim[RLIMIT_CPU].rlim_cur = soft + 1` — re-arm for one second
+    // later. This cannot violate the `cur <= max` invariant the setter
+    // enforces: reaching here means `ptime < hardns` and `ptime >= softns`,
+    // so `soft < hard`, so `soft + 1 <= hard`.
+    let _ = update_rlimit_atomic(
+        task,
+        None,
+        RLIMIT_CPU,
+        Some(RLimitPair {
+            cur: limits.cur.saturating_add(1),
+            max: limits.max,
+        }),
+    );
 }
 
 /// Test hook: raise/lower a limit through the SAME transaction `setrlimit`
