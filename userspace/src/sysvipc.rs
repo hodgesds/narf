@@ -266,6 +266,12 @@ struct SemSet {
     /// satisfiable operation.
     pending_head: Option<u64>,
     pending_tail: Option<u64>,
+    /// Exact linked-waiter counts. Linux routes simple operations through a
+    /// per-semaphore list and keeps complex operations on the array-wide list;
+    /// these counters let the common all-simple/same-semaphore case make the
+    /// same early-stop decision without walking every remaining waiter.
+    pending_count: usize,
+    complex_count: usize,
     ncnt: Vec<usize>,
     zcnt: Vec<usize>,
     /// SEM_UNDO adjustments are owned by the semaphore array in Linux.  Keep
@@ -399,14 +405,19 @@ struct SemLookupCacheEntry {
 }
 
 /// Linux resolves semids under RCU and then locks only the addressed array.
-/// A cache-line-isolated direct slot gives NARF the same uncontended shape for
-/// the common repeated-semop case while the namespace BTree remains the source
-/// of truth for creation, removal, and cache misses.
+/// Cache-line-isolated per-CPU direct slots give NARF the same uncontended
+/// lookup shape for the common repeated-semop case while the namespace BTree
+/// remains the source of truth for creation, removal, and cache misses. A
+/// global slot would put an otherwise unrelated lock acquisition on the same
+/// cache line before every contended semaphore-array lock.
 #[repr(C, align(64))]
 struct SemLookupCacheSlot(IrqSafeSpinLock<Option<SemLookupCacheEntry>>);
 
-static SEM_LOOKUP_CACHE: [SemLookupCacheSlot; IPCMNI as usize] =
-    [const { SemLookupCacheSlot(IrqSafeSpinLock::new(None)) }; IPCMNI as usize];
+const SEM_LOOKUP_CACHE_WAYS: usize = 8;
+
+static SEM_LOOKUP_CACHE: [[SemLookupCacheSlot; SEM_LOOKUP_CACHE_WAYS]; narf_lib::percpu::MAX_CPUS] =
+    [const { [const { SemLookupCacheSlot(IrqSafeSpinLock::new(None)) }; SEM_LOOKUP_CACHE_WAYS] };
+        narf_lib::percpu::MAX_CPUS];
 
 const _: () = assert!(core::mem::size_of::<SemLookupCacheSlot>() == 64);
 
@@ -459,8 +470,23 @@ fn with_sem_wait_state<R>(object: IpcObjectKey, f: impl FnOnce(&mut SemWaitState
     f(shard.get_or_insert_with(SemWaitState::default))
 }
 
+#[inline]
+fn sem_lookup_cache_way(object: IpcObjectKey) -> usize {
+    let mixed = object
+        .0
+        .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(object.1);
+    mixed as usize & (SEM_LOOKUP_CACHE_WAYS - 1)
+}
+
+#[inline]
+fn local_sem_lookup_cache_slot(object: IpcObjectKey) -> &'static SemLookupCacheSlot {
+    let cpu = narf_lib::percpu::current_cpu().min(narf_lib::percpu::MAX_CPUS - 1);
+    &SEM_LOOKUP_CACHE[cpu][sem_lookup_cache_way(object)]
+}
+
 fn lookup_sem_set(object: IpcObjectKey) -> Option<SemSetRef> {
-    let slot = &SEM_LOOKUP_CACHE[object.1 as usize & IPCMNI_IDX_MASK as usize];
+    let slot = local_sem_lookup_cache_slot(object);
     if let Some(set) = {
         let cached = slot.0.lock();
         cached
@@ -489,17 +515,35 @@ fn lookup_sem_set(object: IpcObjectKey) -> Option<SemSetRef> {
     Some(set)
 }
 
-fn invalidate_sem_lookup_cache(object: IpcObjectKey) {
-    let slot = &SEM_LOOKUP_CACHE[object.1 as usize & IPCMNI_IDX_MASK as usize];
-    let old = {
-        let mut cached = slot.0.lock();
-        if cached.as_ref().is_some_and(|entry| entry.object == object) {
-            cached.take()
-        } else {
-            None
-        }
-    };
+/// Run a short set-local operation while the calling CPU's cache entry keeps
+/// the `Arc` alive. The common semop path therefore avoids incrementing and
+/// decrementing one shared Arc refcount on every syscall; Linux's RCU lookup
+/// likewise reaches the array without a per-operation object reference bump.
+///
+/// Removed entries may remain cached. This is safe and bounded: the complete
+/// sequence-bearing id cannot alias a replacement object, and `SemSet::removed`
+/// is checked under the set lock before every operation. Only the owning CPU
+/// accesses its cache slot, so holding the slot across `f` cannot block another
+/// CPU now that removal does not synchronously invalidate remote slots.
+fn with_cached_sem_set<R>(object: IpcObjectKey, f: impl FnOnce(&SemSetRef) -> R) -> Option<R> {
+    let slot = local_sem_lookup_cache_slot(object);
+    let mut cached = slot.0.lock();
+    if cached.as_ref().is_some_and(|entry| entry.object == object) {
+        return Some(f(&cached.as_ref().expect("matching cache entry").set));
+    }
+
+    drop(cached);
+    let set = with_sem_state(|state| state.sets.get(&object).cloned())?;
+    cached = slot.0.lock();
+    let old = cached.replace(SemLookupCacheEntry {
+        object,
+        set: Arc::clone(&set),
+    });
+    let result = f(&cached.as_ref().expect("installed cache entry").set);
+    drop(cached);
+    // Arc destruction can cascade; keep it outside the IRQ-safe cache lock.
     drop(old);
+    Some(result)
 }
 
 fn with_sem_set<R>(
@@ -541,6 +585,8 @@ fn queue_sem_pending(set: &mut SemSet, state: &mut SemWaitState, index: usize) {
     state.waits[index].pending_prev = previous;
     state.waits[index].pending_next = None;
     set.pending_tail = Some(task);
+    set.pending_count += 1;
+    set.complex_count += usize::from(state.waits[index].nsops > 1);
 }
 
 fn unlink_sem_pending(set: &mut SemSet, state: &mut SemWaitState, index: usize) -> bool {
@@ -568,6 +614,16 @@ fn unlink_sem_pending(set: &mut SemSet, state: &mut SemWaitState, index: usize) 
     }
     state.waits[index].pending_prev = None;
     state.waits[index].pending_next = None;
+    set.pending_count = set
+        .pending_count
+        .checked_sub(1)
+        .expect("SysV semaphore pending count underflow");
+    if state.waits[index].nsops > 1 {
+        set.complex_count = set
+            .complex_count
+            .checked_sub(1)
+            .expect("SysV semaphore complex count underflow");
+    }
     true
 }
 
@@ -651,9 +707,9 @@ fn sem_undo_index(undos: &SemUndoTable, owner: u64) -> Result<usize, usize> {
     undos.binary_search_by_key(&owner, |undo| undo.owner)
 }
 
-fn ensure_sem_undo_set(set: &mut SemSet, owner: u64) -> Result<(), i64> {
+fn ensure_sem_undo_set(set: &mut SemSet, owner: u64) -> Result<usize, i64> {
     let insert_at = match sem_undo_index(&set.undos, owner) {
-        Ok(_) => return Ok(()),
+        Ok(index) => return Ok(index),
         Err(index) => index,
     };
     if FAIL_NEXT_SEM_UNDO_RESERVE.swap(false, Ordering::AcqRel) {
@@ -666,7 +722,7 @@ fn ensure_sem_undo_set(set: &mut SemSet, owner: u64) -> Result<(), i64> {
         .map_err(|_| ENOMEM)?;
     adjustments.resize(set.sems.len(), 0);
     set.undos.insert(insert_at, SemUndo { owner, adjustments });
-    Ok(())
+    Ok(insert_at)
 }
 
 #[doc(hidden)]
@@ -1946,10 +2002,8 @@ fn perform_sem_ops(
     sops: &[u8],
     nsops: usize,
     pid: u64,
-    undo_owner: Option<u64>,
+    undo_index: Option<usize>,
 ) -> Result<(), SemOpFailure> {
-    let undo_index = undo_owner
-        .map(|owner| sem_undo_index(&set.undos, owner).expect("SEM_UNDO row preallocated"));
     let mut applied = 0usize;
     let mut fail = None;
     for i in 0..nsops {
@@ -2009,7 +2063,7 @@ fn perform_semop_locked(
     sops: &[u8],
     nsops: usize,
     pid: u64,
-    undo_owner: Option<u64>,
+    undo_index: Option<usize>,
     caller_uid: u32,
     caller_gid: u32,
     caller_groups: &[u32],
@@ -2039,7 +2093,7 @@ fn perform_semop_locked(
     ) {
         return Err((EACCES, true, None));
     }
-    let result = perform_sem_ops(set, sops, nsops, pid, undo_owner);
+    let result = perform_sem_ops(set, sops, nsops, pid, undo_index);
     if result.is_ok() {
         if set.pending_head.is_some() {
             let (wake, more) = with_sem_wait_state(object, |state| {
@@ -2151,31 +2205,59 @@ fn drain_sem_wakes(object: IpcObjectKey) {
 fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) -> bool {
     let mut completed = false;
     loop {
-        let pass_tail = set.pending_tail;
         let mut altered = false;
-        loop {
-            let Some(task) = set.pending_head else {
-                break;
-            };
+        let mut pending_complex = false;
+        let mut completed_complex = false;
+        let mut restart_for_zero = false;
+        let mut simple_queue_exhausted = false;
+        let mut current = set.pending_head;
+        while let Some(task) = current {
             let wait_index = sem_wait_index(&state.waits, task)
                 .expect("SysV semaphore pending waiter disappeared");
-            let last_in_pass = pass_tail == Some(task);
-            assert!(unlink_sem_pending(set, state, wait_index));
+            // Save the intrusive successor before a terminal result unlinks
+            // this record. Unsatisfied operations stay in their original
+            // position, matching Linux's list walk and avoiding unlink/relink
+            // churn under the two contended semaphore locks.
+            let next = state.waits[wait_index].pending_next;
             let wait = &state.waits[wait_index];
             if wait.result.is_some() {
-                if last_in_pass {
-                    break;
-                }
+                assert!(unlink_sem_pending(set, state, wait_index));
+                current = next;
                 continue;
             }
             let nsops = wait.nsops;
             let pid = wait.pid;
             let undo_owner = wait.undo_owner;
             let old_blocker = wait.blocking;
+            // A wait retains the first operation that blocked its last atomic
+            // evaluation. If that exact condition is still impossible, none of
+            // the later operations can matter yet. Linux gets the same O(1)
+            // rejection from its per-semaphore pending lists.
+            let blocker_still_closed = old_blocker.is_some_and(|(num, waits_for_zero)| {
+                if waits_for_zero {
+                    set.sems[num] != 0
+                } else {
+                    set.sems[num] == 0
+                }
+            });
+            if blocker_still_closed {
+                pending_complex |= nsops > 1;
+                current = next;
+                continue;
+            }
             let changes_value = (0..nsops).any(|i| parse_sem_op(wait.sops.as_slice(), i).1 != 0);
-            let result = perform_sem_ops(set, wait.sops.as_slice(), nsops, pid, undo_owner);
+            let undo_index = undo_owner
+                .map(|owner| sem_undo_index(&set.undos, owner).expect("SEM_UNDO row preallocated"));
+            let result = perform_sem_ops(set, wait.sops.as_slice(), nsops, pid, undo_index);
             match result {
                 Ok(()) => {
+                    let simple_decrement_to_zero = if nsops == 1 {
+                        let (num, op, _) = parse_sem_op(wait.sops.as_slice(), 0);
+                        (op < 0 && set.sems[num] == 0).then_some(num)
+                    } else {
+                        None
+                    };
+                    assert!(unlink_sem_pending(set, state, wait_index));
                     completed = true;
                     if let Some(blocker) = old_blocker {
                         adjust_wait_count(set, blocker, false);
@@ -2185,8 +2267,19 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) -> bool {
                         queue_sem_wake(state, index);
                     }
                     altered |= changes_value;
+                    completed_complex |= nsops > 1;
+                    if let Some(num) = simple_decrement_to_zero {
+                        restart_for_zero |= set.zcnt[num] != 0;
+                        // Linux stops its per-semaphore simple-op scan as soon
+                        // as the value reaches zero. When every remaining wait
+                        // is a simple decrement blocked on this member, our
+                        // array-wide queue can make the identical decision.
+                        simple_queue_exhausted =
+                            set.complex_count == 0 && set.pending_count == set.ncnt[num];
+                    }
                 }
                 Err((errno, true, _)) => {
+                    assert!(unlink_sem_pending(set, state, wait_index));
                     if let Some(blocker) = old_blocker {
                         adjust_wait_count(set, blocker, false);
                     }
@@ -2207,11 +2300,10 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) -> bool {
                             state.waits[index].blocking = blocker;
                         }
                     }
-                    let index = sem_wait_index(&state.waits, task)
-                        .expect("SysV semaphore pending waiter disappeared during retry");
-                    queue_sem_pending(set, state, index);
+                    pending_complex |= nsops > 1;
                 }
                 Err((errno, _, _)) => {
+                    assert!(unlink_sem_pending(set, state, wait_index));
                     if let Some(blocker) = old_blocker {
                         adjust_wait_count(set, blocker, false);
                     }
@@ -2221,11 +2313,19 @@ fn scan_sem_waiters(set: &mut SemSet, state: &mut SemWaitState) -> bool {
                     }
                 }
             }
-            if last_in_pass {
+            if simple_queue_exhausted {
                 break;
             }
+            current = next;
         }
-        if !altered {
+        // Linux's check_restart avoids the O(N^2) rescan after a simple
+        // sleeping decrement succeeds: older decrements could not run before
+        // and cannot run after the value fell. Complex operations need another
+        // pass because a multi-member update can satisfy an earlier blocker.
+        if simple_queue_exhausted
+            || !altered
+            || (!pending_complex && !completed_complex && !restart_for_zero)
+        {
             break;
         }
     }
@@ -2254,6 +2354,8 @@ fn complete_sem_set_waits(
     }
     set.pending_head = None;
     set.pending_tail = None;
+    set.pending_count = 0;
+    set.complex_count = 0;
 
     // Synthetic ABI race fixtures can stage an unlinked wait record. Real
     // blocked operations are always members of the per-set FIFO above.
@@ -2744,6 +2846,8 @@ pub fn sys_semget(ctx: &mut dyn TrapContext) {
                 ctime: now_seconds(),
                 pending_head: None,
                 pending_tail: None,
+                pending_count: 0,
+                complex_count: 0,
                 ncnt,
                 zcnt,
                 undos: Vec::new(),
@@ -2947,16 +3051,14 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
     let (pid, caller_uid, caller_gid, caller_groups) = current_identity();
     let has_undo = (0..nsops).any(|i| parse_sem_op(buf, i).2 & SEM_UNDO != 0);
     let undo_owner = has_undo.then(|| sem_undo_owner(pid));
-    let set_ref = lookup_sem_set(object);
     let mut first_wake = None;
     let mut more_wakes = false;
     enum SemopStart {
         Complete(Result<(), SemOpFailure>),
         Queued,
     }
-    let start = match set_ref.as_ref() {
-        None => SemopStart::Complete(Err((EINVAL, true, None))),
-        Some(set_ref) => {
+    let start = with_cached_sem_set(object, |set_ref| {
+        {
             let mut set = set_ref.lock();
             if set.removed {
                 SemopStart::Complete(Err((EIDRM, true, None)))
@@ -2964,38 +3066,24 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 // Linux find_alloc_undo() creates one dense per-set adjustment array
                 // before EFBIG and permission validation.  Do the same, including for
                 // a zero operation carrying SEM_UNDO, so ENOMEM has Linux precedence.
-                let result = if let Some(owner) = undo_owner {
-                    if let Err(errno) = ensure_sem_undo_set(&mut set, owner) {
-                        Err((errno, true, None))
-                    } else {
-                        perform_semop_locked(
-                            &mut set,
-                            object,
-                            buf,
-                            nsops,
-                            pid,
-                            undo_owner,
-                            caller_uid,
-                            caller_gid,
-                            &caller_groups,
-                            &mut first_wake,
-                            &mut more_wakes,
-                        )
-                    }
-                } else {
-                    perform_semop_locked(
+                let undo_index = undo_owner
+                    .map(|owner| ensure_sem_undo_set(&mut set, owner))
+                    .transpose();
+                let result = match undo_index {
+                    Err(errno) => Err((errno, true, None)),
+                    Ok(undo_index) => perform_semop_locked(
                         &mut set,
                         object,
                         buf,
                         nsops,
                         pid,
-                        undo_owner,
+                        undo_index,
                         caller_uid,
                         caller_gid,
                         &caller_groups,
                         &mut first_wake,
                         &mut more_wakes,
-                    )
+                    ),
                 };
                 match result {
                     Err((EAGAIN, false, blocking)) => match SemOps::try_copy_from(buf) {
@@ -3012,7 +3100,8 @@ fn semop_common(ctx: &mut dyn TrapContext, timed: bool) {
                 }
             }
         }
-    };
+    })
+    .unwrap_or(SemopStart::Complete(Err((EINVAL, true, None))));
     let result = match start {
         SemopStart::Complete(result) => result,
         SemopStart::Queued => {
@@ -3135,7 +3224,6 @@ pub fn sys_semctl(ctx: &mut dyn TrapContext) {
                                 return Err(EIDRM);
                             }
                             state.sets.remove(&object);
-                            invalidate_sem_lookup_cache(object);
                             state
                                 .ids
                                 .get_mut(&ipc_ns)

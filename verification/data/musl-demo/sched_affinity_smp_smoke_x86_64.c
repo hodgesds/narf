@@ -85,6 +85,14 @@ int main(void) {
         fail("sched-affinity-smp-fail: self migration\n");
         return 1;
     }
+    // libc resolves sched_getcpu() through __vdso_getcpu when the kernel
+    // advertises AT_SYSINFO_EHDR. It must agree with the raw syscall after a
+    // real migration; returning the historical constant CPU 0 breaks affinity
+    // users such as stress-ng even though SYS_getcpu itself is correct.
+    if (sched_getcpu() != 1) {
+        fail("sched-affinity-smp-fail: vdso getcpu after migration\n");
+        return 1;
+    }
 
     cpu_set_t empty;
     CPU_ZERO(&empty);
@@ -130,6 +138,8 @@ int main(void) {
         }
         if (wait_for_cpu(0) != 0)
             _exit(4);
+        if (sched_getcpu() != 0)
+            _exit(5);
         _exit(0);
     }
 

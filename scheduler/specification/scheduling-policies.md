@@ -74,6 +74,15 @@ to its own virtual runtime. External and wrapper
 policies are never bypassed: their wakees return through `pick_next` so policy
 observation and ordering remain complete.
 
+For an exact synchronous wake of a sleeping direct-eligible partner on another
+CPU, the core may instead request that the running direct-eligible waker join
+the wakee's authoritative home after the waker returns to the executor. This
+one-shot `WF_SYNC`-shaped placement hint is mechanism, not a policy decision:
+live hard affinity and CPU lifecycle state are revalidated at that normal
+requeue boundary, and migration uses the same core-owned enqueue path as every
+other allowed move. The wake path never moves a running task or bypasses
+`pick_next` on the destination CPU.
+
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative
 preemption point because a wake just made a peer runnable. Default `false`

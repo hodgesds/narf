@@ -174,14 +174,27 @@ static int impl_clock_getres(int clk, struct vdso_timespec *res) {
 }
 
 static int impl_getcpu(unsigned *cpu, unsigned *node) {
-    // NARF is single-CPU / single-node; answer directly, no syscall.
-    if (cpu) {
-        *cpu = 0;
+    if (!cpu && !node) {
+        return 0;
     }
-    if (node) {
-        *node = 0;
+#if defined(__x86_64__)
+    if (cpu && !node) {
+        // BSP/AP bring-up writes NARF's logical CPU id to IA32_TSC_AUX.
+        // Linux's x86 vDSO likewise reads its CPU cookie in userspace.  Musl's
+        // sched_getcpu() uses this cpu-only form, so keep it syscall-free while
+        // returning the real CPU on SMP rather than the old constant zero.
+        uint32_t lo, hi, aux;
+        __asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi), "=c"(aux)::"memory");
+        (void)lo;
+        (void)hi;
+        *cpu = aux;
+        return 0;
     }
-    return 0;
+#endif
+    // The kernel owns CPU-to-SRAT-node translation. Until TSC_AUX carries the
+    // Linux cpu+node encoding, requests for a node (and every aarch64 request)
+    // must use getcpu(2), preserving the exact live-topology ABI.
+    return (int)vdso_syscall2(SYS_getcpu, (long)cpu, (long)node);
 }
 
 // ── exported, arch-named entry points ───────────────────────────────

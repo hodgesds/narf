@@ -412,16 +412,25 @@ arrays and message payloads remain
 kernel-owned across that wait, so later user-memory mutation cannot alter an
 in-flight operation. A single-operation semaphore wait retains its six-byte
 `sembuf` inline, matching Linux's stack-resident common case without changing
-the imported snapshot. Repeated semid lookup uses a sequence-bearing,
-cache-line-isolated direct slot backed by the authoritative namespace table;
-removal invalidates that slot while holding the object lifetime lock. Wait
+the imported snapshot. Repeated semid lookup uses sequence-bearing,
+cache-line-isolated per-CPU direct slots backed by the authoritative namespace
+table, so CPUs contending on one semaphore array do not first contend on a
+second global cache lock. The complete sequence-bearing id prevents a removed
+entry from aliasing a replacement, so removal may leave one bounded stale
+reference in each CPU cache until normal replacement; every operation still
+checks the cached set's `removed` state under its mutation lock. The semop fast
+path borrows the cache-owned reference for the duration of the locked update,
+avoiding a shared reference-count write just as Linux's RCU lookup does. Wait
 records and completed-wake queues are partitioned by semaphore object into
 cache-line-isolated shards, while every waiter for one object remains under the
-same lock as its FIFO links. Semaphore waiters are appended and evaluated in queue
-order after each relevant mutation, but an older operation that remains
-unsatisfied is skipped as on Linux. Eligible operations commit their semvals,
-`SEM_UNDO`, `sempid`, timestamp, and terminal result while the semaphore-state
-lock is still held; task wakeups occur after unlocking. Each task owns one
+same lock as its FIFO links. Semaphore waiters are appended and evaluated in
+queue order after each relevant mutation, but an older operation that remains
+unsatisfied stays in place and is skipped as on Linux. Exact linked and complex
+waiter counts provide Linux's no-restart decision after a simple decrement; a
+decrement reaching zero still revisits wait-for-zero operations. Eligible
+operations commit their semvals, `SEM_UNDO`, `sempid`, timestamp, and terminal
+result while the semaphore-state lock is still held; task wakeups occur after
+unlocking. Each task owns one
 replaceable durable waker, so repeated polls are deduplicated, a completion
 that precedes waker registration is observed on the registration recheck, and
 scheduler migration is transparent. Infinite waits have no polling deadline;
@@ -672,7 +681,10 @@ expected value; a stale wait is never reported as a successful wake.
 
 Linux NUMA compatibility reports live topology rather than a structural
 single-node stub: `getcpu(2)` returns the current logical CPU and its
-SRAT proximity node, while `move_pages(2)` walks the caller's page tables,
+SRAT proximity node. The x86_64 vDSO CPU-only fast path reads the logical CPU
+cookie from `IA32_TSC_AUX`, while node queries and aarch64 use the syscall until
+their vDSO topology cookies exist; libc `sched_getcpu()` therefore agrees with
+the syscall after migration. `move_pages(2)` walks the caller's page tables,
 reports physical placement, and can replace resident private backing on
 another node. `migrate_pages(2)` moves the caller's resident private pages
 between node masks. Fault-time `set_mempolicy(2)` and `mbind(2)` placement

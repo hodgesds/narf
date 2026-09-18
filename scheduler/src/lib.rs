@@ -423,6 +423,8 @@ struct PerCpuUrgentWake(AtomicPtr<WakeCell>);
 static URGENT_WAKE_CELL: [PerCpuUrgentWake; narf_lib::percpu::MAX_CPUS] =
     [const { PerCpuUrgentWake(AtomicPtr::new(core::ptr::null_mut())) }; narf_lib::percpu::MAX_CPUS];
 
+const NO_SYNC_REQUEUE_CPU: u32 = u32::MAX;
+
 /// Narrow directed wake for I/O owners only (boot flag `io_next`). The generic
 /// `WAKE_NEXT` path names EVERY wake its CPU's next-buddy and was measured to
 /// thrash this cooperative executor (redis throughput halved, #235). This
@@ -821,6 +823,11 @@ pub(crate) struct WakeCell {
     /// balancing uses it as Linux's `se.exec_start`-shaped cache-hot signal;
     /// zero means the task has never run and remains freely placeable.
     last_run_cycles: AtomicU64,
+    /// One-shot destination requested by an exact synchronous wake of a remote
+    /// peer. The running waker consumes this only after it yields back to the
+    /// executor, where ordinary affinity and CPU-lifecycle validation plus the
+    /// normal migration enqueue path still own placement.
+    sync_requeue_cpu: AtomicU32,
 }
 
 impl WakeCell {
@@ -957,6 +964,7 @@ fn new_wake_cell(id: TaskId, cpu: u32, direct_eligible: bool) -> Arc<WakeCell> {
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
         last_run_cycles: AtomicU64::new(0),
+        sync_requeue_cpu: AtomicU32::new(NO_SYNC_REQUEUE_CPU),
     })
 }
 
@@ -2224,6 +2232,21 @@ fn requeue_cpu_for_affinity(affinity: Affinity, current: usize) -> usize {
     target_cpu_for_affinity(affinity, current)
 }
 
+#[inline]
+fn sync_requeue_candidate(
+    requested: u32,
+    current: usize,
+    allowed: CpuSet,
+    online: CpuSet,
+) -> Option<usize> {
+    let target = requested as usize;
+    (target < narf_lib::percpu::MAX_CPUS
+        && target != current
+        && online.contains(CpuId(requested))
+        && allowed.contains(CpuId(requested)))
+    .then_some(target)
+}
+
 /// Make an infallible spawn request runnable on the current online topology.
 ///
 /// Unlike `set_task_affinity`, the historic spawn API cannot return
@@ -2255,8 +2278,41 @@ fn normalize_spawn_affinity(affinity: Affinity) -> Affinity {
 
 fn enqueue_after_poll(cpu: usize, mut slot: TaskSlot) {
     refresh_slot_affinity(&mut slot);
-    let target = requeue_cpu_for_affinity(slot.spec.affinity, cpu);
-    enqueue_on(target, slot, policy::TaskEnqueueReason::Requeued);
+    // Linux's WF_SYNC wake-affine path co-locates a waker that is about to
+    // sleep with its exact wakee. NARF cannot migrate the currently-running
+    // off-queue slot at wake time, so consume the one-shot request here, at
+    // the ordinary poll-return ownership boundary. A load first keeps the
+    // overwhelmingly common no-hint path free of a locked RMW.
+    let requested = slot.awake.sync_requeue_cpu.load(Ordering::Acquire);
+    let sync_target = if requested == NO_SYNC_REQUEUE_CPU {
+        None
+    } else if slot
+        .awake
+        .sync_requeue_cpu
+        .compare_exchange(
+            requested,
+            NO_SYNC_REQUEUE_CPU,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        // A newer exact wake replaced the hint. Leave it for the next safe
+        // requeue boundary rather than consuming the wrong destination.
+        None
+    } else {
+        sync_requeue_candidate(requested, cpu, slot.spec.affinity.allowed, online_cpu_set())
+            .filter(|_| cpu_lifecycle::cpu_online(CpuId(requested)))
+    };
+    let (target, reason) = if let Some(target) = sync_target {
+        (target, policy::TaskEnqueueReason::Migrated)
+    } else {
+        (
+            requeue_cpu_for_affinity(slot.spec.affinity, cpu),
+            policy::TaskEnqueueReason::Requeued,
+        )
+    };
+    enqueue_on(target, slot, reason);
 }
 
 fn offline_migration_target(slot: &TaskSlot, source: usize) -> Option<usize> {
@@ -3605,6 +3661,18 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         // on the wakee's authoritative home. Direct handoff is deliberately
         // local; remote wakees proceed through normal executor dispatch.
         hint_urgent_next_on(home, task, ptr);
+        if !prev_awake {
+            // If the exact synchronous partner is remote, request that the
+            // running waker join it at the waker's next normal requeue. This
+            // uses ordinary migration rather than the reverted cross-CPU raw
+            // continuation transfer; after one rendezvous, subsequent wakes
+            // can use the existing local direct path.
+            // SAFETY: the caller's live Waker pins `ptr` through this call.
+            let target_direct = unsafe { (*ptr).direct_eligible.load(Ordering::Acquire) };
+            if target_direct {
+                stackful::request_current_sync_requeue(home);
+            }
+        }
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
@@ -5779,6 +5847,7 @@ fn block_on_inner<F: Future>(mut fut: F, allow_halt: bool) -> F::Output {
         direct_claimed: AtomicBool::new(false),
         direct_runtime_cycles: AtomicU64::new(0),
         last_run_cycles: AtomicU64::new(0),
+        sync_requeue_cpu: AtomicU32::new(NO_SYNC_REQUEUE_CPU),
     });
     let waker = make_waker(awake.clone());
     let mut ctx = Context::from_waker(&waker);

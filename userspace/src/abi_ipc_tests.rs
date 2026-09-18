@@ -1243,6 +1243,63 @@ kernel_test_in!(
     smoke_abi_ipc_sem_wake_queue_batches_in_handoff_order
 );
 
+/// Linux keeps wait-for-zero operations on separate per-semaphore lists and
+/// revisits them when a queued decrement brings the value to zero. An
+/// array-wide scan must do the same even when the zero waiter appeared before
+/// the decrement that consumes a later increment.
+fn smoke_abi_ipc_sem_decrement_restarts_earlier_zero_waiter() -> TestResult {
+    with_setup(|| {
+        let id = make_semset(1)?;
+        if call(Syscall::Semctl.raw(), a3(id, 0, SETVAL, 1)) != Some(0) {
+            return Err("setup: SETVAL failed for zero-wait restart");
+        }
+
+        const ZERO_WAITER: u64 = FAKE_TASK + 40;
+        const DECREMENT_WAITER: u64 = FAKE_TASK + 41;
+        let wait_zero = [0u8; 6];
+        let mut minus_two = [0u8; 6];
+        minus_two[2..4].copy_from_slice(&(-2i16).to_le_bytes());
+
+        set_task(ZERO_WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, wait_zero.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("zero operation did not enter the pending queue");
+        }
+        set_task(DECREMENT_WAITER);
+        if call_raw(Syscall::Semop.raw(), a2(id, minus_two.as_ptr() as u64, 1)).value != 0xDEAD {
+            set_task(FAKE_TASK);
+            return Err("large decrement did not enter the pending queue");
+        }
+
+        let mut increment = [0u8; 6];
+        increment[2..4].copy_from_slice(&1i16.to_le_bytes());
+        set_task(FAKE_TASK);
+        if call(Syscall::Semop.raw(), a2(id, increment.as_ptr() as u64, 1)) != Some(0) {
+            return Err("increment failed to release the queued decrement");
+        }
+        if call(Syscall::Semctl.raw(), a3(id, 0, GETVAL, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETNCNT, 0)) != Some(0)
+            || call(Syscall::Semctl.raw(), a3(id, 0, GETZCNT, 0)) != Some(0)
+        {
+            return Err("decrement-to-zero did not complete both waiter classes");
+        }
+
+        for task in [ZERO_WAITER, DECREMENT_WAITER] {
+            set_task(task);
+            if call(Syscall::Semop.raw(), a2(id, BAD_PTR, 1)) != Some(0) {
+                set_task(FAKE_TASK);
+                return Err("zero-restart waiter did not consume cached success");
+            }
+        }
+        set_task(FAKE_TASK);
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/sysvipc_correctness",
+    smoke_abi_ipc_sem_decrement_restarts_earlier_zero_waiter
+);
+
 /// Linux unlinks an interrupted `sem_queue` directly from its intrusive list.
 /// Removing a middle waiter must leave both FIFO neighbours linked and must
 /// not change their handoff order.

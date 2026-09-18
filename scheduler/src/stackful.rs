@@ -747,6 +747,34 @@ fn task_wake_cell(task: &KernelTask) -> Option<Arc<crate::WakeCell>> {
     task.wake_cell.lock().clone()
 }
 
+/// Ask the currently-running direct-eligible task to requeue on `target_cpu`
+/// after its normal poll/yield boundary. This is the off-queue half of Linux's
+/// synchronous wake-affinity shape: the raw wake path cannot move the running
+/// slot itself, so it publishes a one-shot hint that the executor validates
+/// against the task's live affinity and CPU topology before migrating it.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn request_current_sync_requeue(target_cpu: u32) {
+    let cpu = this_cpu();
+    if target_cpu as usize == cpu || target_cpu as usize >= narf_lib::percpu::MAX_CPUS {
+        return;
+    }
+    let task = CURRENT_STACKFUL_TASK.inner[cpu].load(Ordering::Acquire);
+    if task.is_null() {
+        return;
+    }
+    // SAFETY: CURRENT names the synchronously running task. Its in-flight
+    // poll pins both KernelTask and the Arc stored in `wake_cell` until this
+    // function returns.
+    let task = unsafe { &*task };
+    let wake_cell = task.wake_cell.lock();
+    let Some(cell) = wake_cell.as_ref() else {
+        return;
+    };
+    if cell.direct_eligible.load(Ordering::Acquire) {
+        cell.sync_requeue_cpu.store(target_cpu, Ordering::Release);
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 unsafe fn prepare_direct_arch_state(task: &KernelTask) {
     let top = ((task.stack.as_ptr() as u64) + task.stack.len() as u64) & !0xFu64;
