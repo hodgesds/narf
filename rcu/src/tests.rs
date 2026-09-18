@@ -910,3 +910,66 @@ fn smoke_rcu_batched_pending_tracks_unflushed() -> TestResult {
     }
 }
 kernel_test_in!("rcu", smoke_rcu_batched_pending_tracks_unflushed);
+
+fn smoke_rcu_sync_refuses_while_caller_holds_a_guard() -> TestResult {
+    // The one wait that can never be satisfied: `report_quiescent` no-ops
+    // while this CPU has a live guard, so the caller's own CPU would never
+    // cross the target epoch. Spec §3.3 forbids it outright.
+    //
+    // This is what the old eight-round cap was really guarding against,
+    // and the cost was that it truncated the wait for every CORRECT caller
+    // too — `sync()` returned as though a grace period had elapsed after a
+    // few nanoseconds of spinning, which on SMP is long before any peer
+    // can reach a poll boundary. Refusing by name is what lets the normal
+    // path wait properly.
+    let before = crate::sync_reader_held_count();
+    let refused = {
+        let _g = crate::pin();
+        // A deadline in the past: were the guard NOT detected, this would
+        // still return false, so the counter below is what actually
+        // distinguishes "refused for the right reason" from "timed out".
+        crate::sync_until(0)
+    };
+    if refused {
+        return TestResult::Fail("sync_until claimed a grace period while a guard was held");
+    }
+    if crate::sync_reader_held_count() != before + 1 {
+        return TestResult::Fail("guard-held refusal was not counted");
+    }
+
+    // With the guard dropped the same call must now succeed — and against
+    // an already-expired deadline, which proves it did not merely time
+    // out: the grace period genuinely completed on the first pass.
+    if !crate::sync_until(0) {
+        return TestResult::Fail("sync_until failed with no guard held");
+    }
+    if crate::sync_reader_held_count() != before + 1 {
+        return TestResult::Fail("a successful sync must not count as guard-held");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_sync_refuses_while_caller_holds_a_guard);
+
+fn smoke_rcu_sync_waits_for_a_real_grace_period() -> TestResult {
+    // `sync()` must return only once every active CPU has crossed the
+    // epoch it published. The old implementation broke out of that loop
+    // after eight rounds and returned anyway, so this invariant held only
+    // by the accident of there being one CPU.
+    let before = crate::qsbr::global_epoch();
+    crate::sync();
+    let after = crate::qsbr::global_epoch();
+    if after <= before {
+        return TestResult::Fail("sync() did not publish a new target epoch");
+    }
+    // Every CPU must be at or past the epoch sync() published. A CPU that
+    // is idle publishes the u64::MAX "inactive" sentinel, so this holds
+    // for parked APs too.
+    let target = before + 1;
+    for cpu in 0..narf_lib::percpu::MAX_CPUS {
+        if crate::__test_last_quiescent(cpu) < target {
+            return TestResult::Fail("sync() returned with a CPU behind the target epoch");
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("rcu", smoke_rcu_sync_waits_for_a_real_grace_period);
