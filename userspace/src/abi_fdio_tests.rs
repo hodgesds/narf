@@ -860,6 +860,68 @@ fn smoke_abi_fdio_pipe_fionread() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_fionread);
 
+/// FIONBIO (0x5421) is Linux's generic O_NONBLOCK toggle, dispatched in
+/// `do_vfs_ioctl` ahead of any driver ioctl, so it must work on a pipe — not
+/// just ttys/sockets. Rust `std`'s `FileDesc::set_nonblocking` on Linux is
+/// `ioctl(fd, FIONBIO, &on)`, so `Command::output()` (which sets its captured
+/// stdout/stderr pipes non-blocking) depends on it; returning ENOTTY here made
+/// every such program panic with "Inappropriate ioctl for device".
+fn smoke_abi_fdio_pipe_fionbio() -> TestResult {
+    with_setup(|| {
+        const FIONBIO: u64 = 0x5421;
+        const F_GETFL: u64 = 3;
+        const O_NONBLOCK: i64 = 0o4000;
+        let (rd, _wr) = make_pipe()?;
+
+        // FIONBIO(1) sets O_NONBLOCK; F_GETFL must then report it.
+        let mut on: i32 = 1;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(rd as u64, FIONBIO, (&mut on as *mut i32) as u64),
+        ) != Some(0)
+        {
+            return Err("FIONBIO(1) on pipe was not 0");
+        }
+        match call(Syscall::Fcntl.raw(), a2(rd as u64, F_GETFL, 0)) {
+            Some(flags) if flags & O_NONBLOCK != 0 => {}
+            Some(_) => return Err("F_GETFL missing O_NONBLOCK after FIONBIO(1)"),
+            None => return Err("F_GETFL after FIONBIO(1) failed"),
+        }
+        // The now-non-blocking read of the empty pipe is -EAGAIN, not a block:
+        // proof the flag reached the read path, not just the status word.
+        let mut buf = [0u8; 4];
+        if call(
+            Syscall::Read.raw(),
+            a2(rd as u64, buf.as_mut_ptr() as u64, buf.len() as u64),
+        ) != Some(EAGAIN)
+        {
+            return Err("non-blocking read of empty pipe was not -EAGAIN");
+        }
+
+        // FIONBIO(0) clears it again.
+        let mut off: i32 = 0;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(rd as u64, FIONBIO, (&mut off as *mut i32) as u64),
+        ) != Some(0)
+        {
+            return Err("FIONBIO(0) on pipe was not 0");
+        }
+        match call(Syscall::Fcntl.raw(), a2(rd as u64, F_GETFL, 0)) {
+            Some(flags) if flags & O_NONBLOCK == 0 => {}
+            Some(_) => return Err("O_NONBLOCK still set after FIONBIO(0)"),
+            None => return Err("F_GETFL after FIONBIO(0) failed"),
+        }
+
+        // An inaccessible argument pointer is -EFAULT (ioctl_fionbio's get_user).
+        if call(Syscall::Ioctl.raw(), a2(rd as u64, FIONBIO, 0x1000)) != Some(EFAULT) {
+            return Err("FIONBIO bad arg pointer was not -EFAULT");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_pipe_fionbio);
+
 fn smoke_abi_fdio_pipe_write_closed_reader_is_epipe() -> TestResult {
     with_setup(|| {
         let (rd, wr) = make_pipe()?;
