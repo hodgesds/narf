@@ -3339,6 +3339,9 @@ fn remove_mount_namespace(task: u64) {
 /// unshare(CLONE_NEWNS) again). A parent in the root-global view
 /// leaves the child in the same root-global view.
 pub(crate) fn mount_ns_inherit(parent_task: u64, child_task: u64) {
+    if TASK_MOUNT_NS_COUNT.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
     let parent_ns = {
         let g = TASK_MOUNT_NS.lock();
         g.as_ref().and_then(|m| m.get(&parent_task).cloned())
@@ -3721,6 +3724,7 @@ static IOPRIO_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<BTreeMap<u64, alloc::sync::Arc<core::sync::atomic::AtomicU32>>>,
 > =
     narf_lib::sync::IrqSafeSpinLock::new(None);
+static IOPRIO_ROWS: AtomicUsize = AtomicUsize::new(0);
 
 /// Linux's default when a task has no io_context: `IOPRIO_CLASS_BE` in the
 /// class field with priority 4 (`IOPRIO_NORM`).
@@ -3735,11 +3739,15 @@ const IOPRIO_DEFAULT: u32 = (2u32 << 13) | 4;
 /// tuple-keyed version's obscurity had been hiding.
 pub fn ioprio_init() {
     *IOPRIO_TABLE.lock() = Some(BTreeMap::new());
+    IOPRIO_ROWS.store(0, core::sync::atomic::Ordering::Release);
 }
 
 /// Read the task's current Linux I/O-priority word. An absent `io_context`
 /// has the normal best-effort/default priority.
 fn ioprio_of_task(task: u64) -> u32 {
+    if IOPRIO_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return IOPRIO_DEFAULT;
+    }
     IOPRIO_TABLE
         .lock()
         .as_ref()
@@ -3755,11 +3763,20 @@ fn ioprio_set_task(task: u64, value: u32) {
     let shared = {
         let mut guard = IOPRIO_TABLE.lock();
         let map = guard.get_or_insert_with(BTreeMap::new);
-        map.entry(task)
+        let new_row = !map.contains_key(&task);
+        if new_row {
+            // Publish before insertion while holding the table lock. A racing
+            // exit that observes a non-zero count then blocks here and cannot
+            // miss the row during cleanup.
+            IOPRIO_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
+        }
+        let shared = map
+            .entry(task)
             .or_insert_with(|| {
                 alloc::sync::Arc::new(core::sync::atomic::AtomicU32::new(IOPRIO_DEFAULT))
             })
-            .clone()
+            .clone();
+        shared
     };
     shared.store(value, core::sync::atomic::Ordering::Release);
 }
@@ -3768,6 +3785,9 @@ fn ioprio_set_task(task: u64, value: u32) {
 /// for an ordinary clone/fork, and leave the child context-less when the
 /// parent had never allocated one.
 fn ioprio_fork(parent: u64, child: u64, share_io: bool) {
+    if IOPRIO_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
     let parent_ctx = IOPRIO_TABLE
         .lock()
         .as_ref()
@@ -3782,15 +3802,26 @@ fn ioprio_fork(parent: u64, child: u64, share_io: bool) {
             parent_ctx.load(core::sync::atomic::Ordering::Acquire),
         ))
     };
-    IOPRIO_TABLE
-        .lock()
-        .get_or_insert_with(BTreeMap::new)
-        .insert(child, child_ctx);
+    let mut table = IOPRIO_TABLE.lock();
+    let map = table.get_or_insert_with(BTreeMap::new);
+    let new_row = !map.contains_key(&child);
+    if new_row {
+        IOPRIO_ROWS.fetch_add(1, core::sync::atomic::Ordering::Release);
+    }
+    map.insert(child, child_ctx);
 }
 
 fn ioprio_release(task: u64) {
-    if let Some(map) = IOPRIO_TABLE.lock().as_mut() {
-        map.remove(&task);
+    if IOPRIO_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0 {
+        return;
+    }
+    if IOPRIO_TABLE
+        .lock()
+        .as_mut()
+        .and_then(|map| map.remove(&task))
+        .is_some()
+    {
+        IOPRIO_ROWS.fetch_sub(1, core::sync::atomic::Ordering::Release);
     }
 }
 

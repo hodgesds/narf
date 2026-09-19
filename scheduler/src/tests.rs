@@ -521,6 +521,35 @@ fn smoke_scheduler_cpu_set_membership() -> TestResult {
 }
 kernel_test_in!("scheduler", smoke_scheduler_cpu_set_membership);
 
+fn smoke_scheduler_fork_cpu_tie_policy() -> TestResult {
+    use crate::{choose_fork_cpu, CpuId};
+
+    let cpu0 = CpuId(0);
+    let cpu1 = CpuId(1);
+    let cpu2 = CpuId(2);
+
+    // A saturated tie stays with the forking task for cache locality.
+    if choose_fork_cpu(cpu0, 1, cpu1, Some(1), cpu2, Some(1)) != cpu1 {
+        return TestResult::Fail("saturated fork placement did not retain current CPU");
+    }
+    // Any idle candidate wins over a busy current CPU; the rotating preference
+    // breaks the minimum-load tie so setup bursts still spread.
+    if choose_fork_cpu(cpu0, 0, cpu1, Some(1), cpu2, Some(0)) != cpu2 {
+        return TestResult::Fail("idle fork placement did not honor rotating preference");
+    }
+    // A preferred CPU that is not minimum-loaded cannot override the best CPU.
+    if choose_fork_cpu(cpu0, 1, cpu1, Some(2), cpu2, Some(2)) != cpu0 {
+        return TestResult::Fail("fork placement selected a busier CPU");
+    }
+    // An affinity-excluded current or preferred CPU has no recorded load.
+    if choose_fork_cpu(cpu0, 1, cpu1, None, cpu2, None) != cpu0 {
+        return TestResult::Fail("fork placement escaped its sampled candidates");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("scheduler", smoke_scheduler_fork_cpu_tie_policy);
+
 fn smoke_scheduler_steal_disabled_returns_clean() -> TestResult {
     // With work-stealing off (the default), an empty BSP queue causes
     // run_until_empty to return promptly. A test that calls it with

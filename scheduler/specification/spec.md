@@ -62,8 +62,9 @@ pub fn install_memory_pid_resolver(resolve: fn(task: u64) -> Option<u64>);
 pub fn install_process_task_resolver(resolve: fn(pid: u64) -> Option<u64>);
 pub fn online_cpu_set() -> CpuSet;
 /// Best-effort initial placement for a new process child. Samples allowed,
-/// online run queues without blocking and honors a caller-provided rotating
-/// preference on a load tie.
+/// online run queues without blocking. The current CPU wins a saturated
+/// least-load tie; otherwise a caller-provided rotating preference wins a
+/// minimum-load tie.
 pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId>;
 pub fn task_affinity(task: TaskId) -> Option<CpuSet>;
 pub fn set_task_affinity(task: TaskId, requested: CpuSet)

@@ -6918,6 +6918,15 @@ static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
 static CUSTOM_MEMPOLICY_POSSIBLE: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
+/// Whether any task or address space could carry non-default NUMA policy
+/// state. Writers publish this before inserting table rows and it never
+/// returns to false, so a false load proves every policy/inheritance table is
+/// still empty without taking their four global IRQ-safe locks.
+#[inline]
+fn custom_mempolicy_possible() -> bool {
+    CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire)
+}
+
 /// Linux keeps `il_prev`/`il_weight` in task state. NARF stores the equivalent
 /// monotonically increasing sequence position by task ID so CPU migration
 /// cannot restart or duplicate an interleave cycle.
@@ -7202,7 +7211,7 @@ fn mbind_scope() -> u64 {
 /// space outright (`kernel/fork.c:1579`), so it shares the ranges already,
 /// which is exactly why they are keyed by address space rather than task.
 pub(crate) fn fork_address_space_mbind_ranges(parent_id: u64, child_id: u64) {
-    if parent_id == child_id {
+    if parent_id == child_id || !custom_mempolicy_possible() {
         return;
     }
     let mut table = MBIND_TABLE.lock();
@@ -7225,7 +7234,7 @@ pub(crate) fn fork_address_space_mbind_ranges(parent_id: u64, child_id: u64) {
 /// round-robin, so a forked child re-walked nodes its parent had already
 /// used.
 pub(crate) fn interleave_index_fork(parent_task: u64, child_task: u64) {
-    if parent_task == child_task {
+    if parent_task == child_task || !custom_mempolicy_possible() {
         return;
     }
     let mut table = INTERLEAVE_INDEX_TABLE.lock();
@@ -7257,7 +7266,7 @@ pub(crate) fn interleave_index_fork(parent_task: u64, child_task: u64) {
 /// early-returns for any task with no pacing entry, so a forked child of a
 /// balancing process silently stopped being balanced.
 pub(crate) fn numa_balance_fork(parent_task: u64, child_task: u64) {
-    if parent_task == child_task {
+    if parent_task == child_task || !custom_mempolicy_possible() {
         return;
     }
     let mut table = NUMA_BALANCE_TICKS.lock();
@@ -7355,7 +7364,7 @@ pub fn __test_mbind_scope() -> u64 {
 /// copy, not a share: a later `set_mempolicy(2)` in either task must not
 /// disturb the other.
 pub(crate) fn mempolicy_fork(parent_task: u64, child_task: u64) {
-    if parent_task == child_task {
+    if parent_task == child_task || !custom_mempolicy_possible() {
         return;
     }
     let mut table = MEMPOLICY_TABLE.lock();
@@ -7373,6 +7382,9 @@ pub(crate) fn mempolicy_fork(parent_task: u64, child_task: u64) {
 /// seals — range policies die with the mm, not with the thread that
 /// happened to call `mbind`.
 pub(crate) fn drop_address_space_mbind_ranges(address_space_id: u64) {
+    if !custom_mempolicy_possible() {
+        return;
+    }
     if let Some(m) = MBIND_TABLE.lock().as_mut() {
         m.remove(&address_space_id);
     }
@@ -7381,7 +7393,7 @@ pub(crate) fn drop_address_space_mbind_ranges(address_space_id: u64) {
 /// Resolve the policy in force at user address `va`: a covering mbind range
 /// (address-space scoped) wins, else `task`'s default, else DEFAULT.
 fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
-    if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
+    if !custom_mempolicy_possible() {
         return StoredPolicy::DEFAULT;
     }
     // Range policies belong to the address space, not the calling thread, so
@@ -7417,7 +7429,7 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
 /// `FUTEX_NO_NODE`.
 fn futex_mpol_node(va: u64) -> i32 {
     const FUTEX_NO_NODE: i32 = -1;
-    if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
+    if !custom_mempolicy_possible() {
         return FUTEX_NO_NODE;
     }
     let policy = {
@@ -10129,8 +10141,34 @@ struct PendingExit {
 }
 
 type PendingExitMap = BTreeMap<u64, alloc::vec::Vec<PendingExit>>;
-static PENDING_EXITS: narf_lib::sync::IrqSafeSpinLock<Option<PendingExitMap>> =
-    narf_lib::sync::IrqSafeSpinLock::new(None);
+const PENDING_EXIT_SHARDS: usize = 64;
+
+#[repr(align(64))]
+struct PendingExitShard {
+    map: narf_lib::sync::IrqSafeSpinLock<Option<PendingExitMap>>,
+}
+
+impl PendingExitShard {
+    const fn new() -> Self {
+        Self {
+            map: narf_lib::sync::IrqSafeSpinLock::new(None),
+        }
+    }
+}
+
+static PENDING_EXITS: [PendingExitShard; PENDING_EXIT_SHARDS] =
+    [const { PendingExitShard::new() }; PENDING_EXIT_SHARDS];
+
+#[inline]
+fn pending_exit_shard(parent: u64) -> usize {
+    parent as usize & (PENDING_EXIT_SHARDS - 1)
+}
+
+fn pending_exits_init() {
+    for shard in &PENDING_EXITS {
+        *shard.map.lock() = Some(BTreeMap::new());
+    }
+}
 
 // ── Job control: stop / continue ───────────────────────────────────
 //
@@ -10308,9 +10346,11 @@ fn reap_pending_exit(
     peek: bool,
 ) -> Option<PendingExit> {
     let parents = wait_parent_ids(waiter, options);
-    let mut g = PENDING_EXITS.lock();
-    let m = g.as_mut()?;
     for parent in parents {
+        let mut shard = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
+        let Some(m) = shard.as_mut() else {
+            continue;
+        };
         let Some(q) = m.get_mut(&parent) else {
             continue;
         };
@@ -10485,7 +10525,7 @@ pub fn wait_init() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
     crate::ptrace::ptrace_init();
-    *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    pending_exits_init();
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
@@ -10603,7 +10643,7 @@ fn cgroup_freeze_hook(pid: u64, freeze: bool) {
 pub fn __test_wait_reset() {
     *PARENT_OF.lock() = Some(BTreeMap::new());
     *PARENT_CHILD_COUNTS.lock() = Some(BTreeMap::new());
-    *PENDING_EXITS.lock() = Some(BTreeMap::new());
+    pending_exits_init();
     *TASK_STOPPED.lock() = Some(BTreeMap::new());
     *PENDING_STOPCONT.lock() = Some(BTreeMap::new());
     *PENDING_TERMINATION.lock() = Some(BTreeMap::new());
@@ -11088,7 +11128,7 @@ pub fn __test_inject_parent_of(child: u64, parent: u64) {
     }
     parent_of_set(child, parent);
     {
-        let mut g = PENDING_EXITS.lock();
+        let mut g = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
         if g.is_none() {
             *g = Some(BTreeMap::new());
         }
@@ -11112,7 +11152,7 @@ pub fn __test_stage_pending_exit_with_signal(
     status: i32,
     exit_signal: u8,
 ) {
-    let mut g = PENDING_EXITS.lock();
+    let mut g = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
     if g.is_none() {
         *g = Some(BTreeMap::new());
     }
@@ -11132,7 +11172,7 @@ pub fn __test_stage_pending_exit_with_signal(
 /// `__test_stage_pending_exit` for tests whose asserted path (e.g. an ECHILD
 /// early-return) intentionally does NOT reap the entry it staged.
 pub fn __test_clear_pending_exits(parent: u64) {
-    let mut g = PENDING_EXITS.lock();
+    let mut g = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
     if let Some(m) = g.as_mut() {
         m.remove(&parent);
     }
@@ -11413,17 +11453,19 @@ fn release_task_tables(tid: u64) {
     // policies are keyed by address space and die with it
     // (`drop_address_space_mbind_ranges`), because CLONE_VM siblings still
     // share them after this thread exits.
-    if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    // Pacing is per task. The scan CURSOR is deliberately not retired here:
-    // it belongs to the address space and outlives any one thread, exactly
-    // as the `mbind` ranges beside it do.
-    if let Some(m) = NUMA_BALANCE_TICKS.lock().as_mut() {
-        m.remove(&tid);
+    if custom_mempolicy_possible() {
+        if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
+            m.remove(&tid);
+        }
+        if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
+            m.remove(&tid);
+        }
+        // Pacing is per task. The scan CURSOR is deliberately not retired here:
+        // it belongs to the address space and outlives any one thread, exactly
+        // as the `mbind` ranges beside it do.
+        if let Some(m) = NUMA_BALANCE_TICKS.lock().as_mut() {
+            m.remove(&tid);
+        }
     }
     narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {
@@ -11577,7 +11619,7 @@ fn orphanize_children_of(parent_tid: u64) {
     // same-thread-group transfer preserves the clone exit signal; an external
     // reparent resets it to SIGCHLD, exactly like Linux reparent_leader.
     let mut stale: alloc::vec::Vec<PendingExit> = {
-        let mut g = PENDING_EXITS.lock();
+        let mut g = PENDING_EXITS[pending_exit_shard(parent_tid)].map.lock();
         g.as_mut()
             .and_then(|m| m.remove(&parent_tid))
             .unwrap_or_default()
@@ -11591,7 +11633,7 @@ fn orphanize_children_of(parent_tid: u64) {
                 entry.ptraced = false;
                 parent_of_set_with_signal(entry.child_pid, r, entry.exit_signal);
             }
-            if let Some(m) = PENDING_EXITS.lock().as_mut() {
+            if let Some(m) = PENDING_EXITS[pending_exit_shard(r)].map.lock().as_mut() {
                 m.entry(r).or_default().extend(stale.iter().copied());
             }
             // Threaded reparenting stays inside the same wait domain and does
@@ -12265,7 +12307,7 @@ fn on_child_exit(child_pid: u64, child_tid: u64) {
     let status = take_pending_termination(child_pid).unwrap_or(0);
     // (1) Reap entry — for wait4.
     {
-        let mut g = PENDING_EXITS.lock();
+        let mut g = PENDING_EXITS[pending_exit_shard(parent)].map.lock();
         if let Some(m) = g.as_mut() {
             m.entry(parent)
                 .or_insert_with(alloc::vec::Vec::new)
@@ -14070,7 +14112,14 @@ fn prlimit_permission(caller: u64, target: u64) -> bool {
 fn rlimit_fork(parent: u64, child: u64) {
     let parent_key = process_state_key(parent);
     let child_key = process_state_key(child);
-    if parent_key == child_key {
+    // Absence means the complete default table.  The exact row count lets
+    // the overwhelmingly common default-only fork avoid contending on the
+    // global IRQ-safe table lock.  Writers publish the count before they
+    // return; a fork overlapping the first writer may linearize before that
+    // update, while a completed update is observed by this acquire load.
+    if parent_key == child_key
+        || RLIMIT_CUSTOM_ROWS.load(core::sync::atomic::Ordering::Acquire) == 0
+    {
         return;
     }
     let mut g = RLIMIT_TABLE.lock();
