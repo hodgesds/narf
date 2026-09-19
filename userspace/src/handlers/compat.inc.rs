@@ -5726,6 +5726,8 @@ pub fn proc_task_info(
     // above) resolves the accounting tables (they key on TaskId); PARENT_OF
     // keys on the visible pid. USER_HZ = 100 → 10ms per tick.
     const NS_PER_TICK: u64 = 10_000_000;
+    // One pass over the disposition table; it is behind a lock.
+    let dispositions = sig_disposition_masks(tid);
     Some(ProcTaskInfo {
         // Report the pid the reader asked for (its namespace view), not the
         // outer ProcessId — stat field 1 must echo /proc/<N>.
@@ -5772,7 +5774,104 @@ pub fn proc_task_info(
         },
         // Live thread count of this thread-group (visible pid keys the table).
         num_threads: thread_group_live_count(pid),
+        umask: umask_of(tid),
+        sig_pending: signal_pending_of(tid),
+        sig_blocked: signal_mask_of(tid),
+        sig_ignored: dispositions.0,
+        sig_caught: dispositions.1,
+        cpus_allowed: task_cpus_allowed(tid),
+        nr_cpus: narf_lib::smp::cpu_count(),
+        caps: {
+            // A task with no CAP_TABLE row reads the FULL set by design
+            // (`Caps::boot`), so init still reports unconfined — which is
+            // what systemd's unit-capability check expects of PID 1, and
+            // the reason the renderer hardcoded it. Everything that has
+            // actually narrowed its credential now reports what it holds.
+            let c = read_caps(tid);
+            [
+                c.inheritable,
+                c.permitted,
+                c.effective,
+                c.bounding,
+                c.ambient,
+            ]
+        },
+        no_new_privs: read_prctl(tid).no_new_privs,
+        // `get_task_tracer` is pid-keyed and returns the tracer's pid, so
+        // it goes back out through the reader's namespace like every other
+        // pid in this file. A tracer the reader cannot see reports 0 —
+        // Linux does the same, rather than leaking a pid from a namespace
+        // the reader has no business observing.
+        tracer_pid: crate::ptrace::get_task_tracer(pid)
+            .map(|tracer| report_pid_to(tid, tracer))
+            .unwrap_or(0),
+        fd_table_size: fd::with_table(tid, |t| t.fd_table_size())
+            // Linux's table starts at NR_OPEN_DEFAULT and never shrinks
+            // below it, so neither does this. The value must never
+            // UNDERSTATE the highest open descriptor: a consumer scanning
+            // `0..FDSize` would otherwise walk past live fds.
+            .unwrap_or(0)
+            .max(64),
     })
+}
+
+/// `(ignored, caught)` signal masks — Linux `collect_sigign_sigcatch`.
+///
+/// ```text
+/// for_each_signal(k = t->sighand->action) {
+///         if (k->sa.sa_handler == SIG_IGN)      sigaddset(ign, i);
+///         else if (k->sa.sa_handler != SIG_DFL) sigaddset(catch, i);
+/// }
+/// ```
+///
+/// An absent slot is SIG_DFL and appears in neither mask, which is what
+/// makes the two distinguishable from "nothing installed": a caller that
+/// finds a signal in neither set knows the default action applies, rather
+/// than having to guess.
+fn sig_disposition_masks(task: u64) -> (u64, u64) {
+    const SIG_DFL: u64 = 0;
+    const SIG_IGN: u64 = 1;
+    let Some(sighand) = sighand_of(task) else {
+        return (0, 0);
+    };
+    let table = sighand.lock();
+    let mut ignored = 0u64;
+    let mut caught = 0u64;
+    for (index, slot) in table.iter().enumerate() {
+        let Some(action) = slot else { continue };
+        let bit = match u32::try_from(index + 1) {
+            Ok(signum) => sig_bit(signum),
+            Err(_) => continue,
+        };
+        match action.handler {
+            SIG_IGN => ignored |= bit,
+            SIG_DFL => {}
+            _ => caught |= bit,
+        }
+    }
+    (ignored, caught)
+}
+
+/// This task's file-creation mask.
+fn umask_of(task: u64) -> u32 {
+    UMASK_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or(0o022)
+}
+
+/// The task's CPU affinity as a plain bitmask.
+///
+/// An unregistered task has never narrowed its affinity, so it may run
+/// anywhere — Linux reports the full online set there, not an empty one,
+/// and an empty mask would read as "pinned to no CPU at all".
+fn task_cpus_allowed(task: u64) -> u64 {
+    let online = narf_lib::smp::online_bitmap();
+    match narf_scheduler::task_affinity(narf_scheduler::TaskId(task)) {
+        Some(set) => set.bits() & online,
+        None => online,
+    }
 }
 
 // ── Extended /proc/[pid]/* public accessors ────────────────────────

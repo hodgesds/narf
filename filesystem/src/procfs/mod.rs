@@ -123,6 +123,56 @@ pub struct ProcTaskInfo {
     /// `Threads:` line. 0 is normalised to 1 by the renderers so a task
     /// that predates per-thread accounting still reports one thread.
     pub num_threads: u64,
+    /// `Umask:` — the file-creation mask, rendered octal.
+    pub umask: u32,
+    /// Signal sets, bit N-1 = signal N, as `/proc/<pid>/status` prints
+    /// them: `SigPnd`/`ShdPnd` (pending), `SigBlk` (blocked), `SigIgn`
+    /// (disposition SIG_IGN) and `SigCgt` (a handler installed).
+    ///
+    /// The distinction is the point. A signal that never arrives was
+    /// blocked, ignored, or caught and discarded, and those are three
+    /// different bugs; `ps s` and anyone chasing a handler that never ran
+    /// read these columns to tell them apart.
+    pub sig_pending: u64,
+    pub sig_blocked: u64,
+    pub sig_ignored: u64,
+    pub sig_caught: u64,
+    /// `Cpus_allowed:` — the task's affinity mask, which `taskset -p`
+    /// reads back.
+    pub cpus_allowed: u64,
+    /// Online CPU count. Linux sizes the rendered mask by `nr_cpu_ids`
+    /// rather than by the mask's value, so the width is stable across
+    /// processes on one machine.
+    pub nr_cpus: u32,
+    /// The five capability sets — `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/
+    /// `CapAmb`, in that order.
+    ///
+    /// These were CONSTANTS: inheritable and ambient zero, the other
+    /// three the full set, for every process. A container runtime or
+    /// systemd unit check reading `CapBnd`/`CapEff` to confirm a drop
+    /// therefore saw "unconfined" whether or not anything had been
+    /// dropped — and a fabricated value is worse than an absent field,
+    /// because it answers the question wrongly instead of not at all.
+    pub caps: [u64; 5],
+    /// `TracerPid:` — the process tracing this one, 0 when untraced.
+    ///
+    /// Hardcoded to 0 before, so a traced process reported itself
+    /// untraced. That is the field an anti-debugging check reads, and
+    /// equally the one a human reads to find out WHY a process is stopped
+    /// — answering 0 while a tracer holds it stopped points the reader at
+    /// everything except the cause.
+    pub tracer_pid: u64,
+    /// `FDSize:` — descriptor-table capacity, Linux's `max_fds`.
+    ///
+    /// Was a hardcoded 64. A process holding more than 64 descriptors had
+    /// its table understated, and a consumer scanning `0..FDSize` for open
+    /// fds would walk past live ones and report them closed.
+    pub fd_table_size: u64,
+    /// `NoNewPrivs:` — also a hardcoded 0 before, while `prctl`
+    /// `PR_SET_NO_NEW_PRIVS` really does set a flag. systemd reads it to
+    /// decide whether a unit is already sandboxed, so reporting 0 for a
+    /// task that had set it understated the confinement in place.
+    pub no_new_privs: bool,
 }
 
 /// A key-value pair from the ELF auxiliary vector.  Used by
@@ -2453,6 +2503,8 @@ fn render_stat(info: &ProcTaskInfo) -> String {
 fn render_status(info: &ProcTaskInfo) -> String {
     let mut s = String::new();
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Name:\t{}\n", info.comm));
+    // Linux prints Umask immediately after Name, always four octal digits.
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Umask:\t{:04o}\n", info.umask));
     let _ = core::fmt::Write::write_fmt(
         &mut s,
         format_args!(
@@ -2470,7 +2522,7 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t{}\n", info.ppid));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t{}\n", info.tracer_pid));
     // Uid/Gid: real, effective, saved, fs — NARF tracks one id, so all
     // four columns mirror it. glibc's __libc_setup_tls and systemd's
     // uid/gid probes parse these tab-separated quads.
@@ -2480,7 +2532,10 @@ fn render_status(info: &ProcTaskInfo) -> String {
         core::fmt::Write::write_fmt(&mut s, format_args!("Gid:\t{0}\t{0}\t{0}\t{0}\n", info.gid));
     // FDSize/Groups: systemd reads FDSize when sizing its fd copy loop;
     // an empty supplementary-group set is well-formed.
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("FDSize:\t64\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("FDSize:\t{}\n", info.fd_table_size.max(64)),
+    );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Groups:\t\n"));
     // NStgid/NSpid/NSpgid/NSsid: the id as seen from each nested pid
     // namespace, outermost first. NARF has a single pid namespace, so
@@ -2507,23 +2562,98 @@ fn render_status(info: &ProcTaskInfo) -> String {
         &mut s,
         format_args!("Threads:\t{}\n", info.num_threads.max(1)),
     );
+    // `task_sig`: the queued count, then five 16-hex-digit masks.
+    // ShdPnd is the thread GROUP's shared pending set and SigPnd the
+    // thread's own. NARF keeps one pending set per task, so both report
+    // it rather than inventing a split it does not track.
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!(
+            "SigQ:\t{}/{}\n\
+             SigPnd:\t{:016x}\n\
+             ShdPnd:\t{:016x}\n\
+             SigBlk:\t{:016x}\n\
+             SigIgn:\t{:016x}\n\
+             SigCgt:\t{:016x}\n",
+            info.sig_pending.count_ones(),
+            64,
+            info.sig_pending,
+            info.sig_pending,
+            info.sig_blocked,
+            info.sig_ignored,
+            info.sig_caught,
+        ),
+    );
     // Capability sets — NARF runs everything with full capabilities (no
     // capability model yet), so the bounding/effective/permitted/inheritable
     // masks all read as the full 41-bit set. systemd's capability probe
     // (CapBnd/CapEff) parses these hex bitmaps; an all-set value is the
     // "unconfined" answer it expects for PID 1.
-    const CAP_FULL: u64 = 0x0000_01ff_ffff_ffff;
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapInh:\t0000000000000000\n"));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapPrm:\t{:016x}\n", CAP_FULL));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapEff:\t{:016x}\n", CAP_FULL));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapBnd:\t{:016x}\n", CAP_FULL));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("CapAmb:\t0000000000000000\n"));
+    for (label, set) in ["CapInh", "CapPrm", "CapEff", "CapBnd", "CapAmb"]
+        .iter()
+        .zip(info.caps.iter())
+    {
+        let _ = core::fmt::Write::write_fmt(&mut s, format_args!("{label}:\t{set:016x}\n"));
+    }
     // Seccomp: 0 = disabled (SECCOMP_MODE_DISABLED). systemd reads this to
     // decide whether a unit is already sandboxed. NoNewPrivs mirrors it.
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("NoNewPrivs:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("NoNewPrivs:\t{}\n", u32::from(info.no_new_privs)),
+    );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Seccomp_filters:\t0\n"));
+    // Linux sizes the mask by `nr_cpu_ids`, not by the value, so every
+    // process on one machine renders the same width — which is what lets
+    // a reader compare two of them by eye.
+    let groups = (info.nr_cpus.max(1)).div_ceil(32).max(1) as usize;
+    let mut mask = String::new();
+    for group in (0..groups).rev() {
+        if !mask.is_empty() {
+            mask.push(',');
+        }
+        let word = (info.cpus_allowed >> (group * 32)) as u32;
+        let _ = core::fmt::Write::write_fmt(&mut mask, format_args!("{word:08x}"));
+    }
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!(
+            "Cpus_allowed:\t{}\nCpus_allowed_list:\t{}\n",
+            mask,
+            render_cpu_list(info.cpus_allowed)
+        ),
+    );
     s
+}
+
+/// A CPU mask as the range list `Cpus_allowed_list` uses — `0-3,7`.
+///
+/// `taskset -p` prints this form straight back to the user, so the ranges
+/// have to collapse the way Linux's `%*pbl` does rather than listing every
+/// bit individually.
+fn render_cpu_list(mask: u64) -> String {
+    let mut out = String::new();
+    let mut cpu = 0u32;
+    while cpu < 64 {
+        if mask & (1u64 << cpu) == 0 {
+            cpu += 1;
+            continue;
+        }
+        let start = cpu;
+        while cpu + 1 < 64 && mask & (1u64 << (cpu + 1)) != 0 {
+            cpu += 1;
+        }
+        if !out.is_empty() {
+            out.push(',');
+        }
+        if start == cpu {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{start}"));
+        } else {
+            let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{start}-{cpu}"));
+        }
+        cpu += 1;
+    }
+    out
 }
 
 fn render_maps(info: &ProcTaskInfo) -> String {
@@ -3015,8 +3145,189 @@ fn sample_task_info() -> ProcTaskInfo {
         uid: 0,
         gid: 0,
         num_threads: 1,
+        umask: 0o022,
+        sig_pending: 0,
+        sig_blocked: 0,
+        sig_ignored: 0,
+        sig_caught: 0,
+        cpus_allowed: 1,
+        nr_cpus: 1,
+        caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
+        no_new_privs: false,
     }
 }
+
+/// `TracerPid` and `FDSize` report live state, not constants.
+///
+/// Both were hardcoded — `TracerPid: 0` and `FDSize: 64` — and both had
+/// a real source sitting behind them.
+///
+/// `TracerPid: 0` told every reader the process was untraced. That is
+/// what an anti-debugging check reads, and equally what a human reads to
+/// find out why a process is stopped: answering 0 while a tracer holds it
+/// points the reader at everything except the cause.
+///
+/// `FDSize: 64` understated any table larger than that. The failure mode
+/// is specific: a consumer scanning `0..FDSize` for open descriptors
+/// walks past live fds and concludes they are closed, so the value must
+/// never come in under the highest one in use.
+fn smoke_status_tracer_and_fdsize_are_live() -> TestResult {
+    let traced = ProcTaskInfo {
+        tracer_pid: 4242,
+        fd_table_size: 512,
+        ..sample_task_info()
+    };
+    let body = render_status(&traced);
+    if !body.contains("TracerPid:\t4242") {
+        return TestResult::Fail("status did not report the tracing process");
+    }
+    if body.contains("TracerPid:\t0") {
+        return TestResult::Fail("status still reports the hardcoded TracerPid");
+    }
+    if !body.contains("FDSize:\t512") {
+        return TestResult::Fail("status did not report the real fd-table size");
+    }
+
+    // Untraced still reads 0 — the field has to stay usable as "nobody is
+    // tracing me", which is what makes the non-zero case meaningful.
+    let plain = ProcTaskInfo {
+        tracer_pid: 0,
+        fd_table_size: 8,
+        ..sample_task_info()
+    };
+    let body = render_status(&plain);
+    if !body.contains("TracerPid:\t0") {
+        return TestResult::Fail("an untraced process must report TracerPid 0");
+    }
+    // ...and a table smaller than Linux's NR_OPEN_DEFAULT floors at 64
+    // rather than reporting 8, which is what Linux shows and what keeps
+    // the value from shrinking below the conventional minimum.
+    if !body.contains("FDSize:\t64") {
+        return TestResult::Fail("FDSize must not drop below the 64 floor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_status_tracer_and_fdsize_are_live);
+
+/// `status` reports the task's REAL capability sets, not constants.
+///
+/// All five were hardcoded: `CapInh`/`CapAmb` zero, `CapPrm`/`CapEff`/
+/// `CapBnd` the full 41-bit set, for every process. A container runtime
+/// or systemd unit check reading `CapBnd`/`CapEff` to confirm a drop
+/// therefore saw "unconfined" whether or not anything had been dropped —
+/// and an unprivileged process reported a full effective set.
+///
+/// A fabricated value is worse than an absent field: it answers the
+/// question wrongly rather than not at all, and nothing about the output
+/// looks suspect.
+fn smoke_status_reports_real_capabilities() -> TestResult {
+    let info = ProcTaskInfo {
+        // A credential that has genuinely been narrowed: CAP_NET_BIND
+        // (10) permitted and effective, nothing else, and a bounding set
+        // that is not the full mask.
+        caps: [0, 1 << 10, 1 << 10, 0x3ff, 0],
+        no_new_privs: true,
+        ..sample_task_info()
+    };
+    let body = render_status(&info);
+    for want in [
+        "CapInh:\t0000000000000000",
+        "CapPrm:\t0000000000000400",
+        "CapEff:\t0000000000000400",
+        "CapBnd:\t00000000000003ff",
+        "CapAmb:\t0000000000000000",
+    ] {
+        if !body.contains(want) {
+            return TestResult::Fail("status did not report the task's real capability sets");
+        }
+    }
+    // The old constant, which every process used to report.
+    if body.contains("CapEff:\t000001ffffffffff") {
+        return TestResult::Fail("status still reports the hardcoded full capability set");
+    }
+    // NoNewPrivs was a hardcoded 0 beside them.
+    if !body.contains("NoNewPrivs:\t1") {
+        return TestResult::Fail("status did not report the real no_new_privs flag");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_status_reports_real_capabilities);
+
+/// `status` distinguishes blocked, ignored and caught signals.
+///
+/// A signal that never arrives was blocked, ignored, or caught and
+/// discarded. Those are three different bugs, and these are the columns
+/// `ps s` renders and anyone chasing a handler that never ran reads to
+/// tell them apart — so a single mask, or all three reading alike, would
+/// be worse than useless.
+fn smoke_status_signal_masks_are_distinct() -> TestResult {
+    let info = ProcTaskInfo {
+        sig_pending: 1 << 1,  // SIGINT (2)
+        sig_blocked: 1 << 16, // SIGCHLD (17)
+        sig_ignored: 1 << 12, // SIGPIPE (13)
+        sig_caught: 1 << 10,  // SIGSEGV (11)
+        umask: 0o027,
+        ..sample_task_info()
+    };
+    let body = render_status(&info);
+    for want in [
+        "SigPnd:\t0000000000000002",
+        "ShdPnd:\t0000000000000002",
+        "SigBlk:\t0000000000010000",
+        "SigIgn:\t0000000000001000",
+        "SigCgt:\t0000000000000400",
+        "SigQ:\t1/64",
+        // Four octal digits, immediately after Name, as Linux orders it.
+        "Umask:\t0027",
+    ] {
+        if !body.contains(want) {
+            return TestResult::Fail("status signal/umask line is wrong or missing");
+        }
+    }
+    // Umask precedes State, which is where a positional reader expects it.
+    let (umask_at, state_at) = (body.find("Umask:"), body.find("State:"));
+    match (umask_at, state_at) {
+        (Some(u), Some(st)) if u < st => {}
+        _ => return TestResult::Fail("Umask must precede State"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_status_signal_masks_are_distinct);
+
+/// `Cpus_allowed_list` collapses ranges the way `taskset -p` prints them.
+fn smoke_status_cpus_allowed_list_collapses_ranges() -> TestResult {
+    let info = ProcTaskInfo {
+        // CPUs 0-3 and 7.
+        cpus_allowed: 0b1000_1111,
+        nr_cpus: 8,
+        ..sample_task_info()
+    };
+    let body = render_status(&info);
+    if !body.contains("Cpus_allowed_list:\t0-3,7") {
+        return TestResult::Fail("Cpus_allowed_list did not collapse ranges");
+    }
+    // The mask is sized by the CPU COUNT, not by the value — one 32-bit
+    // group here, so every process on this machine renders the same width.
+    if !body.contains("Cpus_allowed:\t0000008f") {
+        return TestResult::Fail("Cpus_allowed mask width or value is wrong");
+    }
+    // A wider machine gets a second group, high word first.
+    let wide = ProcTaskInfo {
+        cpus_allowed: 1u64 << 33,
+        nr_cpus: 64,
+        ..sample_task_info()
+    };
+    if !render_status(&wide).contains("Cpus_allowed:\t00000002,00000000") {
+        return TestResult::Fail("a >32-CPU mask is not rendered as comma-separated groups");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_status_cpus_allowed_list_collapses_ranges
+);
 
 /// `smaps` reports a PSS that is sharer-weighted, not a copy of RSS.
 ///
@@ -3140,6 +3451,17 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         uid: 0,
         gid: 0,
         num_threads: 1,
+        umask: 0,
+        sig_pending: 0,
+        sig_blocked: 0,
+        sig_ignored: 0,
+        sig_caught: 0,
+        cpus_allowed: 0,
+        nr_cpus: 1,
+        caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
+        no_new_privs: false,
     };
     let line = render_stat(&info);
     let f: Vec<&str> = line.split_whitespace().collect();
@@ -3238,6 +3560,17 @@ fn sample_info() -> ProcTaskInfo {
         uid: 1000,
         gid: 1001,
         num_threads: 4,
+        umask: 0,
+        sig_pending: 0,
+        sig_blocked: 0,
+        sig_ignored: 0,
+        sig_caught: 0,
+        cpus_allowed: 0,
+        nr_cpus: 1,
+        caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
+        no_new_privs: false,
     }
 }
 
