@@ -815,23 +815,32 @@ kernel_test_in!(
     smoke_abi_mem_interleave_index_inherited_by_child
 );
 
-/// NUMA-balancing scan state follows a child, and CLONE_VM decides how.
+/// The NUMA-balancing scan cursor belongs to the ADDRESS SPACE; only the
+/// pacing belongs to the task.
 ///
-/// `init_numa_balancing()` (`kernel/sched/fair.c:3620`) splits on which
-/// address space is being scanned: a child with its own mm restarts the
-/// walk (Linux resets `numa_next_scan`/`numa_scan_seq` for a one-user mm
-/// and clears `numa_preferred_nid`), while a CLONE_VM thread scans the
-/// SAME address space and so keeps the shared position, merely staggering
-/// when its own scanning begins. Either way the first scan is delayed.
+/// `mm->numa_next_scan` names a position in a particular address space, so
+/// Linux keeps it in the mm and every CLONE_VM thread shares one walk;
+/// `p->numa_scan_period` / `p->node_stamp` are per task, and
+/// `init_numa_balancing()` (`kernel/sched/fair.c:3620`) staggers a new
+/// thread's start precisely so siblings sharing an mm do not all scan on
+/// the same tick. Keying the cursor per task made each thread re-walk the
+/// same address space independently, sampling the same pages N times over
+/// with no thread's progress advancing any other's.
 ///
-/// Inheriting nothing meant the tick handler's "no entry" early-return
-/// fired forever: a forked child of a balancing process was never scanned
-/// again.
-fn smoke_abi_mem_numa_balance_state_inherited_by_child() -> TestResult {
+/// With the cursor keyed by scope, the CLONE_VM split is structural: a
+/// thread shares its parent's scope and therefore its cursor, while a
+/// forked child's new scope has none yet and starts at the floor.
+fn smoke_abi_mem_numa_scan_cursor_is_per_address_space() -> TestResult {
     with_setup(|| {
         const FORK_TID: u64 = 0x3FED_0004;
-        const THREAD_TID: u64 = 0x3FED_0005;
+        const UNRELATED_SCOPE: u64 = 0x3FED_0006;
         const FLOOR: u64 = 0x0000_0080_0000_0000;
+        let scope = crate::handlers::__test_numa_scan_scope();
+        if scope == FAKE_TASK {
+            // Cannot tell scope-keyed from task-keyed if they collide.
+            return Ok(());
+        }
+
         let mask = 1u64;
         // MPOL_BIND | MPOL_F_NUMA_BALANCING (1 << 13) over a range: this is
         // what seeds a scan cursor away from the floor.
@@ -844,51 +853,49 @@ fn smoke_abi_mem_numa_balance_state_inherited_by_child() -> TestResult {
         {
             return Err("mbind(MPOL_F_NUMA_BALANCING) failed");
         }
-        let (_, parent_cursor) = crate::handlers::__test_numa_balance_state(FAKE_TASK)
-            .ok_or("parent has no NUMA balancing state")?;
-        if parent_cursor == FLOOR {
-            return Err("parent cursor sits at the floor; test cannot discriminate");
+
+        // The cursor is reachable by ADDRESS SPACE...
+        match crate::handlers::__test_numa_scan_cursor(scope) {
+            Some(c) if c == scan_start => {}
+            Some(_) => return Err("scan cursor for this address space is not where mbind put it"),
+            None => return Err("mbind did not seed a scan cursor for this address space"),
+        }
+        // ...and NOT by task: a task id is not a cursor key any more.
+        if crate::handlers::__test_numa_scan_cursor(FAKE_TASK).is_some() {
+            return Err("scan cursor is still keyed by task");
+        }
+        // An unrelated address space has a walk of its own, not this one.
+        if crate::handlers::__test_numa_scan_cursor(UNRELATED_SCOPE).is_some() {
+            return Err("scan cursor leaked into an unrelated address space");
         }
 
-        // A forked child has its own address space: restart the walk.
+        // Pacing IS per task, and a child's first scan is delayed.
         crate::handlers::__test_release_task_tables(FORK_TID);
-        crate::handlers::numa_balance_fork(FAKE_TASK, FORK_TID, false);
-        let forked = crate::handlers::__test_numa_balance_state(FORK_TID);
+        crate::handlers::numa_balance_fork(FAKE_TASK, FORK_TID);
+        let child_ticks = crate::handlers::__test_numa_balance_ticks(FORK_TID);
+        // A child never gets a cursor of its own — it reads its address
+        // space's, which is what makes a thread continue the shared walk
+        // instead of restarting it.
+        let child_cursor = crate::handlers::__test_numa_scan_cursor(FORK_TID);
         crate::handlers::__test_release_task_tables(FORK_TID);
-        match forked {
-            None => return Err("forked child inherited no NUMA balancing state"),
-            Some((ticks, cursor)) => {
-                if cursor != FLOOR {
-                    return Err("forked child must restart the scan at the floor");
-                }
-                if ticks != 0 {
-                    return Err("forked child's first scan must be delayed");
-                }
-            }
+        if child_cursor.is_some() {
+            return Err("child was given a per-task scan cursor");
         }
-
-        // A CLONE_VM thread shares the address space: continue the walk.
-        crate::handlers::__test_release_task_tables(THREAD_TID);
-        crate::handlers::numa_balance_fork(FAKE_TASK, THREAD_TID, true);
-        let threaded = crate::handlers::__test_numa_balance_state(THREAD_TID);
-        crate::handlers::__test_release_task_tables(THREAD_TID);
-        match threaded {
-            None => Err("CLONE_VM thread inherited no NUMA balancing state"),
-            Some((ticks, cursor)) => {
-                if cursor != parent_cursor {
-                    return Err("CLONE_VM thread must continue the shared scan position");
-                }
-                if ticks != 0 {
-                    return Err("CLONE_VM thread's scan start must be staggered");
-                }
-                Ok(())
-            }
+        match child_ticks {
+            Some(0) => {}
+            Some(_) => return Err("child's first scan must be delayed"),
+            None => return Err("child inherited no balancing pacing"),
+        }
+        // The shared walk is untouched by the fork.
+        match crate::handlers::__test_numa_scan_cursor(scope) {
+            Some(c) if c == scan_start => Ok(()),
+            _ => Err("forking disturbed the address space's shared scan position"),
         }
     })
 }
 kernel_test_in!(
     "syscall_abi",
-    smoke_abi_mem_numa_balance_state_inherited_by_child
+    smoke_abi_mem_numa_scan_cursor_is_per_address_space
 );
 
 /// A forked child's new address space inherits the parent's `mbind` ranges.

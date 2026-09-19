@@ -6925,37 +6925,60 @@ static INTERLEAVE_INDEX_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, u64>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-#[derive(Copy, Clone)]
-struct NumaBalanceState {
-    ticks: u16,
-    cursor: u64,
-}
-
-static NUMA_BALANCE_TABLE: narf_lib::sync::IrqSafeSpinLock<
-    Option<alloc::collections::BTreeMap<u64, NumaBalanceState>>,
+/// How far the NUMA-balancing scan has walked, keyed by ADDRESS SPACE.
+///
+/// This is Linux's `mm->numa_next_scan`: the cursor names a position in a
+/// particular address space, so it belongs to the mm and every CLONE_VM
+/// thread shares one. Keeping it per task made each thread of a process
+/// walk the same address space independently, so an N-thread process
+/// sampled the same pages N times over and no thread's progress advanced
+/// any other's.
+static NUMA_SCAN_CURSOR: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u64>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
+/// When this task next samples a page, keyed by TASK.
+///
+/// Linux's `p->numa_scan_period` / `p->node_stamp` really are per task —
+/// `init_numa_balancing` staggers a new thread's start against its
+/// siblings precisely so that threads sharing one mm do not all scan on
+/// the same tick. Pacing is per task; the position is not.
+static NUMA_BALANCE_TICKS: narf_lib::sync::IrqSafeSpinLock<
+    Option<alloc::collections::BTreeMap<u64, u16>>,
+> = narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// The first scan is always delayed: a fresh mm gets
+/// `numa_next_scan = jiffies + scan_delay` and a new thread gets a
+/// `node_stamp` stagger. Only an explicit `mbind` asks to start promptly.
+const NUMA_TICKS_DELAYED: u16 = 0;
+const NUMA_TICKS_PROMPT: u16 = 255;
+
 fn ensure_numa_balance_state(task: u64) {
-    NUMA_BALANCE_TABLE
+    NUMA_BALANCE_TICKS
         .lock()
         .get_or_insert_with(alloc::collections::BTreeMap::new)
-        .insert(
-            task,
-            NumaBalanceState {
-                ticks: 255,
-                cursor: AddressSpace::USER_FIXED_FLOOR,
-            },
-        );
+        .insert(task, NUMA_TICKS_PROMPT);
+    // The cursor belongs to the address space, and a scope that has never
+    // been scanned starts at the floor.
+    NUMA_SCAN_CURSOR
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .entry(mbind_scope())
+        .or_insert(AddressSpace::USER_FIXED_FLOOR);
 }
 
 fn start_numa_balance_range(task: u64, cursor: u64) {
     ensure_numa_balance_state(task);
-    if let Some(state) = NUMA_BALANCE_TABLE
+    NUMA_SCAN_CURSOR
         .lock()
-        .as_mut()
-        .and_then(|states| states.get_mut(&task))
-    {
-        state.cursor = cursor & !0xFFF;
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(mbind_scope(), cursor & !0xFFF);
+}
+
+/// Retire an address space's scan cursor, alongside its `mbind` ranges.
+pub(crate) fn drop_address_space_numa_cursor(address_space_id: u64) {
+    if let Some(m) = NUMA_SCAN_CURSOR.lock().as_mut() {
+        m.remove(&address_space_id);
     }
 }
 
@@ -7043,21 +7066,32 @@ pub fn numa_balance_tick() {
     const SCAN_TICKS: u16 = 256;
     const SEARCH_BUDGET: usize = 16;
     let task = current_task_id();
-    let cursor = {
-        let mut table = NUMA_BALANCE_TABLE.lock();
-        let Some(state) = table.as_mut().and_then(|states| states.get_mut(&task)) else {
+    // Pacing is per task: this tick belongs to THIS thread, and a thread
+    // with no entry is not being balanced at all.
+    {
+        let mut table = NUMA_BALANCE_TICKS.lock();
+        let Some(ticks) = table.as_mut().and_then(|t| t.get_mut(&task)) else {
             return;
         };
-        state.ticks = state.ticks.saturating_add(1);
-        if state.ticks < SCAN_TICKS {
+        *ticks = ticks.saturating_add(1);
+        if *ticks < SCAN_TICKS {
             return;
         }
-        state.ticks = 0;
-        state.cursor
-    };
+        *ticks = 0;
+    }
+    // The position is per address space, so it has to be resolved from the
+    // live AS rather than from the task — every CLONE_VM thread advances
+    // one shared walk instead of each repeating it.
     let Some(as_ref) = active_user_as() else {
         return;
     };
+    let scope = as_ref.identity();
+    let cursor = NUMA_SCAN_CURSOR
+        .lock()
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .get(&scope)
+        .copied()
+        .unwrap_or(AddressSpace::USER_FIXED_FLOOR);
     let mut next = cursor;
     for _ in 0..SEARCH_BUDGET {
         let candidate = as_ref
@@ -7076,26 +7110,23 @@ pub fn numa_balance_tick() {
         // SAFETY: candidate was obtained from this live AS's resident table;
         // the method revalidates it under the region lock.
         if unsafe { as_ref.protect_numa_hint_page(candidate) }.unwrap_or(false) {
-            if let Some(state) = NUMA_BALANCE_TABLE
+            NUMA_SCAN_CURSOR
                 .lock()
-                .as_mut()
-                .and_then(|states| states.get_mut(&task))
-            {
-                state.cursor = next;
-            }
+                .get_or_insert_with(alloc::collections::BTreeMap::new)
+                .insert(scope, next);
             return;
         }
     }
-    if let Some(state) = NUMA_BALANCE_TABLE
+    NUMA_SCAN_CURSOR
         .lock()
-        .as_mut()
-        .and_then(|states| states.get_mut(&task))
-    {
-        state.cursor = next;
-        // Continue the bounded walk on the next tick until it reaches an
-        // eligible policy range; the long interval begins only after a page
-        // has actually been sampled.
-        state.ticks = SCAN_TICKS - 1;
+        .get_or_insert_with(alloc::collections::BTreeMap::new)
+        .insert(scope, next);
+    // Continue the bounded walk on the next tick until it reaches an
+    // eligible policy range; the long interval begins only after a page has
+    // actually been sampled. Pacing is this task's, so only this task
+    // hurries — its siblings keep their own stagger.
+    if let Some(ticks) = NUMA_BALANCE_TICKS.lock().as_mut().and_then(|t| t.get_mut(&task)) {
+        *ticks = SCAN_TICKS - 1;
     }
 }
 
@@ -7207,45 +7238,36 @@ pub(crate) fn interleave_index_fork(parent_task: u64, child_task: u64) {
     map.insert(child_task, inherited);
 }
 
-/// Seed a new child's NUMA-balancing scan state.
+/// Seed a new child's NUMA-balancing pacing.
 ///
-/// `init_numa_balancing()` (`kernel/sched/fair.c:3620`) splits on CLONE_VM,
-/// and the split is about WHICH ADDRESS SPACE is being scanned:
+/// Only the PACING is seeded here. The scan position lives with the address
+/// space now, so the CLONE_VM split `init_numa_balancing()` draws
+/// (`kernel/sched/fair.c:3620`) falls out of the keying instead of being
+/// re-implemented: a thread shares its parent's scope and therefore its
+/// parent's cursor, while a forked child's new scope has no cursor yet and
+/// starts at the floor. That is exactly Linux's "keep the position, it
+/// lives in the shared mm" versus "reset the mm's scan state".
 ///
-///   * A child with its own mm is a fresh scan. Linux resets the mm's scan
-///     state — `numa_next_scan = jiffies + scan_delay`, `numa_scan_seq = 0`
-///     — for an mm with one user, and clears `numa_preferred_nid` because
-///     the placement the parent learned says nothing about a new address
-///     space. The child restarts the walk from the floor.
-///   * A CLONE_VM thread scans the SAME address space, so Linux keeps the
-///     existing position (it lives in the shared mm) and only staggers when
-///     the new thread's scanning starts, via `p->node_stamp = delay`.
+/// The first scan is delayed either way — a fresh mm gets
+/// `numa_next_scan = jiffies + scan_delay`, a new thread gets a
+/// `node_stamp` stagger — so the child's counter starts at
+/// `NUMA_TICKS_DELAYED`.
 ///
-/// Either way the first scan is DELAYED, so both paths start the tick
-/// counter at zero rather than at the near-threshold value
-/// `ensure_numa_balance_state` uses for a fresh `mbind`. A child that
-/// inherited nothing at all was never scanned again: the tick handler
-/// early-returns for any task with no entry, so a forked child of a
+/// A child that inherited nothing was never scanned again: the tick handler
+/// early-returns for any task with no pacing entry, so a forked child of a
 /// balancing process silently stopped being balanced.
-pub(crate) fn numa_balance_fork(parent_task: u64, child_task: u64, share_vm: bool) {
+pub(crate) fn numa_balance_fork(parent_task: u64, child_task: u64) {
     if parent_task == child_task {
         return;
     }
-    let mut table = NUMA_BALANCE_TABLE.lock();
+    let mut table = NUMA_BALANCE_TICKS.lock();
     let Some(map) = table.as_mut() else {
         return;
     };
-    let Some(parent_state) = map.get(&parent_task).copied() else {
+    if !map.contains_key(&parent_task) {
         return;
-    };
-    let cursor = if share_vm {
-        // Same address space: continue the shared walk where it stands.
-        parent_state.cursor
-    } else {
-        // New address space: restart the walk.
-        AddressSpace::USER_FIXED_FLOOR
-    };
-    map.insert(child_task, NumaBalanceState { ticks: 0, cursor });
+    }
+    map.insert(child_task, NUMA_TICKS_DELAYED);
 }
 
 /// Test accessor: the policy stored for `task`, as (mode, nodemask,
@@ -7276,14 +7298,28 @@ pub fn __test_advance_interleave_index(task: u64) -> u64 {
     task_interleave_index(task, true)
 }
 
-/// Test accessor: `task`'s NUMA-balancing scan state as (ticks, cursor).
+/// Test accessor: `task`'s NUMA-balancing pacing counter.
 #[doc(hidden)]
-pub fn __test_numa_balance_state(task: u64) -> Option<(u16, u64)> {
-    NUMA_BALANCE_TABLE
+pub fn __test_numa_balance_ticks(task: u64) -> Option<u16> {
+    NUMA_BALANCE_TICKS
         .lock()
         .as_ref()
         .and_then(|m| m.get(&task).copied())
-        .map(|s| (s.ticks, s.cursor))
+}
+
+/// Test accessor: the scan cursor recorded for an address-space scope.
+#[doc(hidden)]
+pub fn __test_numa_scan_cursor(scope: u64) -> Option<u64> {
+    NUMA_SCAN_CURSOR
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&scope).copied())
+}
+
+/// Test accessor: the scope the scan cursor would be recorded under now.
+#[doc(hidden)]
+pub fn __test_numa_scan_scope() -> u64 {
+    mbind_scope()
 }
 
 /// Test accessor: retire a task's per-task tables, so a test that seeds a
@@ -9731,9 +9767,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // Likewise the interleave cursor: `il_prev` is never reset by
     // `copy_process`, so the struct copy carries it to every child.
     interleave_index_fork(parent_pid, child_tid.raw());
-    // The balancing scan splits on CLONE_VM: a thread continues the walk
-    // over the address space it shares, a new mm restarts it.
-    numa_balance_fork(parent_pid, child_tid.raw(), share_vm);
+    // Only pacing is seeded. The CLONE_VM split is structural now: a
+    // thread shares its parent's scope and so its cursor, while a new mm
+    // has no cursor yet and starts at the floor.
+    numa_balance_fork(parent_pid, child_tid.raw());
 
     // Namespace inheritance + CLONE_NEW* layering. A child — thread OR
     // process — shares the parent's namespaces (Linux copy_*ns), unless
@@ -11382,7 +11419,10 @@ fn release_task_tables(tid: u64) {
     if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
-    if let Some(m) = NUMA_BALANCE_TABLE.lock().as_mut() {
+    // Pacing is per task. The scan CURSOR is deliberately not retired here:
+    // it belongs to the address space and outlives any one thread, exactly
+    // as the `mbind` ranges beside it do.
+    if let Some(m) = NUMA_BALANCE_TICKS.lock().as_mut() {
         m.remove(&tid);
     }
     narf_scheduler::clear_task_mems_allowed(tid);
