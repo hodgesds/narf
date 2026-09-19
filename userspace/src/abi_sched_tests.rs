@@ -281,6 +281,10 @@ fn smoke_abi_sched_setrlimit_validates_pair_and_hard_raise() -> TestResult {
             return Err("setrlimit(cur > max) should return -EINVAL");
         }
         let hard_raise = [1024u64, 4097u64];
+        // Drop caps so this exercises the *unauthorized* path: raising a hard
+        // limit without CAP_SYS_RESOURCE must still be -EPERM. (The harness
+        // otherwise starts as the boot credential with every capability.)
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
         if call(Syscall::Setrlimit.raw(), a1(7, hard_raise.as_ptr() as u64)) != Some(EPERM) {
             return Err("unauthorized hard-limit raise should return -EPERM");
         }
@@ -290,6 +294,38 @@ fn smoke_abi_sched_setrlimit_validates_pair_and_hard_raise() -> TestResult {
 kernel_test_in!(
     "syscall_abi",
     smoke_abi_sched_setrlimit_validates_pair_and_hard_raise
+);
+
+fn smoke_abi_sched_setrlimit_cap_sys_resource_raises_hard_limit() -> TestResult {
+    with_setup(|| {
+        // The harness starts as the boot credential with every Linux
+        // capability effective. `do_prlimit` specifically permits this hard
+        // raise with CAP_SYS_RESOURCE. PAM's `pam_limits` relies on that when
+        // a root systemd executor applies an `@audio nice -11` policy before
+        // entering the user's session.
+        let raised = [31u64, 31u64];
+        if call(Syscall::Setrlimit.raw(), a1(13, raised.as_ptr() as u64)) != Some(0) {
+            return Err("CAP_SYS_RESOURCE should permit raising RLIMIT_NICE");
+        }
+        let mut observed = [0u8; 16];
+        if call(
+            Syscall::Getrlimit.raw(),
+            a1(13, observed.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("getrlimit(RLIMIT_NICE) failed after privileged raise");
+        }
+        let cur = u64::from_ne_bytes(observed[..8].try_into().unwrap());
+        let max = u64::from_ne_bytes(observed[8..].try_into().unwrap());
+        if (cur, max) != (31, 31) {
+            return Err("privileged RLIMIT_NICE raise did not persist");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_sched_setrlimit_cap_sys_resource_raises_hard_limit
 );
 
 fn smoke_abi_sched_prlimit64_error_order_and_missing_pid() -> TestResult {

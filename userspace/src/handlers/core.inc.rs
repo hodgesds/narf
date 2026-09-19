@@ -13903,6 +13903,9 @@ fn rlimit_cpu_tick(task: u64) {
             cur: limits.cur.saturating_add(1),
             max: limits.max,
         }),
+        // Kernel re-arm keeps `max` unchanged, so this never raises the hard
+        // ceiling; the flag is irrelevant here.
+        false,
     );
 }
 
@@ -14036,7 +14039,8 @@ pub(crate) fn nproc_exceeded_blocks_exec(task: u64) -> bool {
 /// `RLIMIT_CORE` now decides whether they produce a file at all.
 #[doc(hidden)]
 pub fn __test_set_rlimit(task: u64, resource: usize, cur: u64, max: u64) -> bool {
-    update_rlimit_atomic(task, None, resource, Some(RLimitPair { cur, max })).is_ok()
+    // Privileged test hook: may raise the hard limit for the fixtures.
+    update_rlimit_atomic(task, None, resource, Some(RLimitPair { cur, max }), true).is_ok()
 }
 
 #[derive(Copy, Clone)]
@@ -14102,6 +14106,7 @@ fn update_rlimit_atomic(
     owner: Option<&alloc::sync::Arc<crate::task::Task>>,
     resource: usize,
     new_value: Option<RLimitPair>,
+    may_raise_hard: bool,
 ) -> Result<RLimitPair, i64> {
     if resource >= RLIMIT_COUNT {
         return Err(22); // EINVAL
@@ -14129,8 +14134,13 @@ fn update_rlimit_atomic(
         if value.cur > value.max {
             return Err(22); // EINVAL
         }
-        if value.max > prior.max {
-            // No authenticated CAP_SYS_RESOURCE authority exists yet.
+        if value.max > prior.max && !may_raise_hard {
+            // `do_prlimit`: raising the hard ceiling requires CAP_SYS_RESOURCE
+            // in the target task's user namespace. The caller's authority is
+            // resolved before taking RLIMIT_TABLE and passed into this
+            // transaction, keeping the table independent of the credential and
+            // namespace lock order. pam_limits (and any Limit* that raises a
+            // hard limit) relies on root holding this.
             return Err(1); // EPERM
         }
         let new_row = !state.rows.contains_key(&key);
@@ -14158,11 +14168,29 @@ fn prlimit_target_task(caller: u64, pid: u64) -> Option<PrlimitTarget> {
     })
 }
 
+/// Whether `caller` holds CAP_SYS_RESOURCE over `target`'s user namespace.
+/// This is the authority Linux uses both for cross-task `prlimit64` and for
+/// raising a hard limit. Resolve it outside [`RLIMIT_TABLE`] transactions so
+/// the rlimit lock never nests credential or namespace locks.
+fn prlimit_resource_capable(caller: u64, target: u64) -> bool {
+    #[cfg(feature = "container")]
+    {
+        let target_ns = crate::namespaces::current_user_ns(target);
+        task_ns_capable(caller, &target_ns, CAP_SYS_RESOURCE)
+    }
+    #[cfg(not(feature = "container"))]
+    {
+        let _ = target;
+        task_capable(caller, CAP_SYS_RESOURCE)
+    }
+}
+
 /// Linux permits cross-task prlimit when the caller's real uid/gid matches all
-/// of the target's real/effective/saved IDs. NARF reports saved as effective,
-/// so these are the complete representable checks. Only the exact current task
-/// bypasses them; same-thread-group membership alone does not. A future
-/// authenticated CAP_SYS_RESOURCE query can provide the namespace bypass.
+/// of the target's real/effective/saved IDs, or when the caller has
+/// CAP_SYS_RESOURCE in the target's user namespace. NARF reports saved as
+/// effective, so these are the complete representable identity checks. Only the
+/// exact current task bypasses the identity comparison; same-thread-group
+/// membership alone does not.
 fn prlimit_permission(caller: u64, target: u64) -> bool {
     if caller == target {
         return true;
@@ -14173,6 +14201,7 @@ fn prlimit_permission(caller: u64, target: u64) -> bool {
         && caller_ids.uid == target_ids.euid
         && caller_ids.gid == target_ids.gid
         && caller_ids.gid == target_ids.egid
+        || prlimit_resource_capable(caller, target)
 }
 
 fn rlimit_fork(parent: u64, child: u64) {
