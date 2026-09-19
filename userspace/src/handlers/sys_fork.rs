@@ -22,12 +22,44 @@ fn round_robin_cpu(mut candidates: u64, sequence: u64) -> Option<narf_scheduler:
     }
 }
 
-/// Spread newly forked process groups across every online CPU. This is shared
-/// by `fork(2)` and process-creating `clone(2)`/`clone3(2)`; pthread siblings
-/// subsequently inherit the creator CPU, retaining shared-memory locality.
+fn parent_rotated_cpu(
+    candidates: u64,
+    parent_cpu: narf_scheduler::CpuId,
+    sequence: u64,
+) -> Option<narf_scheduler::CpuId> {
+    if parent_cpu.0 >= 64 || candidates & (1u64 << parent_cpu.0) == 0 {
+        return round_robin_cpu(candidates, sequence);
+    }
+    let before_parent = if parent_cpu.0 == 0 {
+        0
+    } else {
+        candidates & ((1u64 << parent_cpu.0) - 1)
+    };
+    round_robin_cpu(
+        candidates,
+        u64::from(before_parent.count_ones())
+            .wrapping_add(1)
+            .wrapping_add(sequence),
+    )
+}
+
+/// Place a parent's first process child on the next online allowed CPU, then
+/// rotate that parent's later process children over the remaining CPUs. This
+/// avoids initially queueing a runnable child behind its still-running parent,
+/// while a per-parent cursor prevents helper forks made by one child from
+/// consuming another parent's placement sequence. This is shared by `fork(2)`
+/// and process-creating `clone(2)`/`clone3(2)`; pthread siblings remain local.
 pub(super) fn fork_cpu(allowed: narf_scheduler::CpuSet) -> Option<narf_scheduler::CpuId> {
     let candidates = allowed.intersection(narf_scheduler::online_cpu_set()).bits();
-    round_robin_cpu(candidates, NEXT_FORK_CPU.fetch_add(1, Ordering::Relaxed))
+    let current_cpu = narf_lib::percpu::current_cpu() as u32;
+    let rotated = match crate::task::current_next_fork_sequence(current_cpu) {
+        Some((base_cpu, sequence)) => {
+            parent_rotated_cpu(candidates, narf_scheduler::CpuId(base_cpu), sequence)
+        }
+        None => round_robin_cpu(candidates, NEXT_FORK_CPU.fetch_add(1, Ordering::Relaxed)),
+    };
+    let preferred = rotated.unwrap_or(narf_scheduler::CpuId(current_cpu));
+    narf_scheduler::select_fork_cpu(allowed, preferred).or(rotated)
 }
 
 pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
@@ -195,28 +227,20 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
         entry: crate::EntryPoint(narf_memory::VirtAddr::new(0)),
         stack_top: narf_memory::VirtAddr::new(0),
         fs_base: {
-            // SAFETY: `rdmsr` reads MSR `ecx`=IA32_FS_BASE into edx:eax; the MSR is
-            // architectural and readable at CPL0. Operands name the ABI registers and
-            // the instruction has no memory side effects.
             #[cfg(target_arch = "x86_64")]
-            // SAFETY: Valid memory or trusted environment
-            unsafe {
-                use core::arch::asm;
-                let lo: u32;
-                let hi: u32;
-                const IA32_FS_BASE: u32 = 0xC000_0100;
-                asm!(
-                    "rdmsr",
-                    in("ecx") IA32_FS_BASE,
-                    out("eax") lo,
-                    out("edx") hi,
-                    options(nostack, preserves_flags),
-                );
-                let v = (lo as u64) | ((hi as u64) << 32);
-                if v == 0 {
+            {
+                // Linux's `current_save_fsgs()` uses RDFSBASE when the CPU
+                // enabled CR4.FSGSBASE and falls back to RDMSR otherwise.
+                // Reuse NARF's identically-gated helper: besides avoiding a
+                // serialising MSR read on every fork, it snapshots direct
+                // userspace WRFSBASE updates from the live register.
+                // SAFETY: the syscall handler executes at CPL0 on the current
+                // CPU; the helper owns the per-CPU feature gate and fences.
+                let value = unsafe { narf_arch::x86_64::user_mode::user_fs_base() };
+                if value == 0 {
                     None
                 } else {
-                    Some(v)
+                    Some(value)
                 }
             }
             #[cfg(target_arch = "aarch64")]
@@ -344,23 +368,23 @@ mod tests {
     use super::*;
     use narf_kernel_test::{kernel_test_in, TestResult};
 
-    fn smoke_fork_cpu_rotation_covers_sparse_allowed_set() -> TestResult {
+    fn smoke_fork_cpu_rotation_is_parent_local_and_sparse_safe() -> TestResult {
         let candidates = (1u64 << 1) | (1u64 << 3) | (1u64 << 7);
         let observed = [0, 1, 2, 3].map(|sequence| {
-            round_robin_cpu(candidates, sequence)
+            parent_rotated_cpu(candidates, narf_scheduler::CpuId(3), sequence)
                 .map(|cpu| cpu.0)
                 .unwrap_or(u32::MAX)
         });
-        if observed != [1, 3, 7, 1] {
-            return TestResult::Fail("fork CPU rotation skipped or duplicated an allowed CPU");
+        if observed != [7, 1, 3, 7] {
+            return TestResult::Fail("per-parent fork rotation lost locality or sparse coverage");
         }
-        if round_robin_cpu(0, 0).is_some() {
+        if parent_rotated_cpu(0, narf_scheduler::CpuId(3), 0).is_some() {
             return TestResult::Fail("empty fork CPU candidate set selected a CPU");
         }
         TestResult::Pass
     }
     kernel_test_in!(
         "userspace/process",
-        smoke_fork_cpu_rotation_covers_sparse_allowed_set
+        smoke_fork_cpu_rotation_is_parent_local_and_sparse_safe
     );
 }

@@ -77,6 +77,13 @@ pub struct Task {
     /// Time spent executing syscall continuations for this task. Kept beside
     /// `user_cpu_ns` so the hot accounting path never takes a B-tree lock.
     kernel_cpu_ns: AtomicU64,
+    /// Number of process children created by this task. Fork placement uses
+    /// the per-parent sequence so a child's own helper forks cannot consume
+    /// another parent's CPU rotation.
+    fork_sequence: AtomicU64,
+    /// CPU anchoring this task's process-child rotation. Established by its
+    /// first process fork and retained if the parent later migrates.
+    fork_base_cpu: AtomicU32,
     /// Set by `exit_group(2)` (Linux `signal->group_exit`): the whole
     /// thread group is terminating. Consulted so a sibling that races
     /// the group exit reports the group's status.
@@ -135,6 +142,8 @@ impl Task {
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
             kernel_cpu_ns: AtomicU64::new(0),
+            fork_sequence: AtomicU64::new(0),
+            fork_base_cpu: AtomicU32::new(u32::MAX),
             group_exiting: core::sync::atomic::AtomicBool::new(false),
             uctx: UserTaskCtx::new(),
             poll_files: narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new()),
@@ -1035,6 +1044,25 @@ pub fn current_task() -> Option<Arc<Task>> {
         return None;
     }
     task_get_local(tid)
+}
+
+/// Advance the current task's process-child placement sequence.
+///
+/// This is deliberately task-local rather than global: independent children
+/// may fork helpers without perturbing their parent's placement rotation.
+pub(crate) fn current_next_fork_sequence(current_cpu: u32) -> Option<(u32, u64)> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc for this complete syscall.
+    let task = unsafe { &*ptr };
+    let base = task
+        .fork_base_cpu
+        .compare_exchange(u32::MAX, current_cpu, Ordering::Relaxed, Ordering::Relaxed)
+        .map_or_else(|base| base, |_| current_cpu);
+    Some((base, task.fork_sequence.fetch_add(1, Ordering::Relaxed)))
 }
 
 /// Flip a task to ZOMBIE at the top of its exit path. Idempotent;

@@ -266,11 +266,14 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
     //                  all ASes so kernel code reaches during traps.
     // SAFETY: `phys` points at a freshly-allocated identity-mapped frame.
     unsafe {
-        // Start with all zeroes.
+        // Only the private user half remains empty. The kernel half is
+        // overwritten entry-by-entry immediately below, so zeroing it first
+        // just writes another 2 KiB into a fresh fork root and evicts useful
+        // cache lines without changing the published table.
         ptr::write_bytes(
             phys.kernel_mut_ptr::<u8>(),
             0,
-            core::mem::size_of::<PageTable>(),
+            core::mem::size_of::<PageTable>() / 2,
         );
         // PML4[0] is deliberately NOT copied. It used to carry the kernel's
         // low identity map so kernel code could reach physical RAM while a
@@ -331,10 +334,12 @@ pub unsafe fn new_user_pml4_on(node: usize) -> Result<PhysAddr, PageTableAllocEr
             );
         }
         crate::frame::__pagetable_register(user_pdpt_phys.raw());
-        // Zero the fresh PDPT.
-        // SAFETY: identity-mapped freshly-allocated frame.
+        // Only PDPT[0] remains private/empty. Entries 1..512 are all
+        // overwritten from the fixed-width kernel snapshot below, so a
+        // whole-page zero first is redundant on every fork.
+        // SAFETY: identity-mapped freshly-allocated frame; entry 0 is aligned.
         unsafe {
-            ptr::write_bytes(user_pdpt_phys.kernel_mut_ptr::<u8>(), 0, 4096);
+            ptr::write_volatile(user_pdpt_phys.kernel_mut_ptr::<u64>(), 0);
         }
         // Copy kernel PDPT[1..512] (skip PDPT[0] — that's where the
         // user binary lives, must stay private to this AS).

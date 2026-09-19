@@ -86,6 +86,14 @@ tracked by cache-line-isolated, per-page reference shards. A creator reference
 keeps each page live until VMA publication or rollback completes; VMA and fork
 aliases take their own references, and the last alias unmap reclaims the page.
 Named and System V shared-memory objects retain the public-handle registry.
+Ordinary unlocked file-backed `MAP_PRIVATE` mappings likewise publish only
+VMA and file-owner metadata. First access reads exactly the faulting page into
+a newly allocated address-space-owned frame; a page wholly beyond EOF takes
+the Linux `SIGBUS` fault path, while a final partial page remains zero-filled
+past EOF. Resident pages follow the ordinary private COW rules across fork,
+and untouched pages remain absent in both parent and child. Explicit
+`MAP_LOCKED` or blocking `MAP_POPULATE` retains eager best-effort population;
+`MAP_NONBLOCK` suppresses prefaulting.
 `MAP_FIXED_NOREPLACE` publishes its exact address non-destructively under the
 address-space VMA transaction. An occupied target returns `EEXIST`, including
 when a `CLONE_VM` peer claims the range after the syscall's initial fast probe;
@@ -594,11 +602,12 @@ otherwise-supported policy; the cooperative scheduler retains compatibility
 state without assigning Linux real-time scheduling authority.
 `sched_yield(2)` returns success and then uses the common completed-syscall
 return path to deliver any pending signal; it is not interrupted with
-`EINTR`. An own-stack task transfers to the executor when another runnable
-task, deferred wake, due timer, or staged cross-CPU wake can use the CPU; when
-the caller is the sole runnable task it returns directly because an executor
-round could only select that same task. Queue contention conservatively
-preserves the transfer.
+`EINTR`. An own-stack task yields when another runnable task, deferred wake,
+due timer, or staged cross-CPU wake can use the CPU. An eligible same-CPU peer
+may be entered through the scheduler's bounded direct-transfer path; every
+failed claim falls back to executor selection. When the caller is the sole
+runnable task it returns directly because an executor round could only select
+that same task. Queue contention conservatively preserves the transfer.
 Anonymous pipes implement `FIONREAD` on both ends and report the shared
 immediately-readable byte count. Writes and final endpoint closure publish a
 readiness notification so parked `poll`/`epoll` waiters wake without unrelated
@@ -663,16 +672,23 @@ for legacy/test contexts and are included in read/reset operations. A task
 never charges another task through this pointer: an expected TID must match.
 `CLONE_THREAD` children inherit the creator CPU as a soft initial preference
 while retaining the full allowed affinity mask, preserving shared-mm locality
-without preventing idle-CPU stealing. Forked process groups instead rotate
-across every online CPU in their allowed mask (starting with an application
-processor on the common contiguous topology); pthread siblings created by each
-child then retain group locality. This uses otherwise-idle BSP capacity under
-process-level oversubscription without bouncing a group's shared lock data
-between CPUs.
+without preventing idle-CPU stealing. Process children use the scheduler's
+non-blocking allowed-queue load snapshot, including running and staged-wake
+work. A per-parent cursor rotates the preferred queue across the allowed mask;
+that preference wins ties and a one-task load difference (the still-running
+forking parent), so a burst of siblings stays distributed even if earlier
+children park during setup, and helper forks cannot consume another parent's
+sequence. The same rotation is the fallback if no queue snapshot is available.
+Process-local thread clones retain shared-memory locality.
 Fork/clone children inherit the parent's live FP/SIMD image on both
 architectures. On x86_64 this includes x87 control/data plus the boot-enabled
-XMM/YMM/ZMM xstate, matching Linux `fpu_clone`; on aarch64 it includes the
-complete FPSIMD image. On aarch64, switch-out also reads live `TPIDR_EL0`
+XMM/YMM/ZMM xstate, matching Linux `fpu_clone`; fork also snapshots live
+`IA32_FS_BASE` with `RDFSBASE` when the executing CPU has enabled FSGSBASE and
+the architectural MSR fallback otherwise, matching Linux `current_save_fsgs`
+even after a direct userspace `WRFSBASE`. Successful x86_64 exec resets all
+user xstate to architectural initial state before entering the replacement
+image, matching Linux `fpu_flush_thread`. On aarch64 the inherited image is the
+complete FPSIMD state. On aarch64, switch-out also reads live `TPIDR_EL0`
 because EL0 may update it without a syscall, fork/clone inherit that live value,
 and exec clears both TLS and FPSIMD in line with Linux arm64
 `copy_thread`/`flush_thread` semantics.
@@ -1019,6 +1035,14 @@ before returning the retained page to the memory fault transaction.
 suppresses prefaulting. Shared mremap slices and transfers only the materialized
 writeback prefix, so an untouched grown or relocated tail remains allocation
 free.
+
+Private generic file faults use the same owner transaction but never enter the
+shared fallback-page cache and never retain a file-owned frame. Filesystem I/O
+runs only after the page-scoped memory ticket and Region prefix are reserved;
+publication either transfers the fresh frame to the live private VMA or frees
+it after cancellation. A block-backed read may park the own-stack task from
+the page-fault continuation; the scheduler runs the executor IRQ-enabled while
+preserving the interrupt-gate continuation's masked state.
 
 The equivalent internal bridge for `AF_NETLINK`/`NETLINK_NETFILTER` accepts
 only a live `NetfilterAdminHandle` whose immutable namespace id equals the

@@ -357,6 +357,12 @@ impl RegionPerms {
     pub const WRITE: RegionPerms;
     pub const EXEC: RegionPerms;
     pub const LOCKED: RegionPerms;
+    /// Externally owned alias; teardown invokes the shared release hook.
+    pub const SHARED: RegionPerms;
+    /// Missing pages are supplied by the installed file-fault hook. With
+    /// SHARED the returned frame is externally owned; without SHARED it is a
+    /// fresh private frame whose ownership transfers to this address space.
+    pub const FILE_DEMAND: RegionPerms;
     /// Lazy memory locking; always accompanied by LOCKED.
     pub const LOCK_ONFAULT: RegionPerms;
     /// Linux VM_SPECIAL analogue; never memory-lock eligible.
@@ -873,8 +879,10 @@ pub fn kalloc(size: usize, align: usize, domain: DomainId) -> Option<NonNull<u8>
 pub fn kfree(ptr: NonNull<u8>, size: usize, domain: DomainId);
 
 /// Allocation and per-CPU-magazine telemetry snapshots. Hit/miss totals are
-/// aggregated modulo 2^64 at read time; allocation/free fast paths update only
-/// the executing CPU's cache-line-isolated magazine counters.
+/// aggregated modulo 2^64 at read time. Allocation/free fast paths update only
+/// the executing CPU's cache-line-isolated magazine counters and published
+/// occupancy; `in_use` is reconstructed from grown minus central/magazine free
+/// inventory and can be transiently approximate during a concurrent operation.
 pub fn slab::stats() -> SlabStats;
 pub fn slab::magazine_stats() -> MagazineStats;
 
@@ -929,6 +937,14 @@ x86_64 is rejected at runtime.
   buddy. Aggregate snapshots visit only nodes in the published online mask;
   node counters are initialized before their bit is set and their bit is
   cleared only after the final range has left the allocator.
+- The installed `FrameAlloc` remains an authoritative cap-gated fat pointer,
+  but the shipped buddy identity is published through a release/acquire kind
+  discriminator and dispatches without taking the global installation lock.
+  Installing a custom allocator publishes the custom kind while holding that
+  lock and before replacing the pointer, forcing every new reader through the
+  locked fallback; reinstalling the buddy publishes its lock-free kind only
+  after the pointer is authoritative. Allocator replacement still requires the
+  caller's documented ownership quiescence.
 - Runtime memory online is transactional: overlapping/unmapped ranges are
   rejected before donation, and allocator metadata may not grow while the
   frame lock is held. Offline succeeds only for an exact registered range
@@ -969,11 +985,24 @@ x86_64 is rejected at runtime.
   allocation groups frames by refcount shard, each shard slice groups duplicate
   physical addresses, and the batch locks each touched shard once and
   increments once per input occurrence; unbacked zero sentinels and externally
-  owned SHARED mappings are excluded. Child VMA publication transfers those
-  retains in prefix order. If
-  a later child index reservation fails, partial-child teardown releases the
-  published prefix and an allocation-free rollback removes only the unpublished
-  suffix, including restoration of the implicit sole-owner representation.
+  owned SHARED mappings are excluded. Boot-managed frames instead use the
+  lock-free PFN-indexed table once it is published. Each 64-bit count/epoch
+  state occupies one compile-time-checked 64-byte slot, so concurrent
+  fork/exit traffic for distinct frames cannot false-share a cache line. The
+  table costs 1.6% of boot-managed RAM, comparable to Linux's per-page
+  descriptor; hotplug frames and pre-initialization callers retain the sharded
+  fallback. Slot padding changes neither the implicit-sole-owner encoding nor
+  retain, rollback, and final-release atomic transitions. Child VMA publication
+  transfers those retains in prefix order. Normal fork reserves
+  the fresh child index once, appends the parent's already-ordered VMAs without
+  a per-VMA AVL search, then
+  balances that index in one linear pass. During construction the published
+  prefix remains an ordered, teardown-visible search tree. Any later fallible
+  error first finalizes that prefix, so partial-child teardown releases every
+  published owner, while an allocation-free rollback removes only the
+  unpublished suffix, including restoration of the implicit sole-owner
+  representation. The granular per-region reservation path remains available
+  to inject failures at each publication boundary.
   The shared-owner transaction is released after regular child publication and
   before private huge-page allocation or copying. Multi-page materialization
   and parent permission rewriting snapshot COW counts by shard while holding
@@ -1071,6 +1100,10 @@ x86_64 is rejected at runtime.
   predecessor/successor or intersecting tree range; ordered iteration remains
   O(VMA). Mapping publication generations live in the same tree entry, so VMA
   and generation publication cannot diverge through a second allocation.
+  A fresh, fully reserved index may instead accept strictly increasing keys as
+  a right-linked construction chain and rebalance once after the batch. The
+  chain remains an ordered owned tree throughout construction; callers must
+  finalize a partial prefix before exposing or dropping it after failure.
   Backing ownership and TLB ordering are unchanged by this metadata index
   invariant.
   The periodic NUMA sampler seeks to the VMA containing or succeeding its
@@ -1106,7 +1139,9 @@ x86_64 is rejected at runtime.
   while holding the region lock; structural VMA removal cancels every covered
   ticket before a replacement can appear. A cancelled anonymous allocation
   remains owned by the fault path and returns to the frame allocator; a
-  cancelled file alias is released through its backing-owner hook.
+    cancelled externally-owned file alias is released through its
+    backing-owner hook; a cancelled private file page returns directly to the
+    frame allocator.
 - An anonymous demand fault refused by the protected user reserve reports
   the typed `FrameAllocError::ReservePressure` directly from the allocator;
   fallback policy walks preserve that result rather than collapsing it into
@@ -1141,6 +1176,13 @@ x86_64 is rejected at runtime.
   entry; deletion leaves a tombstone so colliding ownership remains visible;
   lookup may stop only at a never-used slot. Kernel-shared page tables are not
   registered and therefore are never reclaimed by user-address-space teardown.
+- Fresh x86_64 user roots initialize every entry before publication without
+  redundant whole-page clearing: PML4[0..256] is zeroed and PML4[256..512] is
+  copied entry-by-entry from the current kernel root; the private PML4[1]
+  replacement points at a fresh PDPT whose entry 0 is zero and whose entries
+  1..512 are copied entry-by-entry from the kernel high-MMIO table. Thus no
+  stale allocator contents can become a translation even though bytes that are
+  immediately overwritten are not cleared first.
 - Reverse maps use a 64-way sharded, open-addressed physical-frame index with
   a mixed page-number hash and a maximum 75% occupied-plus-tombstone load.
   Growth rehashes in amortized chunks; deletion beyond the reuse bound leaves
@@ -1200,6 +1242,19 @@ x86_64 is rejected at runtime.
   path reached during final-owner return is itself allocation-free. Test
   cleanup unregisters only its named/test-marked shrinkers and cannot erase a
   live slab, page-cache, or other production registration.
+- Slab fast-path allocation accounting is cache-local: each magazine publishes
+  its free occupancy after a local push/pop, while the central-free count moves
+  only on batched refill, spill, grow, and reclaim paths. The diagnostic
+  `in_use` value is the saturating difference between total grown blocks and
+  those two free inventories. A concurrent snapshot may cross a publication
+  boundary, but the shrinker treats the result only as a hint; reclaim safety
+  continues to require every block of a frame to be present on the locked
+  central list before detachment.
+- Synchronous direct compaction is permitted only for higher-order allocations
+  made with local interrupts enabled. An allocation reached while an IRQ-safe
+  metadata lock is held skips compaction and follows its existing scattered or
+  failure path, so migration cannot recursively acquire reverse-map or other
+  allocator-adjacent metadata locks. Order-0 allocation remains non-compacting.
 - `GlobalAlloc` invokes its selected backend exactly once. On failure it
   publishes a bounded per-node reclaim request, wakes kswapd, and returns null;
   it never invokes a shrinker, sleeps, or retries while its caller may hold an

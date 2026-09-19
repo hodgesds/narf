@@ -325,12 +325,13 @@ impl RegionPerms {
     ///
     /// A zero `phys[i]` normally means "anonymous, demand-allocate a fresh
     /// zeroed frame". In a `FILE_DEMAND` region it instead means "ask
-    /// [`install_file_fault_hook`]'s callback", which is what makes a
-    /// `MAP_SHARED` device mapping *track* its file rather than snapshot it:
-    /// pages the file backs after `mmap` still appear. Always set together
-    /// with [`SHARED`](Self::SHARED) — the frames belong to the file, so
-    /// teardown must clear PTEs and free nothing. Bit 11; stripped by the
-    /// POSIX prot mask like the other internal flags.
+    /// [`install_file_fault_hook`]'s callback". With
+    /// [`SHARED`](Self::SHARED), this makes a device or generic file mapping
+    /// track externally-owned backing and teardown releases an external
+    /// mapping hold. Without `SHARED`, the callback supplies a fresh private
+    /// frame owned by this address space; fork and teardown then use the
+    /// ordinary private/COW rules. Bit 11; stripped by the POSIX prot mask like
+    /// the other internal flags.
     pub const FILE_DEMAND: RegionPerms = RegionPerms(1 << 11);
 
     /// Internal flag: at least one resident page in this private region may
@@ -967,6 +968,27 @@ impl RegionTable {
             .map(|entry| entry.region)
     }
 
+    fn push_sorted_reserved(&mut self, region: Region) {
+        self.invalidate_region_caches();
+        let base = region.base.as_u64();
+        let id = self.next_mapping_id;
+        self.next_mapping_id = self
+            .next_mapping_id
+            .checked_add(1)
+            .expect("VMA publication generation exhausted");
+        self.by_base.push_sorted_reserved(
+            base,
+            RegionEntry {
+                region,
+                mapping_id: id,
+            },
+        );
+    }
+
+    fn finish_sorted_build(&mut self) {
+        self.by_base.finish_sorted_build();
+    }
+
     #[inline]
     fn remove(&mut self, base: u64) -> Option<Region> {
         self.invalidate_region_caches();
@@ -1350,7 +1372,11 @@ enum DemandPageClaim {
     /// region lock.
     InProgress,
     /// This caller owns the slow path and may leave the region lock.
-    Owner { ticket: u64, file_backed: bool },
+    Owner {
+        ticket: u64,
+        file_backed: bool,
+        externally_owned: bool,
+    },
 }
 
 static NEXT_COW_TICKET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -7298,6 +7324,7 @@ impl AddressSpace {
         Ok(DemandPageClaim::Owner {
             ticket,
             file_backed: perms.contains(RegionPerms::FILE_DEMAND),
+            externally_owned: perms.contains(RegionPerms::SHARED),
         })
     }
 
@@ -7868,6 +7895,7 @@ impl AddressSpace {
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
+            externally_owned,
         } = claim
         else {
             return Ok(());
@@ -7918,7 +7946,7 @@ impl AddressSpace {
         }) {
             Ok(published) => published,
             Err(error) => {
-                if file_backed {
+                if file_backed && externally_owned {
                     release_shared_phys(phys);
                 } else {
                     crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
@@ -7933,7 +7961,7 @@ impl AddressSpace {
             // The ticket was cancelled before publication, so ownership never
             // left this fault path. A file hook supplies one external alias
             // reference, balanced through the normal shared release hook.
-            if file_backed {
+            if file_backed && externally_owned {
                 release_shared_phys(phys);
             } else {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
@@ -7992,6 +8020,7 @@ impl AddressSpace {
         let DemandPageClaim::Owner {
             ticket,
             file_backed,
+            externally_owned,
         } = claim
         else {
             return Ok(());
@@ -8040,7 +8069,7 @@ impl AddressSpace {
         }) {
             Ok(published) => published,
             Err(error) => {
-                if file_backed {
+                if file_backed && externally_owned {
                     release_shared_phys(phys);
                 } else {
                     crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
@@ -8049,7 +8078,7 @@ impl AddressSpace {
             }
         };
         if !published {
-            if file_backed {
+            if file_backed && externally_owned {
                 release_shared_phys(phys);
             } else {
                 crate::frame::free_frame(crate::frame::PhysFrame::new(phys));
@@ -9612,8 +9641,12 @@ impl AddressSpace {
         for region in parent.iter() {
             // Clone the backing list once; this Vec becomes the child's.
             let mut phys: Vec<PhysAddr> = Vec::new();
-            phys.try_reserve_exact(region.phys.len())
-                .map_err(|_| AddressSpaceError::AllocationFailed)?;
+            if phys.try_reserve_exact(region.phys.len()).is_err() {
+                if !reserve_per_region {
+                    child_regions.finish_sorted_build();
+                }
+                return Err(AddressSpaceError::AllocationFailed);
+            }
             phys.extend_from_slice(&region.phys);
             let mut perms = region.perms;
             perms.0 &= !(RegionPerms::LOCKED.0 | RegionPerms::LOCK_ONFAULT.0);
@@ -9634,6 +9667,9 @@ impl AddressSpace {
                         let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
                         if let Err(error) = protect_run(base, pages) {
                             crate::frame::cow::rollback_inc_ref_batch(&phys[..=page_index]);
+                            if !reserve_per_region {
+                                child_regions.finish_sorted_build();
+                            }
                             return Err(error);
                         }
                     }
@@ -9643,6 +9679,9 @@ impl AddressSpace {
                     let base = VirtAddr::new(region.base.as_u64() + start as u64 * 4096);
                     if let Err(error) = protect_run(base, pages) {
                         crate::frame::cow::rollback_inc_ref_batch(&phys);
+                        if !reserve_per_region {
+                            child_regions.finish_sorted_build();
+                        }
                         return Err(error);
                     }
                 }
@@ -9662,7 +9701,14 @@ impl AddressSpace {
             if shared {
                 retain_shared_frames(&child_region);
             }
-            assert!(child_regions.insert_reserved(child_region).is_none());
+            if reserve_per_region {
+                assert!(child_regions.insert_reserved(child_region).is_none());
+            } else {
+                child_regions.push_sorted_reserved(child_region);
+            }
+        }
+        if !reserve_per_region {
+            child_regions.finish_sorted_build();
         }
 
         #[cfg(target_arch = "x86_64")]

@@ -357,11 +357,14 @@ pub fn direct_compact_pages() -> u64 {
 /// the allocation if this migrated anything. A no-op for `order == 0` (order-0
 /// allocations never need contiguity, so they never compact — which also keeps
 /// the migration path, whose destination frames are order-0 allocations, from
-/// recursing into compaction).
+/// recursing into compaction) or while local interrupts are masked. The latter
+/// is the allocator's GFP_ATOMIC-style boundary: an IRQ-safe lock may protect
+/// metadata whose growth reaches the higher-order allocator, and compaction
+/// must not synchronously re-enter that metadata while its lock is held.
 #[cfg(target_arch = "x86_64")]
 pub fn direct_compact(node: usize, order: usize) -> usize {
     use core::sync::atomic::Ordering;
-    if order == 0 {
+    if order == 0 || !crate::context::irqs_enabled() {
         return 0;
     }
     DIRECT_COMPACT_EVENTS.fetch_add(1, Ordering::Relaxed);
@@ -1113,6 +1116,16 @@ mod tests {
             // Order 0 never compacts and never counts as an attempt.
             if direct_compact(node, 0) != 0 || direct_compact_events() != ev0 {
                 return TestResult::Fail("direct_compact must no-op (uncounted) for order 0");
+            }
+            // Nor may direct compaction run while an IRQ-safe metadata lock can
+            // be held. In particular, rmap Vec growth can reach the higher-order
+            // allocator while holding its shard lock; recursively scanning rmap
+            // there deadlocks the current CPU and eventually every peer.
+            let masked = narf_lib::sync::without_interrupts(|| direct_compact(node, 1));
+            if masked != 0 || direct_compact_events() != ev0 {
+                return TestResult::Fail(
+                    "direct_compact must no-op (uncounted) with interrupts masked",
+                );
             }
             // Order 1: migrate the movable page out, consolidating the block.
             if direct_compact(node, 1) != 1 {

@@ -1032,7 +1032,10 @@ fn smoke_abi_pathx_openat2_in_root_dirfd_relative() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_in_root_dirfd_relative);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_openat2_in_root_dirfd_relative
+);
 
 /// Guard: the double-prefix fix must not weaken scoping. A lexically-escaping
 /// `..` under `RESOLVE_BENEATH` is still -EXDEV.
@@ -1058,7 +1061,10 @@ fn smoke_abi_pathx_openat2_beneath_escape_is_exdev() -> TestResult {
         }
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_beneath_escape_is_exdev);
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_openat2_beneath_escape_is_exdev
+);
 
 // ── readlinkat (dirfd, NUL-term path, buf, buflen) → len / -1 ──────
 //

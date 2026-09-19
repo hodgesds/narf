@@ -47,7 +47,8 @@ pub fn spawn_user(
     address_space: Arc<AddressSpace>,
 ) -> TaskId;
 pub fn yield_now() -> impl Future<Output=()>;
-/// Handle sched_yield for the current own-stack task; false selects fallback.
+/// Handle sched_yield for the current own-stack task; an eligible local peer
+/// may use the bounded direct-transfer path; false selects fallback.
 pub fn stackful::sched_yield_current() -> bool;
 /// Conservative current-CPU probe: false only when no runnable peer,
 /// deferred wake, due timer, or staged cross-CPU wake can use a yield.
@@ -60,6 +61,10 @@ pub fn clear_task_mems_allowed(task: u64);
 pub fn install_memory_pid_resolver(resolve: fn(task: u64) -> Option<u64>);
 pub fn install_process_task_resolver(resolve: fn(pid: u64) -> Option<u64>);
 pub fn online_cpu_set() -> CpuSet;
+/// Best-effort initial placement for a new process child. Samples allowed,
+/// online run queues without blocking and honors a caller-provided rotating
+/// preference on a load tie.
+pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId>;
 pub fn task_affinity(task: TaskId) -> Option<CpuSet>;
 pub fn set_task_affinity(task: TaskId, requested: CpuSet)
     -> Result<(), SetAffinityError>;
@@ -74,6 +79,8 @@ pub fn current_user_context() -> *mut ();
 pub fn stackful::arm_current_user_fpu();
 #[cfg(target_arch = "x86_64")]
 pub fn stackful::materialize_current_user_fpu() -> bool;
+#[cfg(target_arch = "x86_64")]
+pub fn stackful::reset_current_user_fpu() -> bool;
 #[cfg(target_arch = "x86_64")]
 pub fn stackful::handle_user_fpu_unavailable() -> bool;
 pub fn note_forward_progress();          // bounded completion heartbeat
@@ -134,7 +141,10 @@ supervisor access to user leaves; on aarch64 the kernel remains in TTBR1. If a
 poll body replaces and activates its address space (notably inline `execve`),
 the post-poll publication mismatch forces an executor-root restore while both
 old and replacement roots remain strongly owned; a stale outer Arc can never
-authorize a same-MM switch elision.
+authorize a same-MM switch elision. The deferred slot owner is consumed on the
+next dispatch of a pending task and is retired immediately if the task instead
+completes or is abnormally reaped, so a task id that never polls again cannot
+retain an address space.
 On x86_64 and aarch64, every own-stack switch-out folds the elapsed on-CPU slice through
 the slice-account hook. A CPL0 timer preemption additionally calls `pause`
 before switching and calls `resume` only when `pause` reported an open syscall
@@ -148,8 +158,10 @@ syscall-free user loop cannot monopolize a CPU and strand runnable siblings.
 On x86_64, switch-out saves an FP/SIMD image only after the task has consumed
 the register file, then arms CR0.TS; the first user FP/SIMD instruction after
 resume raises `#NM`, restores that task's image, and retries. A task is always
-saved before it can migrate. A privileged consumer that must observe or replace
-user FP/SIMD state (notably signal-frame construction and sigreturn) first calls
+saved before it can migrate. Successful exec resets that task-owned image to
+architectural initial state before the replacement program enters user mode.
+A privileged consumer that must observe or replace user
+FP/SIMD state (notably signal-frame construction and sigreturn) first calls
 `materialize_current_user_fpu`; this restores a deferred task image, clears TS,
 and marks the registers live before capture or replacement. With no published
 image it still clears hardware TS and the scheduler mirror together. No
@@ -171,6 +183,13 @@ NARF now has a nestable CPU-local `preempt_disable()` guard,
 but syscall/driver critical regions have not completed the adoption audit;
 enabling arbitrary CPL0 timer preemption before that would still make an
 unannotated lock-bearing continuation migratable and could strand shared state.
+An own-stack task may also park from a synchronous exception continuation
+(notably a demand-file page fault). The task records that the continuation was
+entered through an IRQ-masking gate and always returns through the executor,
+never a direct task-to-task handoff. Once the task stack is suspended the
+executor unmasks IRQs so block-I/O completion can run; immediately before the
+exact continuation resumes it masks IRQs again. Thus the frame's non-nested
+exception contract remains intact without deadlocking the completion IRQ.
 `note_urgent_wake_preempt` publishes the exact task selected by a synchronous
 wake. An own-stack source may consume that publication as a bounded direct
 handoff when both tasks are stackful tasks using the same execution kind, the
@@ -183,28 +202,42 @@ the direct path never moves a task or hardware address-space owner across run
 queues. Dispatch and stealing skip a locally claimed target until the final
 switch has completed.
 When an exact synchronous wake makes a sleeping, direct-eligible partner
-runnable on another CPU, the running direct-eligible waker may publish that
-partner's authoritative home as a one-shot co-location hint. The waker does
-not migrate inside the wake path: it consumes the hint only after its poll
-returns to the executor, revalidates the destination against the task's live
-hard-affinity mask and the online CPU lifecycle state, and requeues through the
-ordinary migration path. An invalid, same-CPU, offline, affinity-excluded, or
-concurrently replaced hint is ignored. A wakee that moves between publication
-and consumption can leave a placement-stale hint, but it can cause only an
-ordinary migration to a CPU still allowed and online for the waker. This is
-NARF's cooperative analogue of Linux `WF_SYNC` wake-affine placement; once the
-pair is co-located, the existing bounded local direct path may handle later
-exchanges.
-The target normally returns to the source's root executor continuation. If it
-urgently wakes that exact off-queue root, it may instead switch directly to the
-root's saved task continuation. That same fixed root may begin another exact
-handoff, but the batch is capped at 64 target-to-root returns; its next yield
-then must reach the executor. This amortizes executor re-entry while retaining
-a finite fairness and RCU-quiescence progress bound. The off-queue root is
-pinned by its
-in-flight executor poll, the exact `WakeCell` identity substitutes for a queue
-lookup, and a CPU-local whole-poll gate refuses nested sources and arbitrary
-target-to-third-task chains. Before either task's first resumed instruction,
+runnable on another CPU, the core first makes a non-blocking attempt to move
+the queued wakee to the waker's CPU only when that destination has no other
+runnable peer, matching Linux `wake_affine_idle(..., sync)` and its
+`rq->nr_running == 1` test after accounting for NARF's off-queue running waker.
+The source policy and ready-queue locks must both be immediately available,
+both CPUs must use built-in direct-handoff policies, and the destination must
+be online, active, and inside the wakee's live hard-affinity mask. The slot is
+removed under its source queue lock and requeued through the ordinary migration
+path, so policy events, virtual-runtime normalization, task ownership, and
+executor restore checks remain intact. If the wakee is already running,
+staged, contended, or otherwise ineligible, the running direct-eligible waker
+may instead publish that partner's observed home as a one-shot co-location
+hint. The waker does not migrate inside the wake path: it consumes the hint
+only after its poll returns to the executor and revalidates affinity and CPU
+lifecycle state before the same ordinary migration enqueue. Exact synchronous
+wakes do not publish the generic idle-sibling placement hint; allowing an idle
+thief to pull the just-woken endpoint would undo co-location and the local
+urgent-buddy handoff. Once the pair is co-located, the existing bounded local
+direct path may handle later exchanges.
+The target normally returns to the source's root executor continuation. It may
+instead switch directly to the root's saved task continuation when that exact
+off-queue root is still runnable: either an urgent publication names the same
+`WakeCell`, or no competing urgent publication exists and the root's own
+runnable flag remains set from the cooperative re-arm that started the
+handoff. A missing runnable flag declines; an urgent publication naming any
+third task is restored to its ordinary validated path and also declines. That
+same fixed root may begin another exact handoff, but the batch is capped at 64
+target-to-root returns; its next yield then must reach the executor. This
+amortizes executor re-entry while retaining a finite fairness and RCU-
+quiescence progress bound. The off-queue root is pinned by its in-flight
+executor poll, the exact root pointer plus `WakeCell` identity substitutes for
+a queue lookup, and its borrow-only wake-cell pointer is published only after the
+task-owned `Arc`, cleared before current-task unpublication, and remains backed
+by that owner until RCU-deferred task destruction. A CPU-local whole-poll gate
+refuses nested sources and arbitrary target-to-third-task chains. Before either
+task's first resumed instruction,
 the core publishes
 its task/address-space identity and restores its hardware root, kernel-stack
 target, TLS, domain byte plus architecture-saved enforcement state, FPU/SIMD
@@ -215,9 +248,12 @@ exact-buddy/full-validation path and re-kicks its authoritative home. Generic
 every-wake preemption and wake-next remain opt-in. The direct path exchanges
 the target's strong address-space owner into the CPU-local active slot under
 its IRQ-safe lock after activation succeeds. The displaced source owner is
-carried by the handoff and moved back on return, so both hardware-root
-transitions retain the outgoing page tables without extra Arc clones or an
-observable ownerless interval. When the global perf gate is off, switch
+carried by the handoff in a non-locking per-CPU cell and moved back on return.
+That cell is accessed only by its owning CPU while interrupts are masked (or by
+the quiescent kernel-test reset); ownership is always moved rather than
+borrowed. Thus both hardware-root transitions retain the outgoing page tables
+without extra Arc clones, nested IRQ-lock operations, or an observable
+ownerless interval. When the global perf gate is off, switch
 attribution stops before the cross-crate callback; an enabled gate still
 reaches the perf registry's authoritative live-event check.
 Syscall-frequency per-CPU wake, urgent-handoff, and runnable-peer cells occupy
@@ -439,8 +475,20 @@ pub struct TaskSpec {
   within `allowed` under load. Idle balancing does not detach a victim's
   final runnable task: the currently executing task and dispatchable queued
   slots together must exceed one before a thief may take a queued slot. A task
-  that ran within the 500 us migration-cost window is cache-hot and is not an
-  idle-steal candidate; explicit affinity and CPU-lifecycle moves are exempt.
+  that was admitted or ran within the 500 us migration-cost window is
+  cache-hot and is not an idle-steal candidate; explicit affinity and
+  CPU-lifecycle moves are exempt.
+- Process-fork placement may take a non-blocking snapshot of every allowed,
+  online run queue. Its load includes dispatchable queued slots, staged wake
+  inbox entries, and the currently executing task. A contended queue is
+  conservatively busy. The caller's per-parent rotating preference wins a tie
+  or a one-task load difference, accounting for the parent which is still
+  executing the fork burst. This retains sibling distribution toward genuinely
+  idle CPUs when earlier children park during setup and disappear from
+  instantaneous runnable load.
+  The result is only an `Affinity.preferred` hint; admission, hard affinity,
+  CPU lifecycle, and dispatch-time security-state restoration remain
+  authoritative.
 - Runtime affinity updates are published in a task-identity registry so
   a currently-polled slot cannot miss them. A parked slot whose queue is
   excluded is moved immediately; a running cooperative continuation is
@@ -585,6 +633,7 @@ control callback.
   memory subsystem completes a system-wide invalidation. A poll-time address-space
   replacement is reconciled before either root owner is dropped and forces a
   restore rather than carrying stale same-MM identity into the next dispatch.
+  Its deferred slot owner is removed on completion and every abnormal reap.
 - On x86_64 the executor publishes the address space's lifetime process PCID
   before loading `root|pcid|NOFLUSH`. Kernel-root restore and own-stack resume
   preserve nonzero tags. Residency is conservative history and remains set
@@ -599,6 +648,10 @@ control callback.
 - `donate_to` does not bypass capability checks; caller must hold a
   `Cap<Task, Invoke>` (Stage 3).
 - The executor never holds a lock across a poll boundary.
+- A task that parks with hardware IRQs masked cannot use direct handoff. The
+  receiving executor runs with IRQs enabled, while the saved exception
+  continuation resumes masked until its architecture epilogue restores the
+  interrupted state.
 - Work-stealing preserves per-task FIFO ordering of wakes.
 - `has_other_runnable_work` may return a false positive under queue contention
   but never blocks to refine the answer. A false result means the caller can
@@ -609,14 +662,15 @@ control callback.
   conservative fallbacks.
 - On x86_64, a task's FP/SIMD memory image is authoritative whenever CR0.TS is
   armed. The user `#NM` path clears TS, restores only the currently published
-  own-stack task image, and marks the register image live. Signal-frame capture
-  performs that same materialization before reading hardware registers; it may
-  not clear TS independently of the scheduler mirror, including when no task
-  image is published. Every path that can switch or migrate that task,
-  including a scheduler poll nested inside its syscall, saves a live image and
-  re-arms TS first. The nested return restores the outer task's ownership
-  before resuming its continuation. A kernel-mode `#NM` is never attributed to
-  a user task.
+  own-stack task image, and marks the register image live.
+  Signal-frame capture performs that same materialization before reading
+  hardware registers; it may not clear TS independently of the scheduler
+  mirror, including when no task image is published. Every path that can switch
+  or migrate that task, including a scheduler poll nested inside its syscall,
+  saves a live image and re-arms TS first. The nested return restores the outer
+  task's ownership before resuming its continuation. Successful exec overwrites
+  the same task-owned image with architectural initial state while TS remains
+  armed. A kernel-mode `#NM` is never attributed to a user task.
 - A task is never scheduled on a CPU outside its `Affinity.allowed`
   set. Work-stealing and runtime requeue both respect this as a hard
   constraint; a mask change takes effect at the next cooperative poll
@@ -645,22 +699,33 @@ control callback.
   the same boundary without exposing register details to scheduler policy:
   entry neutralises before Rust/outgoing stores, and restore occurs after the
   last incoming-context load and before the resumed continuation.
-- The synchronous-wake direct-transfer path restores the callee's saved
+- The synchronous-wake and `sched_yield` direct-transfer paths restore the
+  callee's saved
   architecture domain state and reported domain byte before its first
   instruction, and captures both before returning to the exact root task or
-  its executor continuation. Every exact-root return restores that root's
-  state before its first resumed instruction; only that fixed root may start
-  another transfer and the 64th return forces the next yield through the
-  executor, so the batch cannot extend to a third task or run unbounded.
-  A remotely queued target is not admitted to direct handoff. It remains on and
-  is woken through its authoritative-home executor path, which retains
-  ownership of cross-CPU task placement and address-space switching.
-  A remote exact synchronous wake may ask the running waker to join that home,
-  but only through a one-shot hint consumed after poll return. The executor
-  checks the live allowed mask, online topology, and CPU lifecycle before the
-  ordinary `enqueue_on(..., Migrated)` path changes queue ownership; the wake
-  path never transfers a running continuation, address-space owner, saved
-  domain state, or FP/SIMD image across CPUs.
+  its executor continuation. A direct root return requires that root's own
+  runnable flag and refuses any urgent publication naming a different task;
+  it does not infer runnable state from the pinned continuation alone. Every
+  exact-root return restores that root's state before its first resumed
+  instruction; only that fixed root may start another transfer and the 64th
+  return forces the next yield through the executor, so the batch cannot
+  extend to a third task or run unbounded.
+  `sched_yield` may select only the first already-runnable, same-CPU slot that
+  passes the same default-class, normal-priority, affinity, budget, and policy
+  eligibility predicate as a synchronous direct wake. Selection and claim use
+  one authoritative run-queue lock after consuming any earlier exact-wake
+  publication; an exact wake racing later remains published for the direct
+  target's return boundary or the executor. Any failed check falls back to
+  executor selection.
+  A remotely queued target is not admitted directly to context handoff. An
+  exact synchronous wake may first move that sleeping slot to the waker's run
+  queue under non-blocking source-policy and source-queue locks; failure leaves
+  it on its authoritative home and may ask the running waker to join that home
+  through a one-shot hint consumed after poll return. Both cases check the live
+  allowed mask, online topology, and CPU lifecycle before the ordinary
+  `enqueue_on(..., Migrated)` path changes queue ownership. The wake path never
+  transfers a running continuation, address-space owner, saved domain state,
+  or FP/SIMD image across CPUs.
   `donate_to` remains a separate capability-checked budget and queue operation;
   it does not branch directly to the donee.
 - **A task never polls across an await with a `ReadGuard` held

@@ -99,6 +99,44 @@ pub(crate) fn load_file_mapping_pages(
     Ok(frames)
 }
 
+/// Load one faulted file page into a fresh private frame.
+///
+/// Unlike the historical eager mmap fallback, a demand fault must not turn an
+/// I/O error into a readable zero page. Bytes after the current EOF within the
+/// final page remain zero, while an offset wholly beyond EOF or a failed read
+/// rejects the fault and returns the frame to the allocator.
+pub(crate) fn load_file_demand_page(
+    ops: &Arc<dyn narf_filesystem::FileOps>,
+    offset: u64,
+) -> Result<narf_memory::PhysAddr, ()> {
+    let file_size = ops.stat().size;
+    if offset >= file_size {
+        return Err(());
+    }
+    let frame = narf_memory::alloc_frame()
+        .map_err(|_| ())?
+        .start_address();
+    // SAFETY: `frame` is a fresh exclusively-owned direct-mapped frame.
+    unsafe {
+        core::ptr::write_bytes(frame.kernel_mut_ptr::<u8>(), 0, 4096);
+    }
+    let want = (file_size - offset).min(4096) as usize;
+    // SAFETY: `want <= 4096` and the fresh frame remains exclusively owned.
+    let dst = unsafe { core::slice::from_raw_parts_mut(frame.kernel_mut_ptr::<u8>(), want) };
+    let mut done = 0usize;
+    while done < want {
+        match poll_io_to_completion(ops.read(offset + done as u64, &mut dst[done..])) {
+            Some(Ok(0)) => break,
+            Some(Ok(n)) => done += n,
+            Some(Err(_)) | None => {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(frame));
+                return Err(());
+            }
+        }
+    }
+    Ok(frame)
+}
+
 /// Read `len` bytes of an fd starting at `offset` into a fresh buffer,
 /// zero-padding past EOF (the BSS tail of a file-backed segment).
 pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
@@ -554,6 +592,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     ops: Arc::clone(&ops),
                                     lifetime: mmap_lifetime.clone(),
                                     writeback_phys: None,
+                                    private_copy: false,
                                     replace: destructive_fixed,
                                 },
                                 || {
@@ -656,6 +695,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     ops: Arc::clone(&ops),
                                     lifetime: None,
                                     writeback_phys: None,
+                                    private_copy: false,
                                     replace: destructive_fixed,
                                 },
                                 || {
@@ -846,6 +886,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         return;
     }
     let shared_file_fallback = !anonymous && flags & MAP_SHARED != 0;
+    let private_file_fallback = !anonymous && map_type == MAP_PRIVATE;
     // Linux generic_file_mmap installs fault operations and obtains a
     // page-cache folio only on first access. NARF likewise leaves a cache
     // miss absent, but may install an already-resident canonical page here:
@@ -855,8 +896,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     let may_defer_shared_file = shared_file_fallback
         && !explicit_lock
         && (flags & MAP_POPULATE == 0 || flags & MAP_NONBLOCK != 0);
+    let may_defer_private_file = private_file_fallback
+        && !explicit_lock
+        && (flags & MAP_POPULATE == 0 || flags & MAP_NONBLOCK != 0);
     let mut lazy_shared_file = false;
+    let mut lazy_private_file = false;
     let mut shared_file_ops = None;
+    let mut private_file_ops = None;
     let mut shared_publication = None;
     let mut shared_cache_generation = None;
     let populate_anonymous = anonymous
@@ -889,14 +935,10 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             v
         }
     } else {
-        // File-backed MAP_PRIVATE: stream the file's [offset, offset+len)
-        // bytes straight into per-page private frames (zero past EOF),
-        // reading ONE page at a time. Slurping the whole region into a single
-        // intermediate Vec OOMs the kernel for big DSOs: ld-musl mmaps Mesa's
-        // libgallium (~40 MiB) and libLLVM (~161 MiB) in a single call, and a
-        // lone 40 MiB+ allocation fails even with GiBs of guest RAM. Per-page
-        // frames are a scatter list, so no large contiguous allocation is
-        // needed.
+        // Generic file mappings normally publish only VMA/owner metadata and
+        // read one page on first fault. Explicit locking/prefault requests keep
+        // the eager fallback, streaming into scatter frames one page at a time
+        // so a large DSO never requires one contiguous kernel allocation.
         let len_bytes = len as usize;
         let ops = match fallback_file_ops.take().or_else(|| {
             fd::with_table(current_task_id(), |t| {
@@ -944,6 +986,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     }
                 }
             }
+        } else if may_defer_private_file {
+            lazy_private_file = true;
+            private_file_ops = Some(Arc::clone(&ops));
+            narf_memory::install_file_fault_hook(crate::mapped_file::demand_frame);
+            // As with Linux's file-backed VMA, mmap publishes no resident pages.
+            // Each first touch reads exactly that file page into a private frame.
+            alloc::vec::Vec::new()
         } else {
             match load_file_mapping_pages(&ops, offset, len_bytes, pages) {
                 Ok(frames) => frames,
@@ -987,11 +1036,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 } else {
                     RegionPerms(0)
                 }
+        } else if lazy_private_file {
+            perms | RegionPerms::FILE_DEMAND
         } else {
             perms
         },
         phys: phys_list,
     };
+    let mut eager_file_population = false;
     let map_result = if let Some(ops) = shared_file_ops.as_ref() {
         as_ref.with_vma_transaction(|| {
             narf_memory::with_address_space_shared_mapping_transaction(as_ref.identity(), || {
@@ -1004,6 +1056,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         ops: Arc::clone(ops),
                         lifetime: None,
                         writeback_phys,
+                        private_copy: false,
                         replace: destructive_fixed,
                     },
                     || {
@@ -1029,6 +1082,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     },
                     |receipt| {
                         if lazy_shared_file {
+                            eager_file_population = as_ref
+                                .perms_covering(receipt.base(), receipt.len())
+                                .is_some_and(|perms| {
+                                    perms.contains(RegionPerms::LOCKED)
+                                        && !perms.contains(RegionPerms::LOCK_ONFAULT)
+                                        && perms.prot_only().0 != 0
+                                });
                             // The complete sparse tail is intentionally absent.
                             // First access publishes a cache-owned page through
                             // the FILE_DEMAND hook.
@@ -1049,6 +1109,55 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             })
         })
         .map(|_| ())
+    } else if let Some(ops) = private_file_ops.as_ref() {
+        as_ref
+            .with_vma_transaction(|| {
+                crate::mapped_file::publish_current_mapping(
+                    as_ref.identity(),
+                    crate::mapped_file::MappingOwnerRegistration {
+                        base,
+                        len,
+                        file_offset: offset,
+                        ops: Arc::clone(ops),
+                        lifetime: None,
+                        writeback_phys: None,
+                        private_copy: true,
+                        replace: destructive_fixed,
+                    },
+                    || {
+                        // SAFETY: the VMA transaction and owner bucket remain
+                        // locked until the private FILE_DEMAND owner is visible.
+                        unsafe {
+                            if destructive_fixed {
+                                as_ref.replace_region_locked_limited_receipt(
+                                    region,
+                                    explicit_lock,
+                                    mlock_authority.limit_bytes,
+                                    mlock_authority.bypass_limit,
+                                )
+                            } else {
+                                as_ref.map_region_locked_limited_receipt(
+                                    region,
+                                    explicit_lock,
+                                    mlock_authority.limit_bytes,
+                                    mlock_authority.bypass_limit,
+                                )
+                            }
+                        }
+                    },
+                    |receipt| {
+                        eager_file_population = as_ref
+                            .perms_covering(receipt.base(), receipt.len())
+                            .is_some_and(|perms| {
+                                perms.contains(RegionPerms::LOCKED)
+                                    && !perms.contains(RegionPerms::LOCK_ONFAULT)
+                                    && perms.prot_only().0 != 0
+                            });
+                        Ok(())
+                    },
+                )
+            })
+            .map(|_| ())
     } else if fixed {
         as_ref.with_vma_transaction(|| {
             crate::mapped_file::publish_current_unowned_mapping(
@@ -1168,6 +1277,17 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-errno) as u64));
         return;
     }
+    if eager_file_population {
+        let end = base.saturating_add(len);
+        let mut page = base;
+        while page < end {
+            // SAFETY: the successful mapping owns a live user root. Population
+            // is best-effort, as Linux specifies for MAP_LOCKED/MCL_FUTURE;
+            // a racing unmap or file fault refusal simply leaves the page lazy.
+            let _ = unsafe { as_ref.demand_alloc_page(VirtAddr::new(page)) };
+            page = page.saturating_add(4096);
+        }
+    }
     if let Some(publication) = shared_publication.take() {
         // map_region retained every SHARED frame before returning. Convert
         // this attempt's pending holds into those committed mapping refs.
@@ -1181,7 +1301,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // page-aligned range remains registered.
         let _ = unsafe { as_ref.materialize_range(VirtAddr::new(base), len) };
     }
-    if shared_file_ops.is_some() {
+    if shared_file_ops.is_some() || private_file_ops.is_some() {
         record_fixed_replacement_owner_committed!();
     } else if fixed {
         // The unowned publication helper already retired overlapping mapped
@@ -1208,7 +1328,7 @@ mod tests {
     use alloc::sync::Arc;
     use alloc::vec;
     use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use narf_filesystem::{FileOps, FsFuture, Mode, Stat};
+    use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
     use narf_kernel_test::{kernel_test_in, TestResult};
     use narf_lib::sync::IrqSafeSpinLock;
     use narf_memory::AddressSpace;
@@ -1269,6 +1389,36 @@ mod tests {
             }
         }
     }
+
+    struct ReadErrorFile;
+
+    impl FileOps for ReadErrorFile {
+        fn read<'a>(&'a self, _offset: u64, _buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+
+        fn write<'a>(&'a self, _offset: u64, _buf: &'a [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async { Err(FsError::ReadOnly) })
+        }
+
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 4096,
+                blocks: 8,
+                mode: Mode::FILE_RW,
+                mtime_cycles: 0,
+            }
+        }
+    }
+
+    fn smoke_file_demand_io_error_fails_closed() -> TestResult {
+        let file: Arc<dyn FileOps> = Arc::new(ReadErrorFile);
+        if load_file_demand_page(&file, 0).is_ok() {
+            return TestResult::Fail("file demand I/O error became readable backing");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!("userspace", smoke_file_demand_io_error_fails_closed);
 
     struct TestCtx {
         args: SyscallArgs,
@@ -1749,6 +1899,126 @@ mod tests {
     kernel_test_in!(
         "userspace",
         smoke_mmap_shared_anon_retires_hidden_handle_on_success
+    );
+
+    fn smoke_mmap_private_file_faults_owned_pages_lazily() -> TestResult {
+        // SAFETY: kernel tests run after paging/frame initialization and this
+        // root remains owned by the test until both VMAs are removed.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::fd::__test_reset();
+
+        let mut contents = vec![0; 4096];
+        contents[..8].copy_from_slice(b"PRIVATE!");
+        let file = Arc::new(TestFile {
+            bytes: IrqSafeSpinLock::new(contents),
+            writes: AtomicUsize::new(0),
+        });
+        let fd = match crate::fd::install(
+            TASK,
+            crate::fd::FdEntry {
+                ops: Arc::clone(&file) as Arc<dyn FileOps>,
+                offset: 0,
+                flags: 0,
+                status_flags: 0,
+            },
+        ) {
+            Some(fd) => fd,
+            None => return TestResult::Fail("could not install test file fd"),
+        };
+
+        let map_private = |len: u64| {
+            let mut call = TestCtx {
+                args: SyscallArgs {
+                    arg1: len,
+                    arg2: 3,    // PROT_READ | PROT_WRITE
+                    arg3: 0x02, // MAP_PRIVATE
+                    arg4: u64::from(fd),
+                    ..SyscallArgs::default()
+                },
+                ret: None,
+            };
+            sys_mmap(&mut call);
+            call.ret.and_then(|ret| {
+                (ret.status == SyscallReturn::OK && (ret.value as i64) > 0).then_some(ret.value)
+            })
+        };
+
+        let Some(base) = map_private(8192) else {
+            return TestResult::Fail("MAP_PRIVATE file mmap failed");
+        };
+        if !aspace.lookup(VirtAddr::new(base)).is_some_and(|region| {
+            region.perms.contains(RegionPerms::FILE_DEMAND)
+                && !region.perms.contains(RegionPerms::SHARED)
+                && region.phys.is_empty()
+        }) {
+            return TestResult::Fail("MAP_PRIVATE file mapping was eagerly backed");
+        }
+        // SAFETY: `base` lies in this test-owned FILE_DEMAND VMA.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(base)) }.is_err() {
+            return TestResult::Fail("private file demand fault failed");
+        }
+        let first = match aspace.lookup(VirtAddr::new(base)) {
+            Some(region) if region.phys.first().is_some_and(|phys| phys.raw() != 0) => {
+                region.phys[0]
+            }
+            _ => return TestResult::Fail("private file fault did not publish backing"),
+        };
+        // SAFETY: `first` is the mapping's live, kernel-direct-mapped frame.
+        if unsafe { core::slice::from_raw_parts(first.kernel_ptr::<u8>(), 8) } != b"PRIVATE!" {
+            return TestResult::Fail("private file fault loaded incorrect bytes");
+        }
+        // SAFETY: this mapping owns the private writable frame.
+        unsafe { first.kernel_mut_ptr::<u8>().write_volatile(b'X') };
+        if file.bytes.lock()[0] != b'P' {
+            return TestResult::Fail("MAP_PRIVATE write modified the backing file");
+        }
+
+        let Some(second_base) = map_private(4096) else {
+            return TestResult::Fail("second MAP_PRIVATE file mmap failed");
+        };
+        // SAFETY: `second_base` lies in a second test-owned FILE_DEMAND VMA.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(second_base)) }.is_err() {
+            return TestResult::Fail("second private file demand fault failed");
+        }
+        let second = match aspace.lookup(VirtAddr::new(second_base)) {
+            Some(region) if region.phys.first().is_some_and(|phys| phys.raw() != 0) => {
+                region.phys[0]
+            }
+            _ => return TestResult::Fail("second private file fault has no backing"),
+        };
+        // Separate MAP_PRIVATE mappings must neither alias writes nor source
+        // their initial bytes from another mapping's already-modified frame.
+        // SAFETY: `second` is the second mapping's live, kernel-direct-mapped
+        // frame and remains owned by `aspace` for this comparison.
+        let second_bytes = unsafe { core::slice::from_raw_parts(second.kernel_ptr::<u8>(), 8) };
+        if second == first || second_bytes != b"PRIVATE!" {
+            return TestResult::Fail("MAP_PRIVATE mappings did not remain isolated");
+        }
+        // A page wholly beyond EOF follows Linux's SIGBUS path, represented by
+        // the memory layer's typed fault refusal.
+        // SAFETY: the address is inside the VMA but begins at file EOF.
+        if unsafe { aspace.demand_alloc_page(VirtAddr::new(base + 4096)) }.is_ok() {
+            return TestResult::Fail("private file fault beyond EOF unexpectedly succeeded");
+        }
+
+        let _ = aspace.unmap_region(VirtAddr::new(second_base));
+        crate::mapped_file::unmap_current(second_base);
+        let _ = aspace.unmap_region(VirtAddr::new(base));
+        crate::mapped_file::unmap_current(base);
+        crate::fd::__test_reset();
+        *USER_AS.lock() = None;
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mmap_private_file_faults_owned_pages_lazily
     );
 
     // `MAP_SHARED` promises that modifications become file data once the

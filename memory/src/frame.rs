@@ -22,7 +22,7 @@
 //! `#[no_mangle]` definitions calling into narf-acpi at boot.
 
 use core::fmt;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 use narf_capabilities::{Cap, CapError, CapKind, CapType, Grant};
@@ -1461,7 +1461,10 @@ pub fn alloc_pages_on_ctx(
     let r = alloc_pages_on_inner(node, order, ctx.migrate_type());
     // Direct compaction: a higher-order allocation that ran out of contiguous
     // blocks may succeed after migrating movable pages together. Compact this
-    // node once and retry before giving up.
+    // node once and retry before giving up. `direct_compact` itself rejects
+    // IRQ-masked callers, so allocations made under an IRQ-safe metadata lock
+    // fall through to their caller's non-contiguous/failure path rather than
+    // recursively entering migration while that metadata is locked.
     let r = retry_after_direct_compaction(r, node, order, ctx.migrate_type());
     #[cfg(feature = "cgroup")]
     if r.is_err() {
@@ -2443,12 +2446,15 @@ pub mod cow {
     // sharded hash above makes every fork and every teardown pay
     // hash+probe+shard-lock per resident page — the dominant cost of a
     // fork+exit cycle. `init_flat_table` (boot, after the slab heap is
-    // live) backs one `AtomicU64` per boot-managed frame via `valloc`
-    // (8 bytes per 4 KiB page, 0.2% of RAM — Linux's `struct page` pays
-    // 64), after which every in-range key uses a single lock-free
-    // atomic. Keys outside the boot RAM range (memory hotplug) and
-    // pre-init callers keep the sharded-hash path; a key is in exactly
-    // one of the two structures, decided solely by its address.
+    // live) backs one cache-line-isolated slot per boot-managed frame via
+    // `valloc` (64 bytes per 4 KiB page, 1.6% of RAM, comparable to Linux's
+    // `struct page`). Fork/exit updates refcounts from many CPUs at once;
+    // packing eight unrelated frames into one cache line made independent
+    // address spaces serialize through false sharing. After publication every
+    // in-range key still uses a single lock-free atomic. Keys outside the boot
+    // RAM range (memory hotplug) and pre-init callers keep the sharded-hash
+    // path; a key is in exactly one of the two structures, decided solely by
+    // its address.
     //
     // Entry layout: low 32 bits = owner count (0 = unregistered, i.e.
     // one implicit sole owner; 1 is stored after a share drops back to a
@@ -2457,7 +2463,14 @@ pub mod cow {
     // recent sole→shared transition, so a duplicate alias in the same
     // batch also reports "newly shared" and every parent alias gets
     // write-protected.
-    static FLAT: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
+    #[repr(align(64))]
+    struct FlatCowSlot {
+        state: AtomicU64,
+    }
+    const _: () = assert!(core::mem::size_of::<FlatCowSlot>() == 64);
+    const _: () = assert!(core::mem::align_of::<FlatCowSlot>() == 64);
+
+    static FLAT: AtomicPtr<FlatCowSlot> = AtomicPtr::new(core::ptr::null_mut());
     static FLAT_FRAMES: AtomicUsize = AtomicUsize::new(0);
     static FLAT_EPOCH: AtomicU32 = AtomicU32::new(0);
 
@@ -2475,7 +2488,7 @@ pub mod cow {
         }
         // SAFETY: `ptr` names the published, never-freed array of
         // `FLAT_FRAMES` entries and `index` is bounds-checked above.
-        Some(unsafe { &*ptr.add(index) })
+        Some(&unsafe { &*ptr.add(index) }.state)
     }
 
     /// Reserve a batch epoch. Epoch 0 is reserved for non-batch
@@ -2559,14 +2572,14 @@ pub mod cow {
             return;
         }
         let frames = (limit >> super::PAGE_SHIFT) as usize;
-        let bytes = frames * core::mem::size_of::<AtomicU64>();
+        let bytes = frames * core::mem::size_of::<FlatCowSlot>();
         let Some(ptr) = crate::vmalloc::valloc(bytes) else {
             return;
         };
         // SAFETY: `valloc` returned `bytes` of exclusively-owned,
         // frame-backed kernel memory; zero it before publication.
         unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
-        let base = ptr.as_ptr() as *mut AtomicU64;
+        let base = ptr.as_ptr() as *mut FlatCowSlot;
         for shard in &REFCOUNTS {
             let mut guard = shard.map.lock();
             if let Some(table) = guard.as_mut() {
@@ -2575,7 +2588,9 @@ pub mod cow {
                         let index = (key >> super::PAGE_SHIFT) as usize;
                         if index < frames {
                             // SAFETY: `base` holds `frames` entries.
-                            unsafe { &*base.add(index) }.store(u64::from(count), Ordering::Relaxed);
+                            unsafe { &*base.add(index) }
+                                .state
+                                .store(u64::from(count), Ordering::Relaxed);
                             *slot = RefSlot::Tombstone;
                             table.len -= 1;
                             table.tombstones += 1;
@@ -3056,7 +3071,9 @@ pub mod cow {
             let frames = FLAT_FRAMES.load(Ordering::Relaxed);
             for index in 0..frames {
                 // SAFETY: `ptr` holds `frames` published entries.
-                unsafe { &*ptr.add(index) }.store(0, Ordering::Relaxed);
+                unsafe { &*ptr.add(index) }
+                    .state
+                    .store(0, Ordering::Relaxed);
             }
         }
         for s in &REFCOUNTS {
@@ -3990,13 +4007,23 @@ impl FrameAlloc for BumpFrameAlloc {
     }
 }
 
-// `&'static dyn FrameAlloc` is a fat pointer (data + vtable). An
-// `AtomicPtr` can only hold one word; we therefore park the trait
-// object behind an `IrqSafeSpinLock<Option<…>>`. Dispatch copies the
-// `'static` fat pointer and releases this lock before invoking it, so
-// buddy work is serialized only by the selected NUMA-zone lock.
+// `&'static dyn FrameAlloc` is a fat pointer (data + vtable), so an AtomicPtr
+// cannot publish an arbitrary implementation. Keep the authoritative object
+// behind the lock, but bypass that globally shared cache line for the shipped
+// buddy: its static identity needs no pointer load. Custom implementations are
+// deliberately cold and retain the locked fallback.
 static FRAME_ALLOC_SLOT: IrqSafeSpinLock<Option<&'static dyn FrameAlloc>> =
     IrqSafeSpinLock::new(None);
+
+const FRAME_ALLOC_NONE: u8 = 0;
+const FRAME_ALLOC_BUDDY: u8 = 1;
+const FRAME_ALLOC_CUSTOM: u8 = 2;
+static FRAME_ALLOC_KIND: AtomicU8 = AtomicU8::new(FRAME_ALLOC_NONE);
+
+#[inline]
+fn is_default_buddy(alloc: &'static dyn FrameAlloc) -> bool {
+    core::ptr::eq(alloc, &BUDDY_FRAME_ALLOC as &dyn FrameAlloc)
+}
 
 /// Install a `FrameAlloc` impl. Cap-gated on `Cap<MemAlloc, Grant>`.
 /// The previous installed allocator is replaced; callers are
@@ -4008,7 +4035,18 @@ pub fn install_frame_alloc(
     alloc: &'static dyn FrameAlloc,
 ) -> Result<(), FrameAllocError> {
     cap.check_live()?;
-    *FRAME_ALLOC_SLOT.lock() = Some(alloc);
+    let mut slot = FRAME_ALLOC_SLOT.lock();
+    if is_default_buddy(alloc) {
+        *slot = Some(alloc);
+        // Publish the lock-free identity only after the authoritative slot.
+        FRAME_ALLOC_KIND.store(FRAME_ALLOC_BUDDY, Ordering::Release);
+    } else {
+        // Divert new readers through the lock before changing the fat pointer.
+        // A reader that observed BUDDY earlier linearizes before this install;
+        // a reader that observes CUSTOM waits for `slot` and sees `alloc`.
+        FRAME_ALLOC_KIND.store(FRAME_ALLOC_CUSTOM, Ordering::Release);
+        *slot = Some(alloc);
+    }
     Ok(())
 }
 
@@ -4019,6 +4057,7 @@ fn install_frame_alloc_default() {
     let mut slot = FRAME_ALLOC_SLOT.lock();
     if slot.is_none() {
         *slot = Some(&BUDDY_FRAME_ALLOC);
+        FRAME_ALLOC_KIND.store(FRAME_ALLOC_BUDDY, Ordering::Release);
     }
 }
 
@@ -4026,18 +4065,19 @@ fn install_frame_alloc_default() {
 /// when no allocator has been installed yet (`init_from_map`
 /// hasn't run).
 pub fn current_frame_alloc_name() -> &'static str {
-    FRAME_ALLOC_SLOT
-        .lock()
-        .as_ref()
-        .map(|a| a.name())
-        .unwrap_or("none")
+    current_alloc().map(|a| a.name()).unwrap_or("none")
 }
 
 /// Snapshot the currently-installed `FrameAlloc`. Returns `None`
 /// pre-init.
 #[inline]
 fn current_alloc() -> Option<&'static dyn FrameAlloc> {
-    *FRAME_ALLOC_SLOT.lock()
+    match FRAME_ALLOC_KIND.load(Ordering::Acquire) {
+        FRAME_ALLOC_BUDDY => Some(&BUDDY_FRAME_ALLOC),
+        FRAME_ALLOC_CUSTOM => *FRAME_ALLOC_SLOT.lock(),
+        FRAME_ALLOC_NONE => None,
+        _ => unreachable!("invalid frame allocator kind"),
+    }
 }
 
 /// Dispatch helper: thread the installed allocator into `f` or

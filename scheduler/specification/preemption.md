@@ -65,9 +65,11 @@ The retired `preempt_yield_stub`/IRET-rewrite design is not used.
 An exact synchronous wake followed by an own-stack source park may take a
 bounded direct path instead of first resuming the executor. The core claims the
 awake target under its home ready-queue lock. A local slot remains resident; a
-remote slot stays on its authoritative home for ordinary executor dispatch.
-This keeps cross-CPU task placement and address-space ownership behind the
-executor boundary. The core then saves the source FP/SIMD and task-domain
+remote sleeping slot may first move to the waker's queue through the ordinary
+migration enqueue, but is never entered until it is local; a failed
+non-blocking move leaves it on its authoritative home for ordinary executor
+dispatch. This keeps cross-CPU continuation and address-space switching behind
+the executor boundary. The core then saves the source FP/SIMD and task-domain
 state, publishes and activates the target's task
 identity/address space, restores its kernel-stack target, TLS, saved domain
 state, and FP/SIMD ownership, then switches to the target continuation. The
@@ -174,18 +176,33 @@ rolling generation-ordered cutover.
 - User FPU/SIMD, address-space, TLS, trap continuation, and task stack remain
   paired across preemption and migration. X86 saves every live FP/SIMD image
   before migration and permits deferred restore only while the task-owned
-  memory image is current; AArch64 captures live `TPIDR_EL0` at switch-out
+  memory image is current; successful exec replaces that image with
+  architectural initial state before the replacement program enters user mode;
+  AArch64 captures live `TPIDR_EL0` at switch-out
   because EL0 may write it directly.
-- Direct handoff is bounded to one claimed target at a time and 64 returns
+- Direct handoff, whether initiated by an exact synchronous wake or an
+  eligible same-CPU `sched_yield` peer, is bounded to one claimed target at a
+  time and 64 returns
   to one fixed exact root: executor dispatch and stealing skip the target until
   each switch completes. Only a target already resident on the source CPU may
-  take this path; remote targets stay on or wake through the ordinary
-  authoritative-home executor path. Nested sources and
-  arbitrary third-task transfers are refused; the root's next yield after the
-  64th return must pass through the executor. Address-space ownership, TLS, domain
-  state, and FP/SIMD ownership are restored before each resumed task's first
-  instruction. A decline leaves the exact wakee on the ordinary validated
-  selection path.
+  take this path; a remote sleeping target must first complete an ordinary
+  queued-slot migration or wake through its authoritative-home executor path.
+  Nested sources and
+  arbitrary third-task transfers are refused. A target may return directly
+  when the fixed root's own wake cell is runnable, whether that state came
+  from an exact urgent wake or from the cooperative self-rearm that began the
+  handoff; a competing urgent publication must name that same root or the
+  direct return declines. The root's next yield after the 64th return must pass
+  through the executor. Address-space ownership, TLS, domain state, and
+  FP/SIMD ownership are restored before each resumed task's first instruction.
+  The root wake-cell fast pointer is borrow-only: its owning Arc
+  is published first, the pointer is cleared before task unpublication, and
+  RCU-deferred KernelTask destruction keeps an already-observed pointer live.
+  The displaced root address-space owner is moved through a per-CPU cell only
+  while that CPU has interrupts masked; the ordinary IRQ-safe active-address-
+  space lock remains authoritative at both hardware-root transitions.
+  A decline leaves an exact wakee or already-runnable yield peer on the
+  ordinary validated selection path.
 - Budget state is stored with the task slot and therefore follows migration.
 - Invalid period contracts are rejected before a slot is published.
 - Realtime class metadata is demoted on generic spawn paths. Only
