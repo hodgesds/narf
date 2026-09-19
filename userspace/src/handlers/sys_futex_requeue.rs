@@ -60,7 +60,11 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
-    if entries[0].uaddr % 4 != 0 || entries[1].uaddr % 4 != 0 {
+    // Each entry's natural alignment follows its own flags: a FUTEX2_NUMA
+    // entry is a value+node pair and must be 8-byte aligned.
+    if entries[0].uaddr % futex2_word_span(entries[0].flags) != 0
+        || entries[1].uaddr % futex2_word_span(entries[1].flags) != 0
+    {
         ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
         return;
     }
@@ -95,7 +99,15 @@ pub(crate) fn sys_futex_requeue(ctx: &mut dyn TrapContext) {
     }
     if src != 0 {
         let namespace = futex_namespace((entries[0].flags & FUTEX_PRIVATE) != 0);
-        let key = futex_key(namespace, src);
+        // Flags-aware: a FUTEX2_NUMA/MPOL source hashes by node, so the wake
+        // must derive the same key the waiter registered under.
+        let key = match get_futex_key_flags(namespace, src, entries[0].flags) {
+            Ok(k) => k,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                return;
+            }
+        };
         futex_bump_counter_key(key);
         let _ = futex_wake_waiters_key(key, nr_wake as u32);
     }

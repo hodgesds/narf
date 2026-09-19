@@ -70,7 +70,8 @@ pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
     // reaches a key for a null address; `get_futex_key`'s access_ok fails
     // first. A caller waking a corrupted or uninitialised futex pointer was
     // told it had successfully woken nobody.
-    let key = match get_futex_key(futex_namespace((flags & FUTEX_PRIVATE) != 0), uaddr) {
+    let key = match get_futex_key_flags(futex_namespace((flags & FUTEX_PRIVATE) != 0), uaddr, flags)
+    {
         Ok(k) => k,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));

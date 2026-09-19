@@ -10,6 +10,17 @@ pub(crate) const FUTEX2_VALID_MASK: u64 = 0x8f;
 /// — rejects everything but `FUTEX2_SIZE_U32`.
 pub(crate) const FUTEX2_SIZE_MASK: u64 = 0x03;
 pub(crate) const FUTEX2_SIZE_U32: u64 = 0x02;
+/// `FUTEX2_NUMA` — the futex word is doubled and the second word carries a
+/// node id. `FUTEX2_MPOL` — hash the futex by the mempolicy covering its
+/// address. Neither is config-gated in `FUTEX2_VALID_MASK`, so both are
+/// always accepted; a kernel built without `CONFIG_FUTEX_MPOL` simply
+/// resolves MPOL to `FUTEX_NO_NODE`.
+pub(crate) const FUTEX2_NUMA: u64 = 0x04;
+pub(crate) const FUTEX2_MPOL: u64 = 0x08;
+/// `FUTEX_NO_NODE` (`include/uapi/linux/futex.h`) — "the special value -1
+/// indicates no-node. This is the same value as NUMA_NO_NODE, except that
+/// value is not ABI, this is."
+pub(crate) const FUTEX_NO_NODE: i32 = -1;
 /// `futex2_setup_timeout()` accepts only these two clocks.
 pub(crate) const FUTEX2_CLOCK_REALTIME: i32 = 0;
 pub(crate) const FUTEX2_CLOCK_MONOTONIC: i32 = 1;
@@ -43,7 +54,22 @@ pub(crate) fn futex2_input_valid(flags: u64, val: u64) -> bool {
 }
 
 pub(crate) fn futex2_flags_valid(flags: u64) -> bool {
-    flags & !FUTEX2_VALID_MASK == 0 && flags & FUTEX2_SIZE_MASK == FUTEX2_SIZE_U32
+    if flags & !FUTEX2_VALID_MASK != 0 || flags & FUTEX2_SIZE_MASK != FUTEX2_SIZE_U32 {
+        return false;
+    }
+    // `futex_flags_valid()`: a NUMA futex stores its node id IN a futex word,
+    // so every valid node id AND FUTEX_NO_NODE must be representable in that
+    // width. At FUTEX2_SIZE_U32 the ceiling is 2^32-1 and no real topology
+    // comes close, but deriving it keeps this honest for the narrower widths
+    // futex2 will eventually admit.
+    if flags & FUTEX2_NUMA != 0 {
+        let bits = 8u32 << (flags & FUTEX2_SIZE_MASK) as u32;
+        let max = u64::MAX >> (64 - bits);
+        if u64::from(narf_memory::online_node_count()) >= max {
+            return false;
+        }
+    }
+    true
 }
 
 /// Decode a futex2 absolute timeout the way `futex2_setup_timeout()` does:
@@ -139,5 +165,6 @@ pub(crate) fn sys_futex_wait(ctx: &mut dyn TrapContext) {
         args.arg0,
         args.arg1 as u32,
         park_cap,
+        flags,
     );
 }
