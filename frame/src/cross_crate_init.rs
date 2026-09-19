@@ -124,6 +124,9 @@ fn install_proc_hooks() {
     narf_filesystem::procfs::aggregate::register_locks_snapshot_hook(
         narf_userspace::handlers::proc_locks_rows,
     );
+    // /proc/<pid>/task/ — the group's threads. Without this the directory
+    // lists the leader alone, which is wrong for anything using CLONE_THREAD.
+    narf_filesystem::procfs::set_thread_list_hook(narf_userspace::handlers::proc_thread_list);
 }
 
 fn install_proc_ext_hooks() {

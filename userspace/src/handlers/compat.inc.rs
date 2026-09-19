@@ -9213,6 +9213,23 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result
     Err(())
 }
 
+/// `/proc/<pid>/task/` contents: the thread ids of `pid`'s group,
+/// reported in the READER's pid namespace.
+///
+/// `pid` arrives as an outer ProcessId (procfs has already resolved the
+/// path component), and each tid goes back out through `report_pid_to` for
+/// the same reason `/proc/locks` translates its owners — a tid is a pid in
+/// its namespace, and handing back a raw scheduler id would name a thread
+/// the reader cannot see.
+pub fn proc_thread_list(pid: u64) -> alloc::vec::Vec<u64> {
+    let reader = current_task_id();
+    crate::task::thread_group_tids(pid)
+        .into_iter()
+        .map(|tid| report_pid_to(reader, task_to_pid_raw(tid).unwrap_or(tid)))
+        .filter(|&v| v != 0)
+        .collect()
+}
+
 /// `/proc/locks` rows for every advisory lock this kernel holds.
 ///
 /// Both registries feed it: `fd::locks` (the `fcntl` record locks, POSIX

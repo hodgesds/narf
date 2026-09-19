@@ -825,7 +825,7 @@ impl DirOps for ProcFdDir {
         let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
         for n in fds {
             let s = n.to_string();
-            let leaked: &'static str = Box::leak(s.into_boxed_str());
+            let leaked: &'static str = crate::procfs::intern_name(&s);
             entries.push(DirEntry {
                 name: leaked,
                 file_type: FileType::Symlink,
@@ -910,7 +910,7 @@ impl DirOps for ProcFdInfoDir {
         let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
         for n in fds {
             let s = n.to_string();
-            let leaked: &'static str = Box::leak(s.into_boxed_str());
+            let leaked: &'static str = crate::procfs::intern_name(&s);
             entries.push(DirEntry {
                 name: leaked,
                 file_type: FileType::File,
@@ -996,10 +996,43 @@ impl ProcTaskDir {
     }
 }
 
+impl ProcTaskDir {
+    /// Every thread in this group, leader first.
+    ///
+    /// The directory used to contain exactly one entry — `tid == pid` —
+    /// under a note reading "NARF has no separate thread IDs yet". It does:
+    /// `CLONE_THREAD` gives a task its own tid while it shares the group's
+    /// pid, which is the whole distinction `gettid` reports. Every thread
+    /// but the leader was therefore invisible to `ps -L`, `top -H`, and
+    /// anything counting a process's threads.
+    ///
+    /// Falls back to the leader alone when no provider is installed, which
+    /// is the previous behaviour and is correct for a single-threaded
+    /// process either way.
+    fn tids(&self) -> Vec<u64> {
+        let leader = self.visible_tid();
+        match crate::procfs::hook_thread_list(self.pid) {
+            Some(mut tids) if !tids.is_empty() => {
+                // Leader first, then ascending — `proc_task_readdir` walks
+                // the group list in order and callers read the first entry
+                // as the main thread.
+                tids.sort_unstable();
+                if let Some(i) = tids.iter().position(|&t| t == leader) {
+                    tids.remove(i);
+                }
+                let mut out = alloc::vec![leader];
+                out.extend(tids);
+                out
+            }
+            _ => alloc::vec![leader],
+        }
+    }
+}
+
 impl DirOps for ProcTaskDir {
     fn lookup(&self, name: &str) -> Option<Arc<dyn FileOps>> {
         let tid: u64 = name.parse().ok()?;
-        if tid == self.visible_tid() {
+        if self.tids().contains(&tid) {
             Some(Arc::new(ProcDirMarker))
         } else {
             None
@@ -1007,22 +1040,25 @@ impl DirOps for ProcTaskDir {
     }
     fn lookup_dir(&self, name: &str) -> Option<Arc<dyn DirOps>> {
         let tid: u64 = name.parse().ok()?;
-        if tid == self.visible_tid() {
+        if self.tids().contains(&tid) {
             Some(Arc::new(ProcTaskTidDir { pid: self.pid }))
         } else {
             None
         }
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
-        let s = self.visible_tid().to_string();
-        let leaked: &'static str = Box::leak(s.into_boxed_str());
-        Box::new(
-            [DirEntry {
-                name: leaked,
+        let entries: Vec<DirEntry> = self
+            .tids()
+            .into_iter()
+            .map(|tid| DirEntry {
+                // Interned, not leaked: this directory is read once per
+                // thread by anything sampling them, so a leak here scales
+                // with thread count AND poll rate.
+                name: crate::procfs::intern_name(&tid.to_string()),
                 file_type: FileType::Dir,
-            }]
-            .into_iter(),
-        )
+            })
+            .collect();
+        Box::new(entries.into_iter())
     }
 }
 
@@ -1672,3 +1708,70 @@ fn smoke_cgroup_v2_unified_line() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_cgroup_v2_unified_line);
+
+/// Interning replaces a `Box::leak` that ran once per entry, per readdir.
+///
+/// The leak was invisible because every individual allocation was correct —
+/// what was wrong was the rate. This asserts the property that matters: a
+/// SECOND readdir of the same directory allocates nothing new. Counting
+/// distinct interned names is the only way to see that from inside the
+/// kernel; the old code would have grown the count on every call.
+fn smoke_procfs_readdir_names_are_interned() -> TestResult {
+    let dir = ProcTaskDir { pid: 1 };
+
+    // Prime, so the first-sight allocations are not what we measure.
+    let first: Vec<_> = dir.iter().map(|e| e.name).collect();
+    if first.is_empty() {
+        return TestResult::Fail("task dir listed nothing");
+    }
+    let after_first = crate::procfs::__interned_name_count();
+
+    // Repeat readdirs must be allocation-free.
+    for _ in 0..16 {
+        let again: Vec<_> = dir.iter().map(|e| e.name).collect();
+        if again != first {
+            return TestResult::Fail("repeat readdir produced different names");
+        }
+    }
+    if crate::procfs::__interned_name_count() != after_first {
+        return TestResult::Fail("readdir allocated a fresh name — entries are still leaking");
+    }
+
+    // And the same name from a different call site resolves to the SAME
+    // pointer, which is what makes the cache a cache rather than a slower
+    // leak.
+    let a = crate::procfs::intern_name("4242");
+    let b = crate::procfs::intern_name("4242");
+    if !core::ptr::eq(a.as_ptr(), b.as_ptr()) {
+        return TestResult::Fail("interning the same name twice allocated twice");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_procfs_readdir_names_are_interned);
+
+/// `/proc/<pid>/task/` lists the whole thread group, not just the leader.
+///
+/// With no provider installed the directory falls back to the leader
+/// alone — the behaviour it had unconditionally — so this pins the
+/// fallback, and the syscall-level smoke pins the populated case.
+fn smoke_procfs_task_dir_lists_leader_without_hook() -> TestResult {
+    let dir = ProcTaskDir { pid: 1 };
+    let names: Vec<_> = dir.iter().map(|e| e.name).collect();
+    if names.len() != 1 {
+        return TestResult::Fail("with no thread-list provider the leader alone should be listed");
+    }
+    // The leader must be reachable by lookup, not merely listed.
+    if dir.lookup_dir(names[0]).is_none() {
+        return TestResult::Fail("the listed tid is not looked up");
+    }
+    // A tid that is not in the group is ENOENT, so lookup is not a
+    // rubber stamp that accepts any number.
+    if dir.lookup_dir("999999").is_some() {
+        return TestResult::Fail("a tid outside the group was looked up");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_procfs_task_dir_lists_leader_without_hook
+);

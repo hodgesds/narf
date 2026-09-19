@@ -376,6 +376,22 @@ pub fn __test_reset_cpu_ns(tid: u64) {
     }
 }
 
+/// Every live thread id in thread group `pid`.
+///
+/// `CLONE_THREAD` gives each thread its own tid under the group's shared
+/// pid, so this is the set `/proc/<pid>/task/` must list and `gettid`
+/// reports from. Zombies are included for the same reason they are in the
+/// CPU-time sum: the task still exists until it is reaped, and Linux keeps
+/// it in the group list until `release_task`.
+pub fn thread_group_tids(pid: u64) -> alloc::vec::Vec<u64> {
+    let tasks = TASKS.lock();
+    tasks
+        .values()
+        .filter(|task| task.pid.load(Ordering::Relaxed) == pid)
+        .map(|task| task.tid)
+        .collect()
+}
+
 /// Total CPU time (user + system) of thread group `pid`, in nanoseconds —
 /// Linux's `CPUCLOCK_PROF` sample for a process.
 ///
