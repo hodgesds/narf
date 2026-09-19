@@ -150,6 +150,19 @@ pub const TIOCGPTLCK: u32 = 0x8004_5439;
 pub const TIOCSIG: u32 = 0x4004_5436;
 /// TIOCPKT_DATA — the status byte prefixed to an ordinary data packet.
 pub const TIOCPKT_DATA: u8 = 0;
+/// The control-packet status bits (`include/uapi/asm-generic/ioctls.h:110`).
+///
+/// A pending status is delivered ALONE: `n_tty_read` returns just the byte
+/// and breaks out, so a control packet is never mixed with data. That is
+/// what lets `rlogind`/`telnetd` tell "the session flushed its input" from
+/// "the session printed a 0x01".
+pub const TIOCPKT_FLUSHREAD: u8 = 1;
+pub const TIOCPKT_FLUSHWRITE: u8 = 2;
+pub const TIOCPKT_STOP: u8 = 4;
+pub const TIOCPKT_START: u8 = 8;
+pub const TIOCPKT_NOSTOP: u8 = 16;
+pub const TIOCPKT_DOSTOP: u8 = 32;
+pub const TIOCPKT_IOCTL: u8 = 64;
 /// `ioctl(fd, KDGKBMODE, &int)` — query the VT keyboard translation mode.
 pub const KDGKBMODE: u32 = 0x4B44;
 /// `ioctl(fd, KDSKBMODE, int)` — set the VT keyboard translation mode.
@@ -596,6 +609,10 @@ pub struct Pty {
     /// slave-to-master direction.
     pub(crate) output: IrqSafeSpinLock<crate::ntty::OutputState>,
 
+    /// Accumulated packet-mode control bits awaiting delivery to the
+    /// master. Linux `tty->ctrl.pktstatus`.
+    pub(crate) pktstatus: core::sync::atomic::AtomicU8,
+
     /// `TTY_EXCLUSIVE` — set by TIOCEXCL. A further open by a caller
     /// without CAP_SYS_ADMIN is EBUSY.
     pub(crate) exclusive: AtomicBool,
@@ -676,11 +693,6 @@ pub struct Pty {
     /// leading status byte (`TIOCPKT_DATA` for ordinary output). Linux
     /// `pty.c`: `tty->link->packet`. KDE's KPtyDevice (konsole) enables this
     /// and relies on the framing; without it its read loop desyncs.
-    // LINUX-GAP: only the TIOCPKT_DATA framing is produced. The flush/stop/
-    // start control packets (TIOCPKT_FLUSHREAD/FLUSHWRITE/STOP/START) are not
-    // emitted yet — they would be raised from tcflush/^S/^Q, which NARF's pty
-    // does not implement. Consumers that only need output framing (konsole)
-    // work; ones that depend on flush notifications lose that signal only.
     pub(crate) packet: AtomicBool,
 }
 
@@ -920,7 +932,11 @@ impl Pty {
                 *slot = old;
             }
         }
+        let previous = *cur;
         cur.raw = raw;
+        let updated = *cur;
+        drop(cur);
+        self.note_termios_change(&previous, &updated);
     }
 
     /// `TIOCSTI`: push one byte back into this tty's input queue.
@@ -993,28 +1009,126 @@ impl Pty {
         Ok(0)
     }
 
+    /// Raise packet-mode control bits for the master to collect.
+    ///
+    /// Linux accumulates these in `tty->ctrl.pktstatus` and only when the
+    /// master is actually in packet mode — every generation site in
+    /// `pty.c` is guarded by `tty->link->ctrl.packet`. Outside packet mode
+    /// there is no framing to carry them and setting them would leak a
+    /// stale status into a later `TIOCPKT` enable.
+    fn raise_pkt(&self, set: u8, clear: u8) {
+        if !self.packet.load(Ordering::Acquire) {
+            return;
+        }
+        let mut cur = self.pktstatus.load(Ordering::Acquire);
+        loop {
+            let next = (cur & !clear) | set;
+            match self.pktstatus.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(seen) => cur = seen,
+            }
+        }
+    }
+
+    /// Take the pending control bits, clearing them.
+    ///
+    /// `n_tty_read`: `cs = pktstatus; pktstatus = 0;` — the whole
+    /// accumulated set is delivered in one byte and consumed at once.
+    fn take_pkt(&self) -> u8 {
+        self.pktstatus.swap(0, Ordering::AcqRel)
+    }
+
+    /// Note a flow-control transition for packet mode.
+    ///
+    /// `pty_start` / `pty_stop` (`drivers/tty/pty.c:320-342`) are mutually
+    /// exclusive: each sets its own bit and clears the other, so the master
+    /// sees the latest state rather than both at once.
+    pub(crate) fn note_flow_change(&self, stopped: bool) {
+        if stopped {
+            self.raise_pkt(TIOCPKT_STOP, TIOCPKT_START);
+        } else {
+            self.raise_pkt(TIOCPKT_START, TIOCPKT_STOP);
+        }
+    }
+
+    /// Note a termios change for packet mode.
+    ///
+    /// `pty_set_termios` (`pty.c:245-268`) reports only a change in whether
+    /// STANDARD flow control is in effect — IXON with the conventional
+    /// `^S`/`^Q` characters — because that is what a remote peer needs in
+    /// order to decide whether it may do the flow control itself:
+    ///
+    /// ```c
+    /// int old_flow = ((old_termios->c_iflag & IXON) &&
+    ///                 (old_termios->c_cc[VSTOP] == '\023') &&
+    ///                 (old_termios->c_cc[VSTART] == '\021'));
+    /// int new_flow = (I_IXON(tty) && STOP_CHAR(tty) == '\023' &&
+    ///                 START_CHAR(tty) == '\021');
+    /// if (old_flow != new_flow) { ... DOSTOP : NOSTOP }
+    /// if (extproc) pktstatus |= TIOCPKT_IOCTL;
+    /// ```
+    ///
+    /// Note `extproc` there is the OR of old and new, so entering *or*
+    /// leaving EXTPROC raises TIOCPKT_IOCTL.
+    fn note_termios_change(&self, old: &Termios, new: &Termios) {
+        let std_flow = |t: &Termios| t.ixon() && t.cc(VSTOP) == 0x13 && t.cc(VSTART) == 0x11;
+        let old_flow = std_flow(old);
+        let new_flow = std_flow(new);
+        let extproc = old.extproc() || new.extproc();
+        if old_flow == new_flow && !extproc {
+            return;
+        }
+        let mut set = 0u8;
+        let mut clear = 0u8;
+        if old_flow != new_flow {
+            clear |= TIOCPKT_DOSTOP | TIOCPKT_NOSTOP;
+            set |= if new_flow {
+                TIOCPKT_DOSTOP
+            } else {
+                TIOCPKT_NOSTOP
+            };
+        }
+        if extproc {
+            set |= TIOCPKT_IOCTL;
+        }
+        self.raise_pkt(set, clear);
+    }
+
     /// `TCFLSH` (`tcflush`): discard queued input and/or output.
     ///
     /// `drivers/tty/tty_ioctl.c::__tty_perform_flush` — TCIFLUSH(0) drops
     /// the input queue, TCOFLUSH(1) the output queue, TCIOFLUSH(2) both;
     /// anything else is -EINVAL.
-    fn flush_queues(&self, arg: usize) -> Result<u64, FsError> {
+    pub(crate) fn flush_queues(&self, arg: usize) -> Result<u64, FsError> {
         const TCIFLUSH: usize = 0;
         const TCOFLUSH: usize = 1;
         const TCIOFLUSH: usize = 2;
         match arg {
             TCIFLUSH | TCIOFLUSH => {
-                let mut st = self.input.lock();
-                st.ready.clear();
-                st.line.clear();
-                st.eof = false;
+                {
+                    let mut st = self.input.lock();
+                    st.ready.clear();
+                    st.line.clear();
+                    st.eof = false;
+                }
+                // `n_tty_packet_mode_flush` (`n_tty.c:327`) tells the master
+                // that the input it had queued is gone.
+                self.raise_pkt(TIOCPKT_FLUSHREAD, 0);
                 if arg == TCIOFLUSH {
                     self.slave_tx_to_master.clear();
+                    // `pty_flush_buffer` (`pty.c:214`).
+                    self.raise_pkt(TIOCPKT_FLUSHWRITE, 0);
                 }
                 Ok(0)
             }
             TCOFLUSH => {
                 self.slave_tx_to_master.clear();
+                self.raise_pkt(TIOCPKT_FLUSHWRITE, 0);
                 Ok(0)
             }
             _ => Err(FsError::InvalidData),
@@ -1035,10 +1149,12 @@ impl Pty {
         match arg {
             TCOOFF => {
                 self.input.lock().stopped = true;
+                self.note_flow_change(true);
                 Ok(0)
             }
             TCOON => {
                 self.input.lock().stopped = false;
+                self.note_flow_change(false);
                 Ok(0)
             }
             // TCIOFF/TCION transmit the flow characters toward the peer.
@@ -1046,10 +1162,12 @@ impl Pty {
             // the received character would have set.
             TCIOFF => {
                 self.input.lock().stopped = true;
+                self.note_flow_change(true);
                 Ok(0)
             }
             TCION => {
                 self.input.lock().stopped = false;
+                self.note_flow_change(false);
                 Ok(0)
             }
             _ => Err(FsError::InvalidData),
@@ -1104,6 +1222,7 @@ impl Pty {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             output: IrqSafeSpinLock::new(crate::ntty::OutputState::new()),
             read_timer: IrqSafeSpinLock::new(ReadTimer::new()),
+            pktstatus: core::sync::atomic::AtomicU8::new(0),
             exclusive: AtomicBool::new(false),
             // All-zero: nothing is locked until TIOCSLCKTRMIOS says so.
             locked_termios: IrqSafeSpinLock::new(Termios {
@@ -1873,8 +1992,20 @@ impl FileOps for PtyMaster {
         // with no pending control event the byte is TIOCPKT_DATA and ordinary
         // output follows. (The flush/stop/start control packets are a
         // documented gap — see `Pty::packet`.)
+        // A pending control packet outranks everything, including the flow
+        // gate below. `n_tty_read` tests `pktstatus` at the very top of its
+        // loop, and it has to: the STOP packet exists precisely to announce
+        // that output stopped, so refusing to deliver it *because* output
+        // stopped would strand the reader waiting for news it already has.
+        if self.pty.packet.load(Ordering::Acquire) && !buf.is_empty() {
+            let status = self.pty.take_pkt();
+            if status != 0 {
+                buf[0] = status;
+                return Box::pin(async move { Ok(1) });
+            }
+        }
         // IXON/TCXONC flow control: while output is stopped the master sees
-        // nothing, which is the whole point of ^S. Linux gates the transmit
+        // no DATA, which is the whole point of ^S. Linux gates the transmit
         // path on `tty->flow.stopped`; a flag that stopped nothing would be
         // an accepted-and-discarded control.
         if self.pty.input.lock().stopped && !self.pty.hung_up() {
@@ -1884,6 +2015,11 @@ impl FileOps for PtyMaster {
             if buf.is_empty() {
                 return Box::pin(async move { Ok(0) });
             }
+            // The control status was already taken above, where it has to
+            // be so a STOP packet escapes the flow gate. Delivering it
+            // alone is the point: a reader distinguishes a control event
+            // from data by the packet being exactly one byte, so folding
+            // data in behind it would make the two ambiguous.
             let n = self.pty.slave_tx_to_master.pop(&mut buf[1..]);
             if n > 0 {
                 buf[0] = TIOCPKT_DATA;
@@ -1929,6 +2065,9 @@ impl FileOps for PtyMaster {
         // Collect ISIG signals to deliver AFTER releasing the discipline
         // lock (signal delivery allocates + takes the pgid/signal locks).
         let mut sigs: Vec<u32> = Vec::new();
+        // IXON transitions driven by a typed ^S/^Q become START/STOP control
+        // packets, the `pty_start`/`pty_stop` handlers' job in Linux.
+        let was_stopped = self.pty.input.lock().stopped;
         {
             let pty = &*self.pty;
             let mut state = pty.input.lock();
@@ -1947,6 +2086,10 @@ impl FileOps for PtyMaster {
                     },
                 );
             }
+        }
+        let now_stopped = self.pty.input.lock().stopped;
+        if now_stopped != was_stopped {
+            self.pty.note_flow_change(now_stopped);
         }
         if !sigs.is_empty() {
             let pgrp = self.pty.ctrl.lock().fg_pgrp;
@@ -2246,6 +2389,15 @@ impl FileOps for PtyMaster {
         let stopped = self.pty.input.lock().stopped;
         if !stopped && self.pty.slave_tx_to_master.len() > 0 {
             mask |= crate::POLL_IN;
+        }
+        // `n_tty_poll`: `if (tty->ctrl.packet && tty->link->ctrl.pktstatus)
+        // mask |= EPOLLPRI | EPOLLIN | EPOLLRDNORM;` — a control packet is
+        // readable even while output is stopped, which is exactly when a
+        // STOP packet needs to reach the reader.
+        if self.pty.packet.load(Ordering::Acquire)
+            && self.pty.pktstatus.load(Ordering::Acquire) != 0
+        {
+            mask |= crate::POLL_IN | crate::POLL_PRI;
         }
         if self.pty.hung_up() {
             mask |= crate::POLL_HUP;
