@@ -661,6 +661,17 @@ impl FdTable {
         Some(self.descriptions.get(fd as usize)?.as_ref()?.lock_owner())
     }
 
+    /// Slots this table has allocated — Linux's `fdtable::max_fds`, which
+    /// `/proc/<pid>/status` reports as `FDSize`.
+    ///
+    /// This is a CAPACITY, not a count of open descriptors: a consumer
+    /// that scans `0..FDSize` looking for open fds must not be told a
+    /// number below the highest one in use, or it walks past live
+    /// descriptors and concludes they are closed.
+    pub fn fd_table_size(&self) -> u64 {
+        self.slots.len() as u64
+    }
+
     /// Snapshot the shared open-file-description position.
     pub fn offset(&self, fd: u32) -> Option<u64> {
         Some(

@@ -154,6 +154,20 @@ pub struct ProcTaskInfo {
     /// dropped — and a fabricated value is worse than an absent field,
     /// because it answers the question wrongly instead of not at all.
     pub caps: [u64; 5],
+    /// `TracerPid:` — the process tracing this one, 0 when untraced.
+    ///
+    /// Hardcoded to 0 before, so a traced process reported itself
+    /// untraced. That is the field an anti-debugging check reads, and
+    /// equally the one a human reads to find out WHY a process is stopped
+    /// — answering 0 while a tracer holds it stopped points the reader at
+    /// everything except the cause.
+    pub tracer_pid: u64,
+    /// `FDSize:` — descriptor-table capacity, Linux's `max_fds`.
+    ///
+    /// Was a hardcoded 64. A process holding more than 64 descriptors had
+    /// its table understated, and a consumer scanning `0..FDSize` for open
+    /// fds would walk past live ones and report them closed.
+    pub fd_table_size: u64,
     /// `NoNewPrivs:` — also a hardcoded 0 before, while `prctl`
     /// `PR_SET_NO_NEW_PRIVS` really does set a flag. systemd reads it to
     /// decide whether a unit is already sandboxed, so reporting 0 for a
@@ -2508,7 +2522,7 @@ fn render_status(info: &ProcTaskInfo) -> String {
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Ngid:\t0\n"));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Pid:\t{}\n", info.pid));
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("PPid:\t{}\n", info.ppid));
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t0\n"));
+    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("TracerPid:\t{}\n", info.tracer_pid));
     // Uid/Gid: real, effective, saved, fs — NARF tracks one id, so all
     // four columns mirror it. glibc's __libc_setup_tls and systemd's
     // uid/gid probes parse these tab-separated quads.
@@ -2518,7 +2532,10 @@ fn render_status(info: &ProcTaskInfo) -> String {
         core::fmt::Write::write_fmt(&mut s, format_args!("Gid:\t{0}\t{0}\t{0}\t{0}\n", info.gid));
     // FDSize/Groups: systemd reads FDSize when sizing its fd copy loop;
     // an empty supplementary-group set is well-formed.
-    let _ = core::fmt::Write::write_fmt(&mut s, format_args!("FDSize:\t64\n"));
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("FDSize:\t{}\n", info.fd_table_size.max(64)),
+    );
     let _ = core::fmt::Write::write_fmt(&mut s, format_args!("Groups:\t\n"));
     // NStgid/NSpid/NSpgid/NSsid: the id as seen from each nested pid
     // namespace, outermost first. NARF has a single pid namespace, so
@@ -3136,9 +3153,63 @@ fn sample_task_info() -> ProcTaskInfo {
         cpus_allowed: 1,
         nr_cpus: 1,
         caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
         no_new_privs: false,
     }
 }
+
+/// `TracerPid` and `FDSize` report live state, not constants.
+///
+/// Both were hardcoded — `TracerPid: 0` and `FDSize: 64` — and both had
+/// a real source sitting behind them.
+///
+/// `TracerPid: 0` told every reader the process was untraced. That is
+/// what an anti-debugging check reads, and equally what a human reads to
+/// find out why a process is stopped: answering 0 while a tracer holds it
+/// points the reader at everything except the cause.
+///
+/// `FDSize: 64` understated any table larger than that. The failure mode
+/// is specific: a consumer scanning `0..FDSize` for open descriptors
+/// walks past live fds and concludes they are closed, so the value must
+/// never come in under the highest one in use.
+fn smoke_status_tracer_and_fdsize_are_live() -> TestResult {
+    let traced = ProcTaskInfo {
+        tracer_pid: 4242,
+        fd_table_size: 512,
+        ..sample_task_info()
+    };
+    let body = render_status(&traced);
+    if !body.contains("TracerPid:\t4242") {
+        return TestResult::Fail("status did not report the tracing process");
+    }
+    if body.contains("TracerPid:\t0") {
+        return TestResult::Fail("status still reports the hardcoded TracerPid");
+    }
+    if !body.contains("FDSize:\t512") {
+        return TestResult::Fail("status did not report the real fd-table size");
+    }
+
+    // Untraced still reads 0 — the field has to stay usable as "nobody is
+    // tracing me", which is what makes the non-zero case meaningful.
+    let plain = ProcTaskInfo {
+        tracer_pid: 0,
+        fd_table_size: 8,
+        ..sample_task_info()
+    };
+    let body = render_status(&plain);
+    if !body.contains("TracerPid:\t0") {
+        return TestResult::Fail("an untraced process must report TracerPid 0");
+    }
+    // ...and a table smaller than Linux's NR_OPEN_DEFAULT floors at 64
+    // rather than reporting 8, which is what Linux shows and what keeps
+    // the value from shrinking below the conventional minimum.
+    if !body.contains("FDSize:\t64") {
+        return TestResult::Fail("FDSize must not drop below the 64 floor");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_status_tracer_and_fdsize_are_live);
 
 /// `status` reports the task's REAL capability sets, not constants.
 ///
@@ -3388,6 +3459,8 @@ fn smoke_pid_stat_real_fields() -> TestResult {
         cpus_allowed: 0,
         nr_cpus: 1,
         caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
         no_new_privs: false,
     };
     let line = render_stat(&info);
@@ -3495,6 +3568,8 @@ fn sample_info() -> ProcTaskInfo {
         cpus_allowed: 0,
         nr_cpus: 1,
         caps: [0; 5],
+        tracer_pid: 0,
+        fd_table_size: 64,
         no_new_privs: false,
     }
 }

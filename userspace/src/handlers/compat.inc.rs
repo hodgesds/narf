@@ -5797,6 +5797,21 @@ pub fn proc_task_info(
             ]
         },
         no_new_privs: read_prctl(tid).no_new_privs,
+        // `get_task_tracer` is pid-keyed and returns the tracer's pid, so
+        // it goes back out through the reader's namespace like every other
+        // pid in this file. A tracer the reader cannot see reports 0 —
+        // Linux does the same, rather than leaking a pid from a namespace
+        // the reader has no business observing.
+        tracer_pid: crate::ptrace::get_task_tracer(pid)
+            .map(|tracer| report_pid_to(tid, tracer))
+            .unwrap_or(0),
+        fd_table_size: fd::with_table(tid, |t| t.fd_table_size())
+            // Linux's table starts at NR_OPEN_DEFAULT and never shrinks
+            // below it, so neither does this. The value must never
+            // UNDERSTATE the highest open descriptor: a consumer scanning
+            // `0..FDSize` would otherwise walk past live fds.
+            .unwrap_or(0)
+            .max(64),
     })
 }
 
