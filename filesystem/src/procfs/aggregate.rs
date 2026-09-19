@@ -703,14 +703,116 @@ fn gen_timer_list() -> Vec<u8> {
 
 // ── /proc/locks ──────────────────────────────────────────────────────
 //
-// Linux: fs/locks.c locks_seq_show
-// NARF has minimal lock support (no POSIX file-lock tracking yet).
+// Linux: fs/locks.c lock_get_status.
 
+/// Which lock flavour a row describes — Linux's `FL_*` flags, reduced to
+/// the three NARF can hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockFlavour {
+    /// A `fcntl` record lock owned by the process.
+    Posix,
+    /// `FL_OFDLCK` — owned by the open file description.
+    Ofd,
+    /// `FL_FLOCK` — a whole-file `flock(2)` lock.
+    Flock,
+}
+
+/// One `/proc/locks` line's worth of data.
+#[derive(Clone, Copy, Debug)]
+pub struct LockRow {
+    pub flavour: LockFlavour,
+    /// `true` for a write/exclusive lock.
+    pub exclusive: bool,
+    /// Already translated into the READER's pid namespace by the
+    /// provider, and `-1` for an OFD lock — `locks_translate_pid` refuses
+    /// to invent a process for an owner that is not one.
+    pub pid: i32,
+    pub dev: u64,
+    pub ino: u64,
+    pub start: u64,
+    /// `None` renders as `EOF`, Linux's `fl_end == OFFSET_MAX`.
+    pub end: Option<u64>,
+}
+
+/// Provider for [`gen_locks`], installed by the crate that owns the lock
+/// tables.
+///
+/// `narf-filesystem` cannot depend on `narf-userspace` — the dependency
+/// runs the other way — so the rendering lives here, where Linux keeps it,
+/// and the data is pushed in. Unset (early boot, or a build without the
+/// syscall layer) renders an empty body, which is also what Linux shows
+/// when nothing is locked.
+type LocksSnapshotFn = fn() -> Vec<LockRow>;
+static LOCKS_SNAPSHOT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the `/proc/locks` provider. Idempotent.
+pub fn register_locks_snapshot_hook(f: LocksSnapshotFn) {
+    LOCKS_SNAPSHOT.store(f as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn locks_snapshot() -> Vec<LockRow> {
+    let raw = LOCKS_SNAPSHOT.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return Vec::new();
+    }
+    // SAFETY: only `register_locks_snapshot_hook` writes this cell, always
+    // from a `LocksSnapshotFn`; a non-zero value round-trips soundly.
+    let f: LocksSnapshotFn = unsafe { core::mem::transmute(raw) };
+    f()
+}
+
+/// `lock_get_status`, which userspace parses positionally:
+///
+/// ```text
+/// 1: POSIX  ADVISORY  WRITE 1234 00:0e:42 0 EOF
+/// 2: FLOCK  ADVISORY  WRITE 1235 00:0e:42 0 EOF
+/// 3: OFDLCK ADVISORY  READ  -1   00:0e:42 0 EOF
+/// ```
+///
+/// The spacing is not cosmetic. Linux emits `"POSIX "` and `"OFDLCK"` —
+/// six characters either way — then `" ADVISORY  "`, so the columns line
+/// up whichever flavour a row is. `lslocks` splits on whitespace, but the
+/// fixed width is what lets a human read a mixed list, and matching it
+/// costs nothing.
 fn gen_locks() -> Vec<u8> {
-    // Linux returns an empty body when no locks are held.
-    // NARF has no POSIX file-lock tracking yet — return empty.
-    // DEFERRED: wire to a lock-registry snapshot when POSIX locks land.
-    Vec::new()
+    let rows = locks_snapshot();
+    let mut s = String::new();
+    for (i, row) in rows.iter().enumerate() {
+        let flavour = match row.flavour {
+            LockFlavour::Posix => "POSIX ",
+            LockFlavour::Ofd => "OFDLCK",
+            LockFlavour::Flock => "FLOCK ",
+        };
+        let access = if row.exclusive { "WRITE" } else { "READ " };
+        // Linux prints `%02x:%02x:%lu` from MAJOR()/MINOR() of s_dev, in
+        // the `(major << 8) | minor` encoding statx already decodes.
+        let major = (row.dev >> 8) & 0xfff;
+        let minor = row.dev & 0xff;
+        let _ = write!(
+            s,
+            "{}: {} ADVISORY  {} {} {:02x}:{:02x}:{} {} ",
+            i + 1,
+            flavour,
+            access,
+            row.pid,
+            major,
+            minor,
+            row.ino,
+            row.start
+        );
+        match row.end {
+            // A whole-file lock and a to-EOF range both read as `EOF`;
+            // Linux prints a literal `0 EOF` for every FLOCK row because
+            // the flavour has no range at all.
+            None => {
+                let _ = writeln!(s, "EOF");
+            }
+            Some(end) => {
+                let _ = writeln!(s, "{end}");
+            }
+        }
+    }
+    s.into_bytes()
 }
 
 // ── /proc/devices ────────────────────────────────────────────────────

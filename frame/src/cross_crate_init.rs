@@ -118,6 +118,12 @@ fn install_proc_hooks() {
         narf_userspace::handlers::proc_pid_resolve,
         narf_userspace::handlers::proc_pid_report,
     );
+    // /proc/locks — the advisory locks this kernel holds. The file existed
+    // and was always empty, under a note deferring it "when POSIX locks
+    // land"; they have, and `lslocks` reads exactly this.
+    narf_filesystem::procfs::aggregate::register_locks_snapshot_hook(
+        narf_userspace::handlers::proc_locks_rows,
+    );
 }
 
 fn install_proc_ext_hooks() {

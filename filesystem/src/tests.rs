@@ -5125,7 +5125,10 @@ fn smoke_overlay_async_only_lower_visible() -> TestResult {
     use alloc::sync::Arc;
     use alloc::vec;
 
-    let backing = Arc::new(MemFs::with_seeds("ao-lower", &[("kdeglobals", b"REAL-CFG")]));
+    let backing = Arc::new(MemFs::with_seeds(
+        "ao-lower",
+        &[("kdeglobals", b"REAL-CFG")],
+    ));
     let lower = Arc::new(AsyncOnlyDir(backing.root())) as Arc<dyn DirOps>;
     let upper = Arc::new(MemFs::new("ao-upper"));
     let ov = OverlayFs::new("ao-ov", upper.root(), vec![lower]);

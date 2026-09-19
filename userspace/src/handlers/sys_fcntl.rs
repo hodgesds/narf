@@ -201,6 +201,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             let req = crate::fd::locks::Lock {
                 owner: lock_owner,
                 kind: lock_kind,
+                // Captured here because the lock table keys by FileOps
+                // pointer and cannot resolve one later — see `Lock::dev`.
+                dev: ops.inode_attrs().dev,
+                ino: ops.ino(),
                 ty: uf.l_type,
                 start: uf.l_start,
                 len: uf.l_len,

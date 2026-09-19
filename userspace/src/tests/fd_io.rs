@@ -877,6 +877,8 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     let key: usize = 0xDEAD_BEEF;
     let a = locks::Lock {
         kind: locks::LockKind::Posix,
+        dev: 0,
+        ino: 0,
         owner: 1,
         ty: locks::F_WRLCK,
         start: 0,
@@ -884,6 +886,8 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     };
     let b = locks::Lock {
         kind: locks::LockKind::Posix,
+        dev: 0,
+        ino: 0,
         owner: 2,
         ty: locks::F_WRLCK,
         start: 50,
@@ -906,6 +910,8 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     locks::__test_reset();
     let r1 = locks::Lock {
         kind: locks::LockKind::Posix,
+        dev: 0,
+        ino: 0,
         owner: 1,
         ty: locks::F_RDLCK,
         start: 0,
@@ -913,6 +919,8 @@ fn smoke_userspace_fcntl_setlk_conflict() -> TestResult {
     };
     let r2 = locks::Lock {
         kind: locks::LockKind::Posix,
+        dev: 0,
+        ino: 0,
         owner: 2,
         ty: locks::F_RDLCK,
         start: 50,

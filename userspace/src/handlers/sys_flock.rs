@@ -51,6 +51,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     };
+    let (dev, ino) = (arc_ops.inode_attrs().dev, arc_ops.ino());
     let nonblock = op & LOCK_NB != 0;
     // The blocking path retries by parking via the yield hook and
     // re-executing the syscall on resume (a longjmp clippy can't see),
@@ -58,7 +59,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     // `never_loop`. The `loop` keeps the retry intent explicit.
     #[allow(clippy::never_loop)]
     loop {
-        if flock_try(file_ptr, op, owner).is_ok() {
+        if flock_try(file_ptr, op, owner, dev, ino).is_ok() {
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }
