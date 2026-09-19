@@ -3766,6 +3766,64 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                     );
                                 }
                             }
+
+                            // The distro root is mounted read-only (its ext4 write
+                            // features are unsupported), so any tree a graphical
+                            // session writes to needs a writable overlay. systemd
+                            // already provides /run and /tmp, but login home dirs
+                            // live on the read-only root: the plasmalogin greeter
+                            // writes ~/.config, ~/.cache (ksycoca, kwinrc, the Mesa
+                            // shader cache) under /var/lib/plasmalogin, and the
+                            // logged-in user under /home/narf. On a read-only root
+                            // those writes fail with EROFS: KConfig cannot lock/write
+                            // kwinrc, the Mesa shader cache is disabled, and
+                            // ~/.cache/ksycoca6 cannot be built — so the Plasma
+                            // application menu comes up EMPTY ("package does not
+                            // exist") and the session may die with a black screen.
+                            //
+                            // Use a writable OVERLAY (lower = the existing read-only
+                            // home dir, upper = a fresh tmpfs), NOT a plain tmpfs
+                            // overmount: a plain tmpfs would HIDE the account's
+                            // populated ~/.config (kdeglobals/kwinrc/plasmashellrc/…),
+                            // so KConfig/ksycoca fail. The overlay lets reads fall
+                            // through to the real config while writes land in the
+                            // tmpfs. Best-effort: a missing mount point or mount
+                            // failure just leaves that home read-only.
+                            for (mount_path, guest_path, mode, uid, gid, ov_name) in [
+                                (
+                                    "/mnt/var/lib/plasmalogin",
+                                    "/var/lib/plasmalogin",
+                                    "mode=0750",
+                                    957,
+                                    957,
+                                    "plasmalogin-home-ov",
+                                ),
+                                (
+                                    "/mnt/home/narf",
+                                    "/home/narf",
+                                    "mode=0700",
+                                    1000,
+                                    1000,
+                                    "narf-home-ov",
+                                ),
+                            ] {
+                                if mounts.iter().any(|m| m == mount_path) {
+                                    continue;
+                                }
+                                if let Ok(fs) = narf_filesystem::TmpFs::from_options(mode, uid, gid) {
+                                    if narf_filesystem::registry()
+                                        .mount_overlay(&auth, mount_path, ov_name, fs)
+                                        .is_ok()
+                                    {
+                                        let _ = writeln!(
+                                            console::Writer,
+                                            "  mnt-dev-bind: writable-overlay {} at {} (lower=real, upper=tmpfs)",
+                                            guest_path,
+                                            mount_path,
+                                        );
+                                    }
+                                }
+                            }
                             narf_init::InitResult::Ok
                         }
                         Err(e) => {
