@@ -30,6 +30,75 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
+// ── Dynamic directory-entry names ────────────────────────────────────
+//
+// `DirEntry::name` is `&'static str`, so a directory whose entries are
+// computed — the pid list, `/proc/<pid>/fd`, `/proc/<pid>/task` — had no
+// way to produce one except `Box::leak`, once per entry, per readdir.
+// That is a permanent allocation on a path tools poll: `top -d 1` over a
+// hundred processes leaked a hundred strings a second, for the life of the
+// boot, and nothing ever freed them.
+//
+// Interning turns that into a bounded cache. The names are decimal ids —
+// pids, tids, fd numbers — drawn from id spaces that recycle, so the set
+// of DISTINCT names a system ever produces is bounded by those spaces
+// (max pid, RLIMIT_NOFILE) rather than by how often anything reads /proc.
+// A repeat readdir now finds the name already interned and allocates
+// nothing.
+//
+// This is deliberately not a free(): an interned name outlives the pid it
+// described, because a `&'static str` handed out to an in-flight readdir
+// has no owner to reclaim it. Bounding the leak is what is achievable
+// without changing `DirEntry::name` across the 131 sites that build one.
+
+static INTERNED_NAMES: IrqSafeSpinLock<Option<alloc::collections::BTreeSet<&'static str>>> =
+    IrqSafeSpinLock::new(None);
+
+/// Intern `s`, returning a `&'static str` suitable for [`DirEntry::name`].
+///
+/// Allocates only the first time a given name is seen.
+pub(crate) fn intern_name(s: &str) -> &'static str {
+    let mut g = INTERNED_NAMES.lock();
+    let set = g.get_or_insert_with(alloc::collections::BTreeSet::new);
+    if let Some(found) = set.get(s) {
+        return found;
+    }
+    let leaked: &'static str = Box::leak(String::from(s).into_boxed_str());
+    set.insert(leaked);
+    leaked
+}
+
+/// Thread ids of a thread group, for `/proc/<pid>/task/`.
+///
+/// Installed by the crate that owns the task registry. Unset — early boot,
+/// or a build without the syscall layer — leaves the directory reporting
+/// the group leader alone, which is what it did unconditionally before.
+type ThreadListFn = fn(u64) -> Vec<u64>;
+static THREAD_LIST: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the `/proc/<pid>/task/` provider. Idempotent.
+pub fn set_thread_list_hook(f: ThreadListFn) {
+    THREAD_LIST.store(f as usize, Ordering::Release);
+}
+
+pub(crate) fn hook_thread_list(pid: u64) -> Option<Vec<u64>> {
+    let raw = THREAD_LIST.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: only `set_thread_list_hook` writes this cell, always from a
+    // `ThreadListFn`; a non-zero value round-trips soundly.
+    let f: ThreadListFn = unsafe { core::mem::transmute(raw) };
+    Some(f(pid))
+}
+
+/// Distinct names interned so far — the bound on what this cache holds.
+/// Read by the smoke that proves a repeated readdir stops allocating.
+#[doc(hidden)]
+pub fn __interned_name_count() -> usize {
+    INTERNED_NAMES.lock().as_ref().map_or(0, |s| s.len())
+}
+
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
 
 pub mod aggregate;
@@ -1823,7 +1892,7 @@ impl DirOps for ProcRoot {
         ];
         // Dynamic registry top-level entries (e.g. "net", "acpi", ...).
         for (name, kind) in list_registry_dir(&[]) {
-            let leaked: &'static str = Box::leak(name.into_boxed_str());
+            let leaked: &'static str = intern_name(&name);
             entries.push(DirEntry {
                 name: leaked,
                 file_type: match kind {
@@ -1837,7 +1906,7 @@ impl DirOps for ProcRoot {
             // Leak the String so its bytes outlive this iter call.
             // Acceptable cost: real consumers (ls, ps) read /proc
             // infrequently and we cap at the live-pid count.
-            let leaked: &'static str = Box::leak(s.into_boxed_str());
+            let leaked: &'static str = intern_name(&s);
             entries.push(DirEntry {
                 name: leaked,
                 file_type: FileType::Dir,
@@ -1904,7 +1973,7 @@ impl DirOps for ProcDynamicDir {
                     ProcNodeKind::File => FileType::File,
                     ProcNodeKind::Dir => FileType::Dir,
                 };
-                let leaked: &'static str = Box::leak(name.into_boxed_str());
+                let leaked: &'static str = intern_name(&name);
                 DirEntry {
                     name: leaked,
                     file_type,
