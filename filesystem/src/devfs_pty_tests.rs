@@ -543,6 +543,100 @@ kernel_test_in!(
     smoke_pty_slave_locked_until_tiocsptlck_clear
 );
 
+// ── Packet mode (TIOCPKT/TIOCGPKT) + TIOCGPTLCK + TIOCSIG ────────────────────
+
+// KDE's KPtyDevice (konsole) enables packet mode and expects every master read
+// to begin with a status byte; without the framing its read loop desyncs.
+fn smoke_pty_packet_mode_frames_master_read() -> TestResult {
+    use crate::devfs_pty::{TIOCGPKT, TIOCPKT, TIOCPKT_DATA};
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let slave_arc = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup failed"),
+    };
+    let slave = PtySlave::new(Arc::clone(&slave_arc));
+
+    // Enable packet mode; TIOCGPKT must then report it.
+    let mut on: i32 = 1;
+    if master.ioctl(TIOCPKT, &mut on as *mut i32 as usize) != Ok(0) {
+        return TestResult::Fail("TIOCPKT(1) did not return Ok(0)");
+    }
+    let mut got: i32 = -1;
+    if master.ioctl(TIOCGPKT, &mut got as *mut i32 as usize) != Ok(0) || got != 1 {
+        return TestResult::Fail("TIOCGPKT did not report packet mode enabled");
+    }
+
+    // Slave output is framed: byte 0 = TIOCPKT_DATA, the rest is the data.
+    if !matches!(poll_once(slave.write(0, b"world")), Some(Ok(5))) {
+        return TestResult::Fail("slave write didn't return 5");
+    }
+    let mut buf = [0xAAu8; 16];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(6)) if buf[0] == TIOCPKT_DATA && &buf[1..6] == b"world" => {}
+        _ => return TestResult::Fail("packet-mode read framing wrong"),
+    }
+
+    // Disable packet mode: reads are un-framed again.
+    let mut off: i32 = 0;
+    if master.ioctl(TIOCPKT, &mut off as *mut i32 as usize) != Ok(0) {
+        return TestResult::Fail("TIOCPKT(0) did not return Ok(0)");
+    }
+    let mut got2: i32 = -1;
+    if master.ioctl(TIOCGPKT, &mut got2 as *mut i32 as usize) != Ok(0) || got2 != 0 {
+        return TestResult::Fail("TIOCGPKT did not report packet mode disabled");
+    }
+    if !matches!(poll_once(slave.write(0, b"x")), Some(Ok(1))) {
+        return TestResult::Fail("second slave write failed");
+    }
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == b'x' => {}
+        _ => return TestResult::Fail("un-framed read after TIOCPKT(0) wrong"),
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_packet_mode_frames_master_read);
+
+fn smoke_pty_tiocgptlck_reports_lock_state() -> TestResult {
+    use crate::devfs_pty::{TIOCGPTLCK, TIOCSPTLCK};
+    __reset_for_test();
+    let master = open_ptmx();
+    // Locked by default right after ptmx open.
+    let mut got: i32 = -1;
+    if master.ioctl(TIOCGPTLCK, &mut got as *mut i32 as usize) != Ok(0) || got != 1 {
+        return TestResult::Fail("TIOCGPTLCK did not report the default lock");
+    }
+    // TIOCSPTLCK(0) clears it; TIOCGPTLCK must follow.
+    let mut zero: i32 = 0;
+    let _ = master.ioctl(TIOCSPTLCK, &mut zero as *mut i32 as usize);
+    let mut got2: i32 = -1;
+    if master.ioctl(TIOCGPTLCK, &mut got2 as *mut i32 as usize) != Ok(0) || got2 != 0 {
+        return TestResult::Fail("TIOCGPTLCK did not follow the unlock");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_tiocgptlck_reports_lock_state);
+
+// TIOCSIG's arg is the signal VALUE (not a pointer). Out-of-range is EINVAL; a
+// valid signal returns Ok(0) even with no foreground group installed.
+fn smoke_pty_tiocsig_validates_signal() -> TestResult {
+    use crate::devfs_pty::TIOCSIG;
+    __reset_for_test();
+    let master = open_ptmx();
+    if master.ioctl(TIOCSIG, 0).is_ok() {
+        return TestResult::Fail("TIOCSIG(0) should be rejected");
+    }
+    if master.ioctl(TIOCSIG, 65).is_ok() {
+        return TestResult::Fail("TIOCSIG(65) should be rejected");
+    }
+    if master.ioctl(TIOCSIG, 9) != Ok(0) {
+        return TestResult::Fail("TIOCSIG(SIGKILL) did not return Ok(0)");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_tiocsig_validates_signal);
+
 fn smoke_pty_per_tty_fg_pgrp_isolated() -> TestResult {
     use crate::devfs_pty::{TIOCGPGRP, TIOCSPGRP};
     __reset_for_test();

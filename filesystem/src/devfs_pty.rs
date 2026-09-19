@@ -108,6 +108,22 @@ pub const TCSBRK: u32 = 0x5409;
 pub const TCXONC: u32 = 0x540A;
 /// `ioctl(fd, TCFLSH, int)` — flush pending input/output (tcflush).
 pub const TCFLSH: u32 = 0x540B;
+/// `ioctl(master_fd, TIOCPKT, &int)` — enable/disable packet mode. In packet
+/// mode every master read is prefixed with a status byte; KDE's KPtyDevice
+/// (konsole) enables it and desyncs without the framing. `0x5420` (raw, like
+/// TIOCPKT in `include/uapi/asm-generic/ioctls.h`).
+pub const TIOCPKT: u32 = 0x5420;
+/// `ioctl(master_fd, TIOCGPKT, &int)` — read the packet-mode flag.
+/// `_IOR('T', 0x38, int)`.
+pub const TIOCGPKT: u32 = 0x8004_5438;
+/// `ioctl(master_fd, TIOCGPTLCK, &int)` — read the slave-lock flag set by
+/// TIOCSPTLCK. `_IOR('T', 0x39, int)`.
+pub const TIOCGPTLCK: u32 = 0x8004_5439;
+/// `ioctl(master_fd, TIOCSIG, sig)` — send signal `sig` (the arg VALUE, not a
+/// pointer) to the slave's foreground process group. `_IOW('T', 0x36, int)`.
+pub const TIOCSIG: u32 = 0x4004_5436;
+/// TIOCPKT_DATA — the status byte prefixed to an ordinary data packet.
+pub const TIOCPKT_DATA: u8 = 0;
 /// `ioctl(fd, KDGKBMODE, &int)` — query the VT keyboard translation mode.
 pub const KDGKBMODE: u32 = 0x4B44;
 /// `ioctl(fd, KDSKBMODE, int)` — set the VT keyboard translation mode.
@@ -407,6 +423,17 @@ pub struct Pty {
     // Only read by the `linux-compat` lock/unlock paths; always constructed so
     // the field is dead only when that feature is off.
     pub(crate) locked: AtomicBool,
+
+    /// Packet mode (TIOCPKT). When set, every master read is framed with a
+    /// leading status byte (`TIOCPKT_DATA` for ordinary output). Linux
+    /// `pty.c`: `tty->link->packet`. KDE's KPtyDevice (konsole) enables this
+    /// and relies on the framing; without it its read loop desyncs.
+    // LINUX-GAP: only the TIOCPKT_DATA framing is produced. The flush/stop/
+    // start control packets (TIOCPKT_FLUSHREAD/FLUSHWRITE/STOP/START) are not
+    // emitted yet — they would be raised from tcflush/^S/^Q, which NARF's pty
+    // does not implement. Consumers that only need output framing (konsole)
+    // work; ones that depend on flush notifications lose that signal only.
+    pub(crate) packet: AtomicBool,
 }
 
 impl core::fmt::Debug for Pty {
@@ -451,6 +478,7 @@ impl Pty {
             slave_opens: AtomicU32::new(0),
             slave_ever_opened: AtomicBool::new(false),
             master_closed: AtomicBool::new(false),
+            packet: AtomicBool::new(false),
         }
     }
 }
@@ -1108,6 +1136,32 @@ impl FileOps for PtyMaster {
     /// Linux ref: `pty.c pty_read` → `tty_buffer_request_room` →
     ///   drains `tty->link->read_buf`.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Packet mode (TIOCPKT): every read is framed as [status][data...].
+        // Linux `pty_read` prefixes the control byte to the drained bytes;
+        // with no pending control event the byte is TIOCPKT_DATA and ordinary
+        // output follows. (The flush/stop/start control packets are a
+        // documented gap — see `Pty::packet`.)
+        if self.pty.packet.load(Ordering::Acquire) {
+            if buf.is_empty() {
+                return Box::pin(async move { Ok(0) });
+            }
+            let n = self.pty.slave_tx_to_master.pop(&mut buf[1..]);
+            if n > 0 {
+                buf[0] = TIOCPKT_DATA;
+                return Box::pin(async move { Ok(n + 1) });
+            }
+            // No data copied. If output is nonetheless pending, the caller's
+            // buffer had room only for the status byte (buf.len() == 1); emit
+            // a bare TIOCPKT_DATA header and leave the data for the next read.
+            if self.pty.slave_tx_to_master.len() > 0 {
+                buf[0] = TIOCPKT_DATA;
+                return Box::pin(async move { Ok(1) });
+            }
+            if self.pty.hung_up() {
+                return Box::pin(async move { Err(FsError::Io(narf_block::BlockError::IOError)) });
+            }
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         let n = self.pty.slave_tx_to_master.pop(buf);
         // Drain first: bytes the slave wrote before it closed are still the
         // child's output and must be delivered, exactly as Linux drains
@@ -1308,6 +1362,42 @@ impl FileOps for PtyMaster {
                 let n = self.pty.slave_tx_to_master.len() as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, n)? };
+                Ok(0)
+            }
+            TIOCPKT => {
+                // Linux `pty_set_pktmode`: a non-zero int enables packet mode
+                // on the master, zero disables it.
+                // SAFETY: arg is a validated user `int *`.
+                let on = unsafe { read_user_i32(arg)? } != 0;
+                self.pty.packet.store(on, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGPKT => {
+                // Linux `pty_get_pktmode`: report the packet-mode flag.
+                let v = self.pty.packet.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCGPTLCK => {
+                // Linux `pty_get_lock`: report the slave-lock flag (the value
+                // last set by TIOCSPTLCK / unlockpt).
+                let v = self.pty.locked.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCSIG => {
+                // Linux `pty_signal`: `arg` is the signal number VALUE (not a
+                // pointer — see the compat path that skips `compat_ptr` for
+                // TIOCSIG). Validate it, then raise it on the slave's
+                // foreground process group; an out-of-range signal is EINVAL.
+                let sig = arg as u32;
+                if sig == 0 || sig > 64 {
+                    return Err(FsError::InvalidData);
+                }
+                let pgrp = self.pty.ctrl.lock().fg_pgrp;
+                pty_deliver_signal(pgrp, sig);
                 Ok(0)
             }
             // TIOCGPTPEER is dispatched by sys_ioctl directly; if it
