@@ -725,6 +725,11 @@ pub enum FsError {
     /// the fix is to enable it. `btrfs qgroup show` on a filesystem without
     /// quotas relies on telling those apart.
     NotConnected,
+    /// No such process or process group — `ESRCH`. Job-control ioctls need
+    /// it distinct from `OperationNotPermitted`: `TIOCSPGRP` answers ESRCH
+    /// for a process group that does not exist and EPERM for one that
+    /// exists in another session (`drivers/tty/tty_jobctrl.c:518-521`).
+    NoSuchProcess,
     /// The backing FS doesn't implement this op (e.g. virtiofs skeleton
     /// pre-Stage-4).
     Unsupported,

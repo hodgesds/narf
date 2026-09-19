@@ -992,10 +992,15 @@ fn smoke_pty_master_empty_read_is_would_block_not_eof() -> TestResult {
         _ => return TestResult::Fail("slave write failed"),
     }
 
-    // With data pending the master must hand it over.
+    // With data pending the master must hand it over — as OPOST processed
+    // it. The default termios carries OPOST|ONLCR, so the payload's closing
+    // `\n` reaches the master as CR-NL (`do_output_char`, n_tty.c:414).
+    // This expectation used to be the raw payload, which is what a terminal
+    // emulator never sees on a real kernel.
+    let expected = b"PTY-CHILD-ALIVE\r\n";
     match poll_once(master.read(0, &mut buf)) {
-        Some(Ok(n)) if n == payload.len() => {
-            if &buf[..n] != payload {
+        Some(Ok(n)) if n == expected.len() => {
+            if &buf[..n] != expected {
                 return TestResult::Fail("master read returned the wrong bytes");
             }
         }
@@ -1335,3 +1340,258 @@ fn smoke_vt_mode_roundtrip() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/vt", smoke_vt_mode_roundtrip);
+
+// ── OPOST / termios parity ───────────────────────────────────────────────────
+
+/// OPOST|ONLCR expands a slave-written `\n` into CR-NL on its way to the
+/// master. `do_output_char` (`drivers/tty/n_tty.c:414`):
+///
+/// ```c
+/// if (O_ONLCR(tty)) { ... tty->ops->write(tty, "\r\n", 2); return 2; }
+/// ```
+///
+/// Without it every line a program prints reaches a terminal emulator as a
+/// bare line feed, which moves down a row without returning to column 0 —
+/// the staircase. A serial console hides the bug because the UART adds its
+/// own CR.
+fn smoke_pty_opost_onlcr_expands_newline() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let pty = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+
+    // Default termios is OPOST|ONLCR, as Linux's n_tty_set_termios leaves it.
+    let w = poll_once(slave.write(0, b"a\nb"));
+    // The RETURN value counts the caller's bytes, not the expanded ones.
+    if !matches!(w, Some(Ok(3))) {
+        return TestResult::Fail("slave write should report the caller's byte count");
+    }
+    let mut buf = [0u8; 16];
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("master read failed"),
+    };
+    if &buf[..n] != b"a\r\nb" {
+        return TestResult::Fail("ONLCR did not expand \\n to CR-NL");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_opost_onlcr_expands_newline);
+
+/// With OPOST clear every other output flag is inert and bytes pass through
+/// untouched — `do_output_char` is only reached via `process_output`, which
+/// `n_tty_write` calls solely when `O_OPOST(tty)`.
+///
+/// This is the other half of the ONLCR test: a discipline that always
+/// inserted CR would pass that one and fail this.
+fn smoke_pty_opost_disabled_passes_bytes_through() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let pty = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    {
+        // Clear OPOST (c_oflag bit 0) — what cfmakeraw() does.
+        let mut t = pty.termios.lock();
+        let mut oflag = u32::from_ne_bytes(t.raw[4..8].try_into().unwrap());
+        oflag &= !1;
+        t.raw[4..8].copy_from_slice(&oflag.to_ne_bytes());
+    }
+    let slave = PtySlave::new(Arc::clone(&pty));
+    if !matches!(poll_once(slave.write(0, b"a\nb")), Some(Ok(3))) {
+        return TestResult::Fail("slave write failed");
+    }
+    let mut buf = [0u8; 16];
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("master read failed"),
+    };
+    if &buf[..n] != b"a\nb" {
+        return TestResult::Fail("raw mode must not insert a CR");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_opost_disabled_passes_bytes_through
+);
+
+/// The window size carries pixels, and they round-trip.
+///
+/// `tty_do_resize` compares the WHOLE `struct winsize`, so dropping the
+/// pixel fields both loses what programs read back (sixel and the kitty
+/// graphics protocol size images from them) and makes a pixels-only resize
+/// look like no resize at all.
+fn smoke_pty_winsize_carries_pixels() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    pty.resize(crate::devfs_pty::WinSize {
+        rows: 40,
+        cols: 100,
+        xpixel: 800,
+        ypixel: 600,
+    });
+    let w = *pty.window.lock();
+    if w.rows != 40 || w.cols != 100 {
+        return TestResult::Fail("winsize rows/cols did not round-trip");
+    }
+    if w.xpixel != 800 || w.ypixel != 600 {
+        return TestResult::Fail("winsize pixel fields were dropped");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_winsize_carries_pixels);
+
+/// Input CR/NL translation follows c_iflag rather than being hardcoded.
+///
+/// `n_tty.c:1355`, and the order matters — IGNCR is tested BEFORE ICRNL:
+///
+/// ```c
+/// if (c == '\r') {
+///         if (I_IGNCR(tty)) return;
+///         if (I_ICRNL(tty)) c = '\n';
+/// } else if (c == '\n' && I_INLCR(tty))
+///         c = '\r';
+/// ```
+fn smoke_pty_input_cr_translation_follows_iflag() -> TestResult {
+    const ICRNL: u32 = 0x100;
+    const IGNCR: u32 = 0x080;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+
+    let set_iflag = |v: u32| {
+        let mut t = pty.termios.lock();
+        t.raw[0..4].copy_from_slice(&v.to_ne_bytes());
+    };
+
+    // ICRNL: a CR becomes NL, which also terminates the canonical line.
+    set_iflag(ICRNL);
+    if poll_once(master.write(0, b"x\r")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    let mut buf = [0u8; 16];
+    let n = match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("slave read failed under ICRNL"),
+    };
+    if &buf[..n] != b"x\n" {
+        return TestResult::Fail("ICRNL did not map CR to NL");
+    }
+
+    // IGNCR wins over ICRNL: the CR is dropped, so the line never
+    // completes and there is nothing to read.
+    set_iflag(IGNCR | ICRNL);
+    if poll_once(master.write(0, b"y\r")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    if pty.input.lock().readable() != 0 {
+        return TestResult::Fail("IGNCR must discard CR before ICRNL maps it");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_input_cr_translation_follows_iflag
+);
+
+/// ECHOCTL renders a control character as `^X` rather than echoing a raw
+/// control byte (`n_tty.c` `echo_char`). Without it a `^C` typed at a shell
+/// prompt emits a literal 0x03 to the terminal.
+fn smoke_pty_echoctl_renders_caret_form() -> TestResult {
+    const ECHO: u32 = 0x08;
+    const ECHOCTL: u32 = 0x200;
+    const ICANON: u32 = 0x02;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    {
+        // ECHO|ECHOCTL|ICANON, and crucially ISIG CLEAR so ^C is ordinary
+        // input rather than a signal.
+        let mut t = pty.termios.lock();
+        t.raw[12..16].copy_from_slice(&(ECHO | ECHOCTL | ICANON).to_ne_bytes());
+    }
+    if poll_once(master.write(0, &[0x03])).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    let mut buf = [0u8; 16];
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("master read of the echo failed"),
+    };
+    if &buf[..n] != b"^C" {
+        return TestResult::Fail("ECHOCTL did not render the control char as ^C");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_echoctl_renders_caret_form);
+
+/// IXON flow control actually stops output: `^S` (VSTOP) suspends what the
+/// master can read and `^Q` (VSTART) resumes it.
+///
+/// Linux gates the transmit path on `tty->flow.stopped`
+/// (`n_tty_receive_char_flow_ctrl` sets it, `start_tty`/`stop_tty` act on
+/// it). A flag that is set but never consulted would leave `^S` and
+/// `tcflow(TCOOFF)` silently inert — accepted and discarded.
+fn smoke_pty_ixon_flow_control_stops_output() -> TestResult {
+    const IXON: u32 = 0x400;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    {
+        let mut t = pty.termios.lock();
+        t.raw[0..4].copy_from_slice(&IXON.to_ne_bytes());
+    }
+    let slave = PtySlave::new(Arc::clone(&pty));
+
+    // ^S from the terminal stops output.
+    if poll_once(master.write(0, &[0x13])).is_none() {
+        return TestResult::Fail("master write of ^S failed");
+    }
+    if poll_once(slave.write(0, b"hidden")).is_none() {
+        return TestResult::Fail("slave write failed");
+    }
+    let mut buf = [0u8; 32];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("stopped output must not be readable"),
+    }
+    // ...and the poll mask has to agree, or an event loop spins.
+    if master.poll_readiness() & crate::POLL_IN != 0 {
+        return TestResult::Fail("stopped output must not report POLLIN");
+    }
+
+    // ^Q resumes it, and nothing was lost.
+    if poll_once(master.write(0, &[0x11])).is_none() {
+        return TestResult::Fail("master write of ^Q failed");
+    }
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("resumed output was not readable"),
+    };
+    if &buf[..n] != b"hidden" {
+        return TestResult::Fail("output queued while stopped must survive the restart");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_ixon_flow_control_stops_output);

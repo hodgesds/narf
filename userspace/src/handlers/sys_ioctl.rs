@@ -840,6 +840,10 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // EACCES = 13
             ctx.set_return(SyscallReturn::ok((-13i64) as u64));
         }
+        Err(narf_filesystem::FsError::NoSuchProcess) => {
+            // ESRCH — TIOCSPGRP for a process group that does not exist.
+            ctx.set_return(SyscallReturn::ok((-3i64) as u64));
+        }
         Err(narf_filesystem::FsError::OperationNotPermitted) => {
             ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
         }
