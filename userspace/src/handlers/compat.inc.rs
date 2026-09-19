@@ -5695,6 +5695,9 @@ pub fn proc_task_info(
                     numa_node_pages: r.node_pages,
                     resident_pages: r.resident_pages,
                     kernel_page_kb: r.kernel_page_kb,
+                    pss_bytes: r.pss_bytes,
+                    shared_pages: r.shared_pages,
+                    private_pages: r.private_pages,
                 });
             }
         }

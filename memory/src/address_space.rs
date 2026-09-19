@@ -1379,6 +1379,23 @@ pub struct NumaRegionSnapshot {
     pub resident_pages: u64,
     /// Resident base-page equivalents per SRAT node.
     pub node_pages: [u64; crate::frame::MAX_NUMA_NODES],
+    /// Proportional set size in bytes — Linux `Pss`. A frame mapped by
+    /// `n` address spaces contributes `PAGE_SIZE / n`, so summing Pss
+    /// across every process counts shared memory exactly once.
+    ///
+    /// This is exact, not estimated: the COW refcounts
+    /// (`frame::cow::count_batch`) are the real sharer counts, so the
+    /// field never has to be approximated by Rss — which would overstate
+    /// shared memory, and is the one number `ps_mem` and systemd's
+    /// memory accounting actually read.
+    pub pss_bytes: u64,
+    /// Resident base pages whose frame is mapped by more than one address
+    /// space, and those mapped by exactly one. Linux splits these further
+    /// by clean/dirty; NARF does not track per-page dirty state, so the
+    /// renderer reports the split it can prove and leaves the rest out
+    /// rather than guessing which half a page belongs in.
+    pub shared_pages: u64,
+    pub private_pages: u64,
 }
 
 /// Allocation-free process memory totals used by procfs and exit accounting.
@@ -7199,13 +7216,20 @@ impl AddressSpace {
                     let node = frame.node();
                     node_pages[node] = node_pages[node].saturating_add(pages_per_leaf);
                 }
+                // Huge leaves are not COW-tracked, so every resident page
+                // is private to this address space. Asserting a sharer
+                // count the refcount table cannot supply would be a guess.
+                let resident_pages = region.frames.len() as u64 * pages_per_leaf;
                 out.push(NumaRegionSnapshot {
                     base: region.base,
                     len: region.len,
                     perms: region.perms,
                     kernel_page_kb: page_bytes >> 10,
-                    resident_pages: region.frames.len() as u64 * pages_per_leaf,
+                    resident_pages,
                     node_pages,
+                    pss_bytes: resident_pages.saturating_mul(4096),
+                    shared_pages: 0,
+                    private_pages: resident_pages,
                 });
             }
         }
@@ -7215,7 +7239,13 @@ impl AddressSpace {
             for region in regions.iter() {
                 let mut node_pages = [0u64; crate::frame::MAX_NUMA_NODES];
                 let mut resident_pages = 0u64;
-                for phys in &region.phys {
+                // Batched: the flat PFN-indexed table is consulted once for
+                // the whole region rather than per frame.
+                let sharers = crate::frame::cow::count_batch(&region.phys);
+                let mut pss_bytes = 0u64;
+                let mut shared_pages = 0u64;
+                let mut private_pages = 0u64;
+                for (index, phys) in region.phys.iter().enumerate() {
                     if phys.raw() == 0 {
                         continue;
                     }
@@ -7224,6 +7254,15 @@ impl AddressSpace {
                     let node = unsafe { crate::frame::narf_phys_node(phys.raw()) };
                     node_pages[node] = node_pages[node].saturating_add(1);
                     resident_pages += 1;
+                    // A frame absent from the COW table is mapped once, so
+                    // `0` and `1` both mean "private" and divide by one.
+                    let n = sharers.get(index).copied().unwrap_or(0).max(1) as u64;
+                    pss_bytes = pss_bytes.saturating_add(4096 / n);
+                    if n > 1 {
+                        shared_pages += 1;
+                    } else {
+                        private_pages += 1;
+                    }
                 }
                 out.push(NumaRegionSnapshot {
                     base: region.base,
@@ -7232,6 +7271,9 @@ impl AddressSpace {
                     kernel_page_kb: 4,
                     resident_pages,
                     node_pages,
+                    pss_bytes,
+                    shared_pages,
+                    private_pages,
                 });
             }
         }
