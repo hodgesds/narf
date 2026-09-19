@@ -59,6 +59,21 @@ pub unsafe fn try_read_byte(base: usize, kind: UartKind) -> Option<u8> {
 /// # Safety
 /// See `init`.
 pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
+    // SAFETY: same contract as `write_bytes_opts`.
+    unsafe { write_bytes_opts(base, kind, bytes, true) }
+}
+
+/// Blocking TX of a byte slice to a PL011, optionally expanding LF to CR-LF.
+///
+/// `translate_lf` separates Linux's two serial paths: the kernel console
+/// (`uart_console_write`, `serial_core.c:2081`) hardcodes the CR so panics
+/// render without any termios, while a userspace tty write (`uart_write`)
+/// transmits exactly what the line discipline produced — OPOST has already
+/// run, and a second CR here would emit CR CR LF.
+///
+/// # Safety
+/// See `init`.
+pub unsafe fn write_bytes_opts(base: usize, kind: UartKind, bytes: &[u8], translate_lf: bool) {
     debug_assert_eq!(kind, UartKind::Pl011);
     for &b in bytes {
         // SAFETY: MMIO read/write, volatile via arch/mmio.
@@ -66,7 +81,7 @@ pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
             while read_u32((base + FR) as *const u32) & FR_TXFF != 0 {
                 core::hint::spin_loop();
             }
-            if b == b'\n' {
+            if translate_lf && b == b'\n' {
                 write_u32((base + DR) as *mut u32, b'\r' as u32);
                 while read_u32((base + FR) as *const u32) & FR_TXFF != 0 {
                     core::hint::spin_loop();

@@ -1132,25 +1132,20 @@ impl FileOps for DevConsole {
         // non-UTF-8 input as best-effort lossy by way of
         // `from_utf8_lossy` — `write_str` is the only public sink.
         let n = buf.len();
-        if let Ok(s) = core::str::from_utf8(buf) {
-            narf_console::write_str(s);
+        // The tty write path: OPOST runs here, and the bytes reach the UART
+        // verbatim afterwards. Using `write_str` (the printk path) instead
+        // both skipped `c_oflag` and hardcoded a CR the line discipline had
+        // not asked for.
+        if core::str::from_utf8(buf).is_ok() {
+            crate::console_tty::write_user(buf);
         } else {
             // Slow path: emit bytes one-by-one as `?` substitutes
             // for invalid UTF-8 — matches the standard library's
-            // handling and keeps the byte count truthful.
+            // handling and keeps the byte count truthful. Still the tty
+            // write path, so still through OPOST.
             for &b in buf {
-                if b.is_ascii() {
-                    // SAFETY: `b.is_ascii()` is true here, so the single-byte
-                    // slice `from_ref(&b)` contains one byte < 0x80, which is
-                    // always valid UTF-8; `from_utf8_unchecked` therefore has no
-                    // invalid sequence to misinterpret.
-                    // SAFETY: Valid memory or trusted environment
-                    narf_console::write_str(unsafe {
-                        core::str::from_utf8_unchecked(core::slice::from_ref(&b))
-                    });
-                } else {
-                    narf_console::write_str("?");
-                }
+                let sub = if b.is_ascii() { b } else { b'?' };
+                crate::console_tty::write_user(core::slice::from_ref(&sub));
             }
         }
         Box::pin(async move { Ok(n) })

@@ -154,6 +154,41 @@ pub fn write_str(s: &str) {
     }
 }
 
+/// Write bytes to the console EXACTLY as given, with no LF expansion.
+///
+/// This is the userspace-write sink: `uart_write` rather than
+/// `uart_console_write`. The tty layer has already run OPOST over these
+/// bytes, so the CR (if ONLCR asked for one) is present already and the
+/// backend must not add a second. `write_str` remains the printk/panic
+/// path and keeps its unconditional CR, exactly as Linux's console write
+/// does (`drivers/tty/serial/serial_core.c:2081`).
+///
+/// The original, unprocessed text is what belongs in the kernel log, so
+/// callers that want a klog record pass it themselves; this function does
+/// not record, because CR bytes in the dmesg ring help nobody.
+pub fn write_bytes_raw(bytes: &[u8]) {
+    let _g = CONSOLE.lock.lock();
+    let kind = match CONSOLE.kind.get() {
+        Some(k) => *k,
+        None => return, // pre-init; silently drop
+    };
+    let base = CONSOLE.base.load(Ordering::Acquire) as usize;
+    // SAFETY: `kind` + `base` were published via Release by `early_init`
+    // or `remap_to_virtual`, and we hold the coarse lock.
+    // SAFETY: Valid memory or trusted environment
+    unsafe {
+        backend::write_bytes_opts(base, kind, bytes, false);
+    }
+
+    // Fan out to the framebuffer-console hook when installed.
+    let h = FB_HOOK.load(Ordering::Acquire);
+    if h != 0 {
+        // SAFETY: stored as `FbHook as usize` in `set_fb_hook`.
+        let f: FbHook = unsafe { core::mem::transmute(h) };
+        f(bytes);
+    }
+}
+
 /// Enable RX-data-available IRQ on the active UART. After this
 /// call, the chipset asserts the platform's UART IRQ line
 /// (typically ISA IRQ 4 for COM1) when bytes arrive — caller

@@ -152,6 +152,28 @@ unsafe fn wait_thr_empty(port: u16) -> bool {
 /// # Safety
 /// Hardware assumptions per `init`.
 pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
+    // SAFETY: same contract as `write_bytes_opts`.
+    unsafe { write_bytes_opts(base, kind, bytes, true) }
+}
+
+/// Write bytes to the UART, optionally expanding LF to CR-LF.
+///
+/// `translate_lf` distinguishes Linux's two serial output paths, which have
+/// always behaved differently:
+///
+/// * the KERNEL console (printk, boot log, panic) — `uart_console_write`
+///   (`drivers/tty/serial/serial_core.c:2081`) hardcodes
+///   `if (*s == '\n') putchar(port, '\r');`. No termios is consulted,
+///   because a panic must render on a serial terminal whether or not any
+///   tty has been configured. That is `translate_lf = true`.
+/// * a USERSPACE write to the tty — `uart_write`, which transmits exactly
+///   the bytes the line discipline handed it. OPOST/ONLCR has already run
+///   by then, so inserting another CR here would emit CR CR LF. That is
+///   `translate_lf = false`.
+///
+/// # Safety
+/// Hardware assumptions per `init`.
+pub unsafe fn write_bytes_opts(base: usize, kind: UartKind, bytes: &[u8], translate_lf: bool) {
     debug_assert_eq!(kind, UartKind::Uart16550);
     if !UART_PRESENT.load(core::sync::atomic::Ordering::Acquire) {
         return;
@@ -163,8 +185,7 @@ pub unsafe fn write_bytes(base: usize, kind: UartKind, bytes: &[u8]) {
             if !wait_thr_empty(port) {
                 continue;
             }
-            // LF ⇒ CR+LF so bare `println` renders on serial terminals.
-            if b == b'\n' {
+            if translate_lf && b == b'\n' {
                 outb(port, b'\r');
                 if !wait_thr_empty(port) {
                     continue;
