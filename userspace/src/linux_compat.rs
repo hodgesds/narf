@@ -122,13 +122,18 @@ impl FileOps for SignalFdFile {
             // store+set), so a queued standard signal is never read as a
             // payload-less SI_USER nor left stranded — same invariant as the
             // sigwait and handler-delivery consumers.
-            if let Some((si_code, si_value, si_pid)) =
-                crate::handlers::sigqueue_take_and_clear(self.owner_task, signum)
-            {
-                buf[8..12].copy_from_slice(&si_code.to_le_bytes());
-                buf[12..16].copy_from_slice(&si_pid.to_le_bytes()); // ssi_pid
-                buf[44..48].copy_from_slice(&(si_value as u32).to_le_bytes());
-                buf[48..56].copy_from_slice(&si_value.to_le_bytes());
+            if let Some(info) = crate::handlers::sigqueue_take_and_clear(self.owner_task, signum) {
+                buf[8..12].copy_from_slice(&info.code.to_le_bytes());
+                if let Some(band) = info.poll_band {
+                    // SIGIO/SIGPOLL payload. Linux signalfd_siginfo exposes
+                    // si_fd at offset 20 and si_band at offset 28.
+                    buf[20..24].copy_from_slice(&(info.value as u32).to_le_bytes());
+                    buf[28..32].copy_from_slice(&band.to_le_bytes());
+                } else {
+                    buf[12..16].copy_from_slice(&info.pid.to_le_bytes()); // ssi_pid
+                    buf[44..48].copy_from_slice(&(info.value as u32).to_le_bytes());
+                    buf[48..56].copy_from_slice(&info.value.to_le_bytes());
+                }
             }
             Ok(SIGNALFD_SIGINFO_LEN)
         })

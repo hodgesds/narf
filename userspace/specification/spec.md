@@ -282,6 +282,18 @@ description accepts only Linux's path-safe command whitelist; other commands
 return `EBADF`. `F_GETFL` reads status from the shared open-file description.
 `F_SETFD` retains only `FD_CLOEXEC`, silently ignores all other argument bits,
 and `F_GETFD` reports only that retained bit.
+`F_SETOWN`, `F_SETOWN_EX`, and `F_SETSIG` likewise update shared
+open-description state; their get forms report namespace-visible pid, tid, or
+process-group values and preserve Linux's `EFAULT`/`EINVAL`/`ESRCH` ordering.
+On a pollable file, setting `O_ASYNC` installs an IRQ-safe persistent readiness
+observer. The observer defers signal-table work to task context and delivers
+ordinary `SIGIO`, or the `F_SETSIG` signal with Linux `si_code`, `si_band`, and
+`si_fd`; clearing `O_ASYNC` or dropping the last description alias disarms it.
+Files without a durable async-readiness path ignore `O_ASYNC`, as a Linux file
+without `file_operations::fasync` does. `F_GET_RW_HINT` and `F_SET_RW_HINT`
+operate on inode identity rather than descriptor identity, accept only the six
+`RWH_WRITE_LIFE_*` values, and check owner-or-`CAP_FOWNER` before importing a
+set value, so `EPERM` precedes pointer `EFAULT` for an unauthorized caller.
 Epoll readiness callbacks run without holding the parent epoll instance lock,
 including during edge-state write-back for nested epoll sets.
 Epoll interest records retain a weak reference to the watched open file

@@ -23,6 +23,282 @@ fn write_flock_to_user(ptr: u64, flock: &UFlock) -> Result<(), ()> {
     unsafe { copy_to_user(ptr, &bytes) }.map_err(|_| ())
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct FOwnerEx {
+    type_: i32,
+    pid: i32,
+}
+
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
+
+/// One persistent readiness callback per async-enabled open description. It
+/// retains the description weakly so a FileOps readiness cell cannot keep a
+/// closed file alive. The callback itself does no signal-table work: it may be
+/// invoked by an IRQ producer while the relevant locks are interrupted.
+struct FasyncWake {
+    description: alloc::sync::Weak<crate::fd::OpenFileDescription>,
+}
+
+static FASYNC_EVENT_VTABLE: core::task::RawWakerVTable = core::task::RawWakerVTable::new(
+    fasync_event_clone,
+    fasync_event_wake,
+    fasync_event_wake_by_ref,
+    fasync_waker_drop,
+);
+static FASYNC_ACTION_VTABLE: core::task::RawWakerVTable = core::task::RawWakerVTable::new(
+    fasync_action_clone,
+    fasync_action_wake,
+    fasync_action_wake_by_ref,
+    fasync_waker_drop,
+);
+
+unsafe fn fasync_clone_with(
+    ptr: *const (),
+    vtable: &'static core::task::RawWakerVTable,
+) -> core::task::RawWaker {
+    // SAFETY: every pointer paired with either fasync vtable was minted by
+    // Arc::into_raw for FasyncWake, and the source Waker keeps one count live.
+    unsafe { alloc::sync::Arc::<FasyncWake>::increment_strong_count(ptr.cast()) };
+    core::task::RawWaker::new(ptr, vtable)
+}
+
+unsafe fn fasync_event_clone(ptr: *const ()) -> core::task::RawWaker {
+    // SAFETY: forwarded RawWaker clone contract.
+    unsafe { fasync_clone_with(ptr, &FASYNC_EVENT_VTABLE) }
+}
+
+unsafe fn fasync_action_clone(ptr: *const ()) -> core::task::RawWaker {
+    // SAFETY: forwarded RawWaker clone contract.
+    unsafe { fasync_clone_with(ptr, &FASYNC_ACTION_VTABLE) }
+}
+
+fn fasync_defer(wake: &alloc::sync::Arc<FasyncWake>) {
+    let action = alloc::sync::Arc::clone(wake);
+    let raw = core::task::RawWaker::new(
+        alloc::sync::Arc::into_raw(action).cast(),
+        &FASYNC_ACTION_VTABLE,
+    );
+    // SAFETY: `raw` owns exactly one Arc<FasyncWake> count and the action
+    // vtable observes the RawWaker clone/wake/drop ownership rules.
+    let action = unsafe { core::task::Waker::from_raw(raw) };
+    if let Err(action) = narf_lib::deferred_wake::try_push_one(action) {
+        // The Readiness cell's event waker remains live throughout this
+        // callback, so dropping the extra action count cannot deallocate in
+        // IRQ context even if the bounded deferred queue is temporarily full.
+        drop(action);
+    }
+}
+
+unsafe fn fasync_event_wake(ptr: *const ()) {
+    // SAFETY: wake-by-value consumes the Arc count held by this RawWaker.
+    let wake = unsafe { alloc::sync::Arc::<FasyncWake>::from_raw(ptr.cast()) };
+    fasync_defer(&wake);
+}
+
+unsafe fn fasync_event_wake_by_ref(ptr: *const ()) {
+    // SAFETY: wake_by_ref borrows the RawWaker's live Arc count.
+    let wake = core::mem::ManuallyDrop::new(unsafe {
+        alloc::sync::Arc::<FasyncWake>::from_raw(ptr.cast())
+    });
+    fasync_defer(&wake);
+}
+
+unsafe fn fasync_waker_drop(ptr: *const ()) {
+    // SAFETY: drop consumes the one Arc count owned by this RawWaker.
+    drop(unsafe { alloc::sync::Arc::<FasyncWake>::from_raw(ptr.cast()) });
+}
+
+unsafe fn fasync_action_wake(ptr: *const ()) {
+    // SAFETY: wake-by-value consumes the Arc count held by this action waker.
+    let wake = unsafe { alloc::sync::Arc::<FasyncWake>::from_raw(ptr.cast()) };
+    deliver_fasync(&wake);
+}
+
+unsafe fn fasync_action_wake_by_ref(ptr: *const ()) {
+    // SAFETY: wake_by_ref borrows the action waker's live Arc count.
+    let wake = core::mem::ManuallyDrop::new(unsafe {
+        alloc::sync::Arc::<FasyncWake>::from_raw(ptr.cast())
+    });
+    deliver_fasync(&wake);
+}
+
+fn fasync_event_waker(
+    description: &crate::fd::Description,
+) -> core::task::Waker {
+    let wake = alloc::sync::Arc::new(FasyncWake {
+        description: alloc::sync::Arc::downgrade(description),
+    });
+    let raw = core::task::RawWaker::new(
+        alloc::sync::Arc::into_raw(wake).cast(),
+        &FASYNC_EVENT_VTABLE,
+    );
+    // SAFETY: `raw` owns exactly one Arc<FasyncWake> count and its vtable
+    // implements the complete RawWaker ownership contract above.
+    unsafe { core::task::Waker::from_raw(raw) }
+}
+
+fn sigio_permitted(target: u64, state: crate::fd::FasyncSnapshot) -> bool {
+    if crate::task::task_get(target).is_none() && target != current_task_id() {
+        return false;
+    }
+    let target_ids = read_uidgid(target);
+    state.owner_euid == 0
+        || state.owner_euid == target_ids.suid
+        || state.owner_euid == target_ids.uid
+        || state.owner_uid == target_ids.suid
+        || state.owner_uid == target_ids.uid
+}
+
+fn deliver_fasync(wake: &FasyncWake) {
+    let Some(description) = wake.description.upgrade() else {
+        return;
+    };
+    let state = description.fasync_snapshot();
+    if !state.enabled || state.owner == crate::fd::FasyncOwner::None {
+        return;
+    }
+    let readiness = description
+        .fasync_ops()
+        .map_or(0, |ops| ops.poll_readiness());
+    // Linux's send_sigio reason -> band_table mapping. The readiness callback
+    // does not carry an event argument, so prefer the strongest currently
+    // observable level and fall back to POLL_IN if an edge was consumed before
+    // this deferred action ran.
+    let (poll_code, poll_band) = if readiness & narf_filesystem::POLL_ERR != 0 {
+        (4, 0x008)
+    } else if readiness & narf_filesystem::POLL_HUP != 0 {
+        (6, 0x018)
+    } else if readiness & narf_filesystem::POLL_PRI != 0 {
+        (5, 0x082)
+    } else if readiness & narf_filesystem::POLL_IN != 0 {
+        (1, 0x041)
+    } else if readiness & narf_filesystem::POLL_OUT != 0 {
+        (2, 0x304)
+    } else {
+        (1, 0x041)
+    };
+    let targets = match state.owner {
+        crate::fd::FasyncOwner::None => alloc::vec::Vec::new(),
+        crate::fd::FasyncOwner::Tid(task) | crate::fd::FasyncOwner::Process(task) => {
+            alloc::vec![task]
+        }
+        crate::fd::FasyncOwner::ProcessGroup(group) => pgrp_task_snapshot(group),
+    };
+    for target in targets {
+        if sigio_permitted(target, state) {
+            raise_sigio_pending(target, state.signal, poll_code, poll_band, state.fd);
+        }
+    }
+}
+
+fn resolve_fasync_task(caller: u64, visible: i32, thread: bool) -> Option<u64> {
+    if visible <= 0 {
+        return None;
+    }
+    let outer = accept_pid_from(caller, visible as u64)?;
+    if thread {
+        linux_tid_to_task_raw(outer).or_else(|| pid_to_task_raw(outer))
+    } else {
+        pid_to_task_raw(outer)
+    }
+}
+
+fn fasync_owner_to_user(
+    caller: u64,
+    state: crate::fd::FasyncSnapshot,
+) -> (i32, i32) {
+    match state.owner {
+        crate::fd::FasyncOwner::None => (state.owner_type, 0),
+        crate::fd::FasyncOwner::Tid(task) => {
+            let outer = task_to_linux_tid_raw(task)
+                .or_else(|| task_to_pid_raw(task))
+                .unwrap_or(0);
+            (F_OWNER_TID, report_pid_to(caller, outer) as i32)
+        }
+        crate::fd::FasyncOwner::Process(task) => {
+            let outer = task_to_pid_raw(task).unwrap_or(0);
+            (F_OWNER_PID, report_pid_to(caller, outer) as i32)
+        }
+        crate::fd::FasyncOwner::ProcessGroup(group) => (
+            F_OWNER_PGRP,
+            if pgrp_task_snapshot(group).is_empty() {
+                0
+            } else {
+                pgid_to_user(group) as i32
+            },
+        ),
+    }
+}
+
+struct RwHintEntry {
+    hint: u64,
+    /// Pointer-identity fallback keys need a lifetime witness so address reuse
+    /// cannot inherit an old hint. Stable `(dev, ino)` keys deliberately keep
+    /// the hint after the opening FileOps is dropped: Linux stores it in the
+    /// inode, whose lifetime is not tied to an open file description.
+    witness: Option<alloc::sync::Weak<dyn narf_filesystem::FileOps>>,
+}
+
+type RwHintKey = (u64, u64, usize);
+const RW_HINT_SHARDS: usize = 32;
+static RW_HINTS: [
+    narf_lib::sync::IrqSafeSpinLock<
+        Option<alloc::collections::BTreeMap<RwHintKey, RwHintEntry>>,
+    >;
+    RW_HINT_SHARDS
+] = [const { narf_lib::sync::IrqSafeSpinLock::new(None) }; RW_HINT_SHARDS];
+
+fn rw_hint_key(ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> RwHintKey {
+    let attrs = ops.inode_attrs();
+    let ino = ops.ino();
+    if attrs.tracked && ino != 0 {
+        (attrs.dev, ino, 0)
+    } else {
+        (0, 0, alloc::sync::Arc::as_ptr(ops) as *const () as usize)
+    }
+}
+
+fn rw_hint_shard(key: RwHintKey) -> usize {
+    (key.0 as usize ^ key.1 as usize ^ key.2) & (RW_HINT_SHARDS - 1)
+}
+
+fn rw_hint_get(ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>) -> u64 {
+    let key = rw_hint_key(ops);
+    let mut guard = RW_HINTS[rw_hint_shard(key)].lock();
+    let Some(map) = guard.as_mut() else {
+        return 0;
+    };
+    if map
+        .get(&key)
+        .and_then(|entry| entry.witness.as_ref())
+        .is_some_and(|witness| witness.upgrade().is_none())
+    {
+        map.remove(&key);
+        return 0;
+    }
+    map.get(&key).map_or(0, |entry| entry.hint)
+}
+
+fn rw_hint_set(ops: &alloc::sync::Arc<dyn narf_filesystem::FileOps>, hint: u64) {
+    let key = rw_hint_key(ops);
+    let mut guard = RW_HINTS[rw_hint_shard(key)].lock();
+    let map = guard.get_or_insert_with(alloc::collections::BTreeMap::new);
+    if hint == 0 {
+        map.remove(&key);
+    } else {
+        map.insert(
+            key,
+            RwHintEntry {
+                hint,
+                witness: (key.2 != 0).then(|| alloc::sync::Arc::downgrade(ops)),
+            },
+        );
+    }
+}
+
 pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let fd = args.arg0 as u32;
@@ -79,8 +355,8 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
 
     if cmd == F_SETFL {
         let mask = crate::fd::O_SETFL_MASK;
-        let new = (arg as u32) & mask;
-        let ops = fd::with_table(task, |table| {
+        let requested = arg as u32;
+        let snapshot = fd::with_table(task, |table| {
             let entry = table.get(fd)?;
             let old = table.status_flags(fd)?;
             // fcntl's syscall entry rejects every command except the small
@@ -94,16 +370,58 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // Linux's fdget_raw lifetime if a CLONE_FILES sibling closes the
             // descriptor concurrently, and prevents returning EBADF after
             // already changing socket or mqueue state.
-            let ops = entry.ops.clone();
-            table.set_status_flags(fd, (old & !mask) | new)?;
-            Some(ops)
+            Some((entry.ops.clone(), table.description(fd)?, old))
         })
         .flatten();
 
-        let Some(ops) = ops else {
+        let Some((ops, description, old)) = snapshot else {
             ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
             return;
         };
+        let mut new_flags = (old & !mask) | (requested & mask);
+        let wanted_async = requested & crate::fd::O_ASYNC != 0;
+        let had_async = old & crate::fd::O_ASYNC != 0;
+        if wanted_async != had_async {
+            if wanted_async {
+                let waker = fasync_event_waker(&description);
+                let interest = narf_filesystem::POLL_IN
+                    | narf_filesystem::POLL_OUT
+                    | narf_filesystem::POLL_PRI
+                    | narf_filesystem::POLL_ERR
+                    | narf_filesystem::POLL_HUP;
+                if ops
+                    .arm_readiness_persistent(
+                        description.fasync_waiter_id(),
+                        interest,
+                        &waker,
+                    )
+                    .is_some()
+                {
+                    description.set_fasync_enabled(true, fd as i32);
+                    new_flags |= crate::fd::O_ASYNC;
+                }
+            } else {
+                let _ = ops.disarm_readiness(description.fasync_waiter_id());
+                description.set_fasync_enabled(false, -1);
+                new_flags &= !crate::fd::O_ASYNC;
+            }
+        } else if had_async {
+            new_flags |= crate::fd::O_ASYNC;
+        }
+        // Publish the description word only after `fasync` succeeds, matching
+        // Linux setfl: an async-provider error leaves f_flags unchanged. The
+        // pinned description stays valid even if a CLONE_FILES sibling closes
+        // this numeric fd while the readiness callback is installed.
+        description.set_status_flags(new_flags);
+        let _ = fd::with_table(task, |table| {
+            if table
+                .description(fd)
+                .is_some_and(|current| alloc::sync::Arc::ptr_eq(&current, &description))
+            {
+                let _ = table.set_status_flags(fd, new_flags);
+            }
+        });
+        let new = requested & mask;
         if let Some(socket) = ops
             .as_any()
             .and_then(|any| any.downcast_ref::<crate::socket::SocketFile>())
@@ -205,6 +523,177 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             }
             Some(false) => {}
         }
+    }
+
+    if matches!(
+        cmd,
+        F_SETOWN | F_GETOWN | F_SETSIG | F_GETSIG | F_SETOWN_EX | F_GETOWN_EX
+    ) {
+        let Some(description) = fd::with_table(task, |table| table.description(fd)).flatten()
+        else {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        };
+        match cmd {
+            F_SETOWN => {
+                let who = arg as i32;
+                let owner = if who == 0 {
+                    crate::fd::FasyncOwner::None
+                } else if who > 0 {
+                    match resolve_fasync_task(task, who, false) {
+                        Some(target) => crate::fd::FasyncOwner::Process(target),
+                        None => {
+                            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                            return;
+                        }
+                    }
+                } else {
+                    if who == i32::MIN {
+                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        return;
+                    }
+                    let group = pgid_from_user((-who) as u64);
+                    if group == 0 || pgrp_task_snapshot(group).is_empty() {
+                        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                        return;
+                    }
+                    crate::fd::FasyncOwner::ProcessGroup(group)
+                };
+                let ids = read_uidgid(task);
+                let owner_type = if who < 0 { F_OWNER_PGRP } else { F_OWNER_PID };
+                description.set_fasync_owner(owner, owner_type, ids.uid, ids.euid);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            F_GETOWN => {
+                let state = description.fasync_snapshot();
+                let (owner_type, visible) = fasync_owner_to_user(task, state);
+                let value = if owner_type == F_OWNER_PGRP && visible != 0 {
+                    -visible
+                } else {
+                    visible
+                };
+                // Linux calls force_successful_syscall_return here so a
+                // negative pgrp id is data, not an errno.
+                ctx.set_return(SyscallReturn::ok(value as i64 as u64));
+            }
+            F_SETSIG => {
+                let signal = arg as i32;
+                if !(0..=64).contains(&signal) {
+                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    return;
+                }
+                description.set_fasync_signal(signal as u32);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            F_GETSIG => {
+                ctx.set_return(SyscallReturn::ok(
+                    description.fasync_snapshot().signal as u64,
+                ));
+            }
+            F_SETOWN_EX => {
+                let mut bytes = [0u8; core::mem::size_of::<FOwnerEx>()];
+                // SAFETY: Linux copies the complete fixed-size f_owner_ex
+                // before validating its type or pid; copy_from_user performs
+                // the range/fault checks for the supplied pointer.
+                if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                    return;
+                }
+                let owner_type = i32::from_ne_bytes(bytes[0..4].try_into().unwrap());
+                let visible = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
+                if !matches!(owner_type, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
+                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    return;
+                }
+                let owner = if visible == 0 {
+                    crate::fd::FasyncOwner::None
+                } else if visible < 0 {
+                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                    return;
+                } else {
+                    match owner_type {
+                        F_OWNER_TID => resolve_fasync_task(task, visible, true)
+                            .map(crate::fd::FasyncOwner::Tid),
+                        F_OWNER_PID => resolve_fasync_task(task, visible, false)
+                            .map(crate::fd::FasyncOwner::Process),
+                        F_OWNER_PGRP => {
+                            let group = pgid_from_user(visible as u64);
+                            (!pgrp_task_snapshot(group).is_empty())
+                                .then_some(crate::fd::FasyncOwner::ProcessGroup(group))
+                        }
+                        _ => None,
+                    }
+                    .unwrap_or(crate::fd::FasyncOwner::None)
+                };
+                if visible != 0 && owner == crate::fd::FasyncOwner::None {
+                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                    return;
+                }
+                let ids = read_uidgid(task);
+                description.set_fasync_owner(owner, owner_type, ids.uid, ids.euid);
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            F_GETOWN_EX => {
+                let state = description.fasync_snapshot();
+                let (owner_type, visible) = fasync_owner_to_user(task, state);
+                let mut bytes = [0u8; core::mem::size_of::<FOwnerEx>()];
+                bytes[0..4].copy_from_slice(&owner_type.to_ne_bytes());
+                bytes[4..8].copy_from_slice(&visible.to_ne_bytes());
+                // SAFETY: fixed-size copy to the caller's f_owner_ex pointer;
+                // copy_to_user validates and fault-brackets the destination.
+                if unsafe { copy_to_user(arg, &bytes) }.is_err() {
+                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                } else {
+                    ctx.set_return(SyscallReturn::ok(0));
+                }
+            }
+            _ => unreachable!(),
+        }
+        return;
+    }
+
+    if cmd == F_GET_RW_HINT || cmd == F_SET_RW_HINT {
+        let Some(ops) = fd::with_table(task, |table| table.get(fd).map(|entry| entry.ops.clone()))
+            .flatten()
+        else {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        };
+        if cmd == F_GET_RW_HINT {
+            let bytes = rw_hint_get(&ops).to_ne_bytes();
+            // SAFETY: fixed-size u64 copy to the caller's hint pointer;
+            // copy_to_user validates and fault-brackets the destination.
+            if unsafe { copy_to_user(arg, &bytes) }.is_err() {
+                ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+            } else {
+                ctx.set_return(SyscallReturn::ok(0));
+            }
+            return;
+        }
+
+        // Linux checks inode ownership/CAP_FOWNER before dereferencing arg.
+        // This ordering is observable when an unprivileged caller supplies a
+        // bad pointer: EPERM wins over EFAULT.
+        let (uid, gid) = ops.owners();
+        if !inode_owner_or_capable(task, uid, gid) {
+            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            return;
+        }
+        let mut bytes = [0u8; 8];
+        // SAFETY: fixed-size u64 copy from the caller's hint pointer;
+        // copy_from_user validates and fault-brackets the source.
+        if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+            return;
+        }
+        let hint = u64::from_ne_bytes(bytes);
+        if hint > 5 {
+            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            return;
+        }
+        rw_hint_set(&ops, hint);
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     }
 
     // F_GETLK / F_SETLK / F_SETLKW and their F_OFD_* counterparts:

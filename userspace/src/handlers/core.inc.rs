@@ -2269,6 +2269,12 @@ const F_SETFL: u64 = 4;
 const F_GETLK: u64 = 5;
 const F_SETLK: u64 = 6;
 const F_SETLKW: u64 = 7;
+const F_SETOWN: u64 = 8;
+const F_GETOWN: u64 = 9;
+const F_SETSIG: u64 = 10;
+const F_GETSIG: u64 = 11;
+const F_SETOWN_EX: u64 = 15;
+const F_GETOWN_EX: u64 = 16;
 /// Open-file-description locks. Same `struct flock` wire shape as the
 /// three above; what differs is the OWNER (`fl_owner = filp`, not
 /// `current->files`) and therefore when the lock is released.
@@ -2280,6 +2286,9 @@ const F_DUPFD_CLOEXEC: u64 = 1030;
 const F_ADD_SEALS: u64 = 1033;
 /// Linux fcntl `F_GET_SEALS` (1034) — read the seal word.
 const F_GET_SEALS: u64 = 1034;
+/// Linux inode write-lifetime hint commands.
+const F_GET_RW_HINT: u64 = 1035;
+const F_SET_RW_HINT: u64 = 1036;
 
 /// Linux EAGAIN value (11).
 const EAGAIN_CODE: u64 = 11;
