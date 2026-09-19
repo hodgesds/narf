@@ -503,7 +503,20 @@ fn virtio_gpu_device_arg(backend: GpuBackend) -> String {
         GpuBackend::Virtio2d => "virtio-gpu-pci",
         GpuBackend::Virgl => "virtio-gpu-gl-pci",
     };
-    format!("{driver},id=vgpu0,disable-legacy=on,disable-modern=off")
+    // Opt-in DRM native context (amdgpu/msm ccmd) so guest Mesa runs its real
+    // hardware driver over virtio-gpu (capset 6) instead of classic VirGL GL
+    // translation. Requires a host virglrenderer built with the DRM renderer
+    // and access to the real render node, plus `blob=on`/`hostmem` for the
+    // host-visible command/shared buffers the native context submits through.
+    // Off by default: plain VirGL still works on hosts without GPU passthrough.
+    let native_ctx =
+        backend == GpuBackend::Virgl && std::env::var_os("XTASK_GPU_DRM_NATIVE").is_some();
+    let extra = if native_ctx {
+        ",blob=on,hostmem=256M,drm_native_context=on"
+    } else {
+        ""
+    };
+    format!("{driver},id=vgpu0,disable-legacy=on,disable-modern=off{extra}")
 }
 
 fn qemu_supports_device(qemu: &str, device: &str) -> bool {

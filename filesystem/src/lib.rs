@@ -1357,6 +1357,17 @@ pub trait FileOps: Send + Sync {
         None
     }
 
+    /// If this fd is a DRM render node (`/dev/dri/renderD1NN`), return the
+    /// card index it renders for. Distinct from [`Self::as_drm_card_index`]
+    /// (a modeset-capable master node): a render node carries no display
+    /// authority but still needs the PRIME ioctls, because Mesa opens the
+    /// render node for its GBM/EGL context and imports the compositor's
+    /// scanout dma-buf there via `DRM_IOCTL_PRIME_FD_TO_HANDLE`. Default: not
+    /// a DRM render node.
+    fn as_drm_render_index(&self) -> Option<u32> {
+        None
+    }
+
     /// If this fd is a DRM PRIME dma-buf (exported via
     /// `DRM_IOCTL_PRIME_HANDLE_TO_FD`), return the GEM handle it wraps. Used
     /// by `sys_ioctl(DRM_IOCTL_PRIME_FD_TO_HANDLE)` to re-import the buffer

@@ -36,18 +36,24 @@ kernel_test_in!(
 
 fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
     use super::cmd::{
-        build_ctx_create, build_resource_create_3d, build_submit_3d, read_hdr, ResourceCreate3D,
-        CTX_CREATE_LEN, RESOURCE_CREATE_3D_LEN, SUBMIT_3D_PREFIX_LEN, VIRTIO_GPU_CMD_CTX_CREATE,
-        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, VIRTIO_GPU_CMD_SUBMIT_3D,
+        build_ctx_create, build_resource_create_3d, build_resource_create_blob, build_submit_3d,
+        read_hdr, MemEntry, ResourceCreate3D, CTX_CREATE_LEN, RESOURCE_CREATE_3D_LEN,
+        RESOURCE_CREATE_BLOB_HDR_LEN, SUBMIT_3D_PREFIX_LEN, VIRTIO_GPU_CMD_CTX_CREATE,
+        VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+        VIRTIO_GPU_CMD_SUBMIT_3D,
     };
 
     let mut ctx = [0u8; CTX_CREATE_LEN];
-    build_ctx_create(&mut ctx, 7, b"narf-virgl");
+    // context_init 6 selects the DRM native-context capset (low byte).
+    build_ctx_create(&mut ctx, 7, 6, b"narf-virgl");
     if read_hdr(&ctx).cmd_type != VIRTIO_GPU_CMD_CTX_CREATE || read_hdr(&ctx).ctx_id != 7 {
         return TestResult::Fail("CTX_CREATE header");
     }
     if u32::from_le_bytes(ctx[24..28].try_into().unwrap()) != 10 || &ctx[32..42] != b"narf-virgl" {
         return TestResult::Fail("CTX_CREATE body");
+    }
+    if u32::from_le_bytes(ctx[28..32].try_into().unwrap()) != 6 {
+        return TestResult::Fail("CTX_CREATE context_init");
     }
 
     let mut resource = [0u8; RESOURCE_CREATE_3D_LEN];
@@ -77,12 +83,44 @@ fn smoke_virtio_gpu_virgl_command_wire_shapes() -> TestResult {
 
     let commands = [0xA5u8; 12];
     let mut submit = [0u8; SUBMIT_3D_PREFIX_LEN + 12];
-    build_submit_3d(&mut submit, 7, &commands);
+    build_submit_3d(&mut submit, 7, None, &commands);
     if read_hdr(&submit).cmd_type != VIRTIO_GPU_CMD_SUBMIT_3D
         || u32::from_le_bytes(submit[24..28].try_into().unwrap()) != commands.len() as u32
         || submit[SUBMIT_3D_PREFIX_LEN..] != commands
     {
         return TestResult::Fail("SUBMIT_3D wire shape");
+    }
+
+    // RESOURCE_CREATE_BLOB with one guest mem entry. Wire layout after the
+    // 24-byte header: resource_id, blob_mem, blob_flags, nr_entries, blob_id
+    // (u64), size (u64), then the {addr,len,pad} entry.
+    let mut blob = [0u8; RESOURCE_CREATE_BLOB_HDR_LEN + 16];
+    let n = build_resource_create_blob(
+        &mut blob,
+        1,           // ctx_id (host3d_guest)
+        0x55,        // resource_id
+        0x0003,      // blob_mem = HOST3D_GUEST
+        0x0001,      // blob_flags = USE_MAPPABLE
+        0xdead_beef, // blob_id
+        0x2000,      // size
+        &[MemEntry {
+            addr: 0x1_0000,
+            length: 0x2000,
+        }],
+    );
+    if n != RESOURCE_CREATE_BLOB_HDR_LEN + 16
+        || read_hdr(&blob).cmd_type != VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB
+        || read_hdr(&blob).ctx_id != 1
+        || u32::from_le_bytes(blob[24..28].try_into().unwrap()) != 0x55
+        || u32::from_le_bytes(blob[28..32].try_into().unwrap()) != 0x0003
+        || u32::from_le_bytes(blob[32..36].try_into().unwrap()) != 0x0001
+        || u32::from_le_bytes(blob[36..40].try_into().unwrap()) != 1
+        || u64::from_le_bytes(blob[40..48].try_into().unwrap()) != 0xdead_beef
+        || u64::from_le_bytes(blob[48..56].try_into().unwrap()) != 0x2000
+        || u64::from_le_bytes(blob[56..64].try_into().unwrap()) != 0x1_0000
+        || u32::from_le_bytes(blob[64..68].try_into().unwrap()) != 0x2000
+    {
+        return TestResult::Fail("RESOURCE_CREATE_BLOB wire shape");
     }
     TestResult::Pass
 }
@@ -402,4 +440,40 @@ fn smoke_virtio_gpu_flush_reentrancy_skips_not_deadlocks() -> TestResult {
 kernel_test_in!(
     "drivers/virtio/gpu_pci",
     smoke_virtio_gpu_flush_reentrancy_skips_not_deadlocks
+);
+
+fn smoke_virtio_gpu_capset_info_round_trip() -> TestResult {
+    use super::cmd::{
+        build_get_capset_info, read_capset_info, read_hdr, CapsetInfo, GET_CAPSET_INFO_LEN,
+        RESP_CAPSET_INFO_LEN, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+    };
+    // Request encodes the command type + capset_index (VirtIO 1.2 §5.7.6).
+    let mut req = [0u8; GET_CAPSET_INFO_LEN];
+    build_get_capset_info(&mut req, 3);
+    if read_hdr(&req).cmd_type != VIRTIO_GPU_CMD_GET_CAPSET_INFO {
+        return TestResult::Fail("GET_CAPSET_INFO header type mismatch");
+    }
+    if u32::from_le_bytes([req[24], req[25], req[26], req[27]]) != 3 {
+        return TestResult::Fail("GET_CAPSET_INFO capset_index not encoded at offset 24");
+    }
+    // Response body: capset_id, max_version, max_size after the 24-byte header.
+    let mut resp = [0u8; RESP_CAPSET_INFO_LEN];
+    resp[24..28].copy_from_slice(&2u32.to_le_bytes());
+    resp[28..32].copy_from_slice(&2u32.to_le_bytes());
+    resp[32..36].copy_from_slice(&1408u32.to_le_bytes());
+    let info = read_capset_info(&resp);
+    if info
+        != (CapsetInfo {
+            capset_id: 2,
+            capset_max_version: 2,
+            capset_max_size: 1408,
+        })
+    {
+        return TestResult::Fail("capset-info response decode mismatch");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/virtio/gpu_pci",
+    smoke_virtio_gpu_capset_info_round_trip
 );

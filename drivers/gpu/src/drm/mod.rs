@@ -29,6 +29,7 @@
 
 pub mod atomic;
 pub mod card;
+pub mod edid_gen;
 pub mod gem;
 pub mod ioctl;
 pub mod prime;

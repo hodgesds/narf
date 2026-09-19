@@ -566,6 +566,34 @@ impl Card {
             .find(|b| b.mmap_offset == mmap_offset)
     }
 
+    /// Retain the dumb backing named by `gem_handle` and return the physical
+    /// snapshot needed to build a dma-buf file. The reference must later be
+    /// balanced with [`Self::remove_dumb_backing`].
+    pub fn retain_dumb_backing(&mut self, gem_handle: u32) -> Option<(u64, usize)> {
+        let backing = self
+            .dumb_backings
+            .iter_mut()
+            .find(|b| b.gem_handle == gem_handle)?;
+        backing.refcount = backing.refcount.checked_add(1)?;
+        Some((backing.phys, backing.byte_len))
+    }
+
+    /// Retain the dumb backing selected by a `MAP_DUMB` offset. This is the
+    /// atomic lookup-plus-pin used before exposing its raw physical frames to
+    /// `mmap(2)`, so a concurrent `GEM_CLOSE` cannot recycle them between the
+    /// lookup and mapping publication.
+    pub fn retain_dumb_backing_by_offset(&mut self, mmap_offset: u64, len: usize) -> Option<u32> {
+        let backing = self
+            .dumb_backings
+            .iter_mut()
+            .find(|b| b.mmap_offset == mmap_offset)?;
+        if len > backing.byte_len {
+            return None;
+        }
+        backing.refcount = backing.refcount.checked_add(1)?;
+        Some(backing.gem_handle)
+    }
+
     /// Register a new dumb backing. Returns the gem handle.
     pub fn register_dumb_backing(
         &mut self,

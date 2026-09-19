@@ -23,7 +23,7 @@
 //! enough that adding an MSI-X vector + waker isn't worth the
 //! complexity yet.
 
-use core::sync::atomic::{compiler_fence, AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
@@ -59,6 +59,20 @@ pub const VIRTIO_GPU_PCI_DEVICE_LEGACY: u16 = 0x1010;
 /// matching resource/context/execbuffer ABI; a 2D-only host remains fully
 /// supported and simply keeps this bit clear.
 pub const VIRTIO_GPU_F_VIRGL: u32 = 0;
+/// VirtIO 1.2 §5.7.3: guest can allocate blob (opaque) resources via
+/// `RESOURCE_CREATE_BLOB`. Required by the DRM native context (capset 6).
+pub const VIRTIO_GPU_F_RESOURCE_BLOB: u32 = 3;
+/// VirtIO 1.2 §5.7.3: `CTX_CREATE` carries a `context_init` capset selector and
+/// `CONTEXT_INIT` is available, letting a client bind a specific capset (e.g.
+/// the DRM native context) rather than only the host default.
+pub const VIRTIO_GPU_F_CONTEXT_INIT: u32 = 4;
+
+/// Blob memory types (VirtIO 1.2 §5.7.6). `GUEST` is guest-page backed only;
+/// `HOST3D` is host-allocated (needs the host-visible window to map);
+/// `HOST3D_GUEST` is a host 3D resource backed by guest pages.
+pub const BLOB_MEM_GUEST: u32 = 0x0001;
+pub const BLOB_MEM_HOST3D: u32 = 0x0002;
+pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x0003;
 
 const fn features_offer_virgl(features: u64) -> bool {
     features & (1u64 << VIRTIO_GPU_F_VIRGL) != 0
@@ -88,7 +102,15 @@ const CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
 // Response codes.
 const RESP_OK_NODATA: u32 = 0x1100;
 const RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const RESP_OK_CAPSET_INFO: u32 = 0x1102;
 const RESP_OK_CAPSET: u32 = 0x1103;
+const RESP_OK_MAP_INFO: u32 = 0x1106;
+
+/// Upper bound on capsets we enumerate. The virtio-gpu spec caps
+/// `num_capsets`; a handful (VIRGL, VIRGL2, VENUS, CROSS_DOMAIN, DRM, …) is
+/// all any host advertises, so 16 is generous and bounds the probe loop when
+/// the host does not error a stale/out-of-range index.
+const MAX_CAPSETS: u32 = 16;
 
 // Pixel format. B8G8R8X8_UNORM matches our `Pixel32` (XRGB).
 const FMT_B8G8R8X8_UNORM: u32 = 1;
@@ -139,6 +161,12 @@ pub struct VirtioGpuPci {
     /// Whether `VIRTIO_GPU_F_VIRGL` was accepted during the immutable feature
     /// negotiation at bring-up.
     virgl_enabled: bool,
+    /// Whether `VIRTIO_GPU_F_RESOURCE_BLOB` was accepted — gates
+    /// `RESOURCE_CREATE_BLOB` and the DRM `VIRTGPU_PARAM_RESOURCE_BLOB` param.
+    resource_blob_enabled: bool,
+    /// Whether `VIRTIO_GPU_F_CONTEXT_INIT` was accepted — gates binding a
+    /// non-default capset (e.g. the DRM native context) via `CTX_CREATE`.
+    context_init_enabled: bool,
     ctrl_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _cursor_q: IrqSafeSpinLock<Option<Virtqueue>>,
     _ctrl_layout_buf: DmaBuffer,
@@ -171,10 +199,28 @@ pub struct VirtioGpuPci {
     /// already holds. `flush` consults this to skip a re-entrant nested paint
     /// instead of deadlocking. See [`flush`].
     req_gate_submit_cpu: AtomicUsize,
-    /// Context 1 is created lazily by the render-node bridge. A separate bit
-    /// keeps context creation out of the 2D boot path and makes retries
-    /// idempotent after an early userspace open races driver bring-up.
-    virgl_context_ready: AtomicBool,
+    /// Capsets the host enumerated via `GET_CAPSET_INFO` at bring-up (empty
+    /// when virgl is disabled or the host advertises none). Mirrors the Linux
+    /// kernel's `vgdev->capsets[]`: the DRM `GET_CAPS` ioctl validates a
+    /// client's `cap_set_id`/version against this list, so a capset the host
+    /// does not really back (e.g. the DRM native-context id 6 without GPU
+    /// passthrough) is reported unsupported and Mesa falls back to classic
+    /// VirGL instead of committing to an empty native context.
+    capsets: IrqSafeSpinLock<Vec<cmd::CapsetInfo>>,
+    /// The host-visible blob window: `(guest_phys_base, length)` of virtio-gpu
+    /// shared-memory region shmid 0, when the host exposes one. host3d
+    /// mappable blobs are placed here and mapped into userspace directly.
+    host_visible: Option<(u64, u64)>,
+    /// Bump cursor (byte offset within `host_visible`) for the trivial window
+    /// allocator. Blobs are never freed back to the window in this first cut, so
+    /// a monotonic cursor is sufficient for the compositor's steady-state set.
+    host_visible_cursor: AtomicU64,
+    /// The raw shared-memory cap as discovered (before BAR resolution), for
+    /// diagnostics: lets the DRM bridge distinguish "cap absent" from "BAR
+    /// unprogrammed" when `host_visible` is None.
+    shm_cap: Option<crate::pci::VirtioShmCap>,
+    /// Diagnostic bitmask of all vendor-cap cfg_types seen at bring-up.
+    cfg_type_mask: u32,
 }
 
 impl core::fmt::Debug for VirtioGpuPci {
@@ -233,17 +279,27 @@ impl VirtioGpuPci {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let virgl_enabled = features_offer_virgl(feats);
+        // Blob resources and context-init are only meaningful alongside VirGL
+        // 3D; accept them precisely when the host offered them so the DRM
+        // native-context (capset 6) path can allocate blobs and bind capset 6.
+        let resource_blob_enabled =
+            virgl_enabled && feats & (1u64 << VIRTIO_GPU_F_RESOURCE_BLOB) != 0;
+        let context_init_enabled =
+            virgl_enabled && feats & (1u64 << VIRTIO_GPU_F_CONTEXT_INIT) != 0;
         // SAFETY: same.
         unsafe {
+            let mut lo_ack = 0u32;
+            if virgl_enabled {
+                lo_ack |= 1u32 << VIRTIO_GPU_F_VIRGL;
+            }
+            if resource_blob_enabled {
+                lo_ack |= 1u32 << VIRTIO_GPU_F_RESOURCE_BLOB;
+            }
+            if context_init_enabled {
+                lo_ack |= 1u32 << VIRTIO_GPU_F_CONTEXT_INIT;
+            }
             common.write32(CC_DRIVER_FEATURE_SELECT, 0);
-            common.write32(
-                CC_DRIVER_FEATURE,
-                if virgl_enabled {
-                    1u32 << VIRTIO_GPU_F_VIRGL
-                } else {
-                    0
-                },
-            );
+            common.write32(CC_DRIVER_FEATURE, lo_ack);
             common.write32(CC_DRIVER_FEATURE_SELECT, 1);
             common.write32(CC_DRIVER_FEATURE, 1u32 << (VIRTIO_F_VERSION_1 - 32));
             common.write8(
@@ -294,6 +350,17 @@ impl VirtioGpuPci {
                 Err(_) => (None, None),
             };
 
+        // Resolve the host-visible blob window (shmid 0) if the host exposes
+        // one and 3D is enabled. Failure is non-fatal: host3d mappable blobs
+        // are simply unavailable (HOST_VISIBLE param reports 0).
+        let host_visible = match caps.shm_host_visible {
+            Some(shm) if virgl_enabled => {
+                // SAFETY: `device` is the live PCIe device that produced `caps`.
+                unsafe { crate::pci::shm_window_phys(device, &shm) }.ok()
+            }
+            _ => None,
+        };
+
         let me = Self {
             notify,
             notify_off_multiplier,
@@ -301,6 +368,8 @@ impl VirtioGpuPci {
             msix,
             offered_features: feats,
             virgl_enabled,
+            resource_blob_enabled,
+            context_init_enabled,
             ctrl_q: IrqSafeSpinLock::new(Some(ctrl_q)),
             _cursor_q: IrqSafeSpinLock::new(Some(cursor_q)),
             _ctrl_layout_buf: ctrl_buf,
@@ -318,10 +387,61 @@ impl VirtioGpuPci {
             last_err: IrqSafeSpinLock::new(None),
             req_gate: AtomicBool::new(false),
             req_gate_submit_cpu: AtomicUsize::new(usize::MAX),
-            virgl_context_ready: AtomicBool::new(false),
+            capsets: IrqSafeSpinLock::new(Vec::new()),
+            host_visible,
+            host_visible_cursor: AtomicU64::new(0),
+            shm_cap: caps.shm_host_visible,
+            cfg_type_mask: caps.cfg_type_mask,
         };
 
+        // Enumerate the host's capsets now that the control queue is live, so
+        // the DRM GET_CAPS surface can validate client requests against a real
+        // list (Linux does this at probe in `virtio_gpu_init`).
+        me.enumerate_capsets();
+
         Ok(me)
+    }
+
+    /// Query `GET_CAPSET_INFO` for each capset index until the host stops
+    /// returning `RESP_OK_CAPSET_INFO` (an out-of-range index), recording the
+    /// `{id, max_version, max_size}` triples. No-op unless virgl was
+    /// negotiated. Runs once at bring-up under the request gate.
+    fn enumerate_capsets(&self) {
+        if !self.virgl_enabled() {
+            return;
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut list: Vec<cmd::CapsetInfo> = Vec::new();
+        for index in 0..MAX_CAPSETS {
+            let mut request = [0u8; cmd::GET_CAPSET_INFO_LEN];
+            cmd::build_get_capset_info(&mut request, index);
+            self.write_raw_request(&request);
+            // SAFETY: response DMA lands in `resp_buf`, serialised by the gate;
+            // RESP_CAPSET_INFO_LEN (40) is well within its 4 KiB.
+            if unsafe { self.submit(request.len(), cmd::RESP_CAPSET_INFO_LEN) }.is_err() {
+                break;
+            }
+            if self.response_type() != RESP_OK_CAPSET_INFO {
+                break; // index >= num_capsets → enumeration complete
+            }
+            let mut buf = [0u8; cmd::RESP_CAPSET_INFO_LEN];
+            // SAFETY: `resp_buf` is coherent kernel-mapped DMA >= 40 bytes.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    self.resp_buf.cpu_ptr::<u8>(),
+                    buf.as_mut_ptr(),
+                    cmd::RESP_CAPSET_INFO_LEN,
+                );
+            }
+            let info = cmd::read_capset_info(&buf);
+            // A zero-id / zero-size entry is not a real capset; stop rather
+            // than record noise.
+            if info.capset_id == 0 || info.capset_max_size == 0 {
+                continue;
+            }
+            list.push(info);
+        }
+        *self.capsets.lock() = list;
     }
 
     /// Most recent error encountered during `init_scanout`, for boot
@@ -347,22 +467,58 @@ impl VirtioGpuPci {
         self.virgl_enabled
     }
 
-    /// Create the render-node's VirGL context (context id 1) if needed.
+    /// Snapshot of the host's enumerated capsets (id, max_version, max_size),
+    /// as collected by [`Self::enumerate_capsets`] at bring-up.
+    pub fn capsets(&self) -> Vec<cmd::CapsetInfo> {
+        self.capsets.lock().clone()
+    }
+
+    /// True if the host enumerated `capset_id` with a non-zero max size —
+    /// i.e. it is a capset the host actually backs. Used by the DRM GET_CAPS
+    /// surface to reject capsets the host merely mentions but cannot fill.
+    pub fn capset_supported(&self, capset_id: u32) -> bool {
+        self.capsets
+            .lock()
+            .iter()
+            .any(|c| c.capset_id == capset_id && c.capset_max_size > 0)
+    }
+
+    /// The host's max supported version for `capset_id`, if enumerated.
+    pub fn capset_max_version(&self, capset_id: u32) -> Option<u32> {
+        self.capsets
+            .lock()
+            .iter()
+            .find(|c| c.capset_id == capset_id)
+            .map(|c| c.capset_max_version)
+    }
+
+    /// Whether `VIRTIO_GPU_F_RESOURCE_BLOB` was negotiated (blob resources).
+    pub fn resource_blob_enabled(&self) -> bool {
+        self.resource_blob_enabled
+    }
+
+    /// Whether `VIRTIO_GPU_F_CONTEXT_INIT` was negotiated (capset binding).
+    pub fn context_init_enabled(&self) -> bool {
+        self.context_init_enabled
+    }
+
+    /// Create a render context `ctx_id` bound to `context_init` (0 = host
+    /// default / classic VirGL, or a capset id in the low byte — e.g. 6 for the
+    /// DRM native context).
     ///
-    /// The context is intentionally created lazily: a 2D console boot must
-    /// remain possible on every virtio-gpu host, while Mesa only opens the
-    /// render node after userspace starts. The request gate serialises this
+    /// Each render-node open owns a DISTINCT context id: the DRM native context
+    /// allocates exactly one host shmem per context, so sharing one context id
+    /// across opens makes the second client's shmem blob fail with
+    /// "there can be only one". Per-open readiness is tracked by the DRM bridge,
+    /// which calls this exactly once per open. The request gate serialises this
     /// control transfer with scanout flushes.
-    pub fn ensure_virgl_context(&self) -> Result<(), VirtioPciError> {
+    pub fn create_context(&self, ctx_id: u32, context_init: u32) -> Result<(), VirtioPciError> {
         if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let _gate = ReqGate::acquire(&self.req_gate);
-        if self.virgl_context_ready.load(Ordering::Acquire) {
-            return Ok(());
-        }
         let mut request = [0u8; cmd::CTX_CREATE_LEN];
-        cmd::build_ctx_create(&mut request, 1, b"narf-virgl");
+        cmd::build_ctx_create(&mut request, ctx_id, context_init, b"narf-virgl");
         self.write_raw_request(&request);
         // SAFETY: request/response DMA and controlq were constructed at
         // bring-up; the gate protects the shared request buffer.
@@ -370,7 +526,159 @@ impl VirtioGpuPci {
         if self.response_type() != RESP_OK_NODATA {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        self.virgl_context_ready.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Allocate a host-side blob resource id and create it with `blob_mem`
+    /// backed by the guest-physical range `[backing_phys, backing_phys+size)`
+    /// (a single contiguous mem entry, as `alloc_coherent` provides). Used by
+    /// the DRM native context for guest / host3d-guest blob objects. The caller
+    /// keeps the backing alive for the resource's lifetime.
+    // The blob-create request genuinely carries this many independent fields.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_blob_resource(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+        backing_phys: u64,
+        backing_len: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.resource_blob_enabled {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        // host3d(_guest) blobs are owned by the render context; a pure guest
+        // blob carries ctx_id 0. Both are guest-page backed here.
+        let ctx_id = if blob_mem == BLOB_MEM_GUEST {
+            0
+        } else {
+            ctx_id
+        };
+        let entries = if backing_phys != 0 && backing_len != 0 {
+            [cmd::MemEntry {
+                addr: backing_phys,
+                length: backing_len,
+            }]
+        } else {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        };
+        let mut request = [0u8; cmd::RESOURCE_CREATE_BLOB_HDR_LEN + 16];
+        let n = cmd::build_resource_create_blob(
+            &mut request,
+            ctx_id,
+            resource_id,
+            blob_mem,
+            blob_flags,
+            blob_id,
+            size,
+            &entries,
+        );
+        self.write_raw_request(&request[..n]);
+        // SAFETY: gate held; req/resp DMA prepared at bring-up.
+        unsafe { self.submit(n, HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::UnexpectedResponse(self.response_type()));
+        }
+        Ok(())
+    }
+
+    /// Whether the host-visible blob window (shmid 0) is available.
+    pub fn host_visible_available(&self) -> bool {
+        self.host_visible.is_some()
+    }
+
+    /// Diagnostic: the raw discovered shared-memory cap `(bar, offset, length)`,
+    /// before BAR resolution. `None` means no cfg_type-8 cap was found.
+    pub fn shm_cap_raw(&self) -> Option<(u8, u64, u64)> {
+        self.shm_cap.map(|c| (c.bar, c.offset, c.length))
+    }
+
+    /// Diagnostic: bitmask of vendor-cap cfg_types seen at bring-up.
+    pub fn cfg_type_mask(&self) -> u32 {
+        self.cfg_type_mask
+    }
+
+    /// Guest-physical base of the host-visible blob window, if present.
+    pub fn host_visible_base(&self) -> Option<u64> {
+        self.host_visible.map(|(base, _)| base)
+    }
+
+    /// Reserve `size` bytes (page-rounded) in the host-visible window, returning
+    /// the byte offset from its base. Bump allocation — never freed in this cut.
+    pub fn alloc_host_visible(&self, size: u64) -> Option<u64> {
+        let (_, len) = self.host_visible?;
+        let size = (size + 0xfff) & !0xfff;
+        loop {
+            let cur = self.host_visible_cursor.load(Ordering::Relaxed);
+            let next = cur.checked_add(size)?;
+            if next > len {
+                return None;
+            }
+            if self
+                .host_visible_cursor
+                .compare_exchange(cur, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(cur);
+            }
+        }
+    }
+
+    /// Create a host3d (host-allocated) blob resource — no guest backing pages.
+    /// Used for host-visible mappable blobs (e.g. the vdrm shmem ring). The
+    /// caller then `map_blob`s it into the host-visible window.
+    pub fn create_blob_host3d(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+        blob_flags: u32,
+        blob_id: u64,
+        size: u64,
+    ) -> Result<(), VirtioPciError> {
+        if !self.resource_blob_enabled {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::RESOURCE_CREATE_BLOB_HDR_LEN];
+        let n = cmd::build_resource_create_blob(
+            &mut request,
+            ctx_id, // owning render context
+            resource_id,
+            BLOB_MEM_HOST3D,
+            blob_flags,
+            blob_id,
+            size,
+            &[],
+        );
+        self.write_raw_request(&request[..n]);
+        // SAFETY: gate held; req/resp DMA prepared at bring-up.
+        unsafe { self.submit(n, HDR_LEN)? };
+        if self.response_type() != RESP_OK_NODATA {
+            return Err(VirtioPciError::UnexpectedResponse(self.response_type()));
+        }
+        Ok(())
+    }
+
+    /// Map a host3d blob into the host-visible window at byte `offset` (from
+    /// [`alloc_host_visible`]). The device replies `RESP_OK_MAP_INFO`.
+    pub fn map_blob(&self, resource_id: u32, offset: u64) -> Result<(), VirtioPciError> {
+        if !self.resource_blob_enabled {
+            return Err(VirtioPciError::DeviceRejectedFeatures);
+        }
+        let _gate = ReqGate::acquire(&self.req_gate);
+        let mut request = [0u8; cmd::RESOURCE_MAP_BLOB_LEN];
+        cmd::build_resource_map_blob(&mut request, resource_id, offset);
+        self.write_raw_request(&request);
+        // SAFETY: gate held; req/resp DMA prepared at bring-up. The response is
+        // virtio_gpu_resp_map_info (header + map_info + padding = 32 bytes).
+        unsafe { self.submit(request.len(), HDR_LEN + 8)? };
+        if self.response_type() != RESP_OK_MAP_INFO {
+            return Err(VirtioPciError::UnexpectedResponse(self.response_type()));
+        }
         Ok(())
     }
 
@@ -383,6 +691,7 @@ impl VirtioGpuPci {
     /// pointer or handle-table policy.
     pub fn create_virgl_resource(
         &self,
+        ctx_id: u32,
         resource: cmd::ResourceCreate3D,
         backing_phys: u64,
         backing_len: u32,
@@ -390,11 +699,10 @@ impl VirtioGpuPci {
         if !self.virgl_enabled() || backing_phys == 0 || backing_len == 0 {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        self.ensure_virgl_context()?;
         let _gate = ReqGate::acquire(&self.req_gate);
 
         let mut create = [0u8; cmd::RESOURCE_CREATE_3D_LEN];
-        cmd::build_resource_create_3d(&mut create, 1, resource);
+        cmd::build_resource_create_3d(&mut create, ctx_id, resource);
         self.write_raw_request(&create);
         // SAFETY: the request gate serialises controlQ + request DMA use.
         unsafe { self.submit(create.len(), HDR_LEN)? };
@@ -411,7 +719,7 @@ impl VirtioGpuPci {
         cmd::build_ctx_resource(
             &mut attach,
             cmd::VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
-            1,
+            ctx_id,
             resource.resource_id,
         );
         self.write_raw_request(&attach);
@@ -428,20 +736,24 @@ impl VirtioGpuPci {
     /// The stream is bounded by the pre-allocated controlQ request DMA page.
     /// It is copied before the virtqueue notify, so callers may reuse their
     /// source buffer as soon as this synchronous method returns.
-    pub fn submit_virgl(&self, commands: &[u8]) -> Result<(), VirtioPciError> {
+    pub fn submit_virgl(
+        &self,
+        ctx_id: u32,
+        ring_idx: Option<u8>,
+        commands: &[u8],
+    ) -> Result<(), VirtioPciError> {
         if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         if commands.len() > self.req_buf.len() - cmd::SUBMIT_3D_PREFIX_LEN {
             return Err(VirtioPciError::RequestTooLarge);
         }
-        self.ensure_virgl_context()?;
         let _gate = ReqGate::acquire(&self.req_gate);
         let request_len = cmd::SUBMIT_3D_PREFIX_LEN + commands.len();
         // The bound above proves this dynamic-sized slice fits in the fixed
         // 4 KiB staging buffer without a heap allocation in the hot path.
         let mut request = [0u8; 4096];
-        cmd::build_submit_3d(&mut request[..request_len], 1, commands);
+        cmd::build_submit_3d(&mut request[..request_len], ctx_id, ring_idx, commands);
         self.write_raw_request(&request[..request_len]);
         // SAFETY: gate protects the shared request/response buffers.
         unsafe { self.submit(request_len, HDR_LEN)? };
@@ -452,17 +764,20 @@ impl VirtioGpuPci {
     }
 
     /// Synchronise a resource's guest backing into the host VirGL context.
-    pub fn transfer_to_host_virgl(&self, transfer: cmd::Transfer3D) -> Result<(), VirtioPciError> {
+    pub fn transfer_to_host_virgl(
+        &self,
+        ctx_id: u32,
+        transfer: cmd::Transfer3D,
+    ) -> Result<(), VirtioPciError> {
         if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
-        self.ensure_virgl_context()?;
         let _gate = ReqGate::acquire(&self.req_gate);
         let mut request = [0u8; cmd::TRANSFER_3D_LEN];
         cmd::build_transfer_3d(
             &mut request,
             cmd::VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
-            1,
+            ctx_id,
             transfer,
         );
         self.write_raw_request(&request);
@@ -477,27 +792,40 @@ impl VirtioGpuPci {
     /// Detach and unref a render resource before its DMA backing is freed.
     /// A failed teardown leaves the caller responsible for retaining the
     /// backing; freeing it would let the host DMA into recycled memory.
-    pub fn destroy_virgl_resource(&self, resource_id: u32) -> Result<(), VirtioPciError> {
-        if !self.virgl_enabled() || !self.virgl_context_ready.load(Ordering::Acquire) {
+    pub fn destroy_virgl_resource(
+        &self,
+        ctx_id: u32,
+        resource_id: u32,
+    ) -> Result<(), VirtioPciError> {
+        if !self.virgl_enabled() {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }
         let _gate = ReqGate::acquire(&self.req_gate);
-        let mut detach = [0u8; cmd::CTX_RESOURCE_LEN];
-        cmd::build_ctx_resource(
-            &mut detach,
-            cmd::VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-            1,
-            resource_id,
-        );
-        self.write_raw_request(&detach);
-        // SAFETY: gate protects the shared controlQ buffers.
-        unsafe { self.submit(detach.len(), HDR_LEN)? };
-        if self.response_type() != RESP_OK_NODATA {
-            return Err(VirtioPciError::DeviceRejectedFeatures);
+        // Detach from the owning context first — best effort: a blob created
+        // with its ctx in the header is not necessarily CTX_ATTACHed, and a
+        // pure guest blob (ctx 0) has no owning context, so a non-OK detach
+        // response must not abort the UNREF that frees the host resource.
+        if ctx_id != 0 {
+            let mut detach = [0u8; cmd::CTX_RESOURCE_LEN];
+            cmd::build_ctx_resource(
+                &mut detach,
+                cmd::VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+                ctx_id,
+                resource_id,
+            );
+            self.write_raw_request(&detach);
+            // SAFETY: gate protects the shared controlQ buffers.
+            unsafe { self.submit(detach.len(), HDR_LEN)? };
+            let _ = self.response_type();
         }
-        self.write_request(CMD_RESOURCE_UNREF, &resource_id.to_le_bytes());
+        // struct virtio_gpu_resource_unref = { hdr, u32 resource_id, u32 pad }
+        // — the body is 8 bytes (QEMU rejects a 4-byte body: "command size
+        // incorrect 28 vs 32").
+        let mut unref_body = [0u8; 8];
+        unref_body[0..4].copy_from_slice(&resource_id.to_le_bytes());
+        self.write_request(CMD_RESOURCE_UNREF, &unref_body);
         // SAFETY: same request gate and coherent buffers.
-        unsafe { self.submit(HDR_LEN + 4, HDR_LEN)? };
+        unsafe { self.submit(HDR_LEN + unref_body.len(), HDR_LEN)? };
         if self.response_type() != RESP_OK_NODATA {
             return Err(VirtioPciError::DeviceRejectedFeatures);
         }

@@ -806,16 +806,89 @@ fn smoke_drm_prime_export_aliases_dumb_frames() -> TestResult {
         Ok(_) => return TestResult::Fail("PRIME dma-buf mmap_frames returned wrong frames"),
         Err(_) => return TestResult::Fail("PRIME dma-buf mmap_frames errored"),
     }
+    // PRIME export owns one backing reference while the fd is live.
+    let refs_while_exported = {
+        let ms = crate::drm_registry::mode_state(idx).unwrap();
+        let card = ms.lock();
+        card.dumb_backing(1).map(|b| b.refcount)
+    };
+    if refs_while_exported != Some(2) {
+        return TestResult::Fail("PRIME dma-buf did not retain its dumb backing");
+    }
+
     // The dma-buf must round-trip back to its GEM handle (FD_TO_HANDLE):
     // a compositor exports its buffer then imports it to build a KMS fb.
-    match dmabuf.as_prime_gem_handle() {
-        Some(1) => TestResult::Pass,
-        _ => TestResult::Fail("PRIME dma-buf did not round-trip to its GEM handle"),
+    if dmabuf.as_prime_gem_handle() != Some(1) {
+        return TestResult::Fail("PRIME dma-buf did not round-trip to its GEM handle");
     }
+    drop(dmabuf);
+    let refs_after_close = {
+        let ms = crate::drm_registry::mode_state(idx).unwrap();
+        let card = ms.lock();
+        card.dumb_backing(1).map(|b| b.refcount)
+    };
+    if refs_after_close != Some(1) {
+        return TestResult::Fail("closing PRIME dma-buf did not release its backing reference");
+    }
+    TestResult::Pass
 }
 kernel_test_in!(
     "drivers/gpu/drm_ioctl",
     smoke_drm_prime_export_aliases_dumb_frames
+);
+
+// ── 15bb. A primary-node mmap pins its dumb backing ──────────────────
+
+fn smoke_drm_primary_mmap_pins_dumb_backing() -> TestResult {
+    use crate::drm::card::DumbBacking;
+
+    let idx = {
+        let name = format!("card{}", crate::drm_registry::count());
+        let mut card = make_test_card();
+        let handle = card.gem.alloc(0xFACE_0000, 4096).unwrap();
+        card.dumb_backings.push(DumbBacking {
+            gem_handle: handle,
+            phys: 0xFACE_0000,
+            byte_len: 4096,
+            order: 0,
+            mmap_offset: (handle as u64) << 12,
+            refcount: 1,
+        });
+        crate::drm_registry::register_drm_card_with_state(
+            Arc::new(crate::drm_devfs_bridge::BochsCard::new(name)),
+            card,
+        )
+    };
+    let file = match crate::drm_devfs_bridge::DriCardFile::new(idx) {
+        Some(file) => file,
+        None => return TestResult::Fail("failed to open registered DRM card"),
+    };
+    let lifetime = match file.mmap_lifetime(4096, 4096) {
+        Some(lifetime) => lifetime,
+        None => return TestResult::Fail("primary mmap did not acquire a backing lease"),
+    };
+    let refs_while_mapped = {
+        let ms = crate::drm_registry::mode_state(idx).unwrap();
+        let card = ms.lock();
+        card.dumb_backing(1).map(|b| b.refcount)
+    };
+    if refs_while_mapped != Some(2) {
+        return TestResult::Fail("primary mmap lease did not retain its dumb backing");
+    }
+    drop(lifetime);
+    let refs_after_unmap = {
+        let ms = crate::drm_registry::mode_state(idx).unwrap();
+        let card = ms.lock();
+        card.dumb_backing(1).map(|b| b.refcount)
+    };
+    if refs_after_unmap != Some(1) {
+        return TestResult::Fail("primary mmap lease did not release its backing reference");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "drivers/gpu/drm_ioctl",
+    smoke_drm_primary_mmap_pins_dumb_backing
 );
 
 // ── 15c. Dumb backing is refcounted: survives GEM_CLOSE while fb-held ──
