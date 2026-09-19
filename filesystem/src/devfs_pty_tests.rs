@@ -1957,3 +1957,164 @@ fn smoke_pty_tiocsti_injects_input() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/pty", smoke_pty_tiocsti_injects_input);
+
+// ── Packet-mode control packets ──────────────────────────────────────────────
+
+/// A pending control status is delivered ALONE, ahead of any data.
+///
+/// `n_tty_read` (`drivers/tty/n_tty.c:2235`) tests the status first and,
+/// when one is pending, writes that single byte and breaks:
+///
+/// ```c
+/// if (packet && tty->link->ctrl.pktstatus) {
+///         if (kb != kbuf) break;
+///         cs = tty->link->ctrl.pktstatus;
+///         tty->link->ctrl.pktstatus = 0;
+///         *kb++ = cs; nr--; break;
+/// }
+/// ```
+///
+/// That one-byte framing is how a reader tells a control event from data;
+/// folding queued output in behind it would make the two ambiguous.
+fn smoke_pty_packet_control_status_delivered_alone() -> TestResult {
+    use crate::devfs_pty::{TIOCPKT_DATA, TIOCPKT_FLUSHREAD};
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    pty.packet
+        .store(true, core::sync::atomic::Ordering::Release);
+    let slave = PtySlave::new(Arc::clone(&pty));
+
+    // Queue output, then flush the INPUT queue: a FLUSHREAD is now pending
+    // while data is also waiting.
+    if poll_once(slave.write(0, b"data")).is_none() {
+        return TestResult::Fail("slave write failed");
+    }
+    if pty.flush_queues(0).is_err() {
+        return TestResult::Fail("TCIFLUSH failed");
+    }
+
+    let mut buf = [0u8; 32];
+    // First read: the status byte on its own, not prefixed to the output.
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == TIOCPKT_FLUSHREAD => {}
+        Some(Ok(n)) => {
+            let _ = n;
+            return TestResult::Fail("a control packet must be delivered alone");
+        }
+        _ => return TestResult::Fail("master read of the control packet failed"),
+    }
+    // Second read: ordinary data, reframed with TIOCPKT_DATA.
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(5)) if buf[0] == TIOCPKT_DATA && &buf[1..5] == b"data" => {}
+        _ => return TestResult::Fail("queued output must survive the control packet"),
+    }
+    // The status is consumed: no repeat.
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => TestResult::Pass,
+        _ => TestResult::Fail("a delivered control status must not repeat"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_packet_control_status_delivered_alone
+);
+
+/// `^S` / `^Q` raise STOP / START, and each clears the other.
+///
+/// `pty_start` and `pty_stop` (`drivers/tty/pty.c:320-342`) are mutually
+/// exclusive — each sets its bit and clears its opposite — so the master
+/// learns the CURRENT flow state rather than a history of both.
+///
+/// The status must also be readable while output is stopped, which is
+/// precisely when a STOP packet needs to get through; `n_tty_poll` reports
+/// it with EPOLLPRI for the same reason.
+fn smoke_pty_packet_flow_control_start_stop() -> TestResult {
+    use crate::devfs_pty::{TIOCPKT_START, TIOCPKT_STOP};
+    const IXON: u32 = 0x400;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    {
+        let mut t = pty.termios.lock();
+        t.raw[0..4].copy_from_slice(&IXON.to_ne_bytes());
+    }
+    pty.packet
+        .store(true, core::sync::atomic::Ordering::Release);
+
+    let mut buf = [0u8; 32];
+    // ^S stops output and raises STOP.
+    if poll_once(master.write(0, &[0x13])).is_none() {
+        return TestResult::Fail("master write of ^S failed");
+    }
+    if master.poll_readiness() & crate::POLL_PRI == 0 {
+        return TestResult::Fail("a pending control packet must report POLLPRI");
+    }
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == TIOCPKT_STOP => {}
+        _ => return TestResult::Fail("^S must raise TIOCPKT_STOP"),
+    }
+    // ^Q restarts it and raises START — with STOP cleared, not both.
+    if poll_once(master.write(0, &[0x11])).is_none() {
+        return TestResult::Fail("master write of ^Q failed");
+    }
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == TIOCPKT_START => TestResult::Pass,
+        Some(Ok(1)) => TestResult::Fail("START must clear STOP rather than accumulate"),
+        _ => TestResult::Fail("^Q must raise TIOCPKT_START"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_packet_flow_control_start_stop);
+
+/// A change in whether STANDARD flow control applies raises DOSTOP/NOSTOP.
+///
+/// `pty_set_termios` (`pty.c:245-268`) reports only that, and it is
+/// specific: IXON must be set AND the stop/start characters must be the
+/// conventional `^S`/`^Q`. A peer uses it to decide whether it may perform
+/// the flow control itself, which it cannot do for custom characters.
+fn smoke_pty_packet_termios_flow_change() -> TestResult {
+    use crate::devfs_pty::{Termios, TIOCPKT_DOSTOP, TIOCPKT_NOSTOP};
+    const IXON: u32 = 0x400;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    pty.packet
+        .store(true, core::sync::atomic::Ordering::Release);
+
+    // Default termios has IXON with ^S/^Q, i.e. standard flow control.
+    // Clearing IXON is a change, and must report NOSTOP.
+    let mut t = Termios::default();
+    t.raw[0..4].copy_from_slice(&0u32.to_ne_bytes());
+    pty.set_termios_locked(t.raw);
+    let mut buf = [0u8; 8];
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == TIOCPKT_NOSTOP => {}
+        _ => return TestResult::Fail("losing standard flow control must raise NOSTOP"),
+    }
+
+    // Restoring it reports DOSTOP.
+    t.raw[0..4].copy_from_slice(&IXON.to_ne_bytes());
+    pty.set_termios_locked(t.raw);
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == TIOCPKT_DOSTOP => {}
+        _ => return TestResult::Fail("regaining standard flow control must raise DOSTOP"),
+    }
+
+    // A termios write that does not change the flow configuration is
+    // silent — otherwise every tcsetattr would wake the peer for nothing.
+    pty.set_termios_locked(t.raw);
+    match poll_once(master.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => TestResult::Pass,
+        _ => TestResult::Fail("an unchanged flow configuration must raise nothing"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_packet_termios_flow_change);
