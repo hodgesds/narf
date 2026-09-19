@@ -1175,3 +1175,11 @@ argument = "The demand-fault fast-path change remains wholly inside the existing
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "An already-backed demand fault continues to hold the authoritative address-space region lock while deriving permissions and repairing its leaf. A successful root-locked map installs the exact Region.phys frame and registers exactly one reverse-map owner; on x86, omitting invalidation for that non-present-to-present transition follows the existing repair-capable demand-map contract, and any retained negative walk faults once more into its AlreadyMapped invalidation branch. AlreadyMapped proves a present leaf, performs the architecture-local invalidation, and does not add another owner. Every other mapping error still fails closed. Frame ownership, COW counts, leaf permissions, cross-CPU retirement, and release ordering are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Saturated fork locality remains inside the existing scheduler executor TCB and changes only the soft initial CPU hint supplied for a new process child. It adds no trusted subsystem, capability, mapping authority, domain transition, user pointer, or context-switch destination."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The fork selector still considers only allowed online CPUs and still derives its decision from scheduler-owned queue, wake-inbox, and current-task state. The current CPU wins only when every sampled candidate is occupied and it is tied for the minimum load; an idle CPU always wins, and an affinity-excluded current CPU has no load entry and cannot be selected. Admission and dispatch retain the existing affinity, lifecycle, address-space, TLS, domain-state, and FP/SIMD validation and restore paths."

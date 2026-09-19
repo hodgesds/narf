@@ -2181,9 +2181,11 @@ pub fn online_cpu_set() -> CpuSet {
 
 /// Select a CPU for a newly forked task using a non-blocking snapshot of each
 /// allowed online run queue. This mirrors Linux's `WF_FORK` load placement:
-/// use an idle/less-loaded CPU when one is available, with `preferred` as the
-/// tie-breaker. Callers rotate that preference across siblings so a burst of
-/// children that park during setup does not collapse onto the first idle CPU.
+/// use an idle/less-loaded CPU when one is available. The current CPU wins a
+/// saturated least-load tie to preserve fork/exit/wait cache locality;
+/// otherwise `preferred` breaks a minimum-load tie. Callers rotate that
+/// preference across siblings so a burst of children that park during setup
+/// does not collapse onto the first idle CPU.
 ///
 /// The result is only a soft initial-placement hint. Queue state can change as
 /// soon as it is observed, and normal affinity validation, stealing, and CPU
@@ -2192,6 +2194,8 @@ pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
     let mut candidates = allowed.intersection(online_cpu_set()).bits();
     let mut best: Option<(CpuId, usize)> = None;
     let mut preferred_load = None;
+    let current = CpuId(narf_lib::percpu::current_cpu() as u32);
+    let mut current_load = None;
     while candidates != 0 {
         let cpu = candidates.trailing_zeros() as usize;
         candidates &= candidates - 1;
@@ -2218,21 +2222,47 @@ pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
         if candidate == preferred {
             preferred_load = Some(load);
         }
+        if candidate == current {
+            current_load = Some(load);
+        }
         let replace = best.is_none_or(|(_, selected_load)| load < selected_load);
         if replace {
             best = Some((candidate, load));
         }
     }
     let (best_cpu, best_load) = best?;
-    // A rapid fork burst commonly has one extra runnable task on the parent's
-    // CPU: the parent doing the forking. Preserve the sibling rotation across
-    // that one-task difference so children which immediately park at a setup
-    // barrier do not all reuse the same apparently-idle queue. A genuinely
-    // busier preferred CPU still loses to the least-loaded queue.
-    if preferred_load.is_some_and(|load| load <= best_load.saturating_add(1)) {
-        Some(preferred)
+    Some(choose_fork_cpu(
+        best_cpu,
+        best_load,
+        current,
+        current_load,
+        preferred,
+        preferred_load,
+    ))
+}
+
+#[inline]
+fn choose_fork_cpu(
+    best_cpu: CpuId,
+    best_load: usize,
+    current: CpuId,
+    current_load: Option<usize>,
+    preferred: CpuId,
+    preferred_load: Option<usize>,
+) -> CpuId {
+    // Linux's WF_FORK search starts from the child's inherited CPU and moves it
+    // only when balancing identifies a better destination. Preserve that
+    // cache-local shape when every CPU is occupied and the parent's CPU is
+    // already one of the least-loaded choices: do not rotate a
+    // fork->exit->wait pair merely to break an equal-load tie. When a genuinely
+    // idle CPU exists, continue spreading a burst and use the parent's rotating
+    // preference only when that CPU is itself tied for the minimum load.
+    if best_load != 0 && current_load == Some(best_load) {
+        current
+    } else if preferred_load == Some(best_load) {
+        preferred
     } else {
-        Some(best_cpu)
+        best_cpu
     }
 }
 
