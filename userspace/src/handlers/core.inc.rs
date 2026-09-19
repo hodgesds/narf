@@ -7184,6 +7184,70 @@ pub(crate) fn fork_address_space_mbind_ranges(parent_id: u64, child_id: u64) {
     map.insert(child_id, inherited);
 }
 
+/// Copy the parent's interleave cursor to a new child.
+///
+/// `il_prev` is a plain `task_struct` field (`include/linux/sched.h:1355`)
+/// that `copy_process` never resets, so `arch_dup_task_struct`'s struct
+/// copy carries it to every child — thread or forked process alike. Only
+/// `set_mempolicy` resets it, and only when installing an interleave policy
+/// (`mm/mempolicy.c:1095`). Starting every child at 0 instead restarted the
+/// round-robin, so a forked child re-walked nodes its parent had already
+/// used.
+pub(crate) fn interleave_index_fork(parent_task: u64, child_task: u64) {
+    if parent_task == child_task {
+        return;
+    }
+    let mut table = INTERLEAVE_INDEX_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return;
+    };
+    let Some(inherited) = map.get(&parent_task).copied() else {
+        return;
+    };
+    map.insert(child_task, inherited);
+}
+
+/// Seed a new child's NUMA-balancing scan state.
+///
+/// `init_numa_balancing()` (`kernel/sched/fair.c:3620`) splits on CLONE_VM,
+/// and the split is about WHICH ADDRESS SPACE is being scanned:
+///
+///   * A child with its own mm is a fresh scan. Linux resets the mm's scan
+///     state — `numa_next_scan = jiffies + scan_delay`, `numa_scan_seq = 0`
+///     — for an mm with one user, and clears `numa_preferred_nid` because
+///     the placement the parent learned says nothing about a new address
+///     space. The child restarts the walk from the floor.
+///   * A CLONE_VM thread scans the SAME address space, so Linux keeps the
+///     existing position (it lives in the shared mm) and only staggers when
+///     the new thread's scanning starts, via `p->node_stamp = delay`.
+///
+/// Either way the first scan is DELAYED, so both paths start the tick
+/// counter at zero rather than at the near-threshold value
+/// `ensure_numa_balance_state` uses for a fresh `mbind`. A child that
+/// inherited nothing at all was never scanned again: the tick handler
+/// early-returns for any task with no entry, so a forked child of a
+/// balancing process silently stopped being balanced.
+pub(crate) fn numa_balance_fork(parent_task: u64, child_task: u64, share_vm: bool) {
+    if parent_task == child_task {
+        return;
+    }
+    let mut table = NUMA_BALANCE_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return;
+    };
+    let Some(parent_state) = map.get(&parent_task).copied() else {
+        return;
+    };
+    let cursor = if share_vm {
+        // Same address space: continue the shared walk where it stands.
+        parent_state.cursor
+    } else {
+        // New address space: restart the walk.
+        AddressSpace::USER_FIXED_FLOOR
+    };
+    map.insert(child_task, NumaBalanceState { ticks: 0, cursor });
+}
+
 /// Test accessor: the policy stored for `task`, as (mode, nodemask,
 /// home_node). `None` when the task has no policy of its own — which is
 /// what an un-inherited child looks like.
@@ -7194,6 +7258,32 @@ pub fn __test_task_mempolicy(task: u64) -> Option<(u32, u64, u32)> {
         .as_ref()
         .and_then(|m| m.get(&task).copied())
         .map(|p| (p.mode, p.nodemask, p.home_node))
+}
+
+/// Test accessor: the interleave cursor stored for `task`, if any.
+#[doc(hidden)]
+pub fn __test_interleave_index(task: u64) -> Option<u64> {
+    INTERLEAVE_INDEX_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+}
+
+/// Test accessor: advance `task`'s interleave cursor through the real
+/// production path, so a test seeds it the way an allocation would.
+#[doc(hidden)]
+pub fn __test_advance_interleave_index(task: u64) -> u64 {
+    task_interleave_index(task, true)
+}
+
+/// Test accessor: `task`'s NUMA-balancing scan state as (ticks, cursor).
+#[doc(hidden)]
+pub fn __test_numa_balance_state(task: u64) -> Option<(u16, u64)> {
+    NUMA_BALANCE_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .map(|s| (s.ticks, s.cursor))
 }
 
 /// Test accessor: retire a task's per-task tables, so a test that seeds a
@@ -9638,6 +9728,12 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // (`kernel/fork.c:2156`) — no CLONE_ flag guards it, so a thread
     // inherits it exactly as a forked process does.
     mempolicy_fork(parent_pid, child_tid.raw());
+    // Likewise the interleave cursor: `il_prev` is never reset by
+    // `copy_process`, so the struct copy carries it to every child.
+    interleave_index_fork(parent_pid, child_tid.raw());
+    // The balancing scan splits on CLONE_VM: a thread continues the walk
+    // over the address space it shares, a new mm restarts it.
+    numa_balance_fork(parent_pid, child_tid.raw(), share_vm);
 
     // Namespace inheritance + CLONE_NEW* layering. A child — thread OR
     // process — shares the parent's namespaces (Linux copy_*ns), unless
