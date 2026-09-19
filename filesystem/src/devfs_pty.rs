@@ -561,6 +561,11 @@ pub struct Pty {
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
     pub(crate) slave_tx_to_master: ByteRing<4096>,
 
+    /// Non-canonical read timing (VMIN/VTIME). Linux keeps the equivalent
+    /// on the stack of `n_tty_read`, which blocks; NARF's reads are
+    /// poll-and-retry, so the deadline has to outlive one attempt.
+    pub(crate) read_timer: IrqSafeSpinLock<ReadTimer>,
+
     /// Output-side line-discipline state (OPOST column tracking) for the
     /// slave-to-master direction.
     pub(crate) output: IrqSafeSpinLock<crate::ntty::OutputState>,
@@ -651,6 +656,42 @@ impl core::fmt::Debug for Pty {
     }
 }
 
+/// Pending-read timing for non-canonical mode.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ReadTimer {
+    /// Absolute monotonic deadline, when a timer is running.
+    deadline: Option<u64>,
+    /// Readable byte count when the timer was last armed, so the arrival
+    /// of a new byte can restart an inter-byte timer.
+    seen: usize,
+}
+
+impl ReadTimer {
+    pub(crate) const fn new() -> Self {
+        Self {
+            deadline: None,
+            seen: 0,
+        }
+    }
+    fn disarm(&mut self) {
+        self.deadline = None;
+        self.seen = 0;
+    }
+}
+
+/// What a non-canonical read should do with the bytes currently queued.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadGate {
+    /// Hand over what is queued (possibly nothing, which is a legitimate
+    /// 0-byte return for a timed-out or polling read).
+    Deliver,
+    /// Not satisfied yet and no timer has expired — would-block.
+    Block,
+}
+
+/// VTIME is counted in tenths of a second (`TIME_CHAR` * `HZ / 10`).
+const DECISECOND_NS: u64 = 100_000_000;
+
 impl Pty {
     /// A slave was opened at some point and none is open now — the master's
     /// end-of-stream condition. Linux `pty_read`: EIO once the last slave
@@ -658,6 +699,94 @@ impl Pty {
     pub(crate) fn hung_up(&self) -> bool {
         self.slave_ever_opened.load(Ordering::Acquire)
             && self.slave_opens.load(Ordering::Acquire) == 0
+    }
+
+    /// Decide whether a non-canonical read may return, per the VMIN/VTIME
+    /// matrix in `n_tty_read` (`drivers/tty/n_tty.c:2216-2281`):
+    ///
+    /// ```c
+    /// minimum = time = 0;
+    /// timeout = MAX_SCHEDULE_TIMEOUT;
+    /// if (!ldata->icanon) {
+    ///         minimum = MIN_CHAR(tty);
+    ///         if (minimum)
+    ///                 time = (HZ / 10) * TIME_CHAR(tty);
+    ///         else {
+    ///                 timeout = (HZ / 10) * TIME_CHAR(tty);
+    ///                 minimum = 1;
+    ///         }
+    /// }
+    /// ...
+    /// if (kb - kbuf >= minimum) break;
+    /// if (time) timeout = time;      /* after the first byte */
+    /// ```
+    ///
+    /// which yields the four POSIX cases:
+    ///
+    /// * **MIN>0, TIME==0** — block until MIN bytes. `time` is 0, so the
+    ///   timeout stays infinite.
+    /// * **MIN>0, TIME>0** — TIME is an INTER-BYTE timer. The first wait is
+    ///   still infinite (`timeout` only becomes `time` after a byte has
+    ///   been copied), and each further byte restarts it.
+    /// * **MIN==0, TIME>0** — TIME is an overall read timer started when
+    ///   the read begins; return as soon as any byte arrives, or empty when
+    ///   it expires.
+    /// * **MIN==0, TIME==0** — poll: return immediately with whatever is
+    ///   queued, including nothing.
+    ///
+    /// Canonical mode never reaches here: `minimum` and `time` are left at
+    /// zero for it, so `c_cc[VMIN]`/`c_cc[VTIME]` are simply not consulted.
+    pub(crate) fn noncanon_read_gate(&self, t: &Termios, avail: usize) -> ReadGate {
+        let (vmin, vtime) = t.vmin_vtime();
+        // `if (minimum) ... else { timeout = ...; minimum = 1; }`
+        let minimum = if vmin == 0 { 1usize } else { vmin as usize };
+        let mut timer = self.read_timer.lock();
+
+        if avail >= minimum {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        // MIN==0, TIME==0: a pure polling read never waits.
+        if vmin == 0 && vtime == 0 {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        // MIN>0, TIME==0: no timer at all, wait for the full count.
+        if vmin > 0 && vtime == 0 {
+            timer.disarm();
+            return ReadGate::Block;
+        }
+
+        let now = narf_time::monotonic_ns();
+        let span = u64::from(vtime) * DECISECOND_NS;
+
+        if vmin == 0 {
+            // Overall read timer, armed on the first attempt of this read.
+            let deadline = *timer.deadline.get_or_insert(now.saturating_add(span));
+            if now >= deadline {
+                timer.disarm();
+                return ReadGate::Deliver; // expired: hand over what there is
+            }
+            return ReadGate::Block;
+        }
+
+        // MIN>0, TIME>0: the inter-byte timer does not run until at least
+        // one byte has arrived — Linux's first wait is still infinite.
+        if avail == 0 {
+            timer.disarm();
+            return ReadGate::Block;
+        }
+        if timer.deadline.is_none() || avail > timer.seen {
+            // First byte, or another one arrived: (re)start the gap timer.
+            timer.deadline = Some(now.saturating_add(span));
+            timer.seen = avail;
+            return ReadGate::Block;
+        }
+        if now >= timer.deadline.unwrap_or(now) {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        ReadGate::Block
     }
 
     /// `TIOCGPGRP`: report the foreground process group.
@@ -823,6 +952,7 @@ impl Pty {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             output: IrqSafeSpinLock::new(crate::ntty::OutputState::new()),
+            read_timer: IrqSafeSpinLock::new(ReadTimer::new()),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
@@ -1901,6 +2031,39 @@ impl FileOps for PtySlave {
     ///
     /// Linux ref: `n_tty.c n_tty_read` → canonical buffer drain.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Non-canonical reads answer to VMIN/VTIME, which decide whether
+        // enough has arrived (or waited long enough) to return at all.
+        // Canonical mode does not consult them — Linux leaves `minimum` and
+        // `time` at zero for it — so it keeps the line-at-a-time path below.
+        let t = *self.pty.termios.lock();
+        if !t.icanon() {
+            let avail = self.pty.input.lock().readable();
+            let gate = self.pty.noncanon_read_gate(&t, avail);
+            let hung_up = self.pty.master_closed.load(Ordering::Acquire);
+            if gate == ReadGate::Block && !hung_up {
+                // Not satisfied and no timer has expired. A hung-up master
+                // is still a real EOF, so it overrides the wait.
+                return Box::pin(async move { Err(FsError::WouldBlock) });
+            }
+            if avail == 0 {
+                // Deliver with an empty queue. With VMIN == 0 this is a
+                // legitimate 0-byte read, NOT end-of-file: a polling read
+                // (VTIME == 0) never waits, and a timed read reports what it
+                // has when VTIME expires — `n_tty_read` returns `kb - kbuf`,
+                // which is simply zero. This is the second place a 0 is
+                // correct on a PTY, alongside canonical mode's latched ^D.
+                return Box::pin(async move { Ok(0) });
+            }
+            let n = self.pty.input.lock().drain_into(buf);
+            return Box::pin(async move {
+                if n == 0 {
+                    // The caller passed a zero-length buffer.
+                    Ok(0)
+                } else {
+                    Ok(n)
+                }
+            });
+        }
         let mut state = self.pty.input.lock();
         if state.readable() == 0 {
             // The ONE PTY case where 0 is correct: canonical mode latches ^D

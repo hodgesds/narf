@@ -1595,3 +1595,202 @@ fn smoke_pty_ixon_flow_control_stops_output() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("filesystem/pty", smoke_pty_ixon_flow_control_stops_output);
+
+// ── VMIN / VTIME ─────────────────────────────────────────────────────────────
+
+/// Put the PTY in non-canonical mode with the given VMIN/VTIME.
+fn set_raw_min_time(pty: &alloc::sync::Arc<crate::devfs_pty::Pty>, vmin: u8, vtime: u8) {
+    let mut t = pty.termios.lock();
+    // Clear ICANON (and ISIG, so control bytes stay ordinary input).
+    t.raw[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    // c_cc[] starts at wire offset 17; VTIME = 5, VMIN = 6.
+    t.raw[17 + 5] = vtime;
+    t.raw[17 + 6] = vmin;
+}
+
+/// VMIN > 0 with VTIME == 0 blocks until MIN bytes have arrived.
+///
+/// `n_tty_read`: `minimum = MIN_CHAR(tty)` and `time` stays 0, so the
+/// timeout remains `MAX_SCHEDULE_TIMEOUT` — there is no timer, only a count.
+fn smoke_pty_vmin_blocks_until_min_bytes() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    set_raw_min_time(&pty, 2, 0);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let mut buf = [0u8; 8];
+
+    // One byte is fewer than VMIN: the read must wait.
+    if poll_once(master.write(0, b"a")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("a read below VMIN must block, not return"),
+    }
+
+    // The second byte satisfies VMIN and both are delivered together.
+    if poll_once(master.write(0, b"b")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(2)) if &buf[..2] == b"ab" => TestResult::Pass,
+        _ => TestResult::Fail("reaching VMIN must deliver the buffered bytes"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_vmin_blocks_until_min_bytes);
+
+/// VMIN == 0 with VTIME == 0 is a polling read: it returns immediately with
+/// whatever is queued, including nothing.
+///
+/// The zero-byte return is NOT end-of-file. `n_tty_read` sets
+/// `timeout = 0` and `minimum = 1`, so the wait expires at once and the
+/// function returns `kb - kbuf`, which is simply zero. Reporting
+/// would-block here instead would hang a program that polls its tty.
+fn smoke_pty_vmin_zero_vtime_zero_is_a_polling_read() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    set_raw_min_time(&pty, 0, 0);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let mut buf = [0u8; 8];
+
+    // Empty queue: an immediate 0, not would-block and not EOF.
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(0)) => {}
+        Some(Err(FsError::WouldBlock)) => {
+            return TestResult::Fail("a VMIN==0/VTIME==0 read must not block")
+        }
+        _ => return TestResult::Fail("polling read returned something unexpected"),
+    }
+
+    // With data queued it returns it, still without waiting.
+    if poll_once(master.write(0, b"xy")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(2)) if &buf[..2] == b"xy" => TestResult::Pass,
+        _ => TestResult::Fail("polling read did not return the queued bytes"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_vmin_zero_vtime_zero_is_a_polling_read
+);
+
+/// Spin until the monotonic clock has advanced `ns`, or give up.
+///
+/// Returns false when the clock is not advancing, so a timing test can skip
+/// rather than hang or report a failure it cannot substantiate.
+fn wait_monotonic(ns: u64) -> bool {
+    let start = narf_time::monotonic_ns();
+    if start == 0 {
+        return false;
+    }
+    for _ in 0..200_000_000u64 {
+        if narf_time::monotonic_ns().saturating_sub(start) >= ns {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// VMIN == 0 with VTIME > 0 is an overall read timer: block until a byte
+/// arrives or the timer expires, then return what there is.
+///
+/// `n_tty_read`: `timeout = (HZ / 10) * TIME_CHAR(tty); minimum = 1;` — the
+/// timer starts when the read begins, not when a byte arrives.
+fn smoke_pty_vmin_zero_vtime_read_timer_expires() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    // VTIME is in tenths of a second, so 1 == 100ms.
+    set_raw_min_time(&pty, 0, 1);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let mut buf = [0u8; 8];
+
+    // First attempt arms the timer and waits — it must NOT return 0 yet, or
+    // the timer would be meaningless.
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("a VTIME read must wait before the timer expires"),
+    }
+    if !wait_monotonic(150_000_000) {
+        return TestResult::Skip("monotonic clock is not advancing; cannot time this");
+    }
+    // Expired: report what there is, which is nothing.
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(0)) => TestResult::Pass,
+        Some(Err(FsError::WouldBlock)) => TestResult::Fail("the VTIME read timer never expired"),
+        _ => TestResult::Fail("expired VTIME read returned something unexpected"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_vmin_zero_vtime_read_timer_expires
+);
+
+/// VMIN > 0 with VTIME > 0 makes VTIME an INTER-BYTE timer: the first wait
+/// is unbounded, and the gap timer only starts once a byte has arrived.
+///
+/// In `n_tty_read` the timeout is `MAX_SCHEDULE_TIMEOUT` until a byte has
+/// been copied — `if (time) timeout = time;` runs only after the copy — so
+/// an idle terminal waits forever rather than returning empty.
+fn smoke_pty_vmin_vtime_is_an_interbyte_timer() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    set_raw_min_time(&pty, 3, 1);
+    let slave = PtySlave::new(Arc::clone(&pty));
+    let mut buf = [0u8; 8];
+
+    // No bytes at all: the gap timer is not running, so waiting is
+    // unbounded — it must not expire into an empty return.
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("an idle VMIN>0/VTIME>0 read must wait indefinitely"),
+    }
+    if !wait_monotonic(150_000_000) {
+        return TestResult::Skip("monotonic clock is not advancing; cannot time this");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => {
+            return TestResult::Fail(
+                "the inter-byte timer must not run before the first byte arrives",
+            )
+        }
+    }
+
+    // One byte arrives — fewer than VMIN, so the gap timer starts.
+    if poll_once(master.write(0, b"q")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Err(FsError::WouldBlock)) => {}
+        _ => return TestResult::Fail("a byte below VMIN must not return before the gap"),
+    }
+    if !wait_monotonic(150_000_000) {
+        return TestResult::Skip("monotonic clock is not advancing; cannot time this");
+    }
+    // Gap elapsed with no further byte: deliver the short read.
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(1)) if buf[0] == b'q' => TestResult::Pass,
+        Some(Err(FsError::WouldBlock)) => TestResult::Fail("the inter-byte timer never expired"),
+        _ => TestResult::Fail("expired inter-byte read returned something unexpected"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_vmin_vtime_is_an_interbyte_timer);
