@@ -116,6 +116,42 @@ fn smoke_abi_proc_getpgid_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_getpgid_pos);
 
+fn smoke_abi_proc_pgid_cache_tracks_outer_id() -> TestResult {
+    with_setup(|| {
+        const LEADER_TASK: u64 = 0x6A10_0001;
+        const LEADER_PID: u64 = 0x6A20_0001;
+        const MEMBER_TASK: u64 = 0x6A10_0002;
+        const MEMBER_PID: u64 = 0x6A20_0002;
+
+        crate::task::release_task(LEADER_TASK);
+        crate::task::release_task(MEMBER_TASK);
+        let _ = crate::task::Task::new_registered(LEADER_TASK, LEADER_PID);
+        let _ = crate::task::Task::new_registered(MEMBER_TASK, MEMBER_PID);
+        crate::handlers::register_pid_task_mapping(LEADER_PID, LEADER_TASK);
+        crate::handlers::register_pid_task_mapping(MEMBER_PID, MEMBER_TASK);
+
+        crate::handlers::__test_set_pgid(LEADER_TASK, LEADER_TASK);
+        crate::handlers::pgid_fork(LEADER_TASK, MEMBER_TASK);
+        let inherited = crate::task::__test_cached_process_group(MEMBER_TASK);
+        if inherited != Some((LEADER_TASK, LEADER_PID)) {
+            crate::task::release_task(LEADER_TASK);
+            crate::task::release_task(MEMBER_TASK);
+            return Err("fork did not cache both TaskId and outer pid of inherited pgrp");
+        }
+
+        crate::handlers::__test_set_pgid(MEMBER_TASK, MEMBER_TASK);
+        let moved = crate::task::__test_cached_process_group(MEMBER_TASK);
+        crate::task::release_task(LEADER_TASK);
+        crate::task::release_task(MEMBER_TASK);
+        if moved == Some((MEMBER_TASK, MEMBER_PID)) {
+            Ok(())
+        } else {
+            Err("setpgid did not update the cached outer process-group id")
+        }
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pgid_cache_tracks_outer_id);
+
 // ── setpgid(2) error ladder — kernel/sys.c::SYSCALL_DEFINE2(setpgid) ──
 //
 // This handler used to validate NOTHING: it translated both arguments and

@@ -7,7 +7,7 @@ pub(crate) fn sys_getpgid(ctx: &mut dyn TrapContext) {
     let pid = ctx.args().arg0 as i32;
     // arg0 is a *visible* pid (0 = self); the table is task-id-keyed.
     if pid == 0 {
-        ctx.set_return(SyscallReturn::ok(pgid_to_user(current_task_pgid())));
+        ctx.set_return(SyscallReturn::ok(current_task_pgid_user()));
         return;
     }
 

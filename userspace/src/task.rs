@@ -65,6 +65,15 @@ pub struct Task {
     /// made runnable; the rare setpgid/setsid writers update every Task with
     /// the same `pid` while holding the PGID table lock.
     process_group_id: AtomicU64,
+    /// Outer ProcessId naming [`Self::process_group_id`].
+    ///
+    /// Linux's `signal->pids[PIDTYPE_PGID]` retains both the process-group
+    /// object and its namespace-visible numbers. Keeping the outer number
+    /// beside NARF's internal TaskId gives the current-task getpgid/getpgrp
+    /// path the same lock-free shape: PID-namespace builds translate this
+    /// stable outer id at the boundary, while the common non-container build
+    /// returns it directly without contending on `TASK_TO_PID`.
+    process_group_pid: AtomicU64,
     /// [`TASK_RUNNING`] | [`TASK_ZOMBIE`].
     pub state: AtomicU32,
     /// Raw wstatus staged at exit (also mirrored in the pending-
@@ -138,6 +147,7 @@ impl Task {
             pid: AtomicU64::new(pid),
             effective_ids: AtomicU64::new(0),
             process_group_id: AtomicU64::new(tid),
+            process_group_pid: AtomicU64::new(pid),
             state: AtomicU32::new(TASK_RUNNING),
             exit_code: AtomicI32::new(0),
             user_cpu_ns: AtomicU64::new(0),
@@ -219,6 +229,23 @@ pub(crate) fn current_process_group_id() -> Option<u64> {
     Some(unsafe { (*ptr).process_group_id.load(Ordering::Acquire) })
 }
 
+/// Read the current task's process group in outer ProcessId space.
+///
+/// Retaining the numeric identity mirrors the read-side property of Linux's
+/// `struct pid`: group members still report the original pgid after the
+/// leader's TaskId-to-ProcessId registry row has been reaped, rather than
+/// accidentally exposing NARF's unrelated internal TaskId.
+#[inline]
+pub(crate) fn current_process_group_pid() -> Option<u64> {
+    let ptr = narf_scheduler::stackful::current_user_context().cast::<Task>();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `publish_current_task` installs `Arc::as_ptr(task)` and the
+    // in-flight `UserTaskFuture` retains that Arc while this hook can run.
+    Some(unsafe { (*ptr).process_group_pid.load(Ordering::Acquire) })
+}
+
 /// Current task identity from the scheduler-published `Task`, without cloning
 /// its Arc or consulting the task/credential registries. The packed effective
 /// ids are updated by the same credential mutation funnel that updates the
@@ -279,10 +306,21 @@ pub(crate) fn reset_effective_ids() {
 /// handled by [`set_process_group_id`].
 pub(crate) fn inherit_process_group_id(parent: u64, child: u64, fallback: u64) {
     let inherited = task_get(parent)
-        .map(|task| task.process_group_id.load(Ordering::Acquire))
-        .unwrap_or(fallback);
+        .map(|task| {
+            (
+                task.process_group_id.load(Ordering::Acquire),
+                task.process_group_pid.load(Ordering::Acquire),
+            )
+        })
+        .unwrap_or_else(|| {
+            let fallback_pid = task_get(fallback)
+                .map(|task| task.pid.load(Ordering::Acquire))
+                .unwrap_or(fallback);
+            (fallback, fallback_pid)
+        });
     if let Some(task) = task_get(child) {
-        task.process_group_id.store(inherited, Ordering::Release);
+        task.process_group_id.store(inherited.0, Ordering::Release);
+        task.process_group_pid.store(inherited.1, Ordering::Release);
     }
 }
 
@@ -297,9 +335,15 @@ pub(crate) fn set_process_group_id(leader: u64, pgid: u64) {
     else {
         return;
     };
+    let process_group_pid = tasks
+        .get(&pgid)
+        .map(|task| task.pid.load(Ordering::Acquire))
+        .unwrap_or(pgid);
     for task in tasks.values() {
         if task.pid.load(Ordering::Acquire) == process_pid {
             task.process_group_id.store(pgid, Ordering::Release);
+            task.process_group_pid
+                .store(process_group_pid, Ordering::Release);
         }
     }
 }
@@ -309,7 +353,20 @@ pub(crate) fn set_process_group_id(leader: u64, pgid: u64) {
 pub(crate) fn __test_reset_process_group_ids() {
     for task in TASKS.lock().values() {
         task.process_group_id.store(task.tid, Ordering::Release);
+        task.process_group_pid
+            .store(task.pid.load(Ordering::Acquire), Ordering::Release);
     }
+}
+
+/// Inspect both process-group identity views without a live scheduler context.
+#[doc(hidden)]
+pub(crate) fn __test_cached_process_group(tid: u64) -> Option<(u64, u64)> {
+    task_get(tid).map(|task| {
+        (
+            task.process_group_id.load(Ordering::Acquire),
+            task.process_group_pid.load(Ordering::Acquire),
+        )
+    })
 }
 
 /// Charge CPU time to the currently-published stackful user task without

@@ -12563,6 +12563,14 @@ pub fn current_task_sid_user() -> u64 {
 /// against a userspace-supplied pgrp; see the number-space note above
 /// `pgid_to_user`.
 pub fn current_task_pgid_user() -> u64 {
+    if let Some(outer) = crate::task::current_process_group_pid() {
+        #[cfg(feature = "container")]
+        return report_pid_to(current_task_id(), outer);
+        #[cfg(not(feature = "container"))]
+        return outer;
+    }
+    // The syscall ABI harness has no scheduler-published Task. Retain its
+    // table-backed fallback so synthetic contexts exercise the same contract.
     pgid_to_user(current_task_pgid())
 }
 
