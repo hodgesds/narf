@@ -7047,7 +7047,7 @@ pub(crate) fn get_futex_key_flags(
     }
     // MPOL resolves the node only when userspace did not name one.
     if node == FUTEX_NO_NODE && flags & FUTEX2_MPOL != 0 {
-        node = futex_mpol_node(current_task_id(), uaddr);
+        node = futex_mpol_node(uaddr);
         node_updated = true;
     }
     if numa {

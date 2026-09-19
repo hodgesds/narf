@@ -7158,6 +7158,90 @@ fn mbind_scope() -> u64 {
         .unwrap_or(0)
 }
 
+/// Copy the parent's `mbind` range policies into a freshly forked address
+/// space.
+///
+/// `fork(2)` gives the child its own mm whose VMAs carry COPIES of the
+/// parent's policies — `dup_mmap` calls `vma_dup_policy`
+/// (`mm/mempolicy.c:2802`) for every VMA it duplicates. Without this the
+/// child silently reverted to `MPOL_DEFAULT`, so a process that bound a
+/// region and then forked had its placement quietly undone in the child.
+///
+/// `CLONE_VM` does not come through here: it shares the parent's address
+/// space outright (`kernel/fork.c:1579`), so it shares the ranges already,
+/// which is exactly why they are keyed by address space rather than task.
+pub(crate) fn fork_address_space_mbind_ranges(parent_id: u64, child_id: u64) {
+    if parent_id == child_id {
+        return;
+    }
+    let mut table = MBIND_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return;
+    };
+    let Some(inherited) = map.get(&parent_id).cloned() else {
+        return;
+    };
+    map.insert(child_id, inherited);
+}
+
+/// Test accessor: the policy stored for `task`, as (mode, nodemask,
+/// home_node). `None` when the task has no policy of its own — which is
+/// what an un-inherited child looks like.
+#[doc(hidden)]
+pub fn __test_task_mempolicy(task: u64) -> Option<(u32, u64, u32)> {
+    MEMPOLICY_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .map(|p| (p.mode, p.nodemask, p.home_node))
+}
+
+/// Test accessor: retire a task's per-task tables, so a test that seeds a
+/// fake child tid does not leak it into whatever runs next.
+#[doc(hidden)]
+pub fn __test_release_task_tables(task: u64) {
+    release_task_tables(task);
+}
+
+/// Test accessor: the number of `mbind` ranges recorded for an address
+/// space scope.
+#[doc(hidden)]
+pub fn __test_mbind_range_count(scope: u64) -> usize {
+    MBIND_TABLE
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&scope))
+        .map(|r| r.len())
+        .unwrap_or(0)
+}
+
+/// Test accessor: the scope `mbind` would record under right now.
+#[doc(hidden)]
+pub fn __test_mbind_scope() -> u64 {
+    mbind_scope()
+}
+
+/// Copy the parent's task mempolicy to a new child.
+///
+/// `copy_process()` does this for EVERY child — `p->mempolicy =
+/// mpol_dup(p->mempolicy)` (`kernel/fork.c:2156`), with no CLONE_ flag
+/// guarding it, so threads inherit it just as forked processes do. It is a
+/// copy, not a share: a later `set_mempolicy(2)` in either task must not
+/// disturb the other.
+pub(crate) fn mempolicy_fork(parent_task: u64, child_task: u64) {
+    if parent_task == child_task {
+        return;
+    }
+    let mut table = MEMPOLICY_TABLE.lock();
+    let Some(map) = table.as_mut() else {
+        return;
+    };
+    let Some(inherited) = map.get(&parent_task).copied() else {
+        return;
+    };
+    map.insert(child_task, inherited);
+}
+
 /// Retire an address space's `mbind` range policies. Called from the same
 /// teardown that retires its file-backed VMA ownership and its `mseal`
 /// seals — range policies die with the mm, not with the thread that
@@ -7205,14 +7289,19 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
 /// `MPOL_BIND` / `MPOL_PREFERRED_MANY` name a node; every other mode —
 /// including interleave, which by definition names no single node — is
 /// `FUTEX_NO_NODE`.
-fn futex_mpol_node(task: u64, va: u64) -> i32 {
+fn futex_mpol_node(va: u64) -> i32 {
     const FUTEX_NO_NODE: i32 = -1;
     if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
         return FUTEX_NO_NODE;
     }
     let policy = {
+        // Keyed by address space, NOT by task: `mbind` ranges belong to the
+        // mm and are shared by every CLONE_VM thread. Taking the key as a
+        // parameter is what let a caller pass a task id into an
+        // address-space-keyed table, so it is derived here instead.
+        let scope = mbind_scope();
         let table = MBIND_TABLE.lock();
-        let Some(ranges) = table.as_ref().and_then(|m| m.get(&task)) else {
+        let Some(ranges) = table.as_ref().and_then(|m| m.get(&scope)) else {
             return FUTEX_NO_NODE;
         };
         let mut found = None;
@@ -9305,6 +9394,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // owner reference keyed to a process that has already been reaped.
     if !share_vm {
         crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+        // A child with its OWN mm carries copies of the parent's mbind range
+        // policies (`dup_mmap` -> `vma_dup_policy`). A CLONE_VM child shares
+        // the address space, and therefore the ranges, already.
+        fork_address_space_mbind_ranges(parent_as.identity(), child_as.identity());
     }
 
     // CLONE_PIDFD: mint the shared exit-state BEFORE the child is spawned.
@@ -9541,6 +9634,10 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // that dropped privilege stays dropped across fork/clone; a root
     // parent stays root. Keyed by task id, so copy unconditionally.
     uidgid_fork(parent_pid, child_tid.raw());
+    // `copy_process` duplicates the task mempolicy for EVERY child
+    // (`kernel/fork.c:2156`) — no CLONE_ flag guards it, so a thread
+    // inherits it exactly as a forked process does.
+    mempolicy_fork(parent_pid, child_tid.raw());
 
     // Namespace inheritance + CLONE_NEW* layering. A child — thread OR
     // process — shares the parent's namespaces (Linux copy_*ns), unless
