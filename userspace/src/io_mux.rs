@@ -344,6 +344,17 @@ impl FileOps for TimerFd {
     /// (`next_fire_ns == 0`) timers report `None` — the former is reported
     /// ready by `poll_readiness`, the latter has no schedule.
     fn poll_deadline(&self) -> Option<u64> {
+        // Tick first, exactly as `poll_readiness` does: without it a timer that
+        // has already elapsed but not yet been ticked still has `expirations==0`
+        // and a past `next_fire_ns`, so this would hand a caller a deadline IN
+        // THE PAST. An epoll waiter clamps its scheduler wake-up to this; a past
+        // deadline makes the scheduler wake it immediately, and if the elapsed
+        // expiry is not deliverable (EPOLLET edge already consumed) the wait
+        // re-parks and re-clamps to the same past instant — a 100%-CPU spin.
+        // After the tick an elapsed timer reports `expirations>0` (=> None,
+        // "ready now, no schedule") or has advanced `next_fire_ns` to a future
+        // instant.
+        self.tick();
         let s = self.state.lock();
         if s.next_fire_ns == 0 || s.expirations > 0 {
             None
@@ -540,4 +551,55 @@ impl FileOps for SignalFd {
         );
         Some(self.readiness.arm_persistent(id, interest, waker))
     }
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    // Regression: a parked epoll_wait clamps its scheduler wake-up to a
+    // timerfd's `poll_deadline()`. If that returns an instant already in the
+    // PAST, the scheduler wakes the waiter immediately; when the elapsed expiry
+    // is not deliverable (its EPOLLET edge was already consumed) the wait
+    // re-parks and re-clamps to the same past instant — a 100%-CPU epoll_wait
+    // livelock (kwin's greeter never presented). `poll_deadline` must tick
+    // first, so an already-elapsed one-shot folds into `expirations` and reports
+    // None ("ready now, no schedule"), never a past deadline.
+    fn smoke_timerfd_poll_deadline_never_past() -> TestResult {
+        let now = narf_scheduler::narf_time::monotonic_ns();
+
+        // One-shot armed at an ABSOLUTE deadline already in the past.
+        let elapsed = TimerFd::new();
+        elapsed.arm(1, 0);
+        match elapsed.poll_deadline() {
+            None => {}
+            Some(d) if d <= now => {
+                return TestResult::Fail("poll_deadline returned a PAST deadline (epoll spin)");
+            }
+            Some(_) => return TestResult::Fail("elapsed one-shot poll_deadline should be None"),
+        }
+        // The elapsed expiry is now counted, so it reports readable.
+        if elapsed.poll_readiness() != POLL_IN {
+            return TestResult::Fail("elapsed timer should be POLL_IN after the tick");
+        }
+
+        // A future one-shot still reports its (future) deadline to the clamp.
+        let future = TimerFd::new();
+        future.arm(now.saturating_add(60_000_000_000), 0);
+        match future.poll_deadline() {
+            Some(d) if d > now => {}
+            _ => return TestResult::Fail("future one-shot must report its future deadline"),
+        }
+
+        // A disarmed timer has no schedule.
+        if TimerFd::new().poll_deadline().is_some() {
+            return TestResult::Fail("disarmed timer must report no deadline");
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/io_mux",
+        smoke_timerfd_poll_deadline_never_past
+    );
 }
