@@ -267,6 +267,20 @@ pub const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u32 =
 pub const DRM_IOCTL_VIRTGPU_GET_CAPS: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x09, 24);
 pub const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u32 = iowr(DRM_IOCTL_BASE, DRM_COMMAND_BASE + 0x0b, 16);
 
+/// virtgpu ioctl command *numbers* (`DRM_COMMAND_BASE + n`), for dispatching by
+/// number rather than the full encoded ioctl. The DRM native context's Mesa
+/// driver sends a `resource_create_blob` struct larger than libdrm's canonical
+/// 48 bytes, so its encoded ioctl size differs — matching on the number keeps
+/// that robust (Linux's `drm_ioctl` also dispatches by number, clamping the
+/// copy to the kernel struct size).
+pub const DRM_VIRTGPU_NR_RESOURCE_CREATE_BLOB: u32 = DRM_COMMAND_BASE + 0x0a;
+
+/// `drm_virtgpu_context_set_param.param` values (libdrm `VIRTGPU_CONTEXT_PARAM_*`).
+pub const VIRTGPU_CONTEXT_PARAM_CAPSET_ID: u64 = 0x0001;
+pub const VIRTGPU_CONTEXT_PARAM_NUM_RINGS: u64 = 0x0002;
+pub const VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 0x0003;
+pub const VIRTGPU_CONTEXT_PARAM_DEBUG_NAME: u64 = 0x0004;
+
 /// `struct drm_virtgpu_map`.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -317,6 +331,24 @@ pub struct DrmVirtGpuContextInitUapi {
     pub num_params: u32,
     pub pad: u32,
     pub ctx_set_params: u64,
+}
+/// `struct drm_virtgpu_resource_create_blob` (libdrm's canonical 48-byte
+/// layout). The DRM native context's Mesa build appends extra trailing bytes,
+/// but every field NARF reads lives in these first 48 bytes and uapi only
+/// appends, so a 48-byte view is safe. `bo_handle`/`res_handle` are written
+/// back; `cmd`/`cmd_size` carry an optional ccmd for host3d(_guest) blobs.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DrmVirtGpuResourceCreateBlobUapi {
+    pub blob_mem: u32,
+    pub blob_flags: u32,
+    pub bo_handle: u32,
+    pub res_handle: u32,
+    pub size: u64,
+    pub pad: u32,
+    pub cmd_size: u32,
+    pub cmd: u64,
+    pub blob_id: u64,
 }
 /// `struct drm_virtgpu_execbuffer` (fence and syncobj fields are rejected in
 /// v1; command and BO handle pointers are copied before transport submission).

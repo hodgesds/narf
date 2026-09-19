@@ -240,6 +240,10 @@ impl FileOps for DriCardFile {
         crate::drm_ioctl_bridge::dispatch_mmap(self.index, offset, len)
     }
 
+    fn mmap_lifetime(&self, offset: u64, len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        retain_dumb_mapping(self.index, offset, len).map(|lease| lease as Arc<dyn MmapLifetime>)
+    }
+
     /// This IS a DRM master card node — hand back its index so
     /// `sys_ioctl(DRM_IOCTL_PRIME_HANDLE_TO_FD)` can export a GEM handle
     /// on this card as a fresh dma-buf fd.
@@ -257,8 +261,9 @@ impl FileOps for DriCardFile {
 /// dumb backing owns, so a client's writes land exactly where the scanout
 /// blit (SETCRTC / page-flip) reads from.
 ///
-/// The buffer memory stays owned by the Card's `DumbBacking` (freed on GEM
-/// close); this file only borrows the frames for mmap, so Drop is a no-op.
+/// The file owns one reference to the Card's `DumbBacking`. Closing the GEM
+/// handle therefore cannot recycle the frames while this dma-buf fd or one of
+/// its mappings remains live.
 #[derive(Debug)]
 pub struct PrimeDmaBufFile {
     /// Physical base of the contiguous dumb allocation.
@@ -270,6 +275,36 @@ pub struct PrimeDmaBufFile {
     /// a compositor exports its render buffer, then imports it to build a
     /// KMS framebuffer to scan out).
     gem_handle: u32,
+    /// Pins the backing from PRIME export through final fd/mapping teardown.
+    backing: Arc<DumbBackingLease>,
+}
+
+/// One reference in [`crate::drm::card::DumbBacking::refcount`].
+///
+/// A lease is shared by the exporting dma-buf file and all mappings created
+/// from it. A direct primary-node mmap receives its own lease. The final Arc
+/// drop balances the single retain that created the lease.
+#[derive(Debug)]
+struct DumbBackingLease {
+    card_index: u32,
+    gem_handle: u32,
+}
+
+impl Drop for DumbBackingLease {
+    fn drop(&mut self) {
+        crate::drm_ioctl_bridge::release_dumb_backing_ref(self.card_index, self.gem_handle);
+    }
+}
+
+fn retain_dumb_mapping(card_index: u32, offset: u64, len: usize) -> Option<Arc<DumbBackingLease>> {
+    let mode_state = crate::drm_registry::mode_state(card_index)?;
+    let gem_handle = mode_state
+        .lock()
+        .retain_dumb_backing_by_offset(offset, len)?;
+    Some(Arc::new(DumbBackingLease {
+        card_index,
+        gem_handle,
+    }))
 }
 
 impl FileOps for PrimeDmaBufFile {
@@ -307,6 +342,10 @@ impl FileOps for PrimeDmaBufFile {
         Ok((0..pages as u64).map(|i| base + i * 4096).collect())
     }
 
+    fn mmap_lifetime(&self, _offset: u64, _len: usize) -> Option<Arc<dyn MmapLifetime>> {
+        Some(Arc::clone(&self.backing) as Arc<dyn MmapLifetime>)
+    }
+
     /// This fd is an exported DRM buffer — hand back the GEM handle it
     /// wraps so `PRIME_FD_TO_HANDLE` can re-import it.
     fn as_prime_gem_handle(&self) -> Option<u32> {
@@ -321,12 +360,16 @@ impl FileOps for PrimeDmaBufFile {
 /// `None` if the handle has no dumb backing on that card.
 pub fn prime_export_fileops(card_index: u32, gem_handle: u32) -> Option<Arc<dyn FileOps>> {
     let ms = crate::drm_registry::mode_state(card_index)?;
-    let card = ms.lock();
-    let backing = card.dumb_backing(gem_handle)?;
-    Some(Arc::new(PrimeDmaBufFile {
-        phys: backing.phys,
-        byte_len: backing.byte_len,
+    let (phys, byte_len) = ms.lock().retain_dumb_backing(gem_handle)?;
+    let backing = Arc::new(DumbBackingLease {
+        card_index,
         gem_handle,
+    });
+    Some(Arc::new(PrimeDmaBufFile {
+        phys,
+        byte_len,
+        gem_handle,
+        backing,
     }))
 }
 
@@ -353,8 +396,9 @@ impl Drop for DriRenderFile {
         // pages. If the device is already gone or rejects teardown, retain
         // the backing instead: a bounded process-exit leak is preferable to a
         // host DMA use-after-free into another process's pages.
+        let ctx_id = self.virtgpu.ctx_id();
         for resource in self.virtgpu.drain_resources() {
-            crate::drm_ioctl_bridge::release_virtgpu_resource(resource);
+            crate::drm_ioctl_bridge::release_virtgpu_resource(ctx_id, resource);
         }
     }
 }
@@ -421,6 +465,13 @@ impl FileOps for DriRenderFile {
             arg,
             /*render*/ true,
         )
+    }
+
+    /// Render node for card `self.index`. Lets `sys_ioctl` service the PRIME
+    /// import/export ioctls Mesa issues on the render fd (it opens the render
+    /// node, not the card node, for its GBM/EGL context).
+    fn as_drm_render_index(&self) -> Option<u32> {
+        Some(self.index)
     }
 
     fn mmap_frames(&self, offset: u64, len: usize) -> Result<Vec<u64>, FsError> {

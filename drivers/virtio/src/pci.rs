@@ -55,6 +55,9 @@ pub enum CfgType {
     Isr = 3,
     Device = 4,
     PciCfg = 5,
+    /// Shared memory region (VirtIO 1.2 §4.1.4.7) — a `virtio_pci_cap64` with
+    /// a `shmid`. virtio-gpu uses shmid 0 as the host-visible blob window.
+    SharedMemory = 8,
 }
 
 impl CfgType {
@@ -65,9 +68,22 @@ impl CfgType {
             3 => Self::Isr,
             4 => Self::Device,
             5 => Self::PciCfg,
+            8 => Self::SharedMemory,
             _ => return None,
         })
     }
+}
+
+/// A discovered virtio shared-memory region cap (`virtio_pci_cap64`).
+#[derive(Copy, Clone, Debug)]
+pub struct VirtioShmCap {
+    pub bar: u8,
+    /// `shmid` (byte +5 of the cap): virtio-gpu host-visible window is 0.
+    pub id: u8,
+    /// 64-bit offset within the BAR.
+    pub offset: u64,
+    /// 64-bit region length.
+    pub length: u64,
 }
 
 /// One discovered virtio-PCI cap header.
@@ -130,6 +146,8 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
     let mut notify = None;
     let mut isr = None;
     let mut dev_c = None;
+    let mut shm_host_visible = None;
+    let mut cfg_type_mask = 0u32;
     // SAFETY: bounded cap-list walk.
     for hdr in unsafe { pci_cap::iter(device) }.map_err(|_| VirtioPciError::NotPcie)? {
         if hdr.id != VIRTIO_PCI_CAP_VENDOR {
@@ -152,6 +170,10 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
         // within the 256-byte config region.
         // SAFETY: Valid MMIO bounds or trusted driver environment
         let cfg_type = unsafe { cfg_read8(cfg, hdr.offset + 3) };
+        // Diagnostic: record every vendor-cap cfg_type seen, before the
+        // recognised-only `from_raw` filter, so a missing shared-memory cap
+        // (type 8) can be distinguished from a parse gap.
+        cfg_type_mask |= 1u32 << (cfg_type as u32 & 31);
         // SAFETY: same identity-mapped cfg space; +4 (bar) is within the cap.
         let bar = unsafe { cfg_read8(cfg, hdr.offset + 4) };
         // SAFETY: same cfg space; +8 (offset, u32) lies within the >=16-byte
@@ -184,6 +206,32 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
             CfgType::Isr => isr = Some(cap),
             CfgType::Device => dev_c = Some(cap),
             CfgType::PciCfg => {}
+            CfgType::SharedMemory => {
+                // virtio_pci_cap64: shmid at +5, 64-bit offset/length whose
+                // high halves are at +16 (offset_hi) and +20 (length_hi); the
+                // low halves reuse `offset`/`length` read above. Only the
+                // host-visible window (shmid 0) is needed for blob mapping.
+                // SAFETY: same identity-mapped cfg space, fields within the
+                // >=24-byte cap64 and below 0x100.
+                let id = unsafe { cfg_read8(cfg, hdr.offset + 5) };
+                // SAFETY: same cfg space; +16/+20 lie within a cap64.
+                let offset_hi = unsafe { cfg_read32(cfg, hdr.offset + 16) };
+                // SAFETY: same cfg space.
+                let length_hi = unsafe { cfg_read32(cfg, hdr.offset + 20) };
+                // virtio-gpu exposes exactly one shared-memory region — the
+                // host-visible window (shmid 1, VIRTIO_GPU_SHM_ID_HOST_VISIBLE;
+                // NOT 0, which is VIRTIO_GPU_SHM_ID_UNDEFINED). Capture the
+                // first shm cap regardless of id so the shmid numbering stays a
+                // device concern, not a transport one.
+                if shm_host_visible.is_none() {
+                    shm_host_visible = Some(VirtioShmCap {
+                        bar,
+                        id,
+                        offset: (offset as u64) | ((offset_hi as u64) << 32),
+                        length: (length as u64) | ((length_hi as u64) << 32),
+                    });
+                }
+            }
         }
     }
 
@@ -194,7 +242,53 @@ pub unsafe fn discover(device: &BusDevice) -> Result<VirtioCaps, VirtioPciError>
         notify,
         isr,
         device_cfg: dev_c,
+        shm_host_visible,
+        cfg_type_mask,
     })
+}
+
+/// Resolve the guest-physical base and byte length of a shared-memory window.
+/// The BAR base is guest-physical (assigned by firmware/QEMU), so
+/// `base + cap.offset` is the address userspace maps for a host-visible blob.
+///
+/// # Safety
+/// `device` must be the live PCIe device that produced `cap`.
+pub unsafe fn shm_window_phys(
+    device: &BusDevice,
+    cap: &VirtioShmCap,
+) -> Result<(u64, u64), VirtioPciError> {
+    // Read the BAR base registers DIRECTLY and non-destructively. We must NOT
+    // use `read_bar` here: its size-detection cycle writes 0xFFFF_FFFF into the
+    // BAR before restoring it, and on the *live* 256 MiB window that transient
+    // write makes QEMU attempt to remap the region at a bogus address
+    // (0xffffffff_........), which KVM rejects with -EINVAL. We only need the
+    // firmware/kernel-assigned base; the length comes from the cap.
+    let cfg = match device.kind {
+        narf_bus::BusKind::Pcie { cfg_phys, .. } => cfg_phys,
+        _ => return Err(VirtioPciError::NotPcie),
+    };
+    let off = 0x10u64 + (cap.bar as u64) * 4; // BAR0 config offset + bar index
+                                              // SAFETY: identity-mapped cfg space; off < 0x28 < 0x100.
+    let lo = unsafe { cfg_read32(cfg, off) };
+    let base_lo = (lo & 0xFFFF_FFF0) as u64;
+    // Memory BAR type bits [2:1]: 0b10 => 64-bit (high half in the next slot).
+    let mem64 = (lo & 0x0000_0006) == 0x0000_0004;
+    let base = if mem64 {
+        // SAFETY: same cfg space; the high slot is within the 256-byte region.
+        let hi = unsafe { cfg_read32(cfg, off + 4) } as u64;
+        (hi << 32) | base_lo
+    } else {
+        base_lo
+    };
+    // Unprogrammed BAR, or an implausible base (all-ones high half from a stray
+    // size-detect) — treat as "no window" rather than handing QEMU garbage.
+    if base_lo == 0 || (base >> 32) == 0xFFFF_FFFF {
+        return Err(VirtioPciError::BarMapFailed);
+    }
+    let base = base
+        .checked_add(cap.offset)
+        .ok_or(VirtioPciError::BarMapFailed)?;
+    Ok((base, cap.length))
 }
 
 /// Snapshot of the four caps a modern virtio-PCI driver needs.
@@ -204,6 +298,12 @@ pub struct VirtioCaps {
     pub notify: VirtioCap,
     pub isr: Option<VirtioCap>,
     pub device_cfg: Option<VirtioCap>,
+    /// The host-visible shared-memory window (virtio-gpu shmid 0), if the
+    /// device exposes one. Backs host3d mappable blob resources.
+    pub shm_host_visible: Option<VirtioShmCap>,
+    /// Diagnostic bitmask: bit N set if a vendor cap with `cfg_type == N` was
+    /// seen during the walk (bit 8 => a shared-memory cap is present).
+    pub cfg_type_mask: u32,
 }
 
 /// Mapped region for a virtio-PCI cap. Wraps `MmioRegion` + the

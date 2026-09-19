@@ -19,6 +19,7 @@ pub const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
 pub const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
 pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 pub const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: u32 = 0x0106;
+pub const VIRTIO_GPU_CMD_GET_CAPSET_INFO: u32 = 0x0108;
 pub const VIRTIO_GPU_CMD_GET_CAPSET: u32 = 0x0109;
 
 // VirGL 3D commands (VirtIO 1.2 §5.7.6.8). These commands are valid only
@@ -31,8 +32,26 @@ pub const VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
 pub const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
 pub const VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
 pub const VIRTIO_GPU_CMD_SUBMIT_3D: u32 = 0x0207;
+// Blob resources (VirtIO 1.2 §5.7.6) — valid when VIRTIO_GPU_F_RESOURCE_BLOB
+// was negotiated. Required by the DRM native context (capset 6): the guest
+// Mesa driver (e.g. radeonsi-over-virtio) allocates its buffer objects as blob
+// resources rather than classic VirGL 3D resources.
+//
+// NOTE the split across the two command groups (verified against the host's
+// `/usr/include/linux/virtio_gpu.h`): CREATE_BLOB/SET_SCANOUT_BLOB live in the
+// 2D group right after RESOURCE_ASSIGN_UUID (0x010b), while MAP_BLOB/UNMAP_BLOB
+// live in the 3D group right after SUBMIT_3D (0x0207). Using 0x0208 for
+// CREATE_BLOB (as if it followed SUBMIT_3D) makes the host execute MAP_BLOB
+// instead — "resource_map_blob: resource does not exist".
+pub const VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB: u32 = 0x010C;
+pub const VIRTIO_GPU_CMD_SET_SCANOUT_BLOB: u32 = 0x010D;
+pub const VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB: u32 = 0x0208;
+pub const VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB: u32 = 0x0209;
 
 pub const HDR_LEN: usize = 24;
+
+/// ctrl_hdr.flags bit: `ring_idx` (byte at offset 20) is meaningful.
+pub const VIRTIO_GPU_FLAG_INFO_RING_IDX: u32 = 1 << 1;
 
 // ── Header (VirtIO 1.2 §5.7.6.7) ───────────────────────────────────
 
@@ -81,6 +100,39 @@ pub fn build_get_capset(out: &mut [u8], capset_id: u32, capset_version: u32) {
     put_hdr(out, VIRTIO_GPU_CMD_GET_CAPSET, 0, 0, 0);
     out[24..28].copy_from_slice(&capset_id.to_le_bytes());
     out[28..32].copy_from_slice(&capset_version.to_le_bytes());
+}
+
+// ── GET_CAPSET_INFO (§5.7.6.8) ─────────────────────────────────────
+// Request body: u32 capset_index, u32 padding.
+// Response `virtio_gpu_resp_capset_info`: hdr(24) + u32 capset_id +
+// u32 capset_max_version + u32 capset_max_size + u32 padding = 40 bytes.
+
+pub const GET_CAPSET_INFO_LEN: usize = HDR_LEN + 8;
+pub const RESP_CAPSET_INFO_LEN: usize = HDR_LEN + 16;
+
+pub fn build_get_capset_info(out: &mut [u8], capset_index: u32) {
+    put_hdr(out, VIRTIO_GPU_CMD_GET_CAPSET_INFO, 0, 0, 0);
+    out[24..28].copy_from_slice(&capset_index.to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes()); // padding
+}
+
+/// Parsed body of a `virtio_gpu_resp_capset_info` (the fields after the
+/// 24-byte ctrl header).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct CapsetInfo {
+    pub capset_id: u32,
+    pub capset_max_version: u32,
+    pub capset_max_size: u32,
+}
+
+/// Read the capset-info body from a response buffer whose ctrl header has
+/// already been validated as `RESP_OK_CAPSET_INFO`.
+pub fn read_capset_info(buf: &[u8]) -> CapsetInfo {
+    CapsetInfo {
+        capset_id: u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]]),
+        capset_max_version: u32::from_le_bytes([buf[28], buf[29], buf[30], buf[31]]),
+        capset_max_size: u32::from_le_bytes([buf[32], buf[33], buf[34], buf[35]]),
+    }
 }
 
 // ── RESOURCE_CREATE_2D (§5.7.6.8) ──────────────────────────────────
@@ -268,11 +320,15 @@ pub fn decode_resource_flush(buf: &[u8]) -> ResourceFlush {
 pub const CTX_CREATE_BODY: usize = 72;
 pub const CTX_CREATE_LEN: usize = HDR_LEN + CTX_CREATE_BODY;
 
-pub fn build_ctx_create(out: &mut [u8], ctx_id: u32, debug_name: &[u8]) {
+/// `context_init` selects the context's capability set: 0 for the host's
+/// default (classic VirGL), or a capset id in its low byte
+/// (`VIRTIO_GPU_CONTEXT_INIT_CAPSET_ID_MASK`) — e.g. 6 for the DRM native
+/// context. Linux fills this from `VIRTGPU_CONTEXT_PARAM_CAPSET_ID`.
+pub fn build_ctx_create(out: &mut [u8], ctx_id: u32, context_init: u32, debug_name: &[u8]) {
     assert!(debug_name.len() <= 64);
     put_hdr(out, VIRTIO_GPU_CMD_CTX_CREATE, 0, 0, ctx_id);
     out[24..28].copy_from_slice(&(debug_name.len() as u32).to_le_bytes());
-    out[28..32].copy_from_slice(&0u32.to_le_bytes()); // context_init
+    out[28..32].copy_from_slice(&context_init.to_le_bytes());
     out[32..96].fill(0);
     out[32..32 + debug_name.len()].copy_from_slice(debug_name);
 }
@@ -344,12 +400,82 @@ pub fn build_resource_create_3d(out: &mut [u8], ctx_id: u32, r: ResourceCreate3D
 /// The command stream immediately follows the 8-byte submit body.
 pub const SUBMIT_3D_PREFIX_LEN: usize = HDR_LEN + 8;
 
-pub fn build_submit_3d(out: &mut [u8], ctx_id: u32, commands: &[u8]) {
+/// `ring_idx` selects the context's command ring (native contexts use per-ring
+/// submission). `Some(r)` sets `VIRTIO_GPU_FLAG_INFO_RING_IDX` + the ring byte;
+/// `None` submits on the default ring (classic VirGL).
+pub fn build_submit_3d(out: &mut [u8], ctx_id: u32, ring_idx: Option<u8>, commands: &[u8]) {
     assert!(out.len() >= SUBMIT_3D_PREFIX_LEN + commands.len());
-    put_hdr(out, VIRTIO_GPU_CMD_SUBMIT_3D, 0, 0, ctx_id);
+    let flags = if ring_idx.is_some() {
+        VIRTIO_GPU_FLAG_INFO_RING_IDX
+    } else {
+        0
+    };
+    put_hdr(out, VIRTIO_GPU_CMD_SUBMIT_3D, flags, 0, ctx_id);
+    if let Some(r) = ring_idx {
+        // ctrl_hdr.ring_idx is the first byte of the 4-byte padding region.
+        out[20] = r;
+    }
     out[24..28].copy_from_slice(&(commands.len() as u32).to_le_bytes());
     out[28..32].copy_from_slice(&0u32.to_le_bytes());
     out[32..32 + commands.len()].copy_from_slice(commands);
+}
+
+/// `RESOURCE_CREATE_BLOB` fixed header length (before the inline mem-entry
+/// array). Wire layout after the 24-byte ctrl header:
+///   u32 resource_id, u32 blob_mem, u32 blob_flags, u32 nr_entries,
+///   u64 blob_id, u64 size, then nr_entries × { u64 addr, u32 len, u32 pad }.
+pub const RESOURCE_CREATE_BLOB_HDR_LEN: usize = HDR_LEN + 32;
+
+/// One guest memory-backing entry: physical `addr` and byte `length`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MemEntry {
+    pub addr: u64,
+    pub length: u32,
+}
+
+/// Build a `RESOURCE_CREATE_BLOB` command with an inline mem-entry array.
+/// `ctx_id` is the owning 3D context for host3d(_guest) blobs (0 for a pure
+/// guest blob). Returns the total command length written.
+// The blob-create wire command genuinely carries this many independent fields.
+#[allow(clippy::too_many_arguments)]
+pub fn build_resource_create_blob(
+    out: &mut [u8],
+    ctx_id: u32,
+    resource_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    entries: &[MemEntry],
+) -> usize {
+    let total = RESOURCE_CREATE_BLOB_HDR_LEN + entries.len() * 16;
+    assert!(out.len() >= total);
+    put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, 0, 0, ctx_id);
+    out[24..28].copy_from_slice(&resource_id.to_le_bytes());
+    out[28..32].copy_from_slice(&blob_mem.to_le_bytes());
+    out[32..36].copy_from_slice(&blob_flags.to_le_bytes());
+    out[36..40].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    out[40..48].copy_from_slice(&blob_id.to_le_bytes());
+    out[48..56].copy_from_slice(&size.to_le_bytes());
+    for (i, e) in entries.iter().enumerate() {
+        let base = RESOURCE_CREATE_BLOB_HDR_LEN + i * 16;
+        out[base..base + 8].copy_from_slice(&e.addr.to_le_bytes());
+        out[base + 8..base + 12].copy_from_slice(&e.length.to_le_bytes());
+        out[base + 12..base + 16].copy_from_slice(&0u32.to_le_bytes());
+    }
+    total
+}
+
+/// `RESOURCE_MAP_BLOB` maps a host3d blob into the host-visible window at
+/// `offset`. Wire body after the header: u32 resource_id, u32 padding,
+/// u64 offset. The device replies `RESP_OK_MAP_INFO` (map_info + padding).
+pub const RESOURCE_MAP_BLOB_LEN: usize = HDR_LEN + 16;
+
+pub fn build_resource_map_blob(out: &mut [u8], resource_id: u32, offset: u64) {
+    put_hdr(out, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, 0, 0, 0);
+    out[24..28].copy_from_slice(&resource_id.to_le_bytes());
+    out[28..32].copy_from_slice(&0u32.to_le_bytes()); // padding
+    out[32..40].copy_from_slice(&offset.to_le_bytes());
 }
 
 /// A 3D transfer box shared by the host-to-guest and guest-to-host commands.
