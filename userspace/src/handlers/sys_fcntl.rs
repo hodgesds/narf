@@ -30,13 +30,103 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     let arg = args.arg2;
     let task = current_task_id();
 
-    // F_SETFL on a socket: mirror O_NONBLOCK into the SocketFile so
-    // recv/send/accept/connect see the flag.
-    if cmd == F_SETFL {
-        if let Some(sock) = current_socket(fd) {
-            sock.set_nonblock((arg as u32) & crate::socket::O_NONBLOCK != 0);
+    // Linux's hot F_GETFL path is `fdget_raw(fd)` followed by a load of
+    // `file::f_flags`. Keep the same shape here: resolve the descriptor once,
+    // read its shared-description flags, and inspect socket/mqueue state
+    // through the borrowed FileOps object. The old generic path first called
+    // `current_socket` and `mqueue::fd_nonblock`, then called `with_table`
+    // again. Besides three table lookups, `current_socket` cloned the shared
+    // stdio FileOps Arc on every call, making unrelated workers contend on one
+    // reference-count cache line.
+    if cmd == F_GETFL {
+        let snapshot = fd::with_table(task, |table| {
+            let entry = table.get(fd)?;
+            let flags = table.status_flags(fd)? as u64;
+            let socket_nonblock = entry
+                .ops
+                .as_any()
+                .and_then(|ops| ops.downcast_ref::<crate::socket::SocketFile>())
+                .map(|socket| socket.is_nonblock());
+            Some((flags, socket_nonblock, entry.ops.mq_queue_id()))
+        })
+        .flatten();
+
+        let Some((mut flags, socket_nonblock, mqueue_id)) = snapshot else {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        };
+        if let Some(nonblock) = socket_nonblock {
+            if nonblock {
+                flags |= crate::socket::O_NONBLOCK as u64;
+            } else {
+                flags &= !(crate::socket::O_NONBLOCK as u64);
+            }
         }
-        crate::mqueue::set_fd_nonblock(task, fd, (arg as u32) & crate::fd::O_NONBLOCK != 0);
+        // Do not nest the mqueuefs lock under the fd-table lock. Other mqueue
+        // operations may reach the same objects in the opposite direction.
+        if let Some(nonblock) = mqueue_id
+            .and_then(|id| narf_filesystem::mqueuefs::is_nonblock(id).ok())
+        {
+            if nonblock {
+                flags |= crate::fd::O_NONBLOCK as u64;
+            } else {
+                flags &= !(crate::fd::O_NONBLOCK as u64);
+            }
+        }
+        ctx.set_return(SyscallReturn::ok(flags));
+        return;
+    }
+
+    if cmd == F_SETFL {
+        let mask = crate::fd::O_SETFL_MASK;
+        let new = (arg as u32) & mask;
+        let ops = fd::with_table(task, |table| {
+            let entry = table.get(fd)?;
+            let old = table.status_flags(fd)?;
+            // fcntl's syscall entry rejects every command except the small
+            // `check_fcntl_cmd` whitelist on an FMODE_PATH file. F_SETFL is
+            // therefore EBADF, even though F_GETFL above is allowed to report
+            // O_PATH in the shared status word.
+            if old & crate::fd::O_PATH != 0 {
+                return None;
+            }
+            // Pin the open file across the mirror updates below. This matches
+            // Linux's fdget_raw lifetime if a CLONE_FILES sibling closes the
+            // descriptor concurrently, and prevents returning EBADF after
+            // already changing socket or mqueue state.
+            let ops = entry.ops.clone();
+            table.set_status_flags(fd, (old & !mask) | new)?;
+            Some(ops)
+        })
+        .flatten();
+
+        let Some(ops) = ops else {
+            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            return;
+        };
+        if let Some(socket) = ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::socket::SocketFile>())
+        {
+            socket.set_nonblock(new & crate::socket::O_NONBLOCK != 0);
+        }
+        if let Some(id) = ops.mq_queue_id() {
+            let _ = narf_filesystem::mqueuefs::set_nonblock(
+                id,
+                new & crate::fd::O_NONBLOCK != 0,
+            );
+        }
+        // `fs/pipe.c::is_packetized` re-reads `filp->f_flags` on every
+        // write, so O_DIRECT set (or cleared) here changes subsequent packet
+        // framing rather than merely changing what F_GETFL reports.
+        if let Some(pipe) = ops
+            .as_any()
+            .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
+        {
+            pipe.set_packetized(new & crate::fd::O_DIRECT != 0);
+        }
+        ctx.set_return(SyscallReturn::ok(0));
+        return;
     }
 
     // F_DUPFD / F_DUPFD_CLOEXEC: dup oldfd into the lowest free slot
@@ -90,6 +180,30 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
             }
             return;
+        }
+    }
+
+    // Linux applies its FMODE_PATH command gate after fdget_raw and before
+    // do_fcntl dispatch. F_GETFL/F_SETFL and the dup commands have already
+    // returned above; of the commands that reach this point, only the
+    // descriptor-local CLOEXEC pair is legal on an O_PATH description.
+    if cmd != F_GETFD && cmd != F_SETFD {
+        let path_only = fd::with_table(task, |table| {
+            table
+                .status_flags(fd)
+                .map(|flags| flags & crate::fd::O_PATH != 0)
+        })
+        .flatten();
+        match path_only {
+            None => {
+                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                return;
+            }
+            Some(true) => {
+                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                return;
+            }
+            Some(false) => {}
         }
     }
 
@@ -462,63 +576,14 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         }
     }
 
-    // Resolve any socket-side flag BEFORE entering the fd-table
-    // closure — `current_socket` itself locks the table, which would
-    // re-enter and deadlock if called from inside `with_table`.
-    let sock_nb = current_socket(fd).map(|s| s.is_nonblock());
-    let mq_nb = crate::mqueue::fd_nonblock(task, fd);
-
     let outcome = fd::with_table(task, |t| {
         let entry = t.get(fd)?;
         Some(match cmd {
-            F_GETFD => SyscallReturn::ok(entry.flags as u64),
+            F_GETFD => SyscallReturn::ok((entry.flags & crate::fd::FD_CLOEXEC) as u64),
             F_SETFD => {
-                t.get_mut(fd)?.flags = arg as u32;
-                SyscallReturn::ok(0)
-            }
-            // F_GETFL: report the per-fd status_flags. Socket
-            // O_NONBLOCK overrides the bit if the SocketFile carries
-            // its own nonblock toggle (kept in sync via F_SETFL).
-            F_GETFL => {
-                let mut v = t.status_flags(fd)? as u64;
-                if let Some(nb) = sock_nb {
-                    if nb {
-                        v |= crate::socket::O_NONBLOCK as u64;
-                    } else {
-                        v &= !(crate::socket::O_NONBLOCK as u64);
-                    }
-                }
-                if let Some(nb) = mq_nb {
-                    if nb {
-                        v |= crate::fd::O_NONBLOCK as u64;
-                    } else {
-                        v &= !(crate::fd::O_NONBLOCK as u64);
-                    }
-                }
-                SyscallReturn::ok(v)
-            }
-            // F_SETFL: only the settable subset (O_NONBLOCK | O_APPEND
-            // | O_DIRECT) is honoured. Access-mode bits are ignored.
-            F_SETFL => {
-                let mask = crate::fd::O_SETFL_MASK;
-                let new = (arg as u32) & mask;
-                let old = t.status_flags(fd)?;
-                // Clone the handle out before the mutable `set_status_flags`
-                // borrow so the pipe update below can still reach it.
-                let ops = entry.ops.clone();
-                t.set_status_flags(fd, (old & !mask) | new)?;
-                // `fs/pipe.c::is_packetized` re-reads `filp->f_flags` on every
-                // write, so O_DIRECT set (or cleared) here changes the framing
-                // of subsequent writes. Storing it only in `status_flags` would
-                // let F_GETFL report packet mode on a pipe that kept writing a
-                // byte stream — the read end would then find no record
-                // boundaries where the writer believed it had made them.
-                if let Some(pipe) = ops
-                    .as_any()
-                    .and_then(|any| any.downcast_ref::<crate::pipe::PipeWrite>())
-                {
-                    pipe.set_packetized(new & crate::fd::O_DIRECT != 0);
-                }
+                // `set_close_on_exec(fd, argi & FD_CLOEXEC)`: unknown bits
+                // are ignored and must never reappear through F_GETFD.
+                t.get_mut(fd)?.flags = (arg as u32) & crate::fd::FD_CLOEXEC;
                 SyscallReturn::ok(0)
             }
             // F_GETPIPE_SZ (1032) / F_SETPIPE_SZ (1031): report or resize the

@@ -275,6 +275,13 @@ sockets, rights are associated with the first byte of their `sendmsg`; they are
 delivered only by a receive that reaches that byte, and an ordinary
 `read`/`recv` consumes and discards them rather than exposing them to a later
 `recvmsg`.
+Linux-compatible `fcntl(2)` resolves the descriptor before command dispatch,
+so a closed descriptor returns `EBADF` even for an unknown command; an unknown
+command on a live non-`O_PATH` descriptor returns `EINVAL`. An `O_PATH`
+description accepts only Linux's path-safe command whitelist; other commands
+return `EBADF`. `F_GETFL` reads status from the shared open-file description.
+`F_SETFD` retains only `FD_CLOEXEC`, silently ignores all other argument bits,
+and `F_GETFD` reports only that retained bit.
 Epoll readiness callbacks run without holding the parent epoll instance lock,
 including during edge-state write-back for nested epoll sets.
 Epoll interest records retain a weak reference to the watched open file

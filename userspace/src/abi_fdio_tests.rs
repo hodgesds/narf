@@ -474,13 +474,21 @@ fn smoke_abi_fdio_fcntl_pos() -> TestResult {
         const F_SETFD: u64 = 2;
         const F_GETFD: u64 = 1;
         const FD_CLOEXEC: i64 = 1;
-        // F_SETFD sets FD_CLOEXEC → 0; F_GETFD reads it back.
-        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 1)) != Some(0) {
+        // Linux stores only `argi & FD_CLOEXEC`; every other bit is ignored
+        // rather than retained in the per-descriptor flag word.
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, u64::MAX)) != Some(0) {
             return Err("F_SETFD did not return 0");
         }
         match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) {
             Some(v) if v == FD_CLOEXEC => Ok(()),
             _ => Err("F_GETFD did not read back FD_CLOEXEC"),
+        }?;
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 2)) != Some(0) {
+            return Err("F_SETFD did not ignore an unknown flag bit");
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("F_GETFD exposed an unknown F_SETFD flag bit"),
         }
     })
 }
@@ -3751,6 +3759,33 @@ kernel_test_in!(
     "syscall_abi/vmsplice",
     smoke_abi_fdio_vmsplice_bad_mode_precedes_iovec
 );
+
+/// `SYSCALL_DEFINE3(fcntl)` admits only Linux's `check_fcntl_cmd` whitelist
+/// for an FMODE_PATH description. In particular F_GETFL may report O_PATH,
+/// but F_SETFL and an unknown command both fail with EBADF rather than EINVAL.
+fn smoke_abi_fdio_fcntl_opath_command_gate() -> TestResult {
+    const O_PATH: u64 = 0o10000000;
+    const O_NONBLOCK: u64 = 0o4000;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_SETFL: u64 = 4;
+    with_memfs("/abi-fcntl-path", "abi-fcntl-path", &[("f", b"x")], || {
+        let fd = open_fd_flags(b"/abi-fcntl-path/f\0", O_PATH)?;
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFL, O_NONBLOCK)) != Some(EBADF) {
+            return Err("F_SETFL on O_PATH did not return EBADF");
+        }
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, 9999, 0)) != Some(EBADF) {
+            return Err("unknown fcntl command on O_PATH did not return EBADF");
+        }
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 1)) != Some(0)
+            || call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) != Some(1)
+        {
+            return Err("O_PATH rejected the descriptor-flag command whitelist");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_opath_command_gate);
 
 /// Named FIFOs use the same pipe-to-user observe/copy/commit rule as
 /// anonymous pipes. A fault after one completed iovec returns that prefix and
