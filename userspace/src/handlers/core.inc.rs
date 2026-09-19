@@ -6893,8 +6893,20 @@ static MEMPOLICY_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, StoredPolicy>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-/// Per-task range policies (mbind), keyed by (task, range-start); each
-/// entry covers `[start, start+len)`.
+/// Range policies (mbind), keyed by ADDRESS-SPACE identity; each entry
+/// covers `[start, start+len)`.
+///
+/// Linux keeps these in `vma->vm_policy` (`mm/mempolicy.c:1029`), which
+/// lives in `mm_struct`. `CLONE_VM` shares that mm outright
+/// (`kernel/fork.c:1579-1581`: `mmget(oldmm); mm = oldmm;`), so every
+/// thread of a process sees ONE set of range policies, and the set
+/// outlives whichever thread happened to call `mbind`. Keying by task id
+/// would give each thread a private set and would retire the ranges when
+/// that thread exited while its siblings still shared the mm.
+///
+/// Contrast `MEMPOLICY_TABLE`, which is correctly per-task: `set_mempolicy`
+/// writes `current->mempolicy` (`mm/mempolicy.c:1091-1092`) and every clone
+/// takes its own copy (`kernel/fork.c:2156`).
 #[allow(clippy::type_complexity)]
 static MBIND_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<u64, alloc::vec::Vec<(u64, u64, StoredPolicy)>>>,
@@ -7129,13 +7141,43 @@ fn mpol_initial_nodemask_valid(mode: u32, nodemask: u64, allowed: u64) -> bool {
     nodemask == 0 || mode & MPOL_F_RELATIVE_NODES != 0 || nodemask & allowed != 0
 }
 
-/// Resolve the policy in force for `task` at user address `va`: a
-/// covering mbind range wins, else the task default, else DEFAULT.
+/// Identity of the address space that owns `mbind` range policies.
+///
+/// The same key `mapped_file` and `mseal` use, retired through the same
+/// address-space drop hook, so a stale entry can never be inherited by a
+/// later address space.
+///
+/// Zero when no address space is installed. That is the reserved
+/// "unassigned" sentinel (`allocate_address_space_id` hands out 1 and up),
+/// so it can never collide with a live address space — it exists for the
+/// ABI harness, which installs no per-task AS and would otherwise have no
+/// stable key to store a binding under and read it back from.
+fn mbind_scope() -> u64 {
+    current_address_space()
+        .map(|space| space.identity())
+        .unwrap_or(0)
+}
+
+/// Retire an address space's `mbind` range policies. Called from the same
+/// teardown that retires its file-backed VMA ownership and its `mseal`
+/// seals — range policies die with the mm, not with the thread that
+/// happened to call `mbind`.
+pub(crate) fn drop_address_space_mbind_ranges(address_space_id: u64) {
+    if let Some(m) = MBIND_TABLE.lock().as_mut() {
+        m.remove(&address_space_id);
+    }
+}
+
+/// Resolve the policy in force at user address `va`: a covering mbind range
+/// (address-space scoped) wins, else `task`'s default, else DEFAULT.
 fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
     if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
         return StoredPolicy::DEFAULT;
     }
-    if let Some(ranges) = MBIND_TABLE.lock().as_ref().and_then(|m| m.get(&task)) {
+    // Range policies belong to the address space, not the calling thread, so
+    // a CLONE_VM sibling resolves the same binding the `mbind` caller set.
+    let scope = mbind_scope();
+    if let Some(ranges) = MBIND_TABLE.lock().as_ref().and_then(|m| m.get(&scope)) {
         for &(start, len, pol) in ranges.iter() {
             if va >= start && va < start.saturating_add(len) {
                 return pol;
@@ -11137,11 +11179,11 @@ fn release_task_tables(tid: u64) {
     remove_mount_namespace(tid);
     crate::mqueue::release_task_fd_paths(tid);
 
-    // Memory policy.
+    // Memory policy. `MBIND_TABLE` is deliberately NOT retired here: range
+    // policies are keyed by address space and die with it
+    // (`drop_address_space_mbind_ranges`), because CLONE_VM siblings still
+    // share them after this thread exits.
     if let Some(m) = MEMPOLICY_TABLE.lock().as_mut() {
-        m.remove(&tid);
-    }
-    if let Some(m) = MBIND_TABLE.lock().as_mut() {
         m.remove(&tid);
     }
     if let Some(m) = INTERLEAVE_INDEX_TABLE.lock().as_mut() {

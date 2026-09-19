@@ -25,9 +25,11 @@ pub(crate) fn sys_set_mempolicy_home_node(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     };
-    let task = current_task_id();
+    // Home-node anchors live on the same range policies `mbind` installed,
+    // which are keyed by address space rather than by the calling thread.
+    let scope = mbind_scope();
     let mut changed = false;
-    if let Some(ranges) = MBIND_TABLE.lock().as_mut().and_then(|m| m.get_mut(&task)) {
+    if let Some(ranges) = MBIND_TABLE.lock().as_mut().and_then(|m| m.get_mut(&scope)) {
         let old = core::mem::take(ranges);
         let mut updated = alloc::vec::Vec::with_capacity(old.len() + 2);
         let mut iter = old.into_iter();

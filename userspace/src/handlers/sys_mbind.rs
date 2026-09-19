@@ -2,8 +2,10 @@
 use super::*;
 
 /// `mbind(addr, len, mode, nodemask, maxnode, flags)` — bind a range to
-/// a NUMA policy. Stored per (task, range); the fault path consults it
-/// via `resolve_policy` so the binding is enforced on demand-fault.
+/// a NUMA policy. Stored per (address space, range); the fault path
+/// consults it via `resolve_policy` so the binding is enforced on
+/// demand-fault. Linux stores it in `vma->vm_policy`, which CLONE_VM
+/// threads share, so the range table is keyed by address space, not task.
 ///
 /// `mm/mempolicy.c::kernel_mbind` runs the mode check, then reads the node
 /// mask, and only then enters `do_mbind` where the flag word is judged:
@@ -157,6 +159,9 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
             }
         }
     }
+    // Range policies live in the address space (Linux: `vma->vm_policy`),
+    // so a CLONE_VM sibling sees this binding and it survives this thread.
+    let scope = mbind_scope();
     {
         // Publish possibility before the table mutation. Readers may take the
         // slow path before this binding is visible, but cannot skip it after
@@ -164,7 +169,7 @@ pub(crate) fn sys_mbind(ctx: &mut dyn TrapContext) {
         CUSTOM_MEMPOLICY_POSSIBLE.store(true, core::sync::atomic::Ordering::Release);
         let mut g = MBIND_TABLE.lock();
         let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
-        let ranges = map.entry(task).or_default();
+        let ranges = map.entry(scope).or_default();
         let old = core::mem::take(ranges);
         for (start, old_len, policy) in old {
             let old_end = start.saturating_add(old_len);

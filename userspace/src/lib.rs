@@ -133,6 +133,10 @@ pub fn drop_mapped_file_address_space(address_space_id: u64) {
     // its address space would seal whatever a later one happened to map at
     // the same addresses.
     handlers::drop_address_space_seals(address_space_id);
+    // `mbind` range policies are keyed by the same identity, for the same
+    // reason: they belong to the mm, so they are retired when it dies rather
+    // than when whichever thread called `mbind` exits.
+    handlers::drop_address_space_mbind_ranges(address_space_id);
 }
 
 pub use elf::{parse as parse_elf, ElfError};
