@@ -106,8 +106,11 @@ int main() {
         close(fd);
         return 1;
     }
+    // Linux reports time_enabled for the complete enabled lifetime and
+    // time_running only while the event owns a physical PMU slot. Scheduling
+    // and multiplexing may therefore make time_running smaller, never larger.
     if (stat[0] == 0 || stat[1] == 0 || stat[2] == 0 ||
-        stat[1] != stat[2] || stat[3] != id) {
+        stat[2] > stat[1] || stat[3] != id) {
         printf("perf_smoke: ERROR - invalid stat record %llu/%llu/%llu/%llu\n",
                (unsigned long long)stat[0], (unsigned long long)stat[1],
                (unsigned long long)stat[2], (unsigned long long)stat[3]);
