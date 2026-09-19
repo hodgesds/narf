@@ -1193,9 +1193,11 @@ x86_64 is rejected at runtime.
   fallibly reserves every promised vector slot before changing a PTE; ordinary
   racing additions reserve beyond those slots, and rollback or final-owner
   removal retains an empty entry while reservations remain outstanding. Each
-  shard may also retain at most 1024 empty physical keys as allocation-free
-  reuse shells; owner lookup, tracked-frame iteration, migration, swap, and
-  reuse auditing treat only non-empty owner states as mapped authority.
+  shard may also retain at most 64 empty physical keys as allocation-free reuse
+  shells. Sparse high-water tables shrink geometrically; allocation failure
+  merely defers the shrink and cannot fail unmap. Owner lookup, tracked-frame
+  iteration, migration, swap, and reuse auditing treat only non-empty owner
+  states as mapped authority.
 - The x86 user not-present demand-fault installer publishes a fresh leaf
   without `INVLPG`, matching Linux's not-present-to-present rule. No stale
   present translation can exist because every older-leaf retirement still

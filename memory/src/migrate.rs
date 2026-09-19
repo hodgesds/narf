@@ -1127,8 +1127,25 @@ mod tests {
                     "direct_compact must no-op (uncounted) with interrupts masked",
                 );
             }
+            // The kernel-test harness deliberately reaches this suite before
+            // enabling the BSP's interrupt flag. Temporarily unmask here so
+            // the positive case exercises direct_compact's sleepable-context
+            // path, then restore the exact state before making assertions or
+            // returning to the next test. The interrupt controller and IDT
+            // are already initialized at this point.
+            let irqs_were_enabled = narf_arch::interrupts_enabled();
+            if !irqs_were_enabled {
+                // SAFETY: the test holds no IRQ-safe lock, and boot has already
+                // initialized the IDT and interrupt controller.
+                unsafe { narf_arch::enable_interrupts() };
+            }
             // Order 1: migrate the movable page out, consolidating the block.
-            if direct_compact(node, 1) != 1 {
+            let migrated = direct_compact(node, 1);
+            if !irqs_were_enabled {
+                // SAFETY: restore the kernel-test harness's incoming IRQ state.
+                unsafe { narf_arch::disable_interrupts() };
+            }
+            if migrated != 1 {
                 return TestResult::Fail("direct_compact should migrate the one movable page");
             }
             if direct_compact_events() != ev0 + 1 || direct_compact_pages() != pg0 + 1 {

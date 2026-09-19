@@ -40,11 +40,12 @@ pub struct Owner {
 // to one shard, but unrelated frames on other CPUs no longer contend on a
 // single lock.
 const RMAP_SHARDS: usize = 64;
-/// Retain a bounded high-water set of empty keys in each shard. Anonymous
+/// Retain a bounded hot set of empty keys in each shard. Anonymous
 /// teardown commonly returns the same physical frames that the next mapping
 /// consumes; keeping their occupied hash slots avoids reinsertion work without
 /// letting reusable empty metadata grow with total machine RAM.
-const RETAINED_EMPTY_KEYS_PER_SHARD: usize = 1024;
+const RETAINED_EMPTY_KEYS_PER_SHARD: usize = 64;
+const RMAP_INITIAL_CAPACITY: usize = 16;
 
 #[repr(align(64))]
 struct RmapShard {
@@ -270,18 +271,34 @@ impl RmapTable {
         first_tombstone.expect("rmap table has no insertion slot")
     }
 
+    fn replace_slots(&mut self, slots: Vec<RmapSlot>) -> Vec<RmapSlot> {
+        debug_assert!(slots.len().is_power_of_two());
+        let mut old = core::mem::replace(&mut self.slots, slots);
+        self.len = 0;
+        self.tombstones = 0;
+        for slot in &mut old {
+            if let RmapSlot::Occupied { key, owners } = core::mem::replace(slot, RmapSlot::Vacant) {
+                self.insert_rehashed(key, owners);
+            }
+        }
+        old
+    }
+
     fn rehash(&mut self, capacity: usize) {
         debug_assert!(capacity.is_power_of_two());
         let mut slots = Vec::with_capacity(capacity);
         slots.resize_with(capacity, || RmapSlot::Vacant);
-        let old = core::mem::replace(&mut self.slots, slots);
-        self.len = 0;
-        self.tombstones = 0;
-        for slot in old {
-            if let RmapSlot::Occupied { key, owners } = slot {
-                self.insert_rehashed(key, owners);
-            }
+        drop(self.replace_slots(slots));
+    }
+
+    fn try_empty_slots(capacity: usize) -> Option<Vec<RmapSlot>> {
+        debug_assert!(capacity.is_power_of_two());
+        let mut slots = Vec::new();
+        if slots.try_reserve_exact(capacity).is_err() {
+            return None;
         }
+        slots.resize_with(capacity, || RmapSlot::Vacant);
+        Some(slots)
     }
 
     fn insert_rehashed(&mut self, key: u64, owners: OwnerList) {
@@ -291,9 +308,8 @@ impl RmapTable {
     }
 
     fn prepare_insert(&mut self) {
-        const INITIAL_CAPACITY: usize = 16;
         if self.slots.is_empty() {
-            self.rehash(INITIAL_CAPACITY);
+            self.rehash(RMAP_INITIAL_CAPACITY);
             return;
         }
         // Keep at least 25% truly-vacant slots so a missing-key probe stays
@@ -312,6 +328,29 @@ impl RmapTable {
             };
             self.rehash(capacity);
         }
+    }
+
+    fn minimum_capacity(len: usize) -> usize {
+        let mut capacity = RMAP_INITIAL_CAPACITY;
+        while len.saturating_add(1) >= capacity - capacity / 4 {
+            capacity = capacity
+                .checked_mul(2)
+                .expect("rmap table capacity overflow");
+        }
+        capacity
+    }
+
+    fn shrink_target(&self) -> Option<usize> {
+        let capacity = self.slots.len();
+        if capacity <= RMAP_INITIAL_CAPACITY {
+            return None;
+        }
+        let all_empty = self.len == self.retained_empty;
+        if !all_empty && self.len > capacity / 8 {
+            return None;
+        }
+        let target = Self::minimum_capacity(self.len);
+        (target < capacity).then_some(target)
     }
 
     fn get(&self, key: u64) -> Option<&OwnerList> {
@@ -460,23 +499,57 @@ pub fn remove(phys: PhysAddr, root: PhysAddr, va: VirtAddr) {
         return;
     }
     let owner = Owner { root, va };
-    let mut g = RMAP[shard(key)].map.lock();
-    if let Some(map) = g.as_mut() {
-        let became_empty = if let Some(list) = map.get_mut(key) {
-            let was_nonempty = list.len() != 0;
-            list.remove(owner);
-            was_nonempty && list.len() == 0 && list.reserved == 0
-        } else {
-            false
-        };
-        if became_empty {
-            if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
-                map.retained_empty += 1;
+    let shard_index = shard(key);
+    let shrink_target = {
+        let mut g = RMAP[shard_index].map.lock();
+        g.as_mut().and_then(|map| {
+            let became_empty = if let Some(list) = map.get_mut(key) {
+                let was_nonempty = list.len() != 0;
+                list.remove(owner);
+                was_nonempty && list.len() == 0 && list.reserved == 0
             } else {
-                map.remove(key);
+                false
+            };
+            if became_empty {
+                if map.retained_empty < RETAINED_EMPTY_KEYS_PER_SHARD {
+                    map.retained_empty += 1;
+                } else {
+                    map.remove(key);
+                }
+                map.shrink_target()
+            } else {
+                None
             }
-        }
-    }
+        })
+    };
+
+    // Allocate with the IRQ-safe shard lock released. If allocation fails,
+    // leave the valid high-water table alone; a later removal can retry.
+    let Some(target) = shrink_target else {
+        return;
+    };
+    let Some(slots) = RmapTable::try_empty_slots(target) else {
+        return;
+    };
+
+    let mut slots = Some(slots);
+    let old = {
+        let mut g = RMAP[shard_index].map.lock();
+        g.as_mut().and_then(|map| {
+            // A racing add may have made the prepared table too small, while a
+            // racing removal may already have contracted past this target.
+            let current_target = map.shrink_target()?;
+            if current_target <= target && map.slots.len() > target {
+                Some(map.replace_slots(slots.take().expect("prepared rmap slots missing")))
+            } else {
+                None
+            }
+        })
+    };
+    // Deallocation may re-enter the heap, so release it outside the IRQ-safe
+    // shard lock just like the allocation above.
+    drop(slots);
+    drop(old);
 }
 
 /// Allocation-free exact-owner membership check.
@@ -699,10 +772,10 @@ mod tests {
         __reset_for_test();
         let root = PhysAddr::new(0x1000);
         let va = VirtAddr::new(0x4000_0000);
-        let count = RETAINED_EMPTY_KEYS_PER_SHARD + 2;
-        // Keep every key in shard 7 while forcing two last-owner removals past
-        // the retention ceiling. Those become tombstones, not probe-chain
-        // terminators.
+        const HIGH_WATER_KEYS: usize = 512;
+        let count = HIGH_WATER_KEYS.max(RETAINED_EMPTY_KEYS_PER_SHARD + 2);
+        // Keep every key in shard 7 and grow its table to the 1024-slot
+        // high-water observed after a populated 128 MiB process exited.
         for index in 0..count {
             let pfn = 7 + index as u64 * super::RMAP_SHARDS as u64;
             add(PhysAddr::new(pfn << 12), root, va);
@@ -715,7 +788,7 @@ mod tests {
         let bounded = RMAP[shard].map.lock().as_ref().is_some_and(|table| {
             table.retained_empty == RETAINED_EMPTY_KEYS_PER_SHARD
                 && table.len == RETAINED_EMPTY_KEYS_PER_SHARD
-                && table.tombstones >= 2
+                && table.slots.len() == 128
         });
         let mut reported = false;
         for_each_tracked_frame(|_| reported = true);
@@ -723,7 +796,7 @@ mod tests {
         if bounded && !reported {
             TestResult::Pass
         } else {
-            TestResult::Fail("rmap empty-key retention exceeded its bound")
+            TestResult::Fail("rmap empty-key table did not shrink after teardown")
         }
     }
     kernel_test_in!("memory/rmap", smoke_rmap_retained_empty_keys_are_bounded);

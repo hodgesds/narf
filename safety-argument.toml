@@ -1159,3 +1159,11 @@ argument = "Successful x86 exec overwrites the current task's aligned, task-owne
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "A poll-time exec replacement remains strongly owned by the active address-space handoff and the task slot while hardware can reference its page tables. The extra deferred slot owner is consumed by the next dispatch only for a pending task; normal completion and every abnormal reap now remove it before the slot is destroyed, and the test-only reset does the same after executor quiescence. Dropping this duplicate owner cannot retire a live root because the reconciled slot owner survives until hardware has returned to another strongly owned root, while a task with no future dispatch can no longer retain page tables indefinitely. Mapping authority, permissions, domains, capabilities, and task selection are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Reverse-map contraction changes only empty-key cache capacity and the allocation backing a shard's existing open-addressed index. Every live or reserved OwnerList is moved into the replacement table while the authoritative shard lock is held; rehash preserves physical-frame keys and mapping owners, clears only tombstones, and publishes no intermediate table. Shrinking is fallible and leaves the original valid table untouched on allocation failure, so unmap cannot fail or lose authority under pressure. Frame reuse, page-table replacement, cross-CPU TLB invalidation, COW ownership, mapping permissions, domain rights, and capability checks are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The direct-compaction edit is verification-only: its positive-path smoke temporarily enables interrupts only after proving the incoming test context held no IRQ-safe lock, invokes the unchanged sleepable compaction path, and restores the exact incoming interrupt state before any assertion or return. Production migration, reverse-map ownership, page-table rewrite, TLB invalidation, and source-frame release code is unchanged."
