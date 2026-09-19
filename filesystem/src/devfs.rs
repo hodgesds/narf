@@ -1995,135 +1995,135 @@ impl DirOps for DevDir {
         const ENTRIES: &[DirEntry] = &[
             // Symlinks [[devfs-symlinks]].
             DirEntry {
-                name: "fd",
+                name: alloc::borrow::Cow::Borrowed("fd"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "stdin",
+                name: alloc::borrow::Cow::Borrowed("stdin"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "stdout",
+                name: alloc::borrow::Cow::Borrowed("stdout"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "stderr",
+                name: alloc::borrow::Cow::Borrowed("stderr"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "null",
+                name: alloc::borrow::Cow::Borrowed("null"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "zero",
+                name: alloc::borrow::Cow::Borrowed("zero"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "full",
+                name: alloc::borrow::Cow::Borrowed("full"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "random",
+                name: alloc::borrow::Cow::Borrowed("random"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "urandom",
+                name: alloc::borrow::Cow::Borrowed("urandom"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "kmsg",
+                name: alloc::borrow::Cow::Borrowed("kmsg"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "console",
+                name: alloc::borrow::Cow::Borrowed("console"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "tty",
+                name: alloc::borrow::Cow::Borrowed("tty"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "tty0",
+                name: alloc::borrow::Cow::Borrowed("tty0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "tty1",
+                name: alloc::borrow::Cow::Borrowed("tty1"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "ptmx",
+                name: alloc::borrow::Cow::Borrowed("ptmx"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "fb0",
+                name: alloc::borrow::Cow::Borrowed("fb0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "uinput",
+                name: alloc::borrow::Cow::Borrowed("uinput"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "fuse",
+                name: alloc::borrow::Cow::Borrowed("fuse"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "fp0",
+                name: alloc::borrow::Cow::Borrowed("fp0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "tpm0",
+                name: alloc::borrow::Cow::Borrowed("tpm0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "tpmrm0",
+                name: alloc::borrow::Cow::Borrowed("tpmrm0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "rtc0",
+                name: alloc::borrow::Cow::Borrowed("rtc0"),
                 file_type: FileType::Special,
             },
             DirEntry {
-                name: "rtc",
+                name: alloc::borrow::Cow::Borrowed("rtc"),
                 file_type: FileType::Symlink,
             },
             DirEntry {
-                name: "pts",
+                name: alloc::borrow::Cow::Borrowed("pts"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "shm",
+                name: alloc::borrow::Cow::Borrowed("shm"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "mqueue",
+                name: alloc::borrow::Cow::Borrowed("mqueue"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "hugepages",
+                name: alloc::borrow::Cow::Borrowed("hugepages"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "disk",
+                name: alloc::borrow::Cow::Borrowed("disk"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "input",
+                name: alloc::borrow::Cow::Borrowed("input"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "snd",
+                name: alloc::borrow::Cow::Borrowed("snd"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "dri",
+                name: alloc::borrow::Cow::Borrowed("dri"),
                 file_type: FileType::Dir,
             },
         ];
         Box::new(
             ENTRIES
                 .iter()
-                .copied()
-                .filter(|entry| static_entry_visible(entry.name)),
+                .filter(|entry| static_entry_visible(&entry.name))
+                .cloned(),
         )
     }
 
@@ -2683,7 +2683,7 @@ fn smoke_dev_dir_iter_contains_symlinks() -> TestResult {
         if entry.file_type != FileType::Symlink {
             continue;
         }
-        match entry.name {
+        match &*entry.name {
             "fd" => found_fd = true,
             "stdin" => found_stdin = true,
             "stdout" => found_stdout = true,

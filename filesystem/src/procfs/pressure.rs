@@ -161,15 +161,15 @@ impl DirOps for ProcPressureDir {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         let entries: Vec<DirEntry> = alloc::vec![
             DirEntry {
-                name: "cpu",
+                name: "cpu".into(),
                 file_type: FileType::File,
             },
             DirEntry {
-                name: "memory",
+                name: "memory".into(),
                 file_type: FileType::File,
             },
             DirEntry {
-                name: "io",
+                name: "io".into(),
                 file_type: FileType::File,
             },
         ];
@@ -233,7 +233,7 @@ kernel_test_in!("filesystem/procfs", smoke_pressure_dir_resolves_via_root);
 /// `iter()` lists exactly cpu, memory, io.
 fn smoke_pressure_iter_lists_three() -> TestResult {
     let dir = ProcPressureDir;
-    let names: Vec<&str> = dir.iter().map(|e| e.name).collect();
+    let names: Vec<alloc::string::String> = dir.iter().map(|e| e.name.into_owned()).collect();
     if names == alloc::vec!["cpu", "memory", "io"] {
         TestResult::Pass
     } else {

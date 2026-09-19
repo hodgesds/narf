@@ -40,7 +40,7 @@ fn enumerate_batch(
                 let mut name = alloc::string::String::new();
                 name.try_reserve_exact(entry.name.len())
                     .map_err(|_| ENOMEM)?;
-                name.push_str(entry.name);
+                name.push_str(&entry.name);
                 entries.push((name, entry.file_type));
             }
             Ok(entries)

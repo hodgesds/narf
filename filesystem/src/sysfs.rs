@@ -2160,7 +2160,7 @@ impl DirOps for SysRoot {
             .map(|n| {
                 let leaked: &'static str = Box::leak(n.into_boxed_str());
                 DirEntry {
-                    name: leaked,
+                    name: leaked.into(),
                     file_type: FileType::Dir,
                 }
             })
@@ -2241,20 +2241,20 @@ impl DirOps for SysKobjDir {
         for n in child_names {
             let leaked: &'static str = Box::leak(n.into_boxed_str());
             entries.push(DirEntry {
-                name: leaked,
+                name: leaked.into(),
                 file_type: FileType::Dir,
             });
         }
         for n in attr_names {
             entries.push(DirEntry {
-                name: n,
+                name: n.into(),
                 file_type: FileType::File,
             });
         }
         for n in symlink_names {
             let leaked: &'static str = Box::leak(n.into_boxed_str());
             entries.push(DirEntry {
-                name: leaked,
+                name: leaked.into(),
                 file_type: FileType::Symlink,
             });
         }

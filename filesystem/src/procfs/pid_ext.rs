@@ -824,10 +824,8 @@ impl DirOps for ProcFdDir {
         let fds = hook_fd_list(self.pid).unwrap_or_default();
         let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
         for n in fds {
-            let s = n.to_string();
-            let leaked: &'static str = crate::procfs::intern_name(&s);
             entries.push(DirEntry {
-                name: leaked,
+                name: n.to_string().into(),
                 file_type: FileType::Symlink,
             });
         }
@@ -909,10 +907,8 @@ impl DirOps for ProcFdInfoDir {
         let fds = hook_fd_list(self.pid).unwrap_or_default();
         let mut entries: Vec<DirEntry> = Vec::with_capacity(fds.len());
         for n in fds {
-            let s = n.to_string();
-            let leaked: &'static str = crate::procfs::intern_name(&s);
             entries.push(DirEntry {
-                name: leaked,
+                name: n.to_string().into(),
                 file_type: FileType::File,
             });
         }
@@ -977,7 +973,7 @@ impl DirOps for ProcTaskTidDir {
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         Box::new(
             [DirEntry {
-                name: "comm",
+                name: "comm".into(),
                 file_type: FileType::File,
             }]
             .into_iter(),
@@ -1054,7 +1050,7 @@ impl DirOps for ProcTaskDir {
                 // Interned, not leaked: this directory is read once per
                 // thread by anything sampling them, so a leak here scales
                 // with thread count AND poll rate.
-                name: crate::procfs::intern_name(&tid.to_string()),
+                name: tid.to_string().into(),
                 file_type: FileType::Dir,
             })
             .collect();
@@ -1709,45 +1705,63 @@ fn smoke_cgroup_v2_unified_line() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs/pid_ext", smoke_cgroup_v2_unified_line);
 
-/// Interning replaces a `Box::leak` that ran once per entry, per readdir.
+/// A computed directory name is OWNED by its entry, so a readdir no longer
+/// leaks.
 ///
-/// The leak was invisible because every individual allocation was correct —
-/// what was wrong was the rate. This asserts the property that matters: a
-/// SECOND readdir of the same directory allocates nothing new. Counting
-/// distinct interned names is the only way to see that from inside the
-/// kernel; the old code would have grown the count on every call.
-fn smoke_procfs_readdir_names_are_interned() -> TestResult {
-    let dir = ProcTaskDir { pid: 1 };
+/// `DirEntry::name` was `&'static str`, which left a directory with
+/// computed entries no way to produce one but `Box::leak` — once per
+/// entry, once per readdir, never freed. Every individual allocation was
+/// correct; the bug was the rate.
+///
+/// What is asserted here is the property rather than the mechanism: the
+/// name a readdir hands back is `Cow::Owned`, and therefore has a
+/// destructor. A `Cow::Borrowed` here would mean the name came from
+/// somewhere with a `'static` lifetime — which, for a tid that did not
+/// exist at compile time, can only have been a leak.
+fn smoke_procfs_computed_dir_names_are_owned() -> TestResult {
+    use alloc::borrow::Cow;
 
-    // Prime, so the first-sight allocations are not what we measure.
-    let first: Vec<_> = dir.iter().map(|e| e.name).collect();
-    if first.is_empty() {
+    let dir = ProcTaskDir { pid: 1 };
+    let entries: Vec<DirEntry> = dir.iter().collect();
+    if entries.is_empty() {
         return TestResult::Fail("task dir listed nothing");
     }
-    let after_first = crate::procfs::__interned_name_count();
+    for e in &entries {
+        if !matches!(e.name, Cow::Owned(_)) {
+            return TestResult::Fail("a computed dir entry name is not owned — it was leaked");
+        }
+    }
 
-    // Repeat readdirs must be allocation-free.
+    // Repeat readdirs are stable in content and each allocation is
+    // reclaimed with its entry, so nothing accumulates.
+    let first: Vec<alloc::string::String> = entries
+        .iter()
+        .map(|e| e.name.clone().into_owned())
+        .collect();
     for _ in 0..16 {
-        let again: Vec<_> = dir.iter().map(|e| e.name).collect();
+        let again: Vec<alloc::string::String> =
+            dir.iter().map(|e| e.name.clone().into_owned()).collect();
         if again != first {
             return TestResult::Fail("repeat readdir produced different names");
         }
     }
-    if crate::procfs::__interned_name_count() != after_first {
-        return TestResult::Fail("readdir allocated a fresh name — entries are still leaking");
-    }
 
-    // And the same name from a different call site resolves to the SAME
-    // pointer, which is what makes the cache a cache rather than a slower
-    // leak.
-    let a = crate::procfs::intern_name("4242");
-    let b = crate::procfs::intern_name("4242");
-    if !core::ptr::eq(a.as_ptr(), b.as_ptr()) {
-        return TestResult::Fail("interning the same name twice allocated twice");
+    // A literal-named entry stays BORROWED, which is the reason for `Cow`
+    // rather than `String`: the ~100 sites that name an entry with a
+    // literal must not start allocating to pay for the computed ones.
+    let e = DirEntry {
+        name: "comm".into(),
+        file_type: FileType::File,
+    };
+    if !matches!(e.name, Cow::Borrowed(_)) {
+        return TestResult::Fail("a literal entry name allocated");
     }
     TestResult::Pass
 }
-kernel_test_in!("filesystem/procfs", smoke_procfs_readdir_names_are_interned);
+kernel_test_in!(
+    "filesystem/procfs",
+    smoke_procfs_computed_dir_names_are_owned
+);
 
 /// `/proc/<pid>/task/` lists the whole thread group, not just the leader.
 ///
@@ -1761,7 +1775,7 @@ fn smoke_procfs_task_dir_lists_leader_without_hook() -> TestResult {
         return TestResult::Fail("with no thread-list provider the leader alone should be listed");
     }
     // The leader must be reachable by lookup, not merely listed.
-    if dir.lookup_dir(names[0]).is_none() {
+    if dir.lookup_dir(&names[0]).is_none() {
         return TestResult::Fail("the listed tid is not looked up");
     }
     // A tid that is not in the group is ENOENT, so lookup is not a

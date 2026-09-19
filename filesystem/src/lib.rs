@@ -848,9 +848,24 @@ pub struct FsStatx {
 /// `&'static str` because the only producer is the initramfs (whose
 /// names live in the `&'static [u8]` archive). Stage 4 will widen this
 /// to an owned `String` once persistent FSes appear.
-#[derive(Copy, Clone, Debug)]
+/// `Clone` but not `Copy`: the name may own its storage. Entries are
+/// built once per readdir and consumed, so the copies this used to permit
+/// were never load-bearing.
+#[derive(Clone, Debug)]
 pub struct DirEntry {
-    pub name: &'static str,
+    /// The entry's name.
+    ///
+    /// `Cow` rather than `&'static str`, which is what this was. A
+    /// directory whose entries are computed — the procfs pid list,
+    /// `/proc/<pid>/fd`, `/proc/<pid>/task` — cannot produce a `'static`
+    /// name without leaking one, and that is exactly what every such
+    /// directory did: `Box::leak`, once per entry, once per readdir,
+    /// never freed.
+    ///
+    /// Borrowed covers the ~100 sites that name an entry with a literal,
+    /// so the common case still allocates nothing; owned covers the
+    /// computed ones and is freed with the entry.
+    pub name: alloc::borrow::Cow<'static, str>,
     pub file_type: FileType,
 }
 

@@ -496,19 +496,19 @@ impl DirOps for DevDiskDir {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         const ENTRIES: &[DirEntry] = &[
             DirEntry {
-                name: "by-label",
+                name: alloc::borrow::Cow::Borrowed("by-label"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "by-uuid",
+                name: alloc::borrow::Cow::Borrowed("by-uuid"),
                 file_type: FileType::Dir,
             },
             DirEntry {
-                name: "by-partuuid",
+                name: alloc::borrow::Cow::Borrowed("by-partuuid"),
                 file_type: FileType::Dir,
             },
         ];
-        Box::new(ENTRIES.iter().copied())
+        Box::new(ENTRIES.iter().cloned())
     }
 }
 

@@ -137,7 +137,7 @@ impl DirOps for DebugRoot {
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         Box::new(
             [DirEntry {
-                name: "sched",
+                name: "sched".into(),
                 file_type: FileType::Dir,
             }]
             .into_iter(),
@@ -158,7 +158,7 @@ impl DirOps for SchedDir {
     }
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
         Box::new(SCHED_KNOBS.iter().map(|k| DirEntry {
-            name: k.name,
+            name: k.name.into(),
             file_type: FileType::File,
         }))
     }
