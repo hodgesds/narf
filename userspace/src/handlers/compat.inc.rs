@@ -9132,6 +9132,11 @@ struct FlockEntry {
     /// Every description currently holding this file. At most one entry
     /// per owner; a re-lock CONVERTS it, as `flock_lock_inode` does.
     holders: alloc::vec::Vec<FlockHolder>,
+    /// `st_dev` / `st_ino`, for `/proc/locks`. Recorded on acquisition for
+    /// the same reason the record-lock table records it: the key is a
+    /// `FileOps` pointer that cannot be resolved back to a file later.
+    dev: u64,
+    ino: u64,
 }
 
 impl FlockEntry {
@@ -9158,10 +9163,14 @@ static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
 /// [`FlockHolder`]. A second lock from the SAME description converts the
 /// one it already holds rather than adding another, which is why every arm
 /// tests `other_*` rather than "is the table empty".
-fn flock_try(file_ptr: usize, op: u32, owner: u64) -> Result<(), ()> {
+fn flock_try(file_ptr: usize, op: u32, owner: u64, dev: u64, ino: u64) -> Result<(), ()> {
     let mut g = FLOCK_TABLE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     let e = map.entry(file_ptr).or_default();
+    if e.holders.is_empty() {
+        e.dev = dev;
+        e.ino = ino;
+    }
     if op & LOCK_UN != 0 {
         // Release only what THIS description holds. Unlocking something
         // never acquired is a no-op success, as it is on Linux.
@@ -9202,6 +9211,90 @@ fn flock_try(file_ptr: usize, op: u32, owner: u64) -> Result<(), ()> {
         return Ok(());
     }
     Err(())
+}
+
+/// `/proc/locks` rows for every advisory lock this kernel holds.
+///
+/// Both registries feed it: `fd::locks` (the `fcntl` record locks, POSIX
+/// and OFD alike) and the `flock(2)` table. Linux lists all three flavours
+/// in the one file, and `lslocks` expects to find them there.
+///
+/// The pid translation happens HERE rather than in procfs, because it is
+/// namespace-relative: `report_pid_to` maps the owner into the READER's
+/// pid namespace, exactly as `locks_translate_pid` does. An OFD lock
+/// reports -1 — its owner is an open file description, so there is no
+/// process to name, and the description can outlive the task that made it.
+pub fn proc_locks_rows() -> alloc::vec::Vec<narf_filesystem::procfs::aggregate::LockRow> {
+    use narf_filesystem::procfs::aggregate::{LockFlavour, LockRow};
+    let reader = current_task_id();
+    let mut rows = alloc::vec::Vec::new();
+
+    for l in crate::fd::locks::snapshot() {
+        let ofd = l.kind == crate::fd::locks::LockKind::Ofd;
+        rows.push(LockRow {
+            flavour: if ofd {
+                LockFlavour::Ofd
+            } else {
+                LockFlavour::Posix
+            },
+            exclusive: l.ty == crate::fd::locks::F_WRLCK,
+            pid: if ofd {
+                -1
+            } else {
+                report_pid_to(reader, task_to_pid_raw(l.owner).unwrap_or(l.owner)) as i32
+            },
+            dev: l.dev,
+            ino: l.ino,
+            start: l.start.max(0) as u64,
+            // `len == 0` is "to end of file", Linux's `fl_end ==
+            // OFFSET_MAX`, which renders as EOF.
+            end: if l.len == 0 {
+                None
+            } else {
+                Some((l.start + l.len - 1).max(0) as u64)
+            },
+        });
+    }
+
+    for (dev, ino, owner, exclusive) in flock_snapshot() {
+        rows.push(LockRow {
+            flavour: LockFlavour::Flock,
+            exclusive,
+            // A flock lock is owned by the description too, so Linux has
+            // no pid for it either — `locks_translate_pid` keys on
+            // FL_OFDLCK, which flock locks do not set, so it reports the
+            // creating process. NARF does not retain one, and inventing
+            // the current reader's pid would be worse than -1.
+            pid: -1,
+            dev,
+            ino,
+            // flock is whole-file: Linux prints a literal "0 EOF".
+            start: 0,
+            end: None,
+        });
+        let _ = owner;
+    }
+    rows
+}
+
+/// Every `flock(2)` holder currently on file, for `/proc/locks`.
+///
+/// One row per holding description, which is only expressible because the
+/// holders are a list of owners rather than the anonymous shared COUNT
+/// they used to be — the count could not name anyone, so the file could
+/// not have listed them.
+pub(crate) fn flock_snapshot() -> alloc::vec::Vec<(u64, u64, u64, bool)> {
+    let g = FLOCK_TABLE.lock();
+    let Some(map) = g.as_ref() else {
+        return alloc::vec::Vec::new();
+    };
+    map.values()
+        .flat_map(|e| {
+            e.holders
+                .iter()
+                .map(move |h| (e.dev, e.ino, h.owner, h.exclusive))
+        })
+        .collect()
 }
 
 /// Drop every `flock(2)` lock held by one open file description.

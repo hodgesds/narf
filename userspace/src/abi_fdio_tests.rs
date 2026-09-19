@@ -4048,6 +4048,8 @@ fn smoke_abi_fdio_setlkw_conflict_paths() -> TestResult {
         crate::fd::locks::__test_reset();
         let foreign = crate::fd::locks::Lock {
             kind: crate::fd::locks::LockKind::Posix,
+            dev: 0,
+            ino: 0,
             owner: 0xF0E1,
             ty: crate::fd::locks::F_WRLCK,
             start: 0,
@@ -4202,6 +4204,8 @@ fn smoke_abi_fdio_getlk_reports_owner_visible_pid() -> TestResult {
         crate::handlers::register_pid_task_mapping(FOREIGN_PID, FOREIGN_TASK);
         let foreign = crate::fd::locks::Lock {
             kind: crate::fd::locks::LockKind::Posix,
+            dev: 0,
+            ino: 0,
             owner: FOREIGN_TASK,
             ty: F_WRLCK,
             start: 0,
@@ -4984,3 +4988,120 @@ fn smoke_abi_fdio_flock_relock_converts() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_flock_relock_converts);
+
+// ── /proc/locks ─────────────────────────────────────────────────────
+//
+// `fs/locks.c::lock_get_status`. The file was registered and always
+// empty, under "DEFERRED: wire to a lock-registry snapshot when POSIX
+// locks land". They landed; `lslocks`, and anything else that answers
+// "who holds this file", reads exactly this.
+//
+// An empty body is also what Linux shows when nothing is locked, so the
+// only way to tell a wired file from a stub is to take a lock and look —
+// which is what these do.
+
+fn proc_locks_body() -> Result<alloc::string::String, &'static str> {
+    let rows = crate::handlers::proc_locks_rows();
+    let mut out = alloc::string::String::new();
+    for (i, r) in rows.iter().enumerate() {
+        use core::fmt::Write as _;
+        let flavour = match r.flavour {
+            narf_filesystem::procfs::aggregate::LockFlavour::Posix => "POSIX",
+            narf_filesystem::procfs::aggregate::LockFlavour::Ofd => "OFDLCK",
+            narf_filesystem::procfs::aggregate::LockFlavour::Flock => "FLOCK",
+        };
+        let _ = writeln!(
+            out,
+            "{}:{}:{}:{}:{}",
+            i + 1,
+            flavour,
+            if r.exclusive { "WRITE" } else { "READ" },
+            r.pid,
+            r.ino
+        );
+    }
+    Ok(out)
+}
+
+fn smoke_abi_fdio_proc_locks_lists_record_locks() -> TestResult {
+    with_memfs("/pl", "pl", &[("f", b"hello")], || {
+        crate::fd::locks::__test_reset();
+        // Nothing held: empty, exactly as Linux renders it.
+        if !proc_locks_body()?.is_empty() {
+            return Err("/proc/locks should be empty with no locks held");
+        }
+        let fd = open_fd(b"/pl/f\0")? as u64;
+        // A POSIX write lock over [0, 16).
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 16, 0);
+        if call(Syscall::Fcntl.raw(), a2(fd, 6, fl.as_mut_ptr() as u64)) != Some(0) {
+            return Err("F_SETLK should succeed");
+        }
+        let body = proc_locks_body()?;
+        if !body.contains("POSIX") || !body.contains("WRITE") {
+            return Err("/proc/locks did not list the POSIX write lock");
+        }
+        // The inode must be the file's, not a zero placeholder — the lock
+        // table keys by FileOps POINTER, so the identity has to be
+        // captured at acquisition or this column is unrenderable.
+        if body.contains(":0\n") {
+            return Err("/proc/locks reported inode 0 — the identity was not captured");
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_proc_locks_lists_record_locks);
+
+fn smoke_abi_fdio_proc_locks_distinguishes_flavours() -> TestResult {
+    with_memfs("/pl", "pl", &[("f", b"hello"), ("g", b"world")], || {
+        crate::fd::locks::__test_reset();
+        let posix_fd = open_fd(b"/pl/f\0")? as u64;
+        let ofd_fd = open_fd(b"/pl/g\0")? as u64;
+        let flock_fd = open_fd(b"/pl/g\0")? as u64;
+
+        let mut fl = ofd_flock(OFD_F_RDLCK, 0, 0, 8, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(posix_fd, 6, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_SETLK should succeed");
+        }
+        let mut fl = ofd_flock(OFD_F_WRLCK, 0, 0, 8, 0);
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(ofd_fd, F_OFD_SETLK, fl.as_mut_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_OFD_SETLK should succeed");
+        }
+        if flock_op(flock_fd, LOCK_SH_OP | LOCK_NB_OP) != Some(0) {
+            return Err("flock LOCK_SH should succeed");
+        }
+
+        let body = proc_locks_body()?;
+        // All three flavours appear, and they are distinguishable — the
+        // whole point of the file. FLOCK rows were impossible to emit
+        // before shared holders had owners to name.
+        for want in ["POSIX", "OFDLCK", "FLOCK"] {
+            if !body.contains(want) {
+                return Err("/proc/locks is missing a lock flavour");
+            }
+        }
+        // A READ row (the shared/read locks) and a WRITE row both present.
+        if !body.contains("READ") || !body.contains("WRITE") {
+            return Err("/proc/locks did not distinguish READ from WRITE");
+        }
+        // OFD and flock rows report pid -1: their owner is a description,
+        // not a process.
+        if !body.contains("OFDLCK:WRITE:-1") {
+            return Err("an OFD lock must be reported with pid -1");
+        }
+        crate::fd::locks::__test_reset();
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_proc_locks_distinguishes_flavours
+);

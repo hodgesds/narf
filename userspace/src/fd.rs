@@ -1750,6 +1750,16 @@ pub mod locks {
         pub ty: i16, // F_RDLCK or F_WRLCK
         pub start: i64,
         pub len: i64, // 0 = to EOF
+        /// `st_dev` / `st_ino` of the locked file, captured when the lock
+        /// is taken.
+        ///
+        /// `/proc/locks` prints `MAJOR:MINOR:ino` per Linux's
+        /// `lock_get_status`, and the table is keyed by a `FileOps`
+        /// POINTER — which cannot be dereferenced later, because nothing
+        /// here keeps the `Arc` alive. Recording the identity at
+        /// acquisition is what makes the file renderable at all.
+        pub dev: u64,
+        pub ino: u64,
     }
 
     impl Lock {
@@ -1813,6 +1823,19 @@ pub mod locks {
         bucket.retain(|l| !(l.same_owner(&req) && l.overlaps(&req)));
         bucket.push(req);
         Ok(())
+    }
+
+    /// Every record lock currently held, for `/proc/locks`.
+    ///
+    /// Flattened across files: the caller renders one line each, and the
+    /// key (a `FileOps` pointer) is deliberately not exposed — the
+    /// `(dev, ino)` on each lock is the identity userspace is given.
+    pub fn snapshot() -> Vec<Lock> {
+        let g = TABLE.lock();
+        let Some(map) = g.as_ref() else {
+            return Vec::new();
+        };
+        map.values().flat_map(|v| v.iter().copied()).collect()
     }
 
     /// Probe `req`. If a conflict exists, returns the blocker; else
