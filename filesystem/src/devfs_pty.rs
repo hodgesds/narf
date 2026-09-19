@@ -98,6 +98,32 @@ pub const TCSETSW2: u32 = 0x402c542c;
 pub const TCSETSF2: u32 = 0x402c542d;
 /// `ioctl(fd, FIONREAD, &i32)` — bytes immediately readable.
 pub const FIONREAD: u32 = 0x541B;
+/// `ioctl(fd, TIOCOUTQ, int*)` — bytes still queued for output.
+///
+/// Note there is deliberately no `TIOCINQ` constant: `ioctls.h:47` defines
+/// it as `#define TIOCINQ FIONREAD`, the very same command, so a separate
+/// match arm for it would be dead code.
+pub const TIOCOUTQ: u32 = 0x5411;
+/// `ioctl(fd, TIOCEXCL)` / `TIOCNXCL` / `TIOCGEXCL` — exclusive-open mode.
+pub const TIOCEXCL: u32 = 0x540C;
+pub const TIOCNXCL: u32 = 0x540D;
+pub const TIOCGEXCL: u32 = 0x8004_5440;
+/// `ioctl(fd, TIOCSTI, char*)` — push one byte back into the input queue.
+pub const TIOCSTI: u32 = 0x5412;
+/// `ioctl(fd, TIOCSETD/TIOCGETD, int*)` — line-discipline number.
+pub const TIOCSETD: u32 = 0x5423;
+pub const TIOCGETD: u32 = 0x5424;
+/// `ioctl(fd, TIOCVHANGUP)` — force a hangup.
+pub const TIOCVHANGUP: u32 = 0x5437;
+/// `ioctl(fd, TIOCGLCKTRMIOS/TIOCSLCKTRMIOS, termios*)` — the mask of
+/// termios bits that `TCSETS` may not change.
+pub const TIOCGLCKTRMIOS: u32 = 0x5456;
+pub const TIOCSLCKTRMIOS: u32 = 0x5457;
+/// `N_TTY` — the only line discipline NARF implements, and the one every
+/// PTY uses (`include/uapi/linux/tty.h`).
+pub const N_TTY: i32 = 0;
+/// `CAP_SYS_ADMIN`, the capability the privileged tty ioctls test.
+pub const CAP_SYS_ADMIN: u32 = 21;
 /// `ioctl(fd, TIOCNOTTY, 0)` — give up the controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
 /// `ioctl(fd, TIOCGSID, &pid_t)` — session id of the tty's session leader.
@@ -207,6 +233,13 @@ impl<const N: usize> ByteRing<N> {
     pub(crate) fn len(&self) -> usize {
         self.inner.lock().len
     }
+
+    /// Discard everything queued — `TCFLSH`'s output half.
+    pub(crate) fn clear(&self) {
+        let mut g = self.inner.lock();
+        g.head = 0;
+        g.len = 0;
+    }
 }
 
 impl<const N: usize> core::fmt::Debug for ByteRing<N> {
@@ -250,6 +283,53 @@ const L_ISIG: u32 = 0x0000_0001;
 const L_ICANON: u32 = 0x0000_0002;
 const L_ECHO: u32 = 0x0000_0008;
 const L_TOSTOP: u32 = 0x0000_0100;
+// Remaining c_lflag bits (`include/uapi/asm-generic/termbits.h`).
+const L_ECHOE: u32 = 0x0000_0010;
+const L_ECHOK: u32 = 0x0000_0020;
+const L_ECHONL: u32 = 0x0000_0040;
+const L_NOFLSH: u32 = 0x0000_0080;
+const L_ECHOCTL: u32 = 0x0000_0200;
+const L_ECHOPRT: u32 = 0x0000_0400;
+const L_ECHOKE: u32 = 0x0000_0800;
+const L_IEXTEN: u32 = 0x0000_8000;
+const L_EXTPROC: u32 = 0x0001_0000;
+// c_iflag bits (`termbits-common.h` + `termbits.h`).
+const I_ISTRIP: u32 = 0x0000_0020;
+const I_INLCR: u32 = 0x0000_0040;
+const I_IGNCR: u32 = 0x0000_0080;
+const I_ICRNL: u32 = 0x0000_0100;
+const I_IUCLC: u32 = 0x0000_0200;
+const I_IXON: u32 = 0x0000_0400;
+const I_IXANY: u32 = 0x0000_0800;
+const I_IMAXBEL: u32 = 0x0000_2000;
+const I_IUTF8: u32 = 0x0000_4000;
+// c_oflag bits.
+const O_OPOST: u32 = 0x0000_0001;
+const O_OLCUC: u32 = 0x0000_0002;
+const O_ONLCR: u32 = 0x0000_0004;
+const O_OCRNL: u32 = 0x0000_0008;
+const O_ONOCR: u32 = 0x0000_0010;
+const O_ONLRET: u32 = 0x0000_0020;
+const O_TABDLY: u32 = 0x0000_1800;
+const O_XTABS: u32 = 0x0000_1800;
+
+/// `c_cc[]` indices (`include/uapi/asm-generic/termbits.h:42`).
+pub const VINTR: usize = 0;
+pub const VQUIT: usize = 1;
+pub const VERASE: usize = 2;
+pub const VKILL: usize = 3;
+pub const VEOF: usize = 4;
+pub const VTIME: usize = 5;
+pub const VMIN: usize = 6;
+pub const VSTART: usize = 8;
+pub const VSTOP: usize = 9;
+pub const VSUSP: usize = 10;
+pub const VEOL: usize = 11;
+pub const VREPRINT: usize = 12;
+pub const VDISCARD: usize = 13;
+pub const VWERASE: usize = 14;
+pub const VLNEXT: usize = 15;
+pub const VEOL2: usize = 16;
 
 /// Full termios state. We keep the userspace `struct termios` wire image
 /// verbatim so TCGETS/TCSETS round-trip every field a program sets, and
@@ -290,6 +370,131 @@ impl Termios {
     pub fn cc(&self, idx: usize) -> u8 {
         self.raw.get(17 + idx).copied().unwrap_or(0)
     }
+
+    fn iflag(&self) -> u32 {
+        u32::from_ne_bytes(self.raw[0..4].try_into().unwrap())
+    }
+    fn oflag(&self) -> u32 {
+        u32::from_ne_bytes(self.raw[4..8].try_into().unwrap())
+    }
+
+    // ── c_iflag ───────────────────────────────────────────────────────
+    /// ISTRIP: clear the 8th bit of every input byte.
+    pub fn istrip(&self) -> bool {
+        self.iflag() & I_ISTRIP != 0
+    }
+    /// INLCR: translate NL to CR on input.
+    pub fn inlcr(&self) -> bool {
+        self.iflag() & I_INLCR != 0
+    }
+    /// IGNCR: discard CR on input. Checked BEFORE ICRNL, as Linux does.
+    pub fn igncr(&self) -> bool {
+        self.iflag() & I_IGNCR != 0
+    }
+    /// ICRNL: translate CR to NL on input.
+    pub fn icrnl(&self) -> bool {
+        self.iflag() & I_ICRNL != 0
+    }
+    /// IUCLC: map upper case to lower case on input.
+    pub fn iuclc(&self) -> bool {
+        self.iflag() & I_IUCLC != 0
+    }
+    /// IXON: ^S/^Q (VSTOP/VSTART) suspend and resume output.
+    pub fn ixon(&self) -> bool {
+        self.iflag() & I_IXON != 0
+    }
+    /// IXANY: any input byte restarts suspended output, not just VSTART.
+    pub fn ixany(&self) -> bool {
+        self.iflag() & I_IXANY != 0
+    }
+    /// IMAXBEL: ring the bell instead of dropping input when the edit
+    /// buffer is full.
+    pub fn imaxbel(&self) -> bool {
+        self.iflag() & I_IMAXBEL != 0
+    }
+    /// IUTF8: input is UTF-8, so continuation bytes do not advance a
+    /// column and erase removes a whole character.
+    pub fn iutf8(&self) -> bool {
+        self.iflag() & I_IUTF8 != 0
+    }
+
+    // ── c_oflag ───────────────────────────────────────────────────────
+    /// OPOST: perform output processing at all. With it clear every other
+    /// output flag is inert, exactly as in `do_output_char`.
+    pub fn opost(&self) -> bool {
+        self.oflag() & O_OPOST != 0
+    }
+    /// OLCUC: map lower case to upper case on output.
+    pub fn olcuc(&self) -> bool {
+        self.oflag() & O_OLCUC != 0
+    }
+    /// ONLCR: translate NL to CR-NL on output. Its absence is why a
+    /// terminal emulator shows staircased text.
+    pub fn onlcr(&self) -> bool {
+        self.oflag() & O_ONLCR != 0
+    }
+    /// OCRNL: translate CR to NL on output.
+    pub fn ocrnl(&self) -> bool {
+        self.oflag() & O_OCRNL != 0
+    }
+    /// ONOCR: suppress CR when already at column 0.
+    pub fn onocr(&self) -> bool {
+        self.oflag() & O_ONOCR != 0
+    }
+    /// ONLRET: NL also performs the carriage-return function.
+    pub fn onlret(&self) -> bool {
+        self.oflag() & O_ONLRET != 0
+    }
+    /// XTABS (TABDLY == XTABS): expand tabs to spaces on output.
+    pub fn xtabs(&self) -> bool {
+        self.oflag() & O_TABDLY == O_XTABS
+    }
+
+    // ── c_lflag ───────────────────────────────────────────────────────
+    /// ECHOE: erase the character with BS-SP-BS rather than echoing the
+    /// erase char itself.
+    pub fn echoe(&self) -> bool {
+        self.lflag() & L_ECHOE != 0
+    }
+    /// ECHOK: echo a newline after the KILL character.
+    pub fn echok(&self) -> bool {
+        self.lflag() & L_ECHOK != 0
+    }
+    /// ECHOKE: erase the whole line on KILL instead of echoing a newline.
+    pub fn echoke(&self) -> bool {
+        self.lflag() & L_ECHOKE != 0
+    }
+    /// ECHONL: echo NL even when ECHO is off.
+    pub fn echonl(&self) -> bool {
+        self.lflag() & L_ECHONL != 0
+    }
+    /// ECHOPRT: echo erased characters between `\` and `/`, the
+    /// hardcopy-terminal erase style.
+    pub fn echoprt(&self) -> bool {
+        self.lflag() & L_ECHOPRT != 0
+    }
+    /// ECHOCTL: render control characters as `^X`.
+    pub fn echoctl(&self) -> bool {
+        self.lflag() & L_ECHOCTL != 0
+    }
+    /// NOFLSH: do NOT flush the input queue when ISIG generates a signal.
+    pub fn noflsh(&self) -> bool {
+        self.lflag() & L_NOFLSH != 0
+    }
+    /// IEXTEN: enable the extended chars — VLNEXT, VWERASE, VREPRINT,
+    /// VDISCARD. With it clear they are ordinary input.
+    pub fn iexten(&self) -> bool {
+        self.lflag() & L_IEXTEN != 0
+    }
+    /// EXTPROC: the line discipline is done externally; the kernel passes
+    /// input through untouched.
+    pub fn extproc(&self) -> bool {
+        self.lflag() & L_EXTPROC != 0
+    }
+    /// VMIN / VTIME, the non-canonical read thresholds.
+    pub fn vmin_vtime(&self) -> (u8, u8) {
+        (self.cc(VMIN), self.cc(VTIME))
+    }
 }
 
 impl Default for Termios {
@@ -304,31 +509,57 @@ impl Default for Termios {
         raw[12..16].copy_from_slice(&0x0000_803bu32.to_ne_bytes()); // c_lflag
                                                                     // c_cc[] begins at offset 17 (after c_line@16). Indices:
                                                                     // VINTR=0 VQUIT=1 VERASE=2 VKILL=3 VEOF=4 VTIME=5 VMIN=6.
+                                                                    // Exactly Linux's `INIT_C_CC` (`include/linux/termios_internal.h:21`).
+                                                                    // The six that used to be missing are not decoration: with VSTART
+                                                                    // and VSTOP zero, ^Q/^S can never match and IXON flow control is
+                                                                    // dead on arrival; with VWERASE/VLNEXT/VREPRINT zero, ^W/^V/^R are
+                                                                    // ordinary input no matter what IEXTEN says.
         let cc = 17;
-        raw[cc] = 0x03; // VINTR  = ^C
-        raw[cc + 1] = 0x1c; // VQUIT  = ^\
-        raw[cc + 2] = 0x7f; // VERASE = DEL
-        raw[cc + 3] = 0x15; // VKILL  = ^U
-        raw[cc + 4] = 0x04; // VEOF   = ^D
-        raw[cc + 6] = 0x01; // VMIN   = 1
-        raw[cc + 10] = 0x1a; // VSUSP = ^Z
+        raw[cc] = 0x03; // VINTR    = ^C
+        raw[cc + 1] = 0x1c; // VQUIT    = ^\
+        raw[cc + 2] = 0x7f; // VERASE   = DEL
+        raw[cc + 3] = 0x15; // VKILL    = ^U
+        raw[cc + 4] = 0x04; // VEOF     = ^D
+        raw[cc + 6] = 0x01; // VMIN     = 1
+        raw[cc + 8] = 0x11; // VSTART   = ^Q
+        raw[cc + 9] = 0x13; // VSTOP    = ^S
+        raw[cc + 10] = 0x1a; // VSUSP    = ^Z
+        raw[cc + 12] = 0x12; // VREPRINT = ^R
+        raw[cc + 13] = 0x0f; // VDISCARD = ^O
+        raw[cc + 14] = 0x17; // VWERASE  = ^W
+        raw[cc + 15] = 0x16; // VLNEXT   = ^V
         Self { raw }
     }
 }
 
-/// Window size.  `ioctl(TIOCGWINSZ)` / `ioctl(TIOCSWINSZ)` deferred
-/// (no ioctl in NARF v1).  Stored here so the struct is ready for Stage 4.
-#[derive(Copy, Clone, Debug)]
+/// Window size — the whole `struct winsize`, pixels included.
+///
+/// The pixel fields are not decoration: terminal emulators set them, and
+/// `tty_do_resize` compares the ENTIRE struct (`memcmp`) to decide whether
+/// a resize happened. Dropping them loses information programs read back
+/// (sixel and the kitty graphics protocol size images from it) and makes a
+/// pixels-only resize look like no resize at all.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct WinSize {
     pub rows: u16,
     pub cols: u16,
+    pub xpixel: u16,
+    pub ypixel: u16,
 }
 
 impl Default for WinSize {
     fn default() -> Self {
-        Self { rows: 24, cols: 80 }
+        Self {
+            rows: 24,
+            cols: 80,
+            xpixel: 0,
+            ypixel: 0,
+        }
     }
 }
+
+/// SIGWINCH — raised on the foreground pgrp when the window size changes.
+const SIGWINCH: u32 = 28;
 
 // ── Pty ───────────────────────────────────────────────────────────────────────
 
@@ -355,6 +586,23 @@ pub struct Pty {
     /// "sees" what was typed.
     /// (Linux: `tty->link->read_buf` from the slave's perspective)
     pub(crate) slave_tx_to_master: ByteRing<4096>,
+
+    /// Non-canonical read timing (VMIN/VTIME). Linux keeps the equivalent
+    /// on the stack of `n_tty_read`, which blocks; NARF's reads are
+    /// poll-and-retry, so the deadline has to outlive one attempt.
+    pub(crate) read_timer: IrqSafeSpinLock<ReadTimer>,
+
+    /// Output-side line-discipline state (OPOST column tracking) for the
+    /// slave-to-master direction.
+    pub(crate) output: IrqSafeSpinLock<crate::ntty::OutputState>,
+
+    /// `TTY_EXCLUSIVE` — set by TIOCEXCL. A further open by a caller
+    /// without CAP_SYS_ADMIN is EBUSY.
+    pub(crate) exclusive: AtomicBool,
+
+    /// The mask of termios bits `TCSETS` may not change, set by
+    /// TIOCSLCKTRMIOS. A set bit keeps the OLD value.
+    pub(crate) locked_termios: IrqSafeSpinLock<Termios>,
 
     /// Line discipline state.
     pub(crate) termios: IrqSafeSpinLock<Termios>,
@@ -442,6 +690,42 @@ impl core::fmt::Debug for Pty {
     }
 }
 
+/// Pending-read timing for non-canonical mode.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct ReadTimer {
+    /// Absolute monotonic deadline, when a timer is running.
+    deadline: Option<u64>,
+    /// Readable byte count when the timer was last armed, so the arrival
+    /// of a new byte can restart an inter-byte timer.
+    seen: usize,
+}
+
+impl ReadTimer {
+    pub(crate) const fn new() -> Self {
+        Self {
+            deadline: None,
+            seen: 0,
+        }
+    }
+    fn disarm(&mut self) {
+        self.deadline = None;
+        self.seen = 0;
+    }
+}
+
+/// What a non-canonical read should do with the bytes currently queued.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReadGate {
+    /// Hand over what is queued (possibly nothing, which is a legitimate
+    /// 0-byte return for a timed-out or polling read).
+    Deliver,
+    /// Not satisfied yet and no timer has expired — would-block.
+    Block,
+}
+
+/// VTIME is counted in tenths of a second (`TIME_CHAR` * `HZ / 10`).
+const DECISECOND_NS: u64 = 100_000_000;
+
 impl Pty {
     /// A slave was opened at some point and none is open now — the master's
     /// end-of-stream condition. Linux `pty_read`: EIO once the last slave
@@ -449,6 +733,359 @@ impl Pty {
     pub(crate) fn hung_up(&self) -> bool {
         self.slave_ever_opened.load(Ordering::Acquire)
             && self.slave_opens.load(Ordering::Acquire) == 0
+    }
+
+    /// Decide whether a non-canonical read may return, per the VMIN/VTIME
+    /// matrix in `n_tty_read` (`drivers/tty/n_tty.c:2216-2281`):
+    ///
+    /// ```c
+    /// minimum = time = 0;
+    /// timeout = MAX_SCHEDULE_TIMEOUT;
+    /// if (!ldata->icanon) {
+    ///         minimum = MIN_CHAR(tty);
+    ///         if (minimum)
+    ///                 time = (HZ / 10) * TIME_CHAR(tty);
+    ///         else {
+    ///                 timeout = (HZ / 10) * TIME_CHAR(tty);
+    ///                 minimum = 1;
+    ///         }
+    /// }
+    /// ...
+    /// if (kb - kbuf >= minimum) break;
+    /// if (time) timeout = time;      /* after the first byte */
+    /// ```
+    ///
+    /// which yields the four POSIX cases:
+    ///
+    /// * **MIN>0, TIME==0** — block until MIN bytes. `time` is 0, so the
+    ///   timeout stays infinite.
+    /// * **MIN>0, TIME>0** — TIME is an INTER-BYTE timer. The first wait is
+    ///   still infinite (`timeout` only becomes `time` after a byte has
+    ///   been copied), and each further byte restarts it.
+    /// * **MIN==0, TIME>0** — TIME is an overall read timer started when
+    ///   the read begins; return as soon as any byte arrives, or empty when
+    ///   it expires.
+    /// * **MIN==0, TIME==0** — poll: return immediately with whatever is
+    ///   queued, including nothing.
+    ///
+    /// Canonical mode never reaches here: `minimum` and `time` are left at
+    /// zero for it, so `c_cc[VMIN]`/`c_cc[VTIME]` are simply not consulted.
+    pub(crate) fn noncanon_read_gate(&self, t: &Termios, avail: usize) -> ReadGate {
+        let (vmin, vtime) = t.vmin_vtime();
+        // `if (minimum) ... else { timeout = ...; minimum = 1; }`
+        let minimum = if vmin == 0 { 1usize } else { vmin as usize };
+        let mut timer = self.read_timer.lock();
+
+        if avail >= minimum {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        // MIN==0, TIME==0: a pure polling read never waits.
+        if vmin == 0 && vtime == 0 {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        // MIN>0, TIME==0: no timer at all, wait for the full count.
+        if vmin > 0 && vtime == 0 {
+            timer.disarm();
+            return ReadGate::Block;
+        }
+
+        let now = narf_time::monotonic_ns();
+        let span = u64::from(vtime) * DECISECOND_NS;
+
+        if vmin == 0 {
+            // Overall read timer, armed on the first attempt of this read.
+            let deadline = *timer.deadline.get_or_insert(now.saturating_add(span));
+            if now >= deadline {
+                timer.disarm();
+                return ReadGate::Deliver; // expired: hand over what there is
+            }
+            return ReadGate::Block;
+        }
+
+        // MIN>0, TIME>0: the inter-byte timer does not run until at least
+        // one byte has arrived — Linux's first wait is still infinite.
+        if avail == 0 {
+            timer.disarm();
+            return ReadGate::Block;
+        }
+        if timer.deadline.is_none() || avail > timer.seen {
+            // First byte, or another one arrived: (re)start the gap timer.
+            timer.deadline = Some(now.saturating_add(span));
+            timer.seen = avail;
+            return ReadGate::Block;
+        }
+        if now >= timer.deadline.unwrap_or(now) {
+            timer.disarm();
+            return ReadGate::Deliver;
+        }
+        ReadGate::Block
+    }
+
+    /// `TIOCGPGRP`: report the foreground process group.
+    ///
+    /// `drivers/tty/tty_jobctrl.c:474` — "Return the pgrp of the current
+    /// tty" but only for the caller's OWN controlling terminal:
+    ///
+    /// ```c
+    /// if (tty == real_tty && current->signal->tty != real_tty)
+    ///         return -ENOTTY;
+    /// ```
+    ///
+    /// Reporting it unconditionally leaks another session's job-control
+    /// state to any process that can open the device.
+    fn get_fg_pgrp(&self) -> Result<u64, FsError> {
+        let ctrl = *self.ctrl.lock();
+        if let Some((caller_sid, _)) = jobctl_query(0) {
+            if ctrl.sid != 0 && ctrl.sid != caller_sid {
+                // ENOTTY — `Unsupported` is the ioctl path's ENOTTY.
+                return Err(FsError::Unsupported);
+            }
+        }
+        Ok(ctrl.fg_pgrp)
+    }
+
+    /// `TIOCSPGRP`: set the foreground process group.
+    ///
+    /// `tty_jobctrl.c:497-521` rejects in this order, and the order is the
+    /// ABI: EINVAL for a negative pgrp, ENOTTY when this is not the
+    /// caller's controlling tty or the sessions differ, ESRCH when no such
+    /// process group exists, EPERM when it exists in another session.
+    /// Storing whatever arrives lets any process hand the terminal to a
+    /// group in a different session.
+    fn set_fg_pgrp(&self, pgrp: i32) -> Result<u64, FsError> {
+        if pgrp < 0 {
+            return Err(FsError::InvalidData);
+        }
+        let pgrp = pgrp as u64;
+        let ctrl_sid = self.ctrl.lock().sid;
+        if let Some((caller_sid, pgrp_sid)) = jobctl_query(pgrp) {
+            if ctrl_sid != 0 && ctrl_sid != caller_sid {
+                // ENOTTY — `Unsupported` is the ioctl path's ENOTTY.
+                return Err(FsError::Unsupported);
+            }
+            if pgrp_sid == 0 {
+                return Err(FsError::NoSuchProcess); // ESRCH
+            }
+            if pgrp_sid != caller_sid {
+                return Err(FsError::OperationNotPermitted); // EPERM
+            }
+        }
+        self.ctrl.lock().fg_pgrp = pgrp;
+        Ok(0)
+    }
+
+    /// Apply a `TCSETS`-family termios, honouring the locked mask.
+    ///
+    /// `tty_ioctl.c`:
+    ///
+    /// ```c
+    /// #define NOSET_MASK(x, y, z) (x = ((x) & ~(z)) | ((y) & (z)))
+    ///     NOSET_MASK(termios->c_iflag, old->c_iflag, locked->c_iflag);
+    ///     ...
+    ///     termios->c_cc[i] = locked->c_cc[i] ? old->c_cc[i] : termios->c_cc[i];
+    /// ```
+    ///
+    /// A bit set in the lock keeps the OLD value, so TIOCSLCKTRMIOS can pin
+    /// individual flags — which is the point: a privileged process can stop
+    /// a setuid program from, say, clearing ECHO on a shared terminal.
+    pub(crate) fn set_termios_locked(&self, mut raw: [u8; TERMIOS_WIRE_LEN]) {
+        let locked = *self.locked_termios.lock();
+        let mut cur = self.termios.lock();
+        // c_iflag/c_oflag/c_cflag/c_lflag: four u32s at offsets 0, 4, 8, 12.
+        for off in [0usize, 4, 8, 12] {
+            let l = u32::from_ne_bytes(locked.raw[off..off + 4].try_into().unwrap());
+            if l == 0 {
+                continue;
+            }
+            let old = u32::from_ne_bytes(cur.raw[off..off + 4].try_into().unwrap());
+            let new = u32::from_ne_bytes(raw[off..off + 4].try_into().unwrap());
+            let merged = (new & !l) | (old & l);
+            raw[off..off + 4].copy_from_slice(&merged.to_ne_bytes());
+        }
+        // c_line at 16: a non-zero lock keeps the old value.
+        if locked.raw[16] != 0 {
+            raw[16] = cur.raw[16];
+        }
+        // c_cc[] from 17: per-entry, a non-zero lock keeps the old value.
+        // NCCS is 19 on the asm-generic layout.
+        let cc = 17..TERMIOS_WIRE_LEN.min(17 + 19);
+        for ((slot, &lock), &old) in raw[cc.clone()]
+            .iter_mut()
+            .zip(locked.raw[cc.clone()].iter())
+            .zip(cur.raw[cc].iter())
+        {
+            if lock != 0 {
+                *slot = old;
+            }
+        }
+        cur.raw = raw;
+    }
+
+    /// `TIOCSTI`: push one byte back into this tty's input queue.
+    ///
+    /// `tty_io.c::tiocsti` (2274-2291):
+    ///
+    /// ```c
+    /// if (!tty_legacy_tiocsti && !capable(CAP_SYS_ADMIN))
+    ///         return -EIO;
+    /// if ((current->signal->tty != tty) && !capable(CAP_SYS_ADMIN))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// `CONFIG_LEGACY_TIOCSTI` defaults to y (`drivers/tty/Kconfig:149`), so
+    /// the first test passes and injecting into YOUR OWN controlling
+    /// terminal is unprivileged; injecting into somebody else's is what
+    /// needs CAP_SYS_ADMIN, because that is the terminal-hijacking case.
+    pub(crate) fn insert_input_byte(&self, b: u8) -> Result<u64, FsError> {
+        let own_tty = match jobctl_query(0) {
+            Some((caller_sid, _)) => {
+                let sid = self.ctrl.lock().sid;
+                sid != 0 && sid == caller_sid
+            }
+            // No session tables (early boot, in-kernel tests): treat it as
+            // the caller's own terminal rather than inventing a denial.
+            None => true,
+        };
+        if !own_tty && !caller_capable(CAP_SYS_ADMIN) {
+            return Err(FsError::OperationNotPermitted); // EPERM
+        }
+        let t = *self.termios.lock();
+        let mut sigs: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        {
+            let mut state = self.input.lock();
+            crate::ntty::feed_byte(
+                &mut state,
+                &t,
+                b,
+                &mut |c| self.slave_tx_to_master.push(&[c]),
+                &mut |bb| match signal_for_cc(&t, bb) {
+                    Some(sig) => {
+                        sigs.push(sig);
+                        true
+                    }
+                    None => false,
+                },
+            );
+        }
+        if !sigs.is_empty() {
+            let pgrp = self.ctrl.lock().fg_pgrp;
+            for sig in sigs {
+                pty_deliver_signal(pgrp, sig);
+            }
+        }
+        Ok(0)
+    }
+
+    /// `TIOCVHANGUP`: force a hangup on this terminal.
+    ///
+    /// `tty_io.c:2729` gates it on CAP_SYS_ADMIN. The effect is what the
+    /// master closing already produces — readers see EOF and pollers HUP —
+    /// so it reuses that path rather than inventing a second one.
+    fn vhangup(&self) -> Result<u64, FsError> {
+        if !caller_capable(CAP_SYS_ADMIN) {
+            return Err(FsError::OperationNotPermitted); // EPERM
+        }
+        self.master_closed.store(true, Ordering::Release);
+        self.slave_opens.store(0, Ordering::Release);
+        self.slave_ever_opened.store(true, Ordering::Release);
+        Ok(0)
+    }
+
+    /// `TCFLSH` (`tcflush`): discard queued input and/or output.
+    ///
+    /// `drivers/tty/tty_ioctl.c::__tty_perform_flush` — TCIFLUSH(0) drops
+    /// the input queue, TCOFLUSH(1) the output queue, TCIOFLUSH(2) both;
+    /// anything else is -EINVAL.
+    fn flush_queues(&self, arg: usize) -> Result<u64, FsError> {
+        const TCIFLUSH: usize = 0;
+        const TCOFLUSH: usize = 1;
+        const TCIOFLUSH: usize = 2;
+        match arg {
+            TCIFLUSH | TCIOFLUSH => {
+                let mut st = self.input.lock();
+                st.ready.clear();
+                st.line.clear();
+                st.eof = false;
+                if arg == TCIOFLUSH {
+                    self.slave_tx_to_master.clear();
+                }
+                Ok(0)
+            }
+            TCOFLUSH => {
+                self.slave_tx_to_master.clear();
+                Ok(0)
+            }
+            _ => Err(FsError::InvalidData),
+        }
+    }
+
+    /// `TCXONC` (`tcflow`): suspend or resume the flow the IXON control
+    /// characters drive.
+    ///
+    /// `tty_ioctl.c` TCXONC: TCOOFF(0) stops output, TCOON(1) restarts it,
+    /// TCIOFF(2) transmits a STOP char and TCION(3) a START char; anything
+    /// else is -EINVAL.
+    fn flow_control(&self, arg: usize) -> Result<u64, FsError> {
+        const TCOOFF: usize = 0;
+        const TCOON: usize = 1;
+        const TCIOFF: usize = 2;
+        const TCION: usize = 3;
+        match arg {
+            TCOOFF => {
+                self.input.lock().stopped = true;
+                Ok(0)
+            }
+            TCOON => {
+                self.input.lock().stopped = false;
+                Ok(0)
+            }
+            // TCIOFF/TCION transmit the flow characters toward the peer.
+            // With no physical line the observable effect is the same flag
+            // the received character would have set.
+            TCIOFF => {
+                self.input.lock().stopped = true;
+                Ok(0)
+            }
+            TCION => {
+                self.input.lock().stopped = false;
+                Ok(0)
+            }
+            _ => Err(FsError::InvalidData),
+        }
+    }
+
+    /// Apply a new window size, signalling the foreground process group
+    /// when it actually changed.
+    ///
+    /// `tty_do_resize` (`drivers/tty/tty_io.c:2324`):
+    ///
+    /// ```c
+    /// if (!memcmp(ws, &tty->winsize, sizeof(*ws)))
+    ///         return 0;
+    /// ...
+    /// kill_pgrp(pgrp, SIGWINCH, 1);
+    /// tty->winsize = *ws;
+    /// ```
+    ///
+    /// Both halves matter. Without the signal a running program never
+    /// learns its geometry changed, so a resized window leaves vi, less and
+    /// every other full-screen program drawing at the old size. And the
+    /// no-change early return is what stops a terminal that re-sends its
+    /// size on every repaint from storming SIGWINCH at the foreground job.
+    pub(crate) fn resize(&self, ws: WinSize) {
+        {
+            let mut w = self.window.lock();
+            if *w == ws {
+                return;
+            }
+            *w = ws;
+        }
+        let pgrp = self.ctrl.lock().fg_pgrp;
+        if pgrp != 0 {
+            pty_deliver_signal(pgrp, SIGWINCH);
+        }
     }
 
     fn acquire_controlling_tty(&self, arg: usize, readable: bool) -> Result<(), FsError> {
@@ -465,6 +1102,13 @@ impl Pty {
     fn new(index: u32, uid: u32, gid: u32) -> Self {
         Self {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
+            output: IrqSafeSpinLock::new(crate::ntty::OutputState::new()),
+            read_timer: IrqSafeSpinLock::new(ReadTimer::new()),
+            exclusive: AtomicBool::new(false),
+            // All-zero: nothing is locked until TIOCSLCKTRMIOS says so.
+            locked_termios: IrqSafeSpinLock::new(Termios {
+                raw: [0u8; TERMIOS_WIRE_LEN],
+            }),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
@@ -503,6 +1147,62 @@ static NEXT_PTY_INDEX: AtomicU32 = AtomicU32::new(0);
 /// is installed — in-kernel tests and very early boot — PTYs are opened on
 /// behalf of root, matching the credentials those callers actually run with.
 static PTY_CREDS_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// `fn(pgrp) -> (caller's session, that pgrp's session or 0 if no such
+/// pgrp)`, installed by userspace.
+///
+/// Job-control ioctls need both answers to reproduce Linux's errno
+/// ordering, and neither is knowable from this crate — process groups and
+/// sessions live in the userspace tables.
+type JobctlHook = fn(u64) -> (u64, u64);
+
+static JOBCTL_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the session / process-group accessor used by the job-control
+/// ioctls.
+pub fn install_pty_jobctl_hook(hook: JobctlHook) {
+    JOBCTL_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// `(caller session, pgrp's session)`; `None` when no hook is installed,
+/// in which case the job-control checks are skipped rather than guessed at
+/// (early boot and in-kernel tests have no session tables).
+fn jobctl_query(pgrp: u64) -> Option<(u64, u64)> {
+    let raw = JOBCTL_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return None;
+    }
+    // SAFETY: `raw` was stored by `install_pty_jobctl_hook` from a
+    // `JobctlHook`, the only writer of this slot, and function pointers are
+    // never unmapped.
+    let hook: JobctlHook = unsafe { core::mem::transmute(raw) };
+    Some(hook(pgrp))
+}
+
+/// `fn(capability) -> bool` for the calling task, installed by userspace.
+type CapHook = fn(u32) -> bool;
+
+static CAP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the capability check used by the privileged tty ioctls.
+pub fn install_pty_cap_hook(hook: CapHook) {
+    CAP_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Whether the caller holds `cap`. With no hook installed — early boot and
+/// in-kernel tests — the answer is "yes", matching the fact that those
+/// callers really do run as root.
+fn caller_capable(cap: u32) -> bool {
+    let raw = CAP_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return true;
+    }
+    // SAFETY: `raw` was stored by `install_pty_cap_hook` from a `CapHook`,
+    // the only writer of this slot, and function pointers are never
+    // unmapped.
+    let hook: CapHook = unsafe { core::mem::transmute(raw) };
+    hook(cap)
+}
 
 /// Install the current-credentials accessor used to own new PTY slaves.
 pub fn install_pty_creds_hook(hook: fn() -> (u32, u32)) {
@@ -620,6 +1320,11 @@ pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
     if pty.locked.load(Ordering::Acquire) {
         return Some(Err(()));
     }
+    // Exclusive mode refuses a second opener without CAP_SYS_ADMIN, the
+    // TIOCGPTPEER equivalent of `tty_open`'s EBUSY.
+    if pty.exclusive.load(Ordering::Acquire) && !caller_capable(CAP_SYS_ADMIN) {
+        return Some(Err(()));
+    }
     Some(Ok(Arc::new(PtySlave::new(pty))))
 }
 
@@ -647,6 +1352,33 @@ pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
         narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const i32))
     };
     Ok(v)
+}
+
+/// Read the single `char` a `TIOCSTI` argument points at.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn read_user_u8(uptr: usize) -> Result<u8, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; the
+    // SMAP window is what makes a CPL=0 load from a user-only PTE legal.
+    // SAFETY: Valid memory or trusted environment
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const u8))
+    };
+    Ok(v)
+}
+
+/// Read the single `char` a `TIOCSTI` argument points at.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn read_user_u8(uptr: usize) -> Result<u8, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // and it is non-null per the check above.
+    // SAFETY: Valid memory or trusted environment
+    Ok(unsafe { core::ptr::read_unaligned(uptr as *const u8) })
 }
 
 // Not linux-compat-gated: /dev/random's RND* ioctls (always present) write an
@@ -1141,6 +1873,13 @@ impl FileOps for PtyMaster {
         // with no pending control event the byte is TIOCPKT_DATA and ordinary
         // output follows. (The flush/stop/start control packets are a
         // documented gap — see `Pty::packet`.)
+        // IXON/TCXONC flow control: while output is stopped the master sees
+        // nothing, which is the whole point of ^S. Linux gates the transmit
+        // path on `tty->flow.stopped`; a flag that stopped nothing would be
+        // an accepted-and-discarded control.
+        if self.pty.input.lock().stopped && !self.pty.hung_up() {
+            return Box::pin(async move { Err(FsError::WouldBlock) });
+        }
         if self.pty.packet.load(Ordering::Acquire) {
             if buf.is_empty() {
                 return Box::pin(async move { Ok(0) });
@@ -1293,7 +2032,7 @@ impl FileOps for PtyMaster {
                 Ok(0)
             }
             TIOCGPGRP => {
-                let pgrp = self.pty.ctrl.lock().fg_pgrp as i32;
+                let pgrp = self.pty.get_fg_pgrp()? as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
@@ -1301,11 +2040,7 @@ impl FileOps for PtyMaster {
             TIOCSPGRP => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let pgrp = unsafe { read_user_i32(arg)? };
-                if pgrp < 0 {
-                    return Err(FsError::InvalidData);
-                }
-                self.pty.ctrl.lock().fg_pgrp = pgrp as u64;
-                Ok(0)
+                self.pty.set_fg_pgrp(pgrp)
             }
             TIOCSCTTY => {
                 self.pty.acquire_controlling_tty(arg, true)?;
@@ -1316,8 +2051,8 @@ impl FileOps for PtyMaster {
                 let ws = WireWinsize {
                     ws_row: w.rows,
                     ws_col: w.cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
+                    ws_xpixel: w.xpixel,
+                    ws_ypixel: w.ypixel,
                 };
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_winsize(arg, ws)? };
@@ -1326,9 +2061,12 @@ impl FileOps for PtyMaster {
             TIOCSWINSZ => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let ws = unsafe { read_user_winsize(arg)? };
-                let mut w = self.pty.window.lock();
-                w.rows = ws.ws_row;
-                w.cols = ws.ws_col;
+                self.pty.resize(WinSize {
+                    rows: ws.ws_row,
+                    cols: ws.ws_col,
+                    xpixel: ws.ws_xpixel,
+                    ypixel: ws.ws_ypixel,
+                });
                 Ok(0)
             }
             TCGETS => {
@@ -1339,10 +2077,21 @@ impl FileOps for PtyMaster {
             }
             TCSETS | TCSETSW | TCSETSF => {
                 // Store the caller's termios so it round-trips and the
-                // ICANON/ECHO knobs take effect in the line discipline.
+                // line-discipline knobs take effect.
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                // TCSETSF additionally DISCARDS queued input
+                // (`tty_ioctl.c::set_termios` -> `tty_ldisc_flush`), which
+                // is the whole reason `tcsetattr(TCSAFLUSH)` exists: a
+                // program switching to raw mode must not then read the
+                // keystrokes typed while it was still cooked.
+                if cmd == TCSETSF {
+                    let mut st = self.pty.input.lock();
+                    st.ready.clear();
+                    st.line.clear();
+                    st.eof = false;
+                }
                 Ok(0)
             }
             TCGETS2 => {
@@ -1354,7 +2103,77 @@ impl FileOps for PtyMaster {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                Ok(0)
+            }
+            TIOCEXCL => {
+                // `set_bit(TTY_EXCLUSIVE, &tty->flags)` (`tty_io.c:2713`).
+                self.pty.exclusive.store(true, Ordering::Release);
+                Ok(0)
+            }
+            TIOCNXCL => {
+                self.pty.exclusive.store(false, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGEXCL => {
+                let v = self.pty.exclusive.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCGETD => {
+                // `put_user(ld->ops->num, p)` — always N_TTY here.
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, N_TTY)? };
+                Ok(0)
+            }
+            TIOCSETD => {
+                // Only N_TTY exists; `tty_set_ldisc` answers EINVAL for a
+                // discipline that is not registered.
+                // SAFETY: arg is a validated user `int *`.
+                let want = unsafe { read_user_i32(arg)? };
+                if want != N_TTY {
+                    return Err(FsError::InvalidData); // EINVAL
+                }
+                Ok(0)
+            }
+            TIOCSTI => {
+                // `arg` is a `char __user *`, read BEFORE the byte is fed.
+                // SAFETY: arg is a validated user `char *`.
+                let b = unsafe { read_user_u8(arg)? };
+                self.pty.insert_input_byte(b)
+            }
+            TIOCVHANGUP => self.pty.vhangup(),
+            TIOCGLCKTRMIOS => {
+                let l = *self.pty.locked_termios.lock();
+                // SAFETY: arg is a validated user `struct termios *`.
+                unsafe { write_user_termios(arg, &l.raw)? };
+                Ok(0)
+            }
+            TIOCSLCKTRMIOS => {
+                // `checkpoint_restore_ns_capable` (`tty_ioctl.c:843`);
+                // CAP_SYS_ADMIN implies it.
+                if !caller_capable(CAP_SYS_ADMIN) {
+                    return Err(FsError::OperationNotPermitted); // EPERM
+                }
+                // SAFETY: arg is a validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.locked_termios.lock().raw = raw;
+                Ok(0)
+            }
+            TCFLSH => self.pty.flush_queues(arg),
+            TCXONC => self.pty.flow_control(arg),
+            // TCSBRK / tcdrain: a PTY has no transmitter to drain and no
+            // BREAK to send, so Linux's pty (which supplies no `break_ctl`)
+            // waits for output to drain and returns success.
+            TCSBRK => Ok(0),
+            TIOCOUTQ => {
+                // The MASTER's output queue is what it has written toward
+                // the slave, i.e. the slave's pending input — not the
+                // slave's output, which is what the master READS.
+                let n = self.pty.input.lock().readable() as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, n)? };
                 Ok(0)
             }
             FIONREAD => {
@@ -1421,7 +2240,11 @@ impl FileOps for PtyMaster {
     /// open counter reproduces.
     fn poll_readiness(&self) -> u32 {
         let mut mask = crate::POLL_OUT;
-        if self.pty.slave_tx_to_master.len() > 0 {
+        // Stopped output is not readable output — the poll mask has to agree
+        // with `read`, or an event loop spins on a POLLIN that never yields
+        // a byte.
+        let stopped = self.pty.input.lock().stopped;
+        if !stopped && self.pty.slave_tx_to_master.len() > 0 {
             mask |= crate::POLL_IN;
         }
         if self.pty.hung_up() {
@@ -1476,6 +2299,39 @@ impl FileOps for PtySlave {
     ///
     /// Linux ref: `n_tty.c n_tty_read` → canonical buffer drain.
     fn read<'a>(&'a self, _offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
+        // Non-canonical reads answer to VMIN/VTIME, which decide whether
+        // enough has arrived (or waited long enough) to return at all.
+        // Canonical mode does not consult them — Linux leaves `minimum` and
+        // `time` at zero for it — so it keeps the line-at-a-time path below.
+        let t = *self.pty.termios.lock();
+        if !t.icanon() {
+            let avail = self.pty.input.lock().readable();
+            let gate = self.pty.noncanon_read_gate(&t, avail);
+            let hung_up = self.pty.master_closed.load(Ordering::Acquire);
+            if gate == ReadGate::Block && !hung_up {
+                // Not satisfied and no timer has expired. A hung-up master
+                // is still a real EOF, so it overrides the wait.
+                return Box::pin(async move { Err(FsError::WouldBlock) });
+            }
+            if avail == 0 {
+                // Deliver with an empty queue. With VMIN == 0 this is a
+                // legitimate 0-byte read, NOT end-of-file: a polling read
+                // (VTIME == 0) never waits, and a timed read reports what it
+                // has when VTIME expires — `n_tty_read` returns `kb - kbuf`,
+                // which is simply zero. This is the second place a 0 is
+                // correct on a PTY, alongside canonical mode's latched ^D.
+                return Box::pin(async move { Ok(0) });
+            }
+            let n = self.pty.input.lock().drain_into(buf);
+            return Box::pin(async move {
+                if n == 0 {
+                    // The caller passed a zero-length buffer.
+                    Ok(0)
+                } else {
+                    Ok(n)
+                }
+            });
+        }
         let mut state = self.pty.input.lock();
         if state.readable() == 0 {
             // The ONE PTY case where 0 is correct: canonical mode latches ^D
@@ -1522,19 +2378,25 @@ impl FileOps for PtySlave {
     /// Linux ref: `pty.c pty_write` for the echo side via
     ///   `n_tty_receive_buf_common → n_tty_echo`.
     fn write<'a>(&'a self, _offset: u64, buf: &'a [u8]) -> FsFuture<'a, usize> {
-        let echo = self.pty.termios.lock().echo();
-        // Push slave output so master can read it.
-        self.pty.slave_tx_to_master.push(buf);
-        // Echo: if ECHO flag is on, also copy to slave_tx_to_master so
-        // the master gets a copy of what the slave wrote.
-        // (Both pushed to slave_tx_to_master; the echo path mirrors
-        //  Linux's n_tty_echo which feeds back into the master read.)
-        if echo {
-            // Already pushed above; echo is the same data going to the
-            // same ring in this simplified model.  A full implementation
-            // would duplicate to a separate echo buffer.
+        // Slave output runs through OPOST on its way to the master, which
+        // is what turns a bare `\n` into CR-NL. Skipping it is invisible on
+        // a serial console (the UART driver adds its own CR) and ruins
+        // every terminal emulator, which correctly expects the line
+        // discipline to have done it.
+        //
+        // This is the `tty->ops->write` side of `do_output_char`; ECHO is
+        // NOT involved here. Echo reflects INPUT — bytes the master wrote —
+        // and is applied on the master write path by `ntty::feed_byte`.
+        let mut processed = alloc::vec::Vec::with_capacity(buf.len() + 8);
+        {
+            let t = *self.pty.termios.lock();
+            let mut out = self.pty.output.lock();
+            crate::ntty::process_output(&mut out, &t, buf, &mut |c| processed.push(c));
         }
-        let _ = echo;
+        self.pty.slave_tx_to_master.push(&processed);
+        // Linux reports the bytes the CALLER supplied, not the expanded
+        // count: a `\n` that became CR-NL still consumed one byte of the
+        // caller's buffer.
         let n = buf.len();
         Box::pin(async move { Ok(n) })
     }
@@ -1584,7 +2446,7 @@ impl FileOps for PtySlave {
                 Ok(0)
             }
             TIOCGPGRP => {
-                let pgrp = self.pty.ctrl.lock().fg_pgrp as i32;
+                let pgrp = self.pty.get_fg_pgrp()? as i32;
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_i32(arg, pgrp)? };
                 Ok(0)
@@ -1592,11 +2454,7 @@ impl FileOps for PtySlave {
             TIOCSPGRP => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let pgrp = unsafe { read_user_i32(arg)? };
-                if pgrp < 0 {
-                    return Err(FsError::InvalidData);
-                }
-                self.pty.ctrl.lock().fg_pgrp = pgrp as u64;
-                Ok(0)
+                self.pty.set_fg_pgrp(pgrp)
             }
             TIOCSCTTY => {
                 self.pty.acquire_controlling_tty(arg, true)?;
@@ -1619,8 +2477,8 @@ impl FileOps for PtySlave {
                 let ws = WireWinsize {
                     ws_row: w.rows,
                     ws_col: w.cols,
-                    ws_xpixel: 0,
-                    ws_ypixel: 0,
+                    ws_xpixel: w.xpixel,
+                    ws_ypixel: w.ypixel,
                 };
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 unsafe { write_user_winsize(arg, ws)? };
@@ -1629,9 +2487,12 @@ impl FileOps for PtySlave {
             TIOCSWINSZ => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let ws = unsafe { read_user_winsize(arg)? };
-                let mut w = self.pty.window.lock();
-                w.rows = ws.ws_row;
-                w.cols = ws.ws_col;
+                self.pty.resize(WinSize {
+                    rows: ws.ws_row,
+                    cols: ws.ws_col,
+                    xpixel: ws.ws_xpixel,
+                    ypixel: ws.ws_ypixel,
+                });
                 Ok(0)
             }
             TCGETS => {
@@ -1643,7 +2504,14 @@ impl FileOps for PtySlave {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                // TCSETSF discards queued input; TCSETS and TCSETSW do not.
+                if cmd == TCSETSF {
+                    let mut st = self.pty.input.lock();
+                    st.ready.clear();
+                    st.line.clear();
+                    st.eof = false;
+                }
                 Ok(0)
             }
             TCGETS2 => {
@@ -1655,7 +2523,75 @@ impl FileOps for PtySlave {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                Ok(0)
+            }
+            TIOCEXCL => {
+                // `set_bit(TTY_EXCLUSIVE, &tty->flags)` (`tty_io.c:2713`).
+                self.pty.exclusive.store(true, Ordering::Release);
+                Ok(0)
+            }
+            TIOCNXCL => {
+                self.pty.exclusive.store(false, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGEXCL => {
+                let v = self.pty.exclusive.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCGETD => {
+                // `put_user(ld->ops->num, p)` — always N_TTY here.
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, N_TTY)? };
+                Ok(0)
+            }
+            TIOCSETD => {
+                // Only N_TTY exists; `tty_set_ldisc` answers EINVAL for a
+                // discipline that is not registered.
+                // SAFETY: arg is a validated user `int *`.
+                let want = unsafe { read_user_i32(arg)? };
+                if want != N_TTY {
+                    return Err(FsError::InvalidData); // EINVAL
+                }
+                Ok(0)
+            }
+            TIOCSTI => {
+                // `arg` is a `char __user *`, read BEFORE the byte is fed.
+                // SAFETY: arg is a validated user `char *`.
+                let b = unsafe { read_user_u8(arg)? };
+                self.pty.insert_input_byte(b)
+            }
+            TIOCVHANGUP => self.pty.vhangup(),
+            TIOCGLCKTRMIOS => {
+                let l = *self.pty.locked_termios.lock();
+                // SAFETY: arg is a validated user `struct termios *`.
+                unsafe { write_user_termios(arg, &l.raw)? };
+                Ok(0)
+            }
+            TIOCSLCKTRMIOS => {
+                // `checkpoint_restore_ns_capable` (`tty_ioctl.c:843`);
+                // CAP_SYS_ADMIN implies it.
+                if !caller_capable(CAP_SYS_ADMIN) {
+                    return Err(FsError::OperationNotPermitted); // EPERM
+                }
+                // SAFETY: arg is a validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.locked_termios.lock().raw = raw;
+                Ok(0)
+            }
+            TCFLSH => self.pty.flush_queues(arg),
+            TCXONC => self.pty.flow_control(arg),
+            // TCSBRK / tcdrain: a PTY has no transmitter to drain and no
+            // BREAK to send, so Linux's pty (which supplies no `break_ctl`)
+            // waits for output to drain and returns success.
+            TCSBRK => Ok(0),
+            TIOCOUTQ => {
+                // Bytes written but not yet consumed by the other end.
+                let n = self.pty.slave_tx_to_master.len() as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, n)? };
                 Ok(0)
             }
             FIONREAD => {
@@ -1856,6 +2792,13 @@ impl DirOps for DevPts {
             }
             let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
             let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
+            // `tty_open`: `if (test_bit(TTY_EXCLUSIVE, &tty->flags) &&
+            // !capable(CAP_SYS_ADMIN)) return -EBUSY;` — exclusive mode is
+            // what stops a second program attaching to a terminal another
+            // already owns.
+            if pty.exclusive.load(Ordering::Acquire) && !caller_capable(CAP_SYS_ADMIN) {
+                return Err(FsError::Busy);
+            }
             if pty.locked.load(Ordering::Acquire) {
                 return Err(FsError::Busy);
             }

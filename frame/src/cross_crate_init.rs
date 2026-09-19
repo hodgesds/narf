@@ -100,6 +100,14 @@ fn install_console_signal_hook() {
     // this the slave stays root-owned and no non-root graphical session can
     // open a terminal.
     narf_filesystem::devfs_pty::install_pty_creds_hook(narf_userspace::handlers::pty_open_fs_ids);
+    // Job-control ioctls need the session tables to tell ENOTTY, ESRCH and
+    // EPERM apart; the filesystem crate cannot see them.
+    narf_filesystem::devfs_pty::install_pty_jobctl_hook(
+        narf_userspace::handlers::pty_jobctl_sessions,
+    );
+    // The privileged tty ioctls test POSIX capabilities, which live in the
+    // process tables rather than the filesystem layer.
+    narf_filesystem::devfs_pty::install_pty_cap_hook(narf_userspace::handlers::pty_capable);
 }
 
 fn install_proc_hooks() {

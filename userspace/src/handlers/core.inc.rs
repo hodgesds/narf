@@ -1571,6 +1571,7 @@ fn open_impl(
                 Some(Some(Err(error))) => {
                     let errno = match error {
                         narf_filesystem::FsError::NotFound => 2,          // ENOENT
+                        narf_filesystem::FsError::NoSuchProcess => 3,     // ESRCH
                         narf_filesystem::FsError::PermissionDenied => 13, // EACCES
                         narf_filesystem::FsError::OperationNotPermitted => 1, // EPERM
                         narf_filesystem::FsError::Io(_) => 5,             // EIO
@@ -3887,6 +3888,7 @@ impl CopyFdEndpoint {
 fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
     match error {
         narf_filesystem::FsError::NotFound => 2,
+        narf_filesystem::FsError::NoSuchProcess => 3, // ESRCH
         narf_filesystem::FsError::PermissionDenied => 13,
         narf_filesystem::FsError::OperationNotPermitted => 1,
         narf_filesystem::FsError::Io(_) => 5,
@@ -12962,6 +12964,53 @@ pub(crate) fn current_fs_ids() -> (u32, u32) {
 pub fn pty_open_fs_ids() -> (u32, u32) {
     let ids = read_uidgid(current_task_id());
     (ids.fsuid, ids.fsgid)
+}
+
+/// Session lookups for the job-control tty ioctls: the caller's session,
+/// and the session owning `pgrp` (0 when no such process group exists).
+///
+/// Whether the calling task holds `cap`, for the privileged tty ioctls
+/// (TIOCSTI on another terminal, TIOCVHANGUP, TIOCSLCKTRMIOS, and an
+/// exclusive-mode open). POSIX capabilities live in the process tables,
+/// not the filesystem layer, so the answer is supplied from here.
+pub fn pty_capable(cap: u32) -> bool {
+    task_capable(current_task_id(), cap)
+}
+
+/// Session lookups for the job-control tty ioctls: the caller's session,
+/// and the session owning `pgrp` (0 when no such process group exists).
+pub fn pty_jobctl_sessions(pgrp: u64) -> (u64, u64) {
+    let caller = read_sid(current_task_id());
+    if pgrp == 0 {
+        // A pure "who am I" query from TIOCGPGRP.
+        return (caller, 0);
+    }
+    // Find any task in that process group, then read ITS session. The two
+    // tables are locked one after the other, never nested, so this cannot
+    // invert a lock order against the pgid/sid setters.
+    let member = {
+        let g = PGID_TABLE.lock();
+        g.as_ref()
+            .and_then(|m| m.iter().find(|(_, &gid)| gid == pgrp).map(|(&t, _)| t))
+    };
+    match member {
+        Some(t) => (caller, read_sid(t)),
+        // A process group whose only member is its leader may have no
+        // explicit PGID row (pgid == pid by default), so fall back to
+        // treating the pgrp id as a task id before declaring ESRCH.
+        None => {
+            let exists = PGID_TABLE
+                .lock()
+                .as_ref()
+                .map(|m| m.contains_key(&pgrp))
+                .unwrap_or(false);
+            if exists || read_sid(pgrp) != pgrp {
+                (caller, read_sid(pgrp))
+            } else {
+                (caller, 0)
+            }
+        }
+    }
 }
 
 /// The calling task's socket credentials (`struct ucred` shape): its
