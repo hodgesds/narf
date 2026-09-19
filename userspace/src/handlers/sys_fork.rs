@@ -310,6 +310,11 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     uidgid_fork(parent_pid, child_tid.raw());
     // `copy_process` duplicates the task mempolicy for every child.
     crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());
+    // The interleave cursor rides along in the task_struct copy.
+    crate::handlers::interleave_index_fork(parent_pid, child_tid.raw());
+    // fork(2) always means a new address space, so the balancing scan
+    // restarts from the floor rather than continuing the parent's walk.
+    crate::handlers::numa_balance_fork(parent_pid, child_tid.raw(), false);
     // brk is inherited by `clone_for_fork` (it's address-space state), not copied
     // per-task.
     sigaction_fork(parent_pid, child_tid.raw());

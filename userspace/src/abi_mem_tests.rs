@@ -769,6 +769,128 @@ fn smoke_abi_mem_mempolicy_inherited_by_child() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mempolicy_inherited_by_child);
 
+/// A child inherits the parent's interleave cursor.
+///
+/// `il_prev` is a plain `task_struct` field that `copy_process` never
+/// resets (`include/linux/sched.h:1355`), so the struct copy carries it to
+/// every child; only `set_mempolicy` resets it, and only for an interleave
+/// policy (`mm/mempolicy.c:1095`). Starting each child at 0 restarted the
+/// round-robin, so a forked child re-walked the nodes its parent had just
+/// used instead of continuing past them.
+fn smoke_abi_mem_interleave_index_inherited_by_child() -> TestResult {
+    with_setup(|| {
+        const CHILD_TID: u64 = 0x3FED_0003;
+        let mask = 1u64;
+        // MPOL_INTERLEAVE (3) — the mode the cursor actually drives.
+        if call(
+            Syscall::SetMempolicy.raw(),
+            a2(3, &mask as *const u64 as u64, 64),
+        ) != Some(0)
+        {
+            return Err("set_mempolicy(MPOL_INTERLEAVE) failed");
+        }
+        // Advance through the production path, so the parent's cursor is
+        // somewhere a fresh child would NOT be.
+        crate::handlers::__test_advance_interleave_index(FAKE_TASK);
+        crate::handlers::__test_advance_interleave_index(FAKE_TASK);
+        let parent = crate::handlers::__test_interleave_index(FAKE_TASK)
+            .ok_or("parent has no interleave cursor")?;
+        if parent == 0 {
+            return Err("parent cursor did not advance; test cannot discriminate");
+        }
+
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        crate::handlers::interleave_index_fork(FAKE_TASK, CHILD_TID);
+        let child = crate::handlers::__test_interleave_index(CHILD_TID);
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        match child {
+            Some(c) if c == parent => Ok(()),
+            Some(_) => Err("child's interleave cursor is not the parent's"),
+            None => Err("child did not inherit the parent's interleave cursor"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_interleave_index_inherited_by_child
+);
+
+/// NUMA-balancing scan state follows a child, and CLONE_VM decides how.
+///
+/// `init_numa_balancing()` (`kernel/sched/fair.c:3620`) splits on which
+/// address space is being scanned: a child with its own mm restarts the
+/// walk (Linux resets `numa_next_scan`/`numa_scan_seq` for a one-user mm
+/// and clears `numa_preferred_nid`), while a CLONE_VM thread scans the
+/// SAME address space and so keeps the shared position, merely staggering
+/// when its own scanning begins. Either way the first scan is delayed.
+///
+/// Inheriting nothing meant the tick handler's "no entry" early-return
+/// fired forever: a forked child of a balancing process was never scanned
+/// again.
+fn smoke_abi_mem_numa_balance_state_inherited_by_child() -> TestResult {
+    with_setup(|| {
+        const FORK_TID: u64 = 0x3FED_0004;
+        const THREAD_TID: u64 = 0x3FED_0005;
+        const FLOOR: u64 = 0x0000_0080_0000_0000;
+        let mask = 1u64;
+        // MPOL_BIND | MPOL_F_NUMA_BALANCING (1 << 13) over a range: this is
+        // what seeds a scan cursor away from the floor.
+        let mode = 2u64 | (1u64 << 13);
+        let scan_start = FLOOR + 0x2000;
+        if call(
+            Syscall::Mbind.raw(),
+            a3(scan_start, 0x1000, mode, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
+            return Err("mbind(MPOL_F_NUMA_BALANCING) failed");
+        }
+        let (_, parent_cursor) = crate::handlers::__test_numa_balance_state(FAKE_TASK)
+            .ok_or("parent has no NUMA balancing state")?;
+        if parent_cursor == FLOOR {
+            return Err("parent cursor sits at the floor; test cannot discriminate");
+        }
+
+        // A forked child has its own address space: restart the walk.
+        crate::handlers::__test_release_task_tables(FORK_TID);
+        crate::handlers::numa_balance_fork(FAKE_TASK, FORK_TID, false);
+        let forked = crate::handlers::__test_numa_balance_state(FORK_TID);
+        crate::handlers::__test_release_task_tables(FORK_TID);
+        match forked {
+            None => return Err("forked child inherited no NUMA balancing state"),
+            Some((ticks, cursor)) => {
+                if cursor != FLOOR {
+                    return Err("forked child must restart the scan at the floor");
+                }
+                if ticks != 0 {
+                    return Err("forked child's first scan must be delayed");
+                }
+            }
+        }
+
+        // A CLONE_VM thread shares the address space: continue the walk.
+        crate::handlers::__test_release_task_tables(THREAD_TID);
+        crate::handlers::numa_balance_fork(FAKE_TASK, THREAD_TID, true);
+        let threaded = crate::handlers::__test_numa_balance_state(THREAD_TID);
+        crate::handlers::__test_release_task_tables(THREAD_TID);
+        match threaded {
+            None => Err("CLONE_VM thread inherited no NUMA balancing state"),
+            Some((ticks, cursor)) => {
+                if cursor != parent_cursor {
+                    return Err("CLONE_VM thread must continue the shared scan position");
+                }
+                if ticks != 0 {
+                    return Err("CLONE_VM thread's scan start must be staggered");
+                }
+                Ok(())
+            }
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_numa_balance_state_inherited_by_child
+);
+
 /// A forked child's new address space inherits the parent's `mbind` ranges.
 ///
 /// `dup_mmap` calls `vma_dup_policy` (`mm/mempolicy.c:2802`) for every VMA
