@@ -78,6 +78,10 @@ impl Drop for OpenFileDescription {
     /// boot with no owner left to unlock it.
     fn drop(&mut self) {
         locks::release_ofd_owner(self.lock_owner());
+        // `flock(2)` locks are owned by the description too, and released
+        // at exactly the same moment — `locks_remove_flock` runs from
+        // `filp_close`/`__fput`, not from any earlier close of an alias.
+        crate::handlers::release_flock_owner(self.lock_owner());
     }
 }
 

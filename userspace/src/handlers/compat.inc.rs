@@ -9103,50 +9103,123 @@ const LOCK_EX: u32 = 2;
 const LOCK_NB: u32 = 4;
 const LOCK_UN: u32 = 8;
 
+/// One holder of a `flock(2)` lock.
+///
+/// Owned by the OPEN FILE DESCRIPTION, as Linux owns them — `fl_file` is
+/// the `struct file *`. This used to be a task id plus an anonymous count
+/// of shared holders, which got three things wrong at once:
+///
+///   * `dup`/`fork` aliases and the ORIGINAL descriptor share one lock in
+///     Linux, and closing one alias releases nothing. Keyed by task, two
+///     descriptions in one process were indistinguishable, so two
+///     independent `open()`s could not conflict — which is precisely the
+///     case `flock` single-instance guards are built on.
+///   * `LOCK_UN` decremented `shared_count` without checking the caller
+///     held anything, so a task that never locked could release someone
+///     else's shared lock.
+///   * a shared hold could not be attributed to anyone, so task exit left
+///     it behind forever. The teardown sweep said so in as many words:
+///     "Shared holds are an anonymous count and can't be attributed".
+#[derive(Clone, Copy, Debug)]
+struct FlockHolder {
+    /// Description identity — `fd::FdTable::description_lock_owner`.
+    owner: u64,
+    exclusive: bool,
+}
+
 #[derive(Default, Debug)]
 struct FlockEntry {
-    /// Number of shared (read) holders. > 0 means SH-locked.
-    shared_count: u32,
-    /// Task id holding an exclusive lock; 0 means no exclusive.
-    exclusive_owner: u64,
+    /// Every description currently holding this file. At most one entry
+    /// per owner; a re-lock CONVERTS it, as `flock_lock_inode` does.
+    holders: alloc::vec::Vec<FlockHolder>,
+}
+
+impl FlockEntry {
+    fn position_of(&self, owner: u64) -> Option<usize> {
+        self.holders.iter().position(|h| h.owner == owner)
+    }
+    /// Any holder that is not `owner`.
+    fn other_holder_exists(&self, owner: u64) -> bool {
+        self.holders.iter().any(|h| h.owner != owner)
+    }
+    /// Any OTHER description holding it exclusively.
+    fn other_exclusive(&self, owner: u64) -> bool {
+        self.holders.iter().any(|h| h.owner != owner && h.exclusive)
+    }
 }
 
 static FLOCK_TABLE: narf_lib::sync::IrqSafeSpinLock<
     Option<alloc::collections::BTreeMap<usize, FlockEntry>>,
 > = narf_lib::sync::IrqSafeSpinLock::new(None);
 
-fn flock_try(file_ptr: usize, op: u32, task: u64) -> Result<(), ()> {
+/// `fs/locks.c::flock_lock_inode`, reduced to what NARF models.
+///
+/// `owner` is the open file description, not the task — see
+/// [`FlockHolder`]. A second lock from the SAME description converts the
+/// one it already holds rather than adding another, which is why every arm
+/// tests `other_*` rather than "is the table empty".
+fn flock_try(file_ptr: usize, op: u32, owner: u64) -> Result<(), ()> {
     let mut g = FLOCK_TABLE.lock();
     let map = g.get_or_insert_with(alloc::collections::BTreeMap::new);
     let e = map.entry(file_ptr).or_default();
     if op & LOCK_UN != 0 {
-        if e.exclusive_owner == task {
-            e.exclusive_owner = 0;
-        } else if e.shared_count > 0 {
-            e.shared_count -= 1;
+        // Release only what THIS description holds. Unlocking something
+        // never acquired is a no-op success, as it is on Linux.
+        if let Some(i) = e.position_of(owner) {
+            e.holders.remove(i);
+        }
+        if e.holders.is_empty() {
+            map.remove(&file_ptr);
         }
         return Ok(());
     }
     if op & LOCK_EX != 0 {
-        // Exclusive: succeed iff no shared, no other exclusive.
-        if e.exclusive_owner == task {
-            return Ok(());
+        // Exclusive conflicts with any other holder, shared or not.
+        if e.other_holder_exists(owner) {
+            return Err(());
         }
-        if e.shared_count == 0 && e.exclusive_owner == 0 {
-            e.exclusive_owner = task;
-            return Ok(());
+        match e.position_of(owner) {
+            Some(i) => e.holders[i].exclusive = true,
+            None => e.holders.push(FlockHolder {
+                owner,
+                exclusive: true,
+            }),
         }
-        return Err(());
+        return Ok(());
     }
     if op & LOCK_SH != 0 {
-        // Shared: succeed iff no exclusive (or we hold it).
-        if e.exclusive_owner == 0 || e.exclusive_owner == task {
-            e.shared_count += 1;
-            return Ok(());
+        // Shared conflicts only with another description's exclusive.
+        if e.other_exclusive(owner) {
+            return Err(());
         }
-        return Err(());
+        match e.position_of(owner) {
+            Some(i) => e.holders[i].exclusive = false,
+            None => e.holders.push(FlockHolder {
+                owner,
+                exclusive: false,
+            }),
+        }
+        return Ok(());
     }
     Err(())
+}
+
+/// Drop every `flock(2)` lock held by one open file description.
+///
+/// Called from that description's `Drop`, which is what "the last
+/// descriptor referring to it was closed" actually means — the same
+/// release rule, and the same hook, as an OFD record lock.
+pub(crate) fn release_flock_owner(owner: u64) {
+    let mut g = FLOCK_TABLE.lock();
+    let Some(map) = g.as_mut() else {
+        return;
+    };
+    for e in map.values_mut() {
+        if let Some(i) = e.position_of(owner) {
+            e.holders.remove(i);
+        }
+    }
+    map.retain(|_, e| !e.holders.is_empty());
 }
 
 // ── Terminal attributes (termios) ───────────────────────────────

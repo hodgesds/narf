@@ -44,6 +44,13 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
         }
     };
     let file_ptr = alloc::sync::Arc::as_ptr(&arc_ops) as *const () as usize;
+    // The lock is owned by the open file description (`fl_file`), not the
+    // task: dup/fork aliases share one lock, and two independent opens in
+    // one process must conflict.
+    let Some(owner) = fd::with_table(task, |t| t.description_lock_owner(fd)).flatten() else {
+        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    };
     let nonblock = op & LOCK_NB != 0;
     // The blocking path retries by parking via the yield hook and
     // re-executing the syscall on resume (a longjmp clippy can't see),
@@ -51,7 +58,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     // `never_loop`. The `loop` keeps the retry intent explicit.
     #[allow(clippy::never_loop)]
     loop {
-        if flock_try(file_ptr, op, task).is_ok() {
+        if flock_try(file_ptr, op, owner).is_ok() {
             ctx.set_return(SyscallReturn::ok(0));
             return;
         }
