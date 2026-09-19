@@ -22,7 +22,10 @@ int main(void) {
     struct cap_data set[2];
     memset(set, 0, sizeof set);
     // 64-bit caps split lo (data[0]) / hi (data[1]).
-    set[0].effective = 0x12345678u;  set[1].effective = 0x9u;
+    // Linux requires the new effective set to be a subset of the new
+    // permitted set (security/commoncap.c::cap_capset). Keep distinct masks
+    // while exercising both 32-bit words of the v3 capability ABI.
+    set[0].effective = 0x12241668u;  set[1].effective = 0x1u;
     set[0].permitted = 0xdeadbeefu;  set[1].permitted = 0x1u;
     if (syscall(SYS_capset, &hdr, set) != 0) { w("cap-fail: capset\n"); return 1; }
 
@@ -30,7 +33,7 @@ int main(void) {
     struct cap_data got[2];
     memset(got, 0, sizeof got);
     if (syscall(SYS_capget, &hdr2, got) != 0) { w("cap-fail: capget\n"); return 1; }
-    if (got[0].effective != 0x12345678u || got[1].effective != 0x9u) {
+    if (got[0].effective != 0x12241668u || got[1].effective != 0x1u) {
         w("cap-fail: eff-mismatch\n"); return 1;
     }
     if (got[0].permitted != 0xdeadbeefu || got[1].permitted != 0x1u) {
