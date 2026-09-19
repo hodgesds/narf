@@ -3820,7 +3820,7 @@ fn smoke_memory_blocks_persist_offline_topology() -> narf_kernel_test::TestResul
 narf_kernel_test::kernel_test_in!("memory/numa", smoke_memory_blocks_persist_offline_topology);
 
 #[inline]
-pub(crate) fn current_cpu_node() -> usize {
+pub fn current_cpu_node() -> usize {
     let cpu = narf_lib::percpu::current_cpu() as u32;
     // SAFETY: narf-frame provides the `#[no_mangle]` definition.
     let n = unsafe { narf_cpu_to_node(cpu) } as usize;

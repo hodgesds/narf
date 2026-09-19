@@ -7149,6 +7149,62 @@ fn resolve_policy(task: u64, va: u64) -> StoredPolicy {
         .unwrap_or(StoredPolicy::DEFAULT)
 }
 
+/// The node a `FUTEX2_MPOL` futex hashes to, or `FUTEX_NO_NODE` (-1).
+///
+/// `kernel/futex/core.c::__futex_key_to_node`. Note what this deliberately
+/// does NOT do: it reads only the *VMA* policy (`vma->vm_policy`, installed
+/// by `mbind(2)`) and answers `FUTEX_NO_NODE` when the address has none. It
+/// never falls back to the task policy the way `resolve_policy` does — a
+/// `set_mempolicy(2)` default must not steer futex hashing, or two threads
+/// with different task policies would hash the same shared futex word to
+/// different buckets and stop seeing each other's wakes.
+///
+/// Only `MPOL_PREFERRED` (first node of the mask) and the home-node of
+/// `MPOL_BIND` / `MPOL_PREFERRED_MANY` name a node; every other mode —
+/// including interleave, which by definition names no single node — is
+/// `FUTEX_NO_NODE`.
+fn futex_mpol_node(task: u64, va: u64) -> i32 {
+    const FUTEX_NO_NODE: i32 = -1;
+    if !CUSTOM_MEMPOLICY_POSSIBLE.load(core::sync::atomic::Ordering::Acquire) {
+        return FUTEX_NO_NODE;
+    }
+    let policy = {
+        let table = MBIND_TABLE.lock();
+        let Some(ranges) = table.as_ref().and_then(|m| m.get(&task)) else {
+            return FUTEX_NO_NODE;
+        };
+        let mut found = None;
+        for &(start, len, pol) in ranges.iter() {
+            if va >= start && va < start.saturating_add(len) {
+                found = Some(pol);
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => return FUTEX_NO_NODE,
+        }
+    };
+    match policy.mode & !MPOL_MODE_FLAGS {
+        narf_memory::MPOL_PREFERRED => {
+            // `first_node(mpol->nodes)`. An empty mask names no node.
+            if policy.nodemask == 0 {
+                FUTEX_NO_NODE
+            } else {
+                policy.nodemask.trailing_zeros() as i32
+            }
+        }
+        narf_memory::MPOL_BIND | narf_memory::MPOL_PREFERRED_MANY => {
+            if policy.home_node == u32::MAX {
+                FUTEX_NO_NODE
+            } else {
+                policy.home_node as i32
+            }
+        }
+        _ => FUTEX_NO_NODE,
+    }
+}
+
 /// Publish the current task's mempolicy for the faulting address `va`
 /// into the memory crate's per-CPU active slot, so the demand-paging
 /// allocator steers the fresh frame. Called by the #PF handler right

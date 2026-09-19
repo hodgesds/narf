@@ -6931,6 +6931,11 @@ fn sign_extend_12(value: u32) -> i32 {
 pub(crate) struct FutexKey {
     namespace: u64,
     uaddr: u64,
+    /// `key->both.node`. `FUTEX_NO_NODE` (-1) for every futex that did not
+    /// ask for NUMA/MPOL hashing, which is all of the classic `futex(2)`
+    /// ABI. Part of the key, so two futex2 waiters that named different
+    /// nodes for one address do not share a wait queue.
+    node: i32,
 }
 
 #[inline]
@@ -6941,7 +6946,11 @@ pub(crate) struct FutexKey {
 /// this directly. Anything reached from a raw syscall ARGUMENT must not:
 /// see `get_futex_key`.
 pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
-    FutexKey { namespace, uaddr }
+    FutexKey {
+        namespace,
+        uaddr,
+        node: handler_sys_futex_wait::FUTEX_NO_NODE,
+    }
 }
 
 /// `kernel/futex/core.c::get_futex_key` — the single funnel from a
@@ -6969,19 +6978,98 @@ pub(crate) fn futex_key(namespace: u64, uaddr: u64) -> FutexKey {
 ///
 /// Note the ORDER — alignment before accessibility — so a misaligned
 /// address is -EINVAL even when it is also unreadable.
+/// The span a futex2 word occupies, which is BOTH its natural-alignment
+/// modulus and its `access_ok` length:
+/// `size = futex_size(flags); if (flags & FLAGS_NUMA) size *= 2;`
+/// (`kernel/futex/core.c::get_futex_key`). A `FUTEX2_NUMA` futex is a pair
+/// — value word then node word — so it must be 8-byte aligned, not 4.
+pub(crate) fn futex2_word_span(flags: u64) -> u64 {
+    let word = 1u64 << (flags & handler_sys_futex_wait::FUTEX2_SIZE_MASK);
+    if flags & handler_sys_futex_wait::FUTEX2_NUMA != 0 {
+        word * 2
+    } else {
+        word
+    }
+}
+
 pub(crate) fn get_futex_key(namespace: u64, uaddr: u64) -> Result<FutexKey, i64> {
+    // The classic `futex(2)` ABI has no width or NUMA bits: it is always a
+    // single 32-bit word with no node.
+    get_futex_key_flags(namespace, uaddr, handler_sys_futex_wait::FUTEX2_SIZE_U32)
+}
+
+/// `get_futex_key()` for the futex2 ABI, which can ask for NUMA and MPOL
+/// hashing (`kernel/futex/core.c::get_futex_key`).
+///
+/// `flags` is a futex2 flag word, already validated by `futex2_flags_valid`.
+///
+/// Rejection order, which Linux fixes and this reproduces: alignment
+/// (-EINVAL) before accessibility (-EFAULT), then the node word's own
+/// readability (-EFAULT) before its validity (-EINVAL).
+pub(crate) fn get_futex_key_flags(
+    namespace: u64,
+    uaddr: u64,
+    flags: u64,
+) -> Result<FutexKey, i64> {
+    use handler_sys_futex_wait::{FUTEX2_MPOL, FUTEX2_NUMA, FUTEX2_SIZE_MASK, FUTEX_NO_NODE};
     const EFAULT: i64 = 14;
     const EINVAL: i64 = 22;
-    if uaddr % 4 != 0 {
+    let numa = flags & FUTEX2_NUMA != 0;
+    let word = 1u64 << (flags & FUTEX2_SIZE_MASK);
+    let span = futex2_word_span(flags);
+    if uaddr % span != 0 {
         return Err(EINVAL);
     }
     // `access_ok(uaddr, size)`. A null address is not special-cased here;
     // it simply fails range validation, which is exactly how Linux rejects
     // it and why no separate `uaddr == 0` arm should ever be written again.
-    if validate_user_range(uaddr, 4).is_err() {
+    if validate_user_range(uaddr, span as usize).is_err() {
         return Err(EFAULT);
     }
-    Ok(futex_key(namespace, uaddr))
+
+    let mut node = FUTEX_NO_NODE;
+    let mut node_updated = false;
+    if numa {
+        // The node lives in the second half of the doubled word.
+        let naddr = uaddr + word;
+        let mut b = [0u8; 4];
+        // SAFETY: range-validated above as part of `span`.
+        if unsafe { copy_from_user(&mut b, naddr) }.is_err() {
+            return Err(EFAULT);
+        }
+        node = i32::from_ne_bytes(b);
+        if node != FUTEX_NO_NODE
+            && ((node as u32) as usize >= narf_memory::FRAME_MAX_NUMA_NODES
+                || narf_memory::online_node_mask() & (1u64 << (node as u32)) == 0)
+        {
+            return Err(EINVAL);
+        }
+    }
+    // MPOL resolves the node only when userspace did not name one.
+    if node == FUTEX_NO_NODE && flags & FUTEX2_MPOL != 0 {
+        node = futex_mpol_node(current_task_id(), uaddr);
+        node_updated = true;
+    }
+    if numa {
+        // An unnamed node resolves to the caller's own, and the resolution
+        // is REPORTED BACK: userspace reads the node it actually got.
+        if node == FUTEX_NO_NODE {
+            node = narf_memory::current_cpu_node() as i32;
+            node_updated = true;
+        }
+        if node_updated {
+            let naddr = uaddr + word;
+            // SAFETY: range-validated above as part of `span`.
+            if unsafe { copy_to_user(naddr, &node.to_ne_bytes()) }.is_err() {
+                return Err(EFAULT);
+            }
+        }
+    }
+    Ok(FutexKey {
+        namespace,
+        uaddr,
+        node,
+    })
 }
 
 /// Namespace for a futex operation. Private futexes are scoped to the live
@@ -7007,6 +7095,13 @@ fn futex_bucket_index(key: FutexKey) -> usize {
     // Futex words are normally 4-byte aligned and adjacent words are common,
     // so mix rather than masking the low address bits directly.
     let mut x = key.uaddr ^ key.namespace.rotate_left(17);
+    // Only a futex that actually named a node perturbs the index. Linux
+    // selects a per-node bucket ARRAY rather than stirring the index, so a
+    // no-node futex — every classic `futex(2)` — must hash exactly as it did
+    // before NUMA keys existed.
+    if key.node != handler_sys_futex_wait::FUTEX_NO_NODE {
+        x ^= ((key.node as u32) as u64).rotate_left(43);
+    }
     x ^= x >> 30;
     x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x ^= x >> 27;
@@ -7522,6 +7617,7 @@ fn futex_wait_core(
     uaddr: u64,
     val: u32,
     park_cap_ns: u64,
+    flags: u64,
 ) {
     const EAGAIN: i64 = 11;
     const EFAULT: i64 = 14;
@@ -7530,7 +7626,7 @@ fn futex_wait_core(
     // kept reporting a spurious wake for a null word after the classic
     // FUTEX_WAIT arm was corrected — the same bug in a second place, which
     // is what a duplicated special case buys.
-    let key = match get_futex_key(namespace, uaddr) {
+    let key = match get_futex_key_flags(namespace, uaddr, flags) {
         Ok(k) => k,
         Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));

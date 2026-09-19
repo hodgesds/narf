@@ -2536,6 +2536,283 @@ fn smoke_userspace_futex_wake_op_operands() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_wake_op_operands);
 
+/// `FUTEX2_NUMA` key derivation, against `kernel/futex/core.c::get_futex_key`
+/// (the `FLAGS_NUMA` arms at 581-606).
+///
+/// A NUMA futex is a PAIR of words — value then node — so it is 8-byte
+/// aligned, its node word is validated, and an unnamed node
+/// (`FUTEX_NO_NODE`) is resolved to the caller's node and WRITTEN BACK so
+/// userspace can read the node it actually got. Accepting the flag and
+/// ignoring it, as NARF did, silently skips all three.
+fn smoke_userspace_futex2_numa_key() -> TestResult {
+    // Kernel-test fixture: drives the syscall entry point directly with a
+    // kernel stack pointer as a stand-in user buffer. See
+    // `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // `futex_wake(uaddr, mask, nr, flags)` — the simplest futex2 op that
+    // derives a key and then returns, with no parking involved.
+    fn wake(uaddr: u64, flags: u64) -> i64 {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: uaddr,
+                arg1: 1, // mask (must be non-zero)
+                arg2: 1, // nr
+                arg3: flags,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::FutexWake.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK => r.value as i64,
+            _ => i64::MIN,
+        }
+    }
+
+    const SIZE_U32: u64 = 0x02;
+    const NUMA: u64 = 0x04;
+    const PRIVATE: u64 = 0x80;
+    const EINVAL: i64 = -22;
+    let base_flags = SIZE_U32 | PRIVATE;
+
+    // A `u64` gives the natural 8-byte alignment a NUMA futex pair needs.
+    // Little-endian layout: low half is the value word, high half the node.
+    let mut pair: u64 = 0;
+    let base = &mut pair as *mut u64 as u64;
+
+    // A plain (non-NUMA) futex at the same address is 4-byte aligned and
+    // fine — this is the control that keeps the cases below meaningful.
+    if wake(base, base_flags) < 0 {
+        __test_clear_global();
+        return TestResult::Fail("plain futex2 wake rejected an aligned address");
+    }
+    // ... but +4 into the pair is 4-byte aligned and NOT 8, so it is a legal
+    // plain futex and an illegal NUMA one.
+    if wake(base + 4, base_flags) < 0 {
+        __test_clear_global();
+        return TestResult::Fail("plain futex2 wake rejected a 4-byte-aligned address");
+    }
+    if wake(base + 4, base_flags | NUMA) != EINVAL {
+        __test_clear_global();
+        return TestResult::Fail("NUMA futex at a 4- but not 8-aligned address was not -EINVAL");
+    }
+
+    // A node id outside the topology is -EINVAL.
+    pair = 999u64 << 32;
+    if wake(base, base_flags | NUMA) != EINVAL {
+        __test_clear_global();
+        return TestResult::Fail("NUMA futex with an out-of-range node was not -EINVAL");
+    }
+    // A rejected node is left exactly as userspace wrote it: the write-back
+    // only ever reports a node the kernel RESOLVED.
+    if (pair >> 32) as u32 != 999 {
+        __test_clear_global();
+        return TestResult::Fail("a rejected node word must not be rewritten");
+    }
+
+    // FUTEX_NO_NODE (-1) resolves to the caller's node, and the resolution is
+    // written back into the node word.
+    pair = 0xFFFF_FFFF_0000_0000;
+    let r = wake(base, base_flags | NUMA);
+    if r < 0 {
+        __test_clear_global();
+        return TestResult::Fail("NUMA futex with FUTEX_NO_NODE returned an error");
+    }
+    let written = (pair >> 32) as u32 as i32;
+    if written == -1 {
+        __test_clear_global();
+        return TestResult::Fail("FUTEX_NO_NODE was not resolved and written back");
+    }
+    if written != narf_memory::current_cpu_node() as i32 {
+        __test_clear_global();
+        return TestResult::Fail("node written back is not the caller's node");
+    }
+    // The value word must be untouched — only the node half is written.
+    if pair as u32 != 0 {
+        __test_clear_global();
+        return TestResult::Fail("NUMA key derivation clobbered the value word");
+    }
+
+    // An explicitly named, valid node is accepted and left alone (no
+    // write-back: nothing was resolved).
+    pair = 0;
+    if wake(base, base_flags | NUMA) < 0 {
+        __test_clear_global();
+        return TestResult::Fail("NUMA futex naming node 0 returned an error");
+    }
+    if (pair >> 32) as u32 != 0 {
+        __test_clear_global();
+        return TestResult::Fail("an explicitly named node must not be rewritten");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex2_numa_key);
+
+/// `FUTEX2_MPOL` node resolution, against
+/// `kernel/futex/core.c::__futex_key_to_node` and the `FLAGS_MPOL` arm of
+/// `get_futex_key` (592-595).
+///
+/// When userspace does not name a node, MPOL resolves one from the
+/// mempolicy covering the address BEFORE the NUMA fallback to the caller's
+/// own node. `mbind`ing a range to `MPOL_PREFERRED` of a node that is not
+/// the caller's is what separates "MPOL was honoured" from "the flag was
+/// ignored and we fell back to the local node".
+fn smoke_userspace_futex2_mpol_node() -> TestResult {
+    // Kernel-test fixture: drives the syscall entry points directly with a
+    // kernel stack pointer as a stand-in user buffer.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    // A single-node topology cannot tell "MPOL picked node N" apart from
+    // "we fell back to the local node", so there is nothing to assert.
+    let online = narf_memory::online_node_count();
+    if online < 2 {
+        return TestResult::Skip("needs >= 2 NUMA nodes to discriminate");
+    }
+    let target = (online - 1) as i32;
+    if target == narf_memory::current_cpu_node() as i32 {
+        return TestResult::Skip("target node is the local node; not discriminating");
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    fn call6(s: Syscall, a: [u64; 6]) -> i64 {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                arg0: a[0],
+                arg1: a[1],
+                arg2: a[2],
+                arg3: a[3],
+                arg4: a[4],
+                arg5: a[5],
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(s.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK => r.value as i64,
+            _ => i64::MIN,
+        }
+    }
+
+    const SIZE_U32: u64 = 0x02;
+    const NUMA: u64 = 0x04;
+    const MPOL: u64 = 0x08;
+    const PRIVATE: u64 = 0x80;
+    const MPOL_PREFERRED: u64 = 1;
+    const MPOL_DEFAULT: u64 = 0;
+
+    // A `u64` gives the 8-byte alignment a NUMA futex pair needs; its page
+    // is what carries the mbind policy.
+    let mut pair: u64 = 0;
+    let base = &mut pair as *mut u64 as u64;
+    let page = base & !0xFFF;
+    let nodemask: u64 = 1u64 << target;
+    let mask_ptr = &nodemask as *const u64 as u64;
+
+    // `flags = 0`: no MPOL_MF_STRICT/MOVE, so this records the policy
+    // without demanding the range be backed.
+    let r = call6(
+        Syscall::Mbind,
+        [page, 0x1000, MPOL_PREFERRED, mask_ptr, 64, 0],
+    );
+    if r < 0 {
+        __test_clear_global();
+        return TestResult::Fail("mbind setup failed; the test cannot conclude anything");
+    }
+
+    // FUTEX_NO_NODE in the node word: MPOL must resolve it to the bound
+    // node, not to the caller's.
+    pair = 0xFFFF_FFFF_0000_0000;
+    let woken = call6(
+        Syscall::FutexWake,
+        [base, 1, 1, SIZE_U32 | PRIVATE | NUMA | MPOL, 0, 0],
+    );
+    let written = (pair >> 32) as u32 as i32;
+    // Reset the range policy before judging, so a failure cannot leak the
+    // mbind entry into whatever test runs next.
+    let _ = call6(Syscall::Mbind, [page, 0x1000, MPOL_DEFAULT, 0, 64, 0]);
+
+    if woken < 0 {
+        __test_clear_global();
+        return TestResult::Fail("FUTEX2_MPOL wake returned an error");
+    }
+    if written == -1 {
+        __test_clear_global();
+        return TestResult::Fail("MPOL/NUMA futex left FUTEX_NO_NODE unresolved");
+    }
+    if written != target {
+        __test_clear_global();
+        return TestResult::Fail("node came from the local CPU, not the mbind policy");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex2_mpol_node);
+
 fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user

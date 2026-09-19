@@ -112,7 +112,10 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
     // Only now look at the words themselves. `get_futex_key` rejects a
     // skewed address with -EINVAL before anything is read.
     for e in &entries {
-        if e.uaddr % 4 != 0 {
+        // Each entry carries its own flags, so each has its own natural
+        // alignment: a FUTEX2_NUMA entry is a value+node pair and must be
+        // 8-byte aligned.
+        if e.uaddr % futex2_word_span(e.flags) != 0 {
             ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
             return;
         }
@@ -148,5 +151,6 @@ pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
         first.uaddr,
         first.val as u32,
         park_cap,
+        first.flags,
     );
 }
