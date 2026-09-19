@@ -1692,6 +1692,108 @@ fn smoke_userspace_load_elf_bytes_end_to_end() -> TestResult {
 kernel_test_in!("userspace", smoke_userspace_load_elf_bytes_end_to_end);
 
 #[cfg(target_arch = "x86_64")]
+fn smoke_userspace_load_elf_bss_is_demand_zero() -> TestResult {
+    use crate::load_elf_bytes;
+    use narf_memory::x86_64::paging;
+    use narf_memory::{RegionPerms, VirtAddr};
+
+    const BASE: u64 = 0x0000_0080_0010_0000;
+    const FILE_OFFSET: usize = 0x1000;
+    const FILE_SIZE: usize = 0x1800;
+    const MEMORY_SIZE: u64 = 0x5000;
+
+    // Two file-image pages followed by three full BSS pages. The final file
+    // byte lands halfway through page two, so that page also proves the ELF
+    // zero-padding rule without forcing the following BSS resident.
+    let mut bytes = alloc::vec![0u8; FILE_OFFSET + FILE_SIZE];
+    bytes[..16].copy_from_slice(&[0x7F, b'E', b'L', b'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    bytes[0x10..0x12].copy_from_slice(&2u16.to_le_bytes());
+    bytes[0x12..0x14].copy_from_slice(&0x3Eu16.to_le_bytes());
+    bytes[0x14..0x18].copy_from_slice(&1u32.to_le_bytes());
+    bytes[0x18..0x20].copy_from_slice(&(BASE + 0x100).to_le_bytes());
+    bytes[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    bytes[0x34..0x36].copy_from_slice(&64u16.to_le_bytes());
+    bytes[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    bytes[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes());
+    let ph = 64usize;
+    bytes[ph..ph + 4].copy_from_slice(&1u32.to_le_bytes());
+    bytes[ph + 4..ph + 8].copy_from_slice(&6u32.to_le_bytes());
+    bytes[ph + 8..ph + 16].copy_from_slice(&(FILE_OFFSET as u64).to_le_bytes());
+    bytes[ph + 16..ph + 24].copy_from_slice(&BASE.to_le_bytes());
+    bytes[ph + 24..ph + 32].copy_from_slice(&BASE.to_le_bytes());
+    bytes[ph + 32..ph + 40].copy_from_slice(&(FILE_SIZE as u64).to_le_bytes());
+    bytes[ph + 40..ph + 48].copy_from_slice(&MEMORY_SIZE.to_le_bytes());
+    bytes[ph + 48..ph + 56].copy_from_slice(&0x1000u64.to_le_bytes());
+    bytes[FILE_OFFSET] = 0xA5;
+    bytes[FILE_OFFSET + FILE_SIZE - 1] = 0x5A;
+
+    // SAFETY: the kernel-test harness supplies the loader's identity-map and
+    // initialized-frame-allocator preconditions.
+    let (as_, _) = match unsafe { load_elf_bytes(&bytes) } {
+        Ok(loaded) => loaded,
+        Err(_) => return TestResult::Fail("BSS ELF failed to load"),
+    };
+    if as_.region_count() != 2 {
+        return TestResult::Fail("ELF file image and BSS were not split");
+    }
+    let file = match as_.lookup(VirtAddr::new(BASE)) {
+        Some(region) => region,
+        None => return TestResult::Fail("file-image VMA missing"),
+    };
+    if file.len != 0x2000 || file.phys.len() != 2 {
+        return TestResult::Fail("file-image VMA has the wrong resident span");
+    }
+    let bss = match as_.lookup(VirtAddr::new(BASE + 0x2000)) {
+        Some(region) => region,
+        None => return TestResult::Fail("BSS VMA missing"),
+    };
+    if bss.len != 0x3000 || !bss.perms.contains(RegionPerms::ANON_MERGEABLE) || !bss.phys.is_empty()
+    {
+        return TestResult::Fail("untouched BSS was eagerly backed");
+    }
+
+    // The partial file page is resident and zero after p_filesz.
+    // SAFETY: this walks the live test address-space root and reads within the
+    // second file-image frame returned by that translation.
+    let file_tail = unsafe { paging::translate(as_.root, VirtAddr::new(BASE + 0x1000)) };
+    let Some(file_tail) = file_tail else {
+        return TestResult::Fail("last file-image page is absent");
+    };
+    // SAFETY: offset 0x800 is within the translated 4 KiB frame.
+    if unsafe { core::ptr::read_volatile(file_tail.kernel_ptr::<u8>().add(0x800)) } != 0 {
+        return TestResult::Fail("partial file page was not zero-padded");
+    }
+
+    // Full BSS starts absent, then one far-page fault grows only its sparse
+    // prefix metadata and supplies a zeroed resident frame.
+    // SAFETY: both translations walk this live root for a page-aligned user VA.
+    if unsafe { paging::translate(as_.root, VirtAddr::new(BASE + 0x2000)) }.is_some() {
+        return TestResult::Fail("untouched BSS unexpectedly had a PTE");
+    }
+    // SAFETY: the test owns the live root and the frame allocator is active.
+    if unsafe { as_.demand_alloc_page(VirtAddr::new(BASE + 0x4000)) }.is_err() {
+        return TestResult::Fail("BSS demand allocation failed");
+    }
+    // SAFETY: the successful demand allocation installed this leaf in the
+    // test root, which remains live through the read below.
+    let demanded = unsafe { paging::translate(as_.root, VirtAddr::new(BASE + 0x4000)) };
+    let Some(demanded) = demanded else {
+        return TestResult::Fail("BSS demand allocation installed no PTE");
+    };
+    // SAFETY: both offsets lie in the translated demand-zero frame.
+    if unsafe {
+        core::ptr::read_volatile(demanded.kernel_ptr::<u8>()) != 0
+            || core::ptr::read_volatile(demanded.kernel_ptr::<u8>().add(4095)) != 0
+    } {
+        return TestResult::Fail("BSS demand page was not zeroed");
+    }
+
+    TestResult::Pass
+}
+#[cfg(target_arch = "x86_64")]
+kernel_test_in!("userspace", smoke_userspace_load_elf_bss_is_demand_zero);
+
+#[cfg(target_arch = "x86_64")]
 fn smoke_userspace_load_multi_segment() -> TestResult {
     // Multi-PT_LOAD: hand-build an ELF with TWO PT_LOAD segments at
     // non-adjacent vaddrs (.text at 0x80_0000_1000 R+X, .data at

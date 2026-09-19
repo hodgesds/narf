@@ -1167,3 +1167,11 @@ argument = "Reverse-map contraction changes only empty-key cache capacity and th
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
 argument = "The direct-compaction edit is verification-only: its positive-path smoke temporarily enables interrupts only after proving the incoming test context held no IRQ-safe lock, invokes the unchanged sleepable compaction path, and restores the exact incoming interrupt state before any assertion or return. Production migration, reverse-map ownership, page-table rewrite, TLB invalidation, and source-frame release code is unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The demand-fault fast-path change remains wholly inside the existing memory TCB. It adds no trusted subsystem, public authority, capability, domain assignment, mapping permission, or user-visible state; it only combines two page-table observations into the existing root-locked map operation."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "An already-backed demand fault continues to hold the authoritative address-space region lock while deriving permissions and repairing its leaf. A successful root-locked map installs the exact Region.phys frame and registers exactly one reverse-map owner; on x86, omitting invalidation for that non-present-to-present transition follows the existing repair-capable demand-map contract, and any retained negative walk faults once more into its AlreadyMapped invalidation branch. AlreadyMapped proves a present leaf, performs the architecture-local invalidation, and does not add another owner. Every other mapping error still fails closed. Frame ownership, COW counts, leaf permissions, cross-CPU retirement, and release ordering are unchanged."

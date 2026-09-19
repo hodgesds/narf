@@ -442,7 +442,11 @@ impl AddressSpace {
     /// Ordinary child leaves may remain absent and fault in from retained
     /// Region backing; huge mappings are copied and installed eagerly.
     pub unsafe fn clone_for_fork(&self) -> Result<Self, AddressSpaceError>;
-    /// Back one anonymous/file-demand page. Anonymous reserve refusal returns
+    /// Back one anonymous/file-demand page. An already-backed not-present
+    /// fault attempts one root-locked leaf install: success registers the rmap
+    /// (without an x86 invalidation for a non-present-to-present transition),
+    /// while `AlreadyMapped` performs the architecture-local invalidation and
+    /// retries without duplicating ownership. Anonymous reserve refusal returns
     /// `AddressSpaceError::ReclaimPressure(ReclaimTicket)` only after its page
     /// claim and all address-space/allocator locks have been released;
     /// `Unmapped` and `OutOfRange` retain their non-reclaim meanings.

@@ -3,9 +3,9 @@
 //! Spec: `userspace/specification/spec.md`. The real loader:
 //!
 //! 1. Parses ELF64 headers from a file-backed or in-memory buffer.
-//! 2. For each `PT_LOAD` segment: allocate physical frames, copy
-//!    `file_size` bytes in, zero `mem_size - file_size` for BSS,
-//!    and call `AddressSpace::map_region(base=vaddr, phys, perms)`.
+//! 2. For each `PT_LOAD` segment: allocate physical frames for its file
+//!    image, copy `file_size` bytes in, retain a zeroed partial-page tail,
+//!    and record every full BSS page as demand-zero backing.
 //! 3. If `kind == ExecKind::Elf64Dyn`, apply relocations from
 //!    `PT_DYNAMIC`.
 //! 4. Allocate a user stack region and push `argv` / `envp` /
@@ -165,9 +165,11 @@ impl From<LoadError> for LoadBytesError {
     }
 }
 
-/// Parse ELF `bytes`, allocate fresh frames for every `PT_LOAD`
-/// segment, copy bytes in, and push regions onto the existing
-/// `addr_space` with each segment's vaddr biased by `vaddr_bias`.
+/// Parse ELF `bytes`, allocate fresh frames for the file image of every
+/// `PT_LOAD` segment, copy bytes in, and push regions onto the existing
+/// `addr_space` with each segment's vaddr biased by `vaddr_bias`. Full BSS
+/// pages are published as private anonymous demand-zero backing; only the
+/// partial page containing the last file byte is allocated and zero-padded.
 /// Returns the (biased) entry point. Does NOT call `materialize` —
 /// the caller batches a single materialize call after every image
 /// has been staged so PT_INTERP can share an AS with the program.
@@ -192,7 +194,7 @@ pub unsafe fn load_elf_into_at(
         return Err(LoadBytesError::Load(LoadError::BadEntry));
     }
 
-    // Per-segment page count, accounting for an in-page vaddr
+    // Per-segment file and memory page counts, accounting for an in-page
     // offset. A PT_LOAD whose biased vaddr isn't 4 KiB-aligned
     // (musl's RW data segment merges .init_array/.got/.data/.bss
     // and lands at the same in-page offset as the file image —
@@ -200,28 +202,37 @@ pub unsafe fn load_elf_into_at(
     // here, otherwise `(mem_size+0xFFF)>>12` undercounts and
     // `map_region` rejects the misaligned base with
     // `AlignmentMismatch`.
-    let page_counts: alloc::vec::Vec<usize> = image
+    let page_counts: alloc::vec::Vec<(usize, usize)> = image
         .segments
         .iter()
         .map(|seg| {
             let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
             let in_page = (vaddr & 0xFFF) as usize;
-            ((in_page + seg.mem_size as usize + 0xFFF) >> 12).max(1)
+            let memory_pages = ((in_page + seg.mem_size as usize + 0xFFF) >> 12).max(1);
+            let file_pages = if seg.file_size == 0 {
+                0
+            } else {
+                ((in_page + seg.file_size as usize + 0xFFF) >> 12).min(memory_pages)
+            };
+            (file_pages, memory_pages)
         })
         .collect();
 
-    // Allocate all needed frames up front, chunk by chunk.
+    // Allocate only file-image frames up front, chunk by chunk. Linux maps
+    // full BSS pages as anonymous demand-zero memory; allocating them here
+    // inflated every exec, fork COW retain, and child teardown in proportion
+    // to an ELF's untouched BSS (stress-ng reserves about 6.8 MiB).
     let mut allocated: alloc::vec::Vec<PhysAddr> = alloc::vec::Vec::new();
-    for &pages in &page_counts {
-        for _ in 0..pages {
+    for &(file_pages, _) in &page_counts {
+        for _ in 0..file_pages {
             let f = narf_memory::alloc_frame().map_err(|_| LoadBytesError::NoFrame)?;
             allocated.push(f.start_address());
         }
     }
 
-    // Zero every allocated frame before we copy into it (so the
-    // `mem_size > file_size` BSS tail is naturally zero, and the
-    // padding before the in-page-offset copy start is zero too).
+    // Zero every allocated file-image frame before copying. This supplies the
+    // ELF-required zero fill after `p_filesz` in its final partial page, and
+    // also clears padding before an unaligned segment start.
     for &p in &allocated {
         // SAFETY: identity-mapped in low 4 GiB.
         unsafe {
@@ -229,12 +240,15 @@ pub unsafe fn load_elf_into_at(
         }
     }
 
-    // Push regions. Each region's base is the segment vaddr rounded
-    // down to a page boundary; `len` covers every page the segment
-    // touches.
+    // Push an exact-scatter file prefix plus, when present, a sparse anonymous
+    // BSS suffix. Keeping the split page in the file prefix mirrors Linux's
+    // elf_load(): padzero() clears that page and vm_brk_flags() creates only
+    // the following full pages as anonymous demand-zero memory.
     let mut cursor: usize = 0;
-    for (seg, &pages) in image.segments.iter().zip(page_counts.iter()) {
-        let end = cursor.checked_add(pages).ok_or(LoadBytesError::NoFrame)?;
+    for (seg, &(file_pages, memory_pages)) in image.segments.iter().zip(page_counts.iter()) {
+        let end = cursor
+            .checked_add(file_pages)
+            .ok_or(LoadBytesError::NoFrame)?;
         if end > allocated.len() {
             return Err(LoadBytesError::NoFrame);
         }
@@ -243,28 +257,46 @@ pub unsafe fn load_elf_into_at(
 
         let vaddr = seg.vaddr.wrapping_add(vaddr_bias);
         let region_base = vaddr & !0xFFF;
+        let perms = perms_of(seg.flags);
 
-        addr_space
-            .map_region(Region {
-                base: VirtAddr::new(region_base),
-                len: (pages as u64) << 12,
-                perms: perms_of(seg.flags),
-                phys,
-            })
-            .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+        if file_pages != 0 {
+            addr_space
+                .map_region(Region {
+                    base: VirtAddr::new(region_base),
+                    len: (file_pages as u64) << 12,
+                    perms,
+                    phys,
+                })
+                .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+        }
+
+        if memory_pages > file_pages {
+            addr_space
+                .map_region(Region {
+                    base: VirtAddr::new(region_base + ((file_pages as u64) << 12)),
+                    len: ((memory_pages - file_pages) as u64) << 12,
+                    // This suffix is genuinely private anonymous memory, not
+                    // an absent file page. The marker permits a short backing
+                    // vector and preserves anonymous VMA semantics for later
+                    // mprotect/mremap operations.
+                    perms: perms | RegionPerms::ANON_MERGEABLE,
+                    phys: alloc::vec::Vec::new(),
+                })
+                .map_err(|e| LoadBytesError::Load(LoadError::AddressSpace(e)))?;
+        }
     }
 
     // Copy segment data. The frames may not be physically contiguous
     // (alloc_frame is a freelist), so we have to copy page by page,
     // routing each 4 KiB chunk into its own backing frame. The
-    // first frame's destination offset matches the segment's
-    // in-page vaddr offset (zero for page-aligned segments, 0xf78
-    // for musl's RW chunk). Pages past file_size stay zero (BSS)
-    // since the upfront zero pass covered the whole allocation.
+    // first frame's destination offset matches the segment's in-page vaddr
+    // offset (zero for page-aligned segments, 0xf78 for musl's RW chunk). The
+    // final partial page stays zero past file_size; full BSS pages have no
+    // frame here and fault through the ordinary anonymous demand-zero path.
     let mut cursor: usize = 0;
-    for (seg, &pages) in image.segments.iter().zip(page_counts.iter()) {
-        let frames = &allocated[cursor..cursor + pages];
-        cursor += pages;
+    for (seg, &(file_pages, _)) in image.segments.iter().zip(page_counts.iter()) {
+        let frames = &allocated[cursor..cursor + file_pages];
+        cursor += file_pages;
 
         let start = seg.file_off as usize;
         let end = start
@@ -302,14 +334,16 @@ pub unsafe fn load_elf_into_at(
     Ok(image.entry.wrapping_add(vaddr_bias))
 }
 
-/// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`,
-/// map + materialize every `PT_LOAD` segment, and copy the segment
-/// data from `bytes` into the backing physical frames. Returns the
+/// One-shot: parse ELF bytes, allocate a fresh user `AddressSpace`, map every
+/// `PT_LOAD` segment, materialize its file image, and leave full BSS pages
+/// demand-zero. Segment data is copied from `bytes` into the file-image
+/// backing frames. Returns the
 /// `Arc<AddressSpace>` ready to attach to a `spawn_user` task, plus
 /// the entry point.
 ///
-/// BSS (the `mem_size > file_size` tail) is zero — frames come from
-/// the allocator freshly-zeroed.
+/// BSS (the `mem_size > file_size` tail) reads as zero: the last partial file
+/// page is pre-zeroed, and following full pages allocate zeroed frames on
+/// first access.
 ///
 /// # Safety
 /// - `bytes` must be a live slice for the duration of this call.

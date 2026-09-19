@@ -38,6 +38,12 @@ that same root on the reserved task before making it runnable. This permits a
 dynamic service manager to be the direct PID 1 without a userspace chroot
 launcher.
 
+ELF `PT_LOAD` construction follows Linux's BSS split: file-image pages are
+materialized, the unused tail of the final file page is zero-filled, and every
+following full page through `p_memsz` is private anonymous demand-zero memory.
+Untouched BSS therefore consumes neither a frame nor fork-COW ownership, while
+first access observes zeroes with the segment's original permissions.
+
 Architecture syscall reverse tables are unambiguous: every published wire
 number resolves through `Syscall::from_raw` to a single canonical variant. On
 aarch64, generic-ABI numbers such as `openat`, `newfstatat`, and `pipe2` are

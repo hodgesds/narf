@@ -8065,10 +8065,10 @@ fn smoke_memory_relocate_page_moves_frame() -> TestResult {
 #[cfg(target_arch = "x86_64")]
 kernel_test_in!("memory", smoke_memory_relocate_page_moves_frame);
 
-/// `demand_alloc_page` on an already-backed slot is a spurious
-/// fault (TLB shootdown race). Returns AlignmentMismatch so the
-/// trap handler retries cleanly without double-allocating.
-#[cfg(target_arch = "x86_64")]
+/// `demand_alloc_page` on an already-present, backed slot models a spurious
+/// not-present fault from a stale local TLB / paging-structure cache. It must
+/// invalidate and return success without duplicating reverse-map ownership.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
     use crate::{AddressSpace, Region, RegionPerms, VirtAddr};
 
@@ -8089,6 +8089,13 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
         phys: alloc::vec![frame],
     })
     .expect("map_region");
+    // SAFETY: the test owns this live root and the recorded backing frame.
+    if unsafe { a.materialize() }.is_err() {
+        return TestResult::Fail("materialize backed leaf failed");
+    }
+    if crate::rmap::owner_count(frame) != 1 {
+        return TestResult::Fail("materialize did not register one rmap owner");
+    }
     // A demand fault on an ALREADY-backed page is a spurious not-present
     // fault (a peer CPU installed the leaf while this CPU's paging-structure
     // cache still held the miss). demand_alloc_page must RECOVER it: INVLPG
@@ -8097,6 +8104,9 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
     // treated as unhandled → fatal — the SMP mallocng heap-corruption crash.)
     // SAFETY: the operation upholds its documented invariant (see surrounding context).
     let r = unsafe { a.demand_alloc_page(VirtAddr::new(vbase)) };
+    if crate::rmap::owner_count(frame) != 1 {
+        return TestResult::Fail("spurious fault duplicated rmap ownership");
+    }
     core::mem::forget(a);
     match r {
         Ok(()) => TestResult::Pass,
@@ -8106,7 +8116,7 @@ fn smoke_memory_demand_alloc_already_backed_spurious() -> TestResult {
         }
     }
 }
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 kernel_test_in!("memory", smoke_memory_demand_alloc_already_backed_spurious);
 
 /// `demand_alloc_page` on a PROT_NONE region is a real access
