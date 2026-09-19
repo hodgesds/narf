@@ -30,44 +30,6 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use narf_lib::sync::IrqSafeSpinLock;
 
-// ── Dynamic directory-entry names ────────────────────────────────────
-//
-// `DirEntry::name` is `&'static str`, so a directory whose entries are
-// computed — the pid list, `/proc/<pid>/fd`, `/proc/<pid>/task` — had no
-// way to produce one except `Box::leak`, once per entry, per readdir.
-// That is a permanent allocation on a path tools poll: `top -d 1` over a
-// hundred processes leaked a hundred strings a second, for the life of the
-// boot, and nothing ever freed them.
-//
-// Interning turns that into a bounded cache. The names are decimal ids —
-// pids, tids, fd numbers — drawn from id spaces that recycle, so the set
-// of DISTINCT names a system ever produces is bounded by those spaces
-// (max pid, RLIMIT_NOFILE) rather than by how often anything reads /proc.
-// A repeat readdir now finds the name already interned and allocates
-// nothing.
-//
-// This is deliberately not a free(): an interned name outlives the pid it
-// described, because a `&'static str` handed out to an in-flight readdir
-// has no owner to reclaim it. Bounding the leak is what is achievable
-// without changing `DirEntry::name` across the 131 sites that build one.
-
-static INTERNED_NAMES: IrqSafeSpinLock<Option<alloc::collections::BTreeSet<&'static str>>> =
-    IrqSafeSpinLock::new(None);
-
-/// Intern `s`, returning a `&'static str` suitable for [`DirEntry::name`].
-///
-/// Allocates only the first time a given name is seen.
-pub(crate) fn intern_name(s: &str) -> &'static str {
-    let mut g = INTERNED_NAMES.lock();
-    let set = g.get_or_insert_with(alloc::collections::BTreeSet::new);
-    if let Some(found) = set.get(s) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(String::from(s).into_boxed_str());
-    set.insert(leaked);
-    leaked
-}
-
 /// Thread ids of a thread group, for `/proc/<pid>/task/`.
 ///
 /// Installed by the crate that owns the task registry. Unset — early boot,
@@ -90,13 +52,6 @@ pub(crate) fn hook_thread_list(pid: u64) -> Option<Vec<u64>> {
     // `ThreadListFn`; a non-zero value round-trips soundly.
     let f: ThreadListFn = unsafe { core::mem::transmute(raw) };
     Some(f(pid))
-}
-
-/// Distinct names interned so far — the bound on what this cache holds.
-/// Read by the smoke that proves a repeated readdir stops allocating.
-#[doc(hidden)]
-pub fn __interned_name_count() -> usize {
-    INTERNED_NAMES.lock().as_ref().map_or(0, |s| s.len())
 }
 
 use crate::{DirEntry, DirOps, FileOps, FileType, FsError, FsFuture, FsInstance, Mode, Stat};
@@ -1361,155 +1316,155 @@ impl DirOps for ProcPidDir {
             [
                 // Core five (original Stage-1).
                 DirEntry {
-                    name: "stat",
+                    name: "stat".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "status",
+                    name: "status".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "cmdline",
+                    name: "cmdline".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "maps",
+                    name: "maps".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "numa_maps",
+                    name: "numa_maps".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "comm",
+                    name: "comm".into(),
                     file_type: FileType::File,
                 },
                 // Extended flat files.
                 DirEntry {
-                    name: "io",
+                    name: "io".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "sched",
+                    name: "sched".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "schedstat",
+                    name: "schedstat".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "stack",
+                    name: "stack".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "wchan",
+                    name: "wchan".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "syscall",
+                    name: "syscall".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "environ",
+                    name: "environ".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "auxv",
+                    name: "auxv".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "limits",
+                    name: "limits".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "oom_score",
+                    name: "oom_score".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "oom_score_adj",
+                    name: "oom_score_adj".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "coredump_filter",
+                    name: "coredump_filter".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "mountinfo",
+                    name: "mountinfo".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "mounts",
+                    name: "mounts".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "mountstats",
+                    name: "mountstats".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "loginuid",
+                    name: "loginuid".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "sessionid",
+                    name: "sessionid".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "setgroups",
+                    name: "setgroups".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "personality",
+                    name: "personality".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "cgroup",
+                    name: "cgroup".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "statm",
+                    name: "statm".into(),
                     file_type: FileType::File,
                 },
                 // Magic symlinks [[proc-magic-links]].
                 DirEntry {
-                    name: "exe",
+                    name: "exe".into(),
                     file_type: FileType::Symlink,
                 },
                 DirEntry {
-                    name: "cwd",
+                    name: "cwd".into(),
                     file_type: FileType::Symlink,
                 },
                 DirEntry {
-                    name: "root",
+                    name: "root".into(),
                     file_type: FileType::Symlink,
                 },
                 // user-ns id maps.
                 DirEntry {
-                    name: "uid_map",
+                    name: "uid_map".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
-                    name: "gid_map",
+                    name: "gid_map".into(),
                     file_type: FileType::File,
                 },
                 // Subdirectories.
                 DirEntry {
-                    name: "fd",
+                    name: "fd".into(),
                     file_type: FileType::Dir,
                 },
                 DirEntry {
-                    name: "fdinfo",
+                    name: "fdinfo".into(),
                     file_type: FileType::Dir,
                 },
                 DirEntry {
-                    name: "task",
+                    name: "task".into(),
                     file_type: FileType::Dir,
                 },
                 DirEntry {
-                    name: "ns",
+                    name: "ns".into(),
                     file_type: FileType::Dir,
                 },
                 DirEntry {
-                    name: "attr",
+                    name: "attr".into(),
                     file_type: FileType::Dir,
                 },
             ]
@@ -1560,7 +1515,7 @@ impl DirOps for ProcNsDir {
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         Box::new(NS_NAMES.iter().map(|(n, _)| DirEntry {
-            name: n,
+            name: (*n).into(),
             file_type: FileType::Symlink,
         }))
     }
@@ -1625,7 +1580,7 @@ impl DirOps for ProcAttrDir {
     }
     fn iter(&self) -> Box<dyn Iterator<Item = DirEntry> + '_> {
         Box::new(ATTR_NAMES.iter().map(|n| DirEntry {
-            name: n,
+            name: (*n).into(),
             file_type: FileType::File,
         }))
     }
@@ -1834,67 +1789,66 @@ impl DirOps for ProcRoot {
         // consumer needs the savings.
         let mut entries: Vec<DirEntry> = alloc::vec![
             DirEntry {
-                name: "cpuinfo",
+                name: "cpuinfo".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "meminfo",
+                name: "meminfo".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "mounts",
+                name: "mounts".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "uptime",
+                name: "uptime".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "version",
+                name: "version".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "cmdline",
+                name: "cmdline".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "loadavg",
+                name: "loadavg".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "filesystems",
+                name: "filesystems".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "partitions",
+                name: "partitions".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "sched",
+                name: "sched".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "stat",
+                name: "stat".into(),
                 file_type: FileType::File
             },
             DirEntry {
-                name: "pressure",
+                name: "pressure".into(),
                 file_type: FileType::Dir
             },
             DirEntry {
-                name: "self",
+                name: "self".into(),
                 file_type: FileType::Symlink
             },
             DirEntry {
-                name: "thread-self",
+                name: "thread-self".into(),
                 file_type: FileType::Symlink
             },
         ];
         // Dynamic registry top-level entries (e.g. "net", "acpi", ...).
         for (name, kind) in list_registry_dir(&[]) {
-            let leaked: &'static str = intern_name(&name);
             entries.push(DirEntry {
-                name: leaked,
+                name: name.into(),
                 file_type: match kind {
                     ProcNodeKind::File => FileType::File,
                     ProcNodeKind::Dir => FileType::Dir,
@@ -1902,13 +1856,14 @@ impl DirOps for ProcRoot {
             });
         }
         for pid in list_pids() {
-            let s = pid.to_string();
-            // Leak the String so its bytes outlive this iter call.
-            // Acceptable cost: real consumers (ls, ps) read /proc
-            // infrequently and we cap at the live-pid count.
-            let leaked: &'static str = intern_name(&s);
             entries.push(DirEntry {
-                name: leaked,
+                // Owned by the entry and freed with it. This used to leak
+                // the String "so its bytes outlive this iter call", on the
+                // reasoning that "real consumers (ls, ps) read /proc
+                // infrequently and we cap at the live-pid count". Neither
+                // held: `top -d 1` reads it every second, and the leak was
+                // per READDIR, not per pid, so it was bounded by uptime.
+                name: pid.to_string().into(),
                 file_type: FileType::Dir,
             });
         }
@@ -1973,9 +1928,8 @@ impl DirOps for ProcDynamicDir {
                     ProcNodeKind::File => FileType::File,
                     ProcNodeKind::Dir => FileType::Dir,
                 };
-                let leaked: &'static str = intern_name(&name);
                 DirEntry {
-                    name: leaked,
+                    name: name.into(),
                     file_type,
                 }
             })

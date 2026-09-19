@@ -518,19 +518,21 @@ impl DirOps for DevSndDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        // Static entries only — dynamic card names don't satisfy
-        // `&'static str`; callers wanting a full listing use `enumerate`.
-        const STATIC: &[DirEntry] = &[
-            DirEntry {
-                name: "timer",
-                file_type: FileType::Special,
-            },
-            DirEntry {
-                name: "seq",
-                file_type: FileType::Special,
-            },
-        ];
-        Box::new(STATIC.iter().copied())
+        // Every node, cards included. This used to list `timer` and `seq`
+        // alone because "dynamic card names don't satisfy `&'static str`",
+        // which is exactly the limitation `DirEntry::name` being a `Cow`
+        // removes — so `ls /dev/snd` showed neither the controls nor the
+        // PCM devices, and callers had to reach for the parallel
+        // `enumerate` to see a real listing.
+        let entries: Vec<DirEntry> = self
+            .enumerate(0, usize::MAX)
+            .into_iter()
+            .map(|(name, file_type)| DirEntry {
+                name: name.into(),
+                file_type,
+            })
+            .collect();
+        Box::new(entries.into_iter())
     }
 
     fn enumerate(&self, cursor: usize, max: usize) -> Vec<(String, FileType)> {

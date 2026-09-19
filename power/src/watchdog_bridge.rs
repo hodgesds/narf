@@ -442,35 +442,35 @@ impl WatchdogDevDir {
 // Static entries for `iter()` — must be `&'static str`.
 const WATCHDOG_ATTR_NAMES: &[DirEntry] = &[
     DirEntry {
-        name: "identity",
+        name: alloc::borrow::Cow::Borrowed("identity"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "state",
+        name: alloc::borrow::Cow::Borrowed("state"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "status",
+        name: alloc::borrow::Cow::Borrowed("status"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "timeout",
+        name: alloc::borrow::Cow::Borrowed("timeout"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "pretimeout",
+        name: alloc::borrow::Cow::Borrowed("pretimeout"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "nowayout",
+        name: alloc::borrow::Cow::Borrowed("nowayout"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "bootstatus",
+        name: alloc::borrow::Cow::Borrowed("bootstatus"),
         file_type: FileType::File,
     },
     DirEntry {
-        name: "fw_version",
+        name: alloc::borrow::Cow::Borrowed("fw_version"),
         file_type: FileType::File,
     },
 ];
@@ -556,7 +556,7 @@ impl DirOps for WatchdogDevDir {
     }
 
     fn iter<'a>(&'a self) -> Box<dyn Iterator<Item = DirEntry> + 'a> {
-        Box::new(WATCHDOG_ATTR_NAMES.iter().copied())
+        Box::new(WATCHDOG_ATTR_NAMES.iter().cloned())
     }
 }
 
