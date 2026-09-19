@@ -100,16 +100,61 @@ pub fn arp_resolve_in(net_ns_id: u64, ip: [u8; 4], timeout_ms: u64) -> Result<[u
     if let Some(m) = arp_lookup_local(net_ns_id, ip) {
         return Ok(m);
     }
+    // The cache is keyed by interface, so resolution state is tracked
+    // against the interface that actually owns the route.
+    let iface_name = iface::for_dst_in(net_ns_id, ip).map(|i| i.name);
+
+    // Negative cache. Linux drops packets to a NUD_FAILED neighbour without
+    // re-probing; without this, every send to a host that is switched off
+    // restarts a full probe cycle, turning one unreachable address into a
+    // burst of broadcast per packet.
+    if let Some(name) = iface_name.as_deref() {
+        if crate::arp_cache::resolution_failed(name, ip) {
+            return Err(());
+        }
+        crate::arp_cache::mark_incomplete(name, ip);
+    }
+
     let _ = send_arp_request_in(net_ns_id, ip);
     let deadline = narf_time::Deadline::after_ns(timeout_ms.saturating_mul(1_000_000));
+    let mut gave_up = false;
     let _ = narf_scheduler::responsive_spin_until(
         || {
             while iface::drain_pump() {}
-            arp_lookup_local(net_ns_id, ip).is_some()
+            if arp_lookup_local(net_ns_id, ip).is_some() {
+                return true;
+            }
+            // Retransmit on the 1 s timer rather than firing once and
+            // hoping. A single request lost to a dropped frame used to sink
+            // the whole resolution until the caller's timeout expired.
+            if let Some(name) = iface_name.as_deref() {
+                match crate::arp_cache::poll_resolution(name, ip) {
+                    crate::arp_cache::ResolutionStep::Retransmit => {
+                        let _ = send_arp_request_in(net_ns_id, ip);
+                    }
+                    crate::arp_cache::ResolutionStep::GaveUp => {
+                        gave_up = true;
+                        return true;
+                    }
+                    crate::arp_cache::ResolutionStep::Wait => {}
+                }
+            }
+            false
         },
         deadline,
     );
-    arp_lookup_local(net_ns_id, ip).ok_or(())
+    if gave_up {
+        return Err(());
+    }
+    let resolved = arp_lookup_local(net_ns_id, ip);
+    if resolved.is_none() {
+        // The caller's deadline expired before the probe budget did. That
+        // is NOT a failed resolution — the entry stays Incomplete so a
+        // later attempt resumes the remaining probes instead of starting a
+        // negative-cache entry the host never earned.
+        return Err(());
+    }
+    resolved.ok_or(())
 }
 
 // ── RX dispatch ─────────────────────────────────────────────────
