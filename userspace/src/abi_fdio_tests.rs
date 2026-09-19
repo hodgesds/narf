@@ -474,13 +474,21 @@ fn smoke_abi_fdio_fcntl_pos() -> TestResult {
         const F_SETFD: u64 = 2;
         const F_GETFD: u64 = 1;
         const FD_CLOEXEC: i64 = 1;
-        // F_SETFD sets FD_CLOEXEC → 0; F_GETFD reads it back.
-        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 1)) != Some(0) {
+        // Linux stores only `argi & FD_CLOEXEC`; every other bit is ignored
+        // rather than retained in the per-descriptor flag word.
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, u64::MAX)) != Some(0) {
             return Err("F_SETFD did not return 0");
         }
         match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) {
             Some(v) if v == FD_CLOEXEC => Ok(()),
             _ => Err("F_GETFD did not read back FD_CLOEXEC"),
+        }?;
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 2)) != Some(0) {
+            return Err("F_SETFD did not ignore an unknown flag bit");
+        }
+        match call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) {
+            Some(0) => Ok(()),
+            _ => Err("F_GETFD exposed an unknown F_SETFD flag bit"),
         }
     })
 }
@@ -3752,6 +3760,33 @@ kernel_test_in!(
     smoke_abi_fdio_vmsplice_bad_mode_precedes_iovec
 );
 
+/// `SYSCALL_DEFINE3(fcntl)` admits only Linux's `check_fcntl_cmd` whitelist
+/// for an FMODE_PATH description. In particular F_GETFL may report O_PATH,
+/// but F_SETFL and an unknown command both fail with EBADF rather than EINVAL.
+fn smoke_abi_fdio_fcntl_opath_command_gate() -> TestResult {
+    const O_PATH: u64 = 0o10000000;
+    const O_NONBLOCK: u64 = 0o4000;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_SETFL: u64 = 4;
+    with_memfs("/abi-fcntl-path", "abi-fcntl-path", &[("f", b"x")], || {
+        let fd = open_fd_flags(b"/abi-fcntl-path/f\0", O_PATH)?;
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFL, O_NONBLOCK)) != Some(EBADF) {
+            return Err("F_SETFL on O_PATH did not return EBADF");
+        }
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, 9999, 0)) != Some(EBADF) {
+            return Err("unknown fcntl command on O_PATH did not return EBADF");
+        }
+        if call(Syscall::Fcntl.raw(), a2(fd as u64, F_SETFD, 1)) != Some(0)
+            || call(Syscall::Fcntl.raw(), a2(fd as u64, F_GETFD, 0)) != Some(1)
+        {
+            return Err("O_PATH rejected the descriptor-flag command whitelist");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_opath_command_gate);
+
 /// Named FIFOs use the same pipe-to-user observe/copy/commit rule as
 /// anonymous pipes. A fault after one completed iovec returns that prefix and
 /// leaves the faulting segment queued; a fault before any progress returns
@@ -4378,28 +4413,242 @@ fn smoke_abi_fdio_fcntl_ofd_locks_are_granted() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_ofd_locks_are_granted);
 
-/// F_SETOWN/F_SETSIG must not promise SIGIO that never arrives.
-///
-/// NARF has no async-I/O owner and no SIGIO delivery. Answering 0 leaves a
-/// caller blocked forever on a signal the kernel will not send; EINVAL sends
-/// it to poll/epoll, which NARF does implement.
-fn smoke_abi_fdio_fcntl_async_owner_is_einval() -> TestResult {
+/// Linux f_owner state is shared by dup aliases, and O_ASYNC on a pollable fd
+/// turns a readiness event into the F_SETSIG signal with SIGPOLL siginfo.
+fn smoke_abi_fdio_fcntl_async_sigio_delivery() -> TestResult {
     const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
     const F_SETSIG: u64 = 10;
-    const F_NOTIFY: u64 = 1026;
-    with_memfs("/abi-fcntl-own", "abi-fcntl-own", &[("f", b"x")], || {
-        let fd = open_fd(b"/abi-fcntl-own/f\0")?;
-        for cmd in [F_SETOWN, F_SETSIG, F_NOTIFY] {
-            match call_raw(Syscall::Fcntl.raw(), a2(fd as u64, cmd, 1)).value as i64 {
-                v if v == EINVAL => {}
-                0 => return Err("an unimplemented fcntl command reported success"),
-                _ => return Err("unimplemented fcntl commands must be -EINVAL"),
-            }
+    const F_GETSIG: u64 = 11;
+    const F_SETFL: u64 = 4;
+    const F_GETFL: u64 = 3;
+    const F_DUPFD: u64 = 0;
+    const O_ASYNC: u64 = 0o20000;
+    with_setup(|| {
+        let (rd, wr) = make_pipe()?;
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_SETOWN, FAKE_TASK)) != Some(0)
+            || call(Syscall::Fcntl.raw(), a2(rd as u64, F_SETSIG, 10)) != Some(0)
+        {
+            return Err("F_SETOWN/F_SETSIG failed on a pipe");
+        }
+        let alias =
+            call(Syscall::Fcntl.raw(), a2(rd as u64, F_DUPFD, 20)).ok_or("F_DUPFD failed")?;
+        if call(Syscall::Fcntl.raw(), a2(alias as u64, F_GETOWN, 0)) != Some(FAKE_TASK as i64)
+            || call(Syscall::Fcntl.raw(), a2(alias as u64, F_GETSIG, 0)) != Some(10)
+        {
+            return Err("async owner/signal were not shared by the dup alias");
+        }
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(
+                alias as u64,
+                F_SETFL,
+                O_ASYNC | crate::fd::O_NONBLOCK as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("F_SETFL(O_ASYNC) failed on a pipe");
+        }
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_GETFL, 0))
+            .is_none_or(|flags| flags as u64 & O_ASYNC == 0)
+        {
+            return Err("O_ASYNC was not visible through the original alias");
+        }
+        let byte = [b'x'];
+        if call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1)) != Some(1) {
+            return Err("pipe write did not publish readiness");
+        }
+        let _ = narf_lib::deferred_wake::drain_and_wake();
+        if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(10) == 0 {
+            return Err("pipe readiness did not raise the configured SIGIO signal");
+        }
+        match crate::handlers::take_sigqueue_info(FAKE_TASK, 10) {
+            Some((1, fd, band)) if fd == alias as u64 && band == 0x41 => {}
+            _ => return Err("SIGIO did not carry Linux POLL_IN si_fd/si_band"),
+        }
+
+        crate::handlers::clear_signal_pending(FAKE_TASK, 10);
+        // SIGCHLD has its own positive si_code namespace. Linux substitutes
+        // SI_SIGIO (-5) to avoid confusing POLL_IN (1) with CLD_EXITED (1),
+        // while retaining the SIGPOLL si_fd/si_band union.
+        if call(Syscall::Fcntl.raw(), a2(alias as u64, F_SETSIG, 17)) != Some(0) {
+            return Err("F_SETSIG(SIGCHLD) failed");
+        }
+        let mut drain = [0u8; 1];
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(rd as u64, drain.as_mut_ptr() as u64, 1),
+        );
+        let _ = call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1));
+        let _ = narf_lib::deferred_wake::drain_and_wake();
+        match crate::handlers::take_sigqueue_info(FAKE_TASK, 17) {
+            Some((-5, fd, band)) if fd == alias as u64 && band == 0x41 => {}
+            _ => return Err("SIGIO on SIGCHLD did not use Linux SI_SIGIO disambiguation"),
+        }
+        crate::handlers::clear_signal_pending(FAKE_TASK, 17);
+
+        // With F_SETSIG reset to zero, fs/fcntl.c falls back to
+        // do_send_sig_info(SIGIO, SEND_SIG_PRIV): signum 29, SI_KERNEL.
+        if call(Syscall::Fcntl.raw(), a2(alias as u64, F_SETSIG, 0)) != Some(0) {
+            return Err("clearing F_SETSIG failed");
+        }
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(rd as u64, drain.as_mut_ptr() as u64, 1),
+        );
+        let _ = call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1));
+        let _ = narf_lib::deferred_wake::drain_and_wake();
+        match crate::handlers::take_sigqueue_info(FAKE_TASK, 29) {
+            Some((0x80, 0, 0)) => {}
+            _ => return Err("plain SIGIO did not carry Linux SI_KERNEL provenance"),
+        }
+        crate::handlers::clear_signal_pending(FAKE_TASK, 29);
+
+        if call(Syscall::Fcntl.raw(), a2(alias as u64, F_SETFL, 0)) != Some(0) {
+            return Err("clearing O_ASYNC failed");
+        }
+        let _ = call(
+            Syscall::Read.raw(),
+            a2(rd as u64, drain.as_mut_ptr() as u64, 1),
+        );
+        let _ = call(Syscall::Write.raw(), a2(wr as u64, byte.as_ptr() as u64, 1));
+        let _ = narf_lib::deferred_wake::drain_and_wake();
+        if crate::handlers::signal_pending_of(FAKE_TASK) & crate::handlers::sig_bit(29) != 0 {
+            return Err("SIGIO remained armed after O_ASYNC was cleared");
         }
         Ok(())
     })
 }
-kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_async_owner_is_einval);
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_async_sigio_delivery);
+
+/// Owner-family validation and errno precedence follow fs/fcntl.c. F_NOTIFY
+/// remains the only command in this cluster that is intentionally absent.
+fn smoke_abi_fdio_fcntl_async_owner_errno_and_ex() -> TestResult {
+    const F_SETOWN: u64 = 8;
+    const F_SETSIG: u64 = 10;
+    const F_SETOWN_EX: u64 = 15;
+    const F_GETOWN_EX: u64 = 16;
+    const F_NOTIFY: u64 = 1026;
+    with_setup(|| {
+        let (rd, _wr) = make_pipe()?;
+        if call(Syscall::Fcntl.raw(), a2(4242, F_SETOWN, FAKE_TASK)) != Some(EBADF) {
+            return Err("bad fd did not win before F_SETOWN validation");
+        }
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_SETOWN, 123_456)) != Some(ESRCH) {
+            return Err("F_SETOWN accepted a nonexistent pid");
+        }
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_SETSIG, 65)) != Some(EINVAL) {
+            return Err("F_SETSIG accepted a signal above SIGRTMAX");
+        }
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_SETOWN_EX, 1)) != Some(EFAULT) {
+            return Err("F_SETOWN_EX bad pointer did not return EFAULT");
+        }
+        let mut owner = [0u8; 8];
+        owner[0..4].copy_from_slice(&2i32.to_ne_bytes()); // F_OWNER_PGRP
+        owner[4..8].copy_from_slice(&(FAKE_TASK as i32).to_ne_bytes());
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(rd as u64, F_SETOWN_EX, owner.as_ptr() as u64),
+        ) != Some(0)
+        {
+            return Err("F_SETOWN_EX(F_OWNER_PGRP) failed");
+        }
+        let mut got = [0u8; 8];
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(rd as u64, F_GETOWN_EX, got.as_mut_ptr() as u64),
+        ) != Some(0)
+            || i32::from_ne_bytes(got[0..4].try_into().unwrap()) != 2
+            || i32::from_ne_bytes(got[4..8].try_into().unwrap()) != FAKE_TASK as i32
+        {
+            return Err("F_GETOWN_EX did not round-trip the process-group owner");
+        }
+        owner[0..4].copy_from_slice(&99i32.to_ne_bytes());
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(rd as u64, F_SETOWN_EX, owner.as_ptr() as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("F_SETOWN_EX accepted an invalid owner type");
+        }
+        if call(Syscall::Fcntl.raw(), a2(rd as u64, F_NOTIFY, 1)) != Some(EINVAL) {
+            return Err("unimplemented F_NOTIFY did not return EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_async_owner_errno_and_ex);
+
+/// F_{GET,SET}_RW_HINT operates on the inode rather than one open description,
+/// validates Linux's six write-life values, and preserves permission/copy
+/// ordering.
+fn smoke_abi_fdio_fcntl_rw_hint_inode_and_errno() -> TestResult {
+    const F_GET_RW_HINT: u64 = 1035;
+    const F_SET_RW_HINT: u64 = 1036;
+    with_memfs("/abi-rwhint", "abi-rwhint", &[("f", b"x")], || {
+        let first = open_fd(b"/abi-rwhint/f\0")?;
+        let second = open_fd(b"/abi-rwhint/f\0")?;
+        let mut hint = 0u64;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(first as u64, F_GET_RW_HINT, (&mut hint as *mut u64) as u64),
+        ) != Some(0)
+            || hint != 0
+        {
+            return Err("new inode did not report RWH_WRITE_LIFE_NOT_SET");
+        }
+        hint = 4; // RWH_WRITE_LIFE_LONG
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(first as u64, F_SET_RW_HINT, (&hint as *const u64) as u64),
+        ) != Some(0)
+        {
+            return Err("F_SET_RW_HINT rejected a valid hint");
+        }
+        hint = 0;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(second as u64, F_GET_RW_HINT, (&mut hint as *mut u64) as u64),
+        ) != Some(0)
+            || hint != 4
+        {
+            return Err("RW hint was not shared by two opens of one inode");
+        }
+        if call(Syscall::Close.raw(), a0(first as u64)) != Some(0) {
+            return Err("closing the setting description failed");
+        }
+        hint = 0;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(second as u64, F_GET_RW_HINT, (&mut hint as *mut u64) as u64),
+        ) != Some(0)
+            || hint != 4
+        {
+            return Err("RW hint incorrectly followed the opening description lifetime");
+        }
+        hint = 6;
+        if call(
+            Syscall::Fcntl.raw(),
+            a2(second as u64, F_SET_RW_HINT, (&hint as *const u64) as u64),
+        ) != Some(EINVAL)
+        {
+            return Err("F_SET_RW_HINT accepted an unknown write-life value");
+        }
+        if call(Syscall::Fcntl.raw(), a2(4242, F_GET_RW_HINT, 1)) != Some(EBADF)
+            || call(Syscall::Fcntl.raw(), a2(second as u64, F_GET_RW_HINT, 1)) != Some(EFAULT)
+            || call(Syscall::Fcntl.raw(), a2(second as u64, F_SET_RW_HINT, 1)) != Some(EFAULT)
+        {
+            return Err("RW-hint EBADF/EFAULT precedence diverged from Linux");
+        }
+        crate::handlers::__test_set_fsids(FAKE_TASK, 1000, 1000);
+        crate::handlers::__test_set_caps(FAKE_TASK, 0, 0);
+        if call(Syscall::Fcntl.raw(), a2(second as u64, F_SET_RW_HINT, 1)) != Some(EPERM) {
+            return Err("RW-hint ownership check did not precede the user copy");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fdio_fcntl_rw_hint_inode_and_errno);
 
 /// Positive pin: the commands NARF does implement still work. The change
 /// above widens an arm that every unhandled command falls into, so this is

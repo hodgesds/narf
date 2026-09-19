@@ -14,9 +14,9 @@
 
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use narf_filesystem::{FileOps, FsError, FsFuture, Mode, Stat};
 use narf_lib::sync::IrqSafeSpinLock;
@@ -52,7 +52,6 @@ struct OpenFileState {
 
 /// Shared `struct file` analogue. The async mutex serializes sequential I/O
 /// across dup/fork aliases without disabling IRQs while FileOps may park.
-#[derive(Debug)]
 pub(crate) struct OpenFileDescription {
     state: IrqSafeSpinLock<OpenFileState>,
     /// Linux's `file::f_flags` analogue. Reads dominate writes, and flag
@@ -64,6 +63,70 @@ pub(crate) struct OpenFileDescription {
     pub(crate) position_lock: narf_lib::mutex::Mutex<()>,
     /// Index into the bounded inode/FileOps append-lock shard table.
     append_lock_index: usize,
+    /// Linux `file::f_owner` analogue. Ownership, configured signal and the
+    /// fd reported in `siginfo_t` are properties of the open description, so
+    /// dup/fork/SCM_RIGHTS aliases observe one shared value.
+    fasync: IrqSafeSpinLock<FasyncConfig>,
+    /// Persistent-readiness subscription key reserved for this description.
+    fasync_waiter_id: u64,
+    /// Used only to remove the persistent readiness callback when the last
+    /// alias closes. Weak avoids a description -> file -> waker -> description
+    /// cycle; the callback itself also retains only a Weak description.
+    fasync_ops: Weak<dyn FileOps>,
+}
+
+impl core::fmt::Debug for OpenFileDescription {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpenFileDescription")
+            .field("state", &self.state)
+            .field("status_flags", &self.status_flags.load(Ordering::Relaxed))
+            .field("append_lock_index", &self.append_lock_index)
+            .field("fasync", &self.fasync)
+            .field("fasync_waiter_id", &self.fasync_waiter_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Stable internal target held by `file::f_owner`. Task ids are never reused,
+/// unlike Linux-visible pid numbers, so an owner that exits cannot retarget a
+/// later process which happens to receive the same pid.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum FasyncOwner {
+    None,
+    Tid(u64),
+    Process(u64),
+    ProcessGroup(u64),
+}
+
+#[derive(Copy, Clone, Debug)]
+struct FasyncConfig {
+    owner: FasyncOwner,
+    owner_type: i32,
+    signal: u32,
+    fd: i32,
+    owner_uid: u32,
+    owner_euid: u32,
+    enabled: bool,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct FasyncSnapshot {
+    pub owner: FasyncOwner,
+    pub owner_type: i32,
+    pub signal: u32,
+    pub fd: i32,
+    pub owner_uid: u32,
+    pub owner_euid: u32,
+    pub enabled: bool,
+}
+
+static FASYNC_WAITER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn next_fasync_waiter_id() -> u64 {
+    // Task waiters use small ids; epoll reserves bit 63. Reserve bit 62 for
+    // SIGIO subscriptions so the three users of one Readiness waiter map can
+    // never replace one another.
+    (FASYNC_WAITER_SEQ.fetch_add(1, Ordering::Relaxed) & ((1u64 << 62) - 1)) | (1u64 << 62)
 }
 
 impl Drop for OpenFileDescription {
@@ -77,6 +140,11 @@ impl Drop for OpenFileDescription {
     /// through a different one — pinning that range for the rest of the
     /// boot with no owner left to unlock it.
     fn drop(&mut self) {
+        if self.fasync.lock().enabled {
+            if let Some(ops) = self.fasync_ops.upgrade() {
+                let _ = ops.disarm_readiness(self.fasync_waiter_id);
+            }
+        }
         locks::release_ofd_owner(self.lock_owner());
         // `flock(2)` locks are owned by the description too, and released
         // at exactly the same moment — `locks_remove_flock` runs from
@@ -123,12 +191,59 @@ impl OpenFileDescription {
         self.state.lock().offset = offset;
     }
 
-    fn status_flags(&self) -> u32 {
+    pub(crate) fn status_flags(&self) -> u32 {
         self.status_flags.load(Ordering::Acquire)
     }
 
-    fn set_status_flags(&self, status_flags: u32) {
+    pub(crate) fn set_status_flags(&self, status_flags: u32) {
         self.status_flags.store(status_flags, Ordering::Release);
+    }
+
+    pub(crate) fn fasync_waiter_id(&self) -> u64 {
+        self.fasync_waiter_id
+    }
+
+    pub(crate) fn fasync_snapshot(&self) -> FasyncSnapshot {
+        let state = *self.fasync.lock();
+        FasyncSnapshot {
+            owner: state.owner,
+            owner_type: state.owner_type,
+            signal: state.signal,
+            fd: state.fd,
+            owner_uid: state.owner_uid,
+            owner_euid: state.owner_euid,
+            enabled: state.enabled,
+        }
+    }
+
+    pub(crate) fn set_fasync_owner(
+        &self,
+        owner: FasyncOwner,
+        owner_type: i32,
+        uid: u32,
+        euid: u32,
+    ) {
+        let mut state = self.fasync.lock();
+        state.owner = owner;
+        state.owner_type = owner_type;
+        state.owner_uid = uid;
+        state.owner_euid = euid;
+    }
+
+    pub(crate) fn set_fasync_signal(&self, signal: u32) {
+        self.fasync.lock().signal = signal;
+    }
+
+    pub(crate) fn set_fasync_enabled(&self, enabled: bool, fd: i32) {
+        let mut state = self.fasync.lock();
+        state.enabled = enabled;
+        if enabled {
+            state.fd = fd;
+        }
+    }
+
+    pub(crate) fn fasync_ops(&self) -> Option<Arc<dyn FileOps>> {
+        self.fasync_ops.upgrade()
     }
 
     pub(crate) fn append_lock(&self) -> &'static narf_lib::mutex::Mutex<()> {
@@ -152,6 +267,9 @@ pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_NONBLOCK: u32 = 0o4000;
+/// Linux `FASYNC` / `O_ASYNC` status bit. Unlike the ordinary `SETFL_MASK`
+/// bits, this is retained only when the file supplies an async wake path.
+pub const O_ASYNC: u32 = 0o20000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_DIRECT: u32 = 0o40000;
 pub const O_CLOEXEC: u32 = 0o2000000;
@@ -449,6 +567,17 @@ impl FdTable {
             status_flags: AtomicU32::new(entry.status_flags),
             position_lock: narf_lib::mutex::Mutex::new(()),
             append_lock_index: append_lock_index(&entry.ops),
+            fasync: IrqSafeSpinLock::new(FasyncConfig {
+                owner: FasyncOwner::None,
+                owner_type: 0,
+                signal: 0,
+                fd: -1,
+                owner_uid: 0,
+                owner_euid: 0,
+                enabled: false,
+            }),
+            fasync_waiter_id: next_fasync_waiter_id(),
+            fasync_ops: Arc::downgrade(&entry.ops),
         })
     }
 

@@ -64,10 +64,6 @@ pub(crate) fn set_fd_nonblock(task: u64, mqd: u32, enabled: bool) {
     }
 }
 
-pub(crate) fn fd_nonblock(task: u64, mqd: u32) -> Option<bool> {
-    queue_id_of(task, mqd).and_then(|id| mqueuefs::is_nonblock(id).ok())
-}
-
 fn read_i64(buf: &[u8]) -> i64 {
     i64::from_le_bytes(buf[..8].try_into().unwrap())
 }

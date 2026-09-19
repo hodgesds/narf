@@ -1748,6 +1748,25 @@ kernel_test_in!(
     smoke_abi_ioerrno_fcntl_dupfd_bad_fd_outranks_floor
 );
 
+fn smoke_abi_ioerrno_fcntl_flag_commands_validate_fd_first() -> TestResult {
+    with_setup(|| {
+        // `SYSCALL_DEFINE3(fcntl)` resolves `fdget_raw(fd)` before command
+        // dispatch. Every flag operation—and even an unknown command—must
+        // therefore report EBADF for a closed descriptor, never EINVAL or a
+        // fabricated successful flag word.
+        for cmd in [1, 2, 3, 4, 9999] {
+            if call(Syscall::Fcntl.raw(), a2(4242, cmd, u64::MAX)) != Some(EBADF) {
+                return Err("fcntl flag command did not validate the fd first");
+            }
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_ioerrno_fcntl_flag_commands_validate_fd_first
+);
+
 fn smoke_abi_ioerrno_fcntl_dupfd_floor_is_32_bit() -> TestResult {
     with_memfs("/abi", "abi", &[("f", b"x")], || {
         let fd = open_rw(b"/abi/f\0")?;

@@ -114,11 +114,21 @@ pub(crate) fn sys_rt_sigtimedwait(ctx: &mut dyn TrapContext) {
             // (the sigval union, offset 24) carry the queued sender payload
             // (stress-ng --sigrt's child replies to si_pid). Rest stays zero.
             let mut si = [0u8; 128];
-            let (si_code, si_value, si_pid) = queued.unwrap_or((0, 0, 0)); // SI_USER shape
+            let (si_code, si_value, si_pid, poll_band) = queued.map_or(
+                (0, 0, 0, None),
+                |info| (info.code, info.value, info.pid, info.poll_band),
+            );
             si[..4].copy_from_slice(&(signum as i32).to_ne_bytes()); // si_signo
             si[8..12].copy_from_slice(&si_code.to_ne_bytes()); // si_code
-            si[16..20].copy_from_slice(&si_pid.to_ne_bytes()); // si_pid
-            si[24..32].copy_from_slice(&si_value.to_ne_bytes()); // si_value
+            if let Some(band) = poll_band {
+                // SIGPOLL union: si_band is long at offset 16; si_fd is int at
+                // offset 24. The zero-filled tail supplies ABI padding.
+                si[16..24].copy_from_slice(&u64::from(band).to_ne_bytes());
+                si[24..28].copy_from_slice(&(si_value as u32).to_ne_bytes());
+            } else {
+                si[16..20].copy_from_slice(&si_pid.to_ne_bytes()); // si_pid
+                si[24..32].copy_from_slice(&si_value.to_ne_bytes()); // si_value
+            }
                                                                  // SAFETY: info_out != 0; copy_to_user range-validates + SMAP-brackets.
             let _ = unsafe { copy_to_user(info_out, &si) };
         }
