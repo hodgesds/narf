@@ -176,6 +176,13 @@ pub struct ProcVma {
     pub resident_pages: u64,
     /// Hardware translation leaf size.
     pub kernel_page_kb: u64,
+    /// Proportional set size in bytes — see `NumaRegionSnapshot::pss_bytes`.
+    /// Exact, derived from real COW sharer counts.
+    pub pss_bytes: u64,
+    /// Resident pages mapped by more than one address space, and by
+    /// exactly one.
+    pub shared_pages: u64,
+    pub private_pages: u64,
 }
 
 type CurrentPidFn = fn() -> u64;
@@ -1130,6 +1137,8 @@ enum PidField {
     Cmdline,
     Maps,
     NumaMaps,
+    Smaps,
+    SmapsRollup,
     Comm,
 }
 
@@ -1147,7 +1156,10 @@ impl FileOps for ProcPidFile {
         let pid = self.pid;
         let field = self.field;
         Box::pin(async move {
-            let query = if matches!(field, PidField::Maps | PidField::NumaMaps) {
+            let query = if matches!(
+                field,
+                PidField::Maps | PidField::NumaMaps | PidField::Smaps | PidField::SmapsRollup
+            ) {
                 TaskInfoQuery::Vmas
             } else {
                 TaskInfoQuery::Basic
@@ -1167,6 +1179,8 @@ impl FileOps for ProcPidFile {
                 PidField::Cmdline => return slice_read(&info.cmdline, offset, buf),
                 PidField::Maps => render_maps(&info),
                 PidField::NumaMaps => render_numa_maps(&info),
+                PidField::Smaps => render_smaps(&info),
+                PidField::SmapsRollup => render_smaps_rollup(&info),
                 PidField::Comm => format!("{}\n", info.comm),
             };
             slice_read(body.as_bytes(), offset, buf)
@@ -1290,6 +1304,8 @@ impl DirOps for ProcPidDir {
             "cmdline" => PidField::Cmdline,
             "maps" => PidField::Maps,
             "numa_maps" => PidField::NumaMaps,
+            "smaps" => PidField::Smaps,
+            "smaps_rollup" => PidField::SmapsRollup,
             "comm" => PidField::Comm,
             _ => {
                 return pid_ext::lookup_pid_ext(self.pid, name)
@@ -1329,6 +1345,14 @@ impl DirOps for ProcPidDir {
                 },
                 DirEntry {
                     name: "maps".into(),
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "smaps".into(),
+                    file_type: FileType::File,
+                },
+                DirEntry {
+                    name: "smaps_rollup".into(),
                     file_type: FileType::File,
                 },
                 DirEntry {
@@ -2509,22 +2533,109 @@ fn render_maps(info: &ProcTaskInfo) -> String {
     // backing files); pathname slot carries our label or empty.
     let mut s = String::new();
     for v in info.vmas.iter() {
-        let r = if v.readable { 'r' } else { '-' };
-        let w = if v.writable { 'w' } else { '-' };
-        let x = if v.executable { 'x' } else { '-' };
-        let p = if v.shared { 's' } else { 'p' };
-        let _ = core::fmt::Write::write_fmt(
-            &mut s,
-            format_args!(
-                "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0",
-                v.start, v.end, r, w, x, p,
-            ),
-        );
-        if !v.label.is_empty() {
-            let _ = core::fmt::Write::write_fmt(&mut s, format_args!("          {}", v.label));
-        }
-        s.push('\n');
+        write_maps_line(&mut s, v);
     }
+    s
+}
+
+/// The `maps` line for one VMA. Shared with `smaps`, whose per-VMA block
+/// opens with exactly this line — Linux renders it from the same helper
+/// for the same reason.
+fn write_maps_line(s: &mut String, v: &ProcVma) {
+    let r = if v.readable { 'r' } else { '-' };
+    let w = if v.writable { 'w' } else { '-' };
+    let x = if v.executable { 'x' } else { '-' };
+    let p = if v.shared { 's' } else { 'p' };
+    let _ = core::fmt::Write::write_fmt(
+        s,
+        format_args!(
+            "{:016x}-{:016x} {}{}{}{} 00000000 00:00 0",
+            v.start, v.end, r, w, x, p,
+        ),
+    );
+    if !v.label.is_empty() {
+        let _ = core::fmt::Write::write_fmt(s, format_args!("          {}", v.label));
+    }
+    s.push('\n');
+}
+
+/// One `/proc/<pid>/smaps` VMA block, and the `smaps_rollup` summary, share
+/// this field list.
+///
+/// Linux emits ~20 fields per VMA. NARF emits the ones it can PROVE and
+/// omits the rest — `Shared_Clean`/`Private_Dirty` and friends need
+/// per-page dirty state this kernel does not track, and a parser skipping
+/// an absent field is strictly better off than one reading a fabricated
+/// number. `Pss` in particular is exact rather than approximated by `Rss`:
+/// the COW refcounts are the real sharer counts, and `Pss = Rss` would
+/// overstate shared memory, which is the one thing `ps_mem` and systemd's
+/// memory accounting read this file for.
+fn write_smaps_fields(
+    s: &mut String,
+    size_bytes: u64,
+    rss_pages: u64,
+    pss_bytes: u64,
+    shared_pages: u64,
+    private_pages: u64,
+) {
+    let kb = |bytes: u64| bytes / 1024;
+    let _ = core::fmt::Write::write_fmt(
+        s,
+        format_args!(
+            "Size:           {:8} kB\n\
+             Rss:            {:8} kB\n\
+             Pss:            {:8} kB\n\
+             Shared:         {:8} kB\n\
+             Private:        {:8} kB\n",
+            kb(size_bytes),
+            rss_pages * 4,
+            kb(pss_bytes),
+            shared_pages * 4,
+            private_pages * 4,
+        ),
+    );
+}
+
+/// `/proc/<pid>/smaps` — every VMA, each with its `maps` header line
+/// followed by the accounting fields.
+fn render_smaps(info: &ProcTaskInfo) -> String {
+    let mut s = String::new();
+    for v in info.vmas.iter() {
+        write_maps_line(&mut s, v);
+        write_smaps_fields(
+            &mut s,
+            v.end.saturating_sub(v.start),
+            v.resident_pages,
+            v.pss_bytes,
+            v.shared_pages,
+            v.private_pages,
+        );
+    }
+    s
+}
+
+/// `/proc/<pid>/smaps_rollup` — the same totals across every VMA, under a
+/// single header line spanning the whole address space.
+///
+/// systemd reads this rather than `smaps` precisely because it is one
+/// block instead of one per mapping.
+fn render_smaps_rollup(info: &ProcTaskInfo) -> String {
+    let mut s = String::new();
+    let start = info.vmas.iter().map(|v| v.start).min().unwrap_or(0);
+    let end = info.vmas.iter().map(|v| v.end).max().unwrap_or(0);
+    let _ = core::fmt::Write::write_fmt(
+        &mut s,
+        format_args!("{start:016x}-{end:016x} ---p 00000000 00:00 0                  [rollup]\n"),
+    );
+    let fold = |f: fn(&ProcVma) -> u64| info.vmas.iter().map(f).fold(0u64, u64::saturating_add);
+    write_smaps_fields(
+        &mut s,
+        fold(|v| v.end.saturating_sub(v.start)),
+        fold(|v| v.resident_pages),
+        fold(|v| v.pss_bytes),
+        fold(|v| v.shared_pages),
+        fold(|v| v.private_pages),
+    );
     s
 }
 
@@ -2878,6 +2989,112 @@ fn smoke_stat_btime_positive() -> TestResult {
 }
 kernel_test_in!("filesystem/procfs", smoke_stat_btime_positive);
 
+/// A minimal `ProcTaskInfo` for renderer tests: everything zeroed but the
+/// identity, so a case only has to set the fields it is actually about.
+fn sample_task_info() -> ProcTaskInfo {
+    ProcTaskInfo {
+        pid: 7,
+        comm: String::from("t"),
+        state: 'R',
+        brk_top: 0,
+        stack_top: 0,
+        cmdline: Vec::new(),
+        vmas: Vec::new(),
+        vm_size_bytes: 0,
+        resident_pages: 0,
+        data_bytes: 0,
+        stack_bytes: 0,
+        ppid: 0,
+        pgrp: 0,
+        session: 0,
+        tty_nr: 0,
+        tpgid: -1,
+        utime_ticks: 0,
+        stime_ticks: 0,
+        starttime_ticks: 0,
+        uid: 0,
+        gid: 0,
+        num_threads: 1,
+    }
+}
+
+/// `smaps` reports a PSS that is sharer-weighted, not a copy of RSS.
+///
+/// This is the field the file exists for: `ps_mem` and systemd's memory
+/// accounting read `Pss` specifically so shared memory is counted once
+/// across the processes sharing it. Reporting `Pss = Rss` — the obvious
+/// shortcut when per-page sharer counts are unavailable — overstates
+/// every shared mapping, and looks entirely plausible while doing it.
+///
+/// NARF can do it exactly because the COW refcounts are the real sharer
+/// counts. Here a mapping of four resident pages, two of them shared with
+/// one other address space, must report Rss 16 kB and Pss 12 kB:
+/// 2 private pages at 4 kB, plus 2 shared pages at 4 kB / 2.
+fn smoke_smaps_pss_is_sharer_weighted() -> TestResult {
+    let vma = ProcVma {
+        start: 0x1000,
+        end: 0x5000, // 4 pages
+        readable: true,
+        writable: true,
+        executable: false,
+        shared: false,
+        label: "",
+        numa_policy: 0,
+        numa_nodemask: 0,
+        numa_node_pages: [0; 16],
+        resident_pages: 4,
+        kernel_page_kb: 4,
+        // 2 private (4096 each) + 2 shared with one peer (2048 each).
+        pss_bytes: 2 * 4096 + 2 * 2048,
+        shared_pages: 2,
+        private_pages: 2,
+    };
+    let info = ProcTaskInfo {
+        vmas: alloc::vec![vma],
+        ..sample_task_info()
+    };
+
+    let body = render_smaps(&info);
+    if !body.contains("Rss:                  16 kB") {
+        return TestResult::Fail("smaps Rss is wrong");
+    }
+    if !body.contains("Pss:                  12 kB") {
+        return TestResult::Fail("smaps Pss is not sharer-weighted");
+    }
+    if body.contains("Pss:                  16 kB") {
+        return TestResult::Fail("smaps Pss was reported as Rss");
+    }
+    // The block opens with the same header line `maps` emits, which is
+    // what lets a consumer correlate the two files.
+    if !body.starts_with("0000000000001000-0000000000005000 rw-p") {
+        return TestResult::Fail("smaps block does not open with the maps header line");
+    }
+    if !body.contains("Shared:                8 kB")
+        || !body.contains("Private:               8 kB")
+    {
+        return TestResult::Fail("smaps shared/private split is wrong");
+    }
+
+    // The rollup sums the same numbers under one header, which is why
+    // systemd reads it instead of walking every mapping.
+    let two = ProcTaskInfo {
+        vmas: alloc::vec![vma, vma],
+        ..sample_task_info()
+    };
+    let rollup = render_smaps_rollup(&two);
+    if !rollup.contains("[rollup]") {
+        return TestResult::Fail("smaps_rollup is missing its header line");
+    }
+    if !rollup.contains("Pss:                  24 kB") {
+        return TestResult::Fail("smaps_rollup did not sum Pss across mappings");
+    }
+    if rollup.matches("Pss:").count() != 1 {
+        return TestResult::Fail("smaps_rollup emitted more than one block");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/procfs", smoke_smaps_pss_is_sharer_weighted);
+
 /// /proc/[pid]/stat now renders 52 real fields — ppid/pgrp/session
 /// (4-6), utime (14), starttime (22), vsize/rss (23-24) — instead of
 /// the pid/comm/state-plus-zeros stub. `ps`/`top` compose starttime
@@ -2904,6 +3121,9 @@ fn smoke_pid_stat_real_fields() -> TestResult {
             numa_node_pages: [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             resident_pages: 2,
             kernel_page_kb: 4,
+            pss_bytes: 0,
+            shared_pages: 0,
+            private_pages: 0,
         }],
         vm_size_bytes: 8192,
         resident_pages: 2,
