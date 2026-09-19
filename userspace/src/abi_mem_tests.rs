@@ -712,6 +712,104 @@ fn smoke_abi_mem_mbind_pos() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_mem_mbind_pos);
 
+/// A child inherits a COPY of the parent's task mempolicy.
+///
+/// `copy_process()` does `p->mempolicy = mpol_dup(p->mempolicy)`
+/// (`kernel/fork.c:2156`) for every child, with no CLONE_ flag guarding it,
+/// so a thread inherits it exactly as a forked process does. NARF kept the
+/// policy in a per-task table that no fork path ever copied, so a child
+/// silently reverted to MPOL_DEFAULT and its allocations ignored the
+/// placement its parent had chosen.
+fn smoke_abi_mem_mempolicy_inherited_by_child() -> TestResult {
+    with_setup(|| {
+        const CHILD_TID: u64 = 0x3FED_0001;
+        // MPOL_BIND (2) over node 0 — a policy that is distinguishable from
+        // the MPOL_DEFAULT an un-inherited child would show.
+        let mask = 1u64;
+        if call(
+            Syscall::SetMempolicy.raw(),
+            a2(2, &mask as *const u64 as u64, 64),
+        ) != Some(0)
+        {
+            return Err("set_mempolicy did not seed the parent policy");
+        }
+        let parent = crate::handlers::__test_task_mempolicy(FAKE_TASK)
+            .ok_or("parent has no stored mempolicy after set_mempolicy")?;
+        if parent.0 & 0xF != 2 {
+            return Err("parent policy is not MPOL_BIND");
+        }
+
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        crate::handlers::mempolicy_fork(FAKE_TASK, CHILD_TID);
+        let child = match crate::handlers::__test_task_mempolicy(CHILD_TID) {
+            Some(c) => c,
+            None => {
+                crate::handlers::__test_release_task_tables(CHILD_TID);
+                return Err("child did not inherit the parent's mempolicy");
+            }
+        };
+        if child != parent {
+            crate::handlers::__test_release_task_tables(CHILD_TID);
+            return Err("child's inherited policy differs from the parent's");
+        }
+
+        // It is a COPY, not a share: `mpol_dup` duplicates the struct, so a
+        // later set_mempolicy in the parent must not move the child.
+        if call(Syscall::SetMempolicy.raw(), a2(0, 0, 0)) != Some(0) {
+            crate::handlers::__test_release_task_tables(CHILD_TID);
+            return Err("set_mempolicy(MPOL_DEFAULT) failed in the parent");
+        }
+        let child_after = crate::handlers::__test_task_mempolicy(CHILD_TID);
+        crate::handlers::__test_release_task_tables(CHILD_TID);
+        if child_after != Some(child) {
+            return Err("parent's later set_mempolicy moved the child's policy");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_mem_mempolicy_inherited_by_child);
+
+/// A forked child's new address space inherits the parent's `mbind` ranges.
+///
+/// `dup_mmap` calls `vma_dup_policy` (`mm/mempolicy.c:2802`) for every VMA
+/// it duplicates, so the child's mm carries copies of the parent's range
+/// policies. Now that NARF keys those ranges by address space, a fresh
+/// address space starts empty — which is correct for an unrelated process
+/// and wrong for a forked child, hence this copy. A CLONE_VM child does not
+/// come through here at all: it shares the address space, and therefore the
+/// ranges, already.
+fn smoke_abi_mem_mbind_ranges_inherited_by_forked_child() -> TestResult {
+    with_setup(|| {
+        const CHILD_SCOPE: u64 = 0x3FED_0002;
+        let mask = 1u64;
+        if call(
+            Syscall::Mbind.raw(),
+            a3(0x1000, 0x1000, 2, &mask as *const u64 as u64),
+        ) != Some(0)
+        {
+            return Err("mbind did not record a range policy");
+        }
+        let parent_scope = crate::handlers::__test_mbind_scope();
+        let parent_ranges = crate::handlers::__test_mbind_range_count(parent_scope);
+        if parent_ranges == 0 {
+            return Err("mbind recorded no range for the parent scope");
+        }
+
+        crate::handlers::drop_address_space_mbind_ranges(CHILD_SCOPE);
+        crate::handlers::fork_address_space_mbind_ranges(parent_scope, CHILD_SCOPE);
+        let child_ranges = crate::handlers::__test_mbind_range_count(CHILD_SCOPE);
+        crate::handlers::drop_address_space_mbind_ranges(CHILD_SCOPE);
+        if child_ranges != parent_ranges {
+            return Err("forked child's address space did not inherit the mbind ranges");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_mem_mbind_ranges_inherited_by_forked_child
+);
+
 fn smoke_abi_mem_mbind_bad_mode_neg() -> TestResult {
     with_setup(|| {
         // mode 9 is invalid (checked before the addr alignment).

@@ -216,6 +216,12 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // key here must be ProcessId, not TaskId.
     parent_of_set(child_pid.raw(), parent_pid);
     crate::mapped_file::fork_address_space(parent_as.identity(), child_as.identity());
+    // The child's mm carries COPIES of the parent's mbind range policies,
+    // the way `dup_mmap` calls `vma_dup_policy` for every duplicated VMA.
+    crate::handlers::fork_address_space_mbind_ranges(
+        parent_as.identity(),
+        child_as.identity(),
+    );
     let proc = crate::UserProcess {
         pid: child_pid,
         address_space: child_as.clone(),
@@ -302,6 +308,8 @@ pub(crate) fn sys_fork(ctx: &mut dyn TrapContext) {
     // chroot inheritance (see do_clone3) — child inherits the parent's root.
     root_dir_fork(parent_pid, child_tid.raw());
     uidgid_fork(parent_pid, child_tid.raw());
+    // `copy_process` duplicates the task mempolicy for every child.
+    crate::handlers::mempolicy_fork(parent_pid, child_tid.raw());
     // brk is inherited by `clone_for_fork` (it's address-space state), not copied
     // per-task.
     sigaction_fork(parent_pid, child_tid.raw());
