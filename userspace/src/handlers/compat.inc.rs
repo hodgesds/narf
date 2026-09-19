@@ -1917,6 +1917,14 @@ fn do_execve_resolved(
                     options(nostack, nomem, preserves_flags));
             }
             narf_scheduler::stackful::set_current_user_cr3(cr3);
+            // Linux flush_thread() resets all user xstate on a successful
+            // exec. This own-stack path keeps the same task/FPU allocation and
+            // jumps directly into the new image, so reset it explicitly before
+            // abandoning the execve syscall continuation.
+            assert!(
+                narf_scheduler::stackful::reset_current_user_fpu(),
+                "own-stack exec lost its published x86 FPU image"
+            );
         }
         #[cfg(target_arch = "x86_64")]
         if let Some(fb) = fs_base {
@@ -11818,7 +11826,7 @@ mod handler_sys_mlock2;
 mod handler_sys_mlockall;
 #[path = "sys_mmap.rs"]
 mod handler_sys_mmap;
-pub(crate) use handler_sys_mmap::load_file_mapping_pages;
+pub(crate) use handler_sys_mmap::load_file_demand_page;
 #[path = "sys_mount.rs"]
 mod handler_sys_mount;
 #[path = "sys_mount_for_test.rs"]

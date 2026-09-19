@@ -211,6 +211,69 @@ impl<V> RegionIndex<V> {
         None
     }
 
+    /// Append one key to a fresh, reserved index in strictly increasing order.
+    ///
+    /// Fork already walks the parent VMAs in key order. Building the child's
+    /// private index through ordinary AVL insertion would search and rebalance
+    /// the same new tree once per VMA. This path maintains a valid right-linked
+    /// search tree while the batch is in flight, then [`Self::finish_sorted_build`]
+    /// rewires the reserved arena into a balanced tree in one linear pass.
+    pub(crate) fn push_sorted_reserved(&mut self, key: u64, value: V) {
+        assert_eq!(self.free_len, 0, "sorted build requires a fresh arena");
+        assert_eq!(
+            self.len,
+            self.slots.len(),
+            "sorted build found vacant slots"
+        );
+        assert!(
+            self.slots.len() < self.slots.capacity(),
+            "RegionIndex sorted insertion was not prepared"
+        );
+        if let Some(last) = self.slots.len().checked_sub(1) {
+            assert!(
+                self.node(last).key < key,
+                "RegionIndex sorted build received an unordered key"
+            );
+        }
+
+        let inserted = self.slots.len();
+        self.slots.push(Slot::Occupied(Node::new(key, value)));
+        if inserted == 0 {
+            self.root = Some(inserted);
+        } else {
+            self.node_mut(inserted - 1).right = Some(inserted);
+        }
+        self.len += 1;
+    }
+
+    /// Balance a fresh index populated by [`Self::push_sorted_reserved`].
+    /// Existing values remain in their arena slots; only child links and
+    /// cached heights change.
+    pub(crate) fn finish_sorted_build(&mut self) {
+        assert_eq!(self.free_len, 0, "sorted build requires a fresh arena");
+        assert_eq!(
+            self.len,
+            self.slots.len(),
+            "sorted build found vacant slots"
+        );
+        self.root = self.build_balanced_sorted_range(0, self.slots.len()).0;
+    }
+
+    fn build_balanced_sorted_range(&mut self, lo: usize, hi: usize) -> (Link, u8) {
+        if lo == hi {
+            return (None, 0);
+        }
+        let middle = lo + (hi - lo) / 2;
+        let (left, left_height) = self.build_balanced_sorted_range(lo, middle);
+        let (right, right_height) = self.build_balanced_sorted_range(middle + 1, hi);
+        let height = 1 + left_height.max(right_height);
+        let node = self.node_mut(middle);
+        node.left = left;
+        node.right = right;
+        node.height = height;
+        (Some(middle), height)
+    }
+
     pub(crate) fn remove(&mut self, key: u64) -> Option<V> {
         let (root, removed) = self.remove_index(self.root, key);
         self.root = root;
@@ -715,6 +778,29 @@ mod tests {
         assert_eq!(map.get(20), Some(&21));
         assert_eq!(map.get(30), Some(&31));
         assert_eq!(map.get(40), Some(&40));
+        assert_invariants(&map);
+    }
+
+    #[test]
+    fn sorted_reserved_build_is_balanced_and_mutable() {
+        let mut map = RegionIndex::new();
+        map.try_reserve_nodes(63).unwrap();
+        let capacity = map.slots.capacity();
+        for key in 0..63u64 {
+            map.push_sorted_reserved(key * 4096, key);
+        }
+        // The in-flight right chain remains iterable, so a failed fork can
+        // still drop every already-published child region before finalizing.
+        assert_eq!(map.iter().count(), 63);
+        map.finish_sorted_build();
+        assert_eq!(map.slots.capacity(), capacity);
+        assert_invariants(&map);
+        for key in 0..63u64 {
+            assert_eq!(map.get(key * 4096), Some(&key));
+        }
+        assert_eq!(map.remove(31 * 4096), Some(31));
+        map.try_reserve_nodes(1).unwrap();
+        assert_eq!(map.insert_reserved(31 * 4096, 99), None);
         assert_invariants(&map);
     }
 }

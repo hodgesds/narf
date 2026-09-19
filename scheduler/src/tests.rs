@@ -1414,15 +1414,18 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
         Arc::new(unsafe { AddressSpace::new_for_user() }.expect("alloc replacement AS"));
     let old_root = old_mm.root.as_u64();
     let replacement_root = replacement.root.as_u64();
+    let replacement_weak = Arc::downgrade(&replacement);
     let replacement_for_poll = Arc::clone(&replacement);
+    let replacement_task = crate::alloc_task_id();
 
     spawn_user(
-        crate::alloc_task_id(),
+        replacement_task,
         async move {
-            // Mirror current-task replace_address_space publication followed
-            // by execve's inline activation. The local + published Arcs keep
-            // the new root owned through the transition.
-            *crate::active_user_as_slot().lock() = Some(Arc::clone(&replacement_for_poll));
+            // Exercise execve's real current-task replacement path. The task
+            // completes in this same poll, so no later dispatch exists to
+            // consume the deferred slot update.
+            let _ =
+                crate::replace_address_space(replacement_task, Arc::clone(&replacement_for_poll));
             let _ = replacement_for_poll.activate();
             // SAFETY: user futures are polled by the executor at CPL0/EL1.
             REPLACEMENT.store(
@@ -1469,6 +1472,9 @@ fn smoke_scheduler_address_space_handoff_reconciles_in_poll_replace() -> TestRes
     }
     if kernel_seen != executor_root {
         return TestResult::Fail("kernel task did not regain root after in-poll replacement");
+    }
+    if replacement_weak.upgrade().is_some() {
+        return TestResult::Fail("completed exec task retained its replacement address space");
     }
     TestResult::Pass
 }
@@ -4070,4 +4076,18 @@ fn smoke_sync_requeue_candidate_respects_affinity_and_online() -> TestResult {
 kernel_test_in!(
     "scheduler",
     smoke_sync_requeue_candidate_respects_affinity_and_online
+);
+
+fn smoke_sync_wake_affine_requires_an_empty_local_queue() -> TestResult {
+    if !crate::sync_wake_affine_has_local_capacity(false) {
+        return TestResult::Fail("sole running waker lost synchronous wake affinity");
+    }
+    if crate::sync_wake_affine_has_local_capacity(true) {
+        return TestResult::Fail("synchronous wake affinity ignored a runnable local peer");
+    }
+    TestResult::Pass
+}
+kernel_test_in!(
+    "scheduler",
+    smoke_sync_wake_affine_requires_an_empty_local_queue
 );

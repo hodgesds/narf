@@ -2107,6 +2107,7 @@ fn gen_meminfo() -> String {
     let total_kb = stats.total * 4;
     let free_kb = stats.free * 4;
     let reserved_kb = stats.reserved * 4;
+    let slab_unreclaimable_kb = narf_memory::slab::frames_held() * 4;
     let mut s = String::new();
     let _ = writeln!(s, "MemTotal:     {:>10} kB", total_kb);
     let _ = writeln!(s, "MemFree:      {:>10} kB", free_kb);
@@ -2117,6 +2118,9 @@ fn gen_meminfo() -> String {
     let _ = writeln!(s, "MemAvailable: {:>10} kB", free_kb);
     let _ = writeln!(s, "Buffers:      {:>10} kB", 0);
     let _ = writeln!(s, "Cached:       {:>10} kB", 0);
+    let _ = writeln!(s, "Slab:         {:>10} kB", slab_unreclaimable_kb);
+    let _ = writeln!(s, "SReclaimable: {:>10} kB", 0);
+    let _ = writeln!(s, "SUnreclaim:   {:>10} kB", slab_unreclaimable_kb);
     let _ = writeln!(s, "Reserved:     {:>10} kB", reserved_kb);
     s
 }
@@ -2861,6 +2865,29 @@ fn smoke_register_proc_then_read() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs", smoke_register_proc_then_read);
+
+/// Linux exposes all three slab totals in `/proc/meminfo`. Keep the fields
+/// present and internally consistent even though NARF conservatively reports
+/// all heap-owned pages as unreclaimable for now.
+fn smoke_meminfo_has_linux_slab_fields() -> TestResult {
+    let text = gen_meminfo();
+    let value = |name: &str| {
+        text.lines().find_map(|line| {
+            line.strip_prefix(name)
+                .and_then(|rest| rest.trim().strip_suffix(" kB"))
+                .and_then(|number| number.trim().parse::<usize>().ok())
+        })
+    };
+    let slab = value("Slab:");
+    let reclaimable = value("SReclaimable:");
+    let unreclaimable = value("SUnreclaim:");
+    if slab.is_some() && reclaimable == Some(0) && slab == unreclaimable {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("meminfo slab fields are missing or inconsistent")
+    }
+}
+kernel_test_in!("filesystem/procfs", smoke_meminfo_has_linux_slab_fields);
 
 /// Regression: the static cpuinfo file still resolves through the
 /// root and returns non-empty content. This verifies the refactor

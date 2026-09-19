@@ -1,4 +1,4 @@
-//! Lifetime tracking for `MAP_SHARED` file/device mappings.
+//! Lifetime and fault-source tracking for file/device mappings.
 //!
 //! Address-space regions store physical frames but intentionally do not depend
 //! on filesystem objects. Keep the backing open-file description alive here
@@ -61,6 +61,10 @@ struct MappingOwner {
     /// for multiplexed devices such as DRM, where GEM_CLOSE removes one buffer
     /// while the fd and other resources remain live.
     lifetime: Option<Arc<dyn MmapLifetime>>,
+    /// Generic `MAP_PRIVATE` file mapping. Its demand hook returns a freshly
+    /// allocated frame owned by the VMA instead of a page-cache/device frame
+    /// carrying an external mapping hold.
+    private_copy: bool,
     /// Ordinary file MAP_SHARED mappings use private physical frames as a
     /// fallback when the filesystem cannot expose cache pages directly. Keep
     /// their frame list so fsync/msync can copy dirty bytes back to FileOps.
@@ -141,6 +145,7 @@ pub(crate) struct MappingOwnerRegistration {
     pub(crate) ops: Arc<dyn FileOps>,
     pub(crate) lifetime: Option<Arc<dyn MmapLifetime>>,
     pub(crate) writeback_phys: Option<Vec<PhysAddr>>,
+    pub(crate) private_copy: bool,
     pub(crate) replace: bool,
 }
 
@@ -157,6 +162,7 @@ pub(crate) fn publish_current_mapping(
         ops,
         lifetime,
         writeback_phys,
+        private_copy,
         replace,
     } = registration;
     let owner_bucket = mapping_owners(address_space_id);
@@ -171,6 +177,7 @@ pub(crate) fn publish_current_mapping(
         file_offset,
         ops,
         lifetime,
+        private_copy,
         writeback: writeback_phys.map(|phys| FileWriteback {
             offset: file_offset,
             phys,
@@ -796,8 +803,9 @@ fn current_address_space_id() -> Option<u64> {
     crate::handlers::active_user_as().map(|address_space| address_space.identity())
 }
 
-/// Resolve a fault on a demand-paged `MAP_SHARED` mapping to the frame its
-/// backing file wants at `vaddr`.
+/// Resolve a fault on a demand-paged file mapping. Shared mappings return a
+/// retained file/cache frame; private mappings read into a newly allocated
+/// frame whose ownership transfers to the faulting address space.
 ///
 /// Installed into `narf-memory` as the `RegionPerms::FILE_DEMAND` hook (see
 /// `sys_mmap`), which is why this lives with the mapping owners rather than
@@ -814,7 +822,7 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
     let page = vaddr & !0xFFFu64;
     let address_space_id = current_address_space_id()?;
     let owner_bucket = existing_mapping_owners(address_space_id)?;
-    let (offset, ops, generic_fallback) = {
+    let (offset, ops, generic_fallback, private_copy) = {
         let owners = owner_bucket.lock();
         let owner = owners.iter().find(|mapping| {
             page >= mapping.base && page < mapping.base.saturating_add(mapping.len)
@@ -823,8 +831,14 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
             owner.file_offset.checked_add(page - owner.base)?,
             Arc::clone(&owner.ops),
             owner.writeback.is_some(),
+            owner.private_copy,
         )
     };
+    if private_copy {
+        return crate::handlers::load_file_demand_page(&ops, offset)
+            .ok()
+            .map(|phys| phys.raw());
+    }
     if !generic_fallback {
         return ops.mmap_fault(offset).ok();
     }
@@ -836,16 +850,21 @@ pub(crate) fn demand_frame(vaddr: u64) -> Option<u64> {
         return None;
     }
     let expected_generation = ops.mmap_cache_generation();
-    let (phys, publication) = if let Some((phys, publication)) =
-        reserve_cached_shared_file_pages(&ops, offset, 1)
-    {
-        (*phys.first()?, publication)
-    } else {
-        let candidates = crate::handlers::load_file_mapping_pages(&ops, offset, 4096, 1).ok()?;
-        let (phys, publication) =
-            publish_shared_file_pages(&ops, offset, candidates, expected_generation);
-        (*phys.first()?, publication)
-    };
+    let (phys, publication) =
+        if let Some((phys, publication)) = reserve_cached_shared_file_pages(&ops, offset, 1) {
+            (*phys.first()?, publication)
+        } else {
+            let candidate = crate::handlers::load_file_demand_page(&ops, offset).ok()?;
+            let mut candidates = Vec::new();
+            if candidates.try_reserve_exact(1).is_err() {
+                narf_memory::free_frame(narf_memory::PhysFrame::new(candidate));
+                return None;
+            }
+            candidates.push(candidate);
+            let (phys, publication) =
+                publish_shared_file_pages(&ops, offset, candidates, expected_generation);
+            (*phys.first()?, publication)
+        };
     if !retain_shared_file_page(phys.raw()) {
         drop(publication);
         return None;
@@ -1052,6 +1071,7 @@ fn register(
         file_offset,
         ops,
         lifetime,
+        private_copy: false,
         writeback,
     });
 }
@@ -1146,6 +1166,7 @@ fn prepare_aliases_locked(
             file_offset,
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
+            private_copy: mapping.private_copy,
             writeback,
         });
     }
@@ -1276,6 +1297,7 @@ fn prepare_relocated_owners_locked(
                 .ok_or(AddressSpaceError::OutOfRange)?,
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
+            private_copy: mapping.private_copy,
             writeback,
         });
     }
@@ -1368,6 +1390,7 @@ fn prepare_punch_suffixes_locked(
             file_offset: mapping.file_offset.saturating_add(end - mapping.base),
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
+            private_copy: mapping.private_copy,
             writeback,
         });
     }
@@ -1473,6 +1496,7 @@ fn punch_locked(owners: &mut Vec<MappingOwner>, base: u64, len: u64) {
                     file_offset: mapping.file_offset.saturating_add(end - original_base),
                     ops: Arc::clone(&mapping.ops),
                     lifetime: mapping.lifetime.clone(),
+                    private_copy: mapping.private_copy,
                     writeback: mapping.writeback.clone(),
                 };
                 if let Some(wb) = suffix.writeback.as_mut() {
@@ -1523,6 +1547,7 @@ pub(crate) fn fork_address_space(parent_id: u64, child_id: u64) {
             file_offset: mapping.file_offset,
             ops: Arc::clone(&mapping.ops),
             lifetime: mapping.lifetime.clone(),
+            private_copy: mapping.private_copy,
             writeback: mapping.writeback.clone(),
         })
         .collect();

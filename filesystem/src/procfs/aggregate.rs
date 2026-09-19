@@ -406,11 +406,16 @@ fn gen_vmstat() -> Vec<u8> {
     let _ = writeln!(s, "nr_zone_write_pending 0");
     let _ = writeln!(s, "nr_mlock 0");
     let _ = writeln!(s, "nr_bounce 0");
+    // NARF does not yet maintain Linux's reclaimable-cache classification.
+    // Conservatively classify every heap-owned frame as unreclaimable, but
+    // preserve Linux's ABI unit: both counters are base pages, not allocation
+    // objects. `large_in_use` counts objects and made one 32 KiB task stack
+    // look identical to one 8 KiB allocation.
     let _ = writeln!(s, "nr_slab_reclaimable 0");
     let _ = writeln!(
         s,
         "nr_slab_unreclaimable {}",
-        narf_memory::slab::stats().large_in_use
+        narf_memory::slab::frames_held()
     );
     let _ = writeln!(s, "nr_page_table_pages 0");
     let _ = writeln!(s, "nr_kernel_stack 0");
@@ -1239,6 +1244,29 @@ fn smoke_slabinfo_version_header() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/procfs/aggregate", smoke_slabinfo_version_header);
+
+/// Linux's nr_slab_* vmstat fields are base-page counts. Pin NARF's aggregate
+/// to the heap's frame accounting so a large allocation is not reported as one
+/// page merely because it is one allocation object.
+fn smoke_vmstat_slab_unreclaimable_uses_page_units() -> TestResult {
+    let bytes = gen_vmstat();
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return TestResult::Fail("vmstat is not valid UTF-8");
+    };
+    let reported = text.lines().find_map(|line| {
+        line.strip_prefix("nr_slab_unreclaimable ")
+            .and_then(|value| value.parse::<usize>().ok())
+    });
+    if reported == Some(narf_memory::slab::frames_held()) {
+        TestResult::Pass
+    } else {
+        TestResult::Fail("vmstat nr_slab_unreclaimable is not a base-page count")
+    }
+}
+kernel_test_in!(
+    "filesystem/procfs/aggregate",
+    smoke_vmstat_slab_unreclaimable_uses_page_units
+);
 
 /// /proc/devices: contains both Character devices + Block devices sections.
 fn smoke_devices_has_both_sections() -> TestResult {

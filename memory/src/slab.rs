@@ -590,6 +590,11 @@ struct Magazine {
     hit_count: AtomicU64,
     /// Operations that had to refill, spill, or grow from this CPU.
     miss_count: AtomicU64,
+    /// Published free-block occupancy for allocation accounting. The owning
+    /// CPU updates this with a cache-local store after changing `inner.top`;
+    /// readers may observe a transiently stale value, which is acceptable for
+    /// diagnostic and reclaim-hint snapshots.
+    available: AtomicUsize,
 }
 
 struct MagazineInner {
@@ -606,13 +611,14 @@ impl Magazine {
             }),
             hit_count: AtomicU64::new(0),
             miss_count: AtomicU64::new(0),
+            available: AtomicUsize::new(0),
         }
     }
 }
 
 // `MagazineInner` is 136 bytes on both supported 64-bit architectures. The
 // cache-line alignment already rounded the old telemetry-free Magazine to 192
-// bytes, so the two counters consume existing tail padding rather than growing
+// bytes, so the counters consume existing tail padding rather than growing
 // the static per-CPU magazine array.
 const _: () = assert!(core::mem::size_of::<Magazine>() == 192);
 
@@ -636,8 +642,10 @@ struct SizeClass {
     head: IrqSafeSpinLock<Option<NonNull<FreeBlock>>>,
     /// Total blocks ever produced by this class (alloc-backed).
     grown: AtomicUsize,
-    /// Currently-allocated block count.
-    in_use: AtomicUsize,
+    /// Free blocks on the central list. Updated only on batched slow paths;
+    /// the allocation/free hot path changes the local magazine's `available`
+    /// snapshot instead of bouncing a class-wide counter between CPUs.
+    central_free: AtomicUsize,
     /// Per-CPU magazines. Indexed by `current_cpu()`.
     magazines: [Magazine; MAX_CPUS],
 }
@@ -647,9 +655,24 @@ impl SizeClass {
         Self {
             head: IrqSafeSpinLock::new(None),
             grown: AtomicUsize::new(0),
-            in_use: AtomicUsize::new(0),
+            central_free: AtomicUsize::new(0),
             magazines: [const { Magazine::new() }; MAX_CPUS],
         }
+    }
+
+    /// Approximate current allocation count from the allocator's block
+    /// inventory. Each component is exact when quiescent; concurrent snapshots
+    /// can momentarily cross an alloc/free publication boundary, so subtraction
+    /// is deliberately saturating.
+    fn in_use(&self, grown: usize) -> usize {
+        let magazine_free = self.magazines.iter().fold(0usize, |free, mag| {
+            free.saturating_add(mag.available.load(Ordering::Relaxed))
+        });
+        grown.saturating_sub(
+            self.central_free
+                .load(Ordering::Relaxed)
+                .saturating_add(magazine_free),
+        )
     }
 
     /// Sum per-CPU telemetry modulo 2^64, preserving the old global counter's
@@ -791,8 +814,8 @@ pub unsafe fn dealloc(ptr: NonNull<u8>, layout: Layout) {
 /// with `try_dealloc_atomic` so frees in the same context don't
 /// bounce off the central lock either.
 ///
-/// O(1) hot path, no atomics beyond the per-class `in_use`
-/// counter. Spec acceptance criterion #6 targets this at < 100 ns
+/// O(1) hot path; accounting and telemetry touch only the executing CPU's
+/// cache-line-isolated magazine. Spec acceptance criterion #6 targets this at < 100 ns
 /// (success) / < 200 ns (failure) on the bring-up CPU.
 ///
 /// Allocations beyond the largest size class always return
@@ -834,7 +857,9 @@ pub fn try_alloc_atomic(layout: Layout) -> Option<NonNull<u8>> {
         let blk = mag.stack[mag.top].take().expect("magazine top non-null");
         // SAFETY: `blk` was just popped; we hold the only reference.
         unsafe { canary_on_alloc(blk, c) };
-        class.in_use.fetch_add(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .available
+            .store(mag.top, Ordering::Relaxed);
         class.magazines[cpu]
             .hit_count
             .fetch_add(1, Ordering::Relaxed);
@@ -892,7 +917,9 @@ pub unsafe fn try_dealloc_atomic(
         kasan_free(ptr, c);
         mag.stack[mag.top] = Some(blk);
         mag.top += 1;
-        class.in_use.fetch_sub(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .available
+            .store(mag.top, Ordering::Relaxed);
         class.magazines[cpu]
             .hit_count
             .fetch_add(1, Ordering::Relaxed);
@@ -940,7 +967,9 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             let blk = mag.stack[mag.top].take().expect("magazine top non-null");
             // SAFETY: `blk` was just popped; we hold the only reference.
             unsafe { canary_on_alloc(blk, c) };
-            class.in_use.fetch_add(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .available
+                .store(mag.top, Ordering::Relaxed);
             class.magazines[cpu]
                 .hit_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -990,7 +1019,10 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
                 let blk = mag.stack[mag.top].take().expect("just pushed");
                 // SAFETY: `blk` was just popped; we hold the only reference.
                 unsafe { canary_on_alloc(blk, c) };
-                class.in_use.fetch_add(1, Ordering::Relaxed);
+                class.central_free.fetch_sub(taken, Ordering::Relaxed);
+                class.magazines[cpu]
+                    .available
+                    .store(mag.top, Ordering::Relaxed);
                 return Ok(blk.cast());
             }
         }
@@ -1047,8 +1079,13 @@ fn alloc_class(c: usize) -> Result<NonNull<u8>, SlabError> {
             }
             drop(g);
         }
+        class.magazines[cpu]
+            .available
+            .store(mag.top, Ordering::Relaxed);
+        class
+            .central_free
+            .fetch_add(n_blocks - 1 - to_mag, Ordering::Relaxed);
         class.grown.fetch_add(n_blocks, Ordering::Relaxed);
-        class.in_use.fetch_add(1, Ordering::Relaxed);
         // First growth of any class arms the slab shrinker so reclaim can later
         // return these frames under pressure (allocation-free, once).
         ensure_slab_shrinker_registered();
@@ -1088,7 +1125,9 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         if mag.top < MAG_SIZE {
             mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
             mag.top += 1;
-            class.in_use.fetch_sub(1, Ordering::Relaxed);
+            class.magazines[cpu]
+                .available
+                .store(mag.top, Ordering::Relaxed);
             class.magazines[cpu]
                 .hit_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -1126,7 +1165,10 @@ unsafe fn dealloc_class(c: usize, ptr: NonNull<u8>) {
         mag.top = MAG_SIZE - flush;
         mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
         mag.top += 1;
-        class.in_use.fetch_sub(1, Ordering::Relaxed);
+        class.magazines[cpu]
+            .available
+            .store(mag.top, Ordering::Relaxed);
+        class.central_free.fetch_add(flush, Ordering::Relaxed);
     });
 }
 
@@ -1270,10 +1312,11 @@ pub fn stats() -> SlabStats {
     }; N_CLASSES];
     for (i, c) in CLASSES.iter().enumerate() {
         let (mag_hit_count, mag_miss_count) = c.magazine_counts();
+        let grown = c.grown.load(Ordering::Relaxed);
         classes[i] = ClassStats {
             block_size: class_size(i),
-            grown: c.grown.load(Ordering::Relaxed),
-            in_use: c.in_use.load(Ordering::Relaxed),
+            grown,
+            in_use: c.in_use(grown),
             mag_hit_count,
             mag_miss_count,
         };
@@ -1384,7 +1427,7 @@ fn slab_reclaimable_count() -> usize {
     let mut n = 0usize;
     for (class_index, class) in CLASSES.iter().enumerate() {
         let grown = class.grown.load(Ordering::Relaxed);
-        let in_use = class.in_use.load(Ordering::Relaxed);
+        let in_use = class.in_use(grown);
         let blocks_per_frame = PAGE_SIZE_USIZE / class_size(class_index);
         n = n.saturating_add(grown.saturating_sub(in_use) / blocks_per_frame);
     }
@@ -1528,6 +1571,9 @@ unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) 
         cur = run_end;
     }
     *g = kept_head;
+    class
+        .central_free
+        .fetch_sub(detached_pages * n_blocks, Ordering::Relaxed);
     class
         .grown
         .fetch_sub(detached_pages * n_blocks, Ordering::Relaxed);
@@ -1753,9 +1799,9 @@ pub unsafe fn _test_magazine_push(class_idx: usize, cpu: usize, ptr: NonNull<u8>
     unsafe { canary_on_free(ptr.cast::<FreeBlock>(), class_idx, true) };
     mag.stack[mag.top] = Some(ptr.cast::<FreeBlock>());
     mag.top += 1;
-    // Mirror the accounting that `dealloc_class` would have done
-    // if this push had come through the public path.
-    CLASSES[class_idx].in_use.fetch_sub(1, Ordering::Relaxed);
+    CLASSES[class_idx].magazines[cpu]
+        .available
+        .store(mag.top, Ordering::Relaxed);
 }
 
 /// Test: per-CPU isolation. After parking a freed block in CPU 1's
@@ -1823,15 +1869,17 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
     }
     // Manually pop the planted block from CPU 1's slot and re-park
     // it on the central free list. The `_test_magazine_push` helper
-    // already decremented in_use, so the block is in "free,
-    // available" accounting state — just move it from CPU 1's
-    // magazine to central.
+    // already published the block as magazine-free, so just move its
+    // accounting and ownership from CPU 1's magazine to central.
     // SAFETY: single-threaded test harness; CPU 1 is quiesced.
     let class = &CLASSES[class_idx];
     // SAFETY: the pointer is non-null, aligned, and points to a live value for this access.
     let mag = unsafe { &mut *class.magazines[1].inner.get() };
     mag.top -= 1;
     let blk = mag.stack[mag.top].take().expect("planted block present");
+    class.magazines[1]
+        .available
+        .store(mag.top, Ordering::Relaxed);
     let mut g = class.head.lock();
     // SAFETY: `blk` came from this slab's class; we own its bytes
     // until pushed onto the central list.
@@ -1842,6 +1890,7 @@ fn smoke_slab_magazine_per_cpu_isolation() -> narf_kernel_test::TestResult {
             .write(FreeBlock { next: *g })
     };
     *g = Some(blk);
+    class.central_free.fetch_add(1, Ordering::Relaxed);
     drop(g);
     TestResult::Pass
 }

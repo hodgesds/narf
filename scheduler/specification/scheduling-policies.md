@@ -75,13 +75,19 @@ policies are never bypassed: their wakees return through `pick_next` so policy
 observation and ordering remain complete.
 
 For an exact synchronous wake of a sleeping direct-eligible partner on another
-CPU, the core may instead request that the running direct-eligible waker join
-the wakee's authoritative home after the waker returns to the executor. This
-one-shot `WF_SYNC`-shaped placement hint is mechanism, not a policy decision:
-live hard affinity and CPU lifecycle state are revalidated at that normal
-requeue boundary, and migration uses the same core-owned enqueue path as every
-other allowed move. The wake path never moves a running task or bypasses
-`pick_next` on the destination CPU.
+CPU, the core may make a non-blocking attempt to move the queued wakee to the
+waker's CPU when both source and destination use the built-in class/FIFO
+policies and the destination has no other runnable peer. This is the Linux
+`wake_affine_idle(..., sync)` `rq->nr_running == 1` direction (NARF's running
+waker is temporarily off-queue): the sleeping
+slot moves, never the currently executing continuation. Failure may instead
+request that the running direct-eligible waker join the wakee's authoritative
+home after the waker returns to the executor. Both `WF_SYNC`-shaped placement
+paths revalidate live hard affinity and CPU lifecycle state and use the same
+core-owned migration enqueue as every other allowed move; the destination
+still dispatches through `pick_next`. The exact wake also suppresses the
+generic idle-sibling pull hint, which would let a thief split the pair that
+co-location and the urgent buddy are establishing.
 
 ### `wakeup_preempt` — defaulted, opt-in
 Returns `true` iff the running task should cede at its next cooperative

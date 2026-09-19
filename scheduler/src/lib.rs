@@ -860,6 +860,118 @@ pub(crate) fn direct_handoff_is_local(home: usize, destination: usize) -> bool {
     home == destination
 }
 
+/// Best-effort Linux `WF_SYNC` wake affinity for an exact sleeping partner.
+///
+/// The wakee is a queued slot, so unlike the running waker it can safely move
+/// at wake time. Cross-CPU locks are non-blocking: if the source policy or run
+/// queue is busy, ownership stays unchanged and the later waker-requeue hint
+/// remains the fallback. A successful move still uses the ordinary migration
+/// enqueue path, including policy events and affinity/lifecycle validation.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn try_sync_wake_affine(home: u32, cell: *const WakeCell) -> Option<u32> {
+    let source = home as usize;
+    let current = narf_lib::percpu::current_cpu();
+    if cell.is_null()
+        || source >= READY.len()
+        || current >= READY.len()
+        || source == current
+        || !narf_lib::smp::is_online(current as u32)
+        || !matches!(
+            policy::cpu_state(CpuId(current as u32)),
+            CpuState::Active | CpuState::Idle
+        )
+        // Linux's wake_affine_idle(sync) selects the waking CPU only when
+        // rq->nr_running == 1 (the running waker itself). NARF removes that
+        // task from READY while it executes, so a published runnable peer is
+        // the equivalent overloaded destination. Decline before taking the
+        // remote queue locks: a batch of synchronous wakes must not migrate
+        // every sleeping endpoint onto one writer CPU.
+        || !sync_wake_affine_has_local_capacity(
+            RUNNABLE_STATE[current].peer.load(Ordering::Acquire),
+        )
+        || !policy::direct_handoff_allowed(CpuId(current as u32))
+    {
+        return None;
+    }
+
+    let slot = policy::try_with_scheduler(CpuId(home), |scheduler| {
+        if !policy::policy_allows_direct_handoff(scheduler) {
+            return None;
+        }
+        let mut ready = READY[source].try_lock()?;
+        let queue = ready.as_mut()?;
+        let position = queue.iter().position(|slot| {
+            core::ptr::eq(Arc::as_ptr(&slot.awake), cell)
+                && direct_handoff_slot_eligible(slot, CpuId(current as u32))
+        })?;
+        let slot = queue.remove(position)?;
+        if let Some(scheduler) = scheduler.filter(|policy| policy::observes_queue_events(*policy)) {
+            scheduler.on_task_queue_event(
+                CpuId(home),
+                policy::TaskQueueEvent::Dequeued {
+                    task: policy::TaskMeta::from_slot(&slot),
+                    reason: policy::TaskDequeueReason::Migrated,
+                },
+            );
+        }
+        Some(slot)
+    })??;
+
+    enqueue_on(current, slot, policy::TaskEnqueueReason::Migrated);
+    Some(current as u32)
+}
+
+#[inline]
+fn sync_wake_affine_has_local_capacity(runnable_peer: bool) -> bool {
+    !runnable_peer
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn claim_direct_handoff_slot(cpu: usize, slot: &TaskSlot) -> Option<DirectHandoffTarget> {
+    if !slot.awake.direct_eligible.load(Ordering::Acquire)
+        || !direct_handoff_slot_eligible(slot, CpuId(cpu as u32))
+    {
+        return None;
+    }
+    let task = slot.awake.stackful.load(Ordering::Acquire);
+    if task.is_null() {
+        return None;
+    }
+    // The home queue lock excludes every executor removal/steal of this slot.
+    // Publish the claim before consuming the wake bit so all later scans skip
+    // it even if another wake races the direct continuation.
+    slot.awake.direct_claimed.store(true, Ordering::Release);
+    slot.awake.flag.store(false, Ordering::Release);
+    publish_current_sched(cpu, slot);
+    Some(DirectHandoffTarget {
+        task,
+        id: slot.awake.task,
+        cell: slot.awake.clone(),
+        addr_space: slot.addr_space.clone(),
+    })
+}
+
+/// Select and claim the first eligible local `sched_yield` peer under one
+/// authoritative run-queue lock. Exact synchronous-wake publications are
+/// consumed before this fallback is attempted.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub(crate) fn claim_direct_yield_target(cpu: usize, current: u64) -> Option<DirectHandoffTarget> {
+    if cpu >= READY.len()
+        || current == TaskId::NONE.raw()
+        || !policy::direct_handoff_allowed(CpuId(cpu as u32))
+    {
+        return None;
+    }
+    let mut ready = READY[cpu].lock();
+    let queue = ready.as_mut()?;
+    let slot = queue.iter().find(|slot| {
+        slot.awake.task != current
+            && slot.awake.direct_eligible.load(Ordering::Acquire)
+            && direct_handoff_slot_eligible(slot, CpuId(cpu as u32))
+    })?;
+    claim_direct_handoff_slot(cpu, slot)
+}
+
 /// Claim one exact urgent wakee for direct execution on `cpu`.
 ///
 /// The target must already reside on `cpu` and remains in that queue under an
@@ -887,25 +999,7 @@ pub(crate) fn claim_direct_handoff_target(
     let mut ready = READY[cpu].lock();
     let queue = ready.as_mut()?;
     let slot = queue.iter().find(|slot| Arc::ptr_eq(&slot.awake, cell))?;
-    if !direct_handoff_slot_eligible(slot, CpuId(cpu as u32)) {
-        return None;
-    }
-    let task = cell.stackful.load(Ordering::Acquire);
-    if task.is_null() {
-        return None;
-    }
-    // The home queue lock excludes every executor removal/steal of this slot.
-    // Publish the claim before consuming the wake bit so all later scans skip
-    // it even if another wake races the direct continuation.
-    cell.direct_claimed.store(true, Ordering::Release);
-    cell.flag.store(false, Ordering::Release);
-    publish_current_sched(cpu, slot);
-    Some(DirectHandoffTarget {
-        task,
-        id: cell.task,
-        cell: cell.clone(),
-        addr_space: slot.addr_space.clone(),
-    })
+    claim_direct_handoff_slot(cpu, slot)
 }
 
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -2016,6 +2110,13 @@ pub fn __reset_queues_for_test() {
         inbox.lock().clear();
         WAKE_INBOX_LEN[cpu].store(0, Ordering::Release);
     }
+    // A task can queue an in-poll exec replacement and then remain pending.
+    // Tests that discard its slot must also discard that deferred owner or the
+    // replacement address space leaks into the next test.
+    for (shard, pending) in PENDING_SLOT_AS.iter().enumerate() {
+        pending.lock().clear();
+        PENDING_SLOT_AS_LEN[shard].store(0, Ordering::Release);
+    }
     // Reset the per-CPU virtual-time floors too. `bump_vfloor` advances them
     // monotonically at every dispatch, so without this they accumulate across
     // the whole suite — and since a newly admitted task is initialised to the
@@ -2076,6 +2177,63 @@ fn unregister_task_affinity(id: TaskId) {
 /// Snapshot the online CPU set used by Linux affinity syscalls and cgroups.
 pub fn online_cpu_set() -> CpuSet {
     CpuSet::from_bits(narf_lib::smp::online_bitmap())
+}
+
+/// Select a CPU for a newly forked task using a non-blocking snapshot of each
+/// allowed online run queue. This mirrors Linux's `WF_FORK` load placement:
+/// use an idle/less-loaded CPU when one is available, with `preferred` as the
+/// tie-breaker. Callers rotate that preference across siblings so a burst of
+/// children that park during setup does not collapse onto the first idle CPU.
+///
+/// The result is only a soft initial-placement hint. Queue state can change as
+/// soon as it is observed, and normal affinity validation, stealing, and CPU
+/// lifecycle checks remain authoritative when the task is admitted.
+pub fn select_fork_cpu(allowed: CpuSet, preferred: CpuId) -> Option<CpuId> {
+    let mut candidates = allowed.intersection(online_cpu_set()).bits();
+    let mut best: Option<(CpuId, usize)> = None;
+    let mut preferred_load = None;
+    while candidates != 0 {
+        let cpu = candidates.trailing_zeros() as usize;
+        candidates &= candidates - 1;
+
+        // A contended queue is conservatively busy for this best-effort
+        // placement snapshot. The inbox is disjoint from READY until its owner
+        // drains it, and CURRENT_TASK accounts for the slot removed while it
+        // is executing, matching Linux rq->nr_running's three constituents.
+        let queued = READY[cpu]
+            .try_lock()
+            .and_then(|ready| {
+                ready.as_ref().map(|queue| {
+                    queue
+                        .iter()
+                        .filter(|slot| slot.awake.executor_runnable())
+                        .count()
+                })
+            })
+            .unwrap_or(usize::MAX / 4);
+        let load = queued
+            .saturating_add(WAKE_INBOX_LEN[cpu].load(Ordering::Acquire))
+            .saturating_add(usize::from(cpu_running_task(CpuId(cpu as u32))));
+        let candidate = CpuId(cpu as u32);
+        if candidate == preferred {
+            preferred_load = Some(load);
+        }
+        let replace = best.is_none_or(|(_, selected_load)| load < selected_load);
+        if replace {
+            best = Some((candidate, load));
+        }
+    }
+    let (best_cpu, best_load) = best?;
+    // A rapid fork burst commonly has one extra runnable task on the parent's
+    // CPU: the parent doing the forking. Preserve the sibling rotation across
+    // that one-task difference so children which immediately park at a setup
+    // barrier do not all reuse the same apparently-idle queue. A genuinely
+    // busier preferred CPU still loses to the least-loaded queue.
+    if preferred_load.is_some_and(|load| load <= best_load.saturating_add(1)) {
+        Some(preferred)
+    } else {
+        Some(best_cpu)
+    }
 }
 
 /// Return a live task's hard affinity mask.
@@ -3022,6 +3180,10 @@ pub fn set_slot_reap_hook(f: fn(TaskId)) {
 }
 
 fn notify_slot_reaped(id: TaskId) {
+    // An exec replacement queued during the task's final poll is normally
+    // consumed on the next dispatch. An abnormal reap has no next dispatch,
+    // so release that duplicate address-space owner before userspace teardown.
+    let _ = take_pending_slot_as(id);
     let p = SLOT_REAP_HOOK.load(Ordering::Acquire);
     if p != 0 {
         // SAFETY: `p` was stored by `set_slot_reap_hook` from a real
@@ -3091,6 +3253,15 @@ where
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let direct_eligible = false;
     let awake = new_wake_cell(id, 0, direct_eligible);
+    // Preserve the load-aware admission decision through the child's first
+    // dispatch. Without this short locality window, an idle CPU can steal a
+    // freshly admitted remote child while the forking parent is still filling
+    // the other CPUs, then receive its own child and create a lasting
+    // collision. Later dispatches refresh this same Linux `se.exec_start`-
+    // shaped timestamp normally.
+    awake
+        .last_run_cycles
+        .store(narf_time::now_cycles(), Ordering::Release);
     let slot = TaskSlot {
         task,
         awake,
@@ -3655,30 +3826,39 @@ unsafe fn wake_by_ref_impl(data: *const (), urgent_task: Option<u64>) {
         unsafe { wake_race_stamp(&*ptr, home) };
         note_runnable_peer(home, task);
     }
+    let mut dispatch_home = home;
     if urgent_task == Some(task) {
         // A provider dequeued this exact exclusive waiter. Unlike the generic
         // opt-in wake-next policy, publish the one-shot hint unconditionally
         // on the wakee's authoritative home. Direct handoff is deliberately
-        // local; remote wakees proceed through normal executor dispatch.
-        hint_urgent_next_on(home, task, ptr);
+        // local; a queued remote wakee first gets a non-blocking Linux
+        // WF_SYNC-shaped move to the waker's CPU, then proceeds through normal
+        // executor dispatch there.
         if !prev_awake {
-            // If the exact synchronous partner is remote, request that the
-            // running waker join it at the waker's next normal requeue. This
-            // uses ordinary migration rather than the reverted cross-CPU raw
-            // continuation transfer; after one rendezvous, subsequent wakes
-            // can use the existing local direct path.
             // SAFETY: the caller's live Waker pins `ptr` through this call.
             let target_direct = unsafe { (*ptr).direct_eligible.load(Ordering::Acquire) };
             if target_direct {
-                stackful::request_current_sync_requeue(home);
+                if let Some(local) = try_sync_wake_affine(home, ptr) {
+                    dispatch_home = local;
+                } else {
+                    // The target was already running/staged or its remote
+                    // queue was contended. Ask the running waker to join its
+                    // observed home at the next normal executor boundary.
+                    stackful::request_current_sync_requeue(home);
+                }
             }
         }
+        hint_urgent_next_on(dispatch_home, task, ptr);
     } else {
         // Name this task its home CPU's next-buddy (Linux `set_next_buddy`).
         record_wake_next(home, task);
+        // Generic wakes may ask an idle sibling to pull work from a busy home.
+        // An exact synchronous wake deliberately does not: its urgent buddy
+        // and one-shot co-location path are trying to establish a stable local
+        // pair, while an idle-sibling pull would immediately split it again.
+        wake_place_hint(dispatch_home);
     }
-    resched_remote(home);
-    wake_place_hint(home);
+    resched_remote(dispatch_home);
 }
 
 unsafe fn wake_by_ref_raw(data: *const ()) {
@@ -4490,7 +4670,13 @@ pub fn run_until_empty() {
             }
 
             match poll_result {
-                Poll::Ready(()) => { /* completed — drop slot */ }
+                Poll::Ready(()) => {
+                    // `replace_address_space` records a duplicate owner so a
+                    // pending task can update its slot on the next dispatch.
+                    // A task that exits from the same poll has no next
+                    // dispatch; retire the deferred owner with the slot.
+                    let _ = take_pending_slot_as(slot.id);
+                }
                 Poll::Pending => {
                     // Stage-5 fair-share enforcement (§3.4): act on
                     // the `BudgetAccount::charge` outcome before
@@ -4997,9 +5183,8 @@ pub fn has_other_runnable_work(current: u64) -> bool {
 pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
     debug_assert!(cpu < CURRENT_SCHED.len(), "CPU id out of scheduler range");
     let cpu = if cpu < CURRENT_SCHED.len() { cpu } else { 0 };
-    if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) == current
-        && RUNNABLE_STATE[cpu].peer.load(Ordering::Acquire)
-    {
+    let published = CURRENT_SCHED[cpu].id.load(Ordering::Acquire);
+    if published == current && RUNNABLE_STATE[cpu].peer.load(Ordering::Acquire) {
         return true;
     }
     // A device/IRQ completion is waiting to wake some task.
@@ -5020,7 +5205,7 @@ pub(crate) fn has_other_runnable_work_on(cpu: usize, current: u64) -> bool {
     // selecting `current`; every later false->true wake/enqueue raises the
     // same hint. A mismatched dispatch identity is conservatively treated as
     // runnable work while the executor is between selections.
-    if CURRENT_SCHED[cpu].id.load(Ordering::Acquire) != current {
+    if published != current {
         return true;
     }
     false

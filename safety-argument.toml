@@ -196,6 +196,10 @@ ref = "security-model/specification/spec.md#L39"
 argument = "Two-CPU user-task placement changes only the preferred initial run queue within the existing CpuSet::ALL allowed mask. It does not expand the TCB, alter a task's domain, capability, address space, or saved security state, and larger topologies retain the existing AP-only policy."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Slab allocation accounting reconstructs diagnostic in-use state from total owned blocks minus central and per-CPU magazine free inventories, removing only a contended shared hot-path counter. Frame reclaim still requires a complete frame's blocks to be found and detached under the central-list lock before ownership returns to the buddy; approximate concurrent snapshots remain hints and cannot authorize detachment."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
 argument = "The placement helper selects only already-online scheduler CPUs and enqueue_on continues to enforce the existing task metadata and domain restore path before polling. Alternating BSP/AP grants no memory or capability authority and never schedules outside Affinity.allowed."
 
@@ -813,6 +817,10 @@ ref = "security-model/specification/spec.md#L75"
 argument = "The scheduler-owned sched_yield helper resolves the current own-stack task once, keeps Linux's zero-return and sole-runnable no-op behavior, re-arms the same executor waker before switching, and delegates every actual selection to the unchanged run queue, affinity, budget, capability, and domain-restoration paths. After an actual yield resumes, that task has just been selected for a fresh slice; when the switch is elided, the same conservative probe just observed no dispatchable peer, deferred wake, due timer, or staged cross-CPU wake. Suppressing only sched_yield's immediately following generic syscall-exit expiry probe therefore defers no work known at that scheduling point; later wakes retain the normal wake-preemption and tick paths, while pending-signal delivery still runs at the common return-to-user boundary."
 
 [[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "A sched_yield direct transfer selects and claims only an already-runnable same-CPU slot that passes the existing direct-handoff class, priority, affinity, budget, and policy predicate. The combined operation holds the authoritative run-queue lock once, so the Arc-owned WakeCell, stackful pointer, address-space owner, and runnable state are one consistent slot snapshot. An exact synchronous-wake publication already present is consumed first; one racing after peer selection remains in the per-CPU one-shot slot for the direct target's return boundary or ordinary executor fallback. Every failed selection or claim falls back to normal executor selection. The existing fixed-root return rule, 64-return bound, address-space ownership transfer, TLS/domain/FPU restore sequence, PMU hooks, task lifetime claim, and post-resume CPU rediscovery are unchanged."
+
+[[invariants_preserved]]
 ref = "security-model/specification/spec.md#L39"
 argument = "Moving the active inner-poll Waker from an abandoned Rust stack local into KernelTask-owned storage stays wholly inside the existing scheduler executor TCB. Direct exit publishes completion and switches to the executor before the owner is destroyed; normal return and KernelTask drop provide the other exactly-once retirement paths. No trusted subsystem, context-switch entry point, capability, domain identifier, mapping authority, or task-selection rule is added."
 
@@ -1026,6 +1034,14 @@ argument = "The chain remains limited to one fixed off-queue root and one locall
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
+argument = "A direct target may return without a redundant urgent-root publication only to the exact root pointer already pinned by the active handoff, and only after atomically consuming that root's own runnable WakeCell flag. A present urgent publication must identify the same WakeCell; any third-task publication is restored to its authoritative ordinary wake path and the direct return declines. The optimization therefore adds no task-selection destination and cannot revive a parked root from the pinned continuation alone."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The runnable-root return uses the existing finish_direct_handoff path, which restores the root address-space owner, kernel-stack target, TLS, domain state, FP/SIMD image, PMU attribution, and task identity before the root resumes. It advances the same fixed-root return counter, so the 65th yield still crosses the executor for fairness and RCU quiescence."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
 argument = "The anonymous-reclaim cursor is an address-space-local virtual-address policy hint protected by the existing authoritative region lock. It neither names nor owns a frame, and every emitted run retains the existing private-anonymous eligibility, present-leaf ageing, swap-slot exclusion, bounded-capacity, and executor-side ownership revalidation. A VMA mutation may leave the cursor in a hole, but the ordered scan seeks forward and wraps without treating the cursor as mapping authority. Frame ownership, page permissions, reverse maps, TLB-before-reuse ordering, allocator admission, domain assignment, and capability authority are unchanged."
 
 [[invariants_preserved]]
@@ -1074,8 +1090,80 @@ argument = "Synchronous-wake co-location remains entirely inside the existing sc
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L42"
-argument = "An exact wake may publish only the wakee's observed authoritative home into the running waker's one-shot hint. The wake path never moves the executing continuation. After poll return, while the executor owns the off-queue slot, consumption revalidates the task's live hard-affinity mask, online topology, and CPU lifecycle and then uses the existing enqueue_on migration path. That path retains the task's WakeCell, address-space owner, kernel stack, TLS, saved domain state, and FP/SIMD image until ordinary dispatch restores them on the destination CPU. Invalid, same-CPU, and concurrently replaced hints fall back conservatively; if the wakee moved after publication, the stale hint can cause only an ordinary migration to a CPU still allowed and online for the waker."
+argument = "An exact wake first attempts Linux-shaped wake affinity only for a sleeping slot still resident in its authoritative source queue and only while the destination publishes no other runnable peer, matching Linux wake_affine_idle(sync)'s rq->nr_running == 1 test after accounting for NARF's off-queue running waker. The source policy and queue locks are non-blocking, the source and destination policies must be built-in direct-handoff policies, and the existing direct eligibility check revalidates default class, priority, budget, donation, destination affinity, and runnable state under the source queue lock. Removal emits the ordinary migrated dequeue event and enqueue_on performs the ordinary destination publication, virtual-runtime normalization, and enqueue event. If load, contention, or ownership prevents that proof, the slot stays untouched and the existing one-shot waker hint remains the fallback. Neither path moves the executing continuation. The migration path retains the task's WakeCell, address-space owner, kernel stack, TLS, saved domain state, and FP/SIMD image until ordinary dispatch restores them on the destination CPU."
 
 [[invariants_preserved]]
 ref = "security-model/specification/spec.md#L75"
-argument = "Only a sleeping direct-eligible exact wakee may request co-location, and only a currently published direct-eligible waker records it. The destination executor still performs ordinary policy selection, class and budget eligibility checks, task-lifetime validation, address-space activation, domain restore, and FPU/SIMD restore before polling. Once co-located, the existing fixed-pair 64-return direct-handoff bound remains the fairness and RCU-quiescence limit; the hint neither extends a batch nor creates a target-to-third-task edge."
+argument = "Only a sleeping direct-eligible exact wakee may move toward its currently running direct-eligible waker, and destination load, contention, or any failed eligibility proof preserves the authoritative source queue. The local runnable-peer guard is conservative: every false-to-true enqueue or wake publishes true, so a stale value can only decline co-location, while the authoritative source lock still revalidates a move that proceeds. This prevents a batch of synchronous wakes from collapsing otherwise distributed wakees onto one CPU. Exact synchronous wakes do not publish the independent generic idle-sibling pull hint, so an idle thief cannot immediately split a proved one-to-one pair; ordinary wakes retain that placement policy unchanged. The destination executor still performs ordinary policy selection, class and budget eligibility checks, task-lifetime validation, address-space activation, domain restore, and FPU/SIMD restore before polling. Once co-located, the existing fixed-pair 64-return direct-handoff bound remains the fairness and RCU-quiescence limit; migration neither extends a batch nor creates a target-to-third-task edge."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The direct-handoff wake-cell fast pointer is a borrow-only mirror of the Arc owned by the same KernelTask: bind stores the Arc before release-publishing the pointer, unbind clears the pointer before current-task slots are withdrawn, and the Arc is not dropped until the KernelTask's existing RCU-deferred destruction. Direct readers already hold a live current or handoff-pinned KernelTask reference, so replacing three lock-and-Arc-clone pairs cannot outlive or transfer ownership of the wake cell. Queue claims, address-space ownership, domain restore, TLS, and FPU/SIMD ordering are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The displaced root address-space Arc is moved into and out of a cache-line-isolated per-CPU cell only by that CPU while interrupts are masked; the test-only reset touches it only after executor quiescence. No reference into the cell escapes either operation. The authoritative ACTIVE_USER_AS slot remains IRQ-safe locked across activation and ownership exchange, and the target/root hardware transitions retain the outgoing strong owner exactly as before. Removing the nested lock around the private displaced-owner cell therefore cannot expose, free, or concurrently replace a live page-table root."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Fork placement remains inside the existing scheduler executor TCB and changes only the soft initial CPU hint supplied for a new process child. It adds no trusted subsystem, capability, mapping authority, domain transition, user pointer, or context-switch destination."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "The fork selector observes only scheduler-owned allowed/online masks, queue occupancy, staged-wake counts, current-task presence, and a per-parent rotating tie-break through existing locks and atomic publications. A contended queue is treated conservatively as busy. The selected CPU remains subject to ordinary enqueue affinity and lifecycle validation, and dispatch still restores the child's address space, TLS, domain state, and FP/SIMD image before its first instruction. First admission initializes the same scheduler-owned last-run timestamp used by the Linux-shaped 500 us cache-hot test, preventing an idle steal from immediately undoing that validated placement. The timestamp grants no affinity or lifecycle exception and is refreshed by ordinary dispatch thereafter."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "The sorted fork-index builder is private to the existing memory TCB and changes only construction of a fresh child address space's already-reserved VMA metadata. It adds no public authority, capability, domain identifier, mapping permission, page-table operation, or trusted subsystem."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Normal fork publishes the parent's already-ordered VMA values into a fresh reserved arena as an ordered right-linked owned prefix, then rewires only arena links and cached heights into a balanced tree. Each Region value and backing vector remains in its original slot and retains exactly the same COW or shared-frame ownership. Every fallible exit finalizes the published prefix before AddressSpace teardown, so Drop can find and release each transferred owner; the current region's unpublished retains are rolled back separately, and the granular failure-injection path retains ordinary AVL insertion. Parent COW retain/write-protect ordering, child permissions, translation invalidation, and Linux ENOMEM propagation are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The frame-allocator fast path changes only how the already-installed shipped buddy trait object is selected. The authoritative cap-gated fat-pointer slot remains locked for installation and every custom implementation. A custom install publishes the locked-fallback discriminator before pointer replacement, while a buddy install publishes the lock-free static identity only after authoritative replacement; readers therefore select either the prior buddy or the fully-published new allocator. The existing requirement that replacement be quiescent with respect to outstanding frame ownership is unchanged. Buddy allocation, per-CPU cache ownership, NUMA routing, COW last-owner checks, watermark admission, domain assignment, and frame return remain identical after dispatch."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Fresh x86 user page-table frames still initialize every architecturally reachable entry before the root is published: the private PML4 half and PDPT[0] are explicitly zero, while every skipped byte belongs to entries immediately overwritten from the existing kernel tables through the same aligned volatile per-entry reads and writes. Root ownership registration, private user subtrees, shared kernel mappings, permissions, and teardown-before-frame-reuse ordering are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Fork now reads the live x86 user FS base through the same architecture helper already used by scheduler switch-out. Its per-CPU CR4 gate selects fenced RDFSBASE only where FSGSBASE is enabled and retains the architectural RDMSR fallback everywhere else. The value remains copied into the child's private task state and is restored by the existing user-entry path; no kernel GS base, domain state, mapping authority, or capability is exposed or changed."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L39"
+argument = "Private file demand paging and masked-exception parking remain inside the existing memory and scheduler executor TCB. They add no trusted subsystem, capability, mapping authority, domain identifier, or task-selection exception; the scheduler state records only how the already-owned continuation's hardware IRQ mask must be restored."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "An unlocked generic MAP_PRIVATE file VMA publishes its file owner and FILE_DEMAND metadata atomically under the existing owner and VMA transactions. Each page fault reserves an exact page ticket and Region prefix before dropping locks for filesystem I/O, allocates and zero-fills a fresh private frame, and publishes it only after revalidating the live ticket. Cancellation or page-table installation failure returns that frame directly to the allocator; normal unmap and fork use the existing private/COW lifetime rules. The private path never enters the shared cache, never invokes an external release for an allocator-owned frame, and never writes through to the backing file. A page wholly beyond EOF fails closed. Permissions, domain rights, and capability authority are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "A task that parks while an interrupt-gate continuation has hardware IRQs masked publishes both a task-owned resume marker and a receiving-CPU executor-return marker before switching. It is ineligible for direct task-to-task transfer, so no unrelated wakee inherits the trap's mask. Only after the continuation and its task state are suspended does the executor unmask completion IRQs; before switching back to that exact task it masks them again, and the resumed task clears its marker before returning through the architecture trap epilogue. Address-space, TLS, domain, affinity, and FPU/SIMD save/restore ordering remain on the existing context-switch path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Cache-line isolation changes only the stride between never-freed boot-managed COW refcount slots. The same PFN bounds check selects the same authoritative slot, and its unchanged AtomicU64 retains the count/epoch encoding, compare-exchange ordering, implicit sole-owner state, speculative rollback, and final-owner decision. Initialization still zeroes every byte before release-publishing the table and migrates preexisting sharded rows before user tasks exist; hotplug and failed initialization retain the existing sharded fallback. No frame becomes reusable before its last owner and translation retire, and no mapping permission, domain right, or capability authority changes."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Direct compaction now rejects IRQ-masked callers before publishing an attempt or inspecting reverse maps. This prevents an allocation made under an IRQ-safe reverse-map or allocator-adjacent lock from synchronously re-entering migration and reacquiring that lock. Eligible process-context compaction retains the same bounded scan, single-owner validation, page-table rewrite, translation invalidation, rmap move, contents copy, and source-frame release ordering; atomic callers retain ownership of every existing mapping and use their prior fallback or allocation-failure path."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "Successful x86 exec overwrites the current task's aligned, task-owned XSAVE image with architectural initial x87/SSE/extended state before abandoning the old continuation, marks memory authoritative, and keeps CR0.TS armed so only that reset image can become live through the existing current-task #NM path. Every prior live image was already saved at syscall entry, the replacement does not alter another task's state, and signal, migration, domain, address-space, TLS, capability, and scheduling ownership remain on their existing paths."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L42"
+argument = "A poll-time exec replacement remains strongly owned by the active address-space handoff and the task slot while hardware can reference its page tables. The extra deferred slot owner is consumed by the next dispatch only for a pending task; normal completion and every abnormal reap now remove it before the slot is destroyed, and the test-only reset does the same after executor quiescence. Dropping this duplicate owner cannot retire a live root because the reconciled slot owner survives until hardware has returned to another strongly owned root, while a task with no future dispatch can no longer retain page tables indefinitely. Mapping authority, permissions, domains, capabilities, and task selection are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "Reverse-map contraction changes only empty-key cache capacity and the allocation backing a shard's existing open-addressed index. Every live or reserved OwnerList is moved into the replacement table while the authoritative shard lock is held; rehash preserves physical-frame keys and mapping owners, clears only tombstones, and publishes no intermediate table. Shrinking is fallible and leaves the original valid table untouched on allocation failure, so unmap cannot fail or lose authority under pressure. Frame reuse, page-table replacement, cross-CPU TLB invalidation, COW ownership, mapping permissions, domain rights, and capability checks are unchanged."
+
+[[invariants_preserved]]
+ref = "security-model/specification/spec.md#L75"
+argument = "The direct-compaction edit is verification-only: its positive-path smoke temporarily enables interrupts only after proving the incoming test context held no IRQ-safe lock, invokes the unchanged sleepable compaction path, and restores the exact incoming interrupt state before any assertion or return. Production migration, reverse-map ownership, page-table rewrite, TLB invalidation, and source-frame release code is unchanged."
