@@ -7,7 +7,7 @@
 //!   /proc/diskstats     — per-block-device I/O counters
 //!   /proc/interrupts    — per-IRQ per-CPU fire counts
 //!   /proc/softirqs      — per-softirq-type per-CPU counters (stub)
-//!   /proc/swaps         — swap area list (header only — NARF has no swap)
+//!   /proc/swaps         — swap area list (header only — no area is enabled)
 //!   /proc/modules       — loadable kernel modules (deferred: LKM agent)
 //!   /proc/iomem         — physical memory layout (deferred: MM wiring)
 //!   /proc/ioports       — I/O port allocations (deferred: IO crate)
@@ -247,8 +247,22 @@ fn gen_softirqs() -> Vec<u8> {
 // ── /proc/swaps ──────────────────────────────────────────────────────
 //
 // Linux: mm/swapfile.c swap_show
-// NARF has no swap space.
-
+//
+// Header only, which is what Linux shows when no swap area is enabled —
+// and no boot path in this tree enables one. NARF DOES have a swap
+// subsystem (`narf_memory::swap`: slot allocator, prioritized areas, a
+// compressed-RAM backend, reclaim integration); it is opt-in behind the
+// `zram` boot flag, and nothing passes that flag. The comment here used to
+// read "NARF has no swap space", which sent at least one reader looking
+// for a subsystem that was in front of them.
+//
+// Listing real areas needs one thing the subsystem does not have: a per-
+// area CAPACITY. `SwapBackend` exposes no size, `SlotAllocator` has no
+// bound (`high_water` grows on demand), and the zpool is unbounded — so
+// there is no honest value for the `Size` column. The high-water mark
+// equals `Used` until pages fault back in, which `free` would read as swap
+// 100% full; zero is worse, since parsers divide by it. Give areas a
+// capacity first, then this can render them.
 fn gen_swaps() -> Vec<u8> {
     "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n"
         .as_bytes()
