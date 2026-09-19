@@ -2528,4 +2528,103 @@ mod tests {
         "userspace",
         smoke_bpf_arena_mapping_keeps_frames_alive_until_munmap
     );
+
+    // `mbind(2)` installs a range policy in `vma->vm_policy`, which lives in
+    // `mm_struct` — NOT in task_struct. `CLONE_VM` shares that mm outright
+    // (`kernel/fork.c:1579-1581`: `mmget(oldmm); mm = oldmm;`), so a thread
+    // must observe a range binding its thread-group peer installed.
+    //
+    // Regression: NARF's range table was keyed by the scheduler task id, which
+    // `CLONE_THREAD` makes distinct per thread, so each thread got a PRIVATE
+    // set of mbind ranges and a sibling saw the default policy. Contrast
+    // `set_mempolicy`, which writes `current->mempolicy` (`mm/mempolicy.c:1091`)
+    // and IS correctly per-task.
+    fn smoke_mbind_range_policy_shared_with_thread_group_peer() -> TestResult {
+        // The nodemask in-pointer and the mode out-pointer below are kernel
+        // stack addresses standing in for user buffers; this is the scoped
+        // opt-in that lets `validate_user_range` accept them.
+        let _kbuf = crate::handlers::kernel_buffers_guard();
+        // SAFETY: the syscall runs with paging active; this allocates an
+        // independent user address space without switching the active one.
+        let aspace = match unsafe { AddressSpace::new_for_user() } {
+            Ok(aspace) => Arc::new(aspace),
+            Err(_) => return TestResult::Fail("new_for_user failed"),
+        };
+        *USER_AS.lock() = Some(Arc::clone(&aspace));
+        install_address_space_lookup(address_space);
+        install_task_id_lookup(task);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        crate::handlers::register_task_to_pid(TASK, PROCESS);
+        crate::handlers::register_task_to_pid(WORKER_TASK, PROCESS);
+
+        // A real mapping, so `get_mempolicy(MPOL_F_ADDR)` clears its
+        // `contains_address` check and reaches the policy lookup.
+        let mut mmap = TestCtx {
+            args: SyscallArgs {
+                arg1: 4096,
+                arg2: 0x3,  // PROT_READ | PROT_WRITE
+                arg3: 0x22, // MAP_PRIVATE | MAP_ANONYMOUS
+                arg4: u64::MAX,
+                ..SyscallArgs::default()
+            },
+            ret: None,
+        };
+        sys_mmap(&mut mmap);
+        let base = match mmap.ret {
+            Some(ret) if ret.status == SyscallReturn::OK && (ret.value as i64) > 0 => ret.value,
+            _ => return TestResult::Fail("anonymous mmap for the mbind range failed"),
+        };
+
+        // Thread A binds the range with MPOL_BIND(2) over node 0. `arg3` is a
+        // POINTER to the nodemask word, which `get_nodes()` copies in.
+        let nodes: u64 = 1;
+        let mut bind = TestCtx {
+            args: SyscallArgs {
+                arg0: base,
+                arg1: 4096,
+                arg2: 2, // MPOL_BIND
+                arg3: &nodes as *const u64 as u64,
+                arg4: 64,
+                arg5: 0,
+            },
+            ret: None,
+        };
+        crate::handlers::sys_mbind(&mut bind);
+        if !matches!(bind.ret, Some(ret) if ret.status == SyscallReturn::OK && ret.value == 0) {
+            return TestResult::Fail("mbind(MPOL_BIND) over the mapped range failed");
+        }
+
+        // Thread B is a CLONE_THREAD peer: same process, same address space,
+        // distinct scheduler task id.
+        CURRENT_TASK.store(WORKER_TASK, Ordering::Relaxed);
+        let mut mode: u32 = u32::MAX;
+        let mode_ptr = &mut mode as *mut u32 as u64;
+        let mut query = TestCtx {
+            args: SyscallArgs {
+                arg0: mode_ptr,
+                arg1: 0,
+                arg2: 0,
+                arg3: base,
+                arg4: 1 << 1, // MPOL_F_ADDR
+                arg5: 0,
+            },
+            ret: None,
+        };
+        crate::handlers::sys_get_mempolicy(&mut query);
+        CURRENT_TASK.store(TASK, Ordering::Relaxed);
+        if !matches!(query.ret, Some(ret) if ret.status == SyscallReturn::OK && ret.value == 0) {
+            return TestResult::Fail("get_mempolicy(MPOL_F_ADDR) from the peer failed");
+        }
+        // Before the fix the peer resolved no range and reported MPOL_DEFAULT(0).
+        if mode != 2 {
+            return TestResult::Fail(
+                "CLONE_VM peer did not observe the mbind range policy (saw MPOL_DEFAULT)",
+            );
+        }
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace",
+        smoke_mbind_range_policy_shared_with_thread_group_peer
+    );
 }
