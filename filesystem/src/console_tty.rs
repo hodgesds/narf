@@ -160,15 +160,50 @@ pub fn set_winsize(rows: u16, cols: u16) {
     *WINSIZE.lock() = (rows, cols);
 }
 
-/// Echo one byte back to the console. `\n` is translated to `\r\n` by the
-/// UART backend, so a bare `\n` is fine here.
-fn echo_byte(b: u8) {
-    if b.is_ascii() {
-        // SAFETY: single byte < 0x80 is always valid UTF-8.
-        narf_console::write_str(unsafe {
-            core::str::from_utf8_unchecked(core::slice::from_ref(&b))
-        });
+/// Output-side line-discipline state for the console (OPOST columns).
+static OUTPUT: narf_lib::sync::IrqSafeSpinLock<crate::ntty::OutputState> =
+    narf_lib::sync::IrqSafeSpinLock::new(crate::ntty::OutputState::new());
+
+/// Run `bytes` through OPOST and put the result on the wire verbatim.
+///
+/// This is the tty write path — `uart_write` — and it must NOT reuse
+/// `narf_console::write_str`, which is the kernel console path
+/// (`uart_console_write`) and inserts a CR of its own. Doing the
+/// translation here, from `c_oflag`, is what makes `stty -opost` on the
+/// console mean something: a full-screen program that clears OPOST now
+/// gets the bare line feeds it asked for instead of CRs it never wanted.
+fn opost_to_console(bytes: &[u8]) {
+    let t = Termios { raw: termios() };
+    let mut out = OUTPUT.lock();
+    let mut processed = alloc::vec::Vec::with_capacity(bytes.len() + 8);
+    crate::ntty::process_output(&mut out, &t, bytes, &mut |c| processed.push(c));
+    drop(out);
+    narf_console::write_bytes_raw(&processed);
+}
+
+/// A userspace write to `/dev/console`.
+///
+/// Returns the count the CALLER supplied: a `\n` that OPOST expanded to
+/// CR-NL still consumed one byte of their buffer.
+pub fn write_user(bytes: &[u8]) -> usize {
+    // The kernel log keeps the ORIGINAL text; CR bytes in the dmesg ring
+    // would help nobody, and `write_str`'s mirroring is what this path
+    // replaces.
+    if let Ok(s) = core::str::from_utf8(bytes) {
+        narf_console::klog::record(s);
     }
+    opost_to_console(bytes);
+    bytes.len()
+}
+
+/// Echo one input byte back to the console.
+///
+/// Echo is output too, so it goes through OPOST like everything else —
+/// Linux drives it through `process_echoes` -> `do_output_char`. Relying on
+/// the UART backend's unconditional CR (as this used to) made the echoed
+/// newline ignore `c_oflag` entirely.
+fn echo_byte(b: u8) {
+    opost_to_console(core::slice::from_ref(&b));
 }
 
 /// Ask the installed signal hook whether `b` should be consumed as a
@@ -280,3 +315,66 @@ pub fn __test_reset_raw() {
     t.raw[12..16].copy_from_slice(&lf.to_ne_bytes());
     *TERMIOS.lock() = Some(t);
 }
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+/// Capture sink for the output tests: the framebuffer fan-out receives the
+/// same bytes the UART does, which makes it the one place a test can see
+/// what actually went on the wire.
+static CAPTURE: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<u8>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn capture_hook(bytes: &[u8]) {
+    CAPTURE.lock().extend_from_slice(bytes);
+}
+
+/// A userspace write to the console is processed by OPOST, not by the
+/// UART backend's unconditional CR.
+///
+/// Linux keeps these two paths apart: `uart_console_write`
+/// (`drivers/tty/serial/serial_core.c:2081`) hardcodes
+/// `if (*s == '\n') putchar(port, '\r')` so a panic renders with no termios
+/// at all, while a userspace write reaches `uart_write` having already been
+/// through the line discipline. Sharing one path meant `stty -opost` on the
+/// console did nothing and a full-screen program got CRs it never asked
+/// for.
+fn smoke_console_userspace_write_honours_opost() -> narf_kernel_test::TestResult {
+    use narf_kernel_test::TestResult;
+    let saved_termios = termios();
+    let prior = narf_console::take_fb_hook();
+    narf_console::set_fb_hook(capture_hook);
+
+    // Default cooked termios carries OPOST|ONLCR: the newline expands.
+    let mut t = Termios::default();
+    set_termios(t.raw);
+    CAPTURE.lock().clear();
+    let n = write_user(b"a\nb");
+    let cooked = CAPTURE.lock().clone();
+
+    // Clearing OPOST (c_oflag bit 0) is what cfmakeraw does.
+    let mut oflag = u32::from_ne_bytes(t.raw[4..8].try_into().unwrap());
+    oflag &= !1;
+    t.raw[4..8].copy_from_slice(&oflag.to_ne_bytes());
+    set_termios(t.raw);
+    CAPTURE.lock().clear();
+    write_user(b"a\nb");
+    let raw = CAPTURE.lock().clone();
+
+    set_termios(saved_termios);
+    narf_console::restore_fb_hook(prior);
+
+    if n != 3 {
+        return TestResult::Fail("write_user must report the caller's byte count");
+    }
+    if cooked != b"a\r\nb" {
+        return TestResult::Fail("ONLCR must expand the newline on a console write");
+    }
+    if raw != b"a\nb" {
+        return TestResult::Fail("with OPOST clear the console must emit a bare LF");
+    }
+    TestResult::Pass
+}
+narf_kernel_test::kernel_test_in!(
+    "filesystem/console",
+    smoke_console_userspace_write_honours_opost
+);
