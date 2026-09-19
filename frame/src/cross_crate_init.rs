@@ -105,6 +105,9 @@ fn install_console_signal_hook() {
     narf_filesystem::devfs_pty::install_pty_jobctl_hook(
         narf_userspace::handlers::pty_jobctl_sessions,
     );
+    // The privileged tty ioctls test POSIX capabilities, which live in the
+    // process tables rather than the filesystem layer.
+    narf_filesystem::devfs_pty::install_pty_cap_hook(narf_userspace::handlers::pty_capable);
 }
 
 fn install_proc_hooks() {

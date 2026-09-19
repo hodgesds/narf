@@ -104,6 +104,26 @@ pub const FIONREAD: u32 = 0x541B;
 /// it as `#define TIOCINQ FIONREAD`, the very same command, so a separate
 /// match arm for it would be dead code.
 pub const TIOCOUTQ: u32 = 0x5411;
+/// `ioctl(fd, TIOCEXCL)` / `TIOCNXCL` / `TIOCGEXCL` — exclusive-open mode.
+pub const TIOCEXCL: u32 = 0x540C;
+pub const TIOCNXCL: u32 = 0x540D;
+pub const TIOCGEXCL: u32 = 0x8004_5440;
+/// `ioctl(fd, TIOCSTI, char*)` — push one byte back into the input queue.
+pub const TIOCSTI: u32 = 0x5412;
+/// `ioctl(fd, TIOCSETD/TIOCGETD, int*)` — line-discipline number.
+pub const TIOCSETD: u32 = 0x5423;
+pub const TIOCGETD: u32 = 0x5424;
+/// `ioctl(fd, TIOCVHANGUP)` — force a hangup.
+pub const TIOCVHANGUP: u32 = 0x5437;
+/// `ioctl(fd, TIOCGLCKTRMIOS/TIOCSLCKTRMIOS, termios*)` — the mask of
+/// termios bits that `TCSETS` may not change.
+pub const TIOCGLCKTRMIOS: u32 = 0x5456;
+pub const TIOCSLCKTRMIOS: u32 = 0x5457;
+/// `N_TTY` — the only line discipline NARF implements, and the one every
+/// PTY uses (`include/uapi/linux/tty.h`).
+pub const N_TTY: i32 = 0;
+/// `CAP_SYS_ADMIN`, the capability the privileged tty ioctls test.
+pub const CAP_SYS_ADMIN: u32 = 21;
 /// `ioctl(fd, TIOCNOTTY, 0)` — give up the controlling terminal.
 pub const TIOCNOTTY: u32 = 0x5422;
 /// `ioctl(fd, TIOCGSID, &pid_t)` — session id of the tty's session leader.
@@ -269,6 +289,7 @@ const L_ECHOK: u32 = 0x0000_0020;
 const L_ECHONL: u32 = 0x0000_0040;
 const L_NOFLSH: u32 = 0x0000_0080;
 const L_ECHOCTL: u32 = 0x0000_0200;
+const L_ECHOPRT: u32 = 0x0000_0400;
 const L_ECHOKE: u32 = 0x0000_0800;
 const L_IEXTEN: u32 = 0x0000_8000;
 const L_EXTPROC: u32 = 0x0001_0000;
@@ -447,6 +468,11 @@ impl Termios {
     pub fn echonl(&self) -> bool {
         self.lflag() & L_ECHONL != 0
     }
+    /// ECHOPRT: echo erased characters between `\` and `/`, the
+    /// hardcopy-terminal erase style.
+    pub fn echoprt(&self) -> bool {
+        self.lflag() & L_ECHOPRT != 0
+    }
     /// ECHOCTL: render control characters as `^X`.
     pub fn echoctl(&self) -> bool {
         self.lflag() & L_ECHOCTL != 0
@@ -569,6 +595,14 @@ pub struct Pty {
     /// Output-side line-discipline state (OPOST column tracking) for the
     /// slave-to-master direction.
     pub(crate) output: IrqSafeSpinLock<crate::ntty::OutputState>,
+
+    /// `TTY_EXCLUSIVE` — set by TIOCEXCL. A further open by a caller
+    /// without CAP_SYS_ADMIN is EBUSY.
+    pub(crate) exclusive: AtomicBool,
+
+    /// The mask of termios bits `TCSETS` may not change, set by
+    /// TIOCSLCKTRMIOS. A set bit keeps the OLD value.
+    pub(crate) locked_termios: IrqSafeSpinLock<Termios>,
 
     /// Line discipline state.
     pub(crate) termios: IrqSafeSpinLock<Termios>,
@@ -842,6 +876,123 @@ impl Pty {
         Ok(0)
     }
 
+    /// Apply a `TCSETS`-family termios, honouring the locked mask.
+    ///
+    /// `tty_ioctl.c`:
+    ///
+    /// ```c
+    /// #define NOSET_MASK(x, y, z) (x = ((x) & ~(z)) | ((y) & (z)))
+    ///     NOSET_MASK(termios->c_iflag, old->c_iflag, locked->c_iflag);
+    ///     ...
+    ///     termios->c_cc[i] = locked->c_cc[i] ? old->c_cc[i] : termios->c_cc[i];
+    /// ```
+    ///
+    /// A bit set in the lock keeps the OLD value, so TIOCSLCKTRMIOS can pin
+    /// individual flags — which is the point: a privileged process can stop
+    /// a setuid program from, say, clearing ECHO on a shared terminal.
+    pub(crate) fn set_termios_locked(&self, mut raw: [u8; TERMIOS_WIRE_LEN]) {
+        let locked = *self.locked_termios.lock();
+        let mut cur = self.termios.lock();
+        // c_iflag/c_oflag/c_cflag/c_lflag: four u32s at offsets 0, 4, 8, 12.
+        for off in [0usize, 4, 8, 12] {
+            let l = u32::from_ne_bytes(locked.raw[off..off + 4].try_into().unwrap());
+            if l == 0 {
+                continue;
+            }
+            let old = u32::from_ne_bytes(cur.raw[off..off + 4].try_into().unwrap());
+            let new = u32::from_ne_bytes(raw[off..off + 4].try_into().unwrap());
+            let merged = (new & !l) | (old & l);
+            raw[off..off + 4].copy_from_slice(&merged.to_ne_bytes());
+        }
+        // c_line at 16: a non-zero lock keeps the old value.
+        if locked.raw[16] != 0 {
+            raw[16] = cur.raw[16];
+        }
+        // c_cc[] from 17: per-entry, a non-zero lock keeps the old value.
+        // NCCS is 19 on the asm-generic layout.
+        let cc = 17..TERMIOS_WIRE_LEN.min(17 + 19);
+        for ((slot, &lock), &old) in raw[cc.clone()]
+            .iter_mut()
+            .zip(locked.raw[cc.clone()].iter())
+            .zip(cur.raw[cc].iter())
+        {
+            if lock != 0 {
+                *slot = old;
+            }
+        }
+        cur.raw = raw;
+    }
+
+    /// `TIOCSTI`: push one byte back into this tty's input queue.
+    ///
+    /// `tty_io.c::tiocsti` (2274-2291):
+    ///
+    /// ```c
+    /// if (!tty_legacy_tiocsti && !capable(CAP_SYS_ADMIN))
+    ///         return -EIO;
+    /// if ((current->signal->tty != tty) && !capable(CAP_SYS_ADMIN))
+    ///         return -EPERM;
+    /// ```
+    ///
+    /// `CONFIG_LEGACY_TIOCSTI` defaults to y (`drivers/tty/Kconfig:149`), so
+    /// the first test passes and injecting into YOUR OWN controlling
+    /// terminal is unprivileged; injecting into somebody else's is what
+    /// needs CAP_SYS_ADMIN, because that is the terminal-hijacking case.
+    pub(crate) fn insert_input_byte(&self, b: u8) -> Result<u64, FsError> {
+        let own_tty = match jobctl_query(0) {
+            Some((caller_sid, _)) => {
+                let sid = self.ctrl.lock().sid;
+                sid != 0 && sid == caller_sid
+            }
+            // No session tables (early boot, in-kernel tests): treat it as
+            // the caller's own terminal rather than inventing a denial.
+            None => true,
+        };
+        if !own_tty && !caller_capable(CAP_SYS_ADMIN) {
+            return Err(FsError::OperationNotPermitted); // EPERM
+        }
+        let t = *self.termios.lock();
+        let mut sigs: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+        {
+            let mut state = self.input.lock();
+            crate::ntty::feed_byte(
+                &mut state,
+                &t,
+                b,
+                &mut |c| self.slave_tx_to_master.push(&[c]),
+                &mut |bb| match signal_for_cc(&t, bb) {
+                    Some(sig) => {
+                        sigs.push(sig);
+                        true
+                    }
+                    None => false,
+                },
+            );
+        }
+        if !sigs.is_empty() {
+            let pgrp = self.ctrl.lock().fg_pgrp;
+            for sig in sigs {
+                pty_deliver_signal(pgrp, sig);
+            }
+        }
+        Ok(0)
+    }
+
+    /// `TIOCVHANGUP`: force a hangup on this terminal.
+    ///
+    /// `tty_io.c:2729` gates it on CAP_SYS_ADMIN. The effect is what the
+    /// master closing already produces — readers see EOF and pollers HUP —
+    /// so it reuses that path rather than inventing a second one.
+    fn vhangup(&self) -> Result<u64, FsError> {
+        if !caller_capable(CAP_SYS_ADMIN) {
+            return Err(FsError::OperationNotPermitted); // EPERM
+        }
+        self.master_closed.store(true, Ordering::Release);
+        self.slave_opens.store(0, Ordering::Release);
+        self.slave_ever_opened.store(true, Ordering::Release);
+        Ok(0)
+    }
+
     /// `TCFLSH` (`tcflush`): discard queued input and/or output.
     ///
     /// `drivers/tty/tty_ioctl.c::__tty_perform_flush` — TCIFLUSH(0) drops
@@ -953,6 +1104,11 @@ impl Pty {
             input: IrqSafeSpinLock::new(crate::ntty::LineState::new()),
             output: IrqSafeSpinLock::new(crate::ntty::OutputState::new()),
             read_timer: IrqSafeSpinLock::new(ReadTimer::new()),
+            exclusive: AtomicBool::new(false),
+            // All-zero: nothing is locked until TIOCSLCKTRMIOS says so.
+            locked_termios: IrqSafeSpinLock::new(Termios {
+                raw: [0u8; TERMIOS_WIRE_LEN],
+            }),
             slave_tx_to_master: ByteRing::new(),
             termios: IrqSafeSpinLock::new(Termios::default()),
             window: IrqSafeSpinLock::new(WinSize::default()),
@@ -1021,6 +1177,31 @@ fn jobctl_query(pgrp: u64) -> Option<(u64, u64)> {
     // never unmapped.
     let hook: JobctlHook = unsafe { core::mem::transmute(raw) };
     Some(hook(pgrp))
+}
+
+/// `fn(capability) -> bool` for the calling task, installed by userspace.
+type CapHook = fn(u32) -> bool;
+
+static CAP_HOOK: AtomicUsize = AtomicUsize::new(0);
+
+/// Install the capability check used by the privileged tty ioctls.
+pub fn install_pty_cap_hook(hook: CapHook) {
+    CAP_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// Whether the caller holds `cap`. With no hook installed — early boot and
+/// in-kernel tests — the answer is "yes", matching the fact that those
+/// callers really do run as root.
+fn caller_capable(cap: u32) -> bool {
+    let raw = CAP_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return true;
+    }
+    // SAFETY: `raw` was stored by `install_pty_cap_hook` from a `CapHook`,
+    // the only writer of this slot, and function pointers are never
+    // unmapped.
+    let hook: CapHook = unsafe { core::mem::transmute(raw) };
+    hook(cap)
 }
 
 /// Install the current-credentials accessor used to own new PTY slaves.
@@ -1139,6 +1320,11 @@ pub fn pts_open_peer(index: u32) -> Option<Result<Arc<PtySlave>, ()>> {
     if pty.locked.load(Ordering::Acquire) {
         return Some(Err(()));
     }
+    // Exclusive mode refuses a second opener without CAP_SYS_ADMIN, the
+    // TIOCGPTPEER equivalent of `tty_open`'s EBUSY.
+    if pty.exclusive.load(Ordering::Acquire) && !caller_capable(CAP_SYS_ADMIN) {
+        return Some(Err(()));
+    }
     Some(Ok(Arc::new(PtySlave::new(pty))))
 }
 
@@ -1166,6 +1352,33 @@ pub(crate) unsafe fn read_user_i32(uptr: usize) -> Result<i32, FsError> {
         narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const i32))
     };
     Ok(v)
+}
+
+/// Read the single `char` a `TIOCSTI` argument points at.
+#[cfg(target_arch = "x86_64")]
+pub(crate) unsafe fn read_user_u8(uptr: usize) -> Result<u8, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: caller guarantees uptr is a valid user-space pointer; the
+    // SMAP window is what makes a CPL=0 load from a user-only PTE legal.
+    // SAFETY: Valid memory or trusted environment
+    let v = unsafe {
+        narf_arch::x86_64::smap::with_user_access(|| core::ptr::read_unaligned(uptr as *const u8))
+    };
+    Ok(v)
+}
+
+/// Read the single `char` a `TIOCSTI` argument points at.
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn read_user_u8(uptr: usize) -> Result<u8, FsError> {
+    if uptr == 0 {
+        return Err(FsError::InvalidData);
+    }
+    // SAFETY: the caller guarantees `uptr` is a valid user-space pointer
+    // and it is non-null per the check above.
+    // SAFETY: Valid memory or trusted environment
+    Ok(unsafe { core::ptr::read_unaligned(uptr as *const u8) })
 }
 
 // Not linux-compat-gated: /dev/random's RND* ioctls (always present) write an
@@ -1867,7 +2080,7 @@ impl FileOps for PtyMaster {
                 // line-discipline knobs take effect.
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
                 // TCSETSF additionally DISCARDS queued input
                 // (`tty_ioctl.c::set_termios` -> `tty_ldisc_flush`), which
                 // is the whole reason `tcsetattr(TCSAFLUSH)` exists: a
@@ -1890,7 +2103,62 @@ impl FileOps for PtyMaster {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                Ok(0)
+            }
+            TIOCEXCL => {
+                // `set_bit(TTY_EXCLUSIVE, &tty->flags)` (`tty_io.c:2713`).
+                self.pty.exclusive.store(true, Ordering::Release);
+                Ok(0)
+            }
+            TIOCNXCL => {
+                self.pty.exclusive.store(false, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGEXCL => {
+                let v = self.pty.exclusive.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCGETD => {
+                // `put_user(ld->ops->num, p)` — always N_TTY here.
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, N_TTY)? };
+                Ok(0)
+            }
+            TIOCSETD => {
+                // Only N_TTY exists; `tty_set_ldisc` answers EINVAL for a
+                // discipline that is not registered.
+                // SAFETY: arg is a validated user `int *`.
+                let want = unsafe { read_user_i32(arg)? };
+                if want != N_TTY {
+                    return Err(FsError::InvalidData); // EINVAL
+                }
+                Ok(0)
+            }
+            TIOCSTI => {
+                // `arg` is a `char __user *`, read BEFORE the byte is fed.
+                // SAFETY: arg is a validated user `char *`.
+                let b = unsafe { read_user_u8(arg)? };
+                self.pty.insert_input_byte(b)
+            }
+            TIOCVHANGUP => self.pty.vhangup(),
+            TIOCGLCKTRMIOS => {
+                let l = *self.pty.locked_termios.lock();
+                // SAFETY: arg is a validated user `struct termios *`.
+                unsafe { write_user_termios(arg, &l.raw)? };
+                Ok(0)
+            }
+            TIOCSLCKTRMIOS => {
+                // `checkpoint_restore_ns_capable` (`tty_ioctl.c:843`);
+                // CAP_SYS_ADMIN implies it.
+                if !caller_capable(CAP_SYS_ADMIN) {
+                    return Err(FsError::OperationNotPermitted); // EPERM
+                }
+                // SAFETY: arg is a validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.locked_termios.lock().raw = raw;
                 Ok(0)
             }
             TCFLSH => self.pty.flush_queues(arg),
@@ -2236,7 +2504,7 @@ impl FileOps for PtySlave {
             TCSETS | TCSETSW | TCSETSF => {
                 // SAFETY: arg is a validated user pointer passed from the ioctl syscall path.
                 let raw = unsafe { read_user_termios(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
                 // TCSETSF discards queued input; TCSETS and TCSETSW do not.
                 if cmd == TCSETSF {
                     let mut st = self.pty.input.lock();
@@ -2255,7 +2523,62 @@ impl FileOps for PtySlave {
             TCSETS2 | TCSETSW2 | TCSETSF2 => {
                 // SAFETY: arg is a validated user `struct termios2 *`.
                 let raw = unsafe { read_user_termios2(arg)? };
-                self.pty.termios.lock().raw = raw;
+                self.pty.set_termios_locked(raw);
+                Ok(0)
+            }
+            TIOCEXCL => {
+                // `set_bit(TTY_EXCLUSIVE, &tty->flags)` (`tty_io.c:2713`).
+                self.pty.exclusive.store(true, Ordering::Release);
+                Ok(0)
+            }
+            TIOCNXCL => {
+                self.pty.exclusive.store(false, Ordering::Release);
+                Ok(0)
+            }
+            TIOCGEXCL => {
+                let v = self.pty.exclusive.load(Ordering::Acquire) as i32;
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, v)? };
+                Ok(0)
+            }
+            TIOCGETD => {
+                // `put_user(ld->ops->num, p)` — always N_TTY here.
+                // SAFETY: arg is a validated user `int *`.
+                unsafe { write_user_i32(arg, N_TTY)? };
+                Ok(0)
+            }
+            TIOCSETD => {
+                // Only N_TTY exists; `tty_set_ldisc` answers EINVAL for a
+                // discipline that is not registered.
+                // SAFETY: arg is a validated user `int *`.
+                let want = unsafe { read_user_i32(arg)? };
+                if want != N_TTY {
+                    return Err(FsError::InvalidData); // EINVAL
+                }
+                Ok(0)
+            }
+            TIOCSTI => {
+                // `arg` is a `char __user *`, read BEFORE the byte is fed.
+                // SAFETY: arg is a validated user `char *`.
+                let b = unsafe { read_user_u8(arg)? };
+                self.pty.insert_input_byte(b)
+            }
+            TIOCVHANGUP => self.pty.vhangup(),
+            TIOCGLCKTRMIOS => {
+                let l = *self.pty.locked_termios.lock();
+                // SAFETY: arg is a validated user `struct termios *`.
+                unsafe { write_user_termios(arg, &l.raw)? };
+                Ok(0)
+            }
+            TIOCSLCKTRMIOS => {
+                // `checkpoint_restore_ns_capable` (`tty_ioctl.c:843`);
+                // CAP_SYS_ADMIN implies it.
+                if !caller_capable(CAP_SYS_ADMIN) {
+                    return Err(FsError::OperationNotPermitted); // EPERM
+                }
+                // SAFETY: arg is a validated user `struct termios *`.
+                let raw = unsafe { read_user_termios(arg)? };
+                self.pty.locked_termios.lock().raw = raw;
                 Ok(0)
             }
             TCFLSH => self.pty.flush_queues(arg),
@@ -2469,6 +2792,13 @@ impl DirOps for DevPts {
             }
             let idx: u32 = name.parse().map_err(|_| FsError::NotFound)?;
             let pty = pts_lookup(idx).ok_or(FsError::NotFound)?;
+            // `tty_open`: `if (test_bit(TTY_EXCLUSIVE, &tty->flags) &&
+            // !capable(CAP_SYS_ADMIN)) return -EBUSY;` — exclusive mode is
+            // what stops a second program attaching to a terminal another
+            // already owns.
+            if pty.exclusive.load(Ordering::Acquire) && !caller_capable(CAP_SYS_ADMIN) {
+                return Err(FsError::Busy);
+            }
             if pty.locked.load(Ordering::Acquire) {
                 return Err(FsError::Busy);
             }

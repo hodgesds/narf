@@ -12927,11 +12927,16 @@ pub fn pty_open_fs_ids() -> (u32, u32) {
 /// Session lookups for the job-control tty ioctls: the caller's session,
 /// and the session owning `pgrp` (0 when no such process group exists).
 ///
-/// `TIOCSPGRP` distinguishes three failures that all look alike from the
-/// filesystem layer (`drivers/tty/tty_jobctrl.c:507-521`): ENOTTY when the
-/// tty is not the caller's, ESRCH when the process group does not exist,
-/// and EPERM when it exists but belongs to another session. Only the
-/// process tables can tell them apart, so they are answered here.
+/// Whether the calling task holds `cap`, for the privileged tty ioctls
+/// (TIOCSTI on another terminal, TIOCVHANGUP, TIOCSLCKTRMIOS, and an
+/// exclusive-mode open). POSIX capabilities live in the process tables,
+/// not the filesystem layer, so the answer is supplied from here.
+pub fn pty_capable(cap: u32) -> bool {
+    task_capable(current_task_id(), cap)
+}
+
+/// Session lookups for the job-control tty ioctls: the caller's session,
+/// and the session owning `pgrp` (0 when no such process group exists).
 pub fn pty_jobctl_sessions(pgrp: u64) -> (u64, u64) {
     let caller = read_sid(current_task_id());
     if pgrp == 0 {

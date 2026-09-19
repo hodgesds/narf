@@ -34,6 +34,9 @@ pub struct LineState {
     /// Output stopped by VSTOP (`^S`) under IXON; VSTART (`^Q`) — or any
     /// byte under IXANY — restarts it. Linux `tty->flow.stopped`.
     pub stopped: bool,
+    /// Mid-erase under ECHOPRT: a `\` has been echoed and the matching `/`
+    /// is still owed. Linux `ldata->erasing`, closed by `finish_erasing`.
+    pub erasing: bool,
 }
 
 impl LineState {
@@ -44,6 +47,7 @@ impl LineState {
             eof: false,
             lnext: false,
             stopped: false,
+            erasing: false,
         }
     }
 
@@ -237,6 +241,20 @@ fn echo_width(t: &Termios, c: u8) -> usize {
     }
 }
 
+/// Close an ECHOPRT erase run: the `\` opened one, this emits the `/`.
+///
+/// Linux `finish_erasing` (`drivers/tty/n_tty.c:905`):
+///
+/// ```c
+/// if (ldata->erasing) { echo_char_raw('/', ldata); ldata->erasing = 0; }
+/// ```
+fn finish_erasing(state: &mut LineState, echo: &mut dyn FnMut(u8)) {
+    if state.erasing {
+        echo(b'/');
+        state.erasing = false;
+    }
+}
+
 /// Rub out `n` display cells.
 fn erase_cells(n: usize, echo: &mut dyn FnMut(u8)) {
     for _ in 0..n {
@@ -377,7 +395,17 @@ pub fn feed_byte(
         if verase != 0 && b == verase {
             if let Some(c) = state.line.pop() {
                 if do_echo {
-                    if t.echoe() {
+                    if t.echoprt() {
+                        // Hardcopy-style erase: open the run with `\\` and
+                        // then echo the character being rubbed out, so the
+                        // record shows what was deleted instead of hiding
+                        // it. `eraser()` (`n_tty.c:982-989`).
+                        if !state.erasing {
+                            echo(b'\\');
+                            state.erasing = true;
+                        }
+                        echo_char(t, c, echo);
+                    } else if t.echoe() {
                         erase_cells(echo_width(t, c), echo);
                     } else {
                         echo_char(t, b, echo);
@@ -392,11 +420,13 @@ pub fn feed_byte(
             // Trailing whitespace first, then the word itself — Linux
             // `eraser()`'s WERASE arm.
             let mut cells = 0usize;
+            let mut erased = alloc::vec::Vec::new();
             while let Some(&c) = state.line.last() {
                 if c != b' ' && c != b'\t' {
                     break;
                 }
                 cells += echo_width(t, c);
+                erased.push(c);
                 state.line.pop();
             }
             while let Some(&c) = state.line.last() {
@@ -404,10 +434,23 @@ pub fn feed_byte(
                     break;
                 }
                 cells += echo_width(t, c);
+                erased.push(c);
                 state.line.pop();
             }
-            if do_echo && t.echoe() {
-                erase_cells(cells, echo);
+            if do_echo {
+                if t.echoprt() {
+                    if !state.erasing {
+                        echo(b'\\');
+                        state.erasing = true;
+                    }
+                    // `erased` came off the end, so replay it in the order
+                    // the characters were typed.
+                    for &c in erased.iter().rev() {
+                        echo_char(t, c, echo);
+                    }
+                } else if t.echoe() {
+                    erase_cells(cells, echo);
+                }
             }
             return;
         }
@@ -458,6 +501,9 @@ pub fn feed_byte(
     if is_eol && !literal {
         state.line.push(b);
         if do_echo || t.echonl() {
+            // `n_tty_receive_char`: `if (L_ECHO(tty)) { finish_erasing(...)`
+            // — any echoed character closes an open ECHOPRT run.
+            finish_erasing(state, echo);
             // ECHONL echoes a newline even with ECHO off (`n_tty.c`
             // `L_ECHONL`), which is how a password prompt still moves to
             // the next line.
@@ -481,6 +527,7 @@ pub fn feed_byte(
     }
     state.line.push(b);
     if do_echo {
+        finish_erasing(state, echo);
         echo_char(t, b, echo);
     }
 }

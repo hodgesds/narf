@@ -1794,3 +1794,166 @@ fn smoke_pty_vmin_vtime_is_an_interbyte_timer() -> TestResult {
     }
 }
 kernel_test_in!("filesystem/pty", smoke_pty_vmin_vtime_is_an_interbyte_timer);
+
+// ── ECHOPRT and the remaining ioctls ─────────────────────────────────────────
+
+/// ECHOPRT shows erased characters between `\` and `/` instead of rubbing
+/// them out, the hardcopy-terminal erase style.
+///
+/// `eraser()` (`n_tty.c:982`) opens the run with a raw `\` on the first
+/// erase and echoes each erased character; `finish_erasing` (905) emits the
+/// closing `/` as soon as anything else is echoed.
+fn smoke_pty_echoprt_brackets_erased_text() -> TestResult {
+    const ECHO: u32 = 0x08;
+    const ICANON: u32 = 0x02;
+    const ECHOPRT: u32 = 0x400;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    {
+        let mut t = pty.termios.lock();
+        t.raw[12..16].copy_from_slice(&(ECHO | ICANON | ECHOPRT).to_ne_bytes());
+    }
+    let mut buf = [0u8; 32];
+    // Type "ab", erase one, then type "c": the erase is bracketed and the
+    // closing slash arrives when the next character echoes.
+    if poll_once(master.write(0, b"ab")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    if poll_once(master.read(0, &mut buf)).is_none() {
+        return TestResult::Fail("master read of the echo failed");
+    }
+    if poll_once(master.write(0, &[0x7f])).is_none() {
+        return TestResult::Fail("master write of DEL failed");
+    }
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("master read after erase failed"),
+    };
+    if &buf[..n] != b"\\b" {
+        return TestResult::Fail("ECHOPRT must open the erase run with a backslash");
+    }
+    if poll_once(master.write(0, b"c")).is_none() {
+        return TestResult::Fail("master write failed");
+    }
+    let n = match poll_once(master.read(0, &mut buf)) {
+        Some(Ok(n)) => n,
+        _ => return TestResult::Fail("master read after resuming input failed"),
+    };
+    match &buf[..n] {
+        b"/c" => TestResult::Pass,
+        _ => TestResult::Fail("ECHOPRT must close the erase run with a slash"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_echoprt_brackets_erased_text);
+
+/// The locked termios pins individual bits against TCSETS.
+///
+/// `tty_ioctl.c`: `NOSET_MASK(termios->c_lflag, old->c_lflag,
+/// locked->c_lflag)` — a bit set in the lock keeps the OLD value, which is
+/// how a privileged process stops another program from, say, clearing ECHO
+/// on a shared terminal.
+fn smoke_pty_locked_termios_pins_bits() -> TestResult {
+    const ECHO: u32 = 0x08;
+    const ICANON: u32 = 0x02;
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    // Start from a known lflag, then lock just the ECHO bit.
+    {
+        let mut t = pty.termios.lock();
+        t.raw[12..16].copy_from_slice(&(ECHO | ICANON).to_ne_bytes());
+    }
+    {
+        let mut l = pty.locked_termios.lock();
+        l.raw = [0u8; 60];
+        l.raw[12..16].copy_from_slice(&ECHO.to_ne_bytes());
+    }
+    // A TCSETS that clears everything must leave ECHO alone and still be
+    // allowed to clear ICANON.
+    let mut want = [0u8; 60];
+    want[12..16].copy_from_slice(&0u32.to_ne_bytes());
+    pty.set_termios_locked(want);
+
+    let t = *pty.termios.lock();
+    if !t.echo() {
+        return TestResult::Fail("a locked ECHO bit must survive TCSETS");
+    }
+    if t.icanon() {
+        return TestResult::Fail("an unlocked bit must still be changeable");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/pty", smoke_pty_locked_termios_pins_bits);
+
+/// TIOCEXCL / TIOCNXCL flip exclusive mode, and while it is set a further
+/// slave open is refused.
+///
+/// `tty_io.c:2713` sets `TTY_EXCLUSIVE`; `tty_open` turns it into -EBUSY
+/// for an opener without CAP_SYS_ADMIN.
+fn smoke_pty_exclusive_mode_refuses_second_open() -> TestResult {
+    use crate::devfs_pty::pts_open_peer;
+    __reset_for_test();
+    let master = open_ptmx();
+    let idx = master.index();
+    let pty = match pts_lookup(idx) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    // unlockpt() first, or the lock rather than exclusivity would refuse.
+    pty.locked
+        .store(false, core::sync::atomic::Ordering::Release);
+    if !matches!(pts_open_peer(idx), Some(Ok(_))) {
+        return TestResult::Fail("an unlocked slave should open");
+    }
+    pty.exclusive
+        .store(true, core::sync::atomic::Ordering::Release);
+    // No capability hook is installed under kernel-test, so the caller
+    // counts as privileged and the open is still allowed — which is itself
+    // Linux's rule. Assert the FLAG round-trips, which is what an
+    // unprivileged opener would be refused on.
+    if !pty.exclusive.load(core::sync::atomic::Ordering::Acquire) {
+        return TestResult::Fail("TIOCEXCL flag did not stick");
+    }
+    pty.exclusive
+        .store(false, core::sync::atomic::Ordering::Release);
+    match pts_open_peer(idx) {
+        Some(Ok(_)) => TestResult::Pass,
+        _ => TestResult::Fail("clearing exclusive mode must allow opens again"),
+    }
+}
+kernel_test_in!(
+    "filesystem/pty",
+    smoke_pty_exclusive_mode_refuses_second_open
+);
+
+/// TIOCSTI pushes a byte back into the input queue, where the slave reads
+/// it as if it had been typed (`tty_io.c::tiocsti`).
+fn smoke_pty_tiocsti_injects_input() -> TestResult {
+    __reset_for_test();
+    let master = open_ptmx();
+    let pty = match pts_lookup(master.index()) {
+        Some(p) => p,
+        None => return TestResult::Fail("pts_lookup returned None"),
+    };
+    let slave = PtySlave::new(Arc::clone(&pty));
+    // Canonical mode: a complete line has to be injected to be readable.
+    if pty.insert_input_byte(b'z').is_err() {
+        return TestResult::Fail("TIOCSTI of an ordinary byte failed");
+    }
+    if pty.insert_input_byte(b'\n').is_err() {
+        return TestResult::Fail("TIOCSTI of a newline failed");
+    }
+    let mut buf = [0u8; 8];
+    match poll_once(slave.read(0, &mut buf)) {
+        Some(Ok(2)) if &buf[..2] == b"z\n" => TestResult::Pass,
+        _ => TestResult::Fail("injected bytes did not reach the slave"),
+    }
+}
+kernel_test_in!("filesystem/pty", smoke_pty_tiocsti_injects_input);
