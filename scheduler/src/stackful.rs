@@ -275,8 +275,7 @@ pub fn user_own_stack_enabled() -> bool {
 #[doc(hidden)]
 pub fn __reset_user_own_stack_for_test() {
     USE_OWN_STACK.store(false, Ordering::Release);
-    for cpu in 0..narf_lib::percpu::MAX_CPUS {
-        let direct = &DIRECT_HANDOFF[cpu];
+    for direct in &DIRECT_HANDOFF {
         direct.active.store(false, Ordering::Release);
         direct.root.store(core::ptr::null_mut(), Ordering::Release);
         direct
@@ -2168,6 +2167,8 @@ impl KernelTask {
             // SAFETY: mirrors the x86 interrupt-gate continuation contract.
             unsafe { narf_arch::disable_interrupts() };
         }
+        // SAFETY: both contexts and the task-owned stack remain live, and this
+        // CPU exclusively owns the executor context for the switch round trip.
         unsafe { kernel_switch(exec_ctx as *mut _, &self.ctx) };
         let resumed_cpu = this_cpu();
         if MASKED_EXCEPTION_RETURN.inner[resumed_cpu].swap(false, Ordering::AcqRel) {
