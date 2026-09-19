@@ -3790,6 +3790,25 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                             // tmpfs. Best-effort: a missing mount point or mount
                             // failure just leaves that home read-only.
                             for (mount_path, guest_path, mode, uid, gid, ov_name) in [
+                                // systemd services with `StateDirectory=` (logind
+                                // -> systemd/linger, timesyncd -> systemd/timesync,
+                                // …) create + chown a subdir under /var/lib/systemd
+                                // during executor setup. On the read-only ext4 root
+                                // that mkdir fails (EROFS) and the executor aborts
+                                // BEFORE exec — so systemd-logind crash-loops, no
+                                // seat is created, and the greeter never gets a DRM
+                                // device (black screen / "no login screen"). Make
+                                // /var/lib/systemd writable via an overlay so the
+                                // state subdirs can be created; reads of the real
+                                // network/, catalog/, … fall through to the lower.
+                                (
+                                    "/mnt/var/lib/systemd",
+                                    "/var/lib/systemd",
+                                    "mode=0755",
+                                    0,
+                                    0,
+                                    "systemd-state-ov",
+                                ),
                                 (
                                     "/mnt/var/lib/plasmalogin",
                                     "/var/lib/plasmalogin",
