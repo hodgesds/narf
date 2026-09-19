@@ -7788,7 +7788,7 @@ impl AddressSpace {
     /// - Frame allocator must be initialised.
     #[cfg(target_arch = "x86_64")]
     pub unsafe fn demand_alloc_page(&self, vaddr: VirtAddr) -> Result<(), AddressSpaceError> {
-        use crate::x86_64::paging::{map_4kb, map_4kb_demand, MapError, PtFlags};
+        use crate::x86_64::paging::{map_4kb_demand, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
         // Swap faults are resolved before anonymous/file demand allocation.
         // Evicting/Loading means another CPU owns the transition; returning Ok
@@ -7881,10 +7881,10 @@ impl AddressSpace {
         }
         let claim = self.claim_demand_page(v, |phys, perms| {
             // Already backed, yet this CPU took a not-present #PF for it.
-            // Two distinct causes, distinguished by whether the leaf PTE
-            // in memory is actually present:
+            // There are two causes, distinguished by `map_4kb_demand`'s result
+            // in a single root-locked walk:
             //
-            // (a) Leaf PRESENT — a peer CPU demand-faulted this page
+            // (a) AlreadyMapped — a peer CPU demand-faulted this page
             //     and, installing its leaf, allocated a fresh
             //     intermediate page-table page; THIS CPU's paging-
             //     structure cache still holds the pre-fault "not
@@ -7895,7 +7895,7 @@ impl AddressSpace {
             //     the spurious fault fell through to try_grow_stack →
             //     fatal — the SMP-only mallocng heap crash.)
             //
-            // (b) Leaf ABSENT — the bookkeeping says "backed" but the
+            // (b) Ok — the bookkeeping says "backed" but the
             //     page table genuinely has no entry. Reachable when a
             //     racing VMA op strips the leaf after this region (or a
             //     replacement mapping) was registered — e.g. the
@@ -7907,16 +7907,6 @@ impl AddressSpace {
             //     the stress-ng --vma SMP wedge. Self-heal instead:
             //     install the leaf for the frame the region owns.
             let va = VirtAddr::new(v);
-            // SAFETY: `self.root` is this AS's valid live root; translate
-            // only reads the tables through the identity map.
-            if unsafe { crate::x86_64::paging::translate(self.root, va) }.is_some() {
-                // SAFETY: INVLPG is always safe; `v` is the page-aligned
-                // faulting VA whose leaf PTE this AS owns.
-                unsafe {
-                    crate::x86_64::paging::invlpg(va);
-                }
-                return Ok(());
-            }
             let mut flags = PtFlags::USER;
             if user_page_writable(perms, phys) {
                 flags |= PtFlags::WRITABLE;
@@ -7925,10 +7915,20 @@ impl AddressSpace {
                 flags |= PtFlags::NO_EXEC;
             }
             // SAFETY: identity map + AS live (active CR3's #PF handler);
-            // `phys` is the frame this region owns for the page.
-            match unsafe { map_4kb(self.root, va, phys, flags) } {
-                Ok(()) | Err(MapError::AlreadyMapped) => {
+            // `phys` is the frame this region owns for the page, and this is
+            // the repair-capable user not-present fault path required by
+            // `map_4kb_demand`.
+            match unsafe { map_4kb_demand(self.root, va, phys, flags) } {
+                Ok(()) => {
                     crate::rmap::add(phys, self.root, va);
+                    Ok(())
+                }
+                Err(MapError::AlreadyMapped) => {
+                    // SAFETY: INVLPG is always safe; `v` is the page-aligned
+                    // faulting VA whose leaf PTE this AS owns.
+                    unsafe {
+                        crate::x86_64::paging::invlpg(va);
+                    }
                     Ok(())
                 }
                 Err(_) => Err(AddressSpaceError::NotImplemented),
@@ -8023,24 +8023,14 @@ impl AddressSpace {
         use crate::aarch64::paging::{map_4kb, MapError, PtFlags};
         let v = vaddr.as_u64() & !0xFFFu64;
         let claim = self.claim_demand_page(v, |phys, perms| {
-            // Already backed, yet this CPU faulted. Present leaf → a
-            // peer installed it while this CPU's TLB / walk caches still
-            // held the pre-fault miss: invalidate locally and retry.
-            // ABSENT leaf → a racing VMA op stripped it after the
-            // backing was registered; re-install the region's own frame
-            // instead of retrying forever. See the x86_64 twin for the
-            // full spurious-vs-raced rationale.
+            // Already backed, yet this CPU faulted. Attempt the leaf install
+            // directly so the common lazy-fork case takes one table walk.
+            // AlreadyMapped means a peer installed it while this CPU's TLB /
+            // walk caches retained the miss, so invalidate and retry. Ok means
+            // a racing VMA operation had stripped the leaf, now repaired from
+            // the region's authoritative backing. See the x86_64 twin for the
+            // full rationale.
             let va = VirtAddr::new(v);
-            // SAFETY: `self.root` is this AS's valid TTBR0 root;
-            // translate only reads the tables.
-            if unsafe { crate::aarch64::paging::translate(self.root, va) }.is_some() {
-                // SAFETY: TLBI VAAE1IS at EL1 is always legal; `v` is the
-                // page-aligned faulting VA owned by this AS.
-                unsafe {
-                    crate::aarch64::paging::tlb_invalidate_va_all_asids_inner_shareable(va);
-                }
-                return Ok(());
-            }
             let mut flags = if user_page_writable(perms, phys) {
                 PtFlags::AP_RW_EL0
             } else {
@@ -8052,8 +8042,16 @@ impl AddressSpace {
             // SAFETY: root valid + frame owned by this region (same
             // contract as the fresh-allocation path below).
             match unsafe { map_4kb(self.root, va, phys, flags) } {
-                Ok(()) | Err(MapError::AlreadyMapped) => {
+                Ok(()) => {
                     crate::rmap::add(phys, self.root, va);
+                    Ok(())
+                }
+                Err(MapError::AlreadyMapped) => {
+                    // SAFETY: TLBI VAAE1IS at EL1 is always legal; `v` is the
+                    // page-aligned faulting VA owned by this address space.
+                    unsafe {
+                        crate::aarch64::paging::tlb_invalidate_va_all_asids_inner_shareable(va);
+                    }
                     Ok(())
                 }
                 Err(_) => Err(AddressSpaceError::NotImplemented),
