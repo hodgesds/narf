@@ -3477,6 +3477,18 @@ fn musl_demo_cmd(args: &MuslDemoArgs) -> Result<()> {
         // SMP=16 — see condbcast_smoke above for the permanent-strand
         // regression pin.
         ("futex_contend_smoke", "futex-contend-ok"),
+        // FUTEX_WAKE_OP's read-modify-write on `uaddr2`. Linux does it with
+        // one locked instruction on the user address; a plain
+        // read-compute-write loses any update that lands in the gap, and a
+        // lost futex-word update surfaces much later as a condvar that never
+        // wakes. The case asserts an exact count instead, so a loss is a
+        // number rather than a timeout.
+        //
+        // Only meaningful where user tasks actually run on several CPUs —
+        // this batch boots `boot-init` at 16 vCPUs, where user-task SMP is
+        // live. It would pass vacuously under `kernel-test`, which keeps
+        // every user task on the BSP.
+        ("futex_wakeop_smoke", "futex-wakeop-ok"),
         // Systemd Type=notify topology on live SMP: a service process pinned
         // to CPU 1 wakes PID-1-like epoll_wait on CPU 0 with SCM credentials.
         ("notify_epoll_smp_smoke", "notify-epoll-smp-ok"),

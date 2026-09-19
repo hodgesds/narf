@@ -5218,6 +5218,14 @@ fn boot_userspace_init() {
                     "futex_contend_smoke",
                     narf_verification::NARF_FUTEX_CONTEND_SMOKE_ELF,
                 ),
+                // FUTEX_WAKE_OP's read-modify-write on `uaddr2`. Asserts an
+                // exact arithmetic invariant rather than watching for a hang:
+                // a lost update is a number, and a hang would only show up
+                // much later as a condvar that never wakes.
+                (
+                    "futex_wakeop_smoke",
+                    narf_verification::NARF_FUTEX_WAKEOP_SMOKE_ELF,
+                ),
                 // Condvar broadcast handoff: the FUTEX_REQUEUE path.
                 (
                     "condbcast_smoke",

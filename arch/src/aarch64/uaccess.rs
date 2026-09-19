@@ -172,3 +172,97 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
     }
     Ok(())
 }
+
+/// Fault-guarded 32-bit compare-and-exchange on a *user* address.
+///
+/// The aarch64 analogue of `crate::x86_64::smap::cmpxchg_user_guarded`, and
+/// the atomic half of `FUTEX_WAKE_OP`. Linux implements that op with a real
+/// exclusive-monitor sequence (`arch/arm64/include/asm/futex.h` — `ldxr` /
+/// `stxr` with `_ASM_EXTABLE` fixups); a plain load followed by a plain
+/// store lets two CPUs racing on one futex word silently lose updates.
+///
+/// Returns the word actually observed at `uaddr`: equal to `old` means the
+/// exchange happened, anything else means it did not and the caller should
+/// recompute and retry. `Err(())` is a fault the probe caught — an address
+/// a racing `munmap` removed — reported by the caller as `EFAULT`, the same
+/// contract [`copy_user_guarded`] provides.
+///
+/// `uaddr` must be 4-byte aligned. Futex addresses are alignment-checked at
+/// syscall entry, and unlike x86's `lock cmpxchg` an unaligned `ldxr` does
+/// not merely split a line — it raises an alignment fault outright.
+///
+/// # Safety
+/// - EL1, not IRQ context.
+/// - `uaddr` may be an arbitrary (even hostile) user pointer — surviving it
+///   is the point of this helper.
+pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Result<u32, ()> {
+    // Save DAIF.I, then mask IRQs: no context switch may run while the
+    // probe is armed (single per-CPU slot). Mirrors `copy_user_guarded`.
+    let daif: u64;
+    // SAFETY: reading DAIF at EL1 is always defined.
+    unsafe {
+        asm!("mrs {d}, daif", d = out(reg) daif, options(nomem, nostack, preserves_flags));
+    }
+    let irqs_were_unmasked = (daif & (1 << 7)) == 0;
+    // SAFETY: masking IRQs at EL1 is always legal.
+    unsafe {
+        crate::aarch64::asm::disable_interrupts();
+    }
+
+    let recovery: u64;
+    // SAFETY: ADR of a local label. `98f` resolves forward into the block
+    // below; a distinct number from `copy_user_guarded`'s `99` so the two
+    // cannot capture each other's label if both inline into one function.
+    unsafe {
+        asm!("adr {r}, 98f", r = out(reg) recovery, options(nostack, preserves_flags));
+    }
+    set_guarded_copy_armed(true);
+    probe::arm(recovery);
+
+    let observed: u32;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: `uaddr` may fault; on an unrecoverable abort the handler sets
+    // ELR to `98:`, whose `clrex` drops any exclusive reservation the
+    // faulting `ldxr` had opened (taking an exception does not architecturally
+    // guarantee the monitor is cleared). `observed` is then undefined, but
+    // `caught.fired` below discards it and returns Err. A healable abort
+    // heals first and the `eret` re-executes the faulting instruction; the
+    // `stxr` can still fail spuriously afterwards, which the retry handles.
+    unsafe {
+        asm!(
+            "1:",
+            "ldxr {obs:w}, [{p}]",
+            "cmp {obs:w}, {o:w}",
+            "b.ne 98f",
+            "stxr {st:w}, {n:w}, [{p}]",
+            // A spurious stxr failure re-reads rather than reporting a
+            // mismatch, so `observed == old` always means the store landed.
+            "cbnz {st:w}, 1b",
+            "98:",
+            "clrex",
+            p = in(reg) uaddr,
+            o = in(reg) old,
+            n = in(reg) new,
+            obs = out(reg) observed,
+            st = out(reg) _,
+            options(nostack),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+
+    let caught = probe::disarm();
+    set_guarded_copy_armed(false);
+
+    // Restore IRQ mask exactly as found.
+    if irqs_were_unmasked {
+        // SAFETY: re-enabling interrupts we masked above.
+        unsafe {
+            crate::aarch64::asm::enable_interrupts();
+        }
+    }
+
+    if caught.fired {
+        return Err(());
+    }
+    Ok(observed)
+}

@@ -344,6 +344,103 @@ pub unsafe fn copy_user_guarded(dst: *mut u8, src: *const u8, len: usize) -> Res
     Ok(())
 }
 
+/// Fault-guarded 32-bit compare-and-exchange on a *user* address.
+///
+/// The atomic half of `FUTEX_WAKE_OP`. Linux implements that op with a
+/// single locked instruction per arm (`xchgl`, `LOCK_PREFIX xaddl`, or a
+/// `cmpxchg` loop — `arch/x86/include/asm/futex.h`); the read-modify-write
+/// must not be decomposable into a separate load and store, or two CPUs
+/// racing on one futex word silently lose updates. Only the UP fallback in
+/// `include/asm-generic/futex.h` splits it, and even that holds
+/// `preempt_disable()`.
+///
+/// Returns the word actually observed at `uaddr`: equal to `old` means the
+/// exchange happened, anything else means it did not and the caller should
+/// recompute and retry. `Err(())` is a fault the probe caught — an address
+/// a racing `munmap` removed — which the caller reports as `EFAULT`, the
+/// same extable-fixup contract [`copy_user_guarded`] provides.
+///
+/// `uaddr` must be 4-byte aligned; futex addresses are alignment-checked
+/// at syscall entry, and an unaligned `lock cmpxchg` would otherwise split
+/// a cache line.
+///
+/// # Safety
+/// - CPL = 0, not IRQ context.
+/// - `uaddr` may be an arbitrary (even hostile) user pointer — surviving
+///   it is the point of this helper.
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn cmpxchg_user_guarded(uaddr: *mut u32, old: u32, new: u32) -> Result<u32, ()> {
+    use core::sync::atomic::{compiler_fence, Ordering};
+
+    use crate::x86_64::probe;
+
+    // Save IF, then CLI: no context switch may run while the probe is
+    // armed (single per-CPU slot), exactly as in `copy_user_guarded`.
+    let saved_rflags: u64;
+    // SAFETY: pushfq/pop/cli are always legal at CPL=0. Not `nostack`
+    // (pushfq uses the stack); not `preserves_flags` (cli clears IF).
+    unsafe {
+        asm!("pushfq", "pop {f}", "cli", f = out(reg) saved_rflags);
+    }
+    // IRQ masking pins execution to this CPU until the probe and the SMAP
+    // window are both closed, so the per-CPU slot resolves once.
+    let cpu = crate::current_cpu_id().raw() as usize;
+    let recovery: u64;
+    // SAFETY: LEA of a local label. `97f` resolves forward into the
+    // cmpxchg block below — GAS numeric labels span asm blocks emitted in
+    // order. A distinct number from `copy_user_guarded`'s `98` so the two
+    // cannot capture each other's label if both inline into one function.
+    unsafe {
+        asm!(
+            "lea {r}, [97f + rip]",
+            r = out(reg) recovery,
+            options(nostack, preserves_flags),
+        );
+    }
+    set_guarded_copy_armed_for(cpu, true);
+    probe::arm_for_cpu(cpu, recovery);
+    // SAFETY: open the user-access window; the matching `clac` below runs
+    // on both the fall-through and the recovery path (label 97 sits
+    // before it).
+    unsafe {
+        stac();
+    }
+    let observed: u32;
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: on an unrecoverable fault the trap handler rewrites the
+    // frame RIP to label 97; EAX is then undefined, but `caught.vector`
+    // below discards it and returns Err. On a healed #PF the iretq
+    // re-executes the cmpxchg with the same register state.
+    unsafe {
+        asm!(
+            "lock cmpxchg dword ptr [{p}], {n:e}",
+            "97:",
+            p = in(reg) uaddr,
+            n = in(reg) new,
+            inout("eax") old => observed,
+            options(nostack),
+        );
+    }
+    compiler_fence(Ordering::SeqCst);
+    // SAFETY: close the user-access window before anything else.
+    unsafe {
+        clac();
+    }
+    let caught = probe::disarm_for_cpu(cpu);
+    set_guarded_copy_armed_for(cpu, false);
+    // Restore IF exactly as found.
+    if saved_rflags & (1 << 9) != 0 {
+        // SAFETY: re-enabling interrupts we disabled above.
+        unsafe {
+            asm!("sti", options(nostack));
+        }
+    }
+    if caught.vector.is_some() {
+        return Err(());
+    }
+    Ok(observed)
+}
+
 /// Clear CR4.SMAP. Reserved for unit-test reset paths only.
 ///
 /// **DO NOT call this from production code.**

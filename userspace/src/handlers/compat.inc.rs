@@ -2613,6 +2613,67 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     Ok(())
 }
 
+/// Atomically compare-and-exchange the 32-bit word at userspace address
+/// `uptr`.
+///
+/// Returns the word actually observed: equal to `old` means the exchange
+/// happened, anything else means it did not and the caller recomputes and
+/// retries. `Err(EFAULT)` mirrors Linux's extable fixup — the address was
+/// validated but faulted unrecoverably anyway (a sibling thread `munmap`ed
+/// it mid-operation).
+///
+/// This exists because a user-word read-modify-write performed as
+/// `copy_from_user` + compute + `copy_to_user` is not one operation: two
+/// CPUs interleaving inside that window each write back a value derived
+/// from the same stale load, and one update is lost. Linux performs the
+/// `FUTEX_WAKE_OP` arithmetic with a single locked instruction for exactly
+/// this reason (`arch/x86/include/asm/futex.h`,
+/// `arch/arm64/include/asm/futex.h`).
+///
+/// `uptr` must be 4-byte aligned — callers get that from `get_futex_key`,
+/// which rejects a skewed address with `EINVAL` before reaching here.
+///
+/// # Safety
+/// - The caller's address space must match the AS that mapped `uptr`.
+/// - Must not be called from IRQ context.
+pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u32, u64> {
+    validate_user_range(uptr, 4)?;
+    if uptr % 4 != 0 {
+        // Unreachable via the futex paths (alignment is checked at syscall
+        // entry), but an unaligned `ldxr` is an alignment fault on aarch64
+        // rather than a slow split access, so refuse rather than trap.
+        return Err(EINVAL_CODE);
+    }
+    let ptr = uptr as *mut u32;
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: range- and alignment-validated user pointer; the guarded
+    // cmpxchg opens the SMAP bracket itself and catches an unrecoverable
+    // fault as Err instead of a kernel panic.
+    unsafe {
+        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT)
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above, via the EL1 exclusive-monitor sequence.
+    unsafe {
+        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT)
+    }
+    // SAFETY: any other target — no fault-fixup surface is implemented
+    // there, so fall back to a plain atomic on the mapped user word.
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    unsafe {
+        let a = &*(ptr as *const core::sync::atomic::AtomicU32);
+        Ok(match a.compare_exchange(
+            old,
+            new,
+            core::sync::atomic::Ordering::SeqCst,
+            core::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(v) => v,
+            Err(v) => v,
+        })
+    }
+}
+
 /// Allocate a kernel `Vec<u8>` of `len` bytes and fill it from userspace
 /// address `src_uptr`.
 ///
@@ -6757,41 +6818,79 @@ fn futex_wake_op(
     uaddr2: u64,
     encoded_op: u32,
 ) -> i64 {
-    const EFAULT: i64 = 14;
-    if uaddr2 == 0 {
-        return -EFAULT;
-    }
+    // `arch_futex_atomic_op_inuser` reports an op it does not implement as
+    // -ENOSYS, not -EINVAL (`arch/x86/include/asm/futex.h`); so does the
+    // cmp switch in `futex_atomic_op_inuser`.
+    const ENOSYS: i64 = 38;
+    // Linux keys BOTH words through `get_futex_key` before touching either
+    // (`kernel/futex/waitwake.c::futex_wake_op`). `uaddr` was keyed by the
+    // caller; keying `uaddr2` here is what makes a skewed second address
+    // -EINVAL and an unmapped one -EFAULT *before* any RMW work happens —
+    // and it is what lets the RMW below assume 4-byte alignment, which
+    // aarch64's `ldxr` requires outright.
+    let key2 = match get_futex_key(namespace, uaddr2) {
+        Ok(k) => k,
+        Err(e) => return -e,
+    };
     // Decode the op word: [31:28]=op (bit 0x8 = OPARG_SHIFT), [27:24]=cmp,
-    // [23:12]=oparg (12b), [11:0]=cmparg (12b).
+    // [23:12]=oparg, [11:0]=cmparg.
     let op_raw = (encoded_op >> 28) & 0xF;
     let oparg_shift = op_raw & 0x8 != 0;
     let op = op_raw & 0x7;
     let cmp = (encoded_op >> 24) & 0xF;
-    let mut oparg = (encoded_op >> 12) & 0xFFF;
-    let cmparg = (encoded_op & 0xFFF) as i32;
+    // Both operands are SIGNED 12-bit fields — Linux sign-extends them with
+    // `sign_extend32(.., 11)`. Reading them as unsigned turns the common
+    // `FUTEX_OP_ADD` of -1 into +4095, and every negative `cmparg`
+    // comparison into a large-positive one.
+    let mut oparg = sign_extend_12(encoded_op >> 12);
+    let cmparg = sign_extend_12(encoded_op);
     if oparg_shift {
-        oparg = 1u32 << (oparg & 31);
+        // Linux masks a shift count out of range (and warns) rather than
+        // failing the call, so a negative `oparg` shifts by `oparg & 31`.
+        oparg = 1i32 << (oparg & 31);
     }
-    // Atomically-ish RMW *uaddr2 (single-CPU cooperative for the handler;
-    // matches NARF's other user-word futex accesses).
+    // RMW *uaddr2 as ONE atomic operation.
+    //
+    // Doing this as copy_from_user + compute + copy_to_user is not one
+    // operation: two CPUs interleaving inside that window each write back a
+    // value derived from the same stale load, and one update is lost. That
+    // is observable from unprivileged userspace — see the
+    // `futex_wakeop_smoke` musl-demo case, which loses ~6% of its updates
+    // against the split version and none against this one. Linux uses a
+    // single locked instruction per arm for exactly this reason; only the
+    // UP fallback in `include/asm-generic/futex.h` splits the access, and
+    // even that holds `preempt_disable()`.
+    //
+    // The compute-and-retry loop is Linux's own shape for the arms x86 has
+    // no single instruction for (OR/ANDN/XOR go through a `cmpxchg` loop);
+    // applying it uniformly keeps one code path for all five.
     let mut b = [0u8; 4];
     // SAFETY: copy_from_user range-validates uaddr2 + SMAP-brackets the read.
     if unsafe { copy_from_user(&mut b, uaddr2) }.is_err() {
-        return -EFAULT;
+        return -(EFAULT as i64);
     }
-    let oldval = u32::from_ne_bytes(b);
-    let newval = match op {
-        0 => oparg,                      // FUTEX_OP_SET
-        1 => oldval.wrapping_add(oparg), // FUTEX_OP_ADD
-        2 => oldval | oparg,             // FUTEX_OP_OR
-        3 => oldval & !oparg,            // FUTEX_OP_ANDN
-        4 => oldval ^ oparg,             // FUTEX_OP_XOR
-        _ => return -22,                 // EINVAL — unknown op
+    let mut cur = u32::from_ne_bytes(b);
+    let oldval = loop {
+        let newval = match op {
+            0 => oparg as u32,                      // FUTEX_OP_SET
+            1 => cur.wrapping_add(oparg as u32),    // FUTEX_OP_ADD
+            2 => cur | oparg as u32,                // FUTEX_OP_OR
+            3 => cur & !(oparg as u32),             // FUTEX_OP_ANDN
+            4 => cur ^ oparg as u32,                // FUTEX_OP_XOR
+            _ => return -ENOSYS,
+        };
+        // SAFETY: uaddr2 is range- and alignment-validated by the
+        // `get_futex_key` above; the guarded cmpxchg brackets the user
+        // access and reports an unrecoverable fault as Err.
+        match unsafe { cmpxchg_user_u32(uaddr2, cur, newval) } {
+            // Observing exactly what we compared against means the store
+            // landed, so `cur` is the pre-op value Linux reports as oldval.
+            Ok(seen) if seen == cur => break cur,
+            // Someone else wrote first: recompute from what is there now.
+            Ok(seen) => cur = seen,
+            Err(e) => return -(e as i64),
+        }
     };
-    // SAFETY: copy_to_user range-validates uaddr2 + SMAP-brackets the write.
-    if unsafe { copy_to_user(uaddr2, &newval.to_ne_bytes()) }.is_err() {
-        return -EFAULT;
-    }
     // Wake `nr_wake` on uaddr unconditionally.
     let key = futex_key(namespace, uaddr);
     futex_bump_counter_key(key);
@@ -6805,14 +6904,21 @@ fn futex_wake_op(
         3 => ov <= cmparg, // LE
         4 => ov > cmparg,  // GT
         5 => ov >= cmparg, // GE
-        _ => return -22,   // EINVAL
+        _ => return -ENOSYS,
     };
     if cond {
-        let key2 = futex_key(namespace, uaddr2);
         futex_bump_counter_key(key2);
         woken += futex_wake_waiters_key(key2, nr_wake2) as i64;
     }
     woken
+}
+
+/// Sign-extend the low 12 bits of a `FUTEX_WAKE_OP` operand field, matching
+/// Linux's `sign_extend32(value, 11)`. Both `oparg` and `cmparg` are signed
+/// 12-bit fields packed into the encoded op word.
+#[inline]
+fn sign_extend_12(value: u32) -> i32 {
+    ((value & 0xFFF) as i32) << 20 >> 20
 }
 
 /// Per-uaddr wait counter. FUTEX_WAKE bumps it; FUTEX_WAIT samples

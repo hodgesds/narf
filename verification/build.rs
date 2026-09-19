@@ -584,6 +584,7 @@ fn main() {
         "psched_smoke",
         "futex2_smoke",
         "futex_contend_smoke",
+        "futex_wakeop_smoke",
         "condbcast_smoke",
         "notify_epoll_smp_smoke",
         "keyring_smoke",
