@@ -2405,6 +2405,137 @@ fn smoke_userspace_futex_wake_op_rmw() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_userspace_futex_wake_op_rmw);
 
+/// `futex_wake_op` operand decoding and error codes, against
+/// `kernel/futex/waitwake.c::futex_atomic_op_inuser` and
+/// `arch/x86/include/asm/futex.h::arch_futex_atomic_op_inuser`.
+///
+/// Three divergences this pins, each of which the sibling RMW smoke above
+/// passes straight through (it uses a positive oparg, a known op and a
+/// known cmp, on an aligned address):
+///   * `oparg`/`cmparg` are SIGNED 12-bit fields (`sign_extend32(.., 11)`).
+///     Read as unsigned, `FUTEX_OP_ADD` of -1 adds 4095.
+///   * an unimplemented op or cmp is -ENOSYS, not -EINVAL.
+///   * `uaddr2` goes through `get_futex_key`, so a skewed address is
+///     -EINVAL before any RMW happens — it must not silently succeed.
+fn smoke_userspace_futex_wake_op_operands() -> TestResult {
+    // Kernel-test fixture: this smoke calls the syscall entry point directly
+    // and passes it a kernel stack pointer as a stand-in user buffer. See
+    // `handlers::kernel_buffers_guard`.
+    let _kbuf = crate::handlers::kernel_buffers_guard();
+    use crate::{
+        install_core_syscalls, install_global, kernel_syscall_entry, syscall::__test_clear_global,
+        Syscall, SyscallArgs, SyscallReturn, SyscallTable, TrapContext,
+    };
+    struct FakeCtx {
+        args: SyscallArgs,
+        ret: Option<SyscallReturn>,
+    }
+    impl TrapContext for FakeCtx {
+        fn args(&self) -> &SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+
+    __test_clear_global();
+    let mut t = SyscallTable::new();
+    install_core_syscalls(&mut t);
+    install_global(t);
+
+    // Returns the raw syscall result (negative errno, or the woken count).
+    fn wake_op(uaddr2: u64, encoded: u64) -> i64 {
+        let mut ctx = FakeCtx {
+            args: SyscallArgs {
+                // Wait-queue key only (no memory access), but still
+                // alignment-checked by `get_futex_key`.
+                arg0: 0xF00C,
+                arg1: 5, // FUTEX_WAKE_OP
+                arg2: 1,
+                arg3: 1,
+                arg4: uaddr2,
+                arg5: encoded,
+            },
+            ret: None,
+        };
+        kernel_syscall_entry(Syscall::Futex.raw(), &mut ctx);
+        match ctx.ret {
+            Some(r) if r.status == SyscallReturn::OK => r.value as i64,
+            _ => i64::MIN,
+        }
+    }
+
+    const ENOSYS: i64 = -38;
+    const EINVAL: i64 = -22;
+    // Layout: [31:28]=op [27:24]=cmp [23:12]=oparg [11:0]=cmparg.
+    // FUTEX_OP_ADD, FUTEX_OP_CMP_EQ, oparg = -1 as a 12-bit field.
+    // cmp is FUTEX_OP_CMP_EQ (0), so only op and oparg are set here.
+    let add_minus_one: u64 = (1 << 28) | (0xFFF << 12);
+    let mut word: u32 = 10;
+    let uaddr2 = &mut word as *mut u32 as u64;
+
+    let r = wake_op(uaddr2, add_minus_one);
+    if r < 0 {
+        __test_clear_global();
+        return TestResult::Fail("FUTEX_OP_ADD with a negative oparg returned an error");
+    }
+    // Sign-extended: 10 + (-1) = 9. Unsigned would give 10 + 4095 = 4105.
+    if word != 9 {
+        __test_clear_global();
+        return TestResult::Fail("oparg not sign-extended (expected 10 + -1 = 9)");
+    }
+
+    // Unimplemented op (5..=7 are unassigned) is -ENOSYS, and must not have
+    // touched the word.
+    word = 42;
+    let bad_op: u64 = (7 << 28) | (5 << 12);
+    if wake_op(uaddr2, bad_op) != ENOSYS {
+        __test_clear_global();
+        return TestResult::Fail("unimplemented FUTEX_WAKE_OP op did not return -ENOSYS");
+    }
+    if word != 42 {
+        __test_clear_global();
+        return TestResult::Fail("unimplemented op still modified *uaddr2");
+    }
+
+    // Unimplemented cmp is likewise -ENOSYS. Linux applies the op first and
+    // only then rejects the comparison, so the word DOES change here.
+    word = 1;
+    let bad_cmp: u64 = (1 << 28) | (9 << 24) | (5 << 12);
+    if wake_op(uaddr2, bad_cmp) != ENOSYS {
+        __test_clear_global();
+        return TestResult::Fail("unimplemented FUTEX_WAKE_OP cmp did not return -ENOSYS");
+    }
+    if word != 6 {
+        __test_clear_global();
+        return TestResult::Fail("unimplemented cmp must still apply the op (expected 1+5=6)");
+    }
+
+    // A skewed `uaddr2` is -EINVAL from `get_futex_key`, not a silent
+    // success. Offsetting a u32's address by one byte cannot be aligned.
+    let mut aligned: u64 = 0;
+    let skewed = (&mut aligned as *mut u64 as u64) + 1;
+    if wake_op(skewed, (1 << 28) | (5 << 12)) != EINVAL {
+        __test_clear_global();
+        return TestResult::Fail("misaligned uaddr2 was not rejected with -EINVAL");
+    }
+
+    __test_clear_global();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_userspace_futex_wake_op_operands);
+
 fn smoke_userspace_sched_priority_bounds_and_param() -> TestResult {
     // Kernel-test fixture: this smoke calls the syscall entry point directly and
     // passes it kernel `.rodata` / stack / heap pointers as stand-in user

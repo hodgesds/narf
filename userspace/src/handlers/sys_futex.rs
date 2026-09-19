@@ -138,8 +138,9 @@ pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
     };
     match op {
         FUTEX_WAKE_OP => {
-            // `futex_wake_op` keys BOTH words, so either one being skewed
-            // is -EINVAL before any of the RMW work happens.
+            // `futex_wake_op` keys `uaddr2` itself (as Linux does) before
+            // it touches either word, so a skewed or unmapped second
+            // address is -EINVAL/-EFAULT before any of the RMW work.
             let r = futex_wake_op(
                 namespace,
                 uaddr,
