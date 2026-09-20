@@ -11,7 +11,8 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
     // Per-branch errnos (the old bare -1 sentinel reached libc as EPERM for
     // every failure). Modelled on sendmsg(2): a bad/unknown registered buffer
     // or out-of-range slice is -EFAULT (bad send buffer), a bad fd is -EBADF,
-    // and a send failure carries the socket's own errno.
+    // a non-socket fd is -ENOTSOCK, and a send failure carries the socket's
+    // own errno.
     let task = current_task_id();
     let (vaddr, slice_len) = match crate::socket::registered_buffer_slice(task, buf_id, off, len) {
         Some(s) => s,
@@ -20,10 +21,10 @@ pub(crate) fn sys_sock_send_zc(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let sock = match current_socket(fd) {
-        Some(s) => s,
-        None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+    let sock = match current_socket_result(fd) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };

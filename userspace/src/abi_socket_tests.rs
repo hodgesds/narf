@@ -2583,6 +2583,16 @@ fn smoke_abi_socket_sock_send_zc_neg() -> TestResult {
         if r != -9 {
             return Err("sock_send_zc(bad fd) must return -EBADF (-9)");
         }
+        // A live non-socket fd (e.g. pipe) → -ENOTSOCK (-88).
+        let mut pipefd = [0u8; 8];
+        if call(Syscall::Pipe2.raw(), a1(pipefd.as_mut_ptr() as u64, 0)) != Some(0) {
+            return Err("pipe2 setup failed");
+        }
+        let non_socket = i32::from_ne_bytes(pipefd[..4].try_into().unwrap()) as u64;
+        let r = call(n, a3(non_socket, bid as u64, 0, 8)).ok_or("status not Ok")?;
+        if r != -88 {
+            return Err("sock_send_zc(non-socket fd) must return -ENOTSOCK (-88)");
+        }
         Ok(())
     })
 }
