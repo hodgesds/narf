@@ -1149,14 +1149,85 @@ fn smoke_abi_proc_pidfd_getfd_pos() -> TestResult {
             Some(fd) if fd >= 0 => fd as u64,
             _ => return Err("pidfd_open setup failed"),
         };
-        match call(Syscall::PidfdGetfd.raw(), a3(pidfd, srcfd, 0, 0)) {
-            Some(newfd) if newfd >= 0 && newfd as u64 != srcfd => Ok(()),
-            Some(_) => Err("pidfd_getfd returned an unexpected fd"),
-            None => Err("pidfd_getfd returned non-Ok status"),
+        let newfd = match call(Syscall::PidfdGetfd.raw(), a3(pidfd, srcfd, 0, 0)) {
+            Some(newfd) if newfd >= 0 && newfd as u64 != srcfd => newfd as u64,
+            Some(_) => return Err("pidfd_getfd returned an unexpected fd"),
+            None => return Err("pidfd_getfd returned non-Ok status"),
+        };
+        // Linux receive_fd always sets O_CLOEXEC on the newly installed descriptor.
+        const F_GETFD: u64 = 1;
+        const FD_CLOEXEC: i64 = 1;
+        if call(Syscall::Fcntl.raw(), a1(newfd, F_GETFD)) != Some(FD_CLOEXEC) {
+            return Err("pidfd_getfd must set FD_CLOEXEC on the new descriptor");
         }
+        let _ = call(Syscall::Close.raw(), a0(newfd));
+        let _ = call(Syscall::Close.raw(), a0(pidfd));
+        let _ = call(Syscall::Close.raw(), a0(srcfd));
+        Ok(())
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_pos);
+
+fn smoke_abi_proc_pidfd_getfd_eperm() -> TestResult {
+    const EPERM: i64 = -1;
+    with_setup(|| {
+        const CALLER_TASK: u64 = 0xB500;
+        const CALLER_PID: u64 = 0xB500;
+        const TARGET_TASK: u64 = 0xB501;
+        const TARGET_PID: u64 = 0xB501;
+        let register = |task: u64, pid: u64| {
+            crate::task::release_task(task);
+            let _ = crate::task::Task::new_registered(task, pid);
+            crate::handlers::register_task_to_pid(task, pid);
+            crate::handlers::register_pid_task_mapping(pid, task);
+        };
+        let result = (|| {
+            register(CALLER_TASK, CALLER_PID);
+            register(TARGET_TASK, TARGET_PID);
+            let drop_to = |task: u64, id: u64| -> Result<(), &'static str> {
+                set_task(task);
+                if call(Syscall::Setresgid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresgid should succeed while privileged");
+                }
+                if call(Syscall::Setresuid.raw(), a2(id, id, id)) != Some(0) {
+                    return Err("setresuid should succeed while privileged");
+                }
+                Ok(())
+            };
+            drop_to(TARGET_TASK, 1000)?;
+            drop_to(CALLER_TASK, 2000)?;
+
+            // Mint a pidfd pointing to TARGET_PID.
+            let state = crate::pidfd::mint_for(TARGET_PID, TARGET_TASK, true);
+            let file: alloc::sync::Arc<dyn narf_filesystem::FileOps> =
+                alloc::sync::Arc::new(crate::pidfd::PidFdFile::new(state));
+            let pidfd = match fd::install(
+                CALLER_TASK,
+                crate::fd::FdEntry {
+                    ops: file,
+                    offset: 0,
+                    flags: 0,
+                    status_flags: 0,
+                },
+            ) {
+                Some(fd) => fd as u64,
+                None => return Err("install pidfd failed"),
+            };
+
+            set_task(CALLER_TASK);
+            let r = call(Syscall::PidfdGetfd.raw(), a3(pidfd, 0, 0, 0));
+            if r != Some(EPERM) {
+                return Err("pidfd_getfd without ptrace permission must return -EPERM");
+            }
+            Ok(())
+        })();
+        set_task(FAKE_TASK);
+        crate::task::release_task(CALLER_TASK);
+        crate::task::release_task(TARGET_TASK);
+        result
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_proc_pidfd_getfd_eperm);
 
 // ── wait4(2) — non-blocking reap paths ──
 

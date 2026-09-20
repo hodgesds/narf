@@ -36,14 +36,21 @@ pub(crate) fn sys_pidfd_getfd(ctx: &mut dyn TrapContext) {
             }
         }
     };
+    if !ptrace_may_access(task, target_tid) {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        return;
+    }
     let entry = fd::with_table(target_tid, |t| t.get(targetfd).cloned()).flatten();
-    let entry = match entry {
+    let mut entry = match entry {
         Some(e) => e,
         None => {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
             return;
         }
     };
+    // Linux `receive_fd(file, NULL, O_CLOEXEC)`: the descriptor in the
+    // calling process is always allocated with close-on-exec set.
+    entry.flags |= crate::fd::FD_CLOEXEC;
     match fd::install(task, entry) {
         Some(n) => ctx.set_return(SyscallReturn::ok(n as u64)),
         None => {
