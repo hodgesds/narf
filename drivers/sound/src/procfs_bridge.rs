@@ -2,14 +2,8 @@
 //!
 //! # Status
 //!
-//! The Wave-19 procfs framework agent (which would expose a
-//! `register_proc_dir` / `register_proc_file` API for out-of-crate
-//! drivers to inject entries into `/proc`) has **not yet landed** as of
-//! the date this file was written.
-//!
-//! The current `narf-filesystem` procfs implementation (`filesystem/src/procfs.rs`)
-//! is a **monolithic ProcRoot** that matches entry names in a hardcoded
-//! `match` arm.  There is no public registration hook for new subtrees.
+//! Exposes ALSA-compatible `/proc/asound/*` entries via `narf-filesystem`'s
+//! dynamic procfs registry (`register_proc`).
 //!
 //! ## What is implemented here
 //!
@@ -31,50 +25,17 @@
 //!    `/proc/asound/card<N>/pcm<M><P|C>/info`.  Returns basic PCM caps.
 //!    Linux ref: `sound/core/pcm_info.c::snd_pcm_stream_proc_info_read`.
 //!
-//! ## TODO — when Wave-19 procfs framework lands
+//! ## Wiring into procfs
 //!
-//! Wire the above generators into procfs by calling the new
-//! `register_proc_dir`/`register_proc_file` API:
-//!
-//! ```rust,ignore
-//! // In register_procfs_asound():
-//! let asound = procfs::register_proc_dir("asound");
-//! procfs::register_proc_file(&asound, "cards",   render_cards_list);
-//! procfs::register_proc_file(&asound, "version", render_version);
-//! for card in list_cards() {
-//!     let card_dir = procfs::register_proc_dir(
-//!         &asound, &format!("card{}", card.index));
-//!     for codec in 0..1u32 {
-//!         procfs::register_proc_file(
-//!             &card_dir,
-//!             &format!("codec#{}", codec),
-//!             move || render_codec_dump(card.index, codec),
-//!         );
-//!     }
-//!     // PCM info files per stream direction.
-//!     for m in 0..card.playback_count {
-//!         procfs::register_proc_file(
-//!             &card_dir,
-//!             &format!("pcm{}P/info", m),
-//!             move || render_pcm_info(card.index, m, false),
-//!         );
-//!     }
-//!     for m in 0..card.capture_count {
-//!         procfs::register_proc_file(
-//!             &card_dir,
-//!             &format!("pcm{}C/info", m),
-//!             move || render_pcm_info(card.index, m, true),
-//!         );
-//!     }
-//! }
-//! ```
-//!
-//! Until that API exists, `/proc/asound` is not reachable via the VFS
-//! path resolver; these generators are only exercised via the unit
-//! tests below.
+//! `register_procfs_asound()` registers the above generators into `/proc/asound/*`
+//! via `narf-filesystem`'s dynamic procfs registry (`register_proc`).
 
 use alloc::format;
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+
+use narf_filesystem::procfs::{register_proc, ProcFile};
 
 use crate::list_cards;
 
@@ -177,20 +138,112 @@ pub fn render_pcm_info(card_index: u32, device: u32, is_capture: bool) -> String
     }
 }
 
-// ── Registration stub ─────────────────────────────────────────────────
+// ── ProcFile adapters ─────────────────────────────────────────────────
+
+#[derive(Debug)]
+struct AsoundCardsFile;
+
+impl ProcFile for AsoundCardsFile {
+    fn read(&self) -> Vec<u8> {
+        render_cards_list().into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct AsoundVersionFile;
+
+impl ProcFile for AsoundVersionFile {
+    fn read(&self) -> Vec<u8> {
+        render_version().into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct AsoundCodecFile {
+    card_index: u32,
+    codec_index: u32,
+}
+
+impl ProcFile for AsoundCodecFile {
+    fn read(&self) -> Vec<u8> {
+        render_codec_dump(self.card_index, self.codec_index).into_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct AsoundPcmInfoFile {
+    card_index: u32,
+    device: u32,
+    is_capture: bool,
+}
+
+impl ProcFile for AsoundPcmInfoFile {
+    fn read(&self) -> Vec<u8> {
+        render_pcm_info(self.card_index, self.device, self.is_capture).into_bytes()
+    }
+}
+
+// ── Registration entry points ─────────────────────────────────────────
+
+/// Register `/proc/asound/card<N>/*` entries for a single card.
+pub fn register_card_procfs(card: &crate::CardInfo) {
+    for codec in 0..1u32 {
+        register_proc(
+            &format!("asound/card{}/codec#{}", card.index, codec),
+            Arc::new(AsoundCodecFile {
+                card_index: card.index,
+                codec_index: codec,
+            }),
+        );
+    }
+    for m in 0..card.playback_count {
+        register_proc(
+            &format!("asound/card{}/pcm{}p/info", card.index, m),
+            Arc::new(AsoundPcmInfoFile {
+                card_index: card.index,
+                device: m,
+                is_capture: false,
+            }),
+        );
+        register_proc(
+            &format!("asound/card{}/pcm{}P/info", card.index, m),
+            Arc::new(AsoundPcmInfoFile {
+                card_index: card.index,
+                device: m,
+                is_capture: false,
+            }),
+        );
+    }
+    for m in 0..card.capture_count {
+        register_proc(
+            &format!("asound/card{}/pcm{}c/info", card.index, m),
+            Arc::new(AsoundPcmInfoFile {
+                card_index: card.index,
+                device: m,
+                is_capture: true,
+            }),
+        );
+        register_proc(
+            &format!("asound/card{}/pcm{}C/info", card.index, m),
+            Arc::new(AsoundPcmInfoFile {
+                card_index: card.index,
+                device: m,
+                is_capture: true,
+            }),
+        );
+    }
+}
 
 /// Register `/proc/asound/*` entries.
 ///
-/// TODO: wire this once the Wave-19 procfs framework agent lands and
-/// exposes `register_proc_dir` / `register_proc_file`.  Until then
-/// this is a no-op.
+/// Registers `/proc/asound/cards`, `/proc/asound/version`, and any
+/// `/proc/asound/card<N>/*` entries for currently probed sound cards.
 pub fn register_procfs_asound() {
-    // TODO(Wave-19): call procfs::register_proc_dir("asound") and
-    // register_proc_file for "cards", "version", "card<N>/codec#<C>",
-    // "card<N>/pcm<M>P/info", "card<N>/pcm<M>C/info".
-    //
-    // Blocked on: Wave-19 procfs framework agent adding the registration
-    // API to `narf-filesystem`'s procfs module.
+    register_proc("asound/cards", Arc::new(AsoundCardsFile));
+    register_proc("asound/version", Arc::new(AsoundVersionFile));
+    for card in list_cards() {
+        register_card_procfs(&card);
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────

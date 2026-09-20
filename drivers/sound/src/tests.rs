@@ -956,3 +956,74 @@ fn smoke_devfs_multi_card_enumerate() -> TestResult {
     }
 }
 kernel_test_in!("drivers/sound", smoke_devfs_multi_card_enumerate);
+
+// ── #36: /proc/asound/* VFS lookup and read ──────────────────────────
+
+fn smoke_procfs_asound_vfs_lookup() -> TestResult {
+    use narf_filesystem::FsInstance;
+    crate::__reset_for_test();
+    mixer::__reset_for_test();
+    register_card("HDA-Intel", "HDA Intel PCH", "HDA Intel PCH", 0, 1, 1);
+    crate::procfs_bridge::register_procfs_asound();
+
+    let root = narf_filesystem::procfs::ProcFs.root();
+    let asound_dir = match root.lookup_dir("asound") {
+        Some(d) => d,
+        None => return TestResult::Fail("/proc/asound directory lookup failed"),
+    };
+    let cards_file = match asound_dir.lookup("cards") {
+        Some(f) => f,
+        None => return TestResult::Fail("/proc/asound/cards file lookup failed"),
+    };
+    let mut buf = [0u8; 256];
+    let n = match crate::tests_support::poll_once(cards_file.read(0, &mut buf)) {
+        Ok(n) if n > 0 => n,
+        _ => return TestResult::Fail("reading /proc/asound/cards failed"),
+    };
+    let text = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("/proc/asound/cards is not valid UTF-8"),
+    };
+    if !text.contains("HDA-Intel") || !text.contains("HDA Intel PCH") {
+        return TestResult::Fail("/proc/asound/cards content mismatch");
+    }
+
+    let version_file = match asound_dir.lookup("version") {
+        Some(f) => f,
+        None => return TestResult::Fail("/proc/asound/version file lookup failed"),
+    };
+    let n = match crate::tests_support::poll_once(version_file.read(0, &mut buf)) {
+        Ok(n) if n > 0 => n,
+        _ => return TestResult::Fail("reading /proc/asound/version failed"),
+    };
+    let text = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("/proc/asound/version is not valid UTF-8"),
+    };
+    if !text.contains("Advanced Linux Sound Architecture") {
+        return TestResult::Fail("/proc/asound/version content mismatch");
+    }
+
+    let card0_dir = match asound_dir.lookup_dir("card0") {
+        Some(d) => d,
+        None => return TestResult::Fail("/proc/asound/card0 directory lookup failed"),
+    };
+    let codec_file = match card0_dir.lookup("codec#0") {
+        Some(f) => f,
+        None => return TestResult::Fail("/proc/asound/card0/codec#0 file lookup failed"),
+    };
+    let n = match crate::tests_support::poll_once(codec_file.read(0, &mut buf)) {
+        Ok(n) if n > 0 => n,
+        _ => return TestResult::Fail("reading /proc/asound/card0/codec#0 failed"),
+    };
+    let text = match core::str::from_utf8(&buf[..n]) {
+        Ok(s) => s,
+        Err(_) => return TestResult::Fail("/proc/asound/card0/codec#0 is not valid UTF-8"),
+    };
+    if !text.contains("Codec: HDA Intel PCH") {
+        return TestResult::Fail("/proc/asound/card0/codec#0 content mismatch");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("drivers/sound", smoke_procfs_asound_vfs_lookup);
