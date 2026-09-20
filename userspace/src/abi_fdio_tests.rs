@@ -3572,6 +3572,85 @@ fn smoke_abi_fdio_copy_file_range_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_copy_file_range_neg);
 
+fn smoke_abi_fdio_copy_file_range_overflow_overlap_immutable() -> TestResult {
+    with_memfs("/abi", "abi", &[("src", b"abcdefgh"), ("dst", b"")], || {
+        let in_fd = open_fd(b"/abi/src\0")?;
+        let out_fd = open_fd(b"/abi/dst\0")?;
+
+        // 1. Overlapping ranges within the same file -> -EINVAL.
+        let mut off_in = 0u64;
+        let mut off_out = 1u64;
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: &mut off_in as *mut u64 as u64,
+                arg2: in_fd as u64,
+                arg3: &mut off_out as *mut u64 as u64,
+                arg4: 2,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == -22 => {}
+            _ => return Err("copy_file_range overlapping same-file ranges must return -EINVAL"),
+        }
+
+        // 2. Offsets overflowing loff_t -> -EOVERFLOW (-75).
+        let mut off_in_overflow = (i64::MAX - 100) as u64;
+        let mut off_out_valid = 0u64;
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: &mut off_in_overflow as *mut u64 as u64,
+                arg2: out_fd as u64,
+                arg3: &mut off_out_valid as *mut u64 as u64,
+                arg4: 200,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == -75 => {}
+            _ => return Err("copy_file_range with overflowing offset must return -EOVERFLOW"),
+        }
+
+        // 3. Immutable destination -> -EPERM (-1).
+        const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+        const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+        let mut flags: u32 = FS_IMMUTABLE_FL;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(
+                out_fd as u64,
+                FS_IOC_SETFLAGS,
+                &mut flags as *mut u32 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_SETFLAGS failed");
+        }
+        match call_raw(
+            Syscall::CopyFileRange.raw(),
+            SyscallArgs {
+                arg0: in_fd as u64,
+                arg1: 0,
+                arg2: out_fd as u64,
+                arg3: 0,
+                arg4: 1,
+                arg5: 0,
+            },
+        ) {
+            r if r.status == SyscallReturn::OK && r.value as i64 == -1 => {}
+            _ => return Err("copy_file_range into immutable file must return -EPERM"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_copy_file_range_overflow_overlap_immutable
+);
+
 // ── tee ────────────────────────────────────────────────────────────
 //
 // tee(fd_in, fd_out, len, flags). Both ends must be distinct pipes; a

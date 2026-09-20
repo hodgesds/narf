@@ -81,6 +81,41 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64));
         return;
     }
+
+    // Linux generic_copy_file_checks (fs/read_write.c:1518):
+    // Immutable output file -> -EPERM.
+    if output.ops.inode_flags() & narf_filesystem::FS_IMMUTABLE_FL != 0 {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        return;
+    }
+
+    let start_in = explicit_in.unwrap_or_else(|| input.description.offset());
+    let start_out = explicit_out.unwrap_or_else(|| output.description.offset());
+
+    // Linux generic_copy_file_checks (fs/read_write.c:1525):
+    // Offsets wrapping or overflowing loff_t -> -EOVERFLOW.
+    if (start_in as i64).checked_add(len as i64).is_none()
+        || (start_out as i64).checked_add(len as i64).is_none()
+    {
+        ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+        return;
+    }
+
+    // Linux generic_copy_file_checks (fs/read_write.c:1540):
+    // Don't allow overlapped copying within the same file -> -EINVAL.
+    let same_file = Arc::ptr_eq(&input.ops, &output.ops)
+        || (input.ops.ino() != 0
+            && input.ops.ino() == output.ops.ino()
+            && input.ops.inode_attrs().dev == output.ops.inode_attrs().dev);
+    if same_file
+        && len > 0
+        && start_out + (len as u64) > start_in
+        && start_out < start_in + (len as u64)
+    {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+
     if len == 0 {
         ctx.set_return(SyscallReturn::ok(0));
         return;
@@ -123,8 +158,6 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         return;
     }
 
-    let start_in = explicit_in.unwrap_or_else(|| input.description.offset());
-    let start_out = explicit_out.unwrap_or_else(|| output.description.offset());
     let mut cur_in = start_in;
     let mut cur_out = start_out;
     let mut copied = 0usize;
