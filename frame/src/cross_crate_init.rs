@@ -112,6 +112,11 @@ fn install_console_signal_hook() {
     // crate, so the UDP RX demux has to ask it before dropping a datagram
     // no in-kernel socket claimed.
     narf_net::udp_sock::install_user_deliver_hook(narf_userspace::socket::deliver_wire_datagram);
+    // `/proc/<pid>/io` reads the per-task accounting, which lives with the
+    // other per-task tables in the userspace crate.
+    narf_filesystem::procfs::install_io_accounting_hook(
+        narf_userspace::handlers::io_accounting_for_pid,
+    );
 }
 
 fn install_proc_hooks() {

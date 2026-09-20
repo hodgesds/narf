@@ -379,17 +379,28 @@ fn render_ext(pid: u64, field: PidExtField) -> Vec<u8> {
 
 /// `/proc/<pid>/io` — per-process I/O accounting.
 ///
-/// Linux ref: `fs/proc/base.c:proc_tid_io_accounting`.
-/// TODO: Hook into the fd table's byte-transfer counters once those
-/// are tracked per task; today all fields are zero.
-fn render_io(_pid: u64) -> String {
-    // TODO: wire rchar/wchar/syscr/syscw/read_bytes/write_bytes from
-    // the per-task fd-table I/O counters once those land.
+/// Linux ref: `fs/proc/base.c:proc_tid_io_accounting`, reading
+/// `task_struct.ioac`.
+///
+/// `rchar`/`wchar`/`syscr`/`syscw` are the `CONFIG_TASK_XACCT` half and are
+/// real: the syscall layer accounts every read/write-family call, the way
+/// `vfs_read`/`vfs_write` do.
+///
+/// `read_bytes`/`write_bytes`/`cancelled_write_bytes` are the
+/// `CONFIG_TASK_IO_ACCOUNTING` half and mean something different — bytes
+/// this task caused to move to or from STORAGE, which needs block-layer
+/// attribution NARF does not have. They stay 0 deliberately rather than
+/// being aliased onto the character counts: `iotop` and `pidstat -d` read
+/// these specifically to separate page-cache traffic from disk traffic, so
+/// copying rchar into read_bytes would not be an approximation, it would be
+/// a wrong answer to a different question.
+fn render_io(pid: u64) -> String {
+    let (rchar, wchar, syscr, syscw) = crate::procfs::io_accounting_for(pid);
     let mut s = String::new();
-    let _ = writeln!(s, "rchar: 0");
-    let _ = writeln!(s, "wchar: 0");
-    let _ = writeln!(s, "syscr: 0");
-    let _ = writeln!(s, "syscw: 0");
+    let _ = writeln!(s, "rchar: {rchar}");
+    let _ = writeln!(s, "wchar: {wchar}");
+    let _ = writeln!(s, "syscr: {syscr}");
+    let _ = writeln!(s, "syscw: {syscw}");
     let _ = writeln!(s, "read_bytes: 0");
     let _ = writeln!(s, "write_bytes: 0");
     let _ = writeln!(s, "cancelled_write_bytes: 0");

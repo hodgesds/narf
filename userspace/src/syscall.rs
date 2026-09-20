@@ -3316,6 +3316,63 @@ impl Syscall {
 ///
 /// An unknown `num` returns [`SyscallReturn::not_implemented`] — -ENOSYS in
 /// the value register, `NarfStatus::InvalidOp` in the status word.
+/// Which half of `/proc/<pid>/io` a syscall contributes to.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum IoClass {
+    Read,
+    Write,
+}
+
+/// The read/write family Linux accounts, i.e. everything that reaches
+/// `vfs_read`/`vfs_write`/`do_readv`/`do_writev`.
+///
+/// `recvmsg`/`sendmsg` are deliberately absent: they do not go through
+/// those paths in Linux, so they do not move `rchar`/`wchar`. A socket
+/// read via `read(2)` does, and is covered by `Read` below.
+fn io_accounting_class(variant: Syscall) -> Option<IoClass> {
+    match variant {
+        Syscall::Read | Syscall::Pread64 | Syscall::Readv | Syscall::Preadv | Syscall::Preadv2 => {
+            Some(IoClass::Read)
+        }
+        Syscall::Write
+        | Syscall::Pwrite64
+        | Syscall::Writev
+        | Syscall::Pwritev
+        | Syscall::Pwritev2 => Some(IoClass::Write),
+        _ => None,
+    }
+}
+
+/// Forwards every `TrapContext` call and records the return, so the
+/// accounting above can see what the handler answered without changing the
+/// value the caller receives.
+struct IoAccountCtx<'a> {
+    inner: &'a mut dyn TrapContext,
+    ret: Option<SyscallReturn>,
+}
+
+impl TrapContext for IoAccountCtx<'_> {
+    fn args(&self) -> &SyscallArgs {
+        self.inner.args()
+    }
+    fn set_return(&mut self, ret: SyscallReturn) {
+        self.ret = Some(ret);
+        self.inner.set_return(ret);
+    }
+    fn user_rsp(&self) -> u64 {
+        self.inner.user_rsp()
+    }
+    fn redirect_to_kernel(&mut self, r: u64, s: u64) -> bool {
+        self.inner.redirect_to_kernel(r, s)
+    }
+    fn rip(&self) -> u64 {
+        self.inner.rip()
+    }
+    fn set_rip(&mut self, rip: u64) {
+        self.inner.set_rip(rip)
+    }
+}
+
 pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
     let p = GLOBAL_TABLE.load(Ordering::Acquire);
     if p.is_null() {
@@ -3356,7 +3413,32 @@ pub fn kernel_syscall_entry(num: u32, ctx: &mut dyn TrapContext) {
             // SAFETY: in-flight task's poller-pinned UserTaskCtx.
             crate::handlers::open_kernel_span(unsafe { &*u });
         }
-        table.dispatch_ctx_versioned(variant, version, ctx);
+        // `/proc/<pid>/io` accounting. Linux does this at ONE funnel —
+        // `vfs_read`/`vfs_write` — so every syscall that reaches the file
+        // op is counted and none is counted twice. NARF's equivalent
+        // single point is here, after dispatch, where the return value of
+        // whichever handler ran is visible. Doing it per handler would
+        // mean touching every early-return path, and `syscr`/`syscw` count
+        // FAILED calls too, so the error exits are exactly the ones that
+        // would get missed.
+        //
+        // Only the read/write family pays for the wrapper.
+        match io_accounting_class(variant) {
+            Some(class) => {
+                let mut cap = IoAccountCtx {
+                    inner: ctx,
+                    ret: None,
+                };
+                table.dispatch_ctx_versioned(variant, version, &mut cap);
+                let ret = cap.ret.map(|r| r.value as i64).unwrap_or(0);
+                let task = crate::handlers::current_task_id();
+                match class {
+                    IoClass::Read => crate::handlers::io_account_read(task, ret),
+                    IoClass::Write => crate::handlers::io_account_write(task, ret),
+                }
+            }
+            None => table.dispatch_ctx_versioned(variant, version, ctx),
+        }
         #[cfg(feature = "syscall-trace")]
         if syscall_trace_relevant(variant) {
             use core::fmt::Write as _;
