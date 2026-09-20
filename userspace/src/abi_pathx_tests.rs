@@ -1433,6 +1433,74 @@ kernel_test_in!(
     smoke_abi_pathx_readlinkat_dirfd_enotdir_and_ebadf
 );
 
+fn smoke_abi_pathx_linkat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let old = b"f\0";
+        let new = b"newlink\0";
+
+        // 1. Invalid flags (not AT_SYMLINK_FOLLOW or AT_EMPTY_PATH) -> -EINVAL (-22).
+        match call(
+            Syscall::Linkat.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0x8888,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("linkat with invalid flags must return -EINVAL"),
+        }
+
+        // 2. Non-directory olddirfd with relative path -> -ENOTDIR (-20).
+        match call(
+            Syscall::Linkat.raw(),
+            a4(fd, old.as_ptr() as u64, AT_FDCWD, new.as_ptr() as u64, 0),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("linkat with non-directory olddirfd must return -ENOTDIR"),
+        }
+
+        // 3. Non-directory newdirfd with relative path -> -ENOTDIR (-20).
+        let dir = b"/p2\0";
+        let dfd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, 0, 0),
+        ) {
+            Some(d) if d >= 0 => d as u64,
+            _ => return Err("openat(dir) did not return an fd"),
+        };
+        match call(
+            Syscall::Linkat.raw(),
+            a4(dfd, old.as_ptr() as u64, fd, new.as_ptr() as u64, 0),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("linkat with non-directory newdirfd must return -ENOTDIR"),
+        }
+
+        // 4. Bad olddirfd (< 0, != AT_FDCWD) -> -EBADF (-9).
+        match call(
+            Syscall::Linkat.raw(),
+            a4(9999, old.as_ptr() as u64, dfd, new.as_ptr() as u64, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("linkat with unallocated olddirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_linkat_flags_and_dirfd_errno);
+
 // ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
 //
 // systemd-logind resolves each seat-master DRM device by devnum:
