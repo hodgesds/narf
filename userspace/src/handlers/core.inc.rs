@@ -4421,6 +4421,7 @@ pub(crate) const CAP_SYS_ADMIN: u32 = 21;
 /// be given the whole of it.
 pub(crate) const CAP_SYSLOG: u32 = 34;
 pub(crate) const CAP_SYS_TIME: u32 = 25;
+pub(crate) const CAP_WAKE_ALARM: u32 = 35;
 /// Linux checkpoint/restore authority accepted by clone3(set_tid), alongside
 /// CAP_SYS_ADMIN.
 pub(crate) const CAP_CHECKPOINT_RESTORE: u32 = 40;

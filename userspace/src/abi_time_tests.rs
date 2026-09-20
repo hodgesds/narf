@@ -1222,6 +1222,71 @@ fn smoke_abi_time_timerfd_create_cloexec() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_create_cloexec);
 
+fn smoke_abi_time_timerfd_create_neg() -> TestResult {
+    with_setup(|| {
+        const EINVAL: i64 = -22;
+        const EPERM: i64 = -1;
+        const CLOCK_REALTIME: u64 = 0;
+        const CLOCK_MONOTONIC: u64 = 1;
+        const CLOCK_BOOTTIME: u64 = 7;
+        const CLOCK_REALTIME_ALARM: u64 = 8;
+        const CLOCK_BOOTTIME_ALARM: u64 = 9;
+        const TFD_CLOEXEC: u64 = 0x80000;
+        const TFD_NONBLOCK: u64 = 0o4000;
+
+        // 1. Invalid clockids return -EINVAL.
+        for bad_clock in [
+            CLOCK_PROCESS_CPUTIME_ID,
+            CLOCK_THREAD_CPUTIME_ID,
+            CLOCK_MONOTONIC_RAW,
+            CLOCK_REALTIME_COARSE,
+            CLOCK_MONOTONIC_COARSE,
+            11, // CLOCK_TAI
+            (-1i64) as u64,
+            999,
+        ] {
+            if call(Syscall::TimerfdCreate.raw(), a1(bad_clock, 0)) != Some(EINVAL) {
+                return Err("timerfd_create with invalid clockid must return -EINVAL");
+            }
+        }
+
+        // 2. Invalid flags return -EINVAL.
+        for bad_flags in [1, 2, 0x10, 0x1000, !(TFD_CLOEXEC | TFD_NONBLOCK)] {
+            if call(Syscall::TimerfdCreate.raw(), a1(CLOCK_MONOTONIC, bad_flags)) != Some(EINVAL) {
+                return Err("timerfd_create with invalid flags must return -EINVAL");
+            }
+        }
+
+        // 3. Valid clocks (REALTIME, MONOTONIC, BOOTTIME) succeed.
+        for good_clock in [CLOCK_REALTIME, CLOCK_MONOTONIC, CLOCK_BOOTTIME] {
+            let fd = match call(Syscall::TimerfdCreate.raw(), a1(good_clock, 0)) {
+                Some(fd) if fd >= 0 => fd,
+                _ => return Err("timerfd_create with valid clock must succeed"),
+            };
+            let _ = call(Syscall::Close.raw(), a0(fd as u64));
+        }
+
+        // 4. Alarm clocks without CAP_WAKE_ALARM return -EPERM.
+        for alarm_clock in [CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM] {
+            let r = call(Syscall::TimerfdCreate.raw(), a1(alarm_clock, 0));
+            if r != Some(EPERM) {
+                if let Some(fd) = r {
+                    if fd >= 0 {
+                        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+                        continue;
+                    }
+                }
+                return Err(
+                    "timerfd_create with alarm clock without CAP_WAKE_ALARM must return -EPERM",
+                );
+            }
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_time_timerfd_create_neg);
+
 // Helper: open a timerfd and return its fd, or Err.
 fn make_timerfd() -> Result<u64, &'static str> {
     match call(Syscall::TimerfdCreate.raw(), a1(CLOCK_MONOTONIC, 0)) {
