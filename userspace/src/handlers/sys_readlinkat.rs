@@ -25,18 +25,12 @@ pub(crate) fn sys_readlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    // Honour a real directory fd (see sys_openat): resolve a relative path
-    // against the directory backing `dirfd`. chase_symlinks readlinkat()s a
-    // component relative to its parent-dir fd.
-    const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-        path_str
-    } else {
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
-            }
-            _ => path_str,
+    let task = current_task_id();
+    let effective = match resolve_at_path(task, dirfd, &path_str) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
     };
     readlink_impl(ctx, effective, buf_ptr, buf_len);
