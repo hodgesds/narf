@@ -652,6 +652,33 @@ pub fn install_ns_proc_hooks(
     NS_IDMAP_WRITE_HOOK.store(idmap_write as usize, Ordering::Release);
 }
 
+/// `fn(pid) -> (rchar, wchar, syscr, syscw)` — per-task I/O accounting for
+/// `/proc/<pid>/io`. Lives in the userspace crate with the rest of the
+/// per-task tables, so procfs asks for it rather than reaching in.
+pub type IoAccountingFn = fn(u64) -> (u64, u64, u64, u64);
+
+static IO_ACCOUNTING_HOOK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+/// Wire the `/proc/<pid>/io` accounting source.
+pub fn install_io_accounting_hook(hook: IoAccountingFn) {
+    IO_ACCOUNTING_HOOK.store(hook as usize, Ordering::Release);
+}
+
+/// `(rchar, wchar, syscr, syscw)` for `pid`, or all zeros when no hook is
+/// installed — which is what an in-kernel test with no task table sees.
+pub(crate) fn io_accounting_for(pid: u64) -> (u64, u64, u64, u64) {
+    let raw = IO_ACCOUNTING_HOOK.load(Ordering::Acquire);
+    if raw == 0 {
+        return (0, 0, 0, 0);
+    }
+    // SAFETY: `raw` was stored by `install_io_accounting_hook` from an
+    // `IoAccountingFn`, the only writer of this slot, and function pointers
+    // are never unmapped.
+    let hook: IoAccountingFn = unsafe { core::mem::transmute(raw) };
+    hook(pid)
+}
+
 /// Wire just the mount-namespace renderer. Mount namespaces are available to
 /// Linux compatibility tasks independently of the optional container feature;
 /// in particular, systemd unshares one for service sandboxing and then reads

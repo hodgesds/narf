@@ -7305,6 +7305,88 @@ pub fn __test_task_mempolicy(task: u64) -> Option<(u32, u64, u32)> {
         .map(|p| (p.mode, p.nodemask, p.home_node))
 }
 
+// ── Per-task I/O accounting (`/proc/<pid>/io`) ────────────────────────
+
+/// `struct task_io_accounting` (`include/linux/task_io_accounting.h`).
+///
+/// Only the `CONFIG_TASK_XACCT` half is tracked: `rchar`/`wchar` count
+/// bytes moved by read/write-family syscalls and `syscr`/`syscw` count the
+/// calls themselves. `read_bytes`/`write_bytes` are the
+/// `CONFIG_TASK_IO_ACCOUNTING` half and mean something different — bytes
+/// this task caused to be fetched from or sent to STORAGE — which needs
+/// block-layer attribution NARF does not have. They stay 0 rather than
+/// being aliased onto the character counts, because a monitoring tool
+/// reading them would take that as real disk traffic.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct TaskIoAccounting {
+    pub rchar: u64,
+    pub wchar: u64,
+    pub syscr: u64,
+    pub syscw: u64,
+}
+
+static IO_ACCOUNTING: narf_lib::sync::IrqSafeSpinLock<Option<BTreeMap<u64, TaskIoAccounting>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(None);
+
+/// Account one read-family syscall.
+///
+/// `vfs_read` (`fs/read_write.c:533`):
+///
+/// ```c
+/// if (ret > 0) {
+///         ...
+///         add_rchar(current, ret);
+/// }
+/// inc_syscr(current);
+/// ```
+///
+/// The asymmetry is the ABI: the byte counter moves only on a positive
+/// return, while the syscall counter counts every ATTEMPT — a read that
+/// failed, or returned 0 at EOF, still shows up in `syscr`.
+pub(crate) fn io_account_read(task: u64, ret: i64) {
+    let mut g = IO_ACCOUNTING.lock();
+    let e = g.get_or_insert_with(BTreeMap::new).entry(task).or_default();
+    if ret > 0 {
+        e.rchar = e.rchar.saturating_add(ret as u64);
+    }
+    e.syscr = e.syscr.saturating_add(1);
+}
+
+/// Account one write-family syscall. Same asymmetry as the read side
+/// (`fs/read_write.c:622`).
+pub(crate) fn io_account_write(task: u64, ret: i64) {
+    let mut g = IO_ACCOUNTING.lock();
+    let e = g.get_or_insert_with(BTreeMap::new).entry(task).or_default();
+    if ret > 0 {
+        e.wchar = e.wchar.saturating_add(ret as u64);
+    }
+    e.syscw = e.syscw.saturating_add(1);
+}
+
+/// Read a task's I/O accounting, for `/proc/<pid>/io`.
+pub fn io_accounting_of(task: u64) -> TaskIoAccounting {
+    IO_ACCOUNTING
+        .lock()
+        .as_ref()
+        .and_then(|m| m.get(&task).copied())
+        .unwrap_or_default()
+}
+
+/// `/proc/<pid>/io` source, in the shape procfs asks for.
+///
+/// The pid is a process id; NARF's accounting is keyed by task id, so this
+/// resolves through the same mapping the other per-pid procfs files use.
+pub fn io_accounting_for_pid(pid: u64) -> (u64, u64, u64, u64) {
+    let task = pid_to_task_raw(pid).unwrap_or(pid);
+    let a = io_accounting_of(task);
+    (a.rchar, a.wchar, a.syscr, a.syscw)
+}
+
+#[doc(hidden)]
+pub fn __test_io_accounting_reset() {
+    *IO_ACCOUNTING.lock() = Some(BTreeMap::new());
+}
+
 /// Test accessor: the interleave cursor stored for `task`, if any.
 #[doc(hidden)]
 pub fn __test_interleave_index(task: u64) -> Option<u64> {
@@ -11480,6 +11562,10 @@ fn release_task_tables(tid: u64) {
         if let Some(m) = NUMA_BALANCE_TICKS.lock().as_mut() {
             m.remove(&tid);
         }
+    }
+    // I/O accounting dies with the task, as `task_struct.ioac` does.
+    if let Some(m) = IO_ACCOUNTING.lock().as_mut() {
+        m.remove(&tid);
     }
     narf_scheduler::clear_task_mems_allowed(tid);
     if let Some(m) = PKEY_TABLE.lock().as_mut() {

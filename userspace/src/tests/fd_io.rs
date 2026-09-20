@@ -4135,3 +4135,124 @@ kernel_test_in!(
     "userspace",
     smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof
 );
+
+/// `/proc/<pid>/io` reports real counters, and counts a FAILED call.
+///
+/// `vfs_read` (`fs/read_write.c:533`) moves the two halves differently:
+///
+/// ```c
+/// if (ret > 0) {
+///         ...
+///         add_rchar(current, ret);
+/// }
+/// inc_syscr(current);
+/// ```
+///
+/// The byte counter advances only on a positive return; the syscall
+/// counter counts every ATTEMPT. A test that only ever does successful
+/// reads cannot tell the two apart — both would simply go up — so this one
+/// drives a failing read as well and asserts `syscr` moved while `rchar`
+/// did not. Every field used to be hardcoded to 0.
+fn smoke_proc_pid_io_counts_reads_and_failures() -> TestResult {
+    use crate::handlers::{__test_io_accounting_reset, io_accounting_of};
+    __test_io_accounting_reset();
+    let task = crate::handlers::current_task_id();
+
+    let before = io_accounting_of(task);
+    if before.rchar != 0 || before.syscr != 0 {
+        return TestResult::Fail("reset should zero the accounting");
+    }
+
+    // A successful read moves both halves.
+    crate::handlers::io_account_read(task, 128);
+    let a = io_accounting_of(task);
+    if a.rchar != 128 || a.syscr != 1 {
+        return TestResult::Fail("a successful read must move rchar and syscr");
+    }
+
+    // A failed read (-EBADF) moves ONLY the syscall counter.
+    crate::handlers::io_account_read(task, -9);
+    let b = io_accounting_of(task);
+    if b.rchar != 128 {
+        return TestResult::Fail("a failed read must not move rchar");
+    }
+    if b.syscr != 2 {
+        return TestResult::Fail("a failed read must still count in syscr");
+    }
+
+    // EOF (0 bytes) is likewise a call but no bytes.
+    crate::handlers::io_account_read(task, 0);
+    let c = io_accounting_of(task);
+    if c.rchar != 128 || c.syscr != 3 {
+        return TestResult::Fail("a zero-byte read must count in syscr only");
+    }
+
+    // The write side is independent of the read side.
+    crate::handlers::io_account_write(task, 64);
+    let d = io_accounting_of(task);
+    if d.wchar != 64 || d.syscw != 1 {
+        return TestResult::Fail("a write must move wchar and syscw");
+    }
+    if d.rchar != 128 || d.syscr != 3 {
+        return TestResult::Fail("a write must not disturb the read counters");
+    }
+
+    // ── The dispatch shim, end to end ──
+    // Everything above exercises the counters directly. This drives a real
+    // read(2) through `kernel_syscall_entry` so the accounting hook itself
+    // is proven wired — a counter nothing increments is the bug this whole
+    // change is about.
+    __test_io_accounting_reset();
+    struct FakeCtx {
+        args: crate::SyscallArgs,
+        ret: Option<crate::SyscallReturn>,
+    }
+    impl crate::TrapContext for FakeCtx {
+        fn args(&self) -> &crate::SyscallArgs {
+            &self.args
+        }
+        fn set_return(&mut self, r: crate::SyscallReturn) {
+            self.ret = Some(r);
+        }
+        fn user_rsp(&self) -> u64 {
+            0
+        }
+        fn redirect_to_kernel(&mut self, _r: u64, _s: u64) -> bool {
+            false
+        }
+        fn rip(&self) -> u64 {
+            0
+        }
+        fn set_rip(&mut self, _rip: u64) {}
+    }
+    // `kernel_syscall_entry` answers ENOSYS and returns early when no
+    // table is installed, so the dispatch — and the accounting with it —
+    // would never run.
+    crate::syscall::__test_clear_global();
+    let mut table = crate::SyscallTable::new();
+    install_core_syscalls(&mut table);
+    install_global(table);
+
+    let mut buf = [0u8; 8];
+    let mut ctx = FakeCtx {
+        args: crate::SyscallArgs {
+            arg0: 0xFFFF_FF00, // a fd nothing owns → EBADF
+            arg1: buf.as_mut_ptr() as u64,
+            arg2: buf.len() as u64,
+            ..Default::default()
+        },
+        ret: None,
+    };
+    kernel_syscall_entry(crate::Syscall::Read.raw(), &mut ctx);
+    let e = io_accounting_of(crate::handlers::current_task_id());
+    if e.syscr != 1 {
+        return TestResult::Fail("a read(2) through the syscall entry must count in syscr");
+    }
+    if e.rchar != 0 {
+        return TestResult::Fail("a failing read(2) must not move rchar");
+    }
+
+    __test_io_accounting_reset();
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_proc_pid_io_counts_reads_and_failures);
