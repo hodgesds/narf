@@ -37,6 +37,15 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
         return;
     }
 
+    // Truncation rewrites data, so BOTH flags refuse it: `do_ftruncate`
+    // checks `IS_APPEND` (returning -EPERM) and reaches `notify_change`,
+    // whose `may_setattr` bars an immutable or append-only inode from an
+    // ATTR_SIZE change.
+    if let Err(errno) = immutable_check(endpoint.ops.inode_flags(), true, false) {
+        ctx.set_return(SyscallReturn::ok(errno as u64));
+        return;
+    }
+
     // `do_truncate` -> `notify_change` -> `inode_newsize_ok`: RLIMIT_FSIZE
     // bounds a truncate that GROWS the file. Shrinking is always allowed,
     // including from above the limit — that is how a process gets back under
@@ -45,6 +54,10 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-errno) as u64));
         return;
     }
+
+    // `do_truncate` passes `ATTR_KILL_SUID | ATTR_KILL_SGID` alongside the
+    // size change, for the same reason a write does.
+    file_remove_privs(endpoint.ops.as_ref(), task);
 
     match poll_blocking(endpoint.ops.truncate(len)) {
         Some(Ok(())) => {
