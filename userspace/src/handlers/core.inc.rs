@@ -3412,11 +3412,35 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
 fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
     const EXDEV: i64 = -18;
     const ENOENT: i64 = -2;
+    const ENOTDIR: i64 = -20;
     const EISDIR: i64 = -21;
     let res = current_resolve_two_parents_absolute(
         old_abs,
         new_abs,
         |_fs, old_dir, old_leaf, new_dir, new_leaf| {
+            let old_is_dir = old_dir.lookup_dir(old_leaf).is_some();
+            let old_node = poll_blocking(old_dir.lookup_async(old_leaf));
+            let old_is_file = old_node.as_ref().is_some_and(|r| r.is_ok());
+            if !old_is_dir && !old_is_file {
+                return ENOENT;
+            }
+
+            let new_is_dir = new_dir.lookup_dir(new_leaf).is_some();
+            let new_node = poll_blocking(new_dir.lookup_async(new_leaf));
+            let new_is_file = new_node.as_ref().is_some_and(|r| r.is_ok());
+
+            // Linux vfs_rename / POSIX rename:
+            // Cannot overwrite a non-directory with a directory (-ENOTDIR),
+            // and cannot overwrite a directory with a non-directory (-EISDIR).
+            if new_is_dir || new_is_file {
+                if old_is_dir && !new_is_dir {
+                    return ENOTDIR;
+                }
+                if !old_is_dir && new_is_dir {
+                    return EISDIR;
+                }
+            }
+
             match poll_blocking(old_dir.rename_to(old_leaf, &*new_dir, new_leaf, 0)) {
                 Some(Ok(())) => return 0,
                 Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
@@ -3425,10 +3449,10 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
             // Directories would need a DirOps-shaped `link_node` the
             // trait doesn't have yet; report EXDEV so callers fall back
             // to a recursive copy rather than silently doing nothing.
-            if old_dir.lookup_dir(old_leaf).is_some() {
-                return EISDIR;
+            if old_is_dir {
+                return EXDEV;
             }
-            let node = match poll_blocking(old_dir.lookup_async(old_leaf)) {
+            let node = match old_node {
                 Some(Ok(n)) => n,
                 _ => return ENOENT,
             };

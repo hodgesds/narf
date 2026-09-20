@@ -1891,6 +1891,86 @@ kernel_test_in!(
     smoke_abi_fsx2_cross_dir_rename_in_private_mount_namespace
 );
 
+fn smoke_abi_fsx2_cross_dir_rename_errno() -> TestResult {
+    with_memfs("/abi-xrn", "xrn", &[], || {
+        const AT_FDCWD: u64 = (-100i64) as u64;
+        const O_CREAT_WRONLY: u64 = 0o100 | 0o1;
+
+        for dir in [
+            c"/abi-xrn/d1",
+            c"/abi-xrn/d2",
+            c"/abi-xrn/d1/sub",
+            c"/abi-xrn/d2/target_dir",
+        ] {
+            if call(
+                Syscall::Mkdirat.raw(),
+                a2(AT_FDCWD, dir.as_ptr() as u64, 0o755),
+            ) != Some(0)
+            {
+                return Err("mkdir failed");
+            }
+        }
+        let src_file = c"/abi-xrn/d1/f";
+        let fd = call_open(src_file.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+        if fd < 0 {
+            return Err("create file failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        let target_file = c"/abi-xrn/d2/target_file";
+        let fd = call_open(target_file.as_ptr() as u64, O_CREAT_WRONLY).unwrap_or(-1);
+        if fd < 0 {
+            return Err("create target file failed");
+        }
+        let _ = call(Syscall::Close.raw(), a0(fd as u64));
+
+        // 1. Moving across different mounts returns -EXDEV (-18).
+        let r = call(
+            Syscall::Renameat.raw(),
+            a3(
+                AT_FDCWD,
+                src_file.as_ptr() as u64,
+                AT_FDCWD,
+                c"/dev/xrn_foreign".as_ptr() as u64,
+            ),
+        );
+        if r != Some(-18) {
+            return Err("cross-mount rename must return -EXDEV (-18)");
+        }
+
+        // 2. Renaming a non-directory over an existing directory returns -EISDIR (-21).
+        let r = call(
+            Syscall::Renameat.raw(),
+            a3(
+                AT_FDCWD,
+                src_file.as_ptr() as u64,
+                AT_FDCWD,
+                c"/abi-xrn/d2/target_dir".as_ptr() as u64,
+            ),
+        );
+        if r != Some(-21) {
+            return Err("renaming a file over a directory must return -EISDIR (-21)");
+        }
+
+        // 3. Renaming a directory over an existing non-directory returns -ENOTDIR (-20).
+        let r = call(
+            Syscall::Renameat.raw(),
+            a3(
+                AT_FDCWD,
+                c"/abi-xrn/d1/sub".as_ptr() as u64,
+                AT_FDCWD,
+                target_file.as_ptr() as u64,
+            ),
+        );
+        if r != Some(-20) {
+            return Err("renaming a directory over a file must return -ENOTDIR (-20)");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_fsx2_cross_dir_rename_errno);
+
 fn smoke_abi_fsx2_open_tree_preserves_descendant_mounts_pos() -> TestResult {
     with_setup(|| {
         const CLONE_NEWNS: u64 = 0x0002_0000;
