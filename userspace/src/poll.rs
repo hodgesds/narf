@@ -663,6 +663,13 @@ pub(crate) fn poll_wait_kernel(
         Some(deadline) => uctx.sleep_deadline_ns.store(deadline, Ordering::Release),
     }
 
+    // Snapshot the net readiness generation BEFORE the readiness scan below, so
+    // the park routine's non-epoll `net_io_wait` lost-wake guard
+    // (`io_wait_generation_raced`) can detect a `notify` that races our
+    // check→register window. A stale snapshot here would make that guard
+    // re-execute forever (there is no per-fd ready-list for a raw poll set).
+    uctx.epoll_park_gen
+        .store(narf_net::readiness::generation(), Ordering::Release);
     install_poll_files(task_id, fds);
     let ready = poll_scan(task_id, fds);
     if ready != 0 {
