@@ -5538,6 +5538,23 @@ impl SocketFile {
         Ok(n)
     }
 
+    /// Whether this AF_UNIX socket is a *connected* endpoint — a
+    /// `socketpair(2)` pair, or a stream/seqpacket/datagram that finished
+    /// `connect`/`accept` and holds crossed delivery rings — as opposed to a
+    /// bound/named datagram that delivers through the address registry.
+    ///
+    /// Mirrors the routing predicate in [`Self::dispatch_op`], which already
+    /// steers a connected `SOCK_DGRAM` socketpair to the connected
+    /// stream/packet path. The SCM_RIGHTS send path needs the same test:
+    /// systemd's `netns_storage_socket` is a `SOCK_DGRAM` socketpair whose
+    /// `sendmsg` stores the netns fd with no `msg_name`, so it must go through
+    /// the connected sender (which delivers to the peer ring) and not the
+    /// address-registry dispatcher (which has no destination and answers
+    /// -ENOTCONN → every `PrivateNetwork=` service failed EXIT_NETWORK).
+    pub(crate) fn is_unix_connected(&self) -> bool {
+        matches!(&*self.state.lock(), SocketState::UnixConnected { .. })
+    }
+
     /// Send an AF_UNIX datagram with SCM_RIGHTS. `sd_notify` uses this exact
     /// shape for `FDSTORE=1`: descriptor-bearing notification datagrams are
     /// not AF_UNIX streams, so they must bypass `unix_sendmsg`'s stream ring.

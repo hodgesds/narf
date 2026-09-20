@@ -4041,6 +4041,49 @@ impl VfsRegistry {
         self.mount_arc(authority, target, bind)
     }
 
+    /// Mount a writable overlay at `path`: the directory currently visible at
+    /// `path` becomes the read-only lower layer and `upper` (a writable FS such
+    /// as a `TmpFs`) is the writable upper. Reads fall through to the existing
+    /// content while writes land in `upper`. This is the correct shape for
+    /// making a read-only-root subtree writable WITHOUT hiding its contents — a
+    /// plain tmpfs overmount would shadow them. (Concretely: an empty tmpfs over
+    /// `/home/narf` hid the distro user's populated `~/.config`, so KConfig /
+    /// ksycoca failed and the Plasma session died with a black screen.)
+    pub fn mount_overlay<F: FsInstance>(
+        &self,
+        authority: &Cap<MountPoint, Grant>,
+        path: &str,
+        name: &'static str,
+        upper: F,
+    ) -> Result<Cap<MountPoint, Write>, FsError> {
+        authority.check_live()?;
+        // Capture the directory currently at `path` as the overlay LOWER, using
+        // the same longest-mount-prefix resolution as `bind_mount`. It is held
+        // as a direct `Arc<dyn DirOps>`, independent of the mount table, so the
+        // overmount below does not shadow the lower from the overlay's own view
+        // (and there is no resolve-through-the-mount recursion).
+        let q = self.inner.lock();
+        let source_mount = q
+            .iter()
+            .filter(|m| {
+                path == m.path
+                    || m.path == "/"
+                    || (path.starts_with(m.path.as_str())
+                        && path.as_bytes().get(m.path.len()) == Some(&b'/'))
+            })
+            .max_by_key(|m| m.path.len())
+            .ok_or(FsError::NotFound)?;
+        let source_fs = source_mount.fs.clone();
+        let rel = String::from(path[source_mount.path.len()..].trim_start_matches('/'));
+        drop(q);
+        let lower = build_bind_fs(&source_fs, &rel)?.root();
+        // `upper.root()` (a `MemDir` Arc) owns the tmpfs tree AND its superblock
+        // (`MemDir.superblock: Arc<MemSuper>`), so the `upper` FsInstance wrapper
+        // may drop here without losing the tree or its quota accounting.
+        let overlay = OverlayFs::new(name, upper.root(), alloc::vec![lower]);
+        self.mount_arc(authority, path, Arc::new(overlay))
+    }
+
     /// List mount paths. Used by `/proc/mounts`-shaped surfaces and by
     /// statfs when the caller wants to know what's where. Returns
     /// owned Strings so the lock is released before the caller walks

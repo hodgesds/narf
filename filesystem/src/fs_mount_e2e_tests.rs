@@ -306,6 +306,79 @@ fn smoke_vfs_mount_read_unmount() -> TestResult {
 }
 kernel_test_in!("filesystem/e2e/mount", smoke_vfs_mount_read_unmount);
 
+/// `registry().mount_overlay()`: a writable overlay mounted OVER a populated
+/// directory must (1) still expose the lower layer's files through full path
+/// resolution — the fix for the empty-tmpfs-overmount that hid the distro user's
+/// ~/.config and black-screened the Plasma session — and (2) accept writes into
+/// the tmpfs upper, visible through the same path. The existing OverlayFs unit
+/// smokes call `overlay.root()` directly; this exercises the registry-mount +
+/// resolve_absolute (topmost-mount) path the runtime actually uses.
+fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
+    use crate::TmpFs;
+    use alloc::format;
+    const BASE: &str = "/ovmnt";
+
+    // Lower: a populated dir standing in for a read-only home's ~/.config.
+    let lower = MemFs::with_seeds("ovmnt-lower", &[("kdeglobals", b"REAL-CONFIG")]);
+    let auth = bootstrap_mount_authority();
+    let base_handle = match registry().mount(&auth, BASE, lower) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount base failed"),
+    };
+
+    // Overlay a fresh writable tmpfs upper over the populated dir.
+    let upper = match TmpFs::from_options("mode=0700", 0, 0) {
+        Ok(fs) => fs,
+        Err(_) => return TestResult::Fail("tmpfs upper build failed"),
+    };
+    let ov_handle = match registry().mount_overlay(&auth, BASE, "ovmnt-ov", upper) {
+        Ok(h) => h,
+        Err(_) => return TestResult::Fail("mount_overlay failed"),
+    };
+
+    // (1) The lower file resolves through the overmounted overlay (topmost).
+    let f = match registry().resolve_absolute(&format!("{BASE}/kdeglobals"), |fs, rel| {
+        resolve(fs.root(), rel)
+    }) {
+        Some(Ok(f)) => f,
+        _ => return TestResult::Fail("lower file hidden by the overlay (regression)"),
+    };
+    let mut buf = vec![0u8; 32];
+    match poll_once(f.read(0, &mut buf)) {
+        Some(Ok(n)) if &buf[..n] == b"REAL-CONFIG" => {}
+        _ => return TestResult::Fail("lower read-through content mismatch"),
+    }
+
+    // (2) A file created through the mount lands in the tmpfs upper (it is NOT in
+    //     the lower seed) and is visible via the same path — proving resolution
+    //     goes through the overlay and writes are accepted.
+    let created = registry().with_mount(BASE, |fs| poll_once(fs.root().create("onlyupper")));
+    match created {
+        Some(Some(Ok(nf))) => match poll_once(nf.write(0, b"UP")) {
+            Some(Ok(2)) => {}
+            _ => return TestResult::Fail("write to overlay-created file failed"),
+        },
+        _ => return TestResult::Fail("create through overlay failed"),
+    }
+    if !matches!(
+        registry().resolve_absolute(&format!("{BASE}/onlyupper"), |fs, rel| resolve(
+            fs.root(),
+            rel
+        )),
+        Some(Ok(_))
+    ) {
+        return TestResult::Fail("upper-written file not visible through the overlay");
+    }
+
+    let _ = registry().unmount(&ov_handle, BASE);
+    let _ = registry().unmount(&base_handle, BASE);
+    TestResult::Pass
+}
+kernel_test_in!(
+    "filesystem/e2e/mount",
+    smoke_vfs_mount_overlay_lower_visible_and_writable
+);
+
 /// Mount stacking (Linux overmount): a mount onto an already-occupied path
 /// succeeds and shadows the one below; resolution sees the topmost; unmount
 /// pops it and reveals the mount underneath. systemd's ProtectHostname= binds

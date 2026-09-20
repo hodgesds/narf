@@ -406,20 +406,45 @@ fn kmsg_visible_message(buf: &[u8]) -> &str {
     msg.trim_end_matches('\n')
 }
 
-struct DevKmsg;
+/// `/dev/kmsg` reader — created fresh per open (see the devfs lookup), so
+/// `read_end` is this open's private cursor.
+#[derive(Default)]
+struct DevKmsg {
+    /// High-water byte offset this open has read (or seeked) up to. epoll polls
+    /// `poll_readiness_at` with the STALE `item.offset` snapshotted at
+    /// `EPOLL_CTL_ADD`, NOT the fd's live position — so a reader (journald) that
+    /// has drained past that snapshot is reported readable forever and busy-
+    /// loops `epoll_wait` at 100% CPU, starving the box and blocking everyone
+    /// who logs to journald. Track the live drain progress here and base
+    /// readiness on it, mirroring Linux's per-open `/dev/kmsg` seq cursor.
+    read_end: core::sync::atomic::AtomicUsize,
+}
 
-impl FileOps for DevKmsg {
-    fn poll_readiness_at(&self, offset: u64) -> u32 {
+impl DevKmsg {
+    fn readable(&self) -> u32 {
         // Use the O(1) length, not `snapshot().len()`: epoll re-polls this on
         // every wait iteration, and a snapshot here reallocates the whole klog
-        // ring each time — enough allocator churn to peg the CPU and starve
-        // the rest of boot (journald drains /dev/kmsg via epoll).
-        let readable = (offset as usize) < narf_console::klog::live_len();
-        if readable {
+        // ring each time — enough allocator churn to peg the CPU.
+        if self.read_end.load(core::sync::atomic::Ordering::Relaxed)
+            < narf_console::klog::live_len()
+        {
             crate::POLL_IN | crate::POLL_OUT
         } else {
             crate::POLL_OUT
         }
+    }
+}
+
+impl FileOps for DevKmsg {
+    fn poll_readiness_at(&self, _offset: u64) -> u32 {
+        // Ignore the epoll snapshot offset (stale — see `read_end`); readiness
+        // follows this open's live read high-water so a caught-up journald
+        // parks instead of spinning.
+        self.readable()
+    }
+
+    fn poll_readiness(&self) -> u32 {
+        self.readable()
     }
 
     fn read<'a>(&'a self, offset: u64, buf: &'a mut [u8]) -> FsFuture<'a, usize> {
@@ -429,6 +454,12 @@ impl FileOps for DevKmsg {
         // Copy only the requested window straight from the ring (no full-log
         // Vec snapshot per read — see poll_readiness_at).
         let n = narf_console::klog::read_at(offset as usize, buf);
+        // Advance the live drain cursor past what this read consumed. Even a
+        // caught-up read (n == 0, WouldBlock) records the reader's position so
+        // readiness clears — otherwise poll_readiness would report POLLIN
+        // forever and the reader would spin.
+        self.read_end
+            .fetch_max(offset as usize + n, core::sync::atomic::Ordering::Relaxed);
         Box::pin(async move {
             if n == 0 {
                 Err(FsError::WouldBlock)
@@ -1843,7 +1874,7 @@ impl DirOps for DevDir {
             "full" => Some(Arc::new(crate::devfs_misc::DevFull) as Arc<dyn FileOps>),
             "random" => Some(Arc::new(DevBlockingRandom) as Arc<dyn FileOps>),
             "urandom" => Some(Arc::new(DevRandom) as Arc<dyn FileOps>),
-            "kmsg" => Some(Arc::new(DevKmsg) as Arc<dyn FileOps>),
+            "kmsg" => Some(Arc::new(DevKmsg::default()) as Arc<dyn FileOps>),
             // `tty1` is the conventional first VT node — `getty@tty1.service`
             // (and login on it) opens it. NARF has one console, so it and the
             // `tty0`/`console` aliases all resolve to the same singleton tty.
@@ -2298,6 +2329,55 @@ kernel_test_in!(
     "filesystem/devfs",
     smoke_dev_kmsg_visible_message_strips_meta
 );
+
+/// Regression: `/dev/kmsg` readiness must CLEAR once the reader is caught up,
+/// including for epoll's stale `poll_readiness_at(snapshot_offset)`. Before the
+/// per-open `read_end` cursor, `poll_readiness_at` keyed off the passed offset
+/// (the `EPOLL_CTL_ADD` snapshot, ~0), so `0 < live_len()` stayed true forever:
+/// journald's epoll_wait re-reported /dev/kmsg readable every call, read got
+/// WouldBlock, and it busy-looped at 100% CPU — starving the box and blocking
+/// everyone who logs to journald (the CachyOS greeter never got to render).
+fn smoke_dev_kmsg_poll_clears_when_drained() -> TestResult {
+    narf_console::klog::__reset_for_test();
+    narf_console::klog::record("kmsg-drain-probe");
+    let total = narf_console::klog::live_len();
+    if total == 0 {
+        return TestResult::Fail("klog empty after record()");
+    }
+    let k = DevKmsg::default();
+    // Unread records → POLLIN.
+    if k.poll_readiness() & crate::POLL_IN == 0 {
+        return TestResult::Fail("kmsg with an unread record must report POLLIN");
+    }
+    // Drain sequentially exactly as an epoll reader does, until WouldBlock/0
+    // (which also records the read high-water). Bounded for safety.
+    let mut off = 0u64;
+    let mut buf = [0u8; 1024];
+    for _ in 0..64 {
+        match poll_once_devfs(k.read(off, &mut buf)) {
+            Some(Ok(n)) if n > 0 => off += n as u64,
+            _ => break,
+        }
+    }
+    // Caught up: readiness MUST drop POLLIN, both the offset-less query...
+    if k.poll_readiness() & crate::POLL_IN != 0 {
+        return TestResult::Fail("caught-up /dev/kmsg still POLLIN (poll_readiness)");
+    }
+    // ...and the epoll query with a STALE snapshot offset (the exact spin bug).
+    if k.poll_readiness_at(0) & crate::POLL_IN != 0 {
+        return TestResult::Fail(
+            "caught-up /dev/kmsg still POLLIN via stale offset (journald spin)",
+        );
+    }
+    // A new record re-arms POLLIN (readiness tracks fresh data).
+    narf_console::klog::record("kmsg-drain-probe-2");
+    if k.poll_readiness_at(0) & crate::POLL_IN == 0 {
+        return TestResult::Fail("new klog record did not re-arm POLLIN");
+    }
+    narf_console::klog::__reset_for_test();
+    TestResult::Pass
+}
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_poll_clears_when_drained);
 
 /// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
 fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {
@@ -2774,7 +2854,7 @@ kernel_test_in!("filesystem/devfs", smoke_kmsg_read_at_matches_snapshot);
 /// error; returning `Ok(0)` instead makes it retry forever after a worker is
 /// terminated by a signal.
 fn smoke_dev_kmsg_empty_read_would_block() -> TestResult {
-    let dev = DevKmsg;
+    let dev = DevKmsg::default();
     let mut buf = [0u8; 16];
     match poll_once_devfs(dev.read(u64::MAX, &mut buf)) {
         Some(Err(FsError::WouldBlock)) => {}

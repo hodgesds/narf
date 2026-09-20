@@ -784,6 +784,67 @@ impl EpollInstance {
         results
     }
 
+    /// Would `collect_ready` deliver at least one event to `task_id` right now?
+    /// Mirrors [`Self::collect_ready_pass`]'s per-fd delivery decision EXACTLY
+    /// — same readiness source, EPOLLONESHOT/EPOLLET edge, and EPOLLEXCLUSIVE
+    /// ownership — but takes NO action: no `last_mask` advance, no ready-list
+    /// drain, no exclusive claim. A full scan (the superset of the fast pass),
+    /// so it is true iff either `collect_ready` pass would deliver.
+    ///
+    /// This is the correct predicate for the register-then-recheck self-wake at
+    /// park. Linux `ep_poll` rechecks with `ep_events_available()` — the SAME
+    /// ready-list that `ep_try_send_events` drains (fs/eventpoll.c) — so the
+    /// recheck and the delivery agree and a park cannot self-wake forever.
+    /// [`Self::poll_readiness`] is the WRONG predicate here: it deliberately
+    /// omits the EPOLLEXCLUSIVE claim (a passive nested-epoll / `poll(2)` query
+    /// must not claim), so a readable EPOLLEXCLUSIVE fd owned by another epoll
+    /// makes `poll_readiness` report ready while `collect_ready` delivers
+    /// nothing — the park recheck then self-wakes on every re-execution, a
+    /// 100%-CPU `epoll_wait` livelock (kwin's greeter never presented).
+    fn has_deliverable(&self, task_id: u64) -> bool {
+        let snapshot: Vec<(i32, EpollItem, bool)> = {
+            let g = self.inner.lock();
+            g.interest
+                .iter()
+                .map(|(k, v)| (*k, v.clone(), g.ready.contains(k)))
+                .collect()
+        };
+        for (fd, item, in_ready) in snapshot {
+            // Disarmed EPOLLONESHOT items deliver nothing.
+            if (item.events & EPOLLONESHOT) != 0
+                && (item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE)) == 0
+            {
+                continue;
+            }
+            let cur = match item.file.upgrade() {
+                Some(f) => f.poll_readiness_at(item.offset),
+                None => continue,
+            };
+            let want = item.events & !(EPOLLET | EPOLLONESHOT | EPOLLEXCLUSIVE);
+            let ready = cur & (want | EPOLLERR | EPOLLHUP);
+            if ready == 0 {
+                continue;
+            }
+            // EPOLLET: a fresh edge only — a rising mask bit or ready-list
+            // membership (the wait-queue edge), exactly as `collect_ready_pass`.
+            if (item.events & EPOLLET) != 0 {
+                let new_bits = ready & !item.last_mask;
+                let listed = item.cell_backed && in_ready;
+                if new_bits == 0 && !listed {
+                    continue;
+                }
+            }
+            // EPOLLEXCLUSIVE: `collect_ready` skips an fd this task cannot claim
+            // (held by another epoll). Mirror that as a non-claiming query so
+            // the recheck never self-wakes on an fd that would not deliver here.
+            if (item.events & EPOLLEXCLUSIVE) != 0 && exclusive_owned_by_other(fd, task_id) {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
     /// Earliest absolute monotonic-ns deadline at which any fd in the
     /// interest set will become readable on its own timed schedule (a
     /// `timerfd`). Returns `None` when no interest fd is time-driven.
@@ -1080,6 +1141,19 @@ fn exclusive_release(fd: i32, owner: u64) {
                 map.remove(&fd);
             }
         }
+    }
+}
+
+/// Non-claiming query: is `fd`'s EPOLLEXCLUSIVE claim held by an owner OTHER
+/// than `owner`? `collect_ready` skips such an fd (its `exclusive_try_claim`
+/// fails), so the park-time deliverability recheck must skip it too — without
+/// taking the claim (a readiness *query* must not claim). Distinct from
+/// [`exclusive_try_claim`], which claims an unheld fd.
+fn exclusive_owned_by_other(fd: i32, owner: u64) -> bool {
+    let g = EXCLUSIVE_HOLDERS.lock();
+    match g.as_ref().and_then(|m| m.get(&fd)) {
+        Some(h) => *h != owner,
+        None => false,
     }
 }
 
@@ -1744,14 +1818,21 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // fired push_ready AFTER the top collect_ready but
                             // BEFORE set_parked_waker listed it on the ready-list
                             // with no parked waker to wake; without this recheck
-                            // the park would STRAND. `poll_readiness()`
-                            // non-destructively mirrors collect_ready's delivery
-                            // filters; if it now reports deliverable, self-wake so
-                            // the park re-executes and delivers. Mirrored filters
-                            // mean a benign always-writable EPOLLOUT or an
-                            // already-consumed EPOLLET edge does NOT trigger, so
-                            // this cannot spin.
-                            if instance.poll_readiness() != 0 {
+                            // the park would STRAND. `has_deliverable(task)`
+                            // non-destructively mirrors collect_ready's EXACT
+                            // delivery decision (owner-aware for EPOLLEXCLUSIVE);
+                            // if it now reports deliverable, self-wake so the park
+                            // re-executes and delivers. It must be `has_deliverable`
+                            // and NOT `poll_readiness()`: the latter omits the
+                            // EPOLLEXCLUSIVE claim (correct for a passive nested
+                            // query, wrong here), so a readable exclusive fd owned
+                            // by another epoll would make poll_readiness report
+                            // ready while collect_ready delivers nothing — a park
+                            // self-wake livelock (100%-CPU epoll_wait). Because
+                            // this mirrors collect_ready, a benign always-writable
+                            // EPOLLOUT or an already-consumed EPOLLET edge does NOT
+                            // trigger, so it cannot spin.
+                            if instance.has_deliverable(task) {
                                 w.wake_by_ref();
                             }
                         }
@@ -1777,14 +1858,28 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
                             // returns its event before the timeout path is reached.
                             // The only lost case is a timer disarmed from another
                             // thread mid-park, which no single-threaded waiter hits.)
+                            // Only clamp to a FUTURE timer deadline. A deadline
+                            // already in the past means the timer is ready now;
+                            // `collect_ready` above would have delivered it, so
+                            // reaching here means it is not deliverable (an
+                            // EPOLLET edge already consumed). Clamping
+                            // `sleep_deadline` to a past instant would make the
+                            // scheduler wake this task immediately, only to
+                            // re-park and re-clamp to the same past instant — a
+                            // 100%-CPU spin. Leave the existing deadline (the
+                            // user timeout, or unbounded) and rely on the fd's
+                            // own readiness wake / the backstop instead.
                             if let Some(timer_dl) = instance.nearest_poll_deadline(task) {
-                                let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
-                                let clamped = if cur == 0 {
-                                    timer_dl
-                                } else {
-                                    cur.min(timer_dl)
-                                };
-                                uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+                                let now = narf_scheduler::narf_time::monotonic_ns();
+                                if timer_dl > now {
+                                    let cur = uc.sleep_deadline_ns.load(Ordering::Acquire);
+                                    let clamped = if cur == 0 {
+                                        timer_dl
+                                    } else {
+                                        cur.min(timer_dl)
+                                    };
+                                    uc.sleep_deadline_ns.store(clamped, Ordering::Release);
+                                }
                             }
                             // Rewind RIP so we re-execute epoll_wait on resume.
                             ctx.set_rip(ctx.rip().wrapping_sub(2));
@@ -1820,4 +1915,151 @@ fn epoll_wait_common(ctx: &mut dyn TrapContext, is_pwait: bool, timeout_override
 #[doc(hidden)]
 pub fn __test_reset() {
     *EXCLUSIVE_HOLDERS.lock() = Some(BTreeMap::new());
+}
+
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+    use core::sync::atomic::AtomicU32;
+    use narf_filesystem::{POLL_IN, POLL_OUT};
+    use narf_kernel_test::{kernel_test_in, TestResult};
+
+    /// A `FileOps` whose readiness mask is settable, to drive an epoll interest
+    /// fd to any exact readiness state.
+    struct MaskFile {
+        mask: AtomicU32,
+    }
+    impl MaskFile {
+        fn new(m: u32) -> Arc<Self> {
+            Arc::new(Self {
+                mask: AtomicU32::new(m),
+            })
+        }
+    }
+    impl FileOps for MaskFile {
+        fn read<'a>(&'a self, _o: u64, _b: &'a mut [u8]) -> FsFuture<'a, usize> {
+            Box::pin(async move { Ok(0) })
+        }
+        fn write<'a>(&'a self, _o: u64, b: &'a [u8]) -> FsFuture<'a, usize> {
+            let n = b.len();
+            Box::pin(async move { Ok(n) })
+        }
+        fn stat(&self) -> Stat {
+            Stat {
+                size: 0,
+                blocks: 0,
+                mode: Mode::FILE_RO,
+                mtime_cycles: 0,
+            }
+        }
+        fn poll_readiness(&self) -> u32 {
+            self.mask.load(Ordering::Relaxed)
+        }
+    }
+
+    const FD: i32 = 7;
+    const TASK: u64 = 0xE9_01;
+
+    /// A one-fd epoll instance in an exact state. Returns the instance and the
+    /// backing file, kept alive so the interest `Weak` upgrades.
+    fn one_fd(
+        events: u32,
+        mask: u32,
+        last_mask: u32,
+        cell_backed: bool,
+        in_ready: bool,
+    ) -> (Arc<EpollInstance>, Arc<MaskFile>) {
+        let file = MaskFile::new(mask);
+        let ep = EpollInstance::new();
+        {
+            let mut g = ep.inner.lock();
+            g.interest.insert(
+                FD,
+                EpollItem {
+                    fd: FD,
+                    file: Arc::downgrade(&(file.clone() as Arc<dyn FileOps>)),
+                    offset: 0,
+                    events,
+                    data: 0,
+                    last_mask,
+                    cell_backed,
+                    sub_id: 1,
+                },
+            );
+            if in_ready {
+                g.ready.insert(FD);
+            }
+        }
+        (ep, file)
+    }
+
+    /// The park-time recheck (`has_deliverable`) MUST agree with what
+    /// `collect_ready` actually delivers. If it ever reports deliverable while
+    /// `collect_ready` returns nothing, the parked `epoll_wait` self-wakes and
+    /// re-parks forever — a 100%-CPU livelock (kwin's greeter never presented).
+    /// Check the spin-prone configurations; `has_deliverable` is non-mutating so
+    /// it is queried before the (mutating) `collect_ready` on the same state.
+    fn smoke_epoll_has_deliverable_matches_collect_ready() -> TestResult {
+        __test_reset();
+
+        // (1) Level-triggered readable -> deliverable both ways.
+        {
+            let (ep, _f) = one_fd(EPOLLIN, POLL_IN, 0, false, false);
+            if !ep.has_deliverable(TASK) {
+                return TestResult::Fail("LT readable: has_deliverable should be true");
+            }
+            if ep.collect_ready(TASK, 8).is_empty() {
+                return TestResult::Fail("LT readable: collect_ready should deliver");
+            }
+        }
+
+        // (2) EPOLLIN|ET with the edge already consumed (mask==last_mask) and not
+        //     on the ready-list -> NOT deliverable. Both must agree (no self-wake).
+        {
+            let (ep, _f) = one_fd(EPOLLIN | EPOLLET, POLL_IN, POLL_IN, true, false);
+            if ep.has_deliverable(TASK) {
+                return TestResult::Fail("ET-consumed IN: has_deliverable must be false");
+            }
+            if !ep.collect_ready(TASK, 8).is_empty() {
+                return TestResult::Fail("ET-consumed IN: collect_ready must be empty");
+            }
+        }
+
+        // (3) EPOLLOUT|ET steadily writable, edge consumed -> NOT deliverable.
+        //     The greeter-spin shape: a permanently-writable OUT|ET fd must not
+        //     drive the park recheck to self-wake.
+        {
+            let (ep, _f) = one_fd(EPOLLOUT | EPOLLET, POLL_OUT, POLL_OUT, true, false);
+            if ep.has_deliverable(TASK) {
+                return TestResult::Fail("ET-consumed OUT: has_deliverable must be false");
+            }
+            if !ep.collect_ready(TASK, 8).is_empty() {
+                return TestResult::Fail("ET-consumed OUT: collect_ready must be empty");
+            }
+        }
+
+        // (4) EPOLLEXCLUSIVE|IN readable but the claim is held by ANOTHER owner:
+        //     collect_ready skips it, so the recheck must too. This is the exact
+        //     `poll_readiness` divergence that caused the exclusive self-wake spin
+        //     (poll_readiness omits the claim and would report ready here).
+        {
+            let (ep, _f) = one_fd(EPOLLIN | EPOLLEXCLUSIVE, POLL_IN, 0, false, false);
+            if !exclusive_try_claim(FD, TASK ^ 0xFF) {
+                return TestResult::Fail("could not seed a foreign exclusive claim");
+            }
+            if ep.has_deliverable(TASK) {
+                return TestResult::Fail("exclusive-owned-by-other: has_deliverable must be false");
+            }
+            if !ep.collect_ready(TASK, 8).is_empty() {
+                return TestResult::Fail("exclusive-owned-by-other: collect_ready must be empty");
+            }
+            __test_reset();
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "userspace/epoll",
+        smoke_epoll_has_deliverable_matches_collect_ready
+    );
 }
