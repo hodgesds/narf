@@ -583,6 +583,11 @@ pub enum SockError {
     /// `unix_find_bsd`: `sk->sk_type != type`), e.g. a stream connect to a path
     /// where only a datagram socket is bound.
     ProtoType,
+    /// `ENODEV` — `SO_BINDTODEVICE` named an interface that does not exist
+    /// (`net/core/sock.c:719`, via `dev_get_by_name_rcu`).
+    NoDevice,
+    /// `EPERM` — the operation needs a capability the caller lacks.
+    PermDenied,
 }
 
 impl SockError {
@@ -603,6 +608,8 @@ impl SockError {
             Self::InProgress => 115,        // EINPROGRESS
             Self::Range => 34,              // ERANGE
             Self::NoEntry => 2,             // ENOENT
+            Self::NoDevice => 19,           // ENODEV
+            Self::PermDenied => 1,          // EPERM
             Self::MsgSize => 90,            // EMSGSIZE
             Self::ProtoType => 91,          // EPROTOTYPE
         }
@@ -809,6 +816,10 @@ pub struct SockOptions {
     pub rcvbuf: u32,
     pub sndbuf: u32,
     pub bindtodevice: Option<String>,
+    /// The resolved `sk_bound_dev_if`. Linux stores the INDEX, not the
+    /// name, and resolves it back for getsockopt — an index survives a
+    /// rename, which a stored string would not.
+    pub bindtodevice_index: u32,
     // TCP
     pub tcp_nodelay: bool,
     pub tcp_keepidle: u32,
@@ -840,6 +851,7 @@ impl Default for SockOptions {
             rcvbuf: 212_992,
             sndbuf: 212_992,
             bindtodevice: None,
+            bindtodevice_index: 0,
             tcp_nodelay: false,
             tcp_keepidle: 7200,
             tcp_keepintvl: 75,
@@ -3564,14 +3576,55 @@ impl SocketFile {
                 }
                 Err(e) => SocketOpResult::Err(e),
             },
-            (SOL_SOCKET, SO_BINDTODEVICE) => match core::str::from_utf8(value) {
-                Ok(s) => {
-                    let n = String::from(s.trim_end_matches('\0'));
-                    opts.bindtodevice = if n.is_empty() { None } else { Some(n) };
-                    SocketOpResult::Ok(0)
+            (SOL_SOCKET, SO_BINDTODEVICE) => {
+                // `sock_setbindtodevice` (`net/core/sock.c:685`): the name
+                // is truncated to IFNAMSIZ-1, an empty name (or zero
+                // length) UNBINDS, and anything else must name a live
+                // interface or the answer is -ENODEV. Linux never validates
+                // the bytes as UTF-8 — a name that is not a device simply
+                // fails the lookup — so a non-UTF-8 name is ENODEV here
+                // too, not EINVAL.
+                const IFNAMSIZ: usize = 16;
+                let raw = &value[..value.len().min(IFNAMSIZ - 1)];
+                let name = core::str::from_utf8(raw)
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+
+                // `sock_bindtoindex_locked` (`net/core/sock.c:648`):
+                //
+                //     ret = -EPERM;
+                //     if (sk->sk_bound_dev_if &&
+                //         !ns_capable(net->user_ns, CAP_NET_RAW))
+                //             goto out;
+                //
+                // Note what that tests: the socket being ALREADY bound. The
+                // first bind is unprivileged; re-binding or unbinding one
+                // that is already pinned to a device is what needs
+                // CAP_NET_RAW, so a sandboxed process cannot move a socket
+                // off the interface it was handed.
+                if opts.bindtodevice.is_some()
+                    && !crate::handlers::task_capable(
+                        crate::handlers::current_task_id(),
+                        crate::handlers::CAP_NET_RAW,
+                    )
+                {
+                    return SocketOpResult::Err(SockError::PermDenied);
                 }
-                Err(_) => SocketOpResult::Err(SockError::InvalidArg),
-            },
+
+                if name.is_empty() {
+                    opts.bindtodevice = None;
+                    opts.bindtodevice_index = 0;
+                    return SocketOpResult::Ok(0);
+                }
+                match narf_net::iface::ifindex_of(name) {
+                    Some(idx) => {
+                        opts.bindtodevice = Some(String::from(name));
+                        opts.bindtodevice_index = idx;
+                        SocketOpResult::Ok(0)
+                    }
+                    None => SocketOpResult::Err(SockError::NoDevice),
+                }
+            }
             (SOL_SOCKET, SO_TYPE)
             | (SOL_SOCKET, SO_DOMAIN)
             | (SOL_SOCKET, SO_PROTOCOL)

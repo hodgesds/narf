@@ -4385,6 +4385,9 @@ pub(crate) const CAP_DAC_OVERRIDE: u32 = 1;
 pub(crate) const CAP_DAC_READ_SEARCH: u32 = 2;
 pub(crate) const CAP_SETGID: u32 = 6;
 pub(crate) const CAP_SETUID: u32 = 7;
+/// `CAP_NET_RAW` (`include/uapi/linux/capability.h`) — raw sockets, and
+/// re-binding a socket that is already pinned to an interface.
+pub(crate) const CAP_NET_RAW: u32 = 13;
 pub(crate) const CAP_SYS_MODULE: u32 = 16;
 pub(crate) const CAP_SYS_CHROOT: u32 = 18;
 pub(crate) const CAP_SYS_NICE: u32 = 23;
