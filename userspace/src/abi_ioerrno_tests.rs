@@ -501,6 +501,44 @@ fn smoke_abi_ioerrno_fallocate_pipe_espipe() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fallocate_pipe_espipe);
 
+fn smoke_abi_ioerrno_fallocate_overflow_efbig() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        const EFBIG: i64 = -27;
+        expect(
+            call(
+                Syscall::Fallocate.raw(),
+                a3(fd as u64, 0, (i64::MAX - 100) as u64, 200),
+            ),
+            EFBIG,
+            "fallocate with overflowing offset+len must be -EFBIG",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fallocate_overflow_efbig);
+
+fn smoke_abi_ioerrno_fallocate_immutable_eperm() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"")], || {
+        let fd = open_rw(b"/abi/f\0")?;
+        const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+        const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+        let mut flags: u32 = FS_IMMUTABLE_FL;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, FS_IOC_SETFLAGS, &mut flags as *mut u32 as u64),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_SETFLAGS failed");
+        }
+        expect(
+            call(Syscall::Fallocate.raw(), a3(fd as u64, 0, 0, 4096)),
+            EPERM,
+            "fallocate on an immutable file must be -EPERM",
+        )
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_ioerrno_fallocate_immutable_eperm);
+
 // ── flock ──────────────────────────────────────────────────────────
 //
 // `fs/locks.c::SYSCALL_DEFINE2(flock)`: LOCK_MAND -> 0,
