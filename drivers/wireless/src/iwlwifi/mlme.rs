@@ -219,6 +219,8 @@ pub struct BeaconInfo {
     pub ssid: Vec<u8>,
     /// Supported rates from the Supported Rates IE (tag=0x01).
     pub supported_rates: Vec<u8>,
+    /// Operating channel from DS Parameter Set (tag=0x03) or HT Operation (tag=0x3D) IE.
+    pub channel: Option<u8>,
     /// RSSI in dBm (set by the RX metadata; caller fills from
     /// `iwl_rx_mpdu_desc`; we default to -100 here).
     pub rssi_dbm: i8,
@@ -232,6 +234,7 @@ impl BeaconInfo {
             capability_info: 0,
             ssid: Vec::new(),
             supported_rates: Vec::new(),
+            channel: None,
             rssi_dbm: -100,
         }
     }
@@ -272,6 +275,24 @@ pub fn parse_beacon(bssid: [u8; 6], body: &[u8]) -> Option<BeaconInfo> {
             0x01 => {
                 // Supported Rates IE.
                 info.supported_rates.extend_from_slice(ie_data);
+            }
+            0x03 => {
+                // DS Parameter Set IE (1 byte: Current Channel).
+                if let Some(&ch) = ie_data.first() {
+                    if ch > 0 {
+                        info.channel = Some(ch);
+                    }
+                }
+            }
+            0x3D => {
+                // HT Operation IE (byte 0: Primary Channel).
+                if info.channel.is_none() {
+                    if let Some(&ch) = ie_data.first() {
+                        if ch > 0 {
+                            info.channel = Some(ch);
+                        }
+                    }
+                }
             }
             _ => {} // skip unknown IEs
         }
@@ -508,6 +529,8 @@ pub struct BssDescriptor {
     pub ssid: Vec<u8>,
     /// Supported rates in 802.11 encoding.
     pub supported_rates: Vec<u8>,
+    /// Operating channel if advertised in DS Parameter Set or HT Operation IE.
+    pub channel: Option<u8>,
     /// Beacon interval in TU (1 TU = 1024 µs).
     pub beacon_interval: u16,
     /// Capability information word.
@@ -543,6 +566,7 @@ pub fn parse_beacon_to_bss(bssid: [u8; 6], body: &[u8]) -> Option<BssDescriptor>
         bssid: info.bssid,
         ssid: info.ssid,
         supported_rates: info.supported_rates,
+        channel: info.channel,
         beacon_interval: info.beacon_interval,
         capability_info: info.capability_info,
         rssi_dbm: info.rssi_dbm,
@@ -903,6 +927,59 @@ pub mod tests {
         TestResult::Pass
     }
 
+    // Beacon parse: DS Parameter Set and HT Operation channel extraction.
+    fn smoke_iwlwifi_mlme_parse_beacon_channel() -> TestResult {
+        let bssid = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+        // 1. DS Parameter Set (tag 0x03, len 1, ch 6)
+        let ds_beacon: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x64, 0x00, // beacon interval = 100
+            0x31, 0x04, // capability
+            0x00, 0x04, b't', b'e', b's', b't', // SSID IE
+            0x03, 0x01, 0x06, // DS Parameter Set: ch 6
+        ];
+        let info_ds = match parse_beacon(bssid, ds_beacon) {
+            Some(i) => i,
+            None => return TestResult::Fail("parse_beacon failed on DS beacon"),
+        };
+        if info_ds.channel != Some(6) {
+            return TestResult::Fail("DS channel should be 6");
+        }
+        let bss_ds = match parse_beacon_to_bss(bssid, ds_beacon) {
+            Some(b) => b,
+            None => return TestResult::Fail("parse_beacon_to_bss failed on DS beacon"),
+        };
+        if bss_ds.channel != Some(6) {
+            return TestResult::Fail("BssDescriptor DS channel should be 6");
+        }
+
+        // 2. HT Operation (tag 0x3D, len 2, primary ch 36)
+        let ht_beacon: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // timestamp
+            0x64, 0x00, // beacon interval = 100
+            0x31, 0x04, // capability
+            0x00, 0x04, b't', b'e', b's', b't', // SSID IE
+            0x3D, 0x02, 0x24, 0x00, // HT Operation: primary ch 36 (0x24)
+        ];
+        let info_ht = match parse_beacon(bssid, ht_beacon) {
+            Some(i) => i,
+            None => return TestResult::Fail("parse_beacon failed on HT beacon"),
+        };
+        if info_ht.channel != Some(36) {
+            return TestResult::Fail("HT channel should be 36");
+        }
+        let bss_ht = match parse_beacon_to_bss(bssid, ht_beacon) {
+            Some(b) => b,
+            None => return TestResult::Fail("parse_beacon_to_bss failed on HT beacon"),
+        };
+        if bss_ht.channel != Some(36) {
+            return TestResult::Fail("BssDescriptor HT channel should be 36");
+        }
+
+        TestResult::Pass
+    }
+
     kernel_test_in!(
         "drivers/wireless/iwlwifi/mlme",
         smoke_iwlwifi_mlme_auth_frame_encode_open
@@ -922,5 +999,9 @@ pub mod tests {
     kernel_test_in!(
         "drivers/wireless/iwlwifi/mlme",
         smoke_iwlwifi_mlme_bss_descriptor_rsn_ie_extracted
+    );
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi/mlme",
+        smoke_iwlwifi_mlme_parse_beacon_channel
     );
 }
