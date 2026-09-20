@@ -881,6 +881,43 @@ fn smoke_abi_pathx_openat2_opath_dirfd_mkdirat() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_opath_dirfd_mkdirat);
 
+fn smoke_abi_pathx_mkdirat_non_directory_dirfd_enotdir() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let leaf = b"sub\0";
+        // 1. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(fd, leaf.as_ptr() as u64, 0o755, 0),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("mkdirat with a non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 2. Bad dirfd (< 0, != AT_FDCWD) -> -EBADF (-9).
+        match call(
+            Syscall::Mkdirat.raw(),
+            a3(9999, leaf.as_ptr() as u64, 0o755, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("mkdirat with an unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_mkdirat_non_directory_dirfd_enotdir
+);
+
 // `openat2` has the same dirfd-relative lookup contract as `openat`.  The
 // systemd mount-unit path walker obtains a parent directory this way before
 // calling mkdirat for the final mount-point component.
