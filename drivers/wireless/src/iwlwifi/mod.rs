@@ -554,7 +554,7 @@ impl rx::RxHandler for IwlRxHandler {
                             list.push(narf_wireless::BssInfo {
                                 bssid: bss.bssid,
                                 ssid: bss.ssid,
-                                channel: 1, // TODO: extract from PHY metadata
+                                channel: bss.channel.unwrap_or(1) as u32,
                                 rssi: bss.rssi_dbm,
                                 security: if bss.rsn_ie_body.is_some() {
                                     narf_wireless::scan::BssSecurity::Wpa2
