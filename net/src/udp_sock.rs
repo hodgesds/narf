@@ -337,25 +337,65 @@ pub fn udp_send(
         Some(p) => p,
         None => sock.peer.lock().ok_or(UdpError::InvalidSocket)?,
     };
+    let opts = sock.options.lock().clone();
+    // In-kernel senders (DHCP, DNS) keep the historical blocking resolve.
+    udp_send_from(sock.net_ns_id, sock.local.port, dst, payload, &opts, 1000)
+}
 
+/// Emit one UDP datagram without needing a bound [`UdpSocket`].
+///
+/// `udp_send` reads only the namespace, the source port and the options off
+/// its socket, so the body is factored out here for callers that HAVE a
+/// source port but no socket in this table — notably the userspace socket
+/// layer, which keeps its own bookkeeping and must not take a second
+/// binding for the same port (that would be EADDRINUSE against itself).
+pub fn udp_send_from(
+    net_ns_id: u64,
+    src_port: u16,
+    dst: SocketAddrV4,
+    payload: &[u8],
+    options: &UdpOptions,
+    arp_timeout_ms: u64,
+) -> Result<usize, UdpError> {
+    udp_send_inner(net_ns_id, src_port, dst, payload, options, arp_timeout_ms)
+}
+
+fn udp_send_inner(
+    net_ns_id: u64,
+    src_port: u16,
+    dst: SocketAddrV4,
+    payload: &[u8],
+    options: &UdpOptions,
+    arp_timeout_ms: u64,
+) -> Result<usize, UdpError> {
     // SO_BROADCAST guard (Linux udp.c:1093).
-    if (dst.ip == [255, 255, 255, 255] || dst.ip[3] == 255) && !sock.options.lock().broadcast {
+    if (dst.ip == [255, 255, 255, 255] || dst.ip[3] == 255) && !options.broadcast {
         return Err(UdpError::NoBroadcastPermission);
     }
 
-    let (opts_sndbuf, ip_ttl, ip_tos) = {
-        let o = sock.options.lock();
-        (o.sndbuf, o.ip_ttl, o.ip_tos)
-    };
+    let (opts_sndbuf, ip_ttl, ip_tos) = (options.sndbuf, options.ip_ttl, options.ip_tos);
     if payload.len() > opts_sndbuf {
         return Err(UdpError::MsgTooLong);
     }
 
     // Wave-47: route by destination so flows on a non-primary iface
     // egress on the correct NIC (capture-iface smokes, multi-NIC hosts).
-    let iface = iface::for_dst_in(sock.net_ns_id, dst.ip).ok_or(UdpError::NoInterface)?;
+    // SO_BINDTODEVICE pins egress to one interface. Linux passes
+    // `sk->sk_bound_dev_if` into the route lookup (`ip_route_output_flow`
+    // via `flowi4.flowi4_oif`), so a bound socket cannot leak onto another
+    // NIC just because the route table prefers it. This field was stored
+    // and never read until now.
+    let iface = if options.bind_to_device != 0 {
+        let name = iface::snapshot_all_in(net_ns_id)
+            .into_iter()
+            .map(|i| i.name)
+            .find(|n| iface::ifindex_of(n) == Some(options.bind_to_device))
+            .ok_or(UdpError::NoInterface)?;
+        iface::lookup_in(net_ns_id, &name).ok_or(UdpError::NoInterface)?
+    } else {
+        iface::for_dst_in(net_ns_id, dst.ip).ok_or(UdpError::NoInterface)?
+    };
     let src_ip = iface.ipv4;
-    let src_port = sock.local.port;
     let dst_ip = dst.ip;
     let dst_port = dst.port;
 
@@ -363,7 +403,17 @@ pub fn udp_send(
     let dst_mac = if dst_ip == [255, 255, 255, 255] {
         [0xFF; 6]
     } else {
-        crate::tcp_stack::arp_resolve_in(sock.net_ns_id, dst_ip, 1000)
+        // `arp_timeout_ms == 0` means "do not wait": `ip_finish_output2`
+        // hands an unresolved destination to `neigh_output`, which queues
+        // the skb, fires an ARP request and returns — `sendmsg` never
+        // blocks on resolution. Blocking a caller for a second inside
+        // sendto is the one behaviour Linux definitely does not have.
+        //
+        // NARF has no neighbour queue, so an unresolved first datagram is
+        // dropped rather than held. That IS a divergence, and a smaller one
+        // than stalling the caller: the ARP request still goes out, so the
+        // next datagram resolves.
+        crate::tcp_stack::arp_resolve_in(net_ns_id, dst_ip, arp_timeout_ms)
             .map_err(|_| UdpError::NetworkUnreachable)?
     };
 
@@ -423,7 +473,7 @@ pub fn udp_send(
     };
     frame[udp_off + 6..udp_off + 8].copy_from_slice(&cs.to_be_bytes());
 
-    if crate::tcp_stack::nf_tx_filter_in(sock.net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
+    if crate::tcp_stack::nf_tx_filter_in(net_ns_id, &iface.name, &mut frame[ETH_HDR_LEN..])
         != crate::netfilter::Verdict::Accept
     {
         return Ok(payload.len());
@@ -487,6 +537,41 @@ pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     deliver_in(0, src_ip, dst_ip, datagram, ttl);
 }
 
+/// `fn(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload) -> bool` —
+/// hand a datagram to the userspace socket layer, which keeps its own
+/// port table. Returns whether a socket there consumed it.
+type UserDeliverHook = fn(u64, [u8; 4], u16, [u8; 4], u16, &[u8]) -> bool;
+
+static USER_DELIVER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Install the userspace-socket delivery hook.
+///
+/// AF_INET datagram sockets live in the userspace crate with their own
+/// bookkeeping, so the RX demux has to ask it rather than the other way
+/// round — this crate cannot depend on that one.
+pub fn install_user_deliver_hook(hook: UserDeliverHook) {
+    USER_DELIVER_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
+}
+
+fn user_deliver(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+) -> bool {
+    let raw = USER_DELIVER_HOOK.load(core::sync::atomic::Ordering::Acquire);
+    if raw == 0 {
+        return false;
+    }
+    // SAFETY: `raw` was stored by `install_user_deliver_hook` from a
+    // `UserDeliverHook`, the only writer of this slot, and function
+    // pointers are never unmapped.
+    let hook: UserDeliverHook = unsafe { core::mem::transmute(raw) };
+    hook(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload)
+}
+
 pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
     if datagram.len() < UDP_HDR_LEN {
         return;
@@ -514,6 +599,11 @@ pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[
     };
 
     if candidates.is_empty() {
+        // No in-kernel socket owns this port. AF_INET datagram sockets live
+        // in the userspace crate with their own port table, so ask it
+        // before the datagram is dropped — that table is the only place a
+        // userspace `bind()` is recorded.
+        user_deliver(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload);
         return;
     }
 

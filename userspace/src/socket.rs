@@ -1006,6 +1006,66 @@ enum SocketState {
     NetlinkNetfilter { replies: VecDeque<Vec<u8>> },
 }
 
+/// Deliver a UDP datagram that arrived from the WIRE to a bound AF_INET
+/// datagram socket. Returns whether one took it.
+///
+/// Installed into `narf_net::udp_sock` at boot, because the RX demux there
+/// cannot see this crate's port table. In-kernel sockets are matched first
+/// and this is the fallback, so a port claimed by an in-kernel consumer
+/// (DHCP, DNS) keeps it.
+///
+/// Wildcard matching mirrors the loopback path and Linux's `compute_score`:
+/// an exact local address wins, INADDR_ANY also matches.
+pub fn deliver_wire_datagram(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    src_port: u16,
+    dst_ip: [u8; 4],
+    dst_port: u16,
+    payload: &[u8],
+) -> bool {
+    let dst = u32::from_be_bytes(dst_ip);
+    let sock = {
+        let bound = INET_DGRAM_BOUND.lock();
+        bound.as_ref().and_then(|m| {
+            m.get(&(net_ns_id, dst, dst_port))
+                .or_else(|| m.get(&(net_ns_id, 0, dst_port)))
+                .cloned()
+        })
+    };
+    let Some(sock) = sock else {
+        return false;
+    };
+
+    // SO_BINDTODEVICE would be enforced here, but this hook does not carry
+    // the arrival interface — see the note on `bindtodevice_index`.
+    let pkt = DgramPacket {
+        peer_unix: None,
+        sender_cred: Ucred::default(),
+        peer_addr: u32::from_be_bytes(src_ip),
+        peer_port: src_port,
+        payload: payload.to_vec(),
+        fds: Vec::new(),
+    };
+    let mut st = sock.state.lock();
+    let delivered = if let SocketState::InetDgram { inbox, .. } = &mut *st {
+        inbox.push_back(pkt);
+        true
+    } else {
+        false
+    };
+    drop(st);
+    if delivered {
+        // Same wake sequence the loopback path uses: the targeted per-fd
+        // cell first, then the global readiness bump, or a reader parked in
+        // epoll_wait(-1) never learns the datagram arrived.
+        sock.dgram_readiness.set(narf_filesystem::POLL_IN, 0);
+        sock.dgram_readiness.notify(narf_filesystem::POLL_IN);
+        narf_net::readiness::notify(0);
+    }
+    delivered
+}
+
 /// Open-file state transported by `SCM_RIGHTS`.
 ///
 /// Descriptor flags such as `FD_CLOEXEC` belong to the sender's fd slot and
@@ -4815,9 +4875,49 @@ impl SocketFile {
                 let dest_sock = match dest_sock {
                     Some(s) => s,
                     None => {
-                        // No listener. UDP convention: silently
-                        // drop (POSIX permits this — no error).
-                        return SocketOpResult::Ok(buf.len() as u64);
+                        // Nothing bound locally, so this is destined for the
+                        // network. Dropping it here (which is what used to
+                        // happen, with a SUCCESS return) meant a userspace
+                        // program could never send a datagram off-box at
+                        // all — every sendto to a remote address was
+                        // silently discarded while reporting the full byte
+                        // count as written.
+                        let o = self.options.lock();
+                        let udp_opts = narf_net::udp_sock::UdpOptions {
+                            broadcast: o.broadcast,
+                            bind_to_device: o.bindtodevice_index,
+                            ..Default::default()
+                        };
+                        drop(o);
+                        let dst =
+                            narf_net::udp_sock::SocketAddrV4::new(dest.0.to_be_bytes(), dest.1);
+                        return match narf_net::udp_sock::udp_send_from(
+                            self.net_ns_id(),
+                            local_port,
+                            dst,
+                            buf,
+                            &udp_opts,
+                            // Never block a sendto on ARP.
+                            0,
+                        ) {
+                            Ok(n) => SocketOpResult::Ok(n as u64),
+                            // `udp_sendmsg` surfaces a routing failure as
+                            // ENETUNREACH; NARF has no such variant here, and
+                            // the broadcast guard is already applied above,
+                            // so the remaining cases map to EINVAL.
+                            Err(narf_net::udp_sock::UdpError::NoBroadcastPermission) => {
+                                SocketOpResult::Err(SockError::InvalidArg)
+                            }
+                            // An unresolved neighbour is not an error to
+                            // the caller: Linux queues the datagram and
+                            // returns success, so report the bytes as sent
+                            // rather than surfacing a failure the
+                            // application cannot act on.
+                            Err(narf_net::udp_sock::UdpError::NetworkUnreachable) => {
+                                SocketOpResult::Ok(buf.len() as u64)
+                            }
+                            Err(_) => SocketOpResult::Err(SockError::InvalidArg),
+                        };
                     }
                 };
                 let pkt = DgramPacket {
