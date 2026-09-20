@@ -1384,6 +1384,55 @@ fn smoke_abi_pathx_readlinkat_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_readlinkat_neg);
 
+fn smoke_abi_pathx_readlinkat_dirfd_enotdir_and_ebadf() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi"), ("link->f", b"f")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"link\0";
+        let mut buf = [0u8; 64];
+
+        // 1. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(
+                fd,
+                rel.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("readlinkat with a non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 2. Bad dirfd (< 0, != AT_FDCWD) -> -EBADF (-9).
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(
+                9999,
+                rel.as_ptr() as u64,
+                buf.as_mut_ptr() as u64,
+                buf.len() as u64,
+            ),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("readlinkat with an unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_readlinkat_dirfd_enotdir_and_ebadf
+);
+
 // ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
 //
 // systemd-logind resolves each seat-master DRM device by devnum:
