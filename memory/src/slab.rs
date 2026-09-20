@@ -1483,6 +1483,41 @@ unsafe fn detach_class_frames(c: usize, max_pages: usize, frames: &mut [usize]) 
     if n_blocks == 0 || limit == 0 {
         return 0;
     }
+    // Page-size class (`block_size == PAGE_SIZE`, so `n_blocks == 1`): every free
+    // block IS a whole free frame, so there are no multi-block runs to find and
+    // NO address sort is needed. Taking, sorting (`O(n log n)`), and rebuilding
+    // the ENTIRE central list on every reclaim call — only to return `limit`
+    // frames — makes draining a large class `O(n²/limit)` and wedges kswapd on a
+    // 60k-block list (the CachyOS greeter's 4 KiB class hoarded ~240 MiB while
+    // the buddy starved). Pop up to `limit` blocks off the list head instead:
+    // `O(limit)`, canary-checked, bounded (so a corrupt/cyclic link cannot spin
+    // this path — the pop count is capped and each detached node's link is
+    // nulled), leaving the remaining free blocks in place for the next call.
+    if n_blocks == 1 {
+        let mut g = class.head.lock();
+        let mut detached = 0usize;
+        while detached < limit {
+            let Some(node) = *g else { break };
+            // SAFETY: `node` is a live free block of class `c` on the central
+            // list; validate its canary before trusting the `next` link, then
+            // null that link (this frame is leaving the allocator for the buddy
+            // and must carry no stale free-list pointer).
+            let nxt = unsafe {
+                canary_check_free(node, c);
+                let n = node.as_ref().next;
+                (*node.as_ptr()).next = None;
+                n
+            };
+            frames[detached] = (node.as_ptr() as usize) & !(PAGE_SIZE_USIZE - 1);
+            *g = nxt;
+            detached += 1;
+        }
+        drop(g);
+        // `n_blocks == 1`, so detached frames == detached blocks.
+        class.central_free.fetch_sub(detached, Ordering::Relaxed);
+        class.grown.fetch_sub(detached, Ordering::Relaxed);
+        return detached;
+    }
     let mut g = class.head.lock();
     let taken = g.take();
     // Validate every free block's canary before trusting its links, and bound
@@ -2519,6 +2554,90 @@ fn smoke_slab_shrinker_detaches_before_free() -> narf_kernel_test::TestResult {
     TestResult::Pass
 }
 kernel_test_in!("memory", smoke_slab_shrinker_detaches_before_free);
+
+/// Page-size class (`n_blocks == 1`) detach fast path. Every free block is a
+/// whole free frame, so `detach_class_frames` returns up to `limit` of them by
+/// popping the central-list head — no address sort, no full-list rebuild. This
+/// is the regression guard for the kswapd livelock: the old path re-sorted the
+/// ENTIRE central list `O(n log n)` on every reclaim call, so draining a large
+/// page-size class (the CachyOS greeter hoarded ~240 MiB of 4 KiB blocks) was
+/// `O(n²/limit)` and wedged forward progress. Assert a bounded detach returns
+/// exactly `limit` distinct, page-aligned frames and decrements `grown` +
+/// `central_free` by that many.
+fn smoke_slab_pagesize_detach_fast_path() -> narf_kernel_test::TestResult {
+    use core::alloc::Layout;
+    use narf_kernel_test::TestResult;
+    // The largest class is the page-size class (block_size == PAGE_SIZE).
+    let c = N_CLASSES - 1;
+    let block_size = class_size(c);
+    if PAGE_SIZE_USIZE / block_size != 1 {
+        return TestResult::Skip("largest class is not page-size (n_blocks != 1)");
+    }
+    let layout = match Layout::from_size_align(block_size, 16) {
+        Ok(l) => l,
+        Err(_) => return TestResult::Fail("bad layout"),
+    };
+    // Alloc then free enough page-size blocks that a batch is guaranteed to
+    // reach the central list (per-CPU magazines cache only a bounded prefix).
+    const M: usize = 64;
+    let mut ptrs: [Option<NonNull<u8>>; M] = [None; M];
+    for slot in ptrs.iter_mut() {
+        match alloc(layout) {
+            Ok(p) => *slot = Some(p),
+            Err(_) => {
+                for q in ptrs.iter().flatten() {
+                    // SAFETY: allocated just above with `layout`.
+                    unsafe { dealloc(*q, layout) };
+                }
+                return TestResult::Skip("frame allocator drained");
+            }
+        }
+    }
+    for p in ptrs.iter().flatten() {
+        // SAFETY: allocated above with `layout`.
+        unsafe { dealloc(*p, layout) };
+    }
+
+    let grown_before = CLASSES[c].grown.load(Ordering::Relaxed);
+    let central_before = CLASSES[c].central_free.load(Ordering::Relaxed);
+    const BATCH: usize = 4;
+    if central_before < BATCH {
+        return TestResult::Skip("fewer page-size blocks on the central list than the batch");
+    }
+    let mut frames = [0usize; BATCH];
+    // SAFETY: `c < N_CLASSES`; the central list holds only class `c`'s blocks and
+    // the initialized detached prefix is returned exactly once below.
+    let detached = unsafe { detach_class_frames(c, BATCH, &mut frames) };
+    if detached != BATCH {
+        return TestResult::Fail("page-size fast-path detach did not return the full batch");
+    }
+    for i in 0..detached {
+        if frames[i] & (PAGE_SIZE_USIZE - 1) != 0 {
+            // SAFETY: initialized prefix; free before bailing.
+            unsafe { free_detached_slab_frames(&frames[..detached]) };
+            return TestResult::Fail("detached frame not page-aligned");
+        }
+        for j in (i + 1)..detached {
+            if frames[i] == frames[j] {
+                // SAFETY: as above.
+                unsafe { free_detached_slab_frames(&frames[..detached]) };
+                return TestResult::Fail("page-size detach returned a duplicate frame");
+            }
+        }
+    }
+    let grown_after = CLASSES[c].grown.load(Ordering::Relaxed);
+    let central_after = CLASSES[c].central_free.load(Ordering::Relaxed);
+    // SAFETY: exactly the initialized detached prefix, returned once.
+    unsafe { free_detached_slab_frames(&frames[..detached]) };
+    if grown_before.saturating_sub(grown_after) != detached {
+        return TestResult::Fail("grown not decremented by detached count");
+    }
+    if central_before.saturating_sub(central_after) != detached {
+        return TestResult::Fail("central_free not decremented by detached count");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("memory", smoke_slab_pagesize_detach_fast_path);
 
 /// A two-page scan must make progress in both the 4 KiB and 2 KiB classes,
 /// rather than spending the whole target on the smallest-object class.
