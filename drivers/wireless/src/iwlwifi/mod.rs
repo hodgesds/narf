@@ -265,13 +265,43 @@ impl Interface for IwlDevice {
     }
 }
 
+/// Populate supported wireless bands for an Intel Wi-Fi chip.
+///
+/// All supported Intel chips cover 2.4 GHz (channels 1-13) and 5 GHz (channels 36-165).
+/// Wi-Fi 6E and Wi-Fi 7 chips (AX210, AX211, BE200) also cover 6 GHz (channels 1-233).
+pub fn bands_for_chip(chip: &ChipConfig) -> Vec<narf_wireless::iface::WirelessBand> {
+    let mut bands = alloc::vec![
+        narf_wireless::iface::WirelessBand {
+            freq_mhz: 2400,
+            channels: (1..=13).collect(),
+        },
+        narf_wireless::iface::WirelessBand {
+            freq_mhz: 5000,
+            channels: alloc::vec![
+                36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136,
+                140, 144, 149, 153, 157, 161, 165
+            ],
+        },
+    ];
+    if matches!(
+        chip.mac,
+        MacFamily::TyA0 | MacFamily::SoA0 | MacFamily::MaA0 | MacFamily::MaB0 | MacFamily::BzA0
+    ) {
+        bands.push(narf_wireless::iface::WirelessBand {
+            freq_mhz: 6000,
+            channels: (1..=233).step_by(4).collect(),
+        });
+    }
+    bands
+}
+
 #[async_trait::async_trait]
 impl WirelessNetIface for IwlDevice {
     fn get_wireless_info(&self) -> WirelessIfaceInfo {
         WirelessIfaceInfo {
             base_name: self.name().into(),
             base_mac: self.mac(),
-            bands: alloc::vec![], // TODO: populate from chip config
+            bands: bands_for_chip(&self.chip),
             modes: narf_wireless::iface::WirelessModes::STATION,
             hw_caps: narf_wireless::iface::HwCaps {
                 ht_supported: true,
@@ -1929,4 +1959,42 @@ pub mod tests {
         TestResult::Pass
     }
     kernel_test_in!("drivers/wireless/iwlwifi", smoke_iwlwifi_cmd_header_layout);
+
+    fn smoke_iwlwifi_bands_populated_from_chip_config() -> TestResult {
+        let ax200 = chip_config_for_pci_id(INTEL_VENDOR, 0x2723).expect("ax200");
+        let bands_ax200 = bands_for_chip(&ax200);
+        if bands_ax200.len() != 2 {
+            return TestResult::Fail("AX200 should have 2 bands (2.4 GHz and 5 GHz)");
+        }
+        if bands_ax200[0].freq_mhz != 2400 || bands_ax200[0].channels.len() != 13 {
+            return TestResult::Fail("AX200 2.4 GHz band incorrect");
+        }
+        if bands_ax200[1].freq_mhz != 5000 || bands_ax200[1].channels.is_empty() {
+            return TestResult::Fail("AX200 5 GHz band incorrect");
+        }
+
+        let ax210 = chip_config_for_pci_id(INTEL_VENDOR, 0x2725).expect("ax210");
+        let bands_ax210 = bands_for_chip(&ax210);
+        if bands_ax210.len() != 3 {
+            return TestResult::Fail("AX210 should have 3 bands (2.4 GHz, 5 GHz, 6 GHz)");
+        }
+        if bands_ax210[2].freq_mhz != 6000 || bands_ax210[2].channels.is_empty() {
+            return TestResult::Fail("AX210 6 GHz band incorrect");
+        }
+
+        let be200 = chip_config_for_pci_id(INTEL_VENDOR, 0x272b).expect("be200");
+        let bands_be200 = bands_for_chip(&be200);
+        if bands_be200.len() != 3 {
+            return TestResult::Fail("BE200 should have 3 bands (2.4 GHz, 5 GHz, 6 GHz)");
+        }
+        if bands_be200[2].freq_mhz != 6000 {
+            return TestResult::Fail("BE200 6 GHz band incorrect");
+        }
+
+        TestResult::Pass
+    }
+    kernel_test_in!(
+        "drivers/wireless/iwlwifi",
+        smoke_iwlwifi_bands_populated_from_chip_config
+    );
 }
