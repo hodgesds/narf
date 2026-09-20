@@ -20,22 +20,13 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
-        path_str
-    } else if dirfd >= 0 {
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(base) if base.starts_with('/') => {
-                alloc::format!("{}/{}", base.trim_end_matches('/'), path_str)
-            }
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-                return;
-            }
+    let task = current_task_id();
+    let effective = match resolve_at_path(task, dirfd, &path_str) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
-    } else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
-        return;
     };
     crate::handlers::handler_sys_mkdir::mkdir_path(ctx, &effective, mode);
 }
