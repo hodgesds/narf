@@ -5293,6 +5293,14 @@ fn smoke_process_coredump_e2e() -> TestResult {
     crate::syscall::__test_clear_global();
     narf_scheduler::__reset_queues_for_test();
     setup_process_state(PARENT);
+    // Start from the default rlimit rows. Production never needs this —
+    // reap removes a task's row and TaskIds are never reused — but the
+    // harness fabricates task ids and REUSES them across tests, so a
+    // predecessor that lowered this id's RLIMIT_CORE hard limit would make
+    // the raise below EPERM. Sibling tests in this file already reset;
+    // this one inherited instead, which made it pass or fail depending on
+    // what ran before it.
+    crate::handlers::__test_rlimit_reset();
     crate::handlers::cwd_init();
 
     // 1. Create a parent address space

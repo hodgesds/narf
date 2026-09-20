@@ -108,6 +108,10 @@ fn install_console_signal_hook() {
     // The privileged tty ioctls test POSIX capabilities, which live in the
     // process tables rather than the filesystem layer.
     narf_filesystem::devfs_pty::install_pty_cap_hook(narf_userspace::handlers::pty_capable);
+    // AF_INET datagram sockets keep their port table in the userspace
+    // crate, so the UDP RX demux has to ask it before dropping a datagram
+    // no in-kernel socket claimed.
+    narf_net::udp_sock::install_user_deliver_hook(narf_userspace::socket::deliver_wire_datagram);
 }
 
 fn install_proc_hooks() {

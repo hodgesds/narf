@@ -1209,3 +1209,126 @@ kernel_test_in!(
     "userspace/netlink",
     smoke_stack_admin_delegates_only_to_current_route_socket
 );
+
+// ── AF_INET datagram sockets on the wire ─────────────────────────────────────
+
+/// Frames the synthetic NIC captured, for the wire-UDP test below.
+static UDP_TX_CAPTURE: narf_lib::sync::IrqSafeSpinLock<alloc::vec::Vec<alloc::vec::Vec<u8>>> =
+    narf_lib::sync::IrqSafeSpinLock::new(alloc::vec::Vec::new());
+
+fn udp_capture_send(frame: &[u8]) -> Result<(), ()> {
+    UDP_TX_CAPTURE.lock().push(frame.to_vec());
+    Ok(())
+}
+
+/// A userspace AF_INET datagram socket reaches the NETWORK, in both
+/// directions.
+///
+/// `sendto` to an address no local socket owns used to look the peer up in
+/// an in-kernel table and, finding nothing, `return SocketOpResult::Ok(len)`
+/// — reporting every byte as written while the datagram went nowhere. TCP
+/// has had a wired path (`SocketState::InetWired` into `tcp_stack`) all
+/// along; UDP had no counterpart, so a userspace program could not send or
+/// receive a datagram off-box at all.
+fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
+    const IFACE: &str = "udptest0";
+    const LOCAL: [u8; 4] = [10, 7, 0, 2];
+    const PEER: [u8; 4] = [10, 7, 0, 9];
+    const LOCAL_PORT: u16 = 4242;
+    const PEER_PORT: u16 = 5353;
+
+    narf_net::iface::register(IFACE, [0x02, 0, 0, 0, 0, 0x07], udp_capture_send);
+    narf_net::iface::set_default_ipv4(LOCAL, LOCAL);
+    narf_net::iface::add_addr(IFACE, LOCAL, 24);
+    // Seed ARP: the send path resolves without blocking, and an unresolved
+    // neighbour would be dropped rather than queued.
+    narf_net::arp_cache::insert(IFACE, PEER, [0x02, 0, 0, 0, 0, 0x09]);
+    narf_net::tcp_stack::__arp_insert_legacy(PEER, [0x02, 0, 0, 0, 0, 0x09]);
+    UDP_TX_CAPTURE.lock().clear();
+
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
+    let mut bind_addr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    bind_addr.extend_from_slice(&LOCAL_PORT.to_be_bytes());
+    bind_addr.extend_from_slice(&[0, 0, 0, 0]); // INADDR_ANY
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::SockAddr {
+                family: crate::socket::AF_INET,
+                body: bind_addr,
+            },
+        }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind failed");
+    }
+
+    // ── TX: a datagram for a remote peer must leave on the wire ──
+    let mut to: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    to.extend_from_slice(&PEER_PORT.to_be_bytes());
+    to.extend_from_slice(&PEER);
+    let r = sock.dispatch_op(crate::socket::SocketOp::Send {
+        buf: b"ping",
+        flags: 0,
+        addr: Some(crate::socket::SockAddr {
+            family: crate::socket::AF_INET,
+            body: to,
+        }),
+    });
+    if !matches!(r, crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("sendto to a remote peer failed");
+    }
+    let frames = UDP_TX_CAPTURE.lock().clone();
+    if frames.is_empty() {
+        return TestResult::Fail("sendto to a remote peer emitted no frame — silently dropped");
+    }
+    // Ethernet(14) + IPv4(20) + UDP(8); check the ports and payload landed.
+    let f = &frames[0];
+    if f.len() < 14 + 20 + 8 + 4 {
+        return TestResult::Fail("captured frame is too short to be the datagram");
+    }
+    let udp = &f[34..];
+    if u16::from_be_bytes([udp[0], udp[1]]) != LOCAL_PORT {
+        return TestResult::Fail("datagram carries the wrong source port");
+    }
+    if u16::from_be_bytes([udp[2], udp[3]]) != PEER_PORT {
+        return TestResult::Fail("datagram carries the wrong destination port");
+    }
+    if &udp[8..12] != b"ping" {
+        return TestResult::Fail("datagram carries the wrong payload");
+    }
+
+    // ── RX: a datagram from the wire must reach the socket ──
+    if !crate::socket::deliver_wire_datagram(
+        sock.net_ns_id(),
+        PEER,
+        PEER_PORT,
+        LOCAL,
+        LOCAL_PORT,
+        b"pong",
+    ) {
+        return TestResult::Fail("a wire datagram was not delivered to the bound socket");
+    }
+    let mut out = [0u8; 32];
+    match sock.dispatch_op(crate::socket::SocketOp::Recv {
+        buf: &mut out,
+        flags: 0,
+    }) {
+        crate::socket::SocketOpResult::Received { n, .. } if &out[..n] == b"pong" => {}
+        _ => return TestResult::Fail("recv did not return the wire datagram"),
+    }
+
+    // A datagram for a port nobody bound is refused, so the net layer can
+    // fall through to its own handling rather than silently swallowing it.
+    if crate::socket::deliver_wire_datagram(
+        sock.net_ns_id(),
+        PEER,
+        PEER_PORT,
+        LOCAL,
+        LOCAL_PORT + 1,
+        b"nobody",
+    ) {
+        return TestResult::Fail("an unbound port must not accept a wire datagram");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_inet_dgram_reaches_the_wire);
