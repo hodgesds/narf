@@ -496,14 +496,45 @@ fn smoke_socket_tcp_congestion_round_trip() -> TestResult {
 }
 kernel_test_in!("userspace", smoke_socket_tcp_congestion_round_trip);
 
-/// SO_BINDTODEVICE: string round-trip.
+/// SO_BINDTODEVICE names a device that must EXIST.
+///
+/// `sock_setbindtodevice` (`net/core/sock.c:685`) resolves the name with
+/// `dev_get_by_name_rcu` and answers -ENODEV when it misses
+/// (`net/core/sock.c:719`); an empty name unbinds. This test used to bind
+/// to "eth0" while discarding the setsockopt result and then assert only
+/// that getsockopt echoed the string back — which passed precisely BECAUSE
+/// nothing validated the name or enforced anything. A round-trip is not
+/// evidence of a device binding.
 fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
     let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
-    let _ = sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
-        level: crate::socket::SOL_SOCKET,
-        name: crate::socket::SO_BINDTODEVICE,
-        value: b"eth0",
-    });
+    let set = |value: &[u8]| {
+        sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+            level: crate::socket::SOL_SOCKET,
+            name: crate::socket::SO_BINDTODEVICE,
+            value,
+        })
+    };
+
+    // A device that does not exist is ENODEV, not silent acceptance.
+    match set(b"definitely-not-a-nic") {
+        crate::socket::SocketOpResult::Err(e) if e.errno() == 19 => {}
+        crate::socket::SocketOpResult::Ok(_) => {
+            return TestResult::Fail("binding to a nonexistent device must fail")
+        }
+        _ => return TestResult::Fail("binding to a nonexistent device must be ENODEV"),
+    }
+
+    // A real interface binds and round-trips. Loopback is always present.
+    let Some(dev) = narf_net::iface::snapshot_all()
+        .into_iter()
+        .map(|i| i.name)
+        .find(|n| narf_net::iface::ifindex_of(n).is_some())
+    else {
+        return TestResult::Skip("no interface registered to bind to");
+    };
+    if !matches!(set(dev.as_bytes()), crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("binding to a live interface should succeed");
+    }
     let mut out = [0u8; 16];
     let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
         level: crate::socket::SOL_SOCKET,
@@ -514,10 +545,26 @@ fn smoke_socket_so_bindtodevice_round_trip() -> TestResult {
         crate::socket::SocketOpResult::OptValue { n } => n,
         _ => return TestResult::Fail("SO_BINDTODEVICE get failed"),
     };
-    if &out[..n] == b"eth0" {
-        TestResult::Pass
-    } else {
-        TestResult::Fail("SO_BINDTODEVICE round-trip mismatch")
+    if &out[..n] != dev.as_bytes() {
+        return TestResult::Fail("SO_BINDTODEVICE round-trip mismatch");
+    }
+
+    // An empty name unbinds. The harness task is privileged, so the
+    // CAP_NET_RAW re-bind gate does not block this.
+    if !matches!(set(b""), crate::socket::SocketOpResult::Ok(_)) {
+        return TestResult::Fail("an empty device name must unbind");
+    }
+    let r = sock.dispatch_op(crate::socket::SocketOp::GetSockOpt {
+        level: crate::socket::SOL_SOCKET,
+        name: crate::socket::SO_BINDTODEVICE,
+        buf: &mut out,
+    });
+    match r {
+        crate::socket::SocketOpResult::OptValue { n: 0 } => TestResult::Pass,
+        crate::socket::SocketOpResult::OptValue { .. } => {
+            TestResult::Fail("an unbound socket must report no device")
+        }
+        _ => TestResult::Fail("SO_BINDTODEVICE get failed after unbind"),
     }
 }
 kernel_test_in!("userspace", smoke_socket_so_bindtodevice_round_trip);
