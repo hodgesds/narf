@@ -598,8 +598,5 @@ mod tests {
         }
         TestResult::Pass
     }
-    kernel_test_in!(
-        "userspace/io_mux",
-        smoke_timerfd_poll_deadline_never_past
-    );
+    kernel_test_in!("userspace/io_mux", smoke_timerfd_poll_deadline_never_past);
 }

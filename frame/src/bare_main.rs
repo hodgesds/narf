@@ -3829,7 +3829,8 @@ pub unsafe extern "C" fn _start_rust(raw: RawBootInfo) -> ! {
                                 if mounts.iter().any(|m| m == mount_path) {
                                     continue;
                                 }
-                                if let Ok(fs) = narf_filesystem::TmpFs::from_options(mode, uid, gid) {
+                                if let Ok(fs) = narf_filesystem::TmpFs::from_options(mode, uid, gid)
+                                {
                                     if narf_filesystem::registry()
                                         .mount_overlay(&auth, mount_path, ov_name, fs)
                                         .is_ok()

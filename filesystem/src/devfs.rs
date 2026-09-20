@@ -458,10 +458,8 @@ impl FileOps for DevKmsg {
         // caught-up read (n == 0, WouldBlock) records the reader's position so
         // readiness clears — otherwise poll_readiness would report POLLIN
         // forever and the reader would spin.
-        self.read_end.fetch_max(
-            offset as usize + n,
-            core::sync::atomic::Ordering::Relaxed,
-        );
+        self.read_end
+            .fetch_max(offset as usize + n, core::sync::atomic::Ordering::Relaxed);
         Box::pin(async move {
             if n == 0 {
                 Err(FsError::WouldBlock)
@@ -2367,7 +2365,9 @@ fn smoke_dev_kmsg_poll_clears_when_drained() -> TestResult {
     }
     // ...and the epoll query with a STALE snapshot offset (the exact spin bug).
     if k.poll_readiness_at(0) & crate::POLL_IN != 0 {
-        return TestResult::Fail("caught-up /dev/kmsg still POLLIN via stale offset (journald spin)");
+        return TestResult::Fail(
+            "caught-up /dev/kmsg still POLLIN via stale offset (journald spin)",
+        );
     }
     // A new record re-arms POLLIN (readiness tracks fresh data).
     narf_console::klog::record("kmsg-drain-probe-2");
@@ -2377,10 +2377,7 @@ fn smoke_dev_kmsg_poll_clears_when_drained() -> TestResult {
     narf_console::klog::__reset_for_test();
     TestResult::Pass
 }
-kernel_test_in!(
-    "filesystem/devfs",
-    smoke_dev_kmsg_poll_clears_when_drained
-);
+kernel_test_in!("filesystem/devfs", smoke_dev_kmsg_poll_clears_when_drained);
 
 /// devtmpfs is writable for runtime aliases such as journald's `/dev/log`.
 fn smoke_dev_runtime_symlink_create_lookup_unlink() -> TestResult {

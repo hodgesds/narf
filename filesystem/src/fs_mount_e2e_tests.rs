@@ -337,9 +337,9 @@ fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
     };
 
     // (1) The lower file resolves through the overmounted overlay (topmost).
-    let f = match registry()
-        .resolve_absolute(&format!("{BASE}/kdeglobals"), |fs, rel| resolve(fs.root(), rel))
-    {
+    let f = match registry().resolve_absolute(&format!("{BASE}/kdeglobals"), |fs, rel| {
+        resolve(fs.root(), rel)
+    }) {
         Some(Ok(f)) => f,
         _ => return TestResult::Fail("lower file hidden by the overlay (regression)"),
     };
@@ -361,7 +361,10 @@ fn smoke_vfs_mount_overlay_lower_visible_and_writable() -> TestResult {
         _ => return TestResult::Fail("create through overlay failed"),
     }
     if !matches!(
-        registry().resolve_absolute(&format!("{BASE}/onlyupper"), |fs, rel| resolve(fs.root(), rel)),
+        registry().resolve_absolute(&format!("{BASE}/onlyupper"), |fs, rel| resolve(
+            fs.root(),
+            rel
+        )),
         Some(Ok(_))
     ) {
         return TestResult::Fail("upper-written file not visible through the overlay");
