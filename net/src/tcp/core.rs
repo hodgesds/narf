@@ -2001,7 +2001,14 @@ fn process_in_state(
     {
         let t = arc.lock();
         if let Some((tsv, _)) = parsed.timestamps {
-            if t.opts.paws_reject(tsv) {
+            // `tcp_validate_incoming` reaches PAWS through `tcp_paws_discard`,
+            // which passes TCP_PAWS_WINDOW — a one-tick replay tolerance, so
+            // a segment the peer emitted a hair behind its own clock is not
+            // treated as a stale duplicate.
+            let now_cycles = narf_scheduler::narf_time::now_cycles();
+            if t.opts
+                .paws_reject(tsv, now_cycles, super::options::TCP_PAWS_WINDOW)
+            {
                 drop(t);
                 // Drop the segment + send ACK as challenge-style
                 // response. Don't touch our state.
