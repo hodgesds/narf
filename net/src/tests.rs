@@ -6914,19 +6914,108 @@ fn smoke_tcp_options_negotiate_picks_lower_mss() -> TestResult {
 kernel_test_in!("net/tcp", smoke_tcp_options_negotiate_picks_lower_mss);
 
 fn smoke_tcp_options_paws_rejects_stale() -> TestResult {
-    use crate::tcp::options::OptionsState;
+    use crate::tcp::options::{OptionsState, TCP_PAWS_WINDOW};
     let mut state = OptionsState::new();
     state.timestamps_active = true;
     state.ts_recent = 100;
-    if !state.paws_reject(50) {
+    // A fresh stamp, so the staleness escape does not mask the comparison.
+    let now = 1_000_000u64;
+    state.ts_recent_at_cycles = now;
+    if !state.paws_reject(50, now, TCP_PAWS_WINDOW) {
         return TestResult::Fail("PAWS should reject older TSval");
     }
-    if state.paws_reject(150) {
+    if state.paws_reject(150, now, TCP_PAWS_WINDOW) {
         return TestResult::Fail("PAWS should accept newer TSval");
     }
     TestResult::Pass
 }
 kernel_test_in!("net/tcp", smoke_tcp_options_paws_rejects_stale);
+
+/// The replay window: a TSval one tick behind is tolerated, not rejected.
+///
+/// `tcp_paws_check` accepts while `ts_recent - rcv_tsval <= paws_win`, and
+/// `tcp_validate_incoming` reaches it through `tcp_paws_discard`, which
+/// passes `TCP_PAWS_WINDOW` (1) — `include/net/tcp.h:201`. Measuring the
+/// difference the other way round and testing `< 0`, as this used to, is
+/// only equivalent at a window of zero, so a segment Linux accepts was
+/// being dropped.
+fn smoke_tcp_paws_tolerates_one_tick_replay() -> TestResult {
+    use crate::tcp::options::{OptionsState, TCP_PAWS_WINDOW};
+    let mut state = OptionsState::new();
+    state.timestamps_active = true;
+    state.ts_recent = 100;
+    let now = 1_000_000u64;
+    state.ts_recent_at_cycles = now;
+    if state.paws_reject(99, now, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("a TSval one tick behind is within the replay window");
+    }
+    // Two behind is outside it.
+    if !state.paws_reject(98, now, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("a TSval beyond the replay window must still be rejected");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_paws_tolerates_one_tick_replay);
+
+/// A `ts_recent` older than `TCP_PAWS_WRAP` is no longer comparable, so
+/// the segment is accepted rather than rejected.
+///
+/// `tcp_paws_check`'s second escape (`include/net/tcp.h:1847`). The peer's
+/// 32-bit timestamp clock may legitimately have wrapped in that time, so
+/// the comparison carries no information. `ts_recent_at_cycles` is
+/// recorded for exactly this and was never read, so the escape could not
+/// fire and a long-idle connection would reject the peer's resumed
+/// traffic indefinitely.
+fn smoke_tcp_paws_stale_ts_recent_stops_rejecting() -> TestResult {
+    use crate::tcp::options::{OptionsState, TCP_PAWS_WINDOW, TCP_PAWS_WRAP_SECS};
+    let mut state = OptionsState::new();
+    state.timestamps_active = true;
+    state.ts_recent = 100;
+    state.ts_recent_at_cycles = 0;
+    let wrap = narf_scheduler::narf_time::ns_to_cycles(TCP_PAWS_WRAP_SECS * 1_000_000_000);
+
+    // Just inside the window: still a stale duplicate.
+    if !state.paws_reject(50, wrap - 1, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("within TCP_PAWS_WRAP an older TSval is still rejected");
+    }
+    // Past it: ts_recent is untrustworthy, so let the segment through.
+    if state.paws_reject(50, wrap, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("past TCP_PAWS_WRAP the comparison must stop rejecting");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_paws_stale_ts_recent_stops_rejecting);
+
+/// A peer that sent `tsval=0` in its SYN is not locked out forever.
+///
+/// `tcp_paws_check`'s third escape, which Linux documents outright:
+/// "Some OSes send SYN and SYNACK messages with tsval=0 tsecr=0, then
+/// following tcp messages have valid values. Ignore 0 value, or else
+/// 'negative' tsval might forbid us to accept their packets."
+///
+/// With `ts_recent` at 0, a real TSval near the top of the 32-bit range
+/// reads as far AHEAD of us in signed distance, so without the guard every
+/// such segment is rejected — the connection stalls against an
+/// otherwise-healthy peer.
+fn smoke_tcp_paws_zero_ts_recent_accepts() -> TestResult {
+    use crate::tcp::options::{OptionsState, TCP_PAWS_WINDOW};
+    let mut state = OptionsState::new();
+    state.timestamps_active = true;
+    state.ts_recent = 0;
+    let now = 1_000_000u64;
+    state.ts_recent_at_cycles = now;
+    // Chosen so the plain comparison WOULD reject: 0 - 0xFFFF_FFF0 = 16 > 1.
+    if state.paws_reject(0xFFFF_FFF0, now, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("a zero ts_recent must not reject the peer's real TSvals");
+    }
+    // Once a real value is recorded, ordinary PAWS resumes.
+    state.ts_recent = 0xFFFF_FFF0;
+    if !state.paws_reject(0xFFFF_FF00, now, TCP_PAWS_WINDOW) {
+        return TestResult::Fail("PAWS must resume once ts_recent is non-zero");
+    }
+    TestResult::Pass
+}
+kernel_test_in!("net/tcp", smoke_tcp_paws_zero_ts_recent_accepts);
 
 fn smoke_tcp_options_window_scale_round_trip() -> TestResult {
     use crate::tcp::options::OptionsState;

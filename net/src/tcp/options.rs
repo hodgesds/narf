@@ -152,6 +152,23 @@ pub struct OptionsState {
     pub ts_recent_at_cycles: u64,
 }
 
+/// `TCP_PAWS_WINDOW` — the per-host replay tolerance (`include/net/tcp.h:201`).
+pub const TCP_PAWS_WINDOW: i32 = 1;
+
+/// `TCP_PAWS_WRAP` = `INT_MAX / USEC_PER_SEC` (`include/net/tcp.h:193`),
+/// i.e. 2147 seconds. Past this, a recorded `ts_recent` is too old to
+/// compare against — the peer's 32-bit clock may have wrapped.
+///
+/// Note this is NOT the 24 days the historical `TCP_PAWS_24DAYS` name
+/// suggests; current kernels derive it from `INT_MAX` microseconds.
+pub const TCP_PAWS_WRAP_SECS: u64 = 2147;
+
+/// `TCP_PAWS_WRAP` expressed in TSC cycles, since `ts_recent_at_cycles` is
+/// a raw cycle snapshot rather than a wall-clock second.
+fn paws_wrap_cycles() -> u64 {
+    narf_scheduler::narf_time::ns_to_cycles(TCP_PAWS_WRAP_SECS.saturating_mul(1_000_000_000))
+}
+
 impl Default for OptionsState {
     fn default() -> Self {
         Self::new()
@@ -219,15 +236,61 @@ impl OptionsState {
         }
     }
 
-    /// RFC 7323 §5.3 PAWS check: returns true iff the segment
-    /// should be *rejected* as a stale duplicate.
-    pub fn paws_reject(&self, peer_tsval: u32) -> bool {
+    /// RFC 7323 §5.3 PAWS check: returns true iff the segment should be
+    /// *rejected* as a stale duplicate.
+    ///
+    /// The inverse of `tcp_paws_check` (`include/net/tcp.h:1842`), which
+    /// has THREE ways to accept and NARF previously implemented only the
+    /// first:
+    ///
+    /// ```c
+    /// if ((s32)(rx_opt->ts_recent - rx_opt->rcv_tsval) <= paws_win)
+    ///         return true;
+    /// if (!time_before32(ktime_get_seconds(),
+    ///                    rx_opt->ts_recent_stamp + TCP_PAWS_WRAP))
+    ///         return true;
+    /// /*
+    ///  * Some OSes send SYN and SYNACK messages with tsval=0 tsecr=0,
+    ///  * then following tcp messages have valid values. Ignore 0 value,
+    ///  * or else 'negative' tsval might forbid us to accept their packets.
+    ///  */
+    /// if (!rx_opt->ts_recent)
+    ///         return true;
+    /// return false;
+    /// ```
+    ///
+    /// The two missing escapes both matter:
+    ///
+    /// * **Stale `ts_recent`.** Past `TCP_PAWS_WRAP` since the value was
+    ///   recorded, the 32-bit timestamp may legitimately have wrapped, so
+    ///   the comparison means nothing and the segment must be let through.
+    ///   This is what `ts_recent_at_cycles` was recorded for — it was
+    ///   written on every update and never read, so the escape never fired.
+    /// * **`ts_recent == 0`.** A peer that sent `tsval=0` in its SYN and
+    ///   real values afterwards would otherwise have every later segment
+    ///   whose TSval looks "negative" against zero rejected forever.
+    ///
+    /// `paws_win` is the replay tolerance; Linux passes 0 from the
+    /// out-of-window path (`tcp_input.c:4100`) and `TCP_PAWS_WINDOW` (1)
+    /// from the segment-validation path (`tcp_input.c:6351`).
+    pub fn paws_reject(&self, peer_tsval: u32, now_cycles: u64, paws_win: i32) -> bool {
         if !self.timestamps_active {
             return false;
         }
-        // Tolerate wrap with the signed-distance trick; reject
-        // strictly older TSvals.
-        ((peer_tsval.wrapping_sub(self.ts_recent)) as i32) < 0
+        // Note the direction: Linux measures how far BEHIND the peer's
+        // TSval is (`ts_recent - rcv_tsval`), so the tolerance is a
+        // positive window. Computing the difference the other way round
+        // and testing `< 0` is only equivalent when `paws_win` is 0.
+        if (self.ts_recent.wrapping_sub(peer_tsval) as i32) <= paws_win {
+            return false;
+        }
+        if now_cycles.saturating_sub(self.ts_recent_at_cycles) >= paws_wrap_cycles() {
+            return false;
+        }
+        if self.ts_recent == 0 {
+            return false;
+        }
+        true
     }
 
     /// Record a fresh TSval from the peer.
