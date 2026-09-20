@@ -15,7 +15,16 @@ use super::*;
 ///
 /// Both file the fd's anonymous inode into newpath via `link_node`.
 pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
+    // Linux SYSCALL_DEFINE5(linkat) validates flags first (fs/namei.c:5786):
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_EMPTY_PATH: u64 = 0x1000;
     let args = *ctx.args();
+    let flags = args.arg4;
+    if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+
     // `SYSCALL_DEFINE5(linkat)` takes `CLASS(filename, old)(oldname)` then
     // `CLASS(filename, new)(newname)`, and `filename_linkat` propagates the
     // OLD name's error first. The tuple form here evaluated both and then
@@ -36,22 +45,7 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    const AT_FDCWD: i64 = -100;
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    let flags = args.arg4;
     let task = current_task_id();
-    let with_dirfd = |dirfd: i64, path: alloc::string::String| -> alloc::string::String {
-        if path.starts_with('/') || dirfd == AT_FDCWD || dirfd < 0 {
-            return path;
-        }
-        match fd_path_for_task(task, dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path)
-            }
-            _ => path,
-        }
-    };
-    let new_eff = with_dirfd(args.arg2 as i64, new_raw);
 
     // O_TMPFILE materialisation, form 1: AT_EMPTY_PATH + empty oldpath →
     // olddirfd is the O_TMPFILE fd whose anonymous inode gets named.
@@ -61,18 +55,34 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
             return;
         }
+        let new_eff = match resolve_at_path(task, args.arg2 as i64, &new_raw) {
+            Ok(p) => p,
+            Err(errno) => {
+                ctx.set_return(SyscallReturn::ok(errno as u64));
+                return;
+            }
+        };
         let new_abs = resolve_cwd_path(task, &new_eff);
         let r = link_fd_node_impl(task, src_fd as u32, &new_abs);
         ctx.set_return(SyscallReturn::ok(r as u64));
         return;
     }
 
-    // O_TMPFILE materialisation, form 2: oldpath = /proc/self/fd/N (or
-    // /proc/<pid>/fd/N) — the anonymous inode is named by that magic
-    // symlink. Only take this route when N names a live PATHLESS fd (an
-    // O_TMPFILE / memfd node); a /proc/self/fd/N that points at a real
-    // named file falls through to the ordinary path-based hard link.
-    let old_eff = with_dirfd(args.arg0 as i64, old_raw);
+    // Linux filename_linkat looks up oldpath first, then newpath.
+    let old_eff = match resolve_at_path(task, args.arg0 as i64, &old_raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    let new_eff = match resolve_at_path(task, args.arg2 as i64, &new_raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
     if let Some(src_fd) = parse_proc_self_fd(&old_eff) {
         // `linkat(…, "/proc/self/fd/N", …, AT_SYMLINK_FOLLOW)` means "give
         // the object this fd refers to another name", so linking the fd's
