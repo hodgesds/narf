@@ -34,9 +34,11 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
         return;
     };
+    let offset_signed = offset as i64;
+    let len_signed = len as i64;
     // loff_t arguments: a negative offset or a non-positive length is a
     // caller error, distinct from "this filesystem cannot preallocate".
-    if (offset as i64) < 0 || (len as i64) <= 0 {
+    if offset_signed < 0 || len_signed <= 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;
     }
@@ -48,6 +50,13 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     }
     if !endpoint.writable() {
         ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        return;
+    }
+    let iflags = endpoint.ops.inode_flags();
+    if iflags & narf_filesystem::FS_IMMUTABLE_FL != 0
+        || ((mode & !KEEP_SIZE != 0) && iflags & narf_filesystem::FS_APPEND_FL != 0)
+    {
+        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
         return;
     }
     match endpoint.ops.stat().mode.file_type {
@@ -64,6 +73,11 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // -ENODEV
             return;
         }
+    }
+    // `fs/open.c::vfs_fallocate`: check for wraparound (`if (check_add_overflow(offset, len, &sum)) return -EFBIG;`).
+    if offset_signed.checked_add(len_signed).is_none() {
+        ctx.set_return(SyscallReturn::ok((-27i64) as u64)); // -EFBIG
+        return;
     }
     let target_end = offset.saturating_add(len);
     let outcome = (|| -> Result<(), narf_filesystem::FsError> {
