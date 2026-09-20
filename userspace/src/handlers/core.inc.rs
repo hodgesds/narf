@@ -1309,7 +1309,21 @@ fn open_impl(
     if flags & O_TMPFILE_BIT != 0 && mnt_len == 0 {
         match resolve_dir_absolute(path) {
             Some(dir) if dir.supports_tmpfile() => {
-                let node = match poll_blocking(dir.tmpfile(0o600)) {
+                // Linux `vfs_tmpfile`: the anonymous inode is born with the
+                // CALLER's requested mode (& ~umask) and `inode_init_owner`
+                // ownership — the creating task's fsuid/fsgid — NOT a hardcoded
+                // root:0600. Qt's QSaveFile/QTemporaryFile (KConfig's atomic
+                // config writer) creates via O_TMPFILE then `linkat()`s the node
+                // into place; a root:0600 temp made the plasmalogin greeter's own
+                // ~/.config/kdedefaults/* files unreadable to it (uid 957) once
+                // linked — KConfig reported "inaccessible config location" and the
+                // greeter never rendered.
+                let tmp_mode = if create_mode & 0o7777 != 0 {
+                    (create_mode & !current_umask()) & 0o7777
+                } else {
+                    0o600
+                };
+                let node = match poll_blocking(dir.tmpfile(tmp_mode)) {
                     Some(Ok(node)) => node,
                     Some(Err(narf_filesystem::FsError::Unsupported)) => {
                         // memfs predates the generic tmpfile hook and can
@@ -1321,6 +1335,10 @@ fn open_impl(
                         return;
                     }
                 };
+                // inode_init_owner: stamp the creating task's fsuid/fsgid so a
+                // later `linkat` materialises a file the creator actually owns.
+                let accessor = current_accessor(task);
+                let _ = poll_blocking(node.set_owners(accessor.uid, accessor.gid));
                 let new_fd = reservation.install(crate::fd::FdEntry {
                         ops: node,
                         offset: 0,

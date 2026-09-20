@@ -2866,6 +2866,77 @@ kernel_test_in!(
     smoke_abi_ioerrno_linkat_across_filesystems_is_exdev
 );
 
+/// O_TMPFILE must mint the anonymous inode with the CREATING task's ownership
+/// (Linux `vfs_tmpfile` → `inode_init_owner`), not a hardcoded root:0600.
+///
+/// Qt's `QSaveFile`/`QTemporaryFile` — KConfig's atomic config writer — writes
+/// via `openat(O_TMPFILE, mode)` then `linkat(AT_EMPTY_PATH)` into place. When
+/// the temp inode was born root:0600 regardless of the creator, the plasmalogin
+/// greeter (uid 957) produced its own `~/.config/kdedefaults/*` files but then
+/// could not read them back — KConfig reported "inaccessible config location"
+/// and the greeter never rendered (black screen). Create as a non-root user and
+/// prove the creator can reopen its own linked file.
+fn smoke_abi_o_tmpfile_owned_by_creator_is_reopenable() -> TestResult {
+    const AT_FDCWD: u64 = 0xffff_ffff_ffff_ff9c;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const O_TMPFILE_BIT: u64 = 0o20_000_000;
+    const O_RDWR: u64 = 2;
+    const O_RDONLY: u64 = 0;
+    const EACCES: i64 = -13;
+
+    let task = crate::handlers::current_task_id();
+    // Create as a non-root user so ownership is observable — root would own the
+    // node either way and hide the bug.
+    crate::handlers::__test_set_fsids(task, 957, 957);
+
+    let result = with_memfs("/abi-tmpf", "tmpf", &[], || {
+        let dir = b"/abi-tmpf\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, dir.as_ptr() as u64, O_TMPFILE_BIT | O_RDWR, 0o600),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(O_TMPFILE) on the memfs mount failed"),
+        };
+        // Materialise the anonymous inode into a name, exactly as QSaveFile does.
+        let empty = b"\0";
+        let named = b"/abi-tmpf/cfg\0";
+        let rc = call(
+            Syscall::Linkat.raw(),
+            a4(
+                fd,
+                empty.as_ptr() as u64,
+                AT_FDCWD,
+                named.as_ptr() as u64,
+                AT_EMPTY_PATH,
+            ),
+        );
+        let _ = call(Syscall::Close.raw(), a0(fd));
+        if rc != Some(0) {
+            return Err("linkat(AT_EMPTY_PATH) of the O_TMPFILE node failed");
+        }
+        // The CREATOR (still uid 957) must read its own file back. Pre-fix the
+        // node was born root:0600, so this reopen EACCES'd — the greeter wedge.
+        match call_open(named.as_ptr() as u64, O_RDONLY) {
+            Some(r) if r >= 0 => {
+                let _ = call(Syscall::Close.raw(), a0(r as u64));
+                Ok(())
+            }
+            Some(rc) if rc == EACCES => Err(
+                "O_TMPFILE node born NOT owned by its creator (root:0600) — creator cannot reopen it",
+            ),
+            _ => Err("reopen of the linked O_TMPFILE file failed unexpectedly"),
+        }
+    });
+
+    crate::handlers::__test_uidgid_reset();
+    result
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_o_tmpfile_owned_by_creator_is_reopenable
+);
+
 /// `epoll_ctl` refuses a target that cannot be polled, with EPERM.
 ///
 /// ```text
