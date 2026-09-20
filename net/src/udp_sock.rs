@@ -534,13 +534,17 @@ static RR_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// Deliver a received UDP datagram to matching socket(s).
 /// `datagram` is the raw UDP segment (header + payload, 8+ bytes).
 pub fn deliver(src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
-    deliver_in(0, src_ip, dst_ip, datagram, ttl);
+    deliver_in(0, src_ip, dst_ip, datagram, ttl, 0);
 }
 
-/// `fn(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload) -> bool` —
-/// hand a datagram to the userspace socket layer, which keeps its own
-/// port table. Returns whether a socket there consumed it.
-type UserDeliverHook = fn(u64, [u8; 4], u16, [u8; 4], u16, &[u8]) -> bool;
+/// `fn(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex)
+/// -> bool` — hand a datagram to the userspace socket layer, which keeps
+/// its own port table. Returns whether a socket there consumed it.
+///
+/// `in_ifindex` is the arrival interface, so that layer can apply the same
+/// SO_BINDTODEVICE rule; without it the check would hold for in-kernel
+/// sockets and silently not for userspace ones.
+type UserDeliverHook = fn(u64, [u8; 4], u16, [u8; 4], u16, &[u8], u32) -> bool;
 
 static USER_DELIVER_HOOK: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
@@ -553,6 +557,7 @@ pub fn install_user_deliver_hook(hook: UserDeliverHook) {
     USER_DELIVER_HOOK.store(hook as usize, core::sync::atomic::Ordering::Release);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn user_deliver(
     net_ns_id: u64,
     src_ip: [u8; 4],
@@ -560,6 +565,7 @@ fn user_deliver(
     dst_ip: [u8; 4],
     dst_port: u16,
     payload: &[u8],
+    in_ifindex: u32,
 ) -> bool {
     let raw = USER_DELIVER_HOOK.load(core::sync::atomic::Ordering::Acquire);
     if raw == 0 {
@@ -569,10 +575,25 @@ fn user_deliver(
     // `UserDeliverHook`, the only writer of this slot, and function
     // pointers are never unmapped.
     let hook: UserDeliverHook = unsafe { core::mem::transmute(raw) };
-    hook(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload)
+    hook(
+        net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
+    )
 }
 
-pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
+/// Demultiplex a received UDP datagram to the sockets bound for it.
+///
+/// `in_ifindex` is the interface it ARRIVED on — Linux's `dif` — and 0
+/// means "unknown", which matches any socket. Without it SO_BINDTODEVICE
+/// cannot be honoured on receive: a socket pinned to one NIC would still be
+/// handed datagrams that came in on another.
+pub fn deliver_in(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    datagram: &[u8],
+    ttl: u8,
+    in_ifindex: u32,
+) {
     if datagram.len() < UDP_HDR_LEN {
         return;
     }
@@ -588,22 +609,54 @@ pub fn deliver_in(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[
     let src_addr = SocketAddrV4::new(src_ip, src_port);
 
     // Collect candidate sockets for this dst_port.
-    let candidates: Vec<Arc<UdpSocket>> = {
+    // `compute_score` (`net/ipv4/udp.c:398`):
+    //
+    //     dev_match = udp_sk_bound_dev_eq(net, sk->sk_bound_dev_if, dif, sdif);
+    //     if (!dev_match)
+    //             return -1;
+    //     if (sk->sk_bound_dev_if)
+    //             score += 4;
+    //
+    // Two rules, and both matter. A socket bound to a DIFFERENT interface
+    // is not a candidate at all; and among sockets that do match, one bound
+    // to this interface OUTRANKS an unbound one — so a wildcard listener
+    // does not steal traffic from a socket that asked for this NIC
+    // specifically.
+    let mut candidates: Vec<Arc<UdpSocket>> = {
         PORTS[port_shard(dst_port)]
             .entries
             .lock()
             .iter()
-            .filter(|(p, socket)| *p == dst_port && socket.net_ns_id == net_ns_id)
+            .filter(|(p, socket)| {
+                if *p != dst_port || socket.net_ns_id != net_ns_id {
+                    return false;
+                }
+                let bound = socket.options.lock().bind_to_device;
+                // `inet_bound_dev_eq`: an unbound socket matches anything;
+                // a bound one only its own interface. An unknown arrival
+                // interface (0) cannot contradict a binding, so it matches.
+                bound == 0 || in_ifindex == 0 || bound == in_ifindex
+            })
             .map(|(_, s)| s.clone())
             .collect()
     };
+    if candidates.len() > 1 {
+        // Device-bound sockets first — the `score += 4` above.
+        candidates.sort_by_key(|s| u8::from(s.options.lock().bind_to_device == 0));
+        let best_is_bound = candidates[0].options.lock().bind_to_device != 0;
+        if best_is_bound {
+            candidates.retain(|s| s.options.lock().bind_to_device != 0);
+        }
+    }
 
     if candidates.is_empty() {
         // No in-kernel socket owns this port. AF_INET datagram sockets live
         // in the userspace crate with their own port table, so ask it
         // before the datagram is dropped — that table is the only place a
         // userspace `bind()` is recorded.
-        user_deliver(net_ns_id, src_ip, src_port, dst_ip, dst_port, payload);
+        user_deliver(
+            net_ns_id, src_ip, src_port, dst_ip, dst_port, payload, in_ifindex,
+        );
         return;
     }
 

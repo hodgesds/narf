@@ -368,13 +368,30 @@ fn handle_ipv4(body: &[u8], net_ns_id: u64, iface_in: &str) {
         IP_PROTO_TCP => {
             crate::tcp::core::handle_segment_in(net_ns_id, ip.src_ip, ip.dst_ip, payload)
         }
-        IP_PROTO_UDP => handle_udp(net_ns_id, ip.src_ip, ip.dst_ip, payload, ttl),
+        IP_PROTO_UDP => handle_udp(
+            net_ns_id,
+            ip.src_ip,
+            ip.dst_ip,
+            payload,
+            ttl,
+            // The arrival interface, Linux's `dif`. `handle_ipv4` has
+            // carried the NAME all along; only the index was missing, which
+            // is why SO_BINDTODEVICE could not be checked on receive.
+            iface::ifindex_of(iface_in).unwrap_or(0),
+        ),
         IP_PROTO_ICMP => crate::icmp_sock::on_icmp_rx_in(net_ns_id, ip.src_ip, ip.dst_ip, payload),
         _ => {}
     }
 }
 
-fn handle_udp(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8], ttl: u8) {
+fn handle_udp(
+    net_ns_id: u64,
+    src_ip: [u8; 4],
+    dst_ip: [u8; 4],
+    datagram: &[u8],
+    ttl: u8,
+    in_ifindex: u32,
+) {
     if datagram.len() < 8 {
         return;
     }
@@ -387,7 +404,9 @@ fn handle_udp(net_ns_id: u64, src_ip: [u8; 4], dst_ip: [u8; 4], datagram: &[u8],
     }
     let payload = &datagram[8..end];
     // Deliver to registered UDP sockets (udp_sock layer).
-    crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, ttl);
+    // `in_ifindex` is Linux's `dif`: SO_BINDTODEVICE is enforced against
+    // the interface the datagram ARRIVED on.
+    crate::udp_sock::deliver_in(net_ns_id, src_ip, dst_ip, datagram, ttl, in_ifindex);
     // Legacy per-protocol consumers.
     if dst_port == 68 {
         crate::dhcp::on_udp_in_in(net_ns_id, src_ip, dst_ip, src_port, dst_port, payload);

@@ -1305,6 +1305,7 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
         LOCAL,
         LOCAL_PORT,
         b"pong",
+        0, // arrival interface unknown: matches any binding
     ) {
         return TestResult::Fail("a wire datagram was not delivered to the bound socket");
     }
@@ -1326,9 +1327,100 @@ fn smoke_socket_inet_dgram_reaches_the_wire() -> TestResult {
         LOCAL,
         LOCAL_PORT + 1,
         b"nobody",
+        0,
     ) {
         return TestResult::Fail("an unbound port must not accept a wire datagram");
     }
     TestResult::Pass
 }
 kernel_test_in!("userspace", smoke_socket_inet_dgram_reaches_the_wire);
+
+/// SO_BINDTODEVICE is enforced on RECEIVE, not just stored.
+///
+/// `compute_score` (`net/ipv4/udp.c:400`) drops a socket from consideration
+/// entirely when it is bound to a different interface:
+///
+/// ```c
+/// dev_match = udp_sk_bound_dev_eq(net, sk->sk_bound_dev_if, dif, sdif);
+/// if (!dev_match)
+///         return -1;
+/// ```
+///
+/// Until the arrival interface was plumbed through the RX path there was
+/// nothing to compare against, so a socket pinned to one NIC still received
+/// traffic that came in on another — the isolation the option exists to
+/// provide, silently absent.
+fn smoke_socket_bindtodevice_filters_receive() -> TestResult {
+    const IFACE_A: &str = "btdtest0";
+    const IFACE_B: &str = "btdtest1";
+    const LOCAL: [u8; 4] = [10, 8, 0, 2];
+    const PEER: [u8; 4] = [10, 8, 0, 9];
+    const PORT: u16 = 4343;
+
+    narf_net::iface::register(IFACE_A, [0x02, 0, 0, 0, 1, 0], |_| Ok(()));
+    narf_net::iface::register(IFACE_B, [0x02, 0, 0, 0, 1, 1], |_| Ok(()));
+    let (Some(idx_a), Some(idx_b)) = (
+        narf_net::iface::ifindex_of(IFACE_A),
+        narf_net::iface::ifindex_of(IFACE_B),
+    ) else {
+        return TestResult::Skip("test interfaces did not register");
+    };
+    if idx_a == idx_b {
+        return TestResult::Fail("the two test interfaces must have distinct indices");
+    }
+
+    let sock = crate::socket::SocketFile::new(crate::socket::AF_INET, crate::socket::SOCK_DGRAM);
+    let mut bind_addr: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    bind_addr.extend_from_slice(&PORT.to_be_bytes());
+    bind_addr.extend_from_slice(&[0, 0, 0, 0]);
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::Bind {
+            addr: crate::socket::SockAddr {
+                family: crate::socket::AF_INET,
+                body: bind_addr,
+            },
+        }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("bind failed");
+    }
+    // Pin the socket to interface A.
+    if !matches!(
+        sock.dispatch_op(crate::socket::SocketOp::SetSockOpt {
+            level: crate::socket::SOL_SOCKET,
+            name: crate::socket::SO_BINDTODEVICE,
+            value: IFACE_A.as_bytes(),
+        }),
+        crate::socket::SocketOpResult::Ok(_)
+    ) {
+        return TestResult::Fail("SO_BINDTODEVICE to a live interface should succeed");
+    }
+
+    let ns = sock.net_ns_id();
+    // Arriving on the WRONG interface: refused.
+    if crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"wrong", idx_b) {
+        return TestResult::Fail("a datagram from another interface must not be delivered");
+    }
+    // Arriving on the RIGHT interface: delivered.
+    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"right", idx_a) {
+        return TestResult::Fail("a datagram from the bound interface must be delivered");
+    }
+    // An unknown arrival interface cannot contradict the binding.
+    if !crate::socket::deliver_wire_datagram(ns, PEER, 9, LOCAL, PORT, b"any", 0) {
+        return TestResult::Fail("an unknown arrival interface must still be delivered");
+    }
+
+    // Only the accepted datagrams are queued, in order.
+    let mut out = [0u8; 32];
+    for expect in [b"right".as_slice(), b"any".as_slice()] {
+        match sock.dispatch_op(crate::socket::SocketOp::Recv {
+            buf: &mut out,
+            flags: 0,
+        }) {
+            crate::socket::SocketOpResult::Received { n, .. } if &out[..n] == expect => {}
+            _ => return TestResult::Fail("queued datagrams do not match what was accepted"),
+        }
+    }
+    TestResult::Pass
+}
+kernel_test_in!("userspace", smoke_socket_bindtodevice_filters_receive);

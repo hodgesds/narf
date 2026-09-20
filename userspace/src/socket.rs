@@ -1016,6 +1016,7 @@ enum SocketState {
 ///
 /// Wildcard matching mirrors the loopback path and Linux's `compute_score`:
 /// an exact local address wins, INADDR_ANY also matches.
+#[allow(clippy::too_many_arguments)]
 pub fn deliver_wire_datagram(
     net_ns_id: u64,
     src_ip: [u8; 4],
@@ -1023,6 +1024,7 @@ pub fn deliver_wire_datagram(
     dst_ip: [u8; 4],
     dst_port: u16,
     payload: &[u8],
+    in_ifindex: u32,
 ) -> bool {
     let dst = u32::from_be_bytes(dst_ip);
     let sock = {
@@ -1037,8 +1039,15 @@ pub fn deliver_wire_datagram(
         return false;
     };
 
-    // SO_BINDTODEVICE would be enforced here, but this hook does not carry
-    // the arrival interface — see the note on `bindtodevice_index`.
+    // SO_BINDTODEVICE, the receive half. `compute_score`
+    // (`net/ipv4/udp.c:400`) drops a socket from consideration entirely
+    // when it is bound to a different interface, so a socket pinned to one
+    // NIC never sees traffic that arrived on another. An arrival interface
+    // of 0 is "unknown" and cannot contradict a binding.
+    let bound = sock.options.lock().bindtodevice_index;
+    if bound != 0 && in_ifindex != 0 && bound != in_ifindex {
+        return false;
+    }
     let pkt = DgramPacket {
         peer_unix: None,
         sender_cred: Ucred::default(),
