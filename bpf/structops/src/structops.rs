@@ -71,6 +71,15 @@ pub struct StructOpsDesc {
     pub cap: CapKind,
     /// The methods, in declaration order.
     pub methods: &'static [MethodDesc],
+    /// Whether this trait dispatches with a **region ctx** — a `(data,
+    /// data_end)` pair over a read-only structure — instead of packing scalar
+    /// arguments into the four-word context tuple.
+    ///
+    /// Part of the descriptor rather than implied by the method signatures
+    /// because it is what a bound program must have been *loaded* for
+    /// ([`BpfProg::load_region_ctx`](narf_bpf::prog::BpfProg::load_region_ctx)),
+    /// and [`validate`] has only the descriptor and the programs to compare.
+    pub region_ctx: bool,
 }
 
 // ── link-section collection ─────────────────────────────────────────
@@ -192,6 +201,20 @@ pub enum StructOpsError {
         /// The method whose binding was rejected.
         method: &'static str,
     },
+    /// A bound program's ctx shape is not the one this trait dispatches with.
+    ///
+    /// The same class of silent failure as [`Self::WrongContext`], one layer
+    /// down: `run_atomic_region` returns `None` for a scalar-ctx program and
+    /// `run_atomic` returns `None` for a region-ctx one, and `None` becomes
+    /// `DEFAULT_RET` — so a mismatched binding installs cleanly and then
+    /// answers every call with the default. Rejected by type at install.
+    WrongCtxShape {
+        /// The method whose binding was rejected.
+        method: &'static str,
+        /// Whether the trait dispatches with a region ctx (and the program
+        /// therefore should have been loaded with one).
+        region_ctx: bool,
+    },
     /// The subsystem's live-slot installer rejected the adapter.
     ///
     /// Returned by a `#[commit(...)]` committer when moving the verified
@@ -285,6 +308,16 @@ pub fn validate<M: CapType>(
         if b.prog.context() != narf_bpf_verifier::Context::Atomic {
             return Err(StructOpsError::WrongContext { method: b.method });
         }
+        // And the ctx shape, for the same reason: a region-ctx trait runs its
+        // programs through `run_atomic_region` and a scalar one through
+        // `run_atomic`, and each returns `None` — i.e. `DEFAULT_RET` — for a
+        // program loaded the other way.
+        if b.prog.is_region_ctx() != desc.region_ctx {
+            return Err(StructOpsError::WrongCtxShape {
+                method: b.method,
+                region_ctx: desc.region_ctx,
+            });
+        }
     }
     Ok(())
 }
@@ -299,6 +332,58 @@ pub fn installed_count() -> usize {
 #[must_use]
 pub fn is_installed(trait_name: &str) -> bool {
     INSTALLED.lock().iter().any(|(n, _)| *n == trait_name)
+}
+
+// ── region ctx ──────────────────────────────────────────────────────
+
+/// A structure a `#[ctx_region]` trait hands its programs as context.
+///
+/// The escape from `MAX_CTX_WORDS`. A scalar-ctx method can carry four words
+/// and no more — enough for an idle governor's two arguments, not for a hook
+/// that wants to describe a task, a cgroup, and the machine it is running on.
+/// A region-ctx method instead passes `(data, data_end)` over one of these, and
+/// the program reads fields out of it after proving each read in bounds.
+///
+/// # Safety
+///
+/// The implementing type is copied verbatim into a byte buffer a *hostile*
+/// program reads. It must therefore be:
+///
+///   * `#[repr(C)]`, so the field offsets a program is compiled against are the
+///     offsets it gets;
+///   * free of padding — padding bytes are uninitialised stack, and handing
+///     them to a program is a kernel-memory disclosure. All-`u64`/`i64` fields
+///     is the easy way to guarantee this;
+///   * free of pointers, references, and interior mutability: everything in the
+///     structure becomes readable data, and a kernel pointer read by a program
+///     is an address-layout leak even when it cannot be dereferenced.
+///
+/// Fields should only ever be *appended*, since a program compiled against
+/// offset N keeps reading offset N.
+pub unsafe trait CtxStruct: Copy + Sized + 'static {}
+
+/// Copy `ctx` into a byte buffer and run `f` over it.
+///
+/// The copy is the point: the program is handed its own scratch image, so even
+/// a verifier bug that admitted a store could only scribble on a stack
+/// temporary rather than on live kernel state. `REGION_CTX` marks `data`
+/// `READONLY` as well — this is the second of the two.
+///
+/// The generated adapter is the only caller; it is `pub` because macro
+/// expansion lands in the consumer's crate.
+pub fn with_ctx_bytes<C: CtxStruct, R>(ctx: &C, f: impl FnOnce(&mut [u8]) -> R) -> R {
+    let mut copy = *ctx;
+    // SAFETY: `CtxStruct` is an unsafe trait precisely to carry this
+    // obligation — `C` is `#[repr(C)]`, padding-free plain data. `copy` is a
+    // live, initialised, uniquely-borrowed local of exactly `size_of::<C>()`
+    // bytes, so the slice covers it and nothing else, and it outlives `f`.
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(copy).cast::<u8>(),
+            core::mem::size_of::<C>(),
+        )
+    };
+    f(bytes)
 }
 
 /// Const-context string equality, for the `#[optional(...)]` list.
@@ -379,6 +464,154 @@ pub const fn is_optional(name: &str, list: &[&str]) -> bool {
 /// that turns a loaded program set into behaviour.
 #[macro_export]
 macro_rules! struct_ops {
+    // ── the region-ctx form ─────────────────────────────────────────
+    //
+    // Keyed on `#[ctx_region]`, which a scalar-ctx declaration does not carry,
+    // so an ordinary invocation falls through to the arm below unchanged.
+    //
+    // A separate arm rather than an optional attribute in one arm because the
+    // two forms generate *different method bodies* — one packs scalars and
+    // calls `run_atomic`, the other copies a structure and calls
+    // `run_atomic_region` — and `macro_rules!` has no `else`: an optional
+    // fragment can add expansion, never choose between two. The shared parts
+    // are therefore duplicated, which is the cost of the feature being in
+    // `macro_rules!` at all.
+    //
+    // One invocation declares either kind, not both; a mixed invocation matches
+    // neither arm. Use two invocations.
+    ($(
+        $(#[doc = $tdoc:literal])*
+        #[cap($cap:ident)]
+        #[install($install:ident)]
+        #[desc($descname:ident)]
+        #[adapter($descname2:ident)]
+        #[ctx_region]
+        $(#[commit($commit:path)])?
+        $(#[optional($($optm:ident),* $(,)?)])?
+        $vis:vis trait $trait_name:ident {
+            $(
+                $(#[doc = $mdoc:literal])*
+                fn $method:ident (&self, $pname:ident : & $cty:ty $(,)?) -> $mret:ty;
+            )*
+        }
+    )*) => {$(
+        $(#[doc = $tdoc])*
+        $vis trait $trait_name: Send + Sync + 'static {
+            $(
+                $(#[doc = $mdoc])*
+                fn $method (&self, $pname : &$cty) -> $mret;
+            )*
+        }
+
+        #[doc = concat!(
+            "`struct_ops!`-generated descriptor for [`", stringify!($trait_name), "`]."
+        )]
+        $vis const $descname: $crate::structops::StructOpsDesc = {
+            const OPTIONAL: &[&str] = &[$($(stringify!($optm)),*)?];
+            $crate::structops::StructOpsDesc {
+                name: stringify!($trait_name),
+                cap: $crate::reexport::CapKind::$cap,
+                methods: &[$(
+                    $crate::structops::MethodDesc {
+                        name: stringify!($method),
+                        // Every region-ctx method has the same ctx: the
+                        // `(data, data_end)` pair. What differs between them is
+                        // the *structure* behind it, which the Rust signature
+                        // names and the verifier never needs — it proves each
+                        // read against `data_end`, not against a schema.
+                        ctx: &$crate::ctx::REGION_CTX,
+                        ret: <$mret as $crate::types::BpfType>::DESC,
+                        optional: $crate::structops::is_optional(stringify!($method), OPTIONAL),
+                    },
+                )*],
+                region_ctx: true,
+            }
+        };
+
+        const _: () = {
+            #[used]
+            #[link_section = "narf.structops"]
+            static ENTRY: $crate::structops::StructOpsDesc = $descname;
+        };
+
+        #[doc = concat!(
+            "A BPF program set dispatching as [`", stringify!($trait_name), "`]."
+        )]
+        ///
+        /// Each method hands its bound program a read-only copy of the context
+        /// structure and returns what the program returns; a method with no
+        /// program bound falls back to the trait's default, which is what
+        /// `#[optional(...)]` declares.
+        #[derive(Debug)]
+        $vis struct $descname2 {
+            progs: $crate::structops::ProgSet,
+        }
+
+        impl $descname2 {
+            /// Wrap a program set.
+            #[must_use]
+            $vis fn new(progs: $crate::structops::ProgSet) -> Self {
+                Self { progs }
+            }
+        }
+
+        impl $trait_name for $descname2 {
+            $(
+                fn $method (&self, $pname : &$cty) -> $mret {
+                    match self.progs.get(stringify!($method)) {
+                        Some(__p) => $crate::structops::with_ctx_bytes($pname, |__bytes| {
+                            match __p.run_atomic_region(__bytes) {
+                                Some($crate::interp::Outcome::Returned(v)) =>
+                                    <$mret as $crate::types::BpfRet>::from_ret(v),
+                                // Declined (nesting limit, no frame, wrong ctx
+                                // shape) or trapped: fall back rather than
+                                // fabricate a value, as the scalar form does.
+                                Some($crate::interp::Outcome::Trapped(_)) | None =>
+                                    <$mret as $crate::types::BpfRet>::DEFAULT_RET,
+                            }
+                        }),
+                        None => <$mret as $crate::types::BpfRet>::DEFAULT_RET,
+                    }
+                }
+            )*
+        }
+
+        #[doc = concat!(
+            "Install a BPF program set implementing [`", stringify!($trait_name),
+            "`]. Cap-gated on the kind the trait declares."
+        )]
+        ///
+        /// # Errors
+        ///
+        /// See [`narf_bpf_structops::structops::install`](narf_bpf_structops::structops::install).
+        $vis fn $install<M: $crate::reexport::CapType>(
+            cap: &$crate::reexport::Cap<M, $crate::reexport::Grant>,
+            set: $crate::structops::ProgSet,
+        ) -> ::core::result::Result<(), $crate::structops::StructOpsError> {
+            #[allow(unused_mut, unused_variables)]
+            let mut __adapter: ::core::option::Option<$descname2> =
+                ::core::option::Option::None;
+            $(
+                let _ = ::core::stringify!($commit);
+                $crate::structops::validate(&$descname, cap, &set)?;
+                __adapter = ::core::option::Option::Some($descname2::new(
+                    <$crate::structops::ProgSet as ::core::clone::Clone>::clone(&set),
+                ));
+            )?
+            $crate::structops::install(&$descname, cap, set)?;
+            #[allow(unused_mut)]
+            let mut __result: ::core::result::Result<(), $crate::structops::StructOpsError> =
+                ::core::result::Result::Ok(());
+            $(
+                if let ::core::option::Option::Some(__a) = __adapter.take() {
+                    __result = $commit(cap, __a);
+                }
+            )?
+            __result
+        }
+    )*};
+
+    // ── the scalar-ctx form ─────────────────────────────────────────
     ($(
         $(#[doc = $tdoc:literal])*
         #[cap($cap:ident)]
@@ -418,6 +651,7 @@ macro_rules! struct_ops {
                         optional: $crate::structops::is_optional(stringify!($method), OPTIONAL),
                     },
                 )*],
+                region_ctx: false,
             }
         };
 

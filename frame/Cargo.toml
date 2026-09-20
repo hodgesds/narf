@@ -98,6 +98,7 @@ narf-user-runtime    = { path = "../user-runtime" }
 narf-bpf             = { path = "../bpf" }
 narf-bpf-idle        = { path = "../bpf-idle", optional = true }
 narf-bpf-leds        = { path = "../bpf-leds", optional = true }
+narf-bpf-oom         = { path = "../bpf-oom", optional = true }
 narf-kernel-test     = { path = "../verification/kernel-test" }
 narf-verification    = { path = "../verification", optional = true }
 
@@ -299,6 +300,8 @@ bpf = [
     "narf-bpf-idle/kernel-test",
     "bpf-leds",
     "narf-bpf-leds/kernel-test",
+    "bpf-oom",
+    "narf-bpf-oom/kernel-test",
 ]
 
 # The BPF idle governor: a struct_ops consumer that lets a runtime-supplied BPF
@@ -311,6 +314,14 @@ bpf-idle = ["dep:narf-bpf-idle"]
 # brightness, blink it, or set an RGB color, mediated through the LED engine
 # worker. Off by default; enable to compile the kfunc + start the worker.
 bpf-leds = ["dep:narf-bpf-leds"]
+
+# The BPF OOM policy: a struct_ops consumer that lets a runtime-supplied BPF
+# program rank OOM victims through `narf-memory`'s `OomKiller` seam. Off by
+# default — with the feature off the in-tree `narf_userspace::oom` policy is the
+# only one compiled in. Enabling this compiles the consumer and registers its
+# candidate source at boot; it does NOT displace the in-tree policy, which stays
+# in `memory`'s slot until a program set is installed at runtime.
+bpf-oom = ["dep:narf-bpf-oom"]
 
 # Chain into verification's opt-in user-mode smoke tests (round-trip,
 # yield_resume, poll_yield_exit, future yield_exit). These pass the

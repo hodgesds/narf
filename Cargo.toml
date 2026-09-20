@@ -30,6 +30,7 @@ members = [
     "bpf/structops",
     "bpf-idle",
     "bpf-leds",
+    "bpf-oom",
     "frame",
     "rcu",
     "bus",

@@ -79,6 +79,7 @@ static __FORCE_LINK_BPF: fn() -> (usize, usize) = narf_bpf::summary;
 // both so their sections survive dead-code elimination.
 extern crate narf_bpf_idle;
 extern crate narf_bpf_leds;
+extern crate narf_bpf_oom;
 extern crate narf_bpf_structops;
 #[used]
 static __FORCE_LINK_BPF_STRUCTOPS: fn() -> usize = narf_bpf_structops::summary;
@@ -88,6 +89,10 @@ static __FORCE_LINK_BPF_IDLE: fn() = narf_bpf_idle::register_initcalls;
 // and the `bpf/leds` smoke; anchor it so both survive the link.
 #[used]
 static __FORCE_LINK_BPF_LEDS: fn() = narf_bpf_leds::register_initcalls;
+// narf-bpf-oom carries a `narf.structops` descriptor (the OOM policy) and the
+// `bpf/oom` smokes; anchor it for the same reason.
+#[used]
+static __FORCE_LINK_BPF_OOM: fn() = narf_bpf_oom::register_initcalls;
 
 use core::fmt::Write;
 

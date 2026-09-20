@@ -25,6 +25,7 @@ narf-bpf        = { path = "../bpf" }
 narf-bpf-structops = { path = "../bpf/structops" }
 narf-bpf-idle   = { path = "../bpf-idle" }
 narf-bpf-leds   = { path = "../bpf-leds" }
+narf-bpf-oom    = { path = "../bpf-oom" }
 narf-bus        = { path = "../bus" }
 narf-boot       = { path = "../boot" }
 narf-rcu        = { path = "../rcu" }
