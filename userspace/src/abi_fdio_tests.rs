@@ -650,6 +650,49 @@ fn smoke_abi_fdio_ftruncate_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_fdio_ftruncate_neg);
 
+fn smoke_abi_fdio_ftruncate_immutable_and_append_eperm() -> TestResult {
+    with_memfs("/abi", "abi", &[("f", b"abcdef"), ("g", b"123456")], || {
+        let fd = open_fd(b"/abi/f\0")?;
+        const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+        const FS_IMMUTABLE_FL: u32 = 0x0000_0010;
+        const FS_APPEND_FL: u32 = 0x0000_0020;
+        let mut flags: u32 = FS_IMMUTABLE_FL;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(fd as u64, FS_IOC_SETFLAGS, &mut flags as *mut u32 as u64),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_SETFLAGS failed");
+        }
+        match call(Syscall::Ftruncate.raw(), a1(fd as u64, 3)) {
+            Some(-1) => {} // -EPERM
+            _ => return Err("ftruncate on immutable file must return -EPERM"),
+        }
+
+        let fd2 = open_fd(b"/abi/g\0")?;
+        let mut flags_append: u32 = FS_APPEND_FL;
+        if call(
+            Syscall::Ioctl.raw(),
+            a2(
+                fd2 as u64,
+                FS_IOC_SETFLAGS,
+                &mut flags_append as *mut u32 as u64,
+            ),
+        ) != Some(0)
+        {
+            return Err("FS_IOC_SETFLAGS failed");
+        }
+        match call(Syscall::Ftruncate.raw(), a1(fd2 as u64, 3)) {
+            Some(-1) => Ok(()), // -EPERM
+            _ => Err("ftruncate on append-only file must return -EPERM"),
+        }
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_fdio_ftruncate_immutable_and_append_eperm
+);
+
 // ── fallocate ──────────────────────────────────────────────────────
 
 fn smoke_abi_fdio_fallocate_pos() -> TestResult {
