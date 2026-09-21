@@ -25,7 +25,6 @@ use super::*;
 /// must report EBADF, because Linux validates the descriptor before it ever
 /// looks at the output pointer.
 pub(crate) fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
-    const EFAULT: i64 = 14;
     let args = *ctx.args();
     // `int ufd` — the descriptor is the low 32 bits.
     let fd = args.arg0 as u32;
@@ -35,7 +34,7 @@ pub(crate) fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     let tfd = match timerfd_arc_from_fd_checked(task, fd) {
         Ok(t) => t,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -56,7 +55,7 @@ pub(crate) fn sys_timerfd_gettime(ctx: &mut dyn TrapContext) {
     // SAFETY: copy_to_user range-validates `out_ptr` (including the null
     // case) and SMAP-brackets the 32-byte write.
     if unsafe { copy_to_user(out_ptr, &buf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

@@ -36,16 +36,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 use crate::handlers::{copy_from_user_vec, copy_to_user, copy_user_cstr};
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno values (negated-long convention) ──────────────────────────
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const ENOKEY: i64 = 126;
-const EKEYREVOKED: i64 = 128;
-const EOPNOTSUPP: i64 = 95;
-
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 fn ok(v: u64) -> SyscallReturn {
     SyscallReturn::ok(v)
 }

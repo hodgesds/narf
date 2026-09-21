@@ -56,14 +56,7 @@ const SIGRTMAX: i32 = 64;
 // actually returns, and they are separable answers: EINVAL means "fix
 // the argument", EFAULT means "fix the pointer", EOPNOTSUPP means "this
 // kernel does not implement it, use your fallback".
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const EOPNOTSUPP: i64 = 95;
-
-/// Linux hands errors back as a negated errno in the return register.
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 
 // ── `clockid_t` as the 32-bit `int` the ABI actually delivers ────────
 //
@@ -909,10 +902,8 @@ fn nanosleep_common(
     // All three took the shared -1 sentinel, which reaches libc as EPERM —
     // so a caller that passed an unsupported clock, a bad pointer, or an
     // out-of-range nanosecond field was told it lacked permission to sleep.
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
-    let einval = SyscallReturn::ok((-EINVAL) as u64);
-    let efault = SyscallReturn::ok((-EFAULT) as u64);
+    let einval = err(EINVAL);
+    let efault = err(EFAULT);
     match clockid {
         CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => {}
         _ => {

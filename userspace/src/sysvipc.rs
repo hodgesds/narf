@@ -21,26 +21,7 @@ use narf_lib::sync::IrqSafeSpinLock;
 
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno + IPC constants ────────────────────────────────────────────
-const ENOENT: i64 = 2;
-const EPERM: i64 = 1;
-const EINTR: i64 = 4;
-const E2BIG: i64 = 7;
-const EFBIG: i64 = 27;
-const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
-const EACCES: i64 = 13;
-const EFAULT: i64 = 14;
-const EEXIST: i64 = 17;
-const EINVAL: i64 = 22;
-const ENOSPC: i64 = 28;
-const ENOMSG: i64 = 42;
-const EIDRM: i64 = 43;
-const ERANGE: i64 = 34;
-
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 
 type IpcObjectKey = (u64, u64); // (IPC namespace id, namespace-local object id)
 type IpcLookupKey = (u64, u32); // (IPC namespace id, user-supplied key)

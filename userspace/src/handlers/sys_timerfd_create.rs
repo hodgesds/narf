@@ -37,14 +37,14 @@ pub(crate) fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
             && clockid != CLOCK_BOOTTIME
             && clockid != CLOCK_BOOTTIME_ALARM)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     if (clockid == CLOCK_REALTIME_ALARM || clockid == CLOCK_BOOTTIME_ALARM)
         && !capable(CAP_WAKE_ALARM)
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -67,7 +67,7 @@ pub(crate) fn sys_timerfd_create(ctx: &mut dyn TrapContext) {
             // `fs/timerfd.c::SYSCALL_DEFINE2(timerfd_create)` finishes with
             // `anon_inode_getfd(...)`, whose descriptor comes from
             // `get_unused_fd_flags`: a table at RLIMIT_NOFILE is -EMFILE.
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };

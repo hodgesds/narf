@@ -29,22 +29,7 @@ use crate::fd;
 use crate::handlers::{copy_user_cstr, current_task_id};
 use crate::syscall::{SyscallReturn, TrapContext};
 
-// ── errno values returned as negated longs ──────────────────────────
-const ENOENT: i64 = 2;
-const EBADF: i64 = 9;
-const EMFILE: i64 = 24;
-const EAGAIN: i64 = 11;
-const EFAULT: i64 = 14;
-const EEXIST: i64 = 17;
-const EINVAL: i64 = 22;
-const ENOSPC: i64 = 28;
-const ENAMETOOLONG: i64 = 36;
-const EMSGSIZE: i64 = 90;
-const ETIMEDOUT: i64 = 110;
-
-fn err(e: i64) -> SyscallReturn {
-    SyscallReturn::ok((-e) as u64)
-}
+use crate::errno::{to_ret as err, *};
 
 // open-flag bits we honour (shared with the generic open path).
 const O_NONBLOCK: u64 = 0o4000;

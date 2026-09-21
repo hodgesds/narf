@@ -24,6 +24,7 @@ use alloc::vec::Vec;
 
 use narf_filesystem::FileOps;
 
+use crate::errno::{to_ret, *};
 use crate::fd;
 
 // ── Re-export POLL_* constants ───────────────────────────────────────
@@ -271,13 +272,13 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
                 // poll_select_set_timeout(): a negative field or tv_nsec
                 // outside [0, 1e9) is -EINVAL, not a clamped timeout.
                 if (secs as i64) < 0 || nsec >= 1_000_000_000 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                    ctx.set_return(to_ret(EINVAL));
                     return;
                 }
                 secs.saturating_mul(1000).saturating_add(nsec / 1_000_000) as i64
             }
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(to_ret(EFAULT));
                 return;
             }
         }
@@ -292,7 +293,7 @@ pub fn sys_ppoll(ctx: &mut dyn TrapContext) {
             let task = current_task_id();
             old_mask = Some(crate::handlers::set_signal_mask_for_task(task, mask));
         } else {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
     }
@@ -636,7 +637,7 @@ pub(crate) fn poll_wait_kernel(
                 return KernelPollWait::TimedOut { deadline_ns };
             }
             if crate::handlers::has_interrupting_signal(task_id) {
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                ctx.set_return(to_ret(EINTR));
                 if let Some(hook) = crate::signal_delivery_hook() {
                     let _ = hook(ctx, syscall_no);
                 }
@@ -678,7 +679,7 @@ pub(crate) fn poll_wait_kernel(
     // Linux checks deliverable signals after its readiness scan, so a ready
     // fd wins over an otherwise simultaneous signal.
     if crate::handlers::has_interrupting_signal(task_id) {
-        ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+        ctx.set_return(to_ret(EINTR));
         if let Some(hook) = crate::signal_delivery_hook() {
             let _ = hook(ctx, syscall_no);
         }
@@ -701,7 +702,7 @@ pub(crate) fn poll_wait_kernel(
                 return KernelPollWait::TimedOut { deadline_ns };
             }
             if crate::handlers::has_interrupting_signal(task_id) {
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                ctx.set_return(to_ret(EINTR));
                 if let Some(hook) = crate::signal_delivery_hook() {
                     let _ = hook(ctx, syscall_no);
                 }
@@ -753,12 +754,10 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // faulting `struct pollfd[]` with -EFAULT. The old `-1` sentinel reached
     // userspace as EPERM, an errno poll(2) never returns, so a caller could
     // neither retry nor degrade on it.
-    const EINVAL: SyscallReturn = SyscallReturn::ok((-22i64) as u64);
-    const EFAULT: SyscallReturn = SyscallReturn::ok((-14i64) as u64);
 
     // Upper bound on nfds to prevent OOM from hostile input.
     if nfds > 1_048_576 {
-        ctx.set_return(EINVAL);
+        ctx.set_return(to_ret(EINVAL));
         return;
     }
 
@@ -795,11 +794,11 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     // multiply cannot wrap, and `validate_user_range` rejects the kernel half,
     // the canonical hole, a null base, and an end-overflow.
     let Some(bytes) = nfds.checked_mul(8) else {
-        ctx.set_return(EINVAL);
+        ctx.set_return(to_ret(EINVAL));
         return;
     };
     if crate::handlers::validate_user_range(ptr as u64, bytes).is_err() {
-        ctx.set_return(EFAULT);
+        ctx.set_return(to_ret(EFAULT));
         return;
     }
 
@@ -808,7 +807,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
     let mut fds = match unsafe { parse_pollfds(ptr, nfds) } {
         Some(v) => v,
         None => {
-            ctx.set_return(EFAULT);
+            ctx.set_return(to_ret(EFAULT));
             return;
         }
     };
@@ -972,7 +971,7 @@ fn poll_common(ctx: &mut dyn TrapContext, ptr: *mut u8, nfds: usize, timeout: i6
                     (*uctx_ptr).blocking_deadline_ns.store(0, Ordering::Release);
                     clear_poll_wait_record(task, &*uctx_ptr);
                 }
-                ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // EINTR
+                ctx.set_return(to_ret(EINTR));
                 return;
             }
         }
