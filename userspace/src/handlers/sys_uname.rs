@@ -6,7 +6,7 @@ use super::*;
 pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     let buf = ctx.args().arg0;
     if buf == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Per-task UTS namespace lives behind the `container` feature.
@@ -48,7 +48,7 @@ pub(crate) fn sys_uname(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(buf, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

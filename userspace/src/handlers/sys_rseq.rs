@@ -24,5 +24,5 @@ use super::*;
 /// `getcpu(2)` path, which is correct on every CPU count.
 pub(crate) fn sys_rseq(ctx: &mut dyn TrapContext) {
     // -ENOSYS (38): NARF provides no rseq restart/cpu_id semantics.
-    ctx.set_return(SyscallReturn::ok((-38i64) as u64));
+    ctx.set_return(errno_ret(ENOSYS));
 }

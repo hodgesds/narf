@@ -131,7 +131,7 @@ pub(crate) fn sys_getxattrat(ctx: &mut dyn TrapContext) {
         }
     };
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut shim = Reshaped {

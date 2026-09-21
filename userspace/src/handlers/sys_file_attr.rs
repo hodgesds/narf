@@ -48,21 +48,21 @@ fn file_attr_target(
     const AT_EMPTY_PATH: u32 = 0x1000;
     const AT_FDCWD: i64 = -100;
     if at_flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(-22); // -EINVAL
+        return Err(-EINVAL);
     }
     let follow = at_flags & AT_SYMLINK_NOFOLLOW == 0;
     let task = current_task_id();
 
     let empty = if path_ptr == 0 {
         if at_flags & AT_EMPTY_PATH == 0 {
-            return Err(-14); // -EFAULT: getname on a NULL pointer
+            return Err(-EFAULT); // getname on a NULL pointer
         }
         true
     } else {
         let raw = copy_user_cstr_checked(path_ptr, 4096).map_err(|e| -e)?;
         if raw.is_empty() {
             if at_flags & AT_EMPTY_PATH == 0 {
-                return Err(-2); // -ENOENT: "" without AT_EMPTY_PATH
+                return Err(-ENOENT); // "" without AT_EMPTY_PATH
             }
             true
         } else {
@@ -71,18 +71,18 @@ fn file_attr_target(
             // follow an ABSOLUTE target out of the filesystem the link lives
             // on, which the in-filesystem resolver cannot.
             let resolved = resolve_vfs_symlink_path(&anchored, follow).unwrap_or(anchored);
-            return resolve_file_absolute_ext(&resolved, false).ok_or(-2);
+            return resolve_file_absolute_ext(&resolved, false).ok_or(-ENOENT);
         }
     };
     debug_assert!(empty);
     // `if (!name && dfd >= 0)`: AT_FDCWD is not a descriptor, so it cannot
     // name a file and falls through to the path branch, which has no path.
     if dfd < 0 || dfd == AT_FDCWD {
-        return Err(-9); // -EBADF
+        return Err(-EBADF);
     }
     crate::fd::with_table(task, |t| t.get(dfd as u32).map(|e| e.ops.clone()))
         .flatten()
-        .ok_or(-9)
+        .ok_or(-EBADF)
 }
 
 /// `usize` handling, shared by both. Note the ORDER — E2BIG before EINVAL,
@@ -95,10 +95,10 @@ fn file_attr_target(
 /// ```
 fn file_attr_usize_ok(usize_bytes: u64) -> Result<(), i64> {
     if usize_bytes > 4096 {
-        return Err(-7); // -E2BIG
+        return Err(-E2BIG);
     }
     if usize_bytes < FILE_ATTR_SIZE_VER0 {
-        return Err(-22); // -EINVAL
+        return Err(-EINVAL);
     }
     Ok(())
 }
@@ -143,7 +143,7 @@ pub(crate) fn sys_file_getattr(ctx: &mut dyn TrapContext) {
     // SAFETY: `ufattr` is the user `struct file_attr`; copy_to_user
     // range-validates it and brackets the write of `n` bytes.
     if unsafe { copy_to_user(ufattr, &fattr[..n]) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
@@ -173,7 +173,7 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
     // SAFETY: `ufattr` is the user `struct file_attr`; copy_from_user
     // range-validates it and brackets the read of `n` bytes.
     if unsafe { copy_from_user(&mut fattr[..n], ufattr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Every byte past the struct this kernel knows must be zero, or -E2BIG —
@@ -184,19 +184,19 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
         let tail = match unsafe { copy_from_user_vec(ufattr + FILE_ATTR_SIZE_VER0, rest) } {
             Ok(v) => v,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         };
         if tail.iter().any(|&b| b != 0) {
-            ctx.set_return(SyscallReturn::ok((-7i64) as u64)); // -E2BIG
+            ctx.set_return(errno_ret(E2BIG));
             return;
         }
     }
     let xflags = u64::from_ne_bytes(fattr[0..8].try_into().unwrap());
     // `if (fattr->fa_xflags & ~mask) return -EINVAL;`
     if xflags & !FS_XFLAGS_MASK != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `fileattr_fill_xflags(fa, fattr->fa_xflags & ~FS_XFLAG_RDONLY_MASK)` —
@@ -224,14 +224,14 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
     if (requested ^ current) & narf_filesystem::FS_PRIVILEGED_FL != 0
         && !capable(CAP_LINUX_IMMUTABLE)
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // `vfs_fileattr_set` -> `may_fileattr_set`: "Verify that we are the
     // owner or have CAP_FOWNER".
     let (uid, gid) = ops.owners();
     if !inode_owner_or_capable(task, uid, gid) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let result = match ops.set_inode_flags(requested) {
@@ -240,7 +240,7 @@ pub(crate) fn sys_file_setattr(ctx: &mut dyn TrapContext) {
         // userspace would believe a file is immutable while nothing
         // enforces it. `file_getattr`/`file_setattr` map the ioctl's
         // ENOTTY to -EOPNOTSUPP, which is the answer this surface uses.
-        Err(_) => -95i64,
+        Err(_) => -EOPNOTSUPP,
     };
     ctx.set_return(SyscallReturn::ok(result as u64));
 }

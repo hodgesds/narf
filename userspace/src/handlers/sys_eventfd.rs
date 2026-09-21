@@ -19,7 +19,7 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
     // semantics the caller asked for — the failure then shows up much later,
     // as a counter that never behaves like a semaphore.
     if flags & !eventfd_flags_set() != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let efd = crate::io_mux::EventFd::new(initval, flags);
@@ -51,7 +51,7 @@ fn create_eventfd(ctx: &mut dyn TrapContext, initval: u64, flags: u32) {
         // line. An unreachability claim that outlives its premise is worse
         // than no comment, because it tells the next reader not to bother
         // testing a path that a test already covers.
-        None => ctx.set_return(SyscallReturn::ok((-24i64) as u64)), // -EMFILE
+        None => ctx.set_return(errno_ret(EMFILE)),
         Some(fd) => ctx.set_return(SyscallReturn::ok(fd as u64)),
     }
 }

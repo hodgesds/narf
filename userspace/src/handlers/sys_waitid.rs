@@ -229,5 +229,5 @@ pub(crate) fn sys_waitid(ctx: &mut dyn TrapContext) {
     // A blocking waitid with no task context cannot safely park. It must not
     // masquerade as a successful reap: Linux reports ECHILD when there is no
     // eligible child, while a successful waitid must fill siginfo_t.
-    ctx.set_return(SyscallReturn::ok((-10i64) as u64)); // ECHILD
+    ctx.set_return(errno_ret(ECHILD));
 }

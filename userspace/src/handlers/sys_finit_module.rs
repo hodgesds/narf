@@ -9,7 +9,7 @@ pub(crate) fn sys_finit_module(ctx: &mut dyn TrapContext) {
     // descriptor is even looked at, so an unprivileged caller cannot use this
     // to probe which fds are open.
     if !capable(CAP_SYS_MODULE) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -45,6 +45,6 @@ pub(crate) fn sys_finit_module(ctx: &mut dyn TrapContext) {
         Some(Ok(bytes)) => ctx.set_return(SyscallReturn::ok(init_module_result(
             narf_modules::syscalls::sys_finit_module(&bytes),
         ))),
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+        _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

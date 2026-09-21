@@ -17,7 +17,7 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     const PIDFD_NONBLOCK: u32 = 0o4000; // O_NONBLOCK
     const PIDFD_THREAD: u32 = 0o200; // O_EXCL
     if flags & !(PIDFD_NONBLOCK | PIDFD_THREAD) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // pid_t is 32-bit signed; the malformed case is `pid <= 0`, not just
@@ -26,7 +26,7 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
     // process). Truncate to i32 so the register's upper bits can't hide the
     // sign.
     if (user_pid as i32) <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `pidfd_open(2)` accepts a PID in the caller's namespace. Keep the
@@ -42,7 +42,7 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
             // `pid = find_get_pid(pid); if (!pid) return -ESRCH;` — the pid is
             // well-formed but names no process, which is a different answer
             // from the -EINVAL above and the -EMFILE below.
-            ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+            ctx.set_return(errno_ret(ESRCH));
             return;
         }
     };
@@ -73,7 +73,7 @@ pub(crate) fn sys_pidfd_open(ctx: &mut dyn TrapContext) {
         None => {
             // The descriptor comes from `get_unused_fd_flags`, so a table at
             // RLIMIT_NOFILE is -EMFILE.
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };

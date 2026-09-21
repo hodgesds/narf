@@ -17,11 +17,11 @@ pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
     // BEFORE `ru` is touched (so a bad `who` beats a NULL ru); the copy-out —
     // including a NULL/faulting ru — is -EFAULT.
     if who != RUSAGE_SELF && who != RUSAGE_CHILDREN && who != RUSAGE_THREAD {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if out == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let task = current_task_id();
@@ -63,7 +63,7 @@ pub(crate) fn sys_getrusage(ctx: &mut dyn TrapContext) {
                                                             // copy_to_user range-validates it and SMAP-brackets the write of `kbuf`.
                                                             // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out, &kbuf) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));
