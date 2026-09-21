@@ -12,7 +12,7 @@ pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
     let path = match copy_user_cstr_checked(ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -21,7 +21,7 @@ pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
 
 pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     if raw_path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let path = resolve_cwd_path(current_task_id(), raw_path);
@@ -40,7 +40,7 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     // `/run` before `/run/udev`) and ENOENT to trigger recursion on a
     // missing parent. A bare -1 → musl EPERM aborts the whole -p chain.
     if path_ref == "/" {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST (root)
+        ctx.set_return(errno_ret(EEXIST)); // root
         return;
     }
     // A path that already resolves to a directory exists → EEXIST, matching
@@ -60,14 +60,14 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
     // service's cgroup setup ("Failed to create cgroup /: Operation not
     // permitted").
     if resolve_dir_absolute(path_ref).is_some() || path_is_mount_ancestor(path_ref) {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
+        ctx.set_return(errno_ret(EEXIST));
         return;
     }
     let (parent, leaf) = match resolve_parent_dir_async(path_ref) {
         Some(p) => p,
         None => {
             // Parent directory doesn't exist.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
     };
@@ -80,7 +80,7 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
             .map(|r| r.is_ok())
             .unwrap_or(false);
     if exists {
-        ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // -EEXIST
+        ctx.set_return(errno_ret(EEXIST));
         return;
     }
     // `do_mkdirat` -> `mnt_want_write` -> `filename_create` ->
@@ -144,13 +144,13 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
                     // namespace when metadata persistence fails.
                     let _ = poll_blocking(parent.rmdir(&leaf));
                     let errno = match metadata_error {
-                        Some(narf_filesystem::FsError::PermissionDenied) => -13, // EACCES
-                        Some(narf_filesystem::FsError::ReadOnly) => -30,         // EROFS
-                        Some(narf_filesystem::FsError::NoSpace) => -28,          // ENOSPC
-                        Some(narf_filesystem::FsError::QuotaExceeded) => -122,   // EDQUOT
-                        _ => -5,                                                 // EIO
+                        Some(narf_filesystem::FsError::PermissionDenied) => EACCES,
+                        Some(narf_filesystem::FsError::ReadOnly) => EROFS,
+                        Some(narf_filesystem::FsError::NoSpace) => ENOSPC,
+                        Some(narf_filesystem::FsError::QuotaExceeded) => EDQUOT,
+                        _ => EIO,
                     };
-                    ctx.set_return(SyscallReturn::ok((errno as i64) as u64));
+                    ctx.set_return(errno_ret(errno));
                     return;
                 }
                 crate::mqueue::notify_create(&path, true);
@@ -162,29 +162,29 @@ pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
         // precise errno rather than a bare -1 → EPERM (which aborts busybox
         // `mkdir -p` and systemd's cgroup/hierarchy setup).
         Some(Err(narf_filesystem::FsError::Busy)) => {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
+            ctx.set_return(errno_ret(EEXIST))
         }
         Some(Err(narf_filesystem::FsError::ReadOnly)) => {
-            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
+            ctx.set_return(errno_ret(EROFS))
         }
         Some(Err(narf_filesystem::FsError::NoSpace)) => {
-            ctx.set_return(SyscallReturn::ok((-28i64) as u64)) // -ENOSPC
+            ctx.set_return(errno_ret(ENOSPC))
         }
         Some(Err(narf_filesystem::FsError::QuotaExceeded)) => {
-            ctx.set_return(SyscallReturn::ok((-122i64) as u64)) // -EDQUOT
+            ctx.set_return(errno_ret(EDQUOT))
         }
         // `vfs_mkdir` opens with `may_create_dentry`, whose permission check
         // is `inode_permission(idmap, dir, MAY_WRITE | MAY_EXEC)` — EACCES,
         // not EPERM, for a parent directory the caller may not write.
         Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-            ctx.set_return(SyscallReturn::ok((-13i64) as u64)) // -EACCES
+            ctx.set_return(errno_ret(EACCES))
         }
         Some(Err(narf_filesystem::FsError::NotFound)) => {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)) // -ENOENT
+            ctx.set_return(errno_ret(ENOENT))
         }
         Some(Err(narf_filesystem::FsError::Io(_))) => {
-            ctx.set_return(SyscallReturn::ok((-5i64) as u64)) // -EIO
+            ctx.set_return(errno_ret(EIO))
         }
-        _ => ctx.set_return(SyscallReturn::ok((-1i64) as u64)), // -EPERM (fs refused)
+        _ => ctx.set_return(errno_ret(EPERM)),
     }
 }

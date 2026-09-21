@@ -40,14 +40,14 @@ pub(crate) fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     let (s, (uid, gid), rdev, ino, attrs) = match stat {
         Some(Some(tuple)) => tuple,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
     // A NULL statbuf is the cp_new_stat arm — reached only once the
     // descriptor has been accepted, exactly as in Linux.
     if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
@@ -64,7 +64,7 @@ pub(crate) fn sys_fstat_linux(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

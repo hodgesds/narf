@@ -35,7 +35,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     let path = match copy_user_cstr_checked(ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -43,7 +43,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     // -ENOENT. Without this the empty string joins the cwd and `chdir("")`
     // silently succeeds as a no-op.
     if path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();
@@ -60,7 +60,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
         // The expander gives up only after SYMLOOP_MAX (40) hops or on a
         // link whose target is empty/unreadable — Linux's -ELOOP from
         // `link_path_walk`.
-        ctx.set_return(SyscallReturn::ok((-40i64) as u64)); // -ELOOP
+        ctx.set_return(errno_ret(ELOOP));
         return;
     };
     // Reject cd into a path that isn't a directory. LOOKUP_DIRECTORY makes
@@ -70,7 +70,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     if resolve_dir_absolute(&resolved).is_none() {
         let errno = match stat_ino_path_dir_aware_ext(&resolved, true) {
             // Exists, but is not a directory (regular file, device, fifo…).
-            Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => -20i64,
+            Some((s, ..)) if s.mode.file_type != narf_filesystem::FileType::Dir => ENOTDIR,
             // The final component resolves to nothing. Re-classify the
             // walk: a NON-final component that is not a directory is also
             // -ENOTDIR in Linux (`link_path_walk`), which this used to
@@ -78,9 +78,9 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
             // `path_lookup_errno` also reports -EACCES when an ANCESTOR is
             // not searchable, which is what Linux's walk would have failed
             // with before it ever reached the final component.
-            _ => -path_lookup_errno(&resolved),
+            _ => path_lookup_errno(&resolved),
         };
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+        ctx.set_return(errno_ret(errno));
         return;
     }
     // `error = path_permission(&path, MAY_EXEC | MAY_CHDIR);` — the check
@@ -90,7 +90,7 @@ pub(crate) fn sys_chdir(ctx: &mut dyn TrapContext) {
     // This is the -EACCES that used to be a documented LINUX-GAP here: a
     // directory a task cannot search is one it cannot make its cwd.
     if !dir_search_permitted(&resolved, task) {
-        ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+        ctx.set_return(errno_ret(EACCES));
         return;
     }
     task_map_set(&CWD_TABLE, task, user_abs);

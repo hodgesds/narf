@@ -79,13 +79,13 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         let (s, (uid, gid), rdev, ino, attrs) = match stat {
             Some(Some(tuple)) => tuple,
             _ => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
         };
         // cp_new_stat's arm — only now is the destination inspected.
         if out_ptr.is_null() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let out = linux_stat_from_fs(s, uid, gid, rdev, ino, attrs);
@@ -98,7 +98,7 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         };
         // SAFETY: `out_ptr` null-checked above; copy_to_user range-validates it.
         if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         ctx.set_return(SyscallReturn::ok(0));
@@ -113,7 +113,7 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         | linux_compat::AT_NO_AUTOMOUNT
         | linux_compat::AT_STATX_SYNC_TYPE;
     if flags & !ALLOWED_FLAGS != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -130,7 +130,7 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
         if dirfd == linux_compat::AT_FDCWD {
             stat_linux_path(ctx, ".", stat_out, follow_final);
         } else {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
         }
         return;
     }
@@ -140,14 +140,14 @@ pub(crate) fn sys_newfstatat_linux(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr_checked(path_uptr, 4096) {
         Ok(path) => path,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if raw.is_empty() {
         // Without AT_EMPTY_PATH there is no LOOKUP_EMPTY, so "" never
         // resolves.
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // Linux resolves a relative pathname beneath dirfd. Journald creates its

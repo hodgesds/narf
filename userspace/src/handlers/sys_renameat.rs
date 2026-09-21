@@ -28,21 +28,21 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
     let new_uptr = args.arg3;
 
     let old_str = match copy_user_cstr_checked(old_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     let new_str = match copy_user_cstr_checked(new_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if old_str.is_empty() || new_str.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
 

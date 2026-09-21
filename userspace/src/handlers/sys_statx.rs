@@ -64,14 +64,14 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
 
     // do_statx / do_statx_fd, before anything is resolved.
     if mask & STATX_RESERVED != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // AT_STATX_SYNC_TYPE is a 2-bit field; asking for FORCE_SYNC and
     // DONT_SYNC at once is contradictory, and only that combination is
     // rejected (each bit on its own is a legal sync mode).
     if flags & AT_STATX_SYNC_TYPE == AT_STATX_SYNC_TYPE {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -118,7 +118,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         let Some(st) = st else {
             // vfs_statx_fd's `fd_empty(f)` arm. A closed descriptor is EBADF,
             // never ENOENT: the caller asked about an fd, not a name.
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         // The mount id of the mount this fd resides on. systemd's
@@ -141,14 +141,14 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         const ALLOWED_FLAGS: u32 =
             AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT | AT_EMPTY_PATH | AT_STATX_SYNC_TYPE;
         if flags & !ALLOWED_FLAGS != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         const AT_FDCWD_I32: i32 = AT_FDCWD;
         let raw = if empty {
             // Reached only for a negative dirfd (the >= 0 case is above).
             if dirfd != AT_FDCWD_I32 {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
             // LOOKUP_EMPTY against AT_FDCWD == the cwd itself.
@@ -159,14 +159,14 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             match copy_user_cstr_checked(path_uptr, 4096) {
                 Ok(s) => s,
                 Err(errno) => {
-                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                    ctx.set_return(errno_ret(errno));
                     return;
                 }
             }
         };
         if raw.is_empty() {
             // A non-AT_EMPTY_PATH empty name never resolves.
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
         // Honour a real directory fd (same shape as sys_readlinkat):
@@ -179,7 +179,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
         let relative = !raw.starts_with('/');
         if relative && dirfd < 0 && dirfd != AT_FDCWD_I32 {
             // path_init's `fdget(nd->dfd)` on a bogus anchor.
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
         let effective = if !relative || dirfd == AT_FDCWD_I32 {
@@ -215,7 +215,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
             // filename_lookup also yields -ENOTDIR, -ELOOP and -EACCES.
             // The resolver reports no reason, so the walk is re-classified
             // after the fact — see `path_lookup_errno`.
-            ctx.set_return(SyscallReturn::ok((-path_lookup_errno(&walked_path)) as u64));
+            ctx.set_return(errno_ret(path_lookup_errno(&walked_path)));
             return;
         }
     };
@@ -337,7 +337,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // cp_statx's arm: the destination is inspected only now, after the mask,
     // the flags and the lookup have all been accepted.
     if out_ptr.is_null() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // SAFETY: Statx is repr(C) POD; bytes are valid for read.
@@ -351,7 +351,7 @@ pub(crate) fn sys_statx(ctx: &mut dyn TrapContext) {
     // copy_to_user range-validates it and SMAP-brackets the write of `bytes`.
     // SAFETY: Valid memory or trusted environment
     if unsafe { copy_to_user(out_ptr as u64, bytes) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

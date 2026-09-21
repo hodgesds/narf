@@ -14,14 +14,14 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
     let flags = args.arg2;
     let mode = args.arg3 as u32;
     let path_str = match copy_user_cstr_checked(path_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno)); // -EFAULT
             return;
-            }
-        };
+        }
+    };
     if path_str.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();
@@ -57,7 +57,7 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
                 status_flags,
             });
             ctx.set_return(SyscallReturn::ok(
-                reopened.map(|fd| fd as u64).unwrap_or((-24i64) as u64),
+                reopened.map(|fd| fd as u64).unwrap_or((-EMFILE) as u64),
             ));
             return;
         }
@@ -106,12 +106,12 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
                     status_flags: sf,
                 });
             ctx.set_return(SyscallReturn::ok(
-                new_fd.map(|nf| nf as u64).unwrap_or((-24i64) as u64),
+                new_fd.map(|nf| nf as u64).unwrap_or((-EMFILE) as u64),
             ));
             return;
         }
         // Stale/unknown fd → ENOENT, as Linux does for a dangling fd symlink.
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     open_impl(ctx, effective, flags, 0, 0, mode);

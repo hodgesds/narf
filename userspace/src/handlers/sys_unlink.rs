@@ -12,12 +12,12 @@ pub(crate) fn sys_unlink(ctx: &mut dyn TrapContext) {
     let path = match copy_user_cstr_checked(ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let path = resolve_cwd_path(current_task_id(), &path);
@@ -31,8 +31,6 @@ pub(crate) fn sys_unlink(ctx: &mut dyn TrapContext) {
 /// pointer, which forced the path through `resolve_cwd_path` and discarded
 /// the dirfd entirely.
 pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
-    let fail = SyscallReturn::ok((-1i64) as u64);
-    let _ = fail;
     // If this path is a live bound AF_UNIX socket, release its address so it
     // can be re-bound (Linux frees the address when the socket inode is
     // unlinked — dbus/wayland unlink a stale socket before re-binding).
@@ -57,7 +55,7 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
     // append-only file cannot be removed, which is what makes `chattr +i`
     // survive an `rm -f` by root.
     if path_inode_flags(path) & narf_filesystem::FS_PRIVILEGED_FL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let task = current_task_id();
@@ -103,6 +101,6 @@ pub(crate) fn unlink_absolute(ctx: &mut dyn TrapContext, path: &str) {
         }
         // The parent path/filesystem didn't resolve at all → the target
         // can't exist. Linux returns ENOENT when a path component is absent.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
+        _ => ctx.set_return(errno_ret(ENOENT)),
     }
 }

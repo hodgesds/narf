@@ -15,19 +15,19 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
     let target_str = match copy_user_cstr_checked(target_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let link_path = match copy_user_cstr_checked(link_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if link_path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // Resolve the link location against the cwd (the symlink *target*
@@ -72,15 +72,15 @@ pub(crate) fn symlink_absolute(ctx: &mut dyn TrapContext, target_str: &str, link
         // and treats EEXIST as "already present" (idempotent). A read-only
         // backing fs is EROFS. Never a bare -1 → EPERM.
         Some(Some(Err(narf_filesystem::FsError::Busy))) => {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)) // -EEXIST
+            ctx.set_return(errno_ret(EEXIST))
         }
         Some(Some(Err(narf_filesystem::FsError::ReadOnly))) => {
-            ctx.set_return(SyscallReturn::ok((-30i64) as u64)) // -EROFS
+            ctx.set_return(errno_ret(EROFS))
         }
         Some(Some(Err(narf_filesystem::FsError::QuotaExceeded))) => {
-            ctx.set_return(SyscallReturn::ok((-122i64) as u64)) // -EDQUOT
+            ctx.set_return(errno_ret(EDQUOT))
         }
         // Parent path/filesystem didn't resolve → a component is missing.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
+        _ => ctx.set_return(errno_ret(ENOENT)),
     }
 }

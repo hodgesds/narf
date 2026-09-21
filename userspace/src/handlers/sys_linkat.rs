@@ -21,7 +21,7 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     let flags = args.arg4;
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -34,19 +34,19 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
     let old_raw = match copy_user_cstr_checked(args.arg1, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let new_raw = match copy_user_cstr_checked(args.arg3, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if new_raw.is_empty() || (old_raw.is_empty() && (flags & AT_EMPTY_PATH == 0)) {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();
@@ -56,7 +56,7 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
     if flags & AT_EMPTY_PATH != 0 && old_raw.is_empty() {
         let src_fd = args.arg0 as i64;
         if src_fd < 0 {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
         let new_eff = match resolve_at_path(task, args.arg2 as i64, &new_raw) {
@@ -110,10 +110,9 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
         // back to the ordinary path-based link only if this filesystem
         // can't adopt a foreign node (-EOPNOTSUPP from `link_node`).
         if fd::with_table(task, |t| t.get(src_fd).is_some()).unwrap_or(false) {
-            const EOPNOTSUPP: i64 = -95;
             let new_abs = resolve_cwd_path(task, &new_eff);
             let r = link_fd_node_impl(task, src_fd, &new_abs);
-            if r != EOPNOTSUPP {
+            if r != -EOPNOTSUPP {
                 ctx.set_return(SyscallReturn::ok(r as u64));
                 return;
             }

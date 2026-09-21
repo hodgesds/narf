@@ -9,7 +9,7 @@ pub(crate) fn sys_mknod(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr(args.arg0, 4096) {
         Some(s) => s,
         None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };

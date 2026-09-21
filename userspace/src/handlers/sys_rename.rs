@@ -7,21 +7,21 @@ pub(crate) fn sys_rename(ctx: &mut dyn TrapContext) {
     let new_ptr = args.arg1;
     // An unreadable user path pointer is EFAULT, not a bare -1 → EPERM.
     let old_path = match copy_user_cstr_checked(old_ptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(errno_ret(errno));
             return;
-            }
-        };
+        }
+    };
     let new_path = match copy_user_cstr_checked(new_ptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     if old_path.is_empty() || new_path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     let task = current_task_id();
@@ -45,14 +45,14 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
     let old_split = match old_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
     let new_split = match new_path.rfind('/') {
         Some(i) => i,
         None => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -86,7 +86,7 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
     if path_inode_flags(old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
         || path_inode_flags(new_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let task = current_task_id();
@@ -118,6 +118,6 @@ pub(crate) fn rename_absolute(ctx: &mut dyn TrapContext, old_path: &str, new_pat
         // spurious EPERM there aborts the unit.
         Some(Some(Err(e))) => ctx.set_return(SyscallReturn::ok(rename_errno(e))),
         // Parent path/filesystem didn't resolve → source can't exist: ENOENT.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)), // -ENOENT
+        _ => ctx.set_return(errno_ret(ENOENT)),
     }
 }

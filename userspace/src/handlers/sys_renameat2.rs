@@ -19,14 +19,14 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     let old_path = match copy_user_cstr_checked(old_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let new_path = match copy_user_cstr_checked(new_uptr, 4096) {
         Ok(s) => s,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -35,7 +35,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     const RENAME_WHITEOUT: u32 = 4;
     // A bare -1 lands in glibc's [-4095,-1] errno window as EPERM, which
     // reads as a permission problem; return real errnos instead.
-    let einval = SyscallReturn::ok((-22i64) as u64);
+    let einval = errno_ret(EINVAL);
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE | RENAME_WHITEOUT) != 0
         || ((flags & (RENAME_NOREPLACE | RENAME_WHITEOUT) != 0) && (flags & RENAME_EXCHANGE != 0))
     {
@@ -48,7 +48,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         return;
     }
     if old_path.is_empty() || new_path.is_empty() {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     }
     // glibc implements plain `rename(2)` on top of renameat2, so this is
@@ -92,7 +92,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
         })
         .unwrap_or(false);
         if exists {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+            ctx.set_return(errno_ret(EEXIST));
             return;
         }
     }
@@ -112,7 +112,7 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     if path_inode_flags(&old_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
         || path_inode_flags(&new_path) & narf_filesystem::FS_PRIVILEGED_FL != 0
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let perm_task = current_task_id();
@@ -144,26 +144,26 @@ pub(crate) fn sys_renameat2(ctx: &mut dyn TrapContext) {
     match outcome {
         Some(Some(Ok(()))) => ctx.set_return(SyscallReturn::ok(0)),
         Some(Some(Err(e))) => {
-            let errno: i64 = match e {
-                narf_filesystem::FsError::NotFound => -2,          // ENOENT
-                narf_filesystem::FsError::PermissionDenied => -13, // EACCES
-                narf_filesystem::FsError::InvalidPath => -22,      // EINVAL
-                narf_filesystem::FsError::CrossDevice => -18,      // EXDEV
-                narf_filesystem::FsError::Busy => -16,             // EBUSY
-                narf_filesystem::FsError::ReadOnly => -30,         // EROFS
-                narf_filesystem::FsError::NoSpace => -28,          // ENOSPC
-                narf_filesystem::FsError::InvalidData => -22,      // EINVAL
+            let errno = match e {
+                narf_filesystem::FsError::NotFound => ENOENT,
+                narf_filesystem::FsError::PermissionDenied => EACCES,
+                narf_filesystem::FsError::InvalidPath => EINVAL,
+                narf_filesystem::FsError::CrossDevice => EXDEV,
+                narf_filesystem::FsError::Busy => EBUSY,
+                narf_filesystem::FsError::ReadOnly => EROFS,
+                narf_filesystem::FsError::NoSpace => ENOSPC,
+                narf_filesystem::FsError::InvalidData => EINVAL,
                 // EINVAL, deliberately, not EOPNOTSUPP: it is the errno
                 // systemd's rename_noreplace() treats as "try the fallback",
                 // and Linux itself returns EINVAL for a rename a filesystem
                 // cannot perform.
-                narf_filesystem::FsError::Unsupported => -22,
-                _ => -22, // EINVAL
+                narf_filesystem::FsError::Unsupported => EINVAL,
+                _ => EINVAL,
             };
-            ctx.set_return(SyscallReturn::ok(errno as u64));
+            ctx.set_return(errno_ret(errno));
         }
         // The parent directory itself did not resolve — the one case where
         // ENOENT is the honest answer.
-        _ => ctx.set_return(SyscallReturn::ok((-2i64) as u64)),
+        _ => ctx.set_return(errno_ret(ENOENT)),
     }
 }
