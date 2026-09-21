@@ -901,7 +901,7 @@ mod tests {
                 }
             }
         }
-        if unshare_pid_ns_for_children(TASK) != Err(ENOSPC as u64) {
+        if !matches!(unshare_pid_ns_for_children(TASK), Err(e) if e == ENOSPC as u64) {
             return TestResult::Fail("PID namespace nesting beyond level 32 did not return ENOSPC");
         }
 
