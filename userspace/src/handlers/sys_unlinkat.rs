@@ -27,6 +27,10 @@ pub(crate) fn sys_unlinkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if path_str.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     if flags & !AT_REMOVEDIR != 0 {
         ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
         return;

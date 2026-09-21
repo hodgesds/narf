@@ -45,6 +45,10 @@ pub(crate) fn sys_linkat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if new_raw.is_empty() || (old_raw.is_empty() && (flags & AT_EMPTY_PATH == 0)) {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let task = current_task_id();
 
     // O_TMPFILE materialisation, form 1: AT_EMPTY_PATH + empty oldpath →

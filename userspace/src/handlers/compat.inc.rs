@@ -951,6 +951,7 @@ fn resolve_file_absolute_ext(
 /// open directory fd. Errors are negative Linux errno values.
 fn resolve_at_path(task: u64, dirfd: i64, raw: &str) -> Result<alloc::string::String, i64> {
     const AT_FDCWD: i64 = -100;
+    let dirfd = dirfd as i32 as i64;
     if raw.starts_with('/') || dirfd == AT_FDCWD {
         return Ok(alloc::string::String::from(raw));
     }

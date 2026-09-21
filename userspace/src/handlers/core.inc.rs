@@ -2469,6 +2469,9 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             _ => return SyscallReturn::ok((-22i64) as u64),        // -EINVAL
         }
     }
+    if raw_path.is_empty() {
+        return SyscallReturn::ok((-2i64) as u64); // -ENOENT
+    }
     // `raw_path` is already the caller's path string; `sys_mknodat` has
     // applied its dirfd so a relative path is resolved against the dirfd's
     // directory, not the cwd. `resolve_cwd_path` then only normalises a
@@ -3494,6 +3497,10 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
 /// parent's `DirOps::link`, and maps `FsError` to the Linux errno the
 /// caller's libc expects.
 fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
+    if old_raw.is_empty() || new_raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);

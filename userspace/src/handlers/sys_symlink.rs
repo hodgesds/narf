@@ -26,6 +26,10 @@ pub(crate) fn sys_symlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if link_path.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     // Resolve the link location against the cwd (the symlink *target*
     // stays verbatim — symlink targets may legitimately be relative).
     let link_path = resolve_cwd_path(current_task_id(), &link_path);

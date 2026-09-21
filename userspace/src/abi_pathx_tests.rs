@@ -4710,3 +4710,170 @@ fn smoke_abi_pathx_openat2_magiclinks_and_cached() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_magiclinks_and_cached);
+
+fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
+    with_memfs("/p2_ren", "p2_ren", &[("f", b"hi")], || {
+        let old = b"/p2_ren/f\0";
+        let new = b"/p2_ren/f2\0";
+        let empty = b"\0";
+
+        // 1. Invalid flags (0x100) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0x100,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("renameat2 with invalid flags must return -EINVAL"),
+        }
+
+        // 2. Unsupported RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                2,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("renameat2 with RENAME_EXCHANGE must return -EINVAL"),
+        }
+
+        // 3. Mutually exclusive RENAME_NOREPLACE (1) | RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                3,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => {
+                return Err("renameat2 with RENAME_NOREPLACE | RENAME_EXCHANGE must return -EINVAL")
+            }
+        }
+
+        // 4. Empty old path -> -ENOENT (-2)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                empty.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0,
+            ),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("renameat2 with empty old path must return -ENOENT"),
+        }
+
+        // 5. Empty new path -> -ENOENT (-2)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                empty.as_ptr() as u64,
+                0,
+            ),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("renameat2 with empty new path must return -ENOENT"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_flags_and_empty_paths
+);
+
+fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {
+    with_memfs("/p2_rl", "p2_rl", &[("f", b"hi")], || {
+        let empty = b"\0";
+        let mut buf = [0u8; 64];
+
+        // 1. bufsiz <= 0 -> -EINVAL (-22) even with NULL pointer
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(AT_FDCWD, 0, buf.as_mut_ptr() as u64, 0),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("readlinkat with bufsiz <= 0 must return -EINVAL"),
+        }
+
+        // 2. empty path -> -ENOENT (-2)
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(AT_FDCWD, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("readlinkat with empty path must return -ENOENT"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_readlinkat_bufsiz_and_empty_path
+);
+
+fn smoke_abi_pathx_empty_path_returns_enoent() -> TestResult {
+    with_setup(|| {
+        let empty = b"\0";
+        let ep = empty.as_ptr() as u64;
+
+        // mkdirat("", 0755) -> -ENOENT
+        if call(Syscall::Mkdirat.raw(), a2(AT_FDCWD, ep, 0o755)) != Some(ENOENT) {
+            return Err("mkdirat with empty path must return -ENOENT");
+        }
+
+        // unlinkat(AT_FDCWD, "", 0) -> -ENOENT
+        if call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, ep, 0)) != Some(ENOENT) {
+            return Err("unlinkat with empty path must return -ENOENT");
+        }
+
+        // symlinkat("target", AT_FDCWD, "") -> -ENOENT
+        let target = b"target\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(target.as_ptr() as u64, AT_FDCWD, ep),
+        ) != Some(ENOENT)
+        {
+            return Err("symlinkat with empty linkpath must return -ENOENT");
+        }
+
+        // linkat(AT_FDCWD, "", AT_FDCWD, "dst", 0) -> -ENOENT
+        let dst = b"dst\0";
+        if call(
+            Syscall::Linkat.raw(),
+            a4(AT_FDCWD, ep, AT_FDCWD, dst.as_ptr() as u64, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("linkat with empty oldpath must return -ENOENT");
+        }
+
+        // mknodat(AT_FDCWD, "", S_IFREG | 0644, 0) -> -ENOENT
+        if call(Syscall::Mknodat.raw(), a3(AT_FDCWD, ep, 0o100644, 0)) != Some(ENOENT) {
+            return Err("mknodat with empty path must return -ENOENT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_empty_path_returns_enoent);

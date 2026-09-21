@@ -48,7 +48,8 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
     if raw.is_empty() {
         if flags & AT_EMPTY_PATH != 0 {
             // Linux permits AT_FDCWD here as well: an empty path names cwd.
-            if args.arg0 as i64 == -100 {
+            let dirfd = args.arg0 as i32 as i64;
+            if dirfd == -100 {
                 let cwd = resolve_cwd_path(current_task_id(), ".");
                 if let Some(dir) = resolve_dir_absolute(&cwd) {
                     match poll_blocking(dir.set_dir_mode_async((args.arg2 as u32 & 0o7777) as u16))
@@ -62,7 +63,7 @@ fn fchmodat_common(ctx: &mut dyn TrapContext, flags: u64) {
                 } else {
                     ctx.set_return(SyscallReturn::ok((-2i64) as u64));
                 }
-            } else if args.arg0 as i64 >= 0 {
+            } else if dirfd >= 0 {
                 let proxy_args = SyscallArgs {
                     arg0: args.arg0,
                     arg1: args.arg2,

@@ -27,12 +27,16 @@ pub(crate) fn sys_symlinkat(ctx: &mut dyn TrapContext) {
             }
         };
     let link_str = match copy_user_cstr_checked(link_ptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-            }
-        };
+        }
+    };
+    if link_str.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let task = current_task_id();
     let joined = match resolve_at_path(task, newdirfd, &link_str) {
         Ok(p) => p,

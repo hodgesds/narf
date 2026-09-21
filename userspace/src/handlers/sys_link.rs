@@ -24,5 +24,9 @@ pub(crate) fn sys_link(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if old_raw.is_empty() || new_raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     link_impl(ctx, &old_raw, &new_raw);
 }
