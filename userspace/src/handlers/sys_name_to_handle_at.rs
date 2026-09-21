@@ -8,7 +8,27 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     const EFAULT: i64 = 14;
     const EOVERFLOW: i64 = 75;
     const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    const AT_HANDLE_FID: u64 = 0x200;
+    const AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x001;
+    const AT_HANDLE_CONNECTABLE: u64 = 0x002;
     let a = *ctx.args();
+    let flags = a.arg4;
+    if flags
+        & !(AT_SYMLINK_FOLLOW
+            | AT_EMPTY_PATH
+            | AT_HANDLE_FID
+            | AT_HANDLE_MNT_ID_UNIQUE
+            | AT_HANDLE_CONNECTABLE)
+        != 0
+    {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
+    if (flags & AT_HANDLE_CONNECTABLE != 0) && (flags & (AT_HANDLE_FID | AT_EMPTY_PATH) != 0) {
+        ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+        return;
+    }
     // As in execveat: a faulting pointer is -EFAULT, not an empty path. Folded
     // together, an unreadable pointer took the AT_EMPTY_PATH branch below and
     // returned a handle for the fd, or EINVAL without it — either way an
@@ -148,16 +168,13 @@ pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
     // per component to compute mount ids; resolving against the cwd
     // instead ENOENT'd exec_setup_credentials' mount-ns child (journald
     // 243/EXIT_CREDENTIALS).
-    let dirfd_i = a.arg0 as i32;
-    const AT_FDCWD_I32: i32 = -100;
-    let raw = if raw.starts_with('/') || dirfd_i == AT_FDCWD_I32 || dirfd_i < 0 {
-        raw
-    } else {
-        match fd_path_for_task(current_task_id(), dirfd_i as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), raw)
-            }
-            _ => raw,
+    let task = current_task_id();
+    let dirfd_i = a.arg0 as i64;
+    let raw = match resolve_at_path(task, dirfd_i, &raw) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
     };
     let path = apply_chroot(&raw);

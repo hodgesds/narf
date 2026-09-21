@@ -8,6 +8,13 @@ use super::*;
 pub(crate) fn sys_execveat(ctx: &mut dyn TrapContext) {
     // Linux: execveat(dirfd, path, argv, envp, flags).
     let a = *ctx.args();
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    const AT_EXECVE_CHECK: u64 = 0x10000;
+    if a.arg4 & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH | AT_EXECVE_CHECK) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     let dirfd = a.arg0 as i32;
     // A NULL path POINTER is invalid (fexecve passes a valid pointer to an
     // empty string, never NULL). Empty-string handling is below.
@@ -29,52 +36,50 @@ pub(crate) fn sys_execveat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
-    let path_empty = path_str.is_empty();
-    const AT_EMPTY_PATH: u64 = 0x1000;
     let task = current_task_id();
 
-    // Resolve the image path:
-    //   - empty path + AT_EMPTY_PATH → the binary the dirfd itself refers to
-    //     (fexecve(3): open the executable, then execveat(fd,"",…,AT_EMPTY_PATH).
-    //     systemd 257 spawns its sd-executor and every service exactly this way).
-    //   - absolute path → used as-is (dirfd ignored, like Linux).
-    //   - relative path → resolved against the dirfd's recorded open path.
-    let resolved: Option<alloc::string::String> = if path_str.is_empty() {
-        if (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
-            fd_path_for_task(task, dirfd as u32)
-        } else {
-            None
+    if path_str.is_empty() {
+        if a.arg4 & AT_EMPTY_PATH == 0 {
+            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+            return;
         }
-    } else if path_str.starts_with('/') {
-        Some(path_str)
-    } else if dirfd >= 0 {
-        fd_path_for_task(task, dirfd as u32).map(|mut d| {
-            if !d.ends_with('/') {
-                d.push('/');
-            }
-            d.push_str(&path_str);
-            d
-        })
-    } else {
-        // AT_FDCWD (or no dir): treat as a plain (cwd-relative) execve path.
-        Some(path_str)
-    };
-
-    if let Some(p) = resolved {
-        do_execve_resolved(ctx, p, a.arg2, a.arg3, None);
-        return;
-    }
-
-    // No filesystem path for the fd. For an AT_EMPTY_PATH fexecve this is the
-    // memfd case (systemd seals its sd-executor into a memfd and fexecve's it):
-    // read the ELF straight out of the fd's FileOps and exec those bytes.
-    if path_empty && (a.arg4 & AT_EMPTY_PATH) != 0 && dirfd >= 0 {
+        const AT_FDCWD_I32: i32 = -100;
+        if dirfd == AT_FDCWD_I32 {
+            ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // -EACCES
+            return;
+        }
+        if dirfd < 0 {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+        let is_open =
+            fd::with_table(task, |t| t.get(dirfd as u32).is_some()).unwrap_or(false);
+        if !is_open {
+            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            return;
+        }
+        if let Some(p) = fd_path_for_task(task, dirfd as u32) {
+            do_execve_resolved(ctx, p, a.arg2, a.arg3, None);
+            return;
+        }
+        // No filesystem path for the fd. For an AT_EMPTY_PATH fexecve this is the
+        // memfd case (systemd seals its sd-executor into a memfd and fexecve's it):
+        // read the ELF straight out of the fd's FileOps and exec those bytes.
         if let Some(bytes) = read_fd_image(task, dirfd as u32) {
             let label = alloc::format!("/proc/self/fd/{}", dirfd);
             do_execve_resolved(ctx, label, a.arg2, a.arg3, Some(bytes));
             return;
         }
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+        return;
     }
-    // Bad dirfd / unreadable fd — ENOENT.
-    ctx.set_return(SyscallReturn::ok((-2i64) as u64));
+
+    let resolved = match resolve_at_path(task, dirfd as i64, &path_str) {
+        Ok(p) => p,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
+        }
+    };
+    do_execve_resolved(ctx, resolved, a.arg2, a.arg3, None);
 }

@@ -38,7 +38,8 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok((-2i64) as u64));
             return;
         }
-        if args.arg0 as i64 == -100 {
+        let dirfd = args.arg0 as i32 as i64;
+        if dirfd == -100 {
             let path = resolve_cwd_path(current_task_id(), ".");
             if let Some(dir) = resolve_dir_absolute(&path) {
                 let (old_uid, old_gid) = dir.dir_owners();
@@ -62,7 +63,7 @@ pub(crate) fn sys_fchmodat_or_fchownat(ctx: &mut dyn TrapContext) {
             } else {
                 ctx.set_return(SyscallReturn::ok((-2i64) as u64));
             }
-        } else if args.arg0 as i64 >= 0 {
+        } else if dirfd >= 0 {
             let proxy_args = SyscallArgs {
                 arg0: args.arg0,
                 arg1: args.arg2,

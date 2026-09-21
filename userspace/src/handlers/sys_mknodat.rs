@@ -31,14 +31,17 @@ use super::*;
 pub(crate) fn sys_mknodat(ctx: &mut dyn TrapContext) {
     let args = *ctx.args();
     // mknodat(dirfd, path, mode, dev): dirfd=arg0, path=arg1, mode=arg2, dev=arg3.
-    let raw = match copy_user_cstr(args.arg1, 4096) {
-        Some(s) => s,
-        // `getname()` — an unreadable path is -EFAULT.
-        None => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+    let raw = match copy_user_cstr_checked(args.arg1, 4096) {
+        Ok(s) => s,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
         }
     };
+    if raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     // Resolve a relative pathname against the dirfd (absolute paths and
     // AT_FDCWD pass through). EBADF / ENOTDIR come straight back, matching
     // `openat`/`mkdirat`, rather than being resolved against the cwd.

@@ -20,6 +20,10 @@ pub(crate) fn sys_mkdirat(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if path_str.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let task = current_task_id();
     let effective = match resolve_at_path(task, dirfd, &path_str) {
         Ok(p) => p,

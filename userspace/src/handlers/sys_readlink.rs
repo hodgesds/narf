@@ -13,6 +13,10 @@ pub(crate) fn sys_readlink(ctx: &mut dyn TrapContext) {
     // it and a negative value must stay negative for the -EINVAL gate in
     // `do_readlinkat`.
     let buf_len = args.arg2 as u32 as i32 as i64;
+    if buf_len <= 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     // `getname_flags` is the first thing every path syscall does, and it has
     // exactly two failures: a pointer it cannot read is -EFAULT, and a path
     // that reaches PATH_MAX with no terminator is -ENAMETOOLONG. This used to
@@ -25,5 +29,9 @@ pub(crate) fn sys_readlink(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     readlink_impl(ctx, raw, buf_ptr, buf_len);
 }

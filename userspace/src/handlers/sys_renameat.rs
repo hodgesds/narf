@@ -35,12 +35,16 @@ pub(crate) fn sys_renameat(ctx: &mut dyn TrapContext) {
             }
         };
     let new_str = match copy_user_cstr_checked(new_uptr, 4096) {
-            Ok(s) => s,
-            Err(errno) => {
+        Ok(s) => s,
+        Err(errno) => {
             ctx.set_return(SyscallReturn::ok((-errno) as u64));
             return;
-            }
-        };
+        }
+    };
+    if old_str.is_empty() || new_str.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
 
     let task = current_task_id();
     let old_path = match resolve_at_path(task, old_dirfd, &old_str) {

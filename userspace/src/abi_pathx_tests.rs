@@ -1561,6 +1561,251 @@ kernel_test_in!(
     smoke_abi_pathx_openat_dirfd_enotdir_and_ebadf
 );
 
+fn smoke_abi_pathx_unlinkat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. Invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Unlinkat.raw(),
+            a2(AT_FDCWD, rel.as_ptr() as u64, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("unlinkat with invalid flags must return -EINVAL"),
+        }
+
+        // 2. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(Syscall::Unlinkat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("unlinkat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. Unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Unlinkat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("unlinkat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_unlinkat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_utimensat_futimesat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. futimens mode (path == NULL) with non-zero flags -> -EINVAL (-22).
+        match call(Syscall::Utimensat.raw(), a3(fd, 0, 0, 1)) {
+            Some(EINVAL) => {}
+            _ => return Err("utimensat with null path and flags != 0 must return -EINVAL"),
+        }
+
+        // 2. Invalid flags in path mode -> -EINVAL (-22).
+        match call(
+            Syscall::Utimensat.raw(),
+            a3(AT_FDCWD, rel.as_ptr() as u64, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("utimensat with invalid flags must return -EINVAL"),
+        }
+
+        // 3. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(Syscall::Utimensat.raw(), a3(fd, rel.as_ptr() as u64, 0, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("utimensat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 4. Unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Utimensat.raw(),
+            a3(9999, rel.as_ptr() as u64, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("utimensat with unallocated dirfd must return -EBADF"),
+        }
+
+        // 5. futimesat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Futimesat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("futimesat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 6. futimesat with unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Futimesat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("futimesat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_utimensat_futimesat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_faccessat_flags_and_dirfd_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. faccessat2 with invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(AT_FDCWD, rel.as_ptr() as u64, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("faccessat2 with invalid flags must return -EINVAL"),
+        }
+
+        // 2. faccessat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Faccessat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("faccessat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. faccessat with unallocated dirfd -> -EBADF (-9).
+        match call(Syscall::Faccessat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("faccessat with unallocated dirfd must return -EBADF"),
+        }
+
+        // 4. faccessat2 with non-directory dirfd -> -ENOTDIR (-20).
+        match call(Syscall::Faccessat2.raw(), a3(fd, rel.as_ptr() as u64, 0, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("faccessat2 with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 5. faccessat2 with unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Faccessat2.raw(),
+            a3(9999, rel.as_ptr() as u64, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("faccessat2 with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_faccessat_flags_and_dirfd_errno
+);
+
+fn smoke_abi_pathx_handle_at_and_execveat_errno() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. name_to_handle_at with invalid flags -> -EINVAL (-22).
+        let mut handle_buf = [0u8; 128];
+        handle_buf[0..4].copy_from_slice(&120u32.to_ne_bytes());
+        let mut mnt_id: i32 = 0;
+        match call(
+            Syscall::NameToHandleAt.raw(),
+            a4(
+                AT_FDCWD,
+                file_path.as_ptr() as u64,
+                handle_buf.as_mut_ptr() as u64,
+                (&mut mnt_id) as *mut i32 as u64,
+                0x8888,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("name_to_handle_at with invalid flags must return -EINVAL"),
+        }
+
+        // 2. name_to_handle_at with non-directory dirfd -> -ENOTDIR (-20).
+        match call(
+            Syscall::NameToHandleAt.raw(),
+            a4(
+                fd,
+                rel.as_ptr() as u64,
+                handle_buf.as_mut_ptr() as u64,
+                (&mut mnt_id) as *mut i32 as u64,
+                0,
+            ),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("name_to_handle_at with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 3. open_by_handle_at with invalid mountdirfd -> -EBADF (-9).
+        match call(
+            Syscall::OpenByHandleAt.raw(),
+            a2(9999, handle_buf.as_ptr() as u64, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("open_by_handle_at with invalid mountdirfd must return -EBADF"),
+        }
+
+        // 4. execveat with invalid flags -> -EINVAL (-22).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(AT_FDCWD, file_path.as_ptr() as u64, 0, 0, 0x8888),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("execveat with invalid flags must return -EINVAL"),
+        }
+
+        // 5. execveat with non-directory dirfd -> -ENOTDIR (-20).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(fd, rel.as_ptr() as u64, 0, 0, 0),
+        ) {
+            Some(ENOTDIR) => {}
+            _ => return Err("execveat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 6. execveat with unallocated dirfd -> -EBADF (-9).
+        match call(
+            Syscall::Execveat.raw(),
+            a4(9999, rel.as_ptr() as u64, 0, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("execveat with unallocated dirfd must return -EBADF"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_handle_at_and_execveat_errno);
+
 // ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
 //
 // systemd-logind resolves each seat-master DRM device by devnum:
@@ -4465,3 +4710,170 @@ fn smoke_abi_pathx_openat2_magiclinks_and_cached() -> TestResult {
     })
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_openat2_magiclinks_and_cached);
+
+fn smoke_abi_pathx_renameat2_flags_and_empty_paths() -> TestResult {
+    with_memfs("/p2_ren", "p2_ren", &[("f", b"hi")], || {
+        let old = b"/p2_ren/f\0";
+        let new = b"/p2_ren/f2\0";
+        let empty = b"\0";
+
+        // 1. Invalid flags (0x100) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0x100,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("renameat2 with invalid flags must return -EINVAL"),
+        }
+
+        // 2. Unsupported RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                2,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("renameat2 with RENAME_EXCHANGE must return -EINVAL"),
+        }
+
+        // 3. Mutually exclusive RENAME_NOREPLACE (1) | RENAME_EXCHANGE (2) -> -EINVAL (-22)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                3,
+            ),
+        ) {
+            Some(EINVAL) => {}
+            _ => {
+                return Err("renameat2 with RENAME_NOREPLACE | RENAME_EXCHANGE must return -EINVAL")
+            }
+        }
+
+        // 4. Empty old path -> -ENOENT (-2)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                empty.as_ptr() as u64,
+                AT_FDCWD,
+                new.as_ptr() as u64,
+                0,
+            ),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("renameat2 with empty old path must return -ENOENT"),
+        }
+
+        // 5. Empty new path -> -ENOENT (-2)
+        match call(
+            Syscall::Renameat2.raw(),
+            a4(
+                AT_FDCWD,
+                old.as_ptr() as u64,
+                AT_FDCWD,
+                empty.as_ptr() as u64,
+                0,
+            ),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("renameat2 with empty new path must return -ENOENT"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_renameat2_flags_and_empty_paths
+);
+
+fn smoke_abi_pathx_readlinkat_bufsiz_and_empty_path() -> TestResult {
+    with_memfs("/p2_rl", "p2_rl", &[("f", b"hi")], || {
+        let empty = b"\0";
+        let mut buf = [0u8; 64];
+
+        // 1. bufsiz <= 0 -> -EINVAL (-22) even with NULL pointer
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(AT_FDCWD, 0, buf.as_mut_ptr() as u64, 0),
+        ) {
+            Some(EINVAL) => {}
+            _ => return Err("readlinkat with bufsiz <= 0 must return -EINVAL"),
+        }
+
+        // 2. empty path -> -ENOENT (-2)
+        match call(
+            Syscall::Readlinkat.raw(),
+            a3(AT_FDCWD, empty.as_ptr() as u64, buf.as_mut_ptr() as u64, 64),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("readlinkat with empty path must return -ENOENT"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_readlinkat_bufsiz_and_empty_path
+);
+
+fn smoke_abi_pathx_empty_path_returns_enoent() -> TestResult {
+    with_setup(|| {
+        let empty = b"\0";
+        let ep = empty.as_ptr() as u64;
+
+        // mkdirat("", 0755) -> -ENOENT
+        if call(Syscall::Mkdirat.raw(), a2(AT_FDCWD, ep, 0o755)) != Some(ENOENT) {
+            return Err("mkdirat with empty path must return -ENOENT");
+        }
+
+        // unlinkat(AT_FDCWD, "", 0) -> -ENOENT
+        if call(Syscall::Unlinkat.raw(), a2(AT_FDCWD, ep, 0)) != Some(ENOENT) {
+            return Err("unlinkat with empty path must return -ENOENT");
+        }
+
+        // symlinkat("target", AT_FDCWD, "") -> -ENOENT
+        let target = b"target\0";
+        if call(
+            Syscall::Symlinkat.raw(),
+            a2(target.as_ptr() as u64, AT_FDCWD, ep),
+        ) != Some(ENOENT)
+        {
+            return Err("symlinkat with empty linkpath must return -ENOENT");
+        }
+
+        // linkat(AT_FDCWD, "", AT_FDCWD, "dst", 0) -> -ENOENT
+        let dst = b"dst\0";
+        if call(
+            Syscall::Linkat.raw(),
+            a4(AT_FDCWD, ep, AT_FDCWD, dst.as_ptr() as u64, 0),
+        ) != Some(ENOENT)
+        {
+            return Err("linkat with empty oldpath must return -ENOENT");
+        }
+
+        // mknodat(AT_FDCWD, "", S_IFREG | 0644, 0) -> -ENOENT
+        if call(Syscall::Mknodat.raw(), a3(AT_FDCWD, ep, 0o100644, 0)) != Some(ENOENT) {
+            return Err("mknodat with empty path must return -ENOENT");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!("syscall_abi", smoke_abi_pathx_empty_path_returns_enoent);

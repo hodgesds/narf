@@ -49,6 +49,7 @@ pub mod coredump;
 pub mod elf;
 pub mod ephemeral_port;
 pub mod epoll;
+pub mod errno;
 pub mod fd;
 pub mod handlers;
 pub mod init;

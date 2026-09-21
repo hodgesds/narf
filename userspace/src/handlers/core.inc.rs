@@ -2429,7 +2429,7 @@ const FALLOC_FL_ZERO_RANGE: u64 = 0x10;
 //
 // unlinkat honours AT_REMOVEDIR (0x200) — when set, route to rmdir.
 
-const AT_REMOVEDIR: u64 = 0x200;
+pub(crate) const AT_REMOVEDIR: u64 = 0x200;
 
 /// Shared node-creation used by both `mknod` and `mknodat`. `S_IFDIR` creates
 /// a directory; `S_IFCHR`/`S_IFBLK` create a device node via the directory's
@@ -2468,6 +2468,9 @@ fn mknod_common(raw_path: &str, mode: u64, dev: u64) -> SyscallReturn {
             S_IFDIR_M => return SyscallReturn::ok((-1i64) as u64), // -EPERM
             _ => return SyscallReturn::ok((-22i64) as u64),        // -EINVAL
         }
+    }
+    if raw_path.is_empty() {
+        return SyscallReturn::ok((-2i64) as u64); // -ENOENT
     }
     // `raw_path` is already the caller's path string; `sys_mknodat` has
     // applied its dirfd so a relative path is resolved against the dirfd's
@@ -3494,6 +3497,10 @@ fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
 /// parent's `DirOps::link`, and maps `FsError` to the Linux errno the
 /// caller's libc expects.
 fn link_impl(ctx: &mut dyn TrapContext, old_raw: &str, new_raw: &str) {
+    if old_raw.is_empty() || new_raw.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let task = current_task_id();
     let old_path = resolve_cwd_path(task, old_raw);
     let new_path = resolve_cwd_path(task, new_raw);

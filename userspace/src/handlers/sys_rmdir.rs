@@ -16,6 +16,10 @@ pub(crate) fn sys_rmdir(ctx: &mut dyn TrapContext) {
             return;
         }
     };
+    if path.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let path = resolve_cwd_path(current_task_id(), &path);
     rmdir_absolute(ctx, &path);
 }

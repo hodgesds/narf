@@ -34,6 +34,11 @@ use crate::{
     TrapContext,
 };
 
+#[allow(unused_imports)]
+pub(crate) use crate::errno::to_ret as errno_ret;
+#[allow(unused_imports)]
+pub(crate) use crate::errno::*;
+
 // Keep the implementation fragments in this module's scope: the syscall
 // handlers deliberately share private state and helpers, and turning the
 // fragments into child modules would widen that internal visibility.

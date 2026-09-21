@@ -20,6 +20,10 @@ pub(crate) fn sys_mkdir(ctx: &mut dyn TrapContext) {
 }
 
 pub(super) fn mkdir_path(ctx: &mut dyn TrapContext, raw_path: &str, mode: u32) {
+    if raw_path.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
     let path = resolve_cwd_path(current_task_id(), raw_path);
     // Normalise trailing slashes; `mkdir("/")` (or any path that resolves
     // to the root) always already exists.
