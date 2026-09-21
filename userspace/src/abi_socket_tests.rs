@@ -1078,7 +1078,6 @@ kernel_test_in!(
 /// readable connection and no ghost.
 fn smoke_abi_socket_connect_twice_no_ghost_pending() -> TestResult {
     with_setup(|| {
-        const EISCONN: i64 = -56;
         let srv = open_unix_stream()?;
         let (addr, alen) = unix_sockaddr(b"/abi-connect-twice");
         if call(
