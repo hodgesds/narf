@@ -11,10 +11,29 @@ pub(crate) fn sys_socketpair(ctx: &mut dyn TrapContext) {
     let raw_type = args.arg1 as u32;
     let _protocol = args.arg2 as u32;
     let sv_ptr = args.arg3;
-    // Peel the SOCK_CLOEXEC / SOCK_NONBLOCK flag bits off the type.
-    let kind = raw_type & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK);
-    let cloexec = raw_type & crate::fd::O_CLOEXEC != 0;
-    let nonblock = raw_type & crate::fd::O_NONBLOCK != 0;
+    // `net/socket.c::__sys_socketpair`:
+    //
+    // ```text
+    //     flags = type & ~SOCK_TYPE_MASK;
+    //     if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+    //             return -EINVAL;
+    //     type &= SOCK_TYPE_MASK;
+    // ```
+    //
+    // The flag word is validated FIRST — before the family is looked at —
+    // so an undefined bit is -EINVAL even when the domain is also wrong.
+    // Without this every unknown bit was silently peeled off and ignored,
+    // so a caller probing for a flag this kernel does not implement saw it
+    // "succeed" and assumed the semantics it asked for were in effect.
+    const SOCK_TYPE_MASK: u32 = 0xf; // include/linux/net.h
+    let flags = raw_type & !SOCK_TYPE_MASK;
+    if flags & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK) != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let kind = raw_type & SOCK_TYPE_MASK;
+    let cloexec = flags & crate::fd::O_CLOEXEC != 0;
+    let nonblock = flags & crate::fd::O_NONBLOCK != 0;
     // Linux only implements socketpair(2) for AF_UNIX/AF_LOCAL. Match its error
     // order: sock_create rejects an unknown family with -EAFNOSUPPORT; a known
     // family that lacks a ->socketpair op (every non-UNIX family here) is
