@@ -20,74 +20,63 @@ pub(crate) fn sys_openat(ctx: &mut dyn TrapContext) {
             return;
             }
         };
+    if path_str.is_empty() {
+        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        return;
+    }
+    let task = current_task_id();
+    // A detached mount returned by fsmount(2) is a directory fd even
+    // though it intentionally has no pathname.  systemd's credential
+    // setup reopens it with `openat(mfd, ".", O_DIRECTORY|O_CLOEXEC)`
+    // before populating and attaching the credentials tmpfs.  Routing
+    // every relative dirfd through fd_path_for_task rejected that valid
+    // operation as EBADF because detached mounts are pathless.
+    //
+    // Do not generalize this to arbitrary pathless descriptors: a pipe,
+    // socket, or fs-context is not a directory.  A MountObjectFile is
+    // explicitly directory-typed and may be reopened as a new reference
+    // to the same detached mount, exactly like Linux's fd_reopen helper.
+    if dirfd >= 0 && path_str == "." {
+        let mount = fd::with_table(task, |t| {
+            t.get(dirfd as u32)
+                .and_then(|entry| entry.ops.mount_object_id().map(|_| entry.ops.clone()))
+        })
+        .flatten();
+        if let Some(ops) = mount {
+            let status_flags =
+                (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
+            let fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
+                crate::fd::FD_CLOEXEC
+            } else {
+                0
+            };
+            let reopened = fd::install(task, crate::fd::FdEntry {
+                ops,
+                offset: 0,
+                flags: fd_flags,
+                status_flags,
+            });
+            ctx.set_return(SyscallReturn::ok(
+                reopened.map(|fd| fd as u64).unwrap_or((-24i64) as u64),
+            ));
+            return;
+        }
+    }
     // Honour a real directory fd: `openat(dirfd, relpath)` resolves `relpath`
     // against the directory backing `dirfd`. Absolute paths and AT_FDCWD
     // resolve as before. sd-device's `chase_symlinks` (behind libudev and
     // elogind's seat-device enumeration) walks a path with one `openat` per
     // component against parent-directory fds; ignoring `dirfd` made every
     // such lookup fail ("Failed to chase symlinks in …") → no DRM card ever
-    // attached to a seat. `fd_path_of` returns the dir's chroot-relative path,
-    // so joining a relative component and letting `open_impl` re-apply the
-    // chroot keeps a chrooted process (e.g. elogind under /mnt) resolving in
-    // its own namespace.
-    const AT_FDCWD: i64 = -100;
-    let effective = if path_str.starts_with('/') || dirfd == AT_FDCWD {
-        path_str
-    } else if dirfd >= 0 {
-        // A detached mount returned by fsmount(2) is a directory fd even
-        // though it intentionally has no pathname.  systemd's credential
-        // setup reopens it with `openat(mfd, ".", O_DIRECTORY|O_CLOEXEC)`
-        // before populating and attaching the credentials tmpfs.  Routing
-        // every relative dirfd through fd_path_for_task rejected that valid
-        // operation as EBADF because detached mounts are pathless.
-        //
-        // Do not generalize this to arbitrary pathless descriptors: a pipe,
-        // socket, or fs-context is not a directory.  A MountObjectFile is
-        // explicitly directory-typed and may be reopened as a new reference
-        // to the same detached mount, exactly like Linux's fd_reopen helper.
-        if path_str == "." {
-            let task = current_task_id();
-            let mount = fd::with_table(task, |t| {
-                t.get(dirfd as u32)
-                    .and_then(|entry| entry.ops.mount_object_id().map(|_| entry.ops.clone()))
-            })
-            .flatten();
-            if let Some(ops) = mount {
-                let status_flags =
-                    (flags as u32) & (crate::fd::O_ACCMODE | crate::fd::O_SETFL_MASK);
-                let fd_flags = if flags & crate::fd::O_CLOEXEC as u64 != 0 {
-                    crate::fd::FD_CLOEXEC
-                } else {
-                    0
-                };
-                let reopened = fd::install(task, crate::fd::FdEntry {
-                        ops,
-                        offset: 0,
-                        flags: fd_flags,
-                        status_flags,
-                    });
-                ctx.set_return(SyscallReturn::ok(
-                    reopened.map(|fd| fd as u64).unwrap_or((-24i64) as u64),
-                ));
-                return;
-            }
+    // attached to a seat. `resolve_at_path` verifies `dirfd` is a valid
+    // directory descriptor (returning -ENOTDIR if not, and -EBADF if invalid),
+    // matching Linux path_init / do_sys_openat2 (fs/namei.c:2750-2755).
+    let effective = match resolve_at_path(task, dirfd, &path_str) {
+        Ok(path) => path,
+        Err(errno) => {
+            ctx.set_return(SyscallReturn::ok(errno as u64));
+            return;
         }
-        match fd_path_for_task(current_task_id(), dirfd as u32) {
-            Some(dir) if dir.starts_with('/') => {
-                alloc::format!("{}/{}", dir.trim_end_matches('/'), path_str)
-            }
-            // An untracked or pathless descriptor cannot name a directory.
-            // Resolving it from cwd would silently operate outside the
-            // caller-selected directory, whereas Linux returns EBADF.
-            _ => {
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-                return;
-            }
-        }
-    } else {
-        // AT_FDCWD is the only negative dirfd accepted for a relative path.
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
-        return;
     };
     // Resolve the `/proc/self/fd/N` (and `/proc/<pid>/fd/N`) magic symlink:
     // opening it reopens the target of fd N. systemd's `fd_reopen` opens an

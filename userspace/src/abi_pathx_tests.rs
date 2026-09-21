@@ -1501,6 +1501,66 @@ fn smoke_abi_pathx_linkat_flags_and_dirfd_errno() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_pathx_linkat_flags_and_dirfd_errno);
 
+fn smoke_abi_pathx_openat_dirfd_enotdir_and_ebadf() -> TestResult {
+    with_memfs("/p2", "p2", &[("f", b"hi")], || {
+        let file_path = b"/p2/f\0";
+        let fd = match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(fd) if fd >= 0 => fd as u64,
+            _ => return Err("openat(file) did not return an fd"),
+        };
+        let rel = b"child\0";
+
+        // 1. Non-directory dirfd with relative path -> -ENOTDIR (-20).
+        match call(Syscall::Openat.raw(), a3(fd, rel.as_ptr() as u64, 0, 0)) {
+            Some(ENOTDIR) => {}
+            _ => return Err("openat with non-directory dirfd must return -ENOTDIR"),
+        }
+
+        // 2. Unallocated dirfd with relative path -> -EBADF (-9).
+        match call(Syscall::Openat.raw(), a3(9999, rel.as_ptr() as u64, 0, 0)) {
+            Some(EBADF) => {}
+            _ => return Err("openat with unallocated dirfd must return -EBADF"),
+        }
+
+        // 3. Negative dirfd (!= AT_FDCWD) with relative path -> -EBADF (-9).
+        match call(
+            Syscall::Openat.raw(),
+            a3((-1i64) as u64, rel.as_ptr() as u64, 0, 0),
+        ) {
+            Some(EBADF) => {}
+            _ => return Err("openat with negative dirfd must return -EBADF"),
+        }
+
+        // 4. Non-directory dirfd with absolute path -> succeeds (ignores dirfd).
+        match call(
+            Syscall::Openat.raw(),
+            a3(fd, file_path.as_ptr() as u64, 0, 0),
+        ) {
+            Some(opened_fd) if opened_fd >= 0 => {}
+            _ => return Err("openat with absolute path must ignore dirfd and succeed"),
+        }
+
+        // 5. Empty path -> -ENOENT (-2).
+        let empty = b"\0";
+        match call(
+            Syscall::Openat.raw(),
+            a3(AT_FDCWD, empty.as_ptr() as u64, 0, 0),
+        ) {
+            Some(ENOENT) => {}
+            _ => return Err("openat with empty path must return -ENOENT"),
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_pathx_openat_dirfd_enotdir_and_ebadf
+);
+
 // ── sd-device chase() of a DRM /sys/dev/char/226:0 symlink ───────────
 //
 // systemd-logind resolves each seat-master DRM device by devnum:
