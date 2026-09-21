@@ -24,12 +24,12 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
 
     // loff_t is signed: a negative offset is rejected before the fd lookup.
     if (offset as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     // pread(2) on a pipe/FIFO/socket is -ESPIPE: those file types never get
@@ -39,16 +39,16 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
         use narf_filesystem::FileType;
         let ty = endpoint.ops.stat().mode.file_type;
         if ty == FileType::Fifo || ty == FileType::Socket {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            ctx.set_return(errno_ret(ESPIPE));
             return;
         }
     }
     if !endpoint.readable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     if let Err(errno) = validate_rw_user_range(ptr, requested) {
-        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+        ctx.set_return(errno_ret(errno as i64));
         return;
     }
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
@@ -80,19 +80,19 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
             // iov length.
             Ok(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             Err(narf_filesystem::FsError::WouldBlock) => break,
             Err(error) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
                     return;
                 }
                 break;
@@ -102,7 +102,7 @@ pub(crate) fn sys_pread64(ctx: &mut dyn TrapContext) {
         // guarded copy still catches a protection change racing it.
         if let Err(errno) = unsafe { copy_to_user(ptr + total as u64, &staging[..read]) } {
             if total == 0 {
-                ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                ctx.set_return(errno_ret(errno as i64));
                 return;
             }
             break;

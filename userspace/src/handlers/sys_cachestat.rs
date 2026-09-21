@@ -37,14 +37,14 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
     let Some(entry_ops) = crate::fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten()
     else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let mut raw = [0u8; 16];
     // SAFETY: `range_ptr` is the user `struct cachestat_range`; copy_from_user
     // range-validates it and brackets the 16-byte read.
     if unsafe { copy_from_user(&mut raw, range_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let off = u64::from_ne_bytes(raw[0..8].try_into().unwrap());
@@ -62,11 +62,11 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     .flatten()
     .unwrap_or(false);
     if !writable && !inode_owner_or_capable(task, uid, gid) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -99,7 +99,7 @@ pub(crate) fn sys_cachestat(ctx: &mut dyn TrapContext) {
     // SAFETY: `out_ptr` is the user `struct cachestat`; copy_to_user
     // range-validates it and brackets the 40-byte write.
     if unsafe { copy_to_user(out_ptr, &out) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

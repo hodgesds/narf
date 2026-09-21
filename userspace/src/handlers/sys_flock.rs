@@ -19,7 +19,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     let fd = args.arg0 as u32;
     let op = args.arg1 as u32;
     // Conflict under LOCK_NB is EWOULDBLOCK, which on Linux is EAGAIN(11).
-    let would_block = SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64);
+    let would_block = errno_ret(EAGAIN);
     let task = current_task_id();
     // LOCK_MAND lost its meaning in 5.15; the syscall now warns once and
     // reports success without taking anything.
@@ -32,14 +32,14 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     // malformed operation outranks a closed descriptor: exactly one of
     // LOCK_SH / LOCK_EX / LOCK_UN, optionally OR'd with LOCK_NB.
     if !matches!(op & !LOCK_NB, LOCK_SH | LOCK_EX | LOCK_UN) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone())).flatten();
     let arc_ops = match arc_ops {
         Some(a) => a,
         None => {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -48,7 +48,7 @@ pub(crate) fn sys_flock(ctx: &mut dyn TrapContext) {
     // task: dup/fork aliases share one lock, and two independent opens in
     // one process must conflict.
     let Some(owner) = fd::with_table(task, |t| t.description_lock_owner(fd)).flatten() else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let (dev, ino) = (arc_ops.inode_attrs().dev, arc_ops.ino());

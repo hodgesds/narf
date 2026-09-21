@@ -24,9 +24,9 @@ pub(crate) fn sys_dup(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(new_fd as u64));
         }
         Some(Err(crate::fd::FdAllocError::TooManyFiles)) => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
         }
         // oldfd is not an open file descriptor → EBADF.
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+        _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

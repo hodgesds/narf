@@ -22,21 +22,21 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
     let new_size = args.arg1;
 
     if (new_size as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let path = match copy_user_cstr_checked(ptr, 4096) {
         Ok(p) => p,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
     let path = apply_chroot(&path);
     // `do_sys_truncate` -> `mnt_want_write`: changing a file's length is a
     // write, refused with EROFS on a read-only mount.
-    if let Err(errno) = mnt_want_write(&path) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    if mnt_want_write(&path).is_err() {
+        ctx.set_return(errno_ret(EROFS));
         return;
     }
     let ops = narf_filesystem::registry()
@@ -45,7 +45,7 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
         })
         .flatten();
     let Some(ops) = ops else {
-        ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // -ENOENT
+        ctx.set_return(errno_ret(ENOENT));
         return;
     };
     // A directory is EISDIR; any other non-regular target (fifo, socket,
@@ -53,19 +53,19 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
     match ops.stat().mode.file_type {
         narf_filesystem::FileType::File => {}
         narf_filesystem::FileType::Dir => {
-            ctx.set_return(SyscallReturn::ok((-21i64) as u64)); // -EISDIR
+            ctx.set_return(errno_ret(EISDIR));
             return;
         }
         _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
     // Truncation rewrites data, so BOTH flags refuse it: `do_truncate`
     // reaches `notify_change`, whose `may_setattr` bars an immutable or
     // append-only inode from an ATTR_SIZE change.
-    if let Err(errno) = immutable_check(ops.inode_flags(), true, false) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    if immutable_check(ops.inode_flags(), true, false).is_err() {
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // `notify_change` -> `inode_newsize_ok`: RLIMIT_FSIZE bounds a truncate
@@ -73,7 +73,7 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
     // the write path is — a resize refused with -EFBIG must not strip the
     // set-user-ID bit on its way out.
     if let Err(errno) = fsize_check_resize(current_task_id(), ops.stat().size, new_size) {
-        ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        ctx.set_return(errno_ret(errno));
         return;
     }
     // `do_truncate` passes `ATTR_KILL_SUID | ATTR_KILL_SGID` alongside the
@@ -85,7 +85,7 @@ pub(crate) fn sys_truncate(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_modify_path(&path);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Some(Err(error)) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
-        None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        Some(Err(error)) => ctx.set_return(errno_ret(copy_fs_errno(error))),
+        None => ctx.set_return(errno_ret(EIO)),
     }
 }

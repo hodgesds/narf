@@ -27,7 +27,7 @@ pub(crate) fn sys_pipe(ctx: &mut dyn TrapContext) {
         Some(pair) => pair,
         // Both ends are allocated or neither is; see `fd::install_pair`.
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };
@@ -46,7 +46,7 @@ pub(crate) fn sys_pipe(ctx: &mut dyn TrapContext) {
             table.close(r);
             table.close(w);
         });
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

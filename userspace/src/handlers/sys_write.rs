@@ -12,15 +12,15 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // ksys_write resolves fd first; vfs_write then checks FMODE_WRITE before
     // access_ok, including for count==0.
     let Some(endpoint) = copy_fd_endpoint(task, fd_num) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     if !endpoint.writable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     if let Err(errno) = validate_rw_user_range(user_ptr, requested) {
-        ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+        ctx.set_return(errno_ret(errno as i64));
         return;
     }
     let count = core::cmp::min(requested, LINUX_MAX_RW_COUNT);
@@ -35,7 +35,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         match poll_blocking(endpoint.description.position_lock.lock()) {
             Some(guard) => Some(guard),
             None => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
         }
@@ -44,7 +44,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         match poll_blocking(endpoint.description.append_lock().lock()) {
             Some(guard) => Some(guard),
             None => {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
         }
@@ -55,8 +55,8 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     // `inode_permission`'s "Nobody gets write access to an immutable
     // file", and the append-only half: the data may grow but never be
     // rewritten, so only an O_APPEND write is allowed through.
-    if let Err(errno) = immutable_check(endpoint.ops.inode_flags(), true, endpoint.append()) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    if immutable_check(endpoint.ops.inode_flags(), true, endpoint.append()).is_err() {
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // `vfs_write` -> `file_remove_privs`: a write strips the set-user-ID
@@ -81,7 +81,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
     let count = match fsize_check_write(task, offset, count, || endpoint.ops.stat().mode.file_type == narf_filesystem::FileType::File) {
         Ok(c) => c,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -104,7 +104,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             match pipe.write_from_user(user_ptr + total as u64, want) {
                 Ok(outcome) => outcome,
                 Err(errno) if total == 0 => {
-                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    ctx.set_return(errno_ret(errno as i64));
                     return;
                 }
                 Err(_) => break,
@@ -128,7 +128,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
                     Err(narf_filesystem::FsError::BrokenPipe)
                 }
                 Err(narf_filesystem::fifo::FifoWriteError::User(errno)) if total == 0 => {
-                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    ctx.set_return(errno_ret(errno as i64));
                     return;
                 }
                 Err(narf_filesystem::fifo::FifoWriteError::User(_)) => break,
@@ -139,7 +139,7 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             let payload = match unsafe { copy_from_user_vec(user_ptr + total as u64, want) } {
                 Ok(payload) => payload,
                 Err(errno) if total == 0 => {
-                    ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+                    ctx.set_return(errno_ret(errno as i64));
                     return;
                 }
                 Err(_) => break,
@@ -153,11 +153,11 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
         match outcome {
             Ok(0) if endpoint.ops.write_should_block() && total == 0 => {
                 if endpoint.nonblocking() {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 if has_interrupting_signal(task) {
-                    ctx.set_return(SyscallReturn::ok((-4i64) as u64)); // EINTR
+                    ctx.set_return(errno_ret(EINTR));
                     return;
                 }
                 if park_reexecute_on_fd(
@@ -180,18 +180,18 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             }
             Ok(_) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
                 if endpoint.nonblocking() {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 if has_interrupting_signal(task) {
-                    ctx.set_return(SyscallReturn::ok((-4i64) as u64));
+                    ctx.set_return(errno_ret(EINTR));
                     return;
                 }
                 if park_reexecute_on_fd(
@@ -207,14 +207,14 @@ pub(crate) fn sys_write(ctx: &mut dyn TrapContext) {
             Err(narf_filesystem::FsError::BrokenPipe) => {
                 raise_signal_pending(task, 13); // SIGPIPE even after a prefix
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+                    ctx.set_return(errno_ret(EPIPE));
                     return;
                 }
                 break;
             }
             Err(error) => {
                 if total == 0 {
-                    ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                    ctx.set_return(errno_ret(copy_fs_errno(error)));
                     return;
                 }
                 break;

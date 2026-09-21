@@ -22,11 +22,11 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
     let direct_bit = crate::fd::O_DIRECT as u64;
     const O_NOTIFICATION_PIPE: u64 = 0o200;
     if flags & !(O_CLOEXEC_BIT | nonblock_bit | direct_bit | O_NOTIFICATION_PIPE) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if flags & O_NOTIFICATION_PIPE != 0 {
-        ctx.set_return(SyscallReturn::ok((-65i64) as u64)); // -ENOPKG
+        ctx.set_return(errno_ret(ENOPKG));
         return;
     }
     let want_cloexec = (flags & O_CLOEXEC_BIT) != 0;
@@ -72,7 +72,7 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
         Some(pair) => pair,
         // Both ends are allocated or neither is; see `fd::install_pair`.
         None => {
-            ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+            ctx.set_return(errno_ret(EMFILE));
             return;
         }
     };
@@ -90,7 +90,7 @@ pub(crate) fn sys_pipe2(ctx: &mut dyn TrapContext) {
             table.close(r);
             table.close(w);
         });
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

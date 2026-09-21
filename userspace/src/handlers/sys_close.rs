@@ -8,7 +8,7 @@ pub(crate) fn sys_close(ctx: &mut dyn TrapContext) {
     // alive for flush and object-specific cleanup below. Linux makes the fd
     // unavailable before the potentially blocking flush hook too.
     let Some(entry) = fd::with_table(task, |table| table.take(fd)).flatten() else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let ops = &entry.ops;

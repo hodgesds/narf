@@ -9,7 +9,7 @@ fn finish_sendfile(ctx: &mut dyn TrapContext, offset_ptr: u64, offset: u64, resu
         // when the transfer returned an error, so a write-back fault wins.
         // SAFETY: copy_to_user validates and brackets the user access.
         if unsafe { copy_to_user(offset_ptr, &offset.to_ne_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }
@@ -32,7 +32,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
         let bytes = match unsafe { copy_from_user_vec(offset_ptr, 8) } {
             Ok(bytes) => bytes,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
         };
@@ -43,22 +43,22 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
 
     // Input fd and FMODE_READ precede every output-side check.
     let Some(input) = copy_fd_endpoint(task, in_fd) else {
-        finish_sendfile(ctx, offset_ptr, initial_offset, -9); // EBADF
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EBADF);
         return;
     };
     if !input.readable() {
-        finish_sendfile(ctx, offset_ptr, initial_offset, -9); // EBADF
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EBADF);
         return;
     }
     if offset_ptr != 0 && input.ops.is_stream() {
         // Explicit offsets require FMODE_PREAD; pipes/sockets fail ESPIPE.
-        finish_sendfile(ctx, offset_ptr, initial_offset, -29);
+        finish_sendfile(ctx, offset_ptr, initial_offset, -ESPIPE);
         return;
     }
     if offset_ptr == 0 && input.ops.is_stream() {
         // NARF streams do not provide Linux's splice_read/mmap source op.
         // Fail closed so an empty live pipe can never masquerade as EOF.
-        finish_sendfile(ctx, offset_ptr, initial_offset, -22);
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
         return;
     }
 
@@ -69,7 +69,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
                 .checked_add(requested as u64)
                 .is_none_or(|end| end > i64::MAX as u64)
         {
-            finish_sendfile(ctx, offset_ptr, initial_offset, -22); // EINVAL
+            finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
             return;
         }
         Some(initial_offset)
@@ -79,15 +79,15 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
 
     // Linux checks output only after the input fd/mode/range is valid.
     let Some(output) = copy_fd_endpoint(task, out_fd) else {
-        finish_sendfile(ctx, offset_ptr, initial_offset, -9); // EBADF
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EBADF);
         return;
     };
     if !output.writable() {
-        finish_sendfile(ctx, offset_ptr, initial_offset, -9); // EBADF
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EBADF);
         return;
     }
     if output.append() {
-        finish_sendfile(ctx, offset_ptr, initial_offset, -22); // EINVAL
+        finish_sendfile(ctx, offset_ptr, initial_offset, -EINVAL);
         return;
     }
 
@@ -98,7 +98,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
         && output.ops.write_should_block()
     {
         if output.nonblocking() {
-            finish_sendfile(ctx, offset_ptr, initial_offset, -(EAGAIN_CODE as i64));
+            finish_sendfile(ctx, offset_ptr, initial_offset, -EAGAIN);
             return;
         }
         if park_reexecute_on_fd(
@@ -116,7 +116,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
             Ok(total) => (total as i64, total as u64),
             Err(CopyFdError::Fs(narf_filesystem::FsError::WouldBlock)) => {
                 if output.nonblocking() {
-                    (-(EAGAIN_CODE as i64), 0)
+                    (-EAGAIN, 0)
                 } else {
                     // No data or position was consumed, so re-execution is safe.
                     if park_reexecute_on_fd(
@@ -132,7 +132,7 @@ pub(crate) fn sys_sendfile(ctx: &mut dyn TrapContext) {
             }
             Err(CopyFdError::Fs(narf_filesystem::FsError::BrokenPipe)) => {
                 raise_signal_pending(task, 13); // SIGPIPE
-                (-32, 0)
+                (-EPIPE, 0)
             }
             Err(CopyFdError::Fs(error)) => (-copy_fs_errno(error), 0),
         };

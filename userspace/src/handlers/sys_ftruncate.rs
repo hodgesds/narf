@@ -21,11 +21,11 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
 
     // off_t is signed; a negative length never reaches the fd table.
     if (len as i64) < 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     // Both "not a regular file" and "not opened for writing" are -EINVAL
@@ -33,7 +33,7 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     if endpoint.ops.stat().mode.file_type != narf_filesystem::FileType::File
         || !endpoint.writable()
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -41,8 +41,8 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     // checks `IS_APPEND` (returning -EPERM) and reaches `notify_change`,
     // whose `may_setattr` bars an immutable or append-only inode from an
     // ATTR_SIZE change.
-    if let Err(errno) = immutable_check(endpoint.ops.inode_flags(), true, false) {
-        ctx.set_return(SyscallReturn::ok(errno as u64));
+    if immutable_check(endpoint.ops.inode_flags(), true, false).is_err() {
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -51,7 +51,7 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
     // including from above the limit — that is how a process gets back under
     // one it has just lowered.
     if let Err(errno) = fsize_check_resize(task, endpoint.ops.stat().size, len) {
-        ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        ctx.set_return(errno_ret(errno));
         return;
     }
 
@@ -65,9 +65,9 @@ pub(crate) fn sys_ftruncate(ctx: &mut dyn TrapContext) {
             crate::mqueue::notify_modify_fd(task, fd);
             ctx.set_return(SyscallReturn::ok(0));
         }
-        Some(Err(error)) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
+        Some(Err(error)) => ctx.set_return(errno_ret(copy_fs_errno(error))),
         // A truncate future that cannot resolve in trap context is an I/O
         // failure, not a caller error.
-        None => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+        None => ctx.set_return(errno_ret(EIO)),
     }
 }

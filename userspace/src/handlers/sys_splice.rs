@@ -31,14 +31,14 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         return;
     }
     if flags & !SPLICE_F_ALL != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     // Linux fdget()s input then output. The paired snapshot preserves that
     // lookup order while pinning both descriptions in one table acquisition.
     let Some((input, output)) = copy_fd_endpoints(task, fd_in, fd_out) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     // Snapshot the endpoint kinds once. Besides avoiding repeated virtual
@@ -52,7 +52,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
 
     // __do_splice identifies pipe endpoints before touching userspace.
     if (in_is_pipe && off_in_ptr != 0) || (out_is_pipe && off_out_ptr != 0) {
-        ctx.set_return(SyscallReturn::ok((-29i64) as u64));
+        ctx.set_return(errno_ret(ESPIPE));
         return;
     }
 
@@ -69,25 +69,25 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     let explicit_out = match import_offset(off_out_ptr) {
         Ok(offset) => offset,
         Err(()) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
     let explicit_in = match import_offset(off_in_ptr) {
         Ok(offset) => offset,
         Err(()) => {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     };
 
     // do_splice checks both f_mode bits before deciding the pipe shape.
     if !input.readable() || !output.writable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     if !in_is_pipe && !out_is_pipe {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if !in_is_pipe
@@ -98,17 +98,17 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
     {
         // Character devices such as /dev/zero do not expose splice_read on
         // Linux. stress-ng probes this once and falls back to write(2).
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if explicit_in.is_some() && input.ops.is_stream()
         || explicit_out.is_some() && output.ops.is_stream()
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // lacks PREAD/PWRITE
+        ctx.set_return(errno_ret(EINVAL)); // lacks PREAD/PWRITE
         return;
     }
     if output.append() && !out_is_pipe {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if requested > isize::MAX as usize
@@ -125,7 +125,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
                     .is_none_or(|end| end > i64::MAX as u64)
         })
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -157,7 +157,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
             |(read, write)| read.shares_pipe_with(write),
         );
         if same_pipe {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -170,7 +170,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         .and_then(|any| any.downcast_ref::<crate::pipe::PipeRead>())
         .is_some();
     if input.ops.is_stream() && !input_has_transactional_splice {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -187,7 +187,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         && output.ops.write_should_block()
     {
         if nonblock {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
             return;
         }
         if park_reexecute_on_fd(
@@ -211,7 +211,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
             // EAGAIN or park+re-exec is safe. A partial transfer is returned as
             // its byte count by the copy core and is never re-executed.
             if nonblock {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             let (wait_ops, interest) = if in_is_pipe
@@ -236,10 +236,10 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
         }
         Err(CopyFdError::Fs(narf_filesystem::FsError::BrokenPipe)) => {
             raise_signal_pending(task, 13); // SIGPIPE
-            ctx.set_return(SyscallReturn::ok((-32i64) as u64));
+            ctx.set_return(errno_ret(EPIPE));
         }
         Err(CopyFdError::Fs(error)) => {
-            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+            ctx.set_return(errno_ret(copy_fs_errno(error)));
         }
         Ok(total) => {
             // __do_splice writes explicit offsets back only after a
@@ -254,7 +254,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
                 }
                 .is_err()
                 {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             }
@@ -268,7 +268,7 @@ pub(crate) fn sys_splice(ctx: &mut dyn TrapContext) {
                 }
                 .is_err()
                 {
-                    ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
             }

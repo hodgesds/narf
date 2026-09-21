@@ -14,7 +14,7 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         } else {
             // dup2 with an invalid oldfd → -EBADF (was InvalidOp).
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+            ctx.set_return(errno_ret(EBADF));
         }
         return;
     }
@@ -30,7 +30,7 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
             .map(|limit| limit.cur)
             .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur);
         if u64::from(newfd) >= nofile {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     }
@@ -43,6 +43,6 @@ pub(crate) fn sys_dup2(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         }
         // oldfd not open → -EBADF (was InvalidOp).
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+        _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

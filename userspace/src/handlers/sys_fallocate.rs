@@ -31,7 +31,7 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     let task = current_task_id();
 
     let Some(endpoint) = copy_fd_endpoint(task, fd) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let offset_signed = offset as i64;
@@ -39,44 +39,44 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     // loff_t arguments: a negative offset or a non-positive length is a
     // caller error, distinct from "this filesystem cannot preallocate".
     if offset_signed < 0 || len_signed <= 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if mode & !(KEEP_SIZE | PUNCH_HOLE | ZERO_RANGE) != 0
         || mode & PUNCH_HOLE != 0 && mode != PUNCH_HOLE | KEEP_SIZE
     {
-        ctx.set_return(SyscallReturn::ok((-95i64) as u64)); // -EOPNOTSUPP
+        ctx.set_return(errno_ret(EOPNOTSUPP));
         return;
     }
     if !endpoint.writable() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     let iflags = endpoint.ops.inode_flags();
     if iflags & narf_filesystem::FS_IMMUTABLE_FL != 0
         || ((mode & !KEEP_SIZE != 0) && iflags & narf_filesystem::FS_APPEND_FL != 0)
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     match endpoint.ops.stat().mode.file_type {
         narf_filesystem::FileType::File | narf_filesystem::FileType::Block => {}
         narf_filesystem::FileType::Fifo => {
-            ctx.set_return(SyscallReturn::ok((-29i64) as u64)); // -ESPIPE
+            ctx.set_return(errno_ret(ESPIPE));
             return;
         }
         narf_filesystem::FileType::Dir => {
-            ctx.set_return(SyscallReturn::ok((-21i64) as u64)); // -EISDIR
+            ctx.set_return(errno_ret(EISDIR));
             return;
         }
         _ => {
-            ctx.set_return(SyscallReturn::ok((-19i64) as u64)); // -ENODEV
+            ctx.set_return(errno_ret(ENODEV));
             return;
         }
     }
     // `fs/open.c::vfs_fallocate`: check for wraparound (`if (check_add_overflow(offset, len, &sum)) return -EFBIG;`).
     if offset_signed.checked_add(len_signed).is_none() {
-        ctx.set_return(SyscallReturn::ok((-27i64) as u64)); // -EFBIG
+        ctx.set_return(errno_ret(EFBIG));
         return;
     }
     let target_end = offset.saturating_add(len);
@@ -121,9 +121,7 @@ pub(crate) fn sys_fallocate(ctx: &mut dyn TrapContext) {
     })();
     match outcome {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(narf_filesystem::FsError::Unsupported) => {
-            ctx.set_return(SyscallReturn::ok((-95i64) as u64)) // -EOPNOTSUPP
-        }
-        Err(error) => ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64)),
+        Err(narf_filesystem::FsError::Unsupported) => ctx.set_return(errno_ret(EOPNOTSUPP)),
+        Err(error) => ctx.set_return(errno_ret(copy_fs_errno(error))),
     }
 }

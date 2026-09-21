@@ -9,14 +9,14 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
     // fs/file.c::ksys_dup3 accepts exactly O_CLOEXEC. FD_CLOEXEC is the
     // per-slot bit used by fcntl, not a dup3 flag, despite sharing value 1.
     if flags & !crate::fd::O_CLOEXEC != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Linux dup3: differ from dup2 by failing on oldfd == newfd. The
     // call exists to atomically install FD_CLOEXEC, which only makes
     // sense when actually duplicating to a different slot.
     if oldfd == newfd {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -36,7 +36,7 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
             .map(|limit| limit.cur)
             .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur);
         if u64::from(newfd) >= nofile {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // -EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     }
@@ -47,6 +47,6 @@ pub(crate) fn sys_dup3(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(newfd as u64));
         }
         // oldfd not open → -EBADF (was InvalidOp).
-        _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+        _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

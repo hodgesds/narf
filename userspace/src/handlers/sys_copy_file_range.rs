@@ -31,30 +31,30 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     // Linux fdget()s both descriptors before touching offset words or flags.
     let task = current_task_id();
     let Some(input) = copy_fd_endpoint(task, fd_in) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
     let Some(output) = copy_fd_endpoint(task, fd_out) else {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     };
 
     let explicit_in = match import_offset(off_in_ptr) {
         Ok(offset) => offset,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
     };
     let explicit_out = match import_offset(off_out_ptr) {
         Ok(offset) => offset,
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-(errno as i64)) as u64));
+            ctx.set_return(errno_ret(errno as i64));
             return;
         }
     };
     if flags != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -64,28 +64,28 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     let in_ty = input.ops.stat().mode.file_type;
     let out_ty = output.ops.stat().mode.file_type;
     if in_ty == FileType::Dir || out_ty == FileType::Dir {
-        ctx.set_return(SyscallReturn::ok((-21i64) as u64));
+        ctx.set_return(errno_ret(EISDIR));
         return;
     }
     if in_ty != FileType::File || out_ty != FileType::File {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if !input.readable() || !output.writable() || output.append() {
-        ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+        ctx.set_return(errno_ret(EBADF));
         return;
     }
     if explicit_in.is_some_and(|offset| (offset as i64) < 0)
         || explicit_out.is_some_and(|offset| (offset as i64) < 0)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
     // Linux generic_copy_file_checks (fs/read_write.c:1518):
     // Immutable output file -> -EPERM.
     if output.ops.inode_flags() & narf_filesystem::FS_IMMUTABLE_FL != 0 {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
 
@@ -97,7 +97,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
     if (start_in as i64).checked_add(len as i64).is_none()
         || (start_out as i64).checked_add(len as i64).is_none()
     {
-        ctx.set_return(SyscallReturn::ok((-75i64) as u64)); // -EOVERFLOW
+        ctx.set_return(errno_ret(EOVERFLOW));
         return;
     }
 
@@ -112,7 +112,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         && start_out + (len as u64) > start_in
         && start_out < start_in + (len as u64)
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -154,7 +154,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         || !same_description
             && (implicit_in && input_guard.is_none() || implicit_out && output_guard.is_none())
     {
-        ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+        ctx.set_return(errno_ret(EIO));
         return;
     }
 
@@ -175,7 +175,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
             optimized = true;
         }
         Some(Ok(_)) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         Some(Err(narf_filesystem::FsError::Unsupported)) | None => {
@@ -186,14 +186,14 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
                     Some(Ok(n)) if n <= span => n,
                     Some(Ok(_)) => {
                         if copied == 0 {
-                            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                         break;
                     }
                     Some(Err(error)) => {
                         if copied == 0 {
-                            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                            ctx.set_return(errno_ret(copy_fs_errno(error)));
                             return;
                         }
                         break;
@@ -207,14 +207,14 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
                     Some(Ok(n)) if n <= read_n => n,
                     Some(Ok(_)) => {
                         if copied == 0 {
-                            ctx.set_return(SyscallReturn::ok((-22i64) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                         break;
                     }
                     Some(Err(error)) => {
                         if copied == 0 {
-                            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+                            ctx.set_return(errno_ret(copy_fs_errno(error)));
                             return;
                         }
                         break;
@@ -230,7 +230,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
             }
         }
         Some(Err(error)) => {
-            ctx.set_return(SyscallReturn::ok((-copy_fs_errno(error)) as u64));
+            ctx.set_return(errno_ret(copy_fs_errno(error)));
             return;
         }
     }
@@ -249,7 +249,7 @@ pub(crate) fn sys_copy_file_range(ctx: &mut dyn TrapContext) {
         // Linux writes explicit offsets back only after positive progress. A
         // guarded fault then wins even though data has already moved.
         if write_offset(off_in_ptr, cur_in).is_err() || write_offset(off_out_ptr, cur_out).is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }
