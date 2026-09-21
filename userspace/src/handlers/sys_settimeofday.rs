@@ -39,19 +39,19 @@ pub(crate) fn sys_settimeofday(ctx: &mut dyn TrapContext) {
     // SAFETY: `tv_ptr` is the user timeval pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
     if unsafe { copy_from_user(&mut kbuf, tv_ptr) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let sec = i64::from_ne_bytes(kbuf[..8].try_into().unwrap());
     let usec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
     // Validate: tv_usec must be in [0, 1_000_000).
     if sec < 0 || !(0..1_000_000).contains(&usec) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `security_settime64` — last of the checks, per the order above.
     if !capable(CAP_SYS_TIME) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // Convert µs → ns and set wall clock.

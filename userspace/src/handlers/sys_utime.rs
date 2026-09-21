@@ -8,7 +8,7 @@ pub(crate) fn sys_utime(ctx: &mut dyn TrapContext) {
     let raw = match copy_user_cstr_checked(a.arg0, 4096) {
             Ok(s) => s,
             Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(errno)); // -EFAULT
             return;
             }
         };
@@ -20,7 +20,7 @@ pub(crate) fn sys_utime(ctx: &mut dyn TrapContext) {
         // SAFETY: non-zero user utimbuf pointer; copy_from_user
         // range-validates and SMAP-brackets the 16-byte read.
         if unsafe { copy_from_user(&mut buf, a.arg1) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let actime = i64::from_ne_bytes(buf[..8].try_into().unwrap());

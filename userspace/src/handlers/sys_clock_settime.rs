@@ -27,12 +27,12 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     let ts = args.arg1;
     // (1) Clock-id validation FIRST (Linux clockid_to_kclock / clock_set).
     if id != CLOCK_REALTIME {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // (2) NULL/faulting timespec → -EFAULT.
     if ts == 0 {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // Read the timespec (two i64s) from user space under the SMAP bracket.
@@ -40,20 +40,20 @@ pub(crate) fn sys_clock_settime(ctx: &mut dyn TrapContext) {
     // SAFETY: `ts` is the user timespec pointer (non-zero, checked above);
     // copy_from_user range-validates it and SMAP-brackets the 16-byte read.
     if unsafe { copy_from_user(&mut kbuf, ts) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     // (3) Value validation → -EINVAL.
     let sec = i64::from_ne_bytes(kbuf[..8].try_into().unwrap());
     let nsec = i64::from_ne_bytes(kbuf[8..].try_into().unwrap());
     if sec < 0 || !(0..1_000_000_000).contains(&nsec) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // (4) `security_settime64` — after every argument check, as in
     // do_sys_settimeofday64.
     if !capable(CAP_SYS_TIME) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let target_ns = (sec as i128) * 1_000_000_000 + (nsec as i128);

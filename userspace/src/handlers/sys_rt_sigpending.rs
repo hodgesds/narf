@@ -18,7 +18,7 @@ pub(crate) fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     let set_out = args.arg0;
     let sigsetsize = args.arg1 as usize;
     if sigsetsize > 8 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let task = current_task_id();
@@ -33,7 +33,7 @@ pub(crate) fn sys_rt_sigpending(ctx: &mut dyn TrapContext) {
     // it and SMAP-brackets the `sigsetsize`-byte write (a NULL/faulting pointer
     // fails the validation and is reported as -EFAULT below).
     if unsafe { copy_to_user(set_out, &user_bits[..sigsetsize]) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     ctx.set_return(SyscallReturn::ok(0));

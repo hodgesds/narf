@@ -22,7 +22,7 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
     let sigsetsize = args.arg3 as usize;
 
     if sigsetsize != 8 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -38,13 +38,13 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // SAFETY: `set_ptr` is the user new-sigmask pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         if unsafe { copy_from_user(&mut buf, set_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         // Validate `how` BEFORE mutating (Linux `sigprocmask` returns -EINVAL
         // for an unknown `how`, and nothing is installed).
         if how != SIG_BLOCK && how != SIG_UNBLOCK && how != SIG_SETMASK {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         // Userspace `sigset_t` bit N-1 == signal N == NARF's internal layout
@@ -65,7 +65,7 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         if updated != Some(true) {
             // No mask slot for the task (a NARF-internal condition, not a
             // Linux-reachable path); EINVAL is the least-wrong answer.
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         // An explicit mask install means the user retook control of the
@@ -79,7 +79,7 @@ pub(crate) fn sys_sigprocmask(ctx: &mut dyn TrapContext) {
         // SAFETY: `old_ptr` is the user old-sigmask pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 8-byte write.
         if unsafe { copy_to_user(old_ptr, &old_mask.to_ne_bytes()) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

@@ -34,13 +34,13 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
     //   4. if `oact`: copy the prior action out (-EFAULT) — written LAST and
     //      only when no earlier step errored.
     if signum == 0 || signum >= NSIG || sigsetsize != 8 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // Linux: SIGKILL and SIGSTOP cannot be caught, ignored, or have
     // their action changed at all when `act` is non-NULL.
     if act_ptr != 0 && (signum == 9 || signum == 19) {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -52,7 +52,7 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         // SAFETY: `act_ptr` is the user sigaction pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 32-byte read.
         if unsafe { copy_from_user(&mut buf, act_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let handler = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
@@ -77,7 +77,7 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         None => {
             // No handler table for the task — a NARF-internal condition, not a
             // Linux-reachable path; EINVAL is the least-wrong answer.
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     };
@@ -108,7 +108,7 @@ pub(crate) fn sys_rt_sigaction(ctx: &mut dyn TrapContext) {
         // SAFETY: `oact_ptr` is the user oldact pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 32-byte write.
         if unsafe { copy_to_user(oact_ptr, &out) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

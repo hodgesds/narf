@@ -37,7 +37,7 @@ pub(crate) fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         // SAFETY: `ss_in` is the user new `stack_t` pointer (non-zero, checked);
         // copy_from_user range-validates it and SMAP-brackets the 24-byte read.
         if unsafe { copy_from_user(&mut buf, ss_in) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let sp = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
@@ -47,11 +47,11 @@ pub(crate) fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         // (2) Validate before any state change. `ss_mode` is the flag word
         // minus SS_FLAG_BITS; it must be exactly SS_DISABLE, SS_ONSTACK, or 0.
         if (flags & !(SS_DISABLE | SS_ONSTACK)) != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         if (flags & SS_DISABLE) == 0 && size < MIN_SIGSTKSZ {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
         Some(SigAltStack { sp, flags, size })
@@ -82,7 +82,7 @@ pub(crate) fn sys_sigaltstack(ctx: &mut dyn TrapContext) {
         // SAFETY: `ss_out` is the user old `stack_t` pointer (non-zero, checked);
         // copy_to_user range-validates it and SMAP-brackets the 24-byte write.
         if unsafe { copy_to_user(ss_out, &buf) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
     }

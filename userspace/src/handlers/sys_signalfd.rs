@@ -12,11 +12,11 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
     let flags = args.arg3 as u32;
 
     if sizemask != 8 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if flags & !(crate::linux_compat::SFD_CLOEXEC | crate::linux_compat::SFD_NONBLOCK) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut mask: u64 = 0;
@@ -25,7 +25,7 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
         // SAFETY: `mask_ptr` is the user sigset pointer (non-zero, checked above);
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
         if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         mask = u64::from_le_bytes(bytes);
@@ -75,7 +75,7 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
                 // `do_signalfd4` publishes the new signalfd with
                 // `get_unused_fd_flags`, so a table at RLIMIT_NOFILE is
                 // -EMFILE.
-                ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+                ctx.set_return(errno_ret(EMFILE));
                 return;
             }
         };

@@ -10,7 +10,7 @@ pub(crate) fn sys_clock_adjtime(ctx: &mut dyn TrapContext) {
     match clockid {
         0 | 1 | 7 | 11 => {}
         _ => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
