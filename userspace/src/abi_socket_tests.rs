@@ -536,6 +536,133 @@ fn smoke_abi_socket_pair_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi/socket", smoke_abi_socket_pair_neg);
 
+/// `net/socket.c::__sys_socketpair`:
+///
+/// ```text
+///     flags = type & ~SOCK_TYPE_MASK;
+///     if (flags & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+///             return -EINVAL;
+/// ```
+///
+/// Bit 4 is outside SOCK_TYPE_MASK (0xf) and is neither SOCK_CLOEXEC nor
+/// SOCK_NONBLOCK, so it is an undefined flag. This used to be peeled off
+/// and ignored, which tells a caller probing for a flag this kernel does
+/// not implement that it took effect.
+fn smoke_abi_socket_pair_undefined_flag_einval() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let n = Syscall::SocketPair.raw();
+        let r = call(
+            n,
+            a3(AF_UNIX, SOCK_STREAM | 0x10, 0, sv.as_mut_ptr() as u64),
+        )
+        .ok_or("status not Ok")?;
+        if r != EINVAL {
+            return Err("socketpair with an undefined type flag did not return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_pair_undefined_flag_einval
+);
+
+/// ORDER PIN. The flag word is validated before the family is looked at,
+/// so when BOTH are wrong Linux reports -EINVAL, not -EAFNOSUPPORT.
+/// Getting this backwards sends a caller off diagnosing the family when
+/// the flags are what it got wrong.
+fn smoke_abi_socket_pair_flag_check_precedes_family() -> TestResult {
+    with_setup(|| {
+        let mut sv = [0u8; 8];
+        let n = Syscall::SocketPair.raw();
+        // Family 9999 is unknown AND bit 4 is an undefined flag.
+        let r = call(n, a3(9999, SOCK_STREAM | 0x10, 0, sv.as_mut_ptr() as u64))
+            .ok_or("status not Ok")?;
+        if r == EAFNOSUPPORT {
+            return Err("socketpair checked the family before the type flags");
+        }
+        if r != EINVAL {
+            return Err("socketpair with a bad family and a bad flag did not return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_pair_flag_check_precedes_family
+);
+
+/// The other half of the check: the two DEFINED flags must still be
+/// accepted, or the EINVAL arm above would be over-rejecting.
+fn smoke_abi_socket_pair_defined_flags_accepted() -> TestResult {
+    with_setup(|| {
+        const SOCK_CLOEXEC: u64 = 0o2000000;
+        const SOCK_NONBLOCK: u64 = 0o4000;
+        let mut sv = [0u8; 8];
+        let n = Syscall::SocketPair.raw();
+        let r = call(
+            n,
+            a3(
+                AF_UNIX,
+                SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                0,
+                sv.as_mut_ptr() as u64,
+            ),
+        )
+        .ok_or("status not Ok")?;
+        if r != 0 {
+            return Err("socketpair rejected SOCK_CLOEXEC|SOCK_NONBLOCK");
+        }
+        let fd0 = i32::from_ne_bytes([sv[0], sv[1], sv[2], sv[3]]);
+        let fd1 = i32::from_ne_bytes([sv[4], sv[5], sv[6], sv[7]]);
+        if fd0 < 0 || fd1 < 0 || fd0 == fd1 {
+            return Err("socketpair with valid flags did not write two distinct fds");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_pair_defined_flags_accepted
+);
+
+/// `net/socket.c::__sys_socket_create` carries the SAME check, and it runs
+/// before `sock_create` — so socket(2) has the same arm and the same order.
+fn smoke_abi_socket_open_undefined_flag_einval() -> TestResult {
+    with_setup(|| {
+        let n = Syscall::SocketOpen.raw();
+        let r = call(n, a2(AF_UNIX, SOCK_STREAM | 0x10, 0)).ok_or("status not Ok")?;
+        if r != EINVAL {
+            return Err("socket() with an undefined type flag did not return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_open_undefined_flag_einval
+);
+
+/// ORDER PIN for socket(2), mirroring the socketpair one above.
+fn smoke_abi_socket_open_flag_check_precedes_family() -> TestResult {
+    with_setup(|| {
+        let n = Syscall::SocketOpen.raw();
+        let r = call(n, a2(9999, SOCK_STREAM | 0x10, 0)).ok_or("status not Ok")?;
+        if r == EAFNOSUPPORT {
+            return Err("socket() checked the family before the type flags");
+        }
+        if r != EINVAL {
+            return Err("socket() with a bad family and a bad flag did not return -EINVAL");
+        }
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi/socket",
+    smoke_abi_socket_open_flag_check_precedes_family
+);
+
 // ───────────────────────────── SocketSend ─────────────────────────────
 
 fn smoke_abi_socket_send_pos() -> TestResult {

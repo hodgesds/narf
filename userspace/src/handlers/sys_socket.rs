@@ -8,12 +8,30 @@ pub(crate) fn sys_socket(ctx: &mut dyn TrapContext) {
     // ORed onto the base type; strip them before categorising the socket
     // (libwayland creates sockets as SOCK_STREAM|SOCK_CLOEXEC, which an
     // unmasked compare reads as an unknown type → bind() fails).
-    const SOCK_CLOEXEC: u32 = 0x8_0000;
-    const SOCK_NONBLOCK: u32 = 0x800;
+    //
+    // `net/socket.c::__sys_socket_create`:
+    //
+    // ```text
+    //     if ((type & ~SOCK_TYPE_MASK) & ~(SOCK_CLOEXEC | SOCK_NONBLOCK))
+    //             return ERR_PTR(-EINVAL);
+    //     type &= SOCK_TYPE_MASK;
+    // ```
+    //
+    // This runs BEFORE `sock_create`, so -EINVAL for an undefined flag bit
+    // beats the -EAFNOSUPPORT an unknown family would otherwise report.
+    // SOCK_CLOEXEC/SOCK_NONBLOCK are defined as O_CLOEXEC/O_NONBLOCK
+    // (include/linux/net.h), so use the shared fd flags rather than
+    // restating their values here.
+    const SOCK_TYPE_MASK: u32 = 0xf; // include/linux/net.h
     let raw_kind = args.arg1 as u32;
-    let sock_cloexec = (raw_kind & SOCK_CLOEXEC) != 0;
-    let sock_nonblock = (raw_kind & SOCK_NONBLOCK) != 0;
-    let kind = raw_kind & !(SOCK_CLOEXEC | SOCK_NONBLOCK);
+    let type_flags = raw_kind & !SOCK_TYPE_MASK;
+    if type_flags & !(crate::fd::O_CLOEXEC | crate::fd::O_NONBLOCK) != 0 {
+        ctx.set_return(errno_ret(EINVAL));
+        return;
+    }
+    let sock_cloexec = (type_flags & crate::fd::O_CLOEXEC) != 0;
+    let sock_nonblock = (type_flags & crate::fd::O_NONBLOCK) != 0;
+    let kind = raw_kind & SOCK_TYPE_MASK;
     let proto = args.arg2 as u32;
     // Reject unknown families up front. Linux `__sock_create` returns
     // -EAFNOSUPPORT when no registered net_proto_family matches the domain.
