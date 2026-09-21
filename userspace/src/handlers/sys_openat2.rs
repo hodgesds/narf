@@ -3,9 +3,11 @@
 #[allow(unused_imports)]
 use super::*;
 
-const EINVAL: i64 = -22;
-const E2BIG: i64 = -7;
-const EFAULT: i64 = -14;
+// Pre-negated spellings: this file returns its errnos verbatim. The
+// explicit import shadows the positive `E*` from `use super::*`.
+use crate::errno::wire::{E2BIG, EFAULT, EINVAL};
+// Guard the shadowing above — see the note in sys_quotactl.rs.
+const _: () = assert!(EINVAL == -22 && E2BIG == -7 && EFAULT == -14);
 
 /// `OPEN_HOW_SIZE_VER0` — `sizeof(struct open_how)`:
 /// `{ __u64 flags; __u64 mode; __u64 resolve; }`. Still the latest version.
@@ -141,7 +143,7 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
     // same situation (`fs/namei.c:2680`, LOOKUP_CACHED without LOOKUP_RCU),
     // and the flag exists precisely so a caller can retry without it.
     if resolve & RESOLVE_CACHED != 0 {
-        const EAGAIN: i64 = -11;
+        use crate::errno::wire::EAGAIN;
         ctx.set_return(SyscallReturn::ok(EAGAIN as u64));
         return;
     }
@@ -174,7 +176,7 @@ pub(crate) fn sys_openat2(ctx: &mut dyn TrapContext) {
             }
         };
         if lexically_escapes(&raw) {
-            const EXDEV: i64 = -18;
+            use crate::errno::wire::EXDEV;
             ctx.set_return(SyscallReturn::ok(EXDEV as u64));
             return;
         }

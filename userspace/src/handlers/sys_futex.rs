@@ -31,11 +31,6 @@ const FUTEX_LOCK_PI2: u64 = 13;
 ///   3. the dispatch switch; anything unrecognised falls out the bottom
 ///      as `return -ENOSYS`.
 pub(crate) fn sys_futex(ctx: &mut dyn TrapContext) {
-    const EAGAIN: i64 = 11;
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
-    const ENOSYS: i64 = 38;
-    const ETIMEDOUT: i64 = 110;
     let args = *ctx.args();
     let uaddr = args.arg0;
     // Linux declares the op as `int`, so only the low 32 bits ever reach

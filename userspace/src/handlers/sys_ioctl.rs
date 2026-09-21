@@ -186,7 +186,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
                         Ok(n) if (72..=4096).contains(&n) => n,
                         _ => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -203,7 +203,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(payload[8..16].try_into().unwrap())) {
                         Ok(count) => count,
                         Err(_) => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -212,7 +212,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     || u64::from_ne_bytes(payload[24..32].try_into().unwrap()) != 0
                     || inherit_size != 72usize.saturating_add(count.saturating_mul(8))
                 {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let mut limit = [0u64; 5];
@@ -221,7 +221,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     *value = u64::from_ne_bytes(payload[off..off + 8].try_into().unwrap());
                 }
                 if limit[0] & !0x3f != 0 {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let mut parents = alloc::vec::Vec::with_capacity(count);
@@ -245,11 +245,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         };
         let raw_name = &input[name_offset..];
         let Some(end) = raw_name.iter().position(|&byte| byte == 0) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let Ok(name) = core::str::from_utf8(&raw_name[..end]) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let source = fd::with_table(task, |t| {
@@ -277,7 +277,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             Some(Err(narf_filesystem::FsError::Unsupported)) => -EOPNOTSUPP,
             Some(Err(narf_filesystem::FsError::NotFound)) => -ENOENT,
             Some(Err(narf_filesystem::FsError::QuotaExceeded)) => -EDQUOT,
-            _ => -(EINVAL_CODE as i64),
+            _ => -(EINVAL),
         };
         ctx.set_return(SyscallReturn::ok(rc as u64));
         return;
@@ -297,13 +297,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         let oldfd = u32::from_ne_bytes(oldfd_bytes);
         let source = fd::with_table(task, |t| t.get(oldfd).map(|e| e.ops.clone())).flatten();
         let Some(source) = source else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let cloned = match narf_filesystem::fuse_conn::DevFuse::clone_endpoint(&ops, &source) {
             Ok(cloned) => cloned,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         };
@@ -340,13 +340,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         let flags = u32::from_ne_bytes(map[4..8].try_into().unwrap());
         let padding = u64::from_ne_bytes(map[8..16].try_into().unwrap());
         if backing_fd < 0 || flags != 0 || padding != 0 {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         let backing =
             fd::with_table(task, |t| t.get(backing_fd as u32).map(|e| e.ops.clone())).flatten();
         let Some(backing) = backing else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         match conn.register_backing(backing) {
@@ -354,13 +354,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             Err(narf_filesystem::FsError::Unsupported) => {
                 ctx.set_return(errno_ret(EOPNOTSUPP));
             }
-            Err(_) => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            Err(_) => ctx.set_return(errno_ret(EINVAL)),
         }
         return;
     }
     if cmd == narf_filesystem::fuse_conn::DevFuse::DEV_IOC_BACKING_CLOSE {
         let Some(conn) = narf_filesystem::fuse_conn::DevFuse::connection_of(&ops) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let mut id_bytes = [0u8; core::mem::size_of::<u32>()];
@@ -372,7 +372,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         let id = i32::from_ne_bytes(id_bytes);
         match conn.unregister_backing(id) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(_) => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+            Err(_) => ctx.set_return(errno_ret(EINVAL)),
         }
         return;
     }
@@ -635,7 +635,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             let user_size = ((cmd >> 16) & 0x3FFF) as usize;
             const PIDFD_INFO_SIZE_VER0: usize = 64;
             if user_size < PIDFD_INFO_SIZE_VER0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             const PIDFD_INFO_PID: u64 = 1 << 0;
@@ -673,7 +673,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             // min(user-declared size, our struct) bytes.
             // SAFETY: Valid memory or trusted environment
             if unsafe { copy_to_user(arg as u64, &info[..n]) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(0));
@@ -739,7 +739,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     match usize::try_from(u64::from_ne_bytes(input[24..32].try_into().unwrap())) {
                         Ok(n) if (72..=4096).contains(&n) => n,
                         _ => {
-                            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                            ctx.set_return(errno_ret(EINVAL));
                             return;
                         }
                     };
@@ -828,7 +828,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     // reporting a missing qgroup.
                     ctx.set_return(errno_ret(ENOTCONN));
                 }
-                _ => ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)),
+                _ => ctx.set_return(errno_ret(EINVAL)),
             }
         }
         Err(narf_filesystem::FsError::PermissionDenied) => {
@@ -851,7 +851,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EFAULT));
         }
         Err(narf_filesystem::FsError::InvalidData) | Err(narf_filesystem::FsError::InvalidPath) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
         }
         Err(narf_filesystem::FsError::Busy) => {
             // EBUSY = 16. A device ioctl that reports the resource is held —
@@ -861,7 +861,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             ctx.set_return(errno_ret(EBUSY));
         }
         Err(_) => {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
         }
     }
 }

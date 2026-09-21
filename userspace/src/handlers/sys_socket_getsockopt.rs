@@ -37,7 +37,6 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
     if level == crate::socket::SOL_NETLINK && name == crate::socket::NETLINK_LIST_MEMBERSHIPS {
         // The optlen out-parameter is mandatory (EFAULT without it).
         if len_ptr == 0 {
-            const EFAULT: i64 = 14;
             ctx.set_return(SyscallReturn::ok((-EFAULT) as u64));
             return;
         }
@@ -119,7 +118,6 @@ pub(crate) fn sys_socket_getsockopt(ctx: &mut dyn TrapContext) {
             crate::socket::SO_PEERSEC | crate::socket::SO_PEERPIDFD
         )
     {
-        const ENOPROTOOPT: i64 = 92;
         ctx.set_return(SyscallReturn::ok((-ENOPROTOOPT) as u64));
         return;
     }

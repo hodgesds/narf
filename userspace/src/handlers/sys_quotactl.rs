@@ -34,25 +34,25 @@ const IF_DQINFO_LEN: usize = 24;
 /// "vfs v0" format; tmpfs has no on-disk file but must report *some* format so
 /// `quotaon`/`repquota` proceed.
 const QFMT_VFS_V0: u32 = 2;
+// Guard the shadowing above: if the explicit `wire::` import ever stopped
+// winning over the `use super::*` glob these would turn positive, and a
+// positive EBADF reads to userspace as a successful quotactl_fd.
+const _: () = assert!(EBADF == -9 && EPERM == -1 && EDQUOT == -122);
 
 // Negative errno returns, per `quotactl(2)`. Every error path in this handler
 // uses one of these named constants so the SAME failure always reports the
 // SAME errno — a mismatch here surfaces far from its cause and is miserable to
 // debug.
-const EPERM: i64 = -1;
-const ENOENT: i64 = -2;
-const ESRCH: i64 = -3;
-/// Shadows the `EBADF` from `core.inc.rs` DELIBERATELY. That one is
-/// `u64 = 9` — positive, for callers that negate at the return site — while
-/// every errno in this file is already negative and returned verbatim.
-/// Mixing the two conventions returned +9, which userspace reads as a
-/// successful `quotactl_fd` that wrote nothing.
-const EBADF: i64 = -9;
-const EIO: i64 = -5;
-const EFAULT: i64 = -14;
-const EINVAL: i64 = -22;
-const ENOSPC: i64 = -28;
-const EDQUOT: i64 = -122;
+// These are the PRE-NEGATED `wire::` spellings, and the explicit import
+// deliberately shadows the positive `E*` that `use super::*` brings in.
+// That distinction is load-bearing: the shared `EBADF` is `9` — positive,
+// for callers that negate at the return site — while every errno in this
+// file is already negative and returned verbatim. Mixing the two
+// conventions returned +9, which userspace reads as a successful
+// `quotactl_fd` that wrote nothing.
+use crate::errno::wire::{
+    EBADF, EDQUOT, EFAULT, EINVAL, EIO, ENOENT, ENOSPC, EPERM, ESRCH,
+};
 
 /// Map a filesystem error to the `quotactl(2)` errno. The quota fs methods only
 /// ever produce the variants enumerated here; the catch-all is a defensive

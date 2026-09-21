@@ -3,10 +3,6 @@ use super::*;
 
 /// `open_by_handle_at(mount_fd, handle, flags)`.
 pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    const ESTALE: i64 = 116;
-    const EFAULT: i64 = 14;
-    const EBADF: i64 = 9;
     const AT_FDCWD: i64 = -100;
     let a = *ctx.args();
     let mount_fd = a.arg0 as i64;
@@ -36,7 +32,7 @@ pub(crate) fn sys_open_by_handle_at(ctx: &mut dyn TrapContext) {
     // `/proc/<pid>/ns/` does — otherwise a handle would be a way around it.
     #[cfg(feature = "container")]
     if htype == super::handler_nsfs::FILEID_NSFS {
-        const EMFILE: i64 = -24;
+        use crate::errno::wire::EMFILE;
         let n = core::cmp::max(hbytes, super::handler_nsfs::NSFS_FILE_HANDLE_SIZE);
         // SAFETY: copy_from_user_vec validates the f_handle range.
         let fid = match unsafe { copy_from_user_vec(a.arg1 + 8, n) } {

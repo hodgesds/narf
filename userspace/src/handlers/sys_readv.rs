@@ -17,7 +17,7 @@ fn scatter_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> Result<(),
     if bytes.is_empty() {
         Ok(())
     } else {
-        Err(EFAULT_CODE)
+        Err(EFAULT as u64)
     }
 }
 
@@ -44,7 +44,7 @@ fn scatter_fanotify_to_iovecs(iovecs: &[ImportedRwIovec], mut bytes: &[u8]) -> R
     if bytes.is_empty() {
         Ok(())
     } else {
-        Err(EFAULT_CODE)
+        Err(EFAULT as u64)
     }
 }
 

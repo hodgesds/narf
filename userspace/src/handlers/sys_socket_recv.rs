@@ -96,7 +96,7 @@ pub(crate) fn sys_socket_recv(ctx: &mut dyn TrapContext) {
             ctx.set_return(SyscallReturn::ok(returned as u64));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) if nonblock => {
-            ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EAGAIN));
         }
         crate::socket::SocketOpResult::Err(crate::socket::SockError::WouldBlock) => {
             // Yield ~1ms; libc loops.

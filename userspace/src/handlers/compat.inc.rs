@@ -561,8 +561,7 @@ pub(crate) fn resolve_vfs_symlink_path_scoped(
     path: &str,
     follow_final: bool,
 ) -> Result<alloc::string::String, i64> {
-    const ELOOP: i64 = -40;
-    const EXDEV: i64 = -18;
+    use crate::errno::wire::{ELOOP, EXDEV};
     let scope = current_resolve_scope();
 
     // `RESOLVE_IN_ROOT` — "treat the directory referred to by dirfd as the
@@ -1014,15 +1013,11 @@ fn stat_path_dir_aware(path: &str) -> Option<narf_filesystem::Stat> {
 /// shell following `a -> b -> a` reports "No such file" for a link that
 /// plainly exists.
 fn path_lookup_errno(path: &str) -> i64 {
-    const ENOENT: i64 = 2;
-    const ENOTDIR: i64 = 20;
-    const ELOOP: i64 = 40;
     let trimmed = path.trim_end_matches('/');
     // No parent to walk (""/"/"/"foo") — nothing can be a non-directory.
     let Some((parent, _leaf)) = trimmed.rsplit_once('/') else {
         return ENOENT;
     };
-    const EACCES: i64 = 13;
     let task = current_task_id();
     let mut prefix = alloc::string::String::new();
     for comp in parent.split('/').filter(|c| !c.is_empty()) {
@@ -1512,7 +1507,7 @@ fn do_execve_resolved(
     // fails. Both execve and execveat funnel through here, which is the
     // same consolidation Linux relies on.
     if nproc_exceeded_blocks_exec(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -2233,8 +2228,6 @@ pub(crate) fn copy_user_cstr_checked(
     ptr: u64,
     max_len: usize,
 ) -> Result<alloc::string::String, i64> {
-    const EFAULT: i64 = 14;
-    const ENAMETOOLONG: i64 = 36;
     if ptr == 0 || max_len == 0 || max_len > 65536 {
         return Err(EFAULT);
     }
@@ -2352,10 +2345,6 @@ fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
 // with EINVAL (-22) so a malicious/buggy userspace cannot force a
 // multi-gigabyte kernel allocation.
 
-/// Linux EFAULT errno value (14).
-pub(crate) const EFAULT_CODE: u64 = 14;
-/// Linux EINVAL errno value (22).
-const EINVAL_CODE: u64 = 22;
 /// 16 MiB per-call cap.
 const MAX_USER_COPY: usize = 16 * 1024 * 1024;
 
@@ -2531,14 +2520,14 @@ pub(crate) mod kernel_buf_scope {
 #[inline]
 pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
     if len > MAX_USER_COPY {
-        return Err(EINVAL_CODE);
+        return Err(EINVAL as u64);
     }
     if ptr == 0 {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     // Reject integer overflow of the range end.
     if ptr.checked_add(len as u64).is_none() {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
@@ -2557,7 +2546,7 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT_CODE);
+            return Err(EFAULT as u64);
         }
     }
     Ok(())
@@ -2588,7 +2577,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: dst is a live kernel slice; src is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort (a validated-
@@ -2600,7 +2589,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile read of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -2643,7 +2632,7 @@ pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u
         // Unreachable via the futex paths (alignment is checked at syscall
         // entry), but an unaligned `ldxr` is an alignment fault on aarch64
         // rather than a slow split access, so refuse rather than trap.
-        return Err(EINVAL_CODE);
+        return Err(EINVAL as u64);
     }
     let ptr = uptr as *mut u32;
     #[cfg(target_arch = "x86_64")]
@@ -2651,12 +2640,12 @@ pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u
     // cmpxchg opens the SMAP bracket itself and catches an unrecoverable
     // fault as Err instead of a kernel panic.
     unsafe {
-        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
+        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT as u64)
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: as above, via the EL1 exclusive-monitor sequence.
     unsafe {
-        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
+        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT as u64)
     }
     // SAFETY: any other target — no fault-fixup surface is implemented
     // there, so fall back to a plain atomic on the mapped user word.
@@ -2715,7 +2704,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: src is a live kernel slice; dst is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort as Err — see
@@ -2724,7 +2713,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT_CODE)?;
+            .map_err(|_remaining| EFAULT as u64)?;
     }
     // SAFETY: any other target — plain volatile write of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -6934,8 +6923,6 @@ fn futex_timeout_deadline(
     absolute: bool,
     realtime: bool,
 ) -> Result<Option<u64>, i64> {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     if timeout_ptr == 0 {
         return Ok(None);
     }
@@ -6983,7 +6970,6 @@ fn futex_wake_op(
     // `arch_futex_atomic_op_inuser` reports an op it does not implement as
     // -ENOSYS, not -EINVAL (`arch/x86/include/asm/futex.h`); so does the
     // cmp switch in `futex_atomic_op_inuser`.
-    const ENOSYS: i64 = 38;
     // Linux keys BOTH words through `get_futex_key` before touching either
     // (`kernel/futex/waitwake.c::futex_wake_op`). `uaddr` was keyed by the
     // caller; keying `uaddr2` here is what makes a skewed second address
@@ -7174,8 +7160,6 @@ pub(crate) fn get_futex_key_flags(
     flags: u64,
 ) -> Result<FutexKey, i64> {
     use handler_sys_futex_wait::{FUTEX2_MPOL, FUTEX2_NUMA, FUTEX2_SIZE_MASK, FUTEX_NO_NODE};
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let numa = flags & FUTEX2_NUMA != 0;
     let word = 1u64 << (flags & FUTEX2_SIZE_MASK);
     let span = futex2_word_span(flags);
@@ -7781,8 +7765,6 @@ fn futex_wait_core(
     park_cap_ns: u64,
     flags: u64,
 ) {
-    const EAGAIN: i64 = 11;
-    const EFAULT: i64 = 14;
     // The address is validated ONLY here, by the shared funnel. This helper
     // used to carry its own `uaddr == 0` shortcut, so the FUTEX2 wait path
     // kept reporting a spurious wake for a null word after the classic
@@ -9965,8 +9947,6 @@ pub(crate) fn timerfd_arc_from_fd_checked(
     task: u64,
     fd: u32,
 ) -> Result<alloc::sync::Arc<crate::io_mux::TimerFd>, i64> {
-    const EBADF: i64 = 9;
-    const EINVAL: i64 = 22;
     let arc_ops = fd::with_table(task, |t| t.get(fd).map(|e| e.ops.clone()))
         .flatten()
         .ok_or(EBADF)?;
@@ -11331,9 +11311,7 @@ mod aio {
     use narf_lib::sync::IrqSafeSpinLock;
 
     // ── errno constants (negated on return, Linux convention) ────────
-    const EINVAL: i64 = -22;
-    const EBADF: i64 = -9;
-    const EFAULT: i64 = -14;
+    use crate::errno::wire::{EBADF, EFAULT, EINVAL};
 
     // ── Linux <uapi/linux/aio_abi.h> opcodes ─────────────────────────
     const IOCB_CMD_PREAD: u16 = 0;

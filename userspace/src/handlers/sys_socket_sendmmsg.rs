@@ -62,7 +62,7 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
                 }
             }
             handler_sys_socket_sendmsg::SendMsgResult::WouldBlock => {
-                first_error = EAGAIN_CODE as i64;
+                first_error = EAGAIN;
                 break;
             }
             handler_sys_socket_sendmsg::SendMsgResult::Error(errno) => {
@@ -76,7 +76,7 @@ pub(crate) fn sys_socket_sendmmsg(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(sent as u64));
         return;
     }
-    if first_error == EAGAIN_CODE as i64 {
+    if first_error == EAGAIN {
         handler_sys_socket_send::socket_send_would_block(ctx, fd, flags, sock.as_ref());
         return;
     }

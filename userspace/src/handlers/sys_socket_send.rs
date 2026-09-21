@@ -111,7 +111,7 @@ pub(super) fn socket_send_would_block(
     const MSG_DONTWAIT: u32 = 0x40;
     let task = current_task_id();
     if flags & MSG_DONTWAIT != 0 || socket_listener_nonblock(task, fd, sock) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
     if park_reexecute_on_fd(
@@ -123,5 +123,5 @@ pub(super) fn socket_send_would_block(
     }
     // Kernel-test/non-stackful context cannot sleep; expose the retryable
     // condition rather than fabricating a zero-byte successful send.
-    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+    ctx.set_return(errno_ret(EAGAIN));
 }

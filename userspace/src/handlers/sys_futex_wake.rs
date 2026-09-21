@@ -26,7 +26,6 @@ use super::*;
 /// (the counter is the queue), so we report the `nr` the caller asked to
 /// wake, which the pthread fast paths treat as "≤ nr released".
 pub(crate) fn sys_futex_wake(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
     let args = *ctx.args();
     let uaddr = args.arg0;
     // `unsigned int flags`; `int nr` — a 64-bit read of `nr` would let a

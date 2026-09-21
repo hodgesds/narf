@@ -2128,7 +2128,7 @@ fn fanotify_read_to_user(
     };
     if reserved.len() != fd_count {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     let mut reserved_iter = reserved.iter().copied();
     let mut installs = alloc::vec::Vec::with_capacity(fd_count);
@@ -2168,7 +2168,7 @@ fn fanotify_read_to_user(
     });
     if installed != Some(true) {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     }
     Ok(staging.len())
 }
@@ -2195,7 +2195,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
         let last_page = last & !0xfff;
         loop {
             if !aspace.contains_address(VirtAddr::new(page)) {
-                return Err(EFAULT_CODE);
+                return Err(EFAULT as u64);
             }
             if page == last_page {
                 return Ok(());
@@ -2211,7 +2211,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
     if kernel_buf_scope::active() && !in_user_half(ptr) {
         return Ok(());
     }
-    Err(EFAULT_CODE)
+    Err(EFAULT as u64)
 }
 
 fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
@@ -2291,7 +2291,6 @@ const F_GET_RW_HINT: u64 = 1035;
 const F_SET_RW_HINT: u64 = 1036;
 
 /// Linux EAGAIN value (11).
-const EAGAIN_CODE: u64 = 11;
 /// Linux EPERM (1) — returned as the value of the failed syscall
 /// (sign-flipped at libc; we follow the existing -1 convention).
 const _EPERM: u64 = 1;
@@ -3409,10 +3408,7 @@ fn unix_path_final_node_exists_depth(path: &str, depth: usize) -> bool {
 /// it); a move across mounts is a genuine `EXDEV` and every caller falls
 /// back to copy+unlink on it.
 fn cross_dir_rename(old_abs: &str, new_abs: &str) -> u64 {
-    const EXDEV: i64 = -18;
-    const ENOENT: i64 = -2;
-    const ENOTDIR: i64 = -20;
-    const EISDIR: i64 = -21;
+    use crate::errno::wire::{EISDIR, ENOENT, ENOTDIR, EXDEV};
     let res = current_resolve_two_parents_absolute(
         old_abs,
         new_abs,
@@ -3945,7 +3941,7 @@ fn copy_fs_errno(error: narf_filesystem::FsError) -> i64 {
         narf_filesystem::FsError::NotConnected => 107,
         narf_filesystem::FsError::BrokenPipe => 32,
         narf_filesystem::FsError::BadFd => 9,
-        narf_filesystem::FsError::WouldBlock => EAGAIN_CODE as i64,
+        narf_filesystem::FsError::WouldBlock => EAGAIN,
     }
 }
 
@@ -3964,7 +3960,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
         return Ok(());
     }
     let Some(end) = ptr.checked_add(len as u64) else {
-        return Err(EFAULT_CODE);
+        return Err(EFAULT as u64);
     };
     let last = if len == 0 { ptr } else { end - 1 };
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3978,7 +3974,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT_CODE);
+            return Err(EFAULT as u64);
         }
     }
     Ok(())
@@ -8047,7 +8043,7 @@ fn preadv_pwritev(ctx: &mut dyn TrapContext, is_write: bool, v2: bool) {
                 break;
             }
             Err(narf_filesystem::FsError::WouldBlock) if total == 0 => {
-                ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EAGAIN));
                 return;
             }
             Err(narf_filesystem::FsError::BrokenPipe) => {
@@ -9351,14 +9347,14 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
     // would report. The two errnos mean very different things to a caller
     // deciding whether to retry.
     if nproc_fork_would_exceed(current_task_id()) {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
     // Fork-bomb guard (also covers pthread/thread storms — every clone mints a
     // user task). EAGAIN at the live-task cap, matching clone(2)/fork(2).
     if !narf_scheduler::user_nproc_available() {
-        ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
 
@@ -9560,7 +9556,7 @@ fn do_clone3(ctx: &mut dyn TrapContext, ca: CloneArgs, legacy: bool, requested_t
             None => {
                 let pid = crate::alloc_pid().raw();
                 if pid == 0 {
-                    Err(EAGAIN_CODE)
+                    Err(EAGAIN as u64)
                 } else {
                     Ok(pid)
                 }

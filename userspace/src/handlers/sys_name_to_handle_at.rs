@@ -3,10 +3,6 @@ use super::*;
 
 /// `name_to_handle_at(dirfd, pathname, handle, mount_id, flags)`.
 pub(crate) fn sys_name_to_handle_at(ctx: &mut dyn TrapContext) {
-    const EINVAL: i64 = 22;
-    const ENOENT: i64 = 2;
-    const EFAULT: i64 = 14;
-    const EOVERFLOW: i64 = 75;
     const AT_EMPTY_PATH: u64 = 0x1000;
     const AT_SYMLINK_FOLLOW: u64 = 0x400;
     const AT_HANDLE_FID: u64 = 0x200;

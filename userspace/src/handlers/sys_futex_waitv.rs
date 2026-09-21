@@ -33,8 +33,6 @@ pub(crate) fn futex2_parse_waitv(
     waiters: u64,
     nr: usize,
 ) -> Result<alloc::vec::Vec<Futex2Waiter>, i64> {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
     let mut out = alloc::vec::Vec::with_capacity(nr);
     for i in 0..nr {
         let mut entry = [0u8; FUTEX_WAITV_SIZE];
@@ -78,9 +76,6 @@ pub(crate) fn futex2_parse_waitv(
 ///      entry 0.
 ///   5. `futex_wait_multiple()` — per-word -EINVAL/-EFAULT/-EAGAIN.
 pub(crate) fn sys_futex_waitv(ctx: &mut dyn TrapContext) {
-    const EFAULT: i64 = 14;
-    const EINVAL: i64 = 22;
-    const ETIMEDOUT: i64 = 110;
     let args = *ctx.args();
     let waiters = args.arg0;
     // `unsigned int nr_futexes` / `unsigned int flags`: 32-bit arguments.

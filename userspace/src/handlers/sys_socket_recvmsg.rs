@@ -33,7 +33,7 @@ pub(crate) fn sys_socket_recvmsg(ctx: &mut dyn TrapContext) {
         total_cap = total_cap.saturating_add(read_user_u64(base + 8) as usize);
     }
     if total_cap > MAX_USER_COPY {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let mut staging = alloc::vec![0u8; total_cap];
