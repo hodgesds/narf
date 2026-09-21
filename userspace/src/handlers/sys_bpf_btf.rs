@@ -39,13 +39,6 @@ use alloc::sync::Arc;
 use narf_bpf::idreg::IdRegistry;
 use narf_bpf_btf::{Btf, BtfError, Errno};
 
-const E2BIG: i64 = 7;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const EMFILE: i64 = 24;
-/// `EOPNOTSUPP`, which on Linux equals `ENOTSUP`.
-const ENOTSUP: i64 = 95;
-
 /// Same cap as `sys_bpf::read_attr`. Spelled here rather than reaching into
 /// the sibling module so that the two files can be edited independently —
 /// three agents share `sys_bpf.rs` and its private helpers are not an

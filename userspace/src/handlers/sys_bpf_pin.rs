@@ -68,17 +68,6 @@ use narf_bpf::map::MapFile;
 use narf_bpf::prog::ProgFile;
 use narf_filesystem::bpffs::{as_bpf_dir, BpfDir};
 
-// Errnos this module returns. Spelled out locally rather than widening
-// `handlers/mod.rs`'s set or reaching into `sys_bpf.rs`'s private ones — the
-// bpf handlers are edited by different agents and a shared private constant is
-// a merge conflict waiting for a reason.
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
-const EBADF_: i64 = 9;
-const EACCES: i64 = 13;
-const EEXIST: i64 = 17;
-const EINVAL: i64 = 22;
-const EMFILE: i64 = 24;
 /// `union bpf_attr`, zero-extended. Same rule and bound as `sys_bpf.rs`.
 const ATTR_BUF: usize = 256;
 
@@ -229,7 +218,7 @@ pub(crate) fn bpf_obj_pin(attr_uptr: u64, size: usize) -> i64 {
     let fd = u32_at(&attr, OB_BPF_FD);
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
-        _ => return -EBADF_,
+        _ => return -EBADF,
     };
     if !is_pinnable(&ops) {
         return -EINVAL;

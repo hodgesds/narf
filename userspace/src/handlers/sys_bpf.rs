@@ -43,24 +43,6 @@ use narf_bpf::prog::{BpfProg, BpfProgLoad, LoadMetadata, LoadRequest, ProgFile};
 use narf_bpf_verifier::kfunc::Context;
 use narf_capabilities::{Cap, Grant};
 
-// Errno values this handler returns. `handlers/mod.rs` names only the few it
-// needs; the rest are spelled out here rather than widening that set.
-const EPERM: i64 = 1;
-const E2BIG: i64 = 7;
-const EBADF_: i64 = 9;
-const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
-const EINVAL: i64 = 22;
-const EMFILE: i64 = 24;
-const EFAULT: i64 = 14;
-const ENOENT: i64 = 2;
-const EBUSY: i64 = 16;
-const EPROTO: i64 = 71;
-const ENOSPC: i64 = 28;
-/// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
-/// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
-
 // ── `enum bpf_cmd`, from include/uapi/linux/bpf.h ───────────────────
 
 const BPF_MAP_CREATE: u32 = 0;
@@ -663,7 +645,7 @@ fn prog_test_run(attr_uptr: u64, size: usize) -> i64 {
     let task = current_task_id();
     let ops = match fd::with_table(task, |t| t.get(prog_fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
-        _ => return -EBADF_,
+        _ => return -EBADF,
     };
     let Some(file) = ops.as_any().and_then(|a| a.downcast_ref::<ProgFile>()) else {
         return -EINVAL;
@@ -983,7 +965,7 @@ fn map_create(attr_uptr: u64, size: usize) -> i64 {
 fn map_file_from_fd(fd: u32) -> Result<(alloc::sync::Arc<narf_bpf::map::BpfMap>, MapAccess), i64> {
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
-        _ => return Err(-EBADF_),
+        _ => return Err(-EBADF),
     };
     let file = ops
         .as_any()
@@ -1011,7 +993,7 @@ fn require_map_access(access: MapAccess, read: bool, write: bool) -> Result<(), 
 fn prog_from_fd(fd: u32) -> Result<alloc::sync::Arc<BpfProg>, i64> {
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
-        _ => return Err(-EBADF_),
+        _ => return Err(-EBADF),
     };
     ops.as_any()
         .and_then(|a| a.downcast_ref::<ProgFile>())
@@ -1645,7 +1627,7 @@ fn resolve_prog_maps(
                 .and_then(|n| t.get(n).map(|entry| entry.ops.clone()))
         }) {
             Some(Some(ops)) => ops,
-            _ => return Err(-EBADF_),
+            _ => return Err(-EBADF),
         };
         let Some(any) = ops.as_any() else {
             return Err(-EINVAL);
