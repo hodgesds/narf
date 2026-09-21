@@ -312,7 +312,7 @@ fn smoke_smap_sys_write_null_efault() -> TestResult {
     fd::__test_reset();
     __test_clear_global();
 
-    let expected = SyscallReturn::ok((-14i64) as u64);
+    let expected = errno_ret(EFAULT);
     if ctx.ret != Some(expected) {
         return TestResult::Fail("sys_write with null ptr did not return EFAULT");
     }

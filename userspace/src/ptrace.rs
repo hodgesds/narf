@@ -24,6 +24,8 @@
 //! `ptrace_traceme`: attaching to a process that already has a tracer,
 //! TRACEME when already traced, and attaching to yourself.
 
+use crate::errno::to_ret as errno_ret;
+use crate::errno::*;
 use crate::handlers::{
     clear_pending_signal_bits, copy_from_user, copy_to_user, current_task_id, push_stopcont_report,
     raise_signal_pending,
@@ -104,7 +106,7 @@ pub const PTRACE_O_MASK: u64 = 0x0000_00ff | (1 << 20) | (1 << 21);
 /// report EPERM to the user as a fatal "Operation not permitted" and
 /// abandon the session. Answering EPERM for a tracee that merely exited
 /// turns a routine race into a hard failure.
-const ESRCH_NOT_TRACER: u64 = (-3i64) as u64;
+const ESRCH_NOT_TRACER: u64 = wire::ESRCH as u64;
 
 /// Per-tracee syscall-stop phase. A PTRACE_SYSCALL resume arms the
 /// tracee to stop at the *next* syscall boundary; the boundary toggles
@@ -746,7 +748,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
         match crate::pid_ns::resolve_inner_pid(caller, pid) {
             Some(outer) => outer,
             None => {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
         }
@@ -762,7 +764,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let parent_pid = match crate::handlers::parent_of_get(caller_pid) {
                 Some(p) => tid_to_pid(p),
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
             };
@@ -773,14 +775,14 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 // clears it — one tracer per process. A genuine EPERM,
                 // not the -1 sentinel.
                 if r.tracers.contains_key(&caller_pid) {
-                    ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                    ctx.set_return(errno_ret(EPERM));
                     return;
                 }
                 PTRACE_TRACEES.fetch_add(1, Ordering::Release);
                 r.tracers.insert(caller_pid, parent_pid);
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
+                ctx.set_return(errno_ret(ENOSYS));
             }
         }
         PTRACE_ATTACH => {
@@ -791,7 +793,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let tid = pid_to_tid(pid);
             let has_task = crate::user_task::with_user_task_ctx(tid, |_| ()).is_some();
             if !has_task {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
                 return;
             }
             // `kernel/ptrace.c::ptrace_attach`:
@@ -808,7 +810,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // argument marshalling, while EPERM correctly says the target
             // is off limits and the probe should fall back.
             if pid == caller_pid {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             // `ptrace_attach` -> `__ptrace_may_access(task,
@@ -819,7 +821,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // compares the caller's REAL uid: this is a syscall that
             // explicitly names another process, not a filesystem access.
             if !crate::handlers::ptrace_may_access(caller, tid) {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             {
@@ -829,13 +831,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // — a process can have only ONE tracer. A genuine
                     // EPERM, not the -1 sentinel.
                     if r.tracers.contains_key(&pid) {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        ctx.set_return(errno_ret(EPERM));
                         return;
                     }
                     PTRACE_TRACEES.fetch_add(1, Ordering::Release);
                     r.tracers.insert(pid, caller_pid);
                 } else {
-                    ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // ENOSYS
+                    ctx.set_return(errno_ret(ENOSYS));
                     return;
                 }
             }
@@ -869,7 +871,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                 // tracee was released while it is still stopped and still
                 // attached, and its next waitpid would hang.
                 if (data as u32) as u64 > 64 {
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                    ctx.set_return(errno_ret(EIO));
                     return;
                 }
                 if r.tracers.remove(&pid).is_some() {
@@ -901,7 +903,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(a) => a,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
@@ -916,7 +918,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // ends with `return put_user(tmp, ...)`.
                     // SAFETY: data is a user pointer, checked by copy_to_user.
                     if data != 0 && unsafe { copy_to_user(data, &val.to_ne_bytes()) }.is_err() {
-                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        ctx.set_return(errno_ret(EFAULT));
                         return;
                     }
                     ctx.set_return(SyscallReturn::ok(val));
@@ -936,7 +938,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // falls off the end of the mapping, and its unwinder
                     // keys on EIO to mean "that address isn't there";
                     // EFAULT reads as an internal error instead.
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                    ctx.set_return(errno_ret(EIO));
                 }
             }
         }
@@ -955,7 +957,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let target_as = match address_space_of(narf_scheduler::TaskId(tid)) {
                 Some(a) => a,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
@@ -979,7 +981,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // own `data` argument; EIO correctly says the tracee
                     // address is unwritable, which is how gdb decides a
                     // software breakpoint cannot be planted there.
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                    ctx.set_return(errno_ret(EIO));
                 }
             }
         }
@@ -997,13 +999,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let regs = match get_tracee_regs(pid) {
                 Some(r) => r,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
             // SAFETY: data is a user pointer, range-checked by copy_to_user.
             if unsafe { copy_to_user(data, slice_from_ref(&regs)) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -1022,13 +1024,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let mut regs = user_regs_struct::default();
             // SAFETY: data is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(slice_from_ref_mut(&mut regs), data) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             if set_tracee_regs(pid, regs) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
             }
         }
         PTRACE_CONT | PTRACE_SINGLESTEP | PTRACE_SYSCALL => {
@@ -1053,7 +1055,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // >= 32) tells a tracer its SIGCONT/SIGTERM injection
                     // succeeded when nothing was delivered.
                     if data > 64 {
-                        ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                        ctx.set_return(errno_ret(EIO));
                         return;
                     }
                     r.stopped.remove(&pid);
@@ -1130,7 +1132,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
                     // not. Rejecting them would be the larger divergence
                     // — Linux accepts them — so they stay accepted here.
                     if data & !PTRACE_O_MASK != 0 {
-                        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     r.options.insert(pid, data);
@@ -1171,7 +1173,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let mut iov = [0u64; 2];
             // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             // WIDTH: `ptrace_regset(struct task_struct *task, int req,
@@ -1180,13 +1182,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // it — NT_PRSTATUS with junk in the high half still resolves.
             // `ptrace_regset` returns EINVAL when `find_regset` misses.
             if addr as u32 as u64 != NT_PRSTATUS {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let regs = match get_tracee_regs(pid) {
                 Some(r) => r,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
@@ -1196,7 +1198,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let src = unsafe { slice_from_ref(&regs) };
             // SAFETY: iov[0] is a user pointer, range-checked by copy_to_user.
             if iov[0] != 0 && unsafe { copy_to_user(iov[0], &src[..n]) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             // Report the number of bytes actually written back in iov_len.
@@ -1222,12 +1224,12 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let mut iov = [0u64; 2];
             // SAFETY: `data` is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(bytes_of_mut(&mut iov), data) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             // WIDTH: the regset id is `unsigned int` in `ptrace_regset`.
             if addr as u32 as u64 != NT_PRSTATUS {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             // `ptrace_regset`: `if (!regset || (kiov->iov_len %
@@ -1240,19 +1242,19 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // length is EINVAL either way.
             let full = core::mem::size_of::<user_regs_struct>();
             if (iov[1] as usize) < full {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let mut regs = user_regs_struct::default();
             // SAFETY: iov[0] is a user pointer, range-checked by copy_from_user.
             if unsafe { copy_from_user(slice_from_ref_mut(&mut regs), iov[0]) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             if set_tracee_regs(pid, regs) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
             }
         }
         PTRACE_PEEKUSER => {
@@ -1292,13 +1294,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let nregs = core::mem::size_of::<user_regs_struct>() / 8;
             let idx = (addr as usize) / 8;
             if addr % 8 != 0 || idx >= nregs {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
             let regs = match get_tracee_regs(pid) {
                 Some(r) => r,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
@@ -1308,7 +1310,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // accept it written to `data` (PTRACE_PEEK* variant), so mirror it.
             // SAFETY: `data` is a user pointer, range-checked by copy_to_user.
             if data != 0 && unsafe { copy_to_user(data, &val.to_ne_bytes()) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(val));
@@ -1333,13 +1335,13 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             let nregs = core::mem::size_of::<user_regs_struct>() / 8;
             let idx = (addr as usize) / 8;
             if addr % 8 != 0 || idx >= nregs {
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
             let mut regs = match get_tracee_regs(pid) {
                 Some(r) => r,
                 None => {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
             };
@@ -1348,7 +1350,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             if set_tracee_regs(pid, regs) {
                 ctx.set_return(SyscallReturn::ok(0));
             } else {
-                ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                ctx.set_return(errno_ret(ESRCH));
             }
         }
         PTRACE_KILL => {
@@ -1414,7 +1416,7 @@ pub fn sys_ptrace(ctx: &mut dyn TrapContext) {
             // PTRACE_GET_SYSCALL_INFO — concludes that ptrace(2) itself is
             // missing and disables tracing wholesale, instead of falling
             // back to the requests this kernel does implement.
-            ctx.set_return(SyscallReturn::ok((-5i64) as u64)); // EIO
+            ctx.set_return(errno_ret(EIO));
         }
     }
 }

@@ -601,7 +601,7 @@ fn smoke_userspace_read_write_routes_through_fd_table() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Read.raw(), &mut ctx4);
     // read(2) on a closed fd → -EBADF (Linux-conformant; was InvalidOp).
-    if ctx4.ret != Some(SyscallReturn::ok((-9i64) as u64)) {
+    if ctx4.ret != Some(errno_ret(EBADF)) {
         return TestResult::Fail("Read on closed fd should return -EBADF");
     }
 
@@ -1088,7 +1088,7 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut full);
-    if full.ret != Some(SyscallReturn::ok((-11i64) as u64)) {
+    if full.ret != Some(errno_ret(EAGAIN)) {
         return TestResult::Fail("full nonblocking pipe write was not -EAGAIN");
     }
     // Linux tests pipe fullness before dereferencing the source. A bad pointer
@@ -1103,7 +1103,7 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut full_fault);
-    if full_fault.ret != Some(SyscallReturn::ok((-11i64) as u64)) {
+    if full_fault.ret != Some(errno_ret(EAGAIN)) {
         return TestResult::Fail("full pipe did not prioritize -EAGAIN over -EFAULT");
     }
 
@@ -1133,7 +1133,7 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut fault);
-    if fault.ret != Some(SyscallReturn::ok((-14i64) as u64)) {
+    if fault.ret != Some(errno_ret(EFAULT)) {
         return TestResult::Fail("faulting pipe write source was not -EFAULT");
     }
 
@@ -1162,7 +1162,7 @@ fn smoke_userspace_pipe_round_trip() -> TestResult {
         ret: None,
     };
     kernel_syscall_entry(Syscall::Write.raw(), &mut broken);
-    if broken.ret != Some(SyscallReturn::ok((-32i64) as u64)) {
+    if broken.ret != Some(errno_ret(EPIPE)) {
         return TestResult::Fail("closed pipe did not prioritize -EPIPE over -EFAULT");
     }
 
@@ -4076,7 +4076,7 @@ fn smoke_userspace_eventfd_nonblock_read_is_eagain_not_eof() -> TestResult {
     };
     kernel_syscall_entry(Syscall::Read.raw(), &mut rctx);
     // -EAGAIN (11) as the negated value, matching how sys_read reports it.
-    let want_eagain = SyscallReturn::ok((-11i64) as u64);
+    let want_eagain = errno_ret(EAGAIN);
     match rctx.ret {
         Some(r) if r == want_eagain => {}
         // The exact regression: a bare 0 read as EOF by the event loop.

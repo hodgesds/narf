@@ -2393,7 +2393,7 @@ fn smoke_userspace_tkill_signum_out_of_range_rejected() -> TestResult {
     // InvalidOp NARF status before the signal-parity pass). The signum
     // check fires before the target existence check, so 0xBEEF's
     // (non)existence is irrelevant here.
-    if r == SyscallReturn::ok((-22i64) as u64) {
+    if r == errno_ret(EINVAL) {
         TestResult::Pass
     } else {
         TestResult::Fail("signum 65 must be rejected with -EINVAL")

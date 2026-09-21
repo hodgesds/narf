@@ -1454,7 +1454,7 @@ fn smoke_userspace_execve_rejects_null_ptr() -> TestResult {
         None => return TestResult::Fail("no return"),
     };
     // Linux: execve with a NULL pathname pointer faults → EFAULT.
-    if r != SyscallReturn::ok((-14i64) as u64) {
+    if r != errno_ret(EFAULT) {
         return TestResult::Fail("null-ptr execve should return -EFAULT");
     }
     crate::syscall::__test_clear_global();
@@ -2175,7 +2175,7 @@ fn smoke_userspace_execve_with_envp_pack_accepts() -> TestResult {
     crate::syscall::__test_clear_global();
     // Path resolved + image loaded + argv/envp parsed → no user ctx → -ENOSYS.
     match r {
-        Some(r) if r == SyscallReturn::ok((-38i64) as u64) => TestResult::Pass,
+        Some(r) if r == errno_ret(ENOSYS) => TestResult::Pass,
         Some(r) if r.value == 0 => {
             TestResult::Fail("execve reported success after bailing for lack of a user ctx")
         }
