@@ -498,8 +498,9 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
 
 /// Broadcast IPI sender for x2APIC. Installed once at boot via
 /// `clockevent::set_broadcast_sender`. Iterates set bits in
-/// `cpu_mask`, composes an x2APIC ICR for each, writes
-/// APIC_ICR_MSR to deliver a fixed-vector IPI at `vector`.
+/// `cpu_mask`, composes an ICR for each, and delivers a fixed-vector
+/// IPI at `vector` — via APIC_ICR_MSR under x2APIC, or the xAPIC
+/// ICR_HI/ICR_LO MMIO pair when it is not active.
 ///
 /// ICR field layout (Intel SDM Vol 3 §10.12.10):
 ///   [7:0]    Vector
@@ -511,10 +512,37 @@ impl narf_time::clockevent::ClockEvent for LapicClockEvent {
 ///   [63:32]  Destination APIC ID (x2APIC: full 32-bit)
 fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
     if !X2APIC_ACTIVE.load(Ordering::Acquire) {
-        // xAPIC fallback not implemented yet — broadcast becomes
-        // a no-op. CPUs in the mask don't get external ticks; if
-        // their local clockevent is also dead they wedge. Future
-        // work: program ICR via MMIO at XAPIC_MMIO_BASE+0x310.
+        // xAPIC MMIO fallback. Same ICR fields as below, but split
+        // across two 32-bit registers: ICR_HI carries the destination
+        // in bits [31:24] (xAPIC IDs are 8-bit), ICR_LO the vector and
+        // delivery fields. ICR_LO is written LAST because that write is
+        // what actually sends.
+        //
+        // This used to `return` unsent. That is not a degraded tick —
+        // `send_fixed_ipi` is also how `ipi::shoot_range` delivers TLB
+        // shootdowns, and its ACK wait is documented as "must not time
+        // out and return" because the caller may reuse a frame whose
+        // stale translation is still cached on a peer. Dropping the IPI
+        // therefore either wedges the sender forever (what the
+        // `interrupts/ipi` smokes hit under `-x2apic`) or, if a peer
+        // happens to drain the bit by polling, lets execution continue
+        // with a stale TLB entry live on another core.
+        let icr_hi = lapic_reg(0x310);
+        let icr_lo = lapic_reg(0x300);
+        let mut m = cpu_mask;
+        while m != 0 {
+            let cpu = m.trailing_zeros();
+            m &= m - 1;
+            // SAFETY: LAPIC MMIO reached via `lapic_reg`; ICR writes are
+            // architectural. Serialising on Delivery Status keeps a
+            // second target's ICR_LO from overwriting an IPI still in
+            // flight (SDM Vol 3 §10.6.1).
+            unsafe {
+                wait_icr_idle(icr_lo);
+                core::ptr::write_volatile(icr_hi, (cpu & 0xFF) << 24);
+                core::ptr::write_volatile(icr_lo, u32::from(vector) | (1 << 14));
+            }
+        }
         return;
     }
     let mut m = cpu_mask;
@@ -539,7 +567,7 @@ fn x2apic_broadcast(cpu_mask: u64, vector: u8) {
 /// reschedule IPI to kick an idle remote CPU off its HLT so a
 /// cross-core wake takes effect immediately instead of at that CPU's
 /// next timer tick. Fire-and-forget (no ack), edge-triggered fixed
-/// delivery. No-op under xAPIC fallback (same caveat as the broadcast).
+/// delivery. Routes through the xAPIC ICR when x2APIC is not active.
 #[inline]
 pub fn send_fixed_ipi(cpu_mask: u64, vector: u8) {
     x2apic_broadcast(cpu_mask, vector);
@@ -749,6 +777,25 @@ fn lapic_reg(offset: u64) -> *mut u32 {
         LAPIC_PHYS.load(core::sync::atomic::Ordering::Acquire)
     };
     (base + offset) as *mut u32
+}
+
+/// Spin until the xAPIC ICR reports the previous IPI delivered
+/// (ICR_LO bit 12, Delivery Status, reads 0), bounded so a wedged LAPIC
+/// degrades to a dropped IPI instead of hanging the sender forever.
+///
+/// # Safety
+/// `icr_lo` must be a mapped LAPIC ICR_LO pointer from [`lapic_reg`].
+#[inline]
+unsafe fn wait_icr_idle(icr_lo: *mut u32) {
+    const DELIVERY_STATUS: u32 = 1 << 12;
+    for _ in 0..100_000 {
+        // SAFETY: caller guarantees `icr_lo` is the mapped ICR_LO register;
+        // reading it is side-effect free.
+        if unsafe { core::ptr::read_volatile(icr_lo) } & DELIVERY_STATUS == 0 {
+            return;
+        }
+        core::hint::spin_loop();
+    }
 }
 
 /// Move LAPIC register access off the boot identity window and onto an
