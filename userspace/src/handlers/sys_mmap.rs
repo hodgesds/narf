@@ -181,7 +181,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Both x86_64 and AArch64 reject a non-page-aligned byte offset in the
     // architecture syscall wrapper before fd lookup or any mmap work.
     if offset & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -201,7 +201,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     if destructive_fixed
         && handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, args.arg1)
     {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // ksys_mmap_pgoff resolves a non-anonymous fd before huge-flag and
@@ -226,7 +226,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                         .is_none_or(|status| status & crate::fd::O_PATH == 0)
             }) == Some(true);
         if !open_and_mappable {
-            ctx.set_return(SyscallReturn::ok((-9i64) as u64)); // EBADF
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
         // ksys_mmap_pgoff, immediately after fget:
@@ -240,7 +240,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // filesystem cannot be mapped at all" and makes a caller give up on
         // the file rather than retry without MAP_HUGETLB.
         if flags & MAP_HUGETLB != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
     }
@@ -250,7 +250,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             0 | 21 => Some(narf_memory::hugepage::HugeSize::M2),
             30 => Some(narf_memory::hugepage::HugeSize::G1),
             _ => {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -264,13 +264,13 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Linux do_mmap rejects an exact zero length before rounding and before
     // get_unmapped_area validates MAP_FIXED. Never promote it to one page.
     if args.arg1 == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let len = match args.arg1.checked_add(page_size - 1) {
         Some(v) => v & !(page_size - 1),
         None => {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
     };
@@ -304,18 +304,18 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             .map(|end| end <= AddressSpace::USER_HALF_END)
             .unwrap_or(false);
         if !fixed_in_range {
-            ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+            ctx.set_return(errno_ret(ENOMEM));
             return;
         }
         if hint & (page_size - 1) != 0 {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         // security_mmap_addr -> cap_mmap_addr: below mmap_min_addr this needs
         // CAP_SYS_RAWIO, and the denial is EPERM. NARF's USER_FIXED_FLOOR is
         // that policy boundary.
         if hint < AddressSpace::USER_FIXED_FLOOR {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         //     if (flags & MAP_FIXED_NOREPLACE) {
@@ -339,14 +339,14 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 .is_empty()
                 || as_ref.huge_intersects(VirtAddr::new(hint), len))
         {
-            ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+            ctx.set_return(errno_ret(EEXIST));
             return;
         }
     }
     let mlock_authority = current_mlock_authority();
     let explicit_lock = flags & MAP_LOCKED != 0;
     if explicit_lock && !can_do_mlock(mlock_authority) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     // do_mmap's `switch (flags & MAP_TYPE)` — for both the file and the
@@ -373,7 +373,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // not this line.
     let map_type = flags & MAP_TYPE;
     if map_type != MAP_SHARED && map_type != MAP_PRIVATE && map_type != MAP_SHARED_VALIDATE {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
 
@@ -419,8 +419,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
     // Fail closed with -ENOMEM rather than mapping at a bogus base.
     // (MAP_FIXED takes the `hint` arm above, which is non-zero.)
     if base == 0 && !defer_private_anonymous_placement {
-        const ENOMEM: i64 = 12;
-        ctx.set_return(SyscallReturn::ok((-ENOMEM) as u64));
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
 
@@ -478,7 +477,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         ) {
             Ok(frames) => frames,
             Err(_) => {
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                ctx.set_return(errno_ret(ENOMEM));
                 return;
             }
         };
@@ -527,12 +526,12 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 ctx.set_return(SyscallReturn::ok(base));
             }
             Err(narf_memory::AddressSpaceError::LockLimit) => {
-                ctx.set_return(SyscallReturn::ok((-11i64) as u64))
+                ctx.set_return(errno_ret(EAGAIN))
             }
             Err(narf_memory::AddressSpaceError::Overlap) if fixed_noreplace => {
-                ctx.set_return(SyscallReturn::ok((-17i64) as u64))
+                ctx.set_return(errno_ret(EEXIST))
             }
-            Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+            Err(_) => ctx.set_return(errno_ret(ENOMEM)),
         }
         return;
     }
@@ -565,8 +564,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // regular file-backed path below, unchanged from before.
             if let Ok(frames) = ops.mmap_frames(offset, len as usize) {
                 if frames.len() != pages {
-                    const EINVAL: i64 = 22;
-                    ctx.set_return(SyscallReturn::ok((-EINVAL) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let phys: alloc::vec::Vec<narf_memory::PhysAddr> = frames
@@ -639,11 +637,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 });
                 if let Err(error) = mapped {
                     let errno = match error {
-                        narf_memory::AddressSpaceError::LockLimit => 11i64, // EAGAIN
-                        narf_memory::AddressSpaceError::Overlap if fixed_noreplace => 17i64,
-                        _ => 12i64, // ENOMEM
+                        narf_memory::AddressSpaceError::LockLimit => EAGAIN,
+                        narf_memory::AddressSpaceError::Overlap if fixed_noreplace => EEXIST,
+                        _ => ENOMEM,
                     };
-                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                    ctx.set_return(errno_ret(errno));
                     return;
                 }
                 record_fixed_replacement_owner_committed!();
@@ -727,11 +725,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 });
                 if let Err(error) = mapped {
                     let errno = match error {
-                        narf_memory::AddressSpaceError::LockLimit => 11i64,
-                        narf_memory::AddressSpaceError::Overlap if fixed_noreplace => 17i64,
-                        _ => 12i64,
+                        narf_memory::AddressSpaceError::LockLimit => EAGAIN,
+                        narf_memory::AddressSpaceError::Overlap if fixed_noreplace => EEXIST,
+                        _ => ENOMEM,
                     };
-                    ctx.set_return(SyscallReturn::ok((-errno) as u64));
+                    ctx.set_return(errno_ret(errno));
                     return;
                 }
                 record_fixed_replacement_owner_committed!();
@@ -773,7 +771,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                     for &phys in &frames_raw {
                         let _ = (v.release_frame)(phys);
                     }
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64));
+                    ctx.set_return(errno_ret(ENOMEM));
                     return;
                 }
                 let phys = frames_raw
@@ -824,7 +822,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                                     match unsafe { as_ref.materialize_mapping_locked(receipt) } {
                                         Ok(()) => Ok(()),
                                         Err(error) => {
-                                            // SAFETY: both structural
+                                             // SAFETY: both structural
                                             // transactions remain held.
                                             let _ = unsafe {
                                                 as_ref.rollback_mapping_locked(receipt)
@@ -855,15 +853,15 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 }
                 let map_error = mapped.expect_err("mapped success returned above");
                 if map_error == narf_memory::AddressSpaceError::LockLimit {
-                    ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 if fixed_noreplace && map_error == narf_memory::AddressSpaceError::Overlap {
-                    ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+                    ctx.set_return(errno_ret(EEXIST));
                     return;
                 }
                 if fixed {
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                    ctx.set_return(errno_ret(ENOMEM));
                     return;
                 }
                 // Publication failure for an ordinary anonymous shared
@@ -882,7 +880,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         )
         .is_err()
     {
-        ctx.set_return(SyscallReturn::ok((-11i64) as u64)); // EAGAIN
+        ctx.set_return(errno_ret(EAGAIN));
         return;
     }
     let shared_file_fallback = !anonymous && flags & MAP_SHARED != 0;
@@ -928,7 +926,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             // rather than entering the kernel allocator's abort path.
             let mut v = alloc::vec::Vec::new();
             if v.try_reserve_exact(pages).is_err() {
-                ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // -ENOMEM
+                ctx.set_return(errno_ret(ENOMEM));
                 return;
             }
             v.resize(pages, narf_memory::PhysAddr::new(0));
@@ -949,7 +947,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             Some(o) => o,
             None => {
                 // File-backed mapping with an fd not in the fd table → EBADF.
-                ctx.set_return(SyscallReturn::ok((-9i64) as u64));
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
         };
@@ -981,7 +979,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
                 match load_file_mapping_pages(&ops, offset, len_bytes, pages) {
                     Ok(frames) => frames,
                     Err(()) => {
-                        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                        ctx.set_return(errno_ret(ENOMEM));
                         return;
                     }
                 }
@@ -997,7 +995,7 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
             match load_file_mapping_pages(&ops, offset, len_bytes, pages) {
                 Ok(frames) => frames,
                 Err(()) => {
-                    ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+                    ctx.set_return(errno_ret(ENOMEM));
                     return;
                 }
             }
@@ -1270,11 +1268,11 @@ pub(crate) fn sys_mmap(ctx: &mut dyn TrapContext) {
         // mapper selecting the same canonical page retains its own hold.
         drop(shared_publication);
         let errno = match error {
-            narf_memory::AddressSpaceError::LockLimit => 11i64,
-            narf_memory::AddressSpaceError::Overlap if fixed_noreplace => 17i64,
-            _ => 12i64,
+            narf_memory::AddressSpaceError::LockLimit => EAGAIN,
+            narf_memory::AddressSpaceError::Overlap if fixed_noreplace => EEXIST,
+            _ => ENOMEM,
         };
-        ctx.set_return(SyscallReturn::ok((-errno) as u64));
+        ctx.set_return(errno_ret(errno));
         return;
     }
     if eager_file_population {

@@ -40,7 +40,7 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
         || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0
         || flags & MS_ASYNC != 0 && flags & MS_SYNC != 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `len = (len + ~PAGE_MASK) & PAGE_MASK` wraps to zero for a length in
@@ -49,7 +49,7 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     let len = a.arg1.wrapping_add(0xFFF) & !0xFFF;
     let end = addr.wrapping_add(len);
     if end < addr {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     if end == addr {
@@ -60,7 +60,7 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     // find_vma would fail there. Return the required ENOMEM before cloning
     // the current AS for the high addresses mmapfixed probes on every pass.
     if end > AddressSpace::USER_HALF_END {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     // `mm/msync.c`, inside the per-VMA walk:
@@ -84,7 +84,7 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
                 .any(|p| p.contains(narf_memory::RegionPerms::LOCKED))
         });
         if locked {
-            ctx.set_return(SyscallReturn::ok((-16i64) as u64)); // -EBUSY
+            ctx.set_return(errno_ret(EBUSY));
             return;
         }
     }
@@ -93,9 +93,9 @@ pub(crate) fn sys_msync(ctx: &mut dyn TrapContext) {
     if mapped {
         match crate::mapped_file::flush_current_range(addr, len) {
             Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-            Err(()) => ctx.set_return(SyscallReturn::ok((-5i64) as u64)), // -EIO
+            Err(()) => ctx.set_return(errno_ret(EIO)),
         }
     } else {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
     }
 }

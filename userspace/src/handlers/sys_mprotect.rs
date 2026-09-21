@@ -47,11 +47,11 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
     let grows = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
     let prot = prot & !(PROT_GROWSDOWN | PROT_GROWSUP);
     if grows == PROT_GROWSDOWN | PROT_GROWSUP {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     if args.arg0 & 0xFFF != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `if (!len) return 0;` — a zero-length mprotect succeeds without looking
@@ -66,13 +66,13 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
     let len = args.arg1.wrapping_add(0xFFF) & !0xFFF;
     let end = args.arg0.wrapping_add(len);
     if end <= args.arg0 {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     // arch_validate_prot: PROT_SEM is accepted and has no NARF effect; any
     // other bit is a request NARF would otherwise honour only partially.
     if prot & !(0b111 | PROT_SEM) != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let as_ref = match current_address_space() {
@@ -86,7 +86,7 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
     // guarantee that what is mapped at an address cannot be replaced, and
     // mprotect is one of the operations that could replace it.
     if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, len) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let base = VirtAddr::new(args.arg0);
@@ -94,6 +94,6 @@ pub(crate) fn sys_mprotect(ctx: &mut dyn TrapContext) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
         // e is the positive errno (ENOMEM for an unmapped range, EACCES for a
         // W^X denial / missing JIT cap); negate for the Linux ABI.
-        Err(e) => ctx.set_return(SyscallReturn::ok((-e) as u64)),
+        Err(e) => ctx.set_return(errno_ret(e)),
     }
 }

@@ -31,7 +31,7 @@ pub(crate) fn sys_munlock(ctx: &mut dyn TrapContext) {
             return;
         }
         Err(errno) => {
-            ctx.set_return(SyscallReturn::ok((-errno) as u64));
+            ctx.set_return(errno_ret(errno));
             return;
         }
     };
@@ -47,8 +47,8 @@ pub(crate) fn sys_munlock(ctx: &mut dyn TrapContext) {
         // Linux munlock(2): EINVAL for an out-of-range request, else ENOMEM for
         // a range that spans an unmapped hole.
         Err(narf_memory::AddressSpaceError::OutOfRange) => {
-            ctx.set_return(SyscallReturn::ok((-22i64) as u64))
+            ctx.set_return(errno_ret(EINVAL))
         }
-        Err(_) => ctx.set_return(SyscallReturn::ok((-12i64) as u64)),
+        Err(_) => ctx.set_return(errno_ret(ENOMEM)),
     }
 }

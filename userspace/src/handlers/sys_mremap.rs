@@ -4,11 +4,6 @@ use super::*;
 const MREMAP_MAYMOVE: u64 = 1;
 const MREMAP_FIXED: u64 = 2;
 const MREMAP_DONTUNMAP: u64 = 4;
-const EPERM: i64 = 1;
-const EAGAIN: i64 = 11;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const ENOMEM: i64 = 12;
 
 fn round_len(requested: u64) -> Result<u64, i64> {
     requested
@@ -819,7 +814,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
     // shrinking or expanding a sealed range all leave an address whose
     // contents can be replaced, which is what sealing forbids.
     if handler_sys_mseal::range_is_sealed(as_ref.identity(), args.arg0, args.arg1) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let task = current_task_id();
@@ -845,7 +840,7 @@ pub(crate) fn sys_mremap(ctx: &mut dyn TrapContext) {
         limits,
     ) {
         Ok(address) => ctx.set_return(SyscallReturn::ok(address)),
-        Err(errno) => ctx.set_return(SyscallReturn::ok((-errno) as u64)),
+        Err(errno) => ctx.set_return(errno_ret(errno)),
     }
 }
 

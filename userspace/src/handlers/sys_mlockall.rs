@@ -34,12 +34,12 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
         || flags & !(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT) != 0
         || flags & MCL_ONFAULT != 0 && flags & (MCL_CURRENT | MCL_FUTURE) == 0
     {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let authority = current_mlock_authority();
     if !can_do_mlock(authority) {
-        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+        ctx.set_return(errno_ret(EPERM));
         return;
     }
     let as_ref = match current_address_space() {
@@ -67,8 +67,6 @@ pub(crate) fn sys_mlockall(ctx: &mut dyn TrapContext) {
         authority.bypass_limit,
     ) {
         Ok(()) => ctx.set_return(SyscallReturn::ok(0)),
-        Err(error) => ctx.set_return(SyscallReturn::ok(
-            (-super::handler_sys_mlock::mlock_errno(error)) as u64,
-        )),
+        Err(error) => ctx.set_return(errno_ret(super::handler_sys_mlock::mlock_errno(error))),
     }
 }

@@ -62,27 +62,27 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
         {
             let id = *id;
             if flg & IPC_CREAT != 0 && flg & IPC_EXCL != 0 {
-                ctx.set_return(SyscallReturn::ok((-17i64) as u64)); // EEXIST
+                ctx.set_return(errno_ret(EEXIST));
                 return;
             }
             if size > seg.len {
-                ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             if !shm_ipc_allowed(seg, (flg as u32) & 0o777) {
-                ctx.set_return(SyscallReturn::ok((-13i64) as u64)); // EACCES
+                ctx.set_return(errno_ret(EACCES));
                 return;
             }
             ctx.set_return(SyscallReturn::ok(id));
             return;
         }
         if flg & IPC_CREAT == 0 {
-            ctx.set_return(SyscallReturn::ok((-2i64) as u64)); // ENOENT
+            ctx.set_return(errno_ret(ENOENT));
             return;
         }
     }
     if size == 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let v = match shmem_vtable() {
@@ -97,14 +97,14 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
             // Linux ABI returns — so `shmget` handed back segment id 0 as if
             // it had allocated one, and the caller carried that id into
             // `shmat`.
-            ctx.set_return(SyscallReturn::ok((-38i64) as u64)); // -ENOSYS
+            ctx.set_return(errno_ret(ENOSYS));
             return;
         }
     };
     const SHMMNI: usize = 4096;
     let shmmax = (v.max_len)();
     if size > shmmax {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let requested_pages = size.div_ceil(4096);
@@ -119,7 +119,7 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
         });
     let shmall = SHMMNI as u64 * shmmax / 4096;
     if used_pages.saturating_add(requested_pages) > shmall || live_ids >= SHMMNI {
-        ctx.set_return(SyscallReturn::ok((-28i64) as u64)); // ENOSPC
+        ctx.set_return(errno_ret(ENOSPC));
         return;
     }
     // `newseg`'s hugetlb branch, in Linux's order: after the size -EINVAL and
@@ -133,7 +133,7 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
     // only on the create path — Linux never inspects SHM_HUGETLB when
     // `ipc_findkey` resolves an existing key.
     if flg & SHM_HUGETLB != 0 {
-        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // EINVAL
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // SysV segments belong to the IPC namespace, not to the creating
@@ -141,7 +141,7 @@ pub(crate) fn sys_shmget_compat(ctx: &mut dyn TrapContext) {
     // shmem exit reaper; IPC_RMID/final detach owns destruction instead.
     let handle = (v.create)(0, size);
     if handle == 0 {
-        ctx.set_return(SyscallReturn::ok((-12i64) as u64)); // ENOMEM
+        ctx.set_return(errno_ret(ENOMEM));
         return;
     }
     #[cfg(feature = "container")]
