@@ -2353,7 +2353,7 @@ fn copy_user_path_raw(ptr: u64, len: usize) -> Option<alloc::string::String> {
 // multi-gigabyte kernel allocation.
 
 /// Linux EFAULT errno value (14).
-const EFAULT: u64 = 14;
+pub(crate) const EFAULT_CODE: u64 = 14;
 /// Linux EINVAL errno value (22).
 const EINVAL_CODE: u64 = 22;
 /// 16 MiB per-call cap.
@@ -2534,11 +2534,11 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
         return Err(EINVAL_CODE);
     }
     if ptr == 0 {
-        return Err(EFAULT);
+        return Err(EFAULT_CODE);
     }
     // Reject integer overflow of the range end.
     if ptr.checked_add(len as u64).is_none() {
-        return Err(EFAULT);
+        return Err(EFAULT_CODE);
     }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
@@ -2557,7 +2557,7 @@ pub(crate) fn validate_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT);
+            return Err(EFAULT_CODE);
         }
     }
     Ok(())
@@ -2588,7 +2588,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT)?;
+            .map_err(|_remaining| EFAULT_CODE)?;
     }
     // SAFETY: dst is a live kernel slice; src is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort (a validated-
@@ -2600,7 +2600,7 @@ pub(crate) unsafe fn copy_from_user(dst: &mut [u8], src_uptr: u64) -> Result<(),
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst.as_mut_ptr(), src, dst.len())
-            .map_err(|_remaining| EFAULT)?;
+            .map_err(|_remaining| EFAULT_CODE)?;
     }
     // SAFETY: any other target — plain volatile read of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -2651,12 +2651,12 @@ pub(crate) unsafe fn cmpxchg_user_u32(uptr: u64, old: u32, new: u32) -> Result<u
     // cmpxchg opens the SMAP bracket itself and catches an unrecoverable
     // fault as Err instead of a kernel panic.
     unsafe {
-        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT)
+        narf_arch::x86_64::smap::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
     }
     #[cfg(target_arch = "aarch64")]
     // SAFETY: as above, via the EL1 exclusive-monitor sequence.
     unsafe {
-        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT)
+        narf_arch::aarch64::uaccess::cmpxchg_user_guarded(ptr, old, new).map_err(|()| EFAULT_CODE)
     }
     // SAFETY: any other target — no fault-fixup surface is implemented
     // there, so fall back to a plain atomic on the mapped user word.
@@ -2715,7 +2715,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::x86_64::smap::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT)?;
+            .map_err(|_remaining| EFAULT_CODE)?;
     }
     // SAFETY: src is a live kernel slice; dst is range-validated; the
     // guarded copy catches any unrecoverable EL1 data abort as Err — see
@@ -2724,7 +2724,7 @@ pub(crate) unsafe fn copy_to_user(dst_uptr: u64, src: &[u8]) -> Result<(), u64> 
     // SAFETY: Valid memory or trusted environment
     unsafe {
         narf_arch::aarch64::uaccess::copy_user_guarded(dst, src.as_ptr(), src.len())
-            .map_err(|_remaining| EFAULT)?;
+            .map_err(|_remaining| EFAULT_CODE)?;
     }
     // SAFETY: any other target — plain volatile write of each in-range user
     // byte (no fault-fixup surface implemented there).
@@ -7029,7 +7029,7 @@ fn futex_wake_op(
     let mut b = [0u8; 4];
     // SAFETY: copy_from_user range-validates uaddr2 + SMAP-brackets the read.
     if unsafe { copy_from_user(&mut b, uaddr2) }.is_err() {
-        return -(EFAULT as i64);
+        return -EFAULT;
     }
     let mut cur = u32::from_ne_bytes(b);
     let oldval = loop {

@@ -2128,7 +2128,7 @@ fn fanotify_read_to_user(
     };
     if reserved.len() != fd_count {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT);
+        return Err(EFAULT_CODE);
     }
     let mut reserved_iter = reserved.iter().copied();
     let mut installs = alloc::vec::Vec::with_capacity(fd_count);
@@ -2168,7 +2168,7 @@ fn fanotify_read_to_user(
     });
     if installed != Some(true) {
         let _ = fd::with_table(task, |table| table.release_reserved(&reserved));
-        return Err(EFAULT);
+        return Err(EFAULT_CODE);
     }
     Ok(staging.len())
 }
@@ -2195,7 +2195,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
         let last_page = last & !0xfff;
         loop {
             if !aspace.contains_address(VirtAddr::new(page)) {
-                return Err(EFAULT);
+                return Err(EFAULT_CODE);
             }
             if page == last_page {
                 return Ok(());
@@ -2211,7 +2211,7 @@ fn validate_fanotify_copy_range(ptr: u64, len: usize) -> Result<(), u64> {
     if kernel_buf_scope::active() && !in_user_half(ptr) {
         return Ok(());
     }
-    Err(EFAULT)
+    Err(EFAULT_CODE)
 }
 
 fn fanotify_resolve_object(abs: &str) -> Option<Arc<dyn narf_filesystem::FileOps>> {
@@ -2338,11 +2338,6 @@ fn clear_flock_routing() {
 //
 // EBADF on closed fd; ENOTTY on a FileOps without an `ioctl` impl
 // or on an unrecognised cmd — mirrors Linux's `do_vfs_ioctl`.
-
-/// Linux ENOTTY value (25 — "inappropriate ioctl for device").
-const ENOTTY: u64 = 25;
-/// Linux EBADF value (9).
-const EBADF: u64 = 9;
 
 // ── Stat / Fstat ───────────────────────────────────────────────────
 //
@@ -3968,7 +3963,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
         return Ok(());
     }
     let Some(end) = ptr.checked_add(len as u64) else {
-        return Err(EFAULT);
+        return Err(EFAULT_CODE);
     };
     let last = if len == 0 { ptr } else { end - 1 };
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
@@ -3982,7 +3977,7 @@ fn validate_rw_user_range(ptr: u64, len: usize) -> Result<(), u64> {
             {
                 return Ok(());
             }
-            return Err(EFAULT);
+            return Err(EFAULT_CODE);
         }
     }
     Ok(())
