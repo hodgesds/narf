@@ -1645,12 +1645,15 @@ fn smoke_abi_pathx_utimensat_futimesat_flags_and_dirfd_errno() -> TestResult {
         }
 
         // 5. futimesat with non-directory dirfd -> -ENOTDIR (-20).
+        // `futimesat` is an x86_64 legacy syscall (aarch64 has no futimesat).
+        #[cfg(target_arch = "x86_64")]
         match call(Syscall::Futimesat.raw(), a2(fd, rel.as_ptr() as u64, 0)) {
             Some(ENOTDIR) => {}
             _ => return Err("futimesat with non-directory dirfd must return -ENOTDIR"),
         }
 
         // 6. futimesat with unallocated dirfd -> -EBADF (-9).
+        #[cfg(target_arch = "x86_64")]
         match call(Syscall::Futimesat.raw(), a2(9999, rel.as_ptr() as u64, 0)) {
             Some(EBADF) => {}
             _ => return Err("futimesat with unallocated dirfd must return -EBADF"),
