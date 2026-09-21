@@ -24,7 +24,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
     let (ops, status_flags) = match entry {
         Some(Some(entry)) => entry,
         _ => {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
     };
@@ -173,13 +173,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         }
         let source_fd = i64::from_ne_bytes(input[0..8].try_into().unwrap());
         if source_fd < 0 || source_fd > i64::from(u32::MAX) {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         }
         let (name_offset, readonly, quota) = if cmd == BTRFS_IOC_SNAP_CREATE_V2 {
             let flags = u64::from_ne_bytes(input[16..24].try_into().unwrap());
             if flags & !(BTRFS_SUBVOL_RDONLY | BTRFS_SUBVOL_QGROUP_INHERIT) != 0 {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let quota = if flags & BTRFS_SUBVOL_QGROUP_INHERIT != 0 {
@@ -258,11 +258,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         })
         .flatten();
         let Some(source) = source else {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         let Some(destination) = ops.as_dir() else {
-            ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+            ctx.set_return(errno_ret(ENOTTY));
             return;
         };
         let result = match quota {
@@ -321,13 +321,13 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
         ctx.set_return(SyscallReturn::ok(if replaced {
             0
         } else {
-            (-(EBADF as i64)) as u64
+            (-EBADF) as u64
         }));
         return;
     }
     if cmd == narf_filesystem::fuse_conn::DevFuse::DEV_IOC_BACKING_OPEN {
         let Some(conn) = narf_filesystem::fuse_conn::DevFuse::connection_of(&ops) else {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         };
         let mut map = [0u8; 16];
@@ -392,18 +392,16 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                 TIOCSCTTY => {
                     // O_PATH has no tty file_operations on Linux.
                     if status_flags & crate::fd::O_PATH != 0 {
-                        ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                        ctx.set_return(errno_ret(EBADF));
                         return;
                     }
                     let readable = status_flags & crate::fd::O_ACCMODE != crate::fd::O_WRONLY;
                     let result = ops.tty_acquire_controlling(arg, readable);
                     let rc = match result {
                         Ok(true) => 0,
-                        Ok(false) | Err(narf_filesystem::FsError::Unsupported) => {
-                            -(ENOTTY as i64)
-                        }
-                        Err(narf_filesystem::FsError::OperationNotPermitted) => -1, // EPERM
-                        Err(_) => -(EINVAL_CODE as i64),
+                        Ok(false) | Err(narf_filesystem::FsError::Unsupported) => -ENOTTY,
+                        Err(narf_filesystem::FsError::OperationNotPermitted) => -EPERM,
+                        Err(_) => -EINVAL,
                     };
                     ctx.set_return(SyscallReturn::ok(rc as u64));
                     return;
@@ -412,7 +410,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     // Linux lets a PTY master query its slave control state,
                     // but a slave fd must be the caller's controlling tty.
                     if master_index.is_none() && task_ctty(task) != Some(pty_index) {
-                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                        ctx.set_return(errno_ret(ENOTTY));
                         return;
                     }
                     let raw = if cmd == TIOCGPGRP {
@@ -420,7 +418,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     } else {
                         match ops.tty_session() {
                             Some(0) | None => {
-                                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                                ctx.set_return(errno_ret(ENOTTY));
                                 return;
                             }
                             Some(sid) => sid,
@@ -430,7 +428,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     // SAFETY: copy_to_user validates the complete pid_t output
                     // after all ownership/session checks, matching Linux.
                     if unsafe { copy_to_user(arg as u64, &visible.to_ne_bytes()) }.is_err() {
-                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        ctx.set_return(errno_ret(EFAULT));
                     } else {
                         ctx.set_return(SyscallReturn::ok(0));
                     }
@@ -441,33 +439,33 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     if task_ctty(task) != Some(pty_index)
                         || ops.tty_session() != Some(caller_sid)
                     {
-                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                        ctx.set_return(errno_ret(ENOTTY));
                         return;
                     }
                     let mut raw_input = [0u8; core::mem::size_of::<i32>()];
                     // SAFETY: copy_from_user validates the complete pid_t
                     // after tty ownership, preserving Linux's errno order.
                     if unsafe { copy_from_user(&mut raw_input, arg as u64) }.is_err() {
-                        ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // EFAULT
+                        ctx.set_return(errno_ret(EFAULT));
                         return;
                     }
                     let visible = i32::from_ne_bytes(raw_input);
                     if visible < 0 {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     let pgrp = pgid_from_user(visible as u64);
                     let Some(group_sid) = (pgrp != 0).then(|| session_of_pgrp(pgrp)).flatten()
                     else {
-                        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // ESRCH
+                        ctx.set_return(errno_ret(ESRCH));
                         return;
                     };
                     if group_sid != caller_sid {
-                        ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // EPERM
+                        ctx.set_return(errno_ret(EPERM));
                         return;
                     }
                     if !ops.set_tty_fg_pgrp(pgrp) {
-                        ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                        ctx.set_return(errno_ret(ENOTTY));
                     } else {
                         ctx.set_return(SyscallReturn::ok(0));
                     }
@@ -486,7 +484,7 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             Some(i) => i,
             None => {
                 // Not a master fd — ENOTTY (Linux semantics).
-                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                ctx.set_return(errno_ret(ENOTTY));
                 return;
             }
         };
@@ -494,11 +492,11 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
             Some(Ok(s)) => s,
             Some(Err(())) => {
                 // EIO: slave still locked.
-                ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                ctx.set_return(errno_ret(EIO));
                 return;
             }
             None => {
-                ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                ctx.set_return(errno_ret(ENOTTY));
                 return;
             }
         };
@@ -801,10 +799,10 @@ pub(crate) fn sys_ioctl(ctx: &mut dyn TrapContext) {
                     ctx.set_return(SyscallReturn::ok((reply.result as i64) as u64));
                 }
                 Some(Err(narf_filesystem::FsError::Unsupported)) => {
-                    ctx.set_return(SyscallReturn::ok((-(ENOTTY as i64)) as u64));
+                    ctx.set_return(errno_ret(ENOTTY));
                 }
                 Some(Err(narf_filesystem::FsError::PermissionDenied)) => {
-                    ctx.set_return(SyscallReturn::ok((-13i64) as u64));
+                    ctx.set_return(errno_ret(EACCES));
                 }
                 Some(Err(narf_filesystem::FsError::Busy)) => {
                     let errno = match cmd {

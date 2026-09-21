@@ -731,3 +731,62 @@ fn smoke_percpu_cpu_type_from_raw() -> TestResult {
     TestResult::Pass
 }
 kernel_test_in!("lib", smoke_percpu_cpu_type_from_raw);
+
+fn smoke_errno_linux_abi_values() -> TestResult {
+    use crate::errno::{self, wire};
+
+    // Base errnos (1..34) match <asm-generic/errno-base.h>
+    if errno::EPERM != 1 || errno::ENOENT != 2 || errno::ESRCH != 3 || errno::EINTR != 4 {
+        return TestResult::Fail("errno base 1..4 mismatch");
+    }
+    if errno::EIO != 5 || errno::ENXIO != 6 || errno::E2BIG != 7 || errno::ENOEXEC != 8 {
+        return TestResult::Fail("errno base 5..8 mismatch");
+    }
+    if errno::EBADF != 9 || errno::ECHILD != 10 || errno::EAGAIN != 11 || errno::ENOMEM != 12 {
+        return TestResult::Fail("errno base 9..12 mismatch");
+    }
+    if errno::EACCES != 13 || errno::EFAULT != 14 || errno::EINVAL != 22 || errno::ENOTTY != 25 {
+        return TestResult::Fail("errno base 13..25 mismatch");
+    }
+    if errno::ERANGE != 34 || errno::EDEADLK != 35 || errno::ENOSYS != 38 {
+        return TestResult::Fail("errno 34..38 mismatch");
+    }
+
+    // Aliases match Linux defines
+    if errno::EWOULDBLOCK != errno::EAGAIN {
+        return TestResult::Fail("EWOULDBLOCK != EAGAIN");
+    }
+    if errno::EDEADLOCK != errno::EDEADLK {
+        return TestResult::Fail("EDEADLOCK != EDEADLK");
+    }
+    if errno::EFSBADCRC != errno::EBADMSG {
+        return TestResult::Fail("EFSBADCRC != EBADMSG");
+    }
+    if errno::EFSCORRUPTED != errno::EUCLEAN {
+        return TestResult::Fail("EFSCORRUPTED != EUCLEAN");
+    }
+    if errno::ENOTSUP != errno::EOPNOTSUPP || errno::ENOTSUP != 95 {
+        return TestResult::Fail("ENOTSUP != EOPNOTSUPP (95)");
+    }
+
+    // High boundary errno
+    if errno::EHWPOISON != 133 {
+        return TestResult::Fail("EHWPOISON != 133");
+    }
+
+    // Kernel-internal errnos match <linux/errno.h>
+    if errno::ERESTARTSYS != 512 || errno::ENOIOCTLCMD != 515 || errno::ENOGRACE != 531 {
+        return TestResult::Fail("kernel-internal errno mismatch");
+    }
+
+    // Wire negations
+    if wire::ENOENT != -2 || wire::EBADF != -9 || wire::EINVAL != -22 {
+        return TestResult::Fail("wire errno negation mismatch");
+    }
+    if errno::to_wire(errno::EINVAL) != -22 {
+        return TestResult::Fail("to_wire(EINVAL) != -22");
+    }
+
+    TestResult::Pass
+}
+kernel_test_in!("lib", smoke_errno_linux_abi_values);

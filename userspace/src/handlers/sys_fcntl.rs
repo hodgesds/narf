@@ -328,7 +328,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         .flatten();
 
         let Some((mut flags, socket_nonblock, mqueue_id)) = snapshot else {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         if let Some(nonblock) = socket_nonblock {
@@ -375,7 +375,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         .flatten();
 
         let Some((ops, description, old)) = snapshot else {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         let mut new_flags = (old & !mask) | (requested & mask);
@@ -456,7 +456,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // closed descriptor is -EBADF from the entry's fdget_raw before
             // any per-command argument check runs.
             if !fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false) {
-                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
             // `f_dupfd`: `if (from >= nofile) return -EINVAL;` — the floor is
@@ -475,7 +475,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 .map(|limit| limit.cur)
                 .unwrap_or_else(|| default_rlimits()[RLIMIT_NOFILE_RESOURCE].cur);
             if u64::from(min_fd) >= nofile {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
             let cloexec = cmd == F_DUPFD_CLOEXEC;
@@ -492,10 +492,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 // above reports: the floor was legal, the table is simply
                 // full between it and the limit.
                 Some(Err(crate::fd::FdAllocError::TooManyFiles)) => {
-                    ctx.set_return(SyscallReturn::ok((-24i64) as u64)); // -EMFILE
+                    ctx.set_return(errno_ret(EMFILE));
                 }
                 // F_DUPFD on a fd that isn't open → -EBADF (was InvalidOp).
-                _ => ctx.set_return(SyscallReturn::ok((-9i64) as u64)),
+                _ => ctx.set_return(errno_ret(EBADF)),
             }
             return;
         }
@@ -514,11 +514,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         .flatten();
         match path_only {
             None => {
-                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
             Some(true) => {
-                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
             Some(false) => {}
@@ -531,7 +531,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
     ) {
         let Some(description) = fd::with_table(task, |table| table.description(fd)).flatten()
         else {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         match cmd {
@@ -549,12 +549,12 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                 } else {
                     if who == i32::MIN {
-                        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                        ctx.set_return(errno_ret(EINVAL));
                         return;
                     }
                     let group = pgid_from_user((-who) as u64);
                     if group == 0 || pgrp_task_snapshot(group).is_empty() {
-                        ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                        ctx.set_return(errno_ret(ESRCH));
                         return;
                     }
                     crate::fd::FasyncOwner::ProcessGroup(group)
@@ -579,7 +579,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             F_SETSIG => {
                 let signal = arg as i32;
                 if !(0..=64).contains(&signal) {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 description.set_fasync_signal(signal as u32);
@@ -596,19 +596,19 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 // before validating its type or pid; copy_from_user performs
                 // the range/fault checks for the supplied pointer.
                 if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
                 let owner_type = i32::from_ne_bytes(bytes[0..4].try_into().unwrap());
                 let visible = i32::from_ne_bytes(bytes[4..8].try_into().unwrap());
                 if !matches!(owner_type, F_OWNER_TID | F_OWNER_PID | F_OWNER_PGRP) {
-                    ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EINVAL));
                     return;
                 }
                 let owner = if visible == 0 {
                     crate::fd::FasyncOwner::None
                 } else if visible < 0 {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 } else {
                     match owner_type {
@@ -626,7 +626,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     .unwrap_or(crate::fd::FasyncOwner::None)
                 };
                 if visible != 0 && owner == crate::fd::FasyncOwner::None {
-                    ctx.set_return(SyscallReturn::ok((-3i64) as u64)); // -ESRCH
+                    ctx.set_return(errno_ret(ESRCH));
                     return;
                 }
                 let ids = read_uidgid(task);
@@ -642,7 +642,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 // SAFETY: fixed-size copy to the caller's f_owner_ex pointer;
                 // copy_to_user validates and fault-brackets the destination.
                 if unsafe { copy_to_user(arg, &bytes) }.is_err() {
-                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                 } else {
                     ctx.set_return(SyscallReturn::ok(0));
                 }
@@ -656,7 +656,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         let Some(ops) = fd::with_table(task, |table| table.get(fd).map(|entry| entry.ops.clone()))
             .flatten()
         else {
-            ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+            ctx.set_return(errno_ret(EBADF));
             return;
         };
         if cmd == F_GET_RW_HINT {
@@ -664,7 +664,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // SAFETY: fixed-size u64 copy to the caller's hint pointer;
             // copy_to_user validates and fault-brackets the destination.
             if unsafe { copy_to_user(arg, &bytes) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                ctx.set_return(errno_ret(EFAULT));
             } else {
                 ctx.set_return(SyscallReturn::ok(0));
             }
@@ -676,19 +676,19 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         // bad pointer: EPERM wins over EFAULT.
         let (uid, gid) = ops.owners();
         if !inode_owner_or_capable(task, uid, gid) {
-            ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+            ctx.set_return(errno_ret(EPERM));
             return;
         }
         let mut bytes = [0u8; 8];
         // SAFETY: fixed-size u64 copy from the caller's hint pointer;
         // copy_from_user validates and fault-brackets the source.
         if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
-            ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+            ctx.set_return(errno_ret(EFAULT));
             return;
         }
         let hint = u64::from_ne_bytes(bytes);
         if hint > 5 {
-            ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+            ctx.set_return(errno_ret(EINVAL));
             return;
         }
         rw_hint_set(&ops, hint);
@@ -727,7 +727,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             let (ops, key) = match ops_key {
                 Some(Some(v)) => v,
                 _ => {
-                    ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                    ctx.set_return(errno_ret(EBADF));
                     return;
                 }
             };
@@ -736,7 +736,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 match owner_desc {
                     Some(d) => (d, crate::fd::locks::LockKind::Ofd),
                     None => {
-                        ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                        ctx.set_return(errno_ret(EBADF));
                         return;
                     }
                 }
@@ -749,7 +749,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // range-validates it and SMAP-brackets the read into the sized `bytes`.
             // SAFETY: Valid memory or trusted environment
             if unsafe { copy_from_user(&mut bytes, arg) }.is_err() {
-                ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                ctx.set_return(errno_ret(EFAULT));
                 return;
             }
             // SAFETY: `bytes` holds exactly `flock_size()` validated bytes and
@@ -863,7 +863,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                             task_to_pid_raw(lock.pid as u64).unwrap_or(lock.pid as u64),
                         ) as i32;
                         if write_flock_to_user(arg, &out).is_err() {
-                            ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                            ctx.set_return(errno_ret(EFAULT));
                         } else {
                             ctx.set_return(SyscallReturn::ok(0));
                         }
@@ -871,7 +871,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                     Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
                     _ => {
-                        ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                        ctx.set_return(errno_ret(EIO));
                         return;
                     }
                 }
@@ -898,7 +898,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     }
                 }
                 if write_flock_to_user(arg, &out).is_err() {
-                    ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+                    ctx.set_return(errno_ret(EFAULT));
                     return;
                 }
                 ctx.set_return(SyscallReturn::ok(0));
@@ -912,11 +912,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                 }
                 Some(Err(narf_filesystem::FsError::Unsupported)) | None => {}
                 Some(Err(narf_filesystem::FsError::Busy)) => {
-                    ctx.set_return(SyscallReturn::ok((-(EAGAIN_CODE as i64)) as u64));
+                    ctx.set_return(errno_ret(EAGAIN));
                     return;
                 }
                 _ => {
-                    ctx.set_return(SyscallReturn::ok((-5i64) as u64));
+                    ctx.set_return(errno_ret(EIO));
                     return;
                 }
             }
@@ -1025,11 +1025,11 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         if cmd == F_ADD_SEALS || cmd == F_GET_SEALS {
             let open = fd::with_table(task, |t| t.get(fd).is_some()).unwrap_or(false);
             if !open {
-                ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64));
+                ctx.set_return(errno_ret(EBADF));
                 return;
             }
             let Some(mfd) = memfd_arc_from_fd(task, fd) else {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             };
             if cmd == F_GET_SEALS {
@@ -1048,17 +1048,13 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             .flatten()
             .unwrap_or(false);
             if !writable {
-                ctx.set_return(SyscallReturn::ok((-1i64) as u64)); // -EPERM
+                ctx.set_return(errno_ret(EPERM));
                 return;
             }
             let r = match mfd.add_seals(arg as u32) {
                 Ok(()) => SyscallReturn::ok(0),
-                Err(crate::linux_compat::SealError::Invalid) => {
-                    SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)
-                }
-                Err(crate::linux_compat::SealError::Denied) => {
-                    SyscallReturn::ok((-1i64) as u64) // -EPERM
-                }
+                Err(crate::linux_compat::SealError::Invalid) => errno_ret(EINVAL),
+                Err(crate::linux_compat::SealError::Denied) => errno_ret(EPERM),
             };
             ctx.set_return(r);
             return;
@@ -1081,7 +1077,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // queries F_GETPIPE_SZ to size its I/O buffer.
             1032 => match entry.ops.pipe_capacity() {
                 Some(cap) => SyscallReturn::ok(cap as u64),
-                None => SyscallReturn::ok((-(EBADF as i64)) as u64),
+                None => errno_ret(EBADF),
             },
             1031 => {
                 // fcntl truncates arg through `int argi`; pipe_fcntl receives
@@ -1102,12 +1098,10 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
                     // compatibility implementation: validate Linux's global
                     // size errors, then report the live capacity.
                     None => match entry.ops.pipe_capacity() {
-                        None => SyscallReturn::ok((-(EBADF as i64)) as u64),
-                        Some(_) if size_arg > (1u32 << 31) => {
-                            SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64)
-                        }
+                        None => errno_ret(EBADF),
+                        Some(_) if size_arg > (1u32 << 31) => errno_ret(EINVAL),
                         Some(_) if (size_arg as usize).max(4096).next_power_of_two() > 1_048_576 => {
-                            SyscallReturn::ok((-1i64) as u64) // -EPERM
+                            errno_ret(EPERM)
                         }
                         Some(cap) => SyscallReturn::ok(cap as u64),
                     },
@@ -1141,7 +1135,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // gives when the machinery is compiled out, and it is the one a
             // caller can act on. `fcntl_setlease` also rejects directories
             // with -EINVAL regardless of config, so both shapes agree.
-            1024 => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
+            1024 => errno_ret(EINVAL),
             // Every command NARF does not implement. `fs/fcntl.c::do_fcntl`
             // opens with `long err = -EINVAL;` and its `default:` arm is a
             // bare `break`, so an unhandled command is -EINVAL.
@@ -1169,7 +1163,7 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
             // F_ADD_SEALS / F_GET_SEALS blocks earlier in this function, all
             // return before reaching here. Only commands whose sole previous
             // answer was a fabricated 0 land in this arm.
-            _ => SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64),
+            _ => errno_ret(EINVAL),
         })
     });
     match outcome {
@@ -1179,6 +1173,6 @@ pub(crate) fn sys_fcntl(ctx: &mut dyn TrapContext) {
         // as D-Bus use F_GETFD to probe inherited descriptors and must observe
         // -EBADF for a closed slot, not NARF's internal InvalidOp value (zero
         // on the Linux return-value wire).
-        _ => ctx.set_return(SyscallReturn::ok((-(EBADF as i64)) as u64)),
+        _ => ctx.set_return(errno_ret(EBADF)),
     }
 }

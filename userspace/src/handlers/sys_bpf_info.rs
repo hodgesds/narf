@@ -52,19 +52,6 @@ use narf_bpf::map::MapFile;
 use narf_bpf::prog::ProgFile;
 use narf_bpf_verifier::kfunc::Context;
 
-// Errnos this module returns. Spelled out locally rather than widening
-// `handlers/mod.rs`'s set or reaching into `sys_bpf.rs`'s private ones — the
-// two files are edited by different agents and a shared private constant is a
-// merge conflict waiting for a reason.
-const EBADF_: i64 = 9;
-const ENOENT: i64 = 2;
-const E2BIG: i64 = 7;
-const ENOMEM: i64 = 12;
-const EFAULT: i64 = 14;
-const EINVAL: i64 = 22;
-const EMFILE: i64 = 24;
-const ENOSPC: i64 = 28;
-
 /// As `sys_bpf.rs`: `union bpf_attr` grows every release and Linux accepts any
 /// size, zero-extending. Copy what the caller supplied into a zeroed buffer.
 const ATTR_BUF: usize = 256;
@@ -351,7 +338,7 @@ pub(crate) fn bpf_obj_get_info_by_fd(attr_uptr: u64, size: usize) -> i64 {
     // buffer must hear about the fd.
     let ops = match fd::with_table(current_task_id(), |t| t.get(fd).map(|e| e.ops.clone())) {
         Some(Some(o)) => o,
-        _ => return -EBADF_,
+        _ => return -EBADF,
     };
     if uinfo == 0 && user_len != 0 {
         return -EFAULT;

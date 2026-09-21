@@ -36,7 +36,7 @@ pub(crate) fn sys_getgroups(ctx: &mut dyn TrapContext) {
     let size = args.arg0 as i32;
     let list = args.arg1;
     if size < 0 {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let size = size as usize;
@@ -46,7 +46,7 @@ pub(crate) fn sys_getgroups(ctx: &mut dyn TrapContext) {
         return;
     }
     if size < groups.len() {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     // `groups_to_user` copies exactly `ngroups` entries, so an empty list
@@ -57,7 +57,7 @@ pub(crate) fn sys_getgroups(ctx: &mut dyn TrapContext) {
         return;
     }
     if list == 0 {
-        ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut bytes = alloc::vec::Vec::with_capacity(groups.len() * 4);
@@ -66,7 +66,7 @@ pub(crate) fn sys_getgroups(ctx: &mut dyn TrapContext) {
     }
     // SAFETY: list is a user pointer; copy_to_user validates and SMAP-brackets.
     if unsafe { copy_to_user(list, &bytes) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+        ctx.set_return(errno_ret(EFAULT));
     } else {
         ctx.set_return(SyscallReturn::ok((bytes.len() / 4) as u64));
     }

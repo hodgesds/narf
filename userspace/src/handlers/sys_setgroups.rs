@@ -31,7 +31,6 @@ use super::*;
 /// gid_map, as distinct from the EPERM that means "you may not call this
 /// at all".
 pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
-    const ENOMEM: i64 = 12;
     const NGROUPS_MAX: u32 = 65_536;
     let args = *ctx.args();
     // `int gidsetsize`, compared as `unsigned` — a negative size becomes a
@@ -39,7 +38,7 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     let size = args.arg0 as i32 as u32;
     let list = args.arg1;
     if size > NGROUPS_MAX {
-        ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+        ctx.set_return(errno_ret(EINVAL));
         return;
     }
     let size = size as usize;
@@ -51,18 +50,18 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
         } else {
             // Linux's only remaining failure here is the credential
             // allocation, which is -ENOMEM.
-            SyscallReturn::ok((-ENOMEM) as u64)
+            errno_ret(ENOMEM)
         });
         return;
     }
     if list == 0 {
-        ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut bytes = alloc::vec![0u8; size * 4];
     // SAFETY: list is a user pointer; copy_from_user validates and SMAP-brackets.
     if unsafe { copy_from_user(&mut bytes, list) }.is_err() {
-        ctx.set_return(SyscallReturn::ok((-(EFAULT as i64)) as u64));
+        ctx.set_return(errno_ret(EFAULT));
         return;
     }
     let mut groups = alloc::vec::Vec::with_capacity(size);
@@ -72,7 +71,7 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
         {
             let ns = crate::namespaces::current_user_ns(current_task_id());
             if !ns.is_initial() && !ns.gid_is_mapped(gid) {
-                ctx.set_return(SyscallReturn::ok((-(EINVAL_CODE as i64)) as u64));
+                ctx.set_return(errno_ret(EINVAL));
                 return;
             }
         }
@@ -82,6 +81,6 @@ pub(crate) fn sys_setgroups(ctx: &mut dyn TrapContext) {
     ctx.set_return(if ok {
         SyscallReturn::ok(0)
     } else {
-        SyscallReturn::ok((-ENOMEM) as u64)
+        errno_ret(ENOMEM)
     });
 }

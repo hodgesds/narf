@@ -19,6 +19,7 @@ pub mod bitmap;
 pub mod context;
 pub mod deferred_wake;
 pub mod directmap;
+pub mod errno;
 pub mod id;
 pub mod intrusive;
 pub mod mutex;

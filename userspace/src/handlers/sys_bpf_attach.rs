@@ -58,21 +58,6 @@ use narf_bpf::prog::{BpfAttach, BpfProg, ProgFile};
 use narf_capabilities::{Cap, Grant};
 use narf_tracing::dispatch::ProbeHandlerInstall;
 
-// Errno values these commands return. Spelled out here rather than widening
-// `handlers/mod.rs`'s set, as `sys_bpf.rs` does for its own.
-const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
-const EBADF: i64 = 9;
-const EFAULT: i64 = 14;
-const ENODEV: i64 = 19;
-const EINVAL: i64 = 22;
-const EBUSY: i64 = 16;
-const EMFILE: i64 = 24;
-const ENOSPC: i64 = 28;
-/// Linux's `ENOTSUPP` is an internal 524; the userspace-visible spelling is
-/// `EOPNOTSUPP`, which on Linux equals `ENOTSUP` (95).
-const ENOTSUP: i64 = 95;
-
 /// `union bpf_attr`, zero-extended. Same rule and same bound as `sys_bpf.rs`:
 /// Linux accepts any size and zero-extends
 /// (`kernel/bpf/syscall.c::bpf_check_uarg_tail_zero`) so that an older binary
