@@ -801,6 +801,28 @@ fn smoke_abi_signal_signalfd_neg() -> TestResult {
 }
 kernel_test_in!("syscall_abi", smoke_abi_signal_signalfd_neg);
 
+fn smoke_abi_signal_signalfd_flags_and_sizemask_einval() -> TestResult {
+    with_setup(|| {
+        // 1. Invalid sizemask (!= 8) -> -EINVAL (-22).
+        let r1 = call(Syscall::Signalfd.raw(), a3((-1i64) as u64, 0, 4, 0));
+        if r1 != Some(EINVAL) {
+            return Err("signalfd with invalid sizemask should return -EINVAL");
+        }
+
+        // 2. Invalid flags -> -EINVAL (-22).
+        let r2 = call(Syscall::Signalfd.raw(), a3((-1i64) as u64, 0, 8, 0x8888));
+        if r2 != Some(EINVAL) {
+            return Err("signalfd with invalid flags should return -EINVAL");
+        }
+
+        Ok(())
+    })
+}
+kernel_test_in!(
+    "syscall_abi",
+    smoke_abi_signal_signalfd_flags_and_sizemask_einval
+);
+
 // ── pidfd_send_signal(2) siginfo payload ────────────────────────────
 //
 // With a non-NULL `info`, `pidfd_send_signal` is `rt_sigqueueinfo(2)`

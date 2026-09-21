@@ -8,20 +8,27 @@ pub(crate) fn sys_signalfd(ctx: &mut dyn TrapContext) {
     // a bogus positive fd 0xffffffff. (`args.arg0 as i64` would read +4G.)
     let fd_arg = args.arg0 as i32 as i64; // -1 = create new; else replace mask
     let mask_ptr = args.arg1;
-    let _sizemask = args.arg2;
+    let sizemask = args.arg2;
     let flags = args.arg3 as u32;
+
+    if sizemask != 8 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
+    if flags & !(crate::linux_compat::SFD_CLOEXEC | crate::linux_compat::SFD_NONBLOCK) != 0 {
+        ctx.set_return(SyscallReturn::ok((-22i64) as u64)); // -EINVAL
+        return;
+    }
     let mut mask: u64 = 0;
     if mask_ptr != 0 {
         let mut bytes = [0u8; 8];
         // SAFETY: `mask_ptr` is the user sigset pointer (non-zero, checked above);
         // copy_from_user range-validates it and SMAP-brackets the 8-byte read.
-        // SAFETY: Valid memory or trusted environment
-        if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_ok() {
-            // A userspace sigset_t puts signal N at bit N-1 — identical to
-            // NARF's SIGNAL_PENDING layout — so the signalfd mask lines up
-            // with the pending bits it is intersected against verbatim.
-            mask = u64::from_le_bytes(bytes);
+        if unsafe { copy_from_user(&mut bytes, mask_ptr) }.is_err() {
+            ctx.set_return(SyscallReturn::ok((-14i64) as u64)); // -EFAULT
+            return;
         }
+        mask = u64::from_le_bytes(bytes);
     }
     let task = current_task_id();
 
